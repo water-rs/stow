@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -83,6 +84,7 @@ impl BuildWorkspace {
 /// invocation it ran under, and that graph's units carry the resolved
 /// feature set the published row is labelled with (stow#611).
 pub struct BuiltWorkspace {
+    local_programs: Vec<stow_types::records::LocalProcMacro>,
     workspace: BuildWorkspace,
     run_dir: TempDir,
     captures: Vec<CapturedRustcArtifact>,
@@ -90,6 +92,9 @@ pub struct BuiltWorkspace {
 }
 
 impl BuiltWorkspace {
+    pub fn local_programs(&self) -> &[stow_types::records::LocalProcMacro] {
+        &self.local_programs
+    }
     pub const fn workspace(&self) -> &BuildWorkspace {
         &self.workspace
     }
@@ -114,36 +119,8 @@ pub async fn create_workspace(
     task: &BuildTaskPayload,
 ) -> stow_types::error::Result<BuildWorkspace> {
     let (tempdir, workspace_root) = create_workspace_root().await?;
-    let (workspace_root, manifest_path, bundled_lockfile) = {
-        let archive = download_crate_archive(task).await?;
-        let crate_name = task.crate_name.as_str().to_owned();
-        let crate_version = task.version.to_string();
-        let unpack_root = workspace_root.clone();
-        let (task_manifest_path, crate_checksum) = smol::unblock(move || {
-            unpack_crate_archive(&unpack_root, &crate_name, &crate_version, &archive)
-                .map(|manifest| (manifest, hex::encode(sha2::Sha256::digest(&archive))))
-        })
-        .await?;
-        let source_root = task_manifest_path
-            .parent()
-            .ok_or_else(|| {
-                stow_types::stow_error!(
-                    "downloaded crate manifest {} has no parent directory",
-                    task_manifest_path.display()
-                )
-            })?
-            .to_path_buf();
-
-        // Every task crate compiles as a registry dependency of the
-        // generated wrapper package. A binary-only crate is an invalid
-        // dependency that cargo ignores outright, so the task crate never
-        // compiles and the publish stage's closure resolution fails the
-        // task instead of publishing nothing.
-        let wrapper_root = workspace_root.join("wrapper");
-        let (manifest_path, bundled_lockfile) =
-            write_wrapper_package(task, &wrapper_root, &crate_checksum, &source_root).await?;
-        (wrapper_root, manifest_path, bundled_lockfile)
-    };
+    let (manifest_path, bundled_lockfile) = create_wrapper_workspace(task, &workspace_root).await?;
+    let workspace_root = workspace_root.join("wrapper");
     let capture_dir = workspace_root.join(".stow-rustc-capture");
     create_dir_all(&capture_dir).await?;
 
@@ -205,30 +182,12 @@ impl BuildWorkspace {
 ///
 /// Returns the wrapper manifest path and, under `preserve_lockfile`, the
 /// crate's bundled `Cargo.lock` verbatim for the post-fetch fidelity check.
-pub async fn write_wrapper_package(
+async fn write_wrapper_package(
     task: &BuildTaskPayload,
     wrapper_root: &Path,
     crate_checksum: &str,
-    source_root: &Path,
+    bundled_lockfile: Option<String>,
 ) -> stow_types::error::Result<(PathBuf, Option<String>)> {
-    let bundled_lockfile = if task.preserve_lockfile {
-        let bundled_path = source_root.join("Cargo.lock");
-        Some(
-            async_fs::read_to_string(&bundled_path)
-                .await
-                .map_err(|error| {
-                    stow_types::stow_error!(
-                        "{} {} ships no Cargo.lock to preserve ({}): {error}",
-                        task.crate_name,
-                        task.version,
-                        bundled_path.display()
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
-
     let manifest_path = wrapper_root.join("Cargo.toml");
     async_fs::create_dir_all(wrapper_root.join("src")).await?;
     async_fs::write(&manifest_path, wrapper_manifest(task)?).await?;
@@ -323,7 +282,7 @@ struct Package {
     publish: bool,
 }
 
-#[derive(serde::Serialize)]
+#[derive(PartialEq, Eq, serde::Serialize)]
 struct Dependency {
     version: String,
     /// The real package name when the table key is an alias: dep pins key
@@ -383,12 +342,12 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
     // semver-incompatible versions of one crate (`syn` 1 and 2 is common)
     // — or a node that shares the task crate's name at another version —
     // would keep only the last insert. Each pin keys on a unique
-    // `<name>-v<version>` alias and names the package in `package`. Two
-    // pins of one crate+version cannot share a section: the subgraph
-    // comes from a single resolve, whose units key per
-    // (package, version, features) per side and platform — an alias
-    // collision inside a section is a real error, not an ambiguity to
-    // disambiguate.
+    // `<name>-v<version>` alias and names the package in `package`.
+    // Distinct nodes can require the same declaration: profiles,
+    // dependency context and invocation requirements are not fields in
+    // Cargo's dependency table. Reuse only an identical declaration;
+    // incompatible feature sets must never be unioned or overwritten.
+    // The dispatched subgraph stays intact for actual-graph validation.
     //
     // The one exception is a pin of the task's own package: cargo
     // requires every declaration from one package to one dependency
@@ -416,10 +375,18 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
         } else {
             pin_alias(node.crate_name.as_str(), &node.version.to_string())
         };
-        if section.insert(alias.clone(), pinned).is_some() {
-            return Err(stow_types::stow_error!(
-                "dep pin alias {alias} collides with an earlier entry in the wrapper manifest"
-            ));
+        match section.entry(alias) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(pinned);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if entry.get() != &pinned {
+                    return Err(stow_types::stow_error!(
+                        "dep pin alias {} has conflicting declarations in the wrapper manifest",
+                        entry.key()
+                    ));
+                }
+            }
         }
     }
     toml::to_string(&WrapperManifest {
@@ -668,19 +635,27 @@ fn lockfile_packages(
 async fn stage_consumption_store(
     task: &BuildTaskPayload,
     unit_graphs: &[PhaseUnitGraph],
-) -> stow_types::error::Result<(Option<TempDir>, Option<PathBuf>)> {
-    if task.dependency_subgraph.nodes.is_empty() {
-        return Ok((None, None));
+) -> stow_types::error::Result<(
+    Option<TempDir>,
+    Option<PathBuf>,
+    Vec<stow_types::records::LocalProcMacro>,
+)> {
+    let packages = consumption_packages(task, unit_graphs)?;
+    if packages.libraries.is_empty() && packages.scripts.is_empty() {
+        return Ok((None, None, Vec::new()));
     }
     let store_dir = TempDir::new()?;
-    let packages = consumption_packages(task, unit_graphs);
     let consumption = consume::prefetch(task, packages, store_dir.path())
         .await
         .map_err(|error| error.wrap_err("stage cache consumption"))?;
     Ok(if consumption.artifacts > 0 {
-        (Some(store_dir), Some(consumption.store_dir))
+        (
+            Some(store_dir),
+            Some(consumption.store_dir),
+            consumption.local_programs,
+        )
     } else {
-        (None, None)
+        (None, None, consumption.local_programs)
     })
 }
 
@@ -862,12 +837,28 @@ pub async fn phase_unit_graphs(
 fn consumption_packages(
     task: &BuildTaskPayload,
     unit_graphs: &[PhaseUnitGraph],
-) -> Vec<dep_scan::ConsumablePackage> {
+) -> stow_types::error::Result<dep_scan::ConsumablePackages> {
+    let mut scripts = BTreeSet::new();
     let mut entries = Vec::new();
     for unit_graph in unit_graphs {
         entries.extend(unit_graph.graph.entries.iter().cloned());
+        for unit in unit_graph.task_units(runner_host_triple(task)?)? {
+            if unit.is_crates_io
+                && unit.key.kind == stow_types::unit_graph::TaskUnitKind::BuildScript
+            {
+                scripts.insert(dep_scan::ConsumablePackage {
+                    crate_name: unit.name,
+                    version: semver::Version::parse(&unit.version)?,
+                    features: unit.features.into_iter().collect(),
+                    host_side: true,
+                });
+            }
+        }
     }
-    dep_scan::consumable_packages(task, &entries)
+    Ok(dep_scan::ConsumablePackages {
+        libraries: dep_scan::consumable_packages(task, &entries),
+        scripts: scripts.into_iter().collect(),
+    })
 }
 
 /// The compiled dependency-context gate (stow#588): every phase×invocation
@@ -1051,7 +1042,8 @@ fn assert_native_sharing_verdicts(
             continue;
         }
         let cargo_shared = origin == twin_origin;
-        let predicate_shared = !kept_apart.contains(&unit.key);
+        let predicate_shared =
+            unit.profile.host_can_share_target(twin.profile) && !kept_apart.contains(&unit.key);
         if cargo_shared != predicate_shared {
             return Err(stow_types::stow_error!(
                 "cargo {} the `{}` {} host/target twin pair but the sharing predicate {} — a probe input the builder does not model disagreed",
@@ -1141,23 +1133,159 @@ fn first_context_difference(
         .to_owned()
 }
 
+trait CompilationMode: Sync {
+    fn workspace(
+        &self,
+        task: &BuildTaskPayload,
+        cargo_home: &Path,
+    ) -> impl std::future::Future<Output = stow_types::error::Result<BuildWorkspace>> + Send;
+    fn consumption(
+        &self,
+        task: &BuildTaskPayload,
+        graphs: &[PhaseUnitGraph],
+    ) -> impl std::future::Future<
+        Output = stow_types::error::Result<(
+            Option<TempDir>,
+            Option<PathBuf>,
+            Vec<stow_types::records::LocalProcMacro>,
+        )>,
+    > + Send;
+    fn wrapper<'a>(&self, setup: &'a PhaseSetup<'_>) -> Option<&'a Path>;
+}
+
+struct CachedCompilation;
+
+impl CompilationMode for CachedCompilation {
+    async fn workspace(
+        &self,
+        task: &BuildTaskPayload,
+        cargo_home: &Path,
+    ) -> stow_types::error::Result<BuildWorkspace> {
+        let mirror_key = workspace_mirror::MirrorTaskKey {
+            task_id: task.task_id.clone(),
+            preserve_lockfile: task.preserve_lockfile,
+        };
+        let workspace = stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
+        fetch_workspace_dependencies(cargo_home, task, &workspace).await?;
+        Ok(workspace)
+    }
+
+    async fn consumption(
+        &self,
+        task: &BuildTaskPayload,
+        graphs: &[PhaseUnitGraph],
+    ) -> stow_types::error::Result<(
+        Option<TempDir>,
+        Option<PathBuf>,
+        Vec<stow_types::records::LocalProcMacro>,
+    )> {
+        stage_consumption_store(task, graphs).await
+    }
+
+    fn wrapper<'a>(&self, setup: &'a PhaseSetup<'_>) -> Option<&'a Path> {
+        Some(&setup.wrappers.rustc_wrapper)
+    }
+}
+
+struct CleanCompilation<'a> {
+    lockfile: &'a str,
+}
+
+impl CompilationMode for CleanCompilation<'_> {
+    async fn workspace(
+        &self,
+        task: &BuildTaskPayload,
+        cargo_home: &Path,
+    ) -> stow_types::error::Result<BuildWorkspace> {
+        let workspace = create_workspace(task).await?;
+        let lock_path = workspace.workspace_root().join("Cargo.lock");
+        async_fs::write(&lock_path, self.lockfile).await?;
+        let status = Command::new("cargo")
+            .args(["fetch", "--locked", "--manifest-path"])
+            .arg(workspace.manifest_path())
+            .env("CARGO_HOME", cargo_home)
+            .env("RUSTUP_TOOLCHAIN", run_toolchain(task))
+            .status()
+            .await?;
+        if !status.success() {
+            return Err(stow_types::stow_error!(
+                "fetch frozen replay dependencies: {status}"
+            ));
+        }
+        if async_fs::read_to_string(lock_path).await? != self.lockfile {
+            return Err(stow_types::stow_error!(
+                "replay changed the frozen lockfile"
+            ));
+        }
+        Ok(workspace)
+    }
+
+    fn consumption(
+        &self,
+        _task: &BuildTaskPayload,
+        _graphs: &[PhaseUnitGraph],
+    ) -> impl std::future::Future<
+        Output = stow_types::error::Result<(
+            Option<TempDir>,
+            Option<PathBuf>,
+            Vec<stow_types::records::LocalProcMacro>,
+        )>,
+    > + Send {
+        std::future::ready(Ok((None, None, Vec::new())))
+    }
+
+    fn wrapper<'a>(&self, _setup: &'a PhaseSetup<'_>) -> Option<&'a Path> {
+        None
+    }
+}
+
 pub async fn build(
     task: &BuildTaskPayload,
     output_dir: &Path,
-) -> stow_types::error::Result<BuiltWorkspace> {
+) -> stow_types::error::Result<Result<BuiltWorkspace, crate::failure::FailureCandidate>> {
+    compile_task(task, output_dir, &CachedCompilation).await
+}
+
+pub async fn verify_source_failure(
+    task: &BuildTaskPayload,
+    candidate: crate::failure::FailureCandidate,
+    output_dir: &Path,
+) -> stow_types::error::Result<stow_types::build_failure::VerifiedSourceFailure> {
+    if candidate.observation.inputs.task != *task
+        || candidate.observation.inputs.lock_sha256
+            != hex::encode(sha2::Sha256::digest(candidate.lockfile.as_bytes()))
+    {
+        return Err(stow_types::stow_error!(
+            "failure evidence does not match dispatched inputs"
+        ));
+    }
+    let replay = compile_task(
+        task,
+        output_dir,
+        &CleanCompilation {
+            lockfile: &candidate.lockfile,
+        },
+    )
+    .await?;
+    candidate
+        .observation
+        .verify_replay(replay.as_ref().err().map(|failure| &failure.observation))
+        .ok_or_else(|| {
+            stow_types::stow_error!("cache-free replay did not reproduce the source failure")
+        })
+}
+
+async fn compile_task(
+    task: &BuildTaskPayload,
+    output_dir: &Path,
+    mode: &impl CompilationMode,
+) -> stow_types::error::Result<Result<BuiltWorkspace, crate::failure::FailureCandidate>> {
     // Resolve and verify the run toolchain once per task — a name whose
     // rustc reports a different release than the pinned `rustc_version`
     // is refused here, before any phase runs cargo.
     verified_run_toolchain(task)?;
-    let mirror_key = workspace_mirror::MirrorTaskKey {
-        target: task.target.as_str().to_owned(),
-        rustc_version: task.rustc_version.as_str().to_owned(),
-        preserve_lockfile: task.preserve_lockfile,
-    };
-    let workspace = stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
-
     let cargo_home = cargo_home()?;
-    fetch_workspace_dependencies(&cargo_home, task, &workspace).await?;
+    let workspace = mode.workspace(task, &cargo_home).await?;
 
     let cargo_subcommand = cargo_subcommand()?;
     // Cargo's own unit graphs are computed once for the whole build:
@@ -1167,7 +1295,8 @@ pub async fn build(
     // not just the cache path.
     let unit_graphs = phase_unit_graphs(&cargo_home, task, &workspace, cargo_subcommand).await?;
     verify_dependency_context(task, &unit_graphs)?;
-    let (_consume_store_dir, consume_store) = stage_consumption_store(task, &unit_graphs).await?;
+    let (_consume_store_dir, consume_store, local_programs) =
+        mode.consumption(task, &unit_graphs).await?;
 
     let audit_log = heel::NetworkAuditLog::file(output_dir.join("network-audit.jsonl"))
         .map_err(|error| stow_types::stow_error!("open network audit log: {error}"))?;
@@ -1231,7 +1360,19 @@ pub async fn build(
     for &phase in phases {
         for &invocation in phase_invocations(task) {
             let target_dir = phase_target_dir(run_dir.path(), phase, invocation);
-            run_sandboxed_phase(&run, task, phase, invocation, &target_dir, &mut collector).await?;
+            if let Some(failure) = run_phase(
+                &run,
+                task,
+                phase,
+                invocation,
+                &target_dir,
+                &mut collector,
+                mode,
+            )
+            .await?
+            {
+                return Ok(Err(failure));
+            }
         }
     }
 
@@ -1244,12 +1385,13 @@ pub async fn build(
         "cargo phases finished"
     );
 
-    Ok(BuiltWorkspace {
+    Ok(Ok(BuiltWorkspace {
+        local_programs,
         workspace,
         run_dir,
         captures: collector.into_records()?,
         unit_graphs,
-    })
+    }))
 }
 
 /// The rustup *name* the phases run `cargo` under — a different fact
@@ -1392,6 +1534,7 @@ pub struct PhaseRun<'a> {
 /// records it delivered. A duplicate identity is fatal, and so is cargo
 /// exiting non-zero — the build compiles one crate, and a phase that
 /// cannot finish means the task failed.
+#[cfg(test)]
 pub async fn run_sandboxed_phase(
     run: &PhaseRun<'_>,
     task: &BuildTaskPayload,
@@ -1399,10 +1542,74 @@ pub async fn run_sandboxed_phase(
     invocation: CargoInvocation,
     target_dir: &Path,
     collector: &mut CaptureCollector,
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<Option<crate::failure::FailureCandidate>> {
+    run_phase(
+        run,
+        task,
+        phase,
+        invocation,
+        target_dir,
+        collector,
+        &CachedCompilation,
+    )
+    .await
+}
+
+fn compilation_inputs(
+    setup: &PhaseSetup<'_>,
+    task: &BuildTaskPayload,
+    target_dir: &Path,
+    args: &[String],
+    lockfile: &str,
+    manifest: &[u8],
+    rustflags: &str,
+) -> stow_types::build_failure::CompilationInputs {
+    stow_types::build_failure::CompilationInputs {
+        rustflags: rustflags
+            .replace(
+                &*setup.workspace.workspace_root().to_string_lossy(),
+                "<workspace>",
+            )
+            .replace(&*target_dir.to_string_lossy(), "<target>"),
+        task: task.clone(),
+        lock_sha256: hex::encode(sha2::Sha256::digest(lockfile.as_bytes())),
+        manifest_sha256: hex::encode(sha2::Sha256::digest(manifest)),
+        cargo_args: args
+            .iter()
+            .map(|arg| {
+                arg.replace(
+                    &setup
+                        .workspace
+                        .workspace_root()
+                        .to_string_lossy()
+                        .to_string(),
+                    "<workspace>",
+                )
+            })
+            .collect(),
+    }
+}
+
+async fn run_phase(
+    run: &PhaseRun<'_>,
+    task: &BuildTaskPayload,
+    phase: CargoSubcommand,
+    invocation: CargoInvocation,
+    target_dir: &Path,
+    collector: &mut CaptureCollector,
+    mode: &impl CompilationMode,
+) -> stow_types::error::Result<Option<crate::failure::FailureCandidate>> {
     let setup = run.setup;
     create_dir_all(target_dir).await?;
-    let args = cargo_phase_args(setup.workspace, task, phase, invocation).await?;
+    let mut args = cargo_phase_args(setup.workspace, task, phase, invocation).await?;
+    args.push("--message-format=json".to_owned());
+    let lockfile =
+        async_fs::read_to_string(setup.workspace.workspace_root().join("Cargo.lock")).await?;
+    let rustflags = phase_rustflags(setup.rustflags, task.target.as_str(), target_dir);
+    let manifest = async_fs::read(setup.workspace.manifest_path()).await?;
+    let inputs = compilation_inputs(
+        setup, task, target_dir, &args, &lockfile, &manifest, &rustflags,
+    );
 
     // A unit that links in more than one phase — a proc-macro's deps like
     // `defmt-parser`, or a build-script crate that `include!`s generated
@@ -1420,15 +1627,20 @@ pub async fn run_sandboxed_phase(
     // argv the boundary drops it from (MSVC CodeView S_OBJNAME embeds the
     // object's own absolute output path; without the remap the two phase
     // dirs hash differently on Windows even though the unit is identical).
-    let rustflags = phase_rustflags(setup.rustflags, task.target.as_str(), target_dir);
-
     let mut command = run
         .sandbox
         .command("cargo")
         .args(args)
         .env("RUSTUP_TOOLCHAIN", run_toolchain(task))
         .env("RUSTFLAGS", rustflags)
-        .env("RUSTC_WRAPPER", path_arg(&setup.wrappers.rustc_wrapper)?)
+        .env(
+            "RUSTC_WRAPPER",
+            mode.wrapper(setup)
+                .map(path_arg)
+                .transpose()?
+                .unwrap_or_default(),
+        )
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
         .env("CARGO_TARGET_DIR", path_arg(target_dir)?)
         .env(
             STOW_BUILD_CAPTURE_DIR_ENV,
@@ -1464,9 +1676,10 @@ pub async fn run_sandboxed_phase(
             );
     }
     let passes_target = invocation_passes_target(task, invocation).await?;
-    let status = command.status().await.map_err(|error| {
+    let output = command.output().await.map_err(|error| {
         stow_types::stow_error!("run sandboxed cargo {}: {error}", phase.as_str())
     })?;
+    tracing::info!(stdout = %String::from_utf8_lossy(&output.stdout), stderr = %String::from_utf8_lossy(&output.stderr), "cargo phase output");
 
     // Absorb the records this phase delivered before looking at cargo's
     // exit status: a duplicate identity is fatal either way. The drain
@@ -1480,14 +1693,30 @@ pub async fn run_sandboxed_phase(
     };
     collector.drain(phase.as_str(), unit_invocation)?;
 
-    if !status.success() {
+    if !output.status.success() {
+        let compiler = crate::failure::source_diagnostics(&output.stdout, setup.cargo_home)?;
+        let mut diagnostics = compiler.source;
+        diagnostics.extend(crate::failure::native_diagnostics(&output.stderr));
+        if output.status.code() == Some(101)
+            && compiler.complete
+            && !diagnostics.is_empty()
+            && !crate::failure::has_tool_failure(&output.stderr)
+        {
+            return Ok(Some(crate::failure::FailureCandidate {
+                observation: stow_types::build_failure::CompilationFailure {
+                    inputs,
+                    diagnostics,
+                },
+                lockfile,
+            }));
+        }
         return Err(stow_types::stow_error!(
             "cargo {} failed for {} {} on {} with status {}",
             phase.as_str(),
             task.crate_name,
             task.version,
             task.target,
-            status
+            output.status
         ));
     }
 
@@ -1500,7 +1729,7 @@ pub async fn run_sandboxed_phase(
         cargo_subcommand = phase.as_str(),
         "cargo phase completed"
     );
-    Ok(())
+    Ok(None)
 }
 
 /// How one phase's `cargo` invocation is spelled: whether `--target`
@@ -1575,6 +1804,9 @@ async fn cargo_phase_args(
     if phase == CargoSubcommand::Test {
         args.push("--no-run".to_owned());
     }
+    // The node's named profile decides the cargo profile every unit builds
+    // under; the host side keeps that profile's own build-override.
+    args.extend(task.profile.cargo_args().iter().map(|&arg| arg.to_owned()));
     // Task feature flags never reach the cargo command line: the wrapper
     // package's dependency declaration already encodes the selection, and
     // the generated package declares no features of its own for them to
@@ -2086,7 +2318,6 @@ fn toolchain_grant_dirs(
         // read its headers, .pc files and libraries.
         "STOW_SYSTEM_LIBS",
     ];
-    const TOOLCHAIN_EXE_PREFIXES: &[&str] = &["CARGO_TARGET_", "CC_", "CXX_", "AR_", "RANLIB_"];
     let android = targets_android(target);
     let mut dirs: Vec<PathBuf> = vars
         .filter_map(|(name, value)| {
@@ -2095,7 +2326,7 @@ fn toolchain_grant_dirs(
             {
                 return Some(PathBuf::from(value));
             }
-            if env_name::starts_with_any(&name, TOOLCHAIN_EXE_PREFIXES) {
+            if env_name::toolchain_executable(&name) {
                 return PathBuf::from(value).parent().map(Path::to_path_buf);
             }
             None
@@ -2625,28 +2856,59 @@ pub async fn create_resolution_workspace(
     task: &BuildTaskPayload,
     root: &Path,
 ) -> stow_types::error::Result<PathBuf> {
-    let archive = download_crate_archive(task).await?;
-    let crate_name = task.crate_name.as_str().to_owned();
-    let crate_version = task.version.to_string();
-    let unpack_root = root.to_path_buf();
-    let (task_manifest_path, crate_checksum) = smol::unblock(move || {
-        unpack_crate_archive(&unpack_root, &crate_name, &crate_version, &archive)
-            .map(|manifest| (manifest, hex::encode(sha2::Sha256::digest(&archive))))
-    })
-    .await?;
-    let source_root = task_manifest_path
-        .parent()
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "downloaded crate manifest {} has no parent directory",
-                task_manifest_path.display()
-            )
-        })?
-        .to_path_buf();
-    let wrapper_root = root.join("wrapper");
-    let (manifest_path, _) =
-        write_wrapper_package(task, &wrapper_root, &crate_checksum, &source_root).await?;
+    let (manifest_path, _) = create_wrapper_workspace(task, root).await?;
     Ok(manifest_path)
+}
+
+/// Both trust domains download their own archive and generate their own wrapper.
+/// Cargo compiles its registry source; only a preserved lockfile needs extraction.
+async fn create_wrapper_workspace(
+    task: &BuildTaskPayload,
+    root: &Path,
+) -> stow_types::error::Result<(PathBuf, Option<String>)> {
+    let archive = download_crate_archive(task).await?;
+    write_wrapper_archive(task, root, archive).await
+}
+
+pub async fn write_wrapper_archive(
+    task: &BuildTaskPayload,
+    root: &Path,
+    archive: Vec<u8>,
+) -> stow_types::error::Result<(PathBuf, Option<String>)> {
+    let archive_task = task.clone();
+    let archive_root = root.to_path_buf();
+    let (checksum, bundled_lockfile) =
+        smol::unblock(move || wrapper_archive_inputs(&archive_task, &archive_root, &archive))
+            .await?;
+    write_wrapper_package(task, &root.join("wrapper"), &checksum, bundled_lockfile).await
+}
+
+fn wrapper_archive_inputs(
+    task: &BuildTaskPayload,
+    root: &Path,
+    archive: &[u8],
+) -> stow_types::error::Result<(String, Option<String>)> {
+    let checksum = hex::encode(sha2::Sha256::digest(archive));
+    let bundled_lockfile = if task.preserve_lockfile {
+        let manifest = unpack_crate_archive(
+            root,
+            task.crate_name.as_str(),
+            &task.version.to_string(),
+            archive,
+        )?;
+        let bundled_path = manifest.with_file_name("Cargo.lock");
+        Some(std::fs::read_to_string(&bundled_path).map_err(|error| {
+            stow_types::stow_error!(
+                "{} {} ships no Cargo.lock to preserve ({}): {error}",
+                task.crate_name,
+                task.version,
+                bundled_path.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    Ok((checksum, bundled_lockfile))
 }
 
 pub fn unpack_crate_archive(
@@ -2897,6 +3159,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wrapper_archive_extracts_only_for_a_preserved_lockfile() {
+        let archive = build_archive(
+            "itoa-1.0.15/Cargo.toml",
+            b"[package]\nname = \"itoa\"\nversion = \"1.0.15\"\n",
+            "itoa-1.0.15/Cargo.lock",
+            b"# bundled lockfile\n",
+        );
+        let mut task = task_with_features(&[]);
+        let ordinary = TempDir::new().unwrap();
+        let (ordinary_checksum, lockfile) =
+            super::wrapper_archive_inputs(&task, ordinary.path(), &archive).unwrap();
+        assert!(lockfile.is_none());
+        assert_eq!(std::fs::read_dir(ordinary.path()).unwrap().count(), 0);
+
+        task.preserve_lockfile = true;
+        let preserved = TempDir::new().unwrap();
+        let (preserved_checksum, lockfile) =
+            super::wrapper_archive_inputs(&task, preserved.path(), &archive).unwrap();
+        assert_eq!(ordinary_checksum, preserved_checksum);
+        assert_eq!(lockfile.as_deref(), Some("# bundled lockfile\n"));
+        assert!(preserved.path().join("itoa-1.0.15/Cargo.toml").exists());
+    }
+
+    #[test]
+    fn wrapper_archive_refuses_a_missing_preserved_lockfile() {
+        let archive = build_archive(
+            "itoa-1.0.15/Cargo.toml",
+            b"[package]\nname = \"itoa\"\nversion = \"1.0.15\"\n",
+            "itoa-1.0.15/src/lib.rs",
+            b"",
+        );
+        let mut task = task_with_features(&[]);
+        task.preserve_lockfile = true;
+        let root = TempDir::new().unwrap();
+        let error = super::wrapper_archive_inputs(&task, root.path(), &archive).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ships no Cargo.lock to preserve")
+        );
+    }
+
+    #[test]
+    fn distinct_node_profiles_preserve_each_others_capture_snapshots() {
+        smol::block_on(async {
+            async fn prepare(task: &BuildTaskPayload) -> BuildWorkspace {
+                let dir = TempDir::new().expect("source workspace");
+                let root = dir.path().to_path_buf();
+                std::fs::write(root.join("Cargo.toml"), wrapper_manifest(task).unwrap()).unwrap();
+                let workspace = BuildWorkspace {
+                    _tempdir: Some(dir),
+                    manifest_path: root.join("Cargo.toml"),
+                    workspace_root: root,
+                    capture_dir: PathBuf::new(),
+                    bundled_lockfile: None,
+                };
+                super::stabilize_workspace(
+                    workspace,
+                    &crate::workspace_mirror::MirrorTaskKey {
+                        task_id: task.task_id.clone(),
+                        preserve_lockfile: task.preserve_lockfile,
+                    },
+                )
+                .await
+                .expect("prepare stable workspace")
+            }
+
+            let namespace = TempDir::new().expect("test namespace");
+            let mut dev = task_with_features(&[]);
+            dev.task_id = format!("{}-dev", namespace.path().display());
+            let mut release = dev.clone();
+            release.profile = stow_types::node_profile::NodeProfile::Release;
+            release.task_id = format!("{}-release", namespace.path().display());
+            assert_eq!(
+                wrapper_manifest(&dev).unwrap(),
+                wrapper_manifest(&release).unwrap()
+            );
+
+            let first = prepare(&dev).await;
+            let snapshot = first.capture_dir().join("live-output.rmeta");
+            std::fs::write(&snapshot, b"first node output").unwrap();
+            let second = prepare(&release).await;
+            let survived = std::fs::read(&snapshot);
+            let distinct = first.workspace_root() != second.workspace_root();
+            std::fs::remove_dir_all(first.workspace_root()).unwrap();
+            if distinct {
+                std::fs::remove_dir_all(second.workspace_root()).unwrap();
+            }
+            assert_eq!(
+                survived.expect("second node must not delete the live snapshot"),
+                b"first node output"
+            );
+            assert!(
+                distinct,
+                "different nodes must own different mutable workspaces"
+            );
+        });
+    }
+
     fn task_with_features(features: &[&str]) -> BuildTaskPayload {
         BuildTaskPayload {
             task_id: "itoa-task".to_owned(),
@@ -2919,6 +3281,7 @@ mod tests {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
             },
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -2937,16 +3300,21 @@ mod tests {
                 host_side: false,
                 keys_apart: false,
                 deps: Vec::new(),
+                profile: stow_types::node_profile::NodeProfile::Dev,
             }],
         };
 
-        let error = smol::block_on(crate::consume::slices_for_task_with(&task, |_, _| {
-            Box::pin(async {
-                Err(stow_types::stow_error!(
-                    "ftp://127.0.0.1 is not a supported registry scheme"
-                ))
-            })
-        }))
+        let error = smol::block_on(crate::consume::slices_for_task_with(
+            &task,
+            false,
+            |_, _| {
+                Box::pin(async {
+                    Err(stow_types::stow_error!(
+                        "ftp://127.0.0.1 is not a supported registry scheme"
+                    ))
+                })
+            },
+        ))
         .expect_err("an unreadable slice fails the build");
         let text = format!("{error:#}");
         assert!(
@@ -2961,12 +3329,13 @@ mod tests {
     #[test]
     fn a_task_without_dependencies_consumes_nothing() {
         let cache_dir = TempDir::new().expect("cache dir");
-        let (store, path) = smol::block_on(super::stage_consumption_store(
+        let (store, path, programs) = smol::block_on(super::stage_consumption_store(
             &task_with_features(&[]),
             &[],
         ))
         .expect("nothing to consume is not a failure");
         assert!(store.is_none() && path.is_none());
+        assert_eq!(programs, []);
         assert!(
             std::fs::read_dir(cache_dir.path())
                 .expect("cache dir")
@@ -3064,6 +3433,38 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_manifest_declares_identical_pins_once_across_node_identities() {
+        let mut task = task_with_features(&[]);
+        let dev = SubgraphNode {
+            crate_name: CrateName::parse("serde").expect("crate name"),
+            version: CrateVersion::new(semver::Version::parse("1.0.229").expect("version")),
+            features_json: FeaturesJson::canonicalize(vec!["std".to_owned()]).expect("features"),
+            host_side: true,
+            keys_apart: false,
+            deps: Vec::new(),
+            profile: stow_types::node_profile::NodeProfile::Dev,
+        };
+        let mut release = dev.clone();
+        release.profile = stow_types::node_profile::NodeProfile::Release;
+        let mut explicit = dev.clone();
+        explicit.keys_apart = true;
+        let mut contextual = dev.clone();
+        contextual.deps = vec![1];
+        task.dependency_subgraph = leaf_pins(vec![dev, release, explicit, contextual]);
+        let original = task.dependency_subgraph.clone();
+        let manifest: toml::Table =
+            toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
+                .expect("generated manifest parses");
+        assert_eq!(manifest["build-dependencies"].as_table().unwrap().len(), 1);
+        assert_eq!(task.dependency_subgraph, original);
+
+        task.dependency_subgraph.nodes[1].features_json =
+            FeaturesJson::canonicalize(vec!["alloc".to_owned()]).expect("features");
+        let error = wrapper_manifest(&task).expect_err("different feature sets conflict");
+        assert!(error.to_string().contains("conflicting declarations"));
+    }
+
+    #[test]
     fn wrapper_manifest_keeps_default_features_when_task_lists_default() {
         let task = task_with_features(&["default", "std"]);
         let manifest: toml::Table =
@@ -3137,6 +3538,7 @@ mod tests {
                 host_side: false,
                 keys_apart: false,
                 deps: Vec::new(),
+                profile: stow_types::node_profile::NodeProfile::Dev,
             },
             SubgraphNode {
                 crate_name: CrateName::parse("syn").expect("crate name"),
@@ -3146,6 +3548,7 @@ mod tests {
                 host_side: true,
                 keys_apart: false,
                 deps: Vec::new(),
+                profile: stow_types::node_profile::NodeProfile::Dev,
             },
         ]);
         let manifest: toml::Table =
@@ -3203,6 +3606,7 @@ mod tests {
             host_side: false,
             keys_apart: false,
             deps: Vec::new(),
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }]);
         let manifest: toml::Table =
             toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
@@ -3245,6 +3649,7 @@ mod tests {
             host_side,
             keys_apart: false,
             deps: Vec::new(),
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         task.dependency_subgraph = leaf_pins(vec![
             pin("1.0.109", false),
@@ -3256,6 +3661,7 @@ mod tests {
                 host_side: false,
                 keys_apart: false,
                 deps: Vec::new(),
+                profile: stow_types::node_profile::NodeProfile::Dev,
             },
         ]);
         let manifest: toml::Table =
@@ -3303,6 +3709,7 @@ mod tests {
             host_side: false,
             keys_apart: false,
             deps: Vec::new(),
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }]);
         let manifest: toml::Table =
             toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
@@ -4049,6 +4456,23 @@ checksum = "33"
         );
         let passed = toolchain_env_names("aarch64-linux-android", names().into_iter());
         assert_eq!(passed, ["ANDROID_HOME", "ANDROID_NDK_LATEST_HOME"]);
+    }
+
+    #[test]
+    fn cargo_output_directories_never_grant_their_parent() {
+        let checkout = TempDir::new().expect("checkout");
+        let output = checkout.path().join("target");
+        std::fs::create_dir(&output).expect("target directory");
+        let vars = [
+            "CARGO_TARGET_DIR",
+            "CARGO_TARGET_TMPDIR",
+            "CARGO_TARGET_X_RUSTFLAGS",
+        ]
+        .map(|name| (OsString::from(name), output.as_os_str().to_owned()));
+        assert_eq!(
+            toolchain_grant_dirs("aarch64-apple-darwin", vars.into_iter()),
+            [] as [PathBuf; 0]
+        );
     }
 
     /// The toolchain variables the build job exports for the task's own

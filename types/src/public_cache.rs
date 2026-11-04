@@ -429,6 +429,16 @@ pub fn normalized_cache_profile(parsed: &ParsedRustcArgs) -> crate::error::Resul
     if !produces_linked_artifact(parsed) {
         profile.strip = StripLevel::None;
     }
+    // A build script computes the same thing at any debug-info level and
+    // symbol-stripping choice, and cargo hands those to a host unit by the
+    // invocation's spelling (`--target` gives it the target settings, a
+    // plain build the build-override ones). Pinning them keys the script
+    // by the host and the profile's real settings alone, so one build
+    // serves a consumer whatever it targets.
+    if parsed.is_build_script() {
+        profile.debuginfo = 1;
+        profile.strip = StripLevel::None;
+    }
     Ok(profile)
 }
 
@@ -667,6 +677,21 @@ pub struct UnitShape {
     pub kind: UnitKind,
 }
 
+impl UnitShape {
+    /// The observed shapes of one artifact. Sharing is recorded only after
+    /// captures from both Cargo invocations prove the same compiler identity.
+    pub fn invocation_shapes(self, shared_invocations: bool) -> impl Iterator<Item = Self> {
+        let other = Self {
+            invocation: match self.invocation {
+                UnitInvocation::Native => UnitInvocation::Target,
+                UnitInvocation::Target => UnitInvocation::Native,
+            },
+            ..self
+        };
+        std::iter::once(self).chain(shared_invocations.then_some(other))
+    }
+}
+
 /// The shapes a node's published artifact set must cover before a
 /// dependent may consume it.
 ///
@@ -734,6 +759,9 @@ fn produces_linked_artifact(parsed: &ParsedRustcArgs) -> bool {
 
 fn parsed_artifact_kind(parsed: &ParsedRustcArgs) -> crate::error::Result<ArtifactKind> {
     let crate_types = parsed_crate_types(parsed)?;
+    if parsed.is_build_script() {
+        return Ok(ArtifactKind::BuildScript);
+    }
     if crate_types
         .iter()
         .any(|crate_type| matches!(crate_type, RustCrateType::ProcMacro))
@@ -769,6 +797,7 @@ fn parsed_crate_types(parsed: &ParsedRustcArgs) -> crate::error::Result<Vec<Rust
             "cdylib" => Ok(RustCrateType::Cdylib),
             "staticlib" => Ok(RustCrateType::Staticlib),
             "proc-macro" => Ok(RustCrateType::ProcMacro),
+            "bin" => Ok(RustCrateType::Bin),
             other => Err(crate::stow_error!("unsupported crate type `{other}`")),
         })
         .collect()
@@ -1188,6 +1217,7 @@ mod tests {
             key_of(&[
                 "--remap-path-prefix=/Users/me/ws=stow-ci://workspace",
                 "--remap-path-prefix=/run/target=stow-ci://target",
+                "--remap-path-prefix=/run/target/build/generated/out=stow-ci://build-output",
             ])
         );
         assert_keys_apart(
@@ -1949,6 +1979,41 @@ mod tests {
         // test vector above locks in.
         assert_ne!(flagged_identity.compile_key, baseline_identity.compile_key);
         assert_eq!(baseline_identity.c_metadata, "0e63365407e7f07c");
+    }
+
+    /// A build script is keyed by its host alone: the debug-info and
+    /// strip settings cargo derives from the invocation's spelling
+    /// (`--target` hands a host unit the target's, a plain build the
+    /// build-override's) never reach its compile key.
+    #[test]
+    fn a_build_scripts_key_ignores_the_invocation_spelling() {
+        let build_script = |codegen: &[&str]| {
+            let mut parts = vec![
+                "--crate-name",
+                "build_script_build",
+                "--edition=2021",
+                "/Users/lexoliu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/build.rs",
+                "--crate-type",
+                "bin",
+                "--emit=dep-info,link",
+                "-C",
+                "embed-bitcode=no",
+            ];
+            parts.extend_from_slice(codegen);
+            parts.extend(["--out-dir", "/tmp/out"]);
+            let parsed = ParsedRustcArgs::parse(&args(&parts)).expect("parse build script");
+            assert!(parsed.is_build_script());
+            test_registry_identity(&parsed).expect("compute identity")
+        };
+        let native = build_script(&[]);
+        let targeted = build_script(&["-C", "debuginfo=2", "-C", "split-debuginfo=unpacked"]);
+        let stripped = build_script(&["-C", "debuginfo=2", "-C", "strip=debuginfo"]);
+        assert_eq!(native.compile_key, targeted.compile_key);
+        assert_eq!(native.compile_key, stripped.compile_key);
+        assert_eq!(native.c_metadata, targeted.c_metadata);
+        // What the script computes still keys it.
+        let optimized = build_script(&["-C", "opt-level=3"]);
+        assert_ne!(native.compile_key, optimized.compile_key);
     }
 
     #[test]

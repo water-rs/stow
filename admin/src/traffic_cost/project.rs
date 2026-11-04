@@ -1,6 +1,6 @@
 //! `stow-admin traffic-cost project` — the monthly projection of each
 //! Cloudflare product against the stow#883 cost line (stow#452,
-//! stow#775): 80% of its monthly Workers Paid allowance.
+//! stow#775): 90% for Durable Object requests, 80% for other dimensions.
 //!
 //! The release gate's `Monthly projection` job runs it over what the
 //! Traffic cost, Preheat cost and Production wave jobs measured: the
@@ -8,9 +8,8 @@
 //! after the peak drive, the Worker CPU report,
 //! `preheat-cost-report.json` and `production-wave.json`. It
 //! fails when any product's projected monthly usage — user traffic plus
-//! preheat — exceeds the line, and when a preheat wave or resubmit
-//! scaled to the measured production wave spends past
-//! [`PREHEAT_BUDGET`].
+//! preheat — exceeds the line. Wave and resubmit measurements are
+//! scaled to the production node count and their monthly cadence.
 //!
 //! **Traffic** multiplies the launch model's per-event monthly counts by
 //! the per-event costs measured in the same run. Nothing it reads is a
@@ -47,7 +46,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use stow_types::api::SchedulerBudgetReport;
-use stow_types::do_budgets::{ALLOWANCE_FRACTION, PREHEAT_BUDGET};
+use stow_types::do_budgets::{ALLOWANCE_FRACTION, DO_REQUEST_ALLOWANCE_FRACTION};
 use stow_types::forwards::{self, RunForwards};
 use stow_types::launch_model::{EventKind, LaunchModel};
 use stow_types::preheat_cost::{PreheatCostReport, ProductionWave};
@@ -88,9 +87,8 @@ pub struct ProjectArgs {
 }
 
 // The gate fires when a product's projected monthly usage exceeds
-// `ALLOWANCE_FRACTION` of its included allowance — the one line
-// declared in `stow-types` (stow#883) that the in-edge breaker and the
-// preheat budget derive from too.
+// its dimension-specific fraction of the included allowance. The runtime
+// breaker retains the default fraction declared in `stow-types`.
 
 /// GB-s each serialized DO wall second is priced at. Cloudflare's
 /// billing rule is fixed — 128 MB of memory per Durable Object
@@ -592,6 +590,16 @@ pub struct UsageLine {
 }
 
 impl UsageLine {
+    /// The monthly budget for this product and dimension.
+    fn bound(&self) -> f64 {
+        let fraction = if self.product == "durable_objects" && self.dimension == "requests" {
+            DO_REQUEST_ALLOWANCE_FRACTION
+        } else {
+            ALLOWANCE_FRACTION
+        };
+        self.allowance * fraction
+    }
+
     /// Traffic plus preheat — what the bound is compared with.
     pub fn total(&self) -> f64 {
         self.traffic + self.preheat.unwrap_or(0.0)
@@ -639,7 +647,7 @@ pub struct Breach {
     pub traffic: f64,
     /// The preheat part of `projected`.
     pub preheat: f64,
-    /// The gate bound — `allowance × ALLOWANCE_FRACTION`.
+    /// The gate bound for the product and dimension.
     pub bound: f64,
     /// The route driving the projection.
     pub top_route: &'static str,
@@ -896,13 +904,13 @@ fn diagnostic_lines(projection: &Projection) -> Vec<UsageLine> {
     ]
 }
 
-/// Turn each usage line whose total is over `ALLOWANCE_FRACTION` of its
-/// allowance into a breach, attributed to the route that dominates the
+/// Turn each usage line whose total exceeds its budget into a breach,
+/// attributed to the route that dominates the
 /// breached dimension — or to preheat when it is the larger part.
 fn usage_breaches(usage: &[UsageLine], top_routes: &[RouteShare]) -> Vec<Breach> {
     let mut breaches = Vec::new();
     for line in usage {
-        let bound = line.allowance * ALLOWANCE_FRACTION;
+        let bound = line.bound();
         if line.total() > bound {
             // `RouteShare::dimension` keys the share dimension by
             // product prefix — `do_`, `worker_`.
@@ -995,11 +1003,6 @@ fn evaluate(
 pub struct ProjectionReport {
     /// What preheat adds to a month, per node and in total.
     pub preheat: PreheatMonthly,
-    /// One wave's or one resubmit's measured per-node cost scaled to
-    /// the production wave's node count and over its [`PREHEAT_BUDGET`]
-    /// share — the totals bound the `Preheat cost` report cannot check
-    /// itself, because the production count only exists here (stow#883).
-    pub preheat_breaches: Vec<Breach>,
     /// The projection from the small report — the clean fixture.
     pub projection: GateEvaluation,
     /// The projection from the post-load report.
@@ -1009,16 +1012,7 @@ pub struct ProjectionReport {
 impl ProjectionReport {
     /// Every failure, one line each.
     fn failures(&self) -> Vec<String> {
-        let mut failures: Vec<String> = self
-            .preheat_breaches
-            .iter()
-            .map(|breach| {
-                format!(
-                    "preheat budget: {} {:.3e} over bound {:.3e}",
-                    breach.dimension, breach.projected, breach.bound
-                )
-            })
-            .collect();
+        let mut failures = Vec::new();
         for (label, evaluation) in [
             ("clean", &self.projection),
             ("post-load", &self.projection_after_load),
@@ -1041,55 +1035,6 @@ impl ProjectionReport {
     }
 }
 
-/// One preheat phase's measured per-node cost scaled to the production
-/// wave's node count, against its [`PREHEAT_BUDGET`] share of the
-/// allowance — a breach per over-budget dimension. `per-node × prod`
-/// versus `share × monthly` is the same bound the per-run totals check
-/// enforced at a checked-in wave-size constant; only the denominator
-/// changed from that constant to the measured production wave
-/// (stow#883).
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "node counts stay far below f64's exact-integer range"
-)]
-fn preheat_breaches(preheat: &PreheatMonthly) -> Vec<Breach> {
-    let nodes = preheat.production_nodes as f64;
-    let wave = PREHEAT_BUDGET.wave();
-    let resubmit = PREHEAT_BUDGET.resubmit();
-    let mut breaches = Vec::new();
-    for (dimension, projected, bound) in [
-        ("wave rows_read", preheat.wave.rows_read * nodes, wave.0),
-        (
-            "wave rows_written",
-            preheat.wave.rows_written * nodes,
-            wave.1,
-        ),
-        (
-            "resubmit rows_read",
-            preheat.resubmit.rows_read * nodes,
-            resubmit.0,
-        ),
-        (
-            "resubmit rows_written",
-            preheat.resubmit.rows_written * nodes,
-            resubmit.1,
-        ),
-    ] {
-        if projected > bound {
-            breaches.push(Breach {
-                product: "durable_objects",
-                dimension,
-                projected,
-                traffic: 0.0,
-                preheat: projected,
-                bound,
-                top_route: PREHEAT_ROUTE,
-            });
-        }
-    }
-    breaches
-}
-
 /// Project both budget reports with the preheat share.
 fn project(
     model: &LaunchModel,
@@ -1101,7 +1046,6 @@ fn project(
 ) -> Result<ProjectionReport, String> {
     let preheat = PreheatMonthly::new(model, preheat_report, production)?;
     Ok(ProjectionReport {
-        preheat_breaches: preheat_breaches(&preheat),
         projection: evaluate(model, small, cpu, &preheat)?,
         projection_after_load: evaluate(model, after, cpu, &preheat)?,
         preheat,
@@ -1141,33 +1085,6 @@ fn render_preheat(preheat: &PreheatMonthly) -> String {
         ]);
     }
     let _ = writeln!(out, "{}", table.render());
-    let mut budgets = Table::new(&[
-        "at production",
-        "rows read",
-        "budget",
-        "rows written",
-        "budget",
-    ]);
-    let wave = PREHEAT_BUDGET.wave();
-    let resubmit = PREHEAT_BUDGET.resubmit();
-    for (label, cost, budget) in [
-        ("wave", &preheat.wave, wave),
-        ("resubmit", &preheat.resubmit, resubmit),
-    ] {
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "node counts stay far below f64's exact-integer range"
-        )]
-        let nodes = preheat.production_nodes as f64;
-        budgets.push([
-            label.to_owned(),
-            format!("{:.3e}", cost.rows_read * nodes),
-            format!("{budget:.3e}", budget = budget.0),
-            format!("{:.3e}", cost.rows_written * nodes),
-            format!("{budget:.3e}", budget = budget.1),
-        ]);
-    }
-    let _ = write!(out, "{}", budgets.render());
     out
 }
 
@@ -1184,13 +1101,13 @@ fn render_usage(usage: &[UsageLine]) -> String {
         "preheat/mo",
         "total/mo",
         "allowance/mo",
-        "bound (80%)",
+        "bound",
         "share",
         "",
     ]);
     let mut unmeasured = Vec::new();
     for line in usage {
-        let bound = line.allowance * ALLOWANCE_FRACTION;
+        let bound = line.bound();
         table.push([
             line.product.to_owned(),
             line.dimension.to_owned(),
@@ -1399,6 +1316,32 @@ mod tests {
     }
 
     #[test]
+    fn only_durable_object_requests_use_the_ninety_percent_budget() {
+        for (product, dimension, limit) in [
+            ("durable_objects", "requests", 90.0),
+            ("workers", "requests", 80.0),
+            ("workers", "cpu_ms", 80.0),
+            ("durable_objects", "rows_read", 80.0),
+            ("durable_objects", "rows_written", 80.0),
+            ("durable_objects", "duration_gb_s", 80.0),
+        ] {
+            let mut line = super::UsageLine {
+                product,
+                dimension,
+                traffic: 0.0,
+                preheat: Some(limit),
+                allowance: 100.0,
+            };
+            assert!(super::usage_breaches(std::slice::from_ref(&line), &[]).is_empty());
+            line.traffic = 1.0;
+            let breaches = super::usage_breaches(std::slice::from_ref(&line), &[]);
+            assert_eq!(breaches.len(), 1, "{product}/{dimension}");
+            assert_eq!(breaches[0].bound, limit);
+            assert!(super::render_usage(&[line]).contains("OVER"));
+        }
+    }
+
+    #[test]
     fn a_healthy_run_passes() {
         let small = fixture_report(100_000, |_| 0.5);
         let after = fixture_report(100_000, |_| 0.5);
@@ -1420,7 +1363,6 @@ mod tests {
         cpu: &crate::traffic_cost::cpu::WorkerCpuReport,
     ) -> Result<super::ProjectionReport, String> {
         Ok(super::ProjectionReport {
-            preheat_breaches: super::preheat_breaches(preheat),
             projection: evaluate(&model(), small, cpu, preheat)?,
             projection_after_load: evaluate(&model(), after, cpu, preheat)?,
             preheat: *preheat,
@@ -1473,35 +1415,20 @@ mod tests {
             .allowance
             .mul_add(super::ALLOWANCE_FRACTION, -line.traffic);
         assert!(headroom > 0.0);
-        // The month has one wave and one resubmit of 10 nodes each, so
-        // `x` rows per node and phase is `20 x` a month. The fits case
-        // must also stay under each phase's `PREHEAT_BUDGET` share at
-        // the production node count — the resubmit's hundredth of the
-        // wave share is the tighter bound, at 10 nodes a per-node cap
-        // of `resubmit / 10`.
-        let resubmit_cap = super::PREHEAT_BUDGET.resubmit().1 / 10.0;
-        let fits = rows_written_per_node((headroom * 0.4 / 10.0).min(resubmit_cap * 0.9));
+        // One wave and one resubmit of 10 nodes each: the combined
+        // month uses 80% of the remaining monthly headroom. Each
+        // phase exceeds the removed daily wave limit, but fits the month.
+        let fits = rows_written_per_node(headroom * 0.4 / 10.0);
         let report = project_with(&small, &after, &preheat_of(fits, fits), &cpu).expect("project");
         assert!(report.failures().is_empty(), "{:?}", report.failures());
 
-        // A month of preheat as large as the whole allowance: over the
-        // bound, and larger than the traffic it joins. Each phase also
-        // breaches its `PREHEAT_BUDGET` share at production scale.
+        // A month of preheat as large as the whole allowance remains
+        // over the combined monthly bound.
         let overflows = rows_written_per_node(line.allowance / 20.0);
         let report =
             project_with(&small, &after, &preheat_of(overflows, overflows), &cpu).expect("project");
-        assert_eq!(
-            report.preheat_breaches.len(),
-            2,
-            "{:?}",
-            report.preheat_breaches
-        );
         let failures = report.failures();
-        assert_eq!(
-            failures.len(),
-            4,
-            "2 budgets + clean and post-load: {failures:?}"
-        );
+        assert_eq!(failures.len(), 2, "clean and post-load: {failures:?}");
         let breach = &report.projection.breaches[0];
         assert_eq!(breach.product, "durable_objects");
         assert_eq!(breach.dimension, "rows_written");

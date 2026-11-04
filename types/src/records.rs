@@ -1,8 +1,8 @@
 //! The per-build artifact records as a signed OCI artifact (stow#455).
 //!
-//! The trusted publish stage pushes each build's `Vec<ArtifactRecord>` as
+//! The trusted publish stage pushes each build's `BuildRecords` as
 //! one signed artifact — the `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`
-//! tag in the same `water-rs/stow-cache-<rustc>` namespace the bundles use —
+//! tag in the same `water-rs/stow-cache-v2-<rustc>` namespace the bundles use —
 //! instead of posting records to the edge. The tag names the Actions run
 //! that published it, so a second build of the same task lands on a new
 //! tag rather than overwriting the first's rows (stow#655). The index
@@ -14,10 +14,60 @@ use crate::api::ArtifactRecord;
 use crate::index::ArtifactIndexRow;
 use crate::registry::MAX_OCI_TAG_LEN;
 
+/// The signed result of one node build. Programs tied to their source
+/// directory complete the node without publishing a downloadable binary.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct BuildRecords {
+    /// Relocatable outputs with verified bundle coordinates.
+    pub artifacts: Vec<ArtifactRecord>,
+    /// Proc macros whose compile reads `CARGO_MANIFEST_DIR` and which
+    /// consumers must compile in their own source directory.
+    pub local_programs: Vec<LocalProcMacro>,
+}
+
+/// A completed proc-macro unit whose binary cannot leave its source tree.
+/// It has no bundle coordinates: consumers use its signed identity to
+/// permit a local compile while still serving its dependencies.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocalProcMacro {
+    /// The semantic node identity at which the program was compiled.
+    pub node: crate::task_graph::TaskNodeIdentity,
+    /// Direct edges committing the node to its resolved dependency tree.
+    pub dependency_task_ids: Vec<String>,
+    /// Compiler dependency identities needed to traverse the artifact closure.
+    pub dependency_c_metadata_json: crate::identity::DependencyCMetadataJson,
+    /// Stable identity of the captured compiler invocation.
+    pub compile_key: String,
+    /// Cargo metadata identity used by the program's consumers.
+    pub c_metadata: crate::identity::CMetadata,
+    /// The invocation and linking shape this completed unit covers.
+    pub unit_shape: crate::public_cache::UnitShape,
+}
+
+impl LocalProcMacro {
+    /// Derive the dependency digest from the carried edges.
+    ///
+    /// # Errors
+    /// Rejects malformed dependency task identities.
+    pub fn dependency_identity(&self) -> crate::error::Result<crate::identity::DependencyIdentity> {
+        crate::identity::DependencyIdentity::from_task_ids(
+            self.dependency_task_ids.iter().map(String::as_str),
+        )
+    }
+
+    /// Derive the completed node's task id.
+    ///
+    /// # Errors
+    /// Mirrors [`Self::dependency_identity`].
+    pub fn task_id(&self) -> crate::error::Result<String> {
+        Ok(self.node.task_id(&self.dependency_identity()?))
+    }
+}
+
 /// `artifactType` (and single-layer media type) of a records artifact: a
-/// JSON array of [`ArtifactRecord`] — the full set of rows one
+/// JSON [`BuildRecords`] object — the full set of rows one
 /// `build-crate.yml` run's publish job pushed.
-pub const RECORDS_ARTIFACT_TYPE: &str = "application/vnd.stow.records.v1+json";
+pub const RECORDS_ARTIFACT_TYPE: &str = "application/vnd.stow.records.v2+json";
 
 /// Media type of the records artifact's empty OCI config blob.
 pub const RECORDS_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.records.config.v1+json";
@@ -83,7 +133,9 @@ pub fn parse_resolve_run_title(title: &str) -> Option<(u32, &str)> {
 /// `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` — so nothing
 /// overwrites a records tag and a rebuilt task's rows always reach the
 /// index (stow#655).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct BuildRun {
     /// The Actions workflow run id.
     pub run_id: u64,
@@ -241,6 +293,7 @@ pub fn record_to_index_row(record: &ArtifactRecord) -> ArtifactIndexRow {
         artifact_kind: record.artifact_kind.clone(),
         crate_types: record.crate_types.clone(),
         profile: record.profile.clone(),
+        node_profile: record.node_profile,
         emit: record.emit.clone(),
         min_glibc: record.min_glibc,
         unit_shape: record.unit_shape,

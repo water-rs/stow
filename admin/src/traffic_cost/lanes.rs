@@ -36,6 +36,7 @@ use stow_types::fixture::{
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::launch_model::{EventKind, LaunchModel};
+use stow_types::node_profile::NodeProfile;
 use stow_types::pow::enqueue_pow_zero_bits;
 use stow_types::records::run_title;
 use stow_types::runs::run_url;
@@ -466,6 +467,7 @@ fn submit_task(rustc: &str, counter: u64) -> Result<EnqueueRequest, String> {
             nodes: Vec::new(),
         },
         host_side: false,
+        profile: NodeProfile::Dev,
         explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         preserve_lockfile: false,
     })
@@ -507,6 +509,7 @@ fn admission_body(target: &str, rustc: &str, counter: u64) -> Result<serde_json:
             version,
             features,
             host_side: false,
+            profile: NodeProfile::Dev,
             explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             dependencies: Vec::new(),
             dependency_subgraph: stow_types::api::TaskSubgraph::default(),

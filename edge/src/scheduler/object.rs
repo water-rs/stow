@@ -284,6 +284,11 @@ impl DurableObject for Scheduler {
                 "/dispatch-cap"
                     .at(read_dispatch_cap)
                     .post(write_dispatch_cap),
+                // The operator's release multiplier (stow#1012):
+                // reached from `GET`/`POST /api/v1/admin/release-priority`.
+                "/release-priority"
+                    .at(read_release_priority)
+                    .post(write_release_priority),
                 // The edge's health probe (stow#860): one read of held
                 // state, reached from `GET /api/v1/scheduler/health`.
                 "/health".at(health),
@@ -799,10 +804,33 @@ pub(super) async fn complete_run_pass(
     let graph = ensure_graph(env, db, graph).await?;
     let settings = scheduler_settings(env, graph)?;
     let now = now_ms();
-    // The finish is durable before anything fallible: parse, append
-    // and apply `RunFinished` ahead of every binding read, mint,
-    // listing and POST — a webhook has no redelivery, so a failure
-    // before this row lands loses the completion (stow#940).
+    let mut verified_report = report.clone();
+    // Evidence is read from GitHub, never accepted from the serving edge.
+    verified_report.source_failure = None;
+    if !report.success && !report.cancelled {
+        let verification = async {
+            let run_id = report
+                .github_run_id
+                .parse::<u64>()
+                .map_err(|error| to_error(error.to_string()))?;
+            unloaded_ci_interface(graph.cell(), env)
+                .await?
+                .source_failure_verification(stow_types::records::BuildRun {
+                    run_id,
+                    run_attempt: report.github_run_attempt,
+                })
+                .await
+                .map_err(|error| to_error(error.to_string()))
+        }
+        .await;
+        match verification {
+            Ok(proof) => verified_report.source_failure = proof,
+            Err(error) => {
+                tracing::warn!(%error, "source failure unverified; counting infrastructure failure");
+            }
+        }
+    }
+    let report = &verified_report;
     let outcome = routes::complete_run(graph, db, report, now)
         .await
         .map_err(route_error)?;
@@ -1484,6 +1512,49 @@ pub(super) async fn dispatch_cap_pass(
     // setting puts in force.
     let settings = scheduler_settings(env, graph)?;
     Ok(graph.with(|graph| graph.dispatch_cap_view(&settings)))
+}
+
+/// `GET /release-priority` — the multiplier in force and the operator
+/// setting behind it (stow#1012).
+async fn read_release_priority(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::ReleasePriority>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    Ok(Json(graph.with(|graph| graph.release_priority_view())))
+}
+
+/// `POST /release-priority` — the operator's `set`: one
+/// `ReleasePriority` event appended, in force until the next `set`.
+/// Ranks are read at claim time, so no queue is re-keyed and the
+/// route runs no dispatch pass: the alarm's next claim ranks under the
+/// new multiplier.
+async fn write_release_priority(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+    actor: Actor,
+    Json(set): Json<stow_types::api::ReleasePrioritySet>,
+) -> Result<Json<stow_types::api::ReleasePriority>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    routes::commit_as(
+        graph,
+        &db,
+        Some(&actor.0),
+        &[SchedulerEvent::ReleasePriority {
+            setting: Box::new(stow_types::api::ReleasePrioritySetting {
+                percent: set.percent,
+                set_at: iso_now(),
+                actor: actor.0.clone(),
+            }),
+        }],
+        now_ms(),
+    )
+    .await
+    .map_err(to_error)?;
+    tracing::warn!(percent = set.percent, actor = %actor.0, "release priority set by operator");
+    Ok(Json(graph.with(|graph| graph.release_priority_view())))
 }
 
 /// `Date#toISOString` — the timestamp format the record and alert

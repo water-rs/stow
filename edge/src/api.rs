@@ -374,6 +374,33 @@ pub async fn set_dispatch_cap(
     Ok(Json(stored))
 }
 
+/// GET /api/v1/admin/release-priority
+///
+/// The multiplier release-profile nodes rank under — the operator
+/// setting behind it when `stow-admin release-priority set` wrote one
+/// (stow#1012).
+pub async fn get_release_priority(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::ReleasePriority>, GetArtifactError> {
+    Ok(Json(
+        scheduler_client::get_release_priority(&scheduler).await?,
+    ))
+}
+
+/// POST /api/v1/admin/release-priority
+///
+/// The operator's `set` — the multiplier in force until the next `set`.
+pub async fn set_release_priority(
+    Mutator { caller, actor, .. }: Mutator<OperatorRoute>,
+    Json(set): Json<stow_types::api::ReleasePrioritySet>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::ReleasePriority>, GetArtifactError> {
+    let stored = scheduler_client::set_release_priority(&scheduler, &set, &actor).await?;
+    tracing::warn!(percent = stored.percent, %caller, "release priority set via admin endpoint");
+    Ok(Json(stored))
+}
+
 /// POST /`api/v1/admin/index/published`
 ///
 /// The index-publish path's report that this run's slices went live,
@@ -1078,7 +1105,7 @@ pub async fn crate_features(
 /// GET /`api/v1/bundles/{rustc_version}/{digest}`
 ///
 /// The byte path: streams the `<tag>.bundle` blobs under the rustc's
-/// `ghcr.io/water-rs/stow-cache-<rustc>` package, handing workerd the
+/// `ghcr.io/water-rs/stow-cache-v2-<rustc>` package, handing workerd the
 /// upstream body as the registry's own stream so the bytes never enter
 /// wasm. The `sha256:<64 lowercase hex>` path segment is validated before
 /// any fetch; the answer's immutable `Cache-Control` is what Workers Cache

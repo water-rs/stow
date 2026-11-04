@@ -10,6 +10,7 @@ use serde::Deserialize;
 use stow_types::api::{ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry};
 use stow_types::env_name;
 use stow_types::error::Context;
+use stow_types::node_profile::NodeProfile;
 use stow_types::public_cache::UnitSide;
 
 use crate::cargo_cmd::MetadataArgs;
@@ -654,6 +655,16 @@ enum CargoStripInner<'a> {
 }
 
 impl CargoUnitProfile<'_> {
+    /// The named profile the unit's compile settings belong to — what was
+    /// compiled, whatever cargo calls the profile. `None` for settings no
+    /// named profile defines: the unit has no node.
+    ///
+    /// # Errors
+    /// A setting value outside the set cargo documents.
+    fn node_profile(&self, pkg_id: &str) -> stow_types::error::Result<Option<NodeProfile>> {
+        Ok(NodeProfile::of(&self.normalized(pkg_id)?))
+    }
+
     /// The unit's profile as the typed [`stow_types::platform::Profile`]
     /// the invocation's parsed profile compares against.
     fn normalized(&self, pkg_id: &str) -> stow_types::error::Result<stow_types::platform::Profile> {
@@ -750,14 +761,28 @@ struct UnitInfo<'a> {
     name: &'a str,
     version_str: &'a str,
     /// `Some` exactly when the unit is a node — a crates.io lib in a
-    /// real-compilation mode (`unit_infos` computes the flag once).
+    /// real-compilation mode compiled under a named profile
+    /// (`unit_infos` computes the flag once). A unit under any other
+    /// settings is no node: it is built and served from the local cache
+    /// only.
     parsed: Option<(stow_types::identity::CrateName, Version)>,
+    /// `Some` for every crates.io lib in a real-compilation mode, named
+    /// profile or not — the units a compile can resolve to, and so the
+    /// ones a node lookup must know the side of.
+    library: Option<(stow_types::identity::CrateName, Version)>,
+    /// The named profile of a node unit, `Some` exactly when `parsed` is.
+    profile: Option<stow_types::node_profile::NodeProfile>,
 }
 
 impl UnitInfo<'_> {
     /// `(CrateName, Version)` of a node unit — the `unit_infos` gate.
     const fn parsed(&self) -> &(stow_types::identity::CrateName, Version) {
         self.parsed.as_ref().expect("node units are parsed")
+    }
+
+    /// The named profile of a node unit — the `unit_infos` gate.
+    const fn node_profile(&self) -> NodeProfile {
+        self.profile.expect("node units carry a profile")
     }
 }
 
@@ -770,7 +795,12 @@ fn unit_infos<'a>(graph: &UnitGraph<'a>) -> stow_types::error::Result<Vec<UnitIn
             let node = crates_io
                 && unit.target.kind.iter().any(|kind| LIB_KINDS.contains(kind))
                 && COMPILE_MODES.contains(&unit.mode);
-            let parsed = node
+            let profile = if node {
+                unit.profile.node_profile(unit.pkg_id)?
+            } else {
+                None
+            };
+            let library = node
                 .then(|| {
                     let bad = |error: &dyn std::fmt::Display| {
                         stow_types::stow_error!(
@@ -785,10 +815,13 @@ fn unit_infos<'a>(graph: &UnitGraph<'a>) -> stow_types::error::Result<Vec<UnitIn
                     ))
                 })
                 .transpose()?;
+            let parsed = library.clone().filter(|_| profile.is_some());
             Ok(UnitInfo {
                 name,
                 version_str: version,
                 parsed,
+                library,
+                profile,
             })
         })
         .collect()
@@ -863,7 +896,10 @@ fn unit_sides(graph: &UnitGraph<'_>, target: Option<&str>) -> stow_types::error:
 /// Each node's compile profile as cargo states it, keyed by node
 /// identity `(crate, version, host_side)` — see
 /// [`ExpandedDependencyGraph::node_profiles`]. A both-reachable lib
-/// unit's profile lands on the target side only (stow#596).
+/// unit's profile lands on the target side only (stow#596). A unit under
+/// no named profile is listed too, though it mints no node: a compile of
+/// its side must resolve to it, and so to nothing, rather than to the
+/// node of the package's other side.
 fn unit_node_profiles(
     graph: &UnitGraph<'_>,
     target: Option<&str>,
@@ -872,7 +908,7 @@ fn unit_node_profiles(
     let sides = unit_sides(graph, target)?;
     let mut profiles = crate::unit_node::NodeProfiles::new();
     for (index, (unit, info)) in graph.units.iter().zip(infos.iter()).enumerate() {
-        let Some((crate_name, version)) = info.parsed.clone() else {
+        let Some((crate_name, version)) = info.library.clone() else {
             continue;
         };
         for side in [HOST, TARGET] {
@@ -890,6 +926,38 @@ fn unit_node_profiles(
     }
     Ok(profiles)
 }
+/// The named profile a task unit carries. Only a crates.io unit under a named
+/// profile mints a node, so only its profile is read; any other unit is a way
+/// through the graph.
+fn task_unit_profile(
+    unit: &Unit<'_>,
+    crates_io: bool,
+) -> stow_types::error::Result<Option<NodeProfile>> {
+    if crates_io {
+        unit.profile.node_profile(unit.pkg_id)
+    } else {
+        Ok(None)
+    }
+}
+
+/// One `(crate, version, side)` key is one node with one named profile: a
+/// second unit stating another is a shape the projection cannot
+/// represent.
+fn ensure_one_profile(
+    entry: &ResolvedDependencyGraphEntry,
+    unit_profile: NodeProfile,
+    pkg_id: &str,
+) -> stow_types::error::Result<()> {
+    if entry.profile == unit_profile {
+        return Ok(());
+    }
+    Err(stow_types::stow_error!(
+        "cargo --unit-graph holds two profiles for the {} node of `{pkg_id}`: {} and {unit_profile}",
+        if entry.host_side { "host" } else { "target" },
+        entry.profile,
+    ))
+}
+
 /// model — the same shape `stow-resolver`'s `emit.rs` assigns, so the
 /// build stage's dependency-context check resolves onto the same task
 /// identities the resolver mints (stow#588).
@@ -946,6 +1014,7 @@ fn unit_graph_task_units(
         }
         let (name, version, crates_io) = parse_pkg_id(unit.pkg_id);
         let platform = unit.platform.unwrap_or(host_triple).to_owned();
+        let profile = task_unit_profile(unit, crates_io)?;
         let emit = |side: TaskUnitSide| TaskUnit {
             key: TaskUnitKey {
                 // `pkg_id` is the full cargo package id — source
@@ -962,7 +1031,8 @@ fn unit_graph_task_units(
                 .iter()
                 .map(|feature| (*feature).to_owned())
                 .collect(),
-            is_crates_io: crates_io,
+            is_crates_io: crates_io && profile.is_some(),
+            profile: profile.unwrap_or_default(),
             deps: Vec::new(),
         };
         // A build-script *compile* unit is host-side by construction;
@@ -1068,9 +1138,9 @@ fn unit_dep_edges(
         for dependency in &unit.dependencies {
             let dep_index = dependency.index as usize;
             let dep = info_at(infos, dependency.index)?;
-            if dep.parsed.is_none() {
+            let Some(dep_profile) = dep.profile else {
                 continue;
-            }
+            };
             for consumer_side in [HOST, TARGET] {
                 if sides[index] & consumer_side == 0 {
                     continue;
@@ -1089,6 +1159,7 @@ fn unit_dep_edges(
                         crate_name: crate_name.clone(),
                         version: version.clone(),
                         host_side: dep_side == HOST,
+                        profile: dep_profile,
                     },
                 );
             }
@@ -1249,10 +1320,12 @@ fn emit_expanded_graph(
                     version: version.clone(),
                     features: unit_features.clone(),
                     host_side: side == HOST,
+                    profile: info.node_profile(),
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                     explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                 });
+            ensure_one_profile(entry, info.node_profile(), unit.pkg_id)?;
             // One `(crate, version, side)` key is one node, and cargo's
             // resolver assigns it one feature set — a second, different
             // set landing on the same key is a unit-graph shape this
@@ -1430,10 +1503,17 @@ fn node_feature_index(
         );
         match node_features.entry(key) {
             std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert(node.identity.features_json.features());
+                slot.insert((
+                    node.identity.features_json.features(),
+                    node.identity.profile,
+                ));
             }
             std::collections::btree_map::Entry::Occupied(slot)
-                if *slot.get() == node.identity.features_json.features() => {}
+                if *slot.get()
+                    == (
+                        node.identity.features_json.features(),
+                        node.identity.profile,
+                    ) => {}
             std::collections::btree_map::Entry::Occupied(slot) => {
                 return Err(stow_types::stow_error!(
                     "the build's unit graph holds two feature sets for the {} node of {} {}: {:?} and {:?}",
@@ -1444,7 +1524,7 @@ fn node_feature_index(
                     },
                     node.identity.crate_name,
                     node.identity.version,
-                    slot.get(),
+                    slot.get().0,
                     node.identity.features_json.features(),
                 ));
             }
@@ -1467,6 +1547,13 @@ pub fn observed_miss_graph(
     profiles: &crate::unit_node::NodeProfiles,
 ) -> stow_types::error::Result<ObservedMissGraph> {
     let node_features = node_feature_index(resolved)?;
+    // The units under no named profile: no node, but a compile of their
+    // side must not resolve to the package's other side.
+    let unnamed = profiles
+        .iter()
+        .filter(|(key, _)| !node_features.contains_key(&(key.0.as_str(), &key.1, key.2)))
+        .map(|(key, profile)| crate::unit_node::NodeCoordinates::unnamed(key, profile))
+        .collect::<Vec<_>>();
 
     let mut entries = BTreeMap::<(String, String, bool), ResolvedDependencyGraphEntry>::new();
     let mut roots = Vec::new();
@@ -1492,13 +1579,18 @@ pub fn observed_miss_graph(
         // observation's `features` — the argv `--cfg feature="…"` scan —
         // is evidence for the resolution, never the node's set: a build
         // script's `cargo:rustc-cfg=feature="…"` lines ride it (stow#615).
-        let Some(node) =
-            resolve_observed_unit(observation, consumer_spelled_target, resolved, profiles)
-        else {
+        let Some(node) = resolve_observed_unit(
+            observation,
+            consumer_spelled_target,
+            resolved,
+            profiles,
+            &unnamed,
+        ) else {
             continue;
         };
         let features = node.features.to_vec();
         let host_side = node.host_side;
+        let (_, profile) = node_features[&(node.crate_name, node.version, host_side)];
         let Some((mut dependencies, dep_nodes)) =
             observed_dep_edges(observation, dep_identities, host_side, &node_features)
         else {
@@ -1526,6 +1618,7 @@ pub fn observed_miss_graph(
                 version,
                 features,
                 host_side,
+                profile,
                 dependencies,
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
@@ -1536,7 +1629,7 @@ pub fn observed_miss_graph(
     roots.sort();
     roots.dedup();
 
-    for (name, version, side, features) in referenced {
+    for (name, version, side, features, profile) in referenced {
         entries
             .entry((name.clone(), version.clone(), side))
             .or_insert_with(|| {
@@ -1548,6 +1641,7 @@ pub fn observed_miss_graph(
                     version: Version::parse(&version).expect("referenced dep version parses"),
                     features,
                     host_side: side,
+                    profile,
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                     explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
@@ -1575,6 +1669,7 @@ fn resolve_observed_unit<'r>(
     consumer_spelled_target: bool,
     resolved: &'r stow_types::task_graph::ResolvedTaskGraph,
     profiles: &'r crate::unit_node::NodeProfiles,
+    unnamed: &[crate::unit_node::NodeCoordinates<'r>],
 ) -> Option<crate::unit_node::NodeCoordinates<'r>> {
     let feature_scan = observation
         .features
@@ -1585,7 +1680,8 @@ fn resolve_observed_unit<'r>(
         resolved
             .nodes()
             .iter()
-            .map(|node| crate::unit_node::NodeCoordinates::from_task_node(node, profiles)),
+            .map(|node| crate::unit_node::NodeCoordinates::from_task_node(node, profiles))
+            .chain(unnamed.iter().copied()),
         consumer_spelled_target,
         &crate::unit_node::UnitEvidence {
             crate_name: observation.crate_name.as_str(),
@@ -1610,11 +1706,12 @@ fn resolve_observed_unit<'r>(
 
 /// A referenced dep's leaf slot: the `(name, version, host_side)` key
 /// it mints under and the feature set the graph node carries (stow#615).
-type DepNodeRef = (String, String, bool, Vec<String>);
+type DepNodeRef = (String, String, bool, Vec<String>, NodeProfile);
 
 /// `(crate name, version, host_side)` → the node's cargo-resolved
-/// feature set, borrowed from the build's unit graph (stow#615).
-type NodeFeatureIndex<'r> = BTreeMap<(&'r str, &'r Version, bool), &'r [String]>;
+/// feature set (stow#615) and named profile, borrowed from the build's
+/// unit graph.
+type NodeFeatureIndex<'r> = BTreeMap<(&'r str, &'r Version, bool), (&'r [String], NodeProfile)>;
 
 /// Resolve one observed unit's `--extern` deps into graph edges at each
 /// dep's own recorded identity, returning the (name, version, side)
@@ -1659,9 +1756,8 @@ fn observed_dep_edges(
         // recorded label, and travels with the node ref (stow#615). A
         // dep the graph does not carry is treated like an extern with
         // no recorded identity.
-        let Some(dep_features) = node_features
-            .get(&(dep_name.as_str(), &dep_version, dep_side))
-            .copied()
+        let Some(&(dep_features, dep_profile)) =
+            node_features.get(&(dep_name.as_str(), &dep_version, dep_side))
         else {
             tracing::warn!(
                 crate_name = %observation.crate_name,
@@ -1677,11 +1773,13 @@ fn observed_dep_edges(
             dep_version.to_string(),
             dep_side,
             dep_features.to_vec(),
+            dep_profile,
         ));
         dependencies.push(ResolvedDependencyGraphDependency {
             crate_name: dep_name,
             version: dep_version,
             host_side: dep_side,
+            profile: dep_profile,
         });
     }
     Some((dependencies, dep_nodes))
@@ -2267,6 +2365,7 @@ mod observed_miss_tests {
                 target: TargetTriple::parse("x86_64-unknown-linux-gnu").expect("target parses"),
                 rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc parses"),
                 host_side,
+                profile: stow_types::node_profile::NodeProfile::Dev,
             },
             explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             dependencies: Vec::new(),
@@ -2548,6 +2647,7 @@ mod observed_miss_tests {
                 target: TargetTriple::parse("x86_64-unknown-linux-gnu").expect("target parses"),
                 rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc parses"),
                 host_side,
+                profile: stow_types::node_profile::NodeProfile::Dev,
             },
             explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             dependencies: Vec::new(),
@@ -3402,6 +3502,108 @@ mod unit_graph_tests {
         assert_eq!(nodes(&dev), nodes(&release));
     }
 
+    /// The fixture with `profiles` appended to its manifest.
+    fn fixture_with_profiles(profiles: &str) -> TempDir {
+        let root = fixture();
+        let manifest = root.path().join("Cargo.toml");
+        let mut contents = std::fs::read_to_string(&manifest).expect("read manifest");
+        contents.push_str(profiles);
+        std::fs::write(&manifest, contents).expect("write manifest");
+        root
+    }
+
+    /// Every node's named profile, by `(crate, side)`.
+    fn profiles_of(
+        graph: &super::ExpandedDependencyGraph,
+    ) -> BTreeMap<(String, bool), stow_types::node_profile::NodeProfile> {
+        graph
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    (entry.crate_name.as_str().to_owned(), entry.host_side),
+                    entry.profile,
+                )
+            })
+            .collect()
+    }
+
+    /// A node's profile is what cargo compiled it with, read from the
+    /// real unit graph: dev and release units of both sides map to their
+    /// profile (a host unit under cargo's default build-override of it),
+    /// and a custom profile that inherits dev with nothing changed is dev.
+    #[test]
+    fn nodes_carry_the_profile_their_units_compile_with() {
+        use stow_types::node_profile::NodeProfile;
+        let root = fixture_with_profiles("\n[profile.ci]\ninherits = \"dev\"\n");
+        let dev = profiles_of(&resolve(root.path(), "build", &[]));
+        assert!(dev.values().all(|profile| *profile == NodeProfile::Dev));
+        assert!(dev.keys().any(|(_, host)| *host) && dev.keys().any(|(_, host)| !*host));
+        let ci = profiles_of(&resolve(root.path(), "build", &["--profile", "ci"]));
+        assert_eq!(ci, dev);
+        let release = profiles_of(&resolve(root.path(), "build", &["--release"]));
+        assert!(
+            release
+                .values()
+                .all(|profile| *profile == NodeProfile::Release)
+        );
+        assert_eq!(
+            release.keys().collect::<BTreeSet<_>>(),
+            dev.keys().collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// A custom profile with settings no named profile defines builds
+    /// without error and mints no target-side node: its units are served
+    /// from the local cache only.
+    #[test]
+    fn a_custom_profile_with_other_settings_has_no_node() {
+        let root = fixture_with_profiles("\n[profile.tuned]\ninherits = \"dev\"\nopt-level = 1\n");
+        let graph = resolve(root.path(), "build", &["--profile", "tuned"]);
+        assert!(
+            graph.entries.iter().all(|entry| entry.host_side),
+            "{:?}",
+            profiles_of(&graph)
+        );
+    }
+
+    /// A package with a node on one side only — its tuned target unit is
+    /// under no named profile, its host unit under cargo's default
+    /// build-override — resolves a target compile to no node, never to the
+    /// host node's feature label, and the host compile to its own node.
+    #[test]
+    fn a_compile_of_a_side_without_a_node_gets_none() {
+        let root = fixture_with_profiles("\n[profile.tuned]\ninherits = \"dev\"\nopt-level = 1\n");
+        let graph = resolve(root.path(), "build", &["--profile", "tuned"]);
+        assert!(index(&graph.entries).contains_key(&("feat-a", true)));
+        assert!(!index(&graph.entries).contains_key(&("feat-a", false)));
+        let profiles = graph.node_profiles(None).expect("node profiles");
+        let table =
+            crate::unit_node::UnitNodeTable::from_expanded(&graph.entries, &profiles, false);
+        let scan = BTreeSet::new();
+        let compile = |host_side: bool| {
+            crate::unit_node::resolve_unit_node(
+                table.coordinates(),
+                table.consumer_spelled_target,
+                &crate::unit_node::UnitEvidence {
+                    crate_name: "feat-a",
+                    version: "1.0.0",
+                    spelled_target: false,
+                    feature_scan: &scan,
+                    profile: profiles
+                        .iter()
+                        .find_map(|(key, profile)| {
+                            (key.0.as_str() == "feat-a" && key.2 == host_side)
+                                .then(|| profile.clone())
+                        })
+                        .expect("the unit graph states the unit's profile"),
+                },
+            )
+        };
+        assert!(compile(false).is_err(), "the target compile has no node");
+        assert!(compile(true).expect("the host compile's node").host_side);
+    }
+
     /// The wrapped action picks the cargo subcommand whose unit graph it
     /// compiles — clippy resolves the graph `check` compiles, predict
     /// answers against the same shape.
@@ -3513,7 +3715,7 @@ mod unit_graph_tests {
         );
         let url = url::Url::from_directory_path(&project).expect("dir url");
         let json = format!(
-            r#"{{"version":1,"roots":[0],"units":[{{"pkg_id":"path+{url}#0.1.0","target":{{"kind":["lib"],"name":"x","crate_types":["lib"]}},"platform":null,"mode":"build","profile":{{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"panic":"unwind","strip":{{"deferred":"None"}}}},"features":[],"dependencies":[]}}]}}"#
+            r#"{{"version":1,"roots":[0],"units":[{{"pkg_id":"path+{url}#0.1.0","target":{{"kind":["lib"],"name":"x","crate_types":["lib"]}},"platform":null,"mode":"build","profile":{{"name":"dev","opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"panic":"unwind","strip":{{"deferred":"None"}}}},"features":[],"dependencies":[]}}]}}"#
         );
         let graph: UnitGraph<'_> = serde_json::from_str(&json).expect("parse");
         let hashes = super::local_manifest_hashes(&graph).expect("hashes");
@@ -3535,7 +3737,7 @@ mod unit_graph_tests {
                 "target": {"kind": ["lib"]},
                 "platform": null,
                 "mode": "build",
-                "profile": {"opt_level": "0", "debuginfo": 0, "debug_assertions": true,
+                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0, "debug_assertions": true,
                             "overflow_checks": true, "panic": "unwind", "strip": {"deferred": "None"}},
                 "features": [],
                 "dependencies": [{"index": 9, "extern_crate_name": "b"}]
@@ -3705,19 +3907,19 @@ mod unit_graph_tests {
             "units": [
                 {"pkg_id": "registry+https://github.com/rust-lang/crates.io-index#a@1.0.0",
                  "target": {"kind": ["lib"]}, "platform": "x86_64-pc-windows-msvc",
-                 "mode": "build", "profile": {"opt_level": "0", "debuginfo": 0,
+                 "mode": "build", "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0,
                      "debug_assertions": true, "overflow_checks": true, "panic": "unwind",
                      "strip": {"deferred": "None"}},
                  "features": [], "dependencies": []},
                 {"pkg_id": "registry+https://github.com/rust-lang/crates.io-index#a@1.0.0",
                  "target": {"kind": ["lib"]}, "platform": "x86_64-unknown-linux-gnu",
-                 "mode": "build", "profile": {"opt_level": "0", "debuginfo": 0,
+                 "mode": "build", "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0,
                      "debug_assertions": true, "overflow_checks": true, "panic": "unwind",
                      "strip": {"deferred": "None"}},
                  "features": [], "dependencies": []},
                 {"pkg_id": "registry+https://github.com/rust-lang/crates.io-index#h@1.0.0",
                  "target": {"kind": ["lib"]}, "platform": null,
-                 "mode": "build", "profile": {"opt_level": "0", "debuginfo": 0,
+                 "mode": "build", "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0,
                      "debug_assertions": true, "overflow_checks": true, "panic": "unwind",
                      "strip": {"deferred": "None"}},
                  "features": [], "dependencies": []}

@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use stow_types::artifact::{ArtifactKey, ArtifactKind, RustCrateType};
 use stow_types::bundle::{
-    ArtifactBundleFile, STOW_DYLIB_MEDIA_TYPE, STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE,
-    STOW_RMETA_MEDIA_TYPE,
+    ArtifactBundleFile, STOW_BUILD_SCRIPT_MEDIA_TYPE, STOW_DYLIB_MEDIA_TYPE,
+    STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE,
 };
 use stow_types::crate_info::{CrateId, FeatureSet};
 use stow_types::error::Context;
@@ -15,6 +15,7 @@ use stow_types::identity::{
     CMetadata, CrateName, CrateVersion, DependencyCMetadataIdentity, DependencyCMetadataJson,
     DependencyCompileKeyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
 };
+use stow_types::node_profile::NodeProfile;
 use stow_types::platform::{Profile, RustcVersion, Target};
 use stow_types::public_cache::UnitSide;
 use stow_types::registry::oci_reference;
@@ -30,8 +31,10 @@ pub async fn build_upload_plan(
     scanned: &[ScannedArtifact],
     consumed: &[ConsumedArtifact],
     dependency_task_ids: &[String],
+    node_profile: NodeProfile,
+    programs: &crate::dep_scan::ProgramClaims,
 ) -> stow_types::error::Result<Vec<PlannedArtifact>> {
-    validate_dependency_graph(scanned, consumed)?;
+    validate_dependency_graph(scanned, consumed, programs)?;
     let mut plans_by_compile_key =
         BTreeMap::<(String, TargetTriple, WireRustcVersion), PlannedArtifact>::new();
 
@@ -78,6 +81,7 @@ pub async fn build_upload_plan(
             target: target_typed,
             rustc_version: rustc_version_typed,
             profile: artifact.profile.clone(),
+            node_profile,
             emit: artifact.emit.clone(),
             oci_reference: oci_reference(&key, &artifact.c_metadata),
             kind: artifact.kind.clone(),
@@ -88,6 +92,7 @@ pub async fn build_upload_plan(
                 .await
                 .wrap_err_with(|| format!("artifact {}", artifact.crate_name))?,
             unit_shape: artifact.unit_shape,
+            shared_invocations: artifact.shared_invocations,
             native: artifact.native.clone(),
             native_archive: build_native_archive(artifact, expected)
                 .await
@@ -111,6 +116,7 @@ pub async fn build_upload_plan(
 fn validate_dependency_graph(
     scanned: &[ScannedArtifact],
     consumed: &[ConsumedArtifact],
+    programs: &crate::dep_scan::ProgramClaims,
 ) -> stow_types::error::Result<()> {
     let mut output_owner_by_path = BTreeMap::<PathBuf, usize>::new();
     let mut output_owner_by_compile_key = BTreeMap::<String, usize>::new();
@@ -150,6 +156,10 @@ fn validate_dependency_graph(
                             dependency.stable_c_metadata.as_str(),
                         )
                 })
+                || programs.completed.iter().chain(&programs.compiled).any(|program| {
+                    program.compile_key == dependency.compile_key
+                        && program.c_metadata.as_str() == dependency.stable_c_metadata
+                })
             {
                 continue;
             }
@@ -181,6 +191,8 @@ fn ensure_reconcilable_duplicate_compile_key(
             != dependency_compile_keys_json(&candidate.dependencies)?
         || existing.target != candidate.target
         || existing.rustc_version != candidate.rustc_version
+        || existing.unit_shape.side != candidate.unit_shape.side
+        || existing.unit_shape.kind != candidate.unit_shape.kind
         || existing.profile != candidate.profile
         || existing.emit != candidate.emit
         || existing.kind != candidate.kind
@@ -196,7 +208,7 @@ fn ensure_reconcilable_duplicate_compile_key(
     Ok(())
 }
 
-fn dependency_c_metadata_json(
+pub fn dependency_c_metadata_json(
     dependencies: &[ScannedArtifactDependency],
 ) -> stow_types::error::Result<DependencyCMetadataJson> {
     let mut identities = Vec::with_capacity(dependencies.len());
@@ -259,13 +271,23 @@ fn reconcile_duplicate_plan(
 ) -> stow_types::error::Result<()> {
     ensure_duplicate_plan_identity(existing, &candidate)?;
 
+    let shared_invocations = existing.shared_invocations
+        || candidate.shared_invocations
+        || existing.unit_shape.invocation != candidate.unit_shape.invocation;
     match plan_preference(existing).cmp(&plan_preference(&candidate)) {
         Ordering::Less => {
             *existing = candidate;
+            existing.shared_invocations = shared_invocations;
             Ok(())
         }
-        Ordering::Greater => Ok(()),
-        Ordering::Equal if plans_share_outputs(existing, &candidate) => Ok(()),
+        Ordering::Greater => {
+            existing.shared_invocations = shared_invocations;
+            Ok(())
+        }
+        Ordering::Equal if plans_share_outputs(existing, &candidate) => {
+            existing.shared_invocations = shared_invocations;
+            Ok(())
+        }
         Ordering::Equal => Err(stow_types::stow_error!(
             "duplicate upload plan artifact {} {} {} remained ambiguous after stable exact identity normalization",
             existing.crate_name,
@@ -289,6 +311,8 @@ fn ensure_duplicate_plan_identity(
         || existing.dependency_compile_keys_json != candidate.dependency_compile_keys_json
         || existing.target != candidate.target
         || existing.rustc_version != candidate.rustc_version
+        || existing.unit_shape.side != candidate.unit_shape.side
+        || existing.unit_shape.kind != candidate.unit_shape.kind
         || existing.profile != candidate.profile
         || existing.emit != candidate.emit
         || existing.oci_reference != candidate.oci_reference
@@ -548,8 +572,11 @@ const fn output_media_type(
         ParsedFileKind::Rmeta => STOW_RMETA_MEDIA_TYPE,
         ParsedFileKind::DynamicLibrary => match artifact_kind {
             ArtifactKind::ProcMacro => STOW_PROC_MACRO_MEDIA_TYPE,
-            ArtifactKind::Dylib | ArtifactKind::Rlib => STOW_DYLIB_MEDIA_TYPE,
+            ArtifactKind::Dylib | ArtifactKind::Rlib | ArtifactKind::BuildScript => {
+                STOW_DYLIB_MEDIA_TYPE
+            }
         },
+        ParsedFileKind::Executable => STOW_BUILD_SCRIPT_MEDIA_TYPE,
     }
 }
 
@@ -630,6 +657,21 @@ mod tests {
         Vec::new()
     }
 
+    /// A build script's executable ships under its own media type, the
+    /// type the CLI writes back as a real file; a dynamic library of the
+    /// same build keeps the library type.
+    #[test]
+    fn a_build_script_executable_ships_as_a_build_script() {
+        assert_eq!(
+            super::output_media_type(ParsedFileKind::Executable, &ArtifactKind::BuildScript),
+            stow_types::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE
+        );
+        assert_eq!(
+            super::output_media_type(ParsedFileKind::DynamicLibrary, &ArtifactKind::ProcMacro),
+            stow_types::bundle::STOW_PROC_MACRO_MEDIA_TYPE
+        );
+    }
+
     #[tokio::test]
     async fn upload_plan_preserves_captured_exact_identity() {
         let output_path = std::env::temp_dir().join(format!(
@@ -649,9 +691,15 @@ mod tests {
             "[\"default\",\"derive\",\"serde_derive\",\"std\"]".to_owned();
         let scanned = vec![serde_artifact];
 
-        let planned = build_upload_plan(&scanned, &[], &dependency_task_ids())
-            .await
-            .expect("build upload plan");
+        let planned = build_upload_plan(
+            &scanned,
+            &[],
+            &dependency_task_ids(),
+            stow_types::node_profile::NodeProfile::Dev,
+            &crate::dep_scan::ProgramClaims::default(),
+        )
+        .await
+        .expect("build upload plan");
         let plan = planned.first().expect("planned artifact");
 
         assert_eq!(plan.compile_key, "original-compile-key");
@@ -684,9 +732,15 @@ mod tests {
             scanned_bitflags_artifact("dba7ec857b47436d", stable_output_path.clone(), 29),
         ];
 
-        let planned = build_upload_plan(&scanned, &[], &dependency_task_ids())
-            .await
-            .expect("build upload plan");
+        let planned = build_upload_plan(
+            &scanned,
+            &[],
+            &dependency_task_ids(),
+            stow_types::node_profile::NodeProfile::Dev,
+            &crate::dep_scan::ProgramClaims::default(),
+        )
+        .await
+        .expect("build upload plan");
 
         assert_eq!(planned.len(), 2);
         assert!(planned.iter().any(|plan| {
@@ -712,6 +766,7 @@ mod tests {
         output_path: std::path::PathBuf,
     ) -> ScannedArtifact {
         ScannedArtifact {
+            shared_invocations: false,
             crate_name: crate_name.to_owned(),
             crate_version: crate_version.to_owned(),
             target: "aarch64-apple-darwin".to_owned(),
@@ -774,6 +829,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_plan_merges_observed_invocations_without_another_bundle() {
+        let root = tempfile::tempdir().expect("directory");
+        let path = root.path().join("libdemo-0123456789abcdef.rlib");
+        fs::write(&path, b"artifact").expect("artifact");
+        let mut native = scanned_lib_artifact(
+            "demo",
+            "1.0.0",
+            "captured-demo",
+            "0123456789abcdef",
+            8,
+            path,
+        );
+        native.unit_shape.side = stow_types::public_cache::UnitSide::Host;
+        native.unit_shape.invocation = stow_types::public_cache::UnitInvocation::Native;
+        let mut plans = build_upload_plan(
+            &[native],
+            &[],
+            &dependency_task_ids(),
+            stow_types::node_profile::NodeProfile::Release,
+            &crate::dep_scan::ProgramClaims::default(),
+        )
+        .await
+        .expect("plan");
+        assert_eq!(plans.len(), 1);
+        let mut explicit = plans[0].clone();
+        explicit.unit_shape.invocation = stow_types::public_cache::UnitInvocation::Target;
+        super::reconcile_duplicate_plan(&mut plans[0], explicit).expect("merge shape coverage");
+        assert!(plans[0].shared_invocations);
+        assert_eq!(
+            plans[0]
+                .unit_shape
+                .invocation_shapes(plans[0].shared_invocations)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn upload_plan_preserves_scanned_dependency_identities() {
         let child_output_path = std::env::temp_dir().join(format!(
             "stow-ci-plan-test-{}-libgetrandom-2384b9107b13ade1.rlib",
@@ -812,9 +905,15 @@ mod tests {
             rand_core,
         ];
 
-        let planned = build_upload_plan(&scanned, &[], &dependency_task_ids())
-            .await
-            .expect("build upload plan");
+        let planned = build_upload_plan(
+            &scanned,
+            &[],
+            &dependency_task_ids(),
+            stow_types::node_profile::NodeProfile::Dev,
+            &crate::dep_scan::ProgramClaims::default(),
+        )
+        .await
+        .expect("build upload plan");
         let rand_core = planned
             .iter()
             .find(|plan| plan.crate_name == "rand_core")
@@ -869,6 +968,7 @@ mod tests {
         let scanned = vec![rand_core];
 
         let served = vec![crate::dep_scan::ConsumedArtifact {
+            kind: ArtifactKind::Rlib,
             crate_name: "getrandom".to_owned(),
             crate_version: "0.2.17".to_owned(),
             compile_key: "served-getrandom".to_owned(),
@@ -877,15 +977,27 @@ mod tests {
             rustc_version: "1.91.1".to_owned(),
             emit: vec!["link".to_owned()],
         }];
-        build_upload_plan(&scanned, &served, &dependency_task_ids())
-            .await
-            .expect("consumed dependency resolves the plan");
+        build_upload_plan(
+            &scanned,
+            &served,
+            &dependency_task_ids(),
+            stow_types::node_profile::NodeProfile::Dev,
+            &crate::dep_scan::ProgramClaims::default(),
+        )
+        .await
+        .expect("consumed dependency resolves the plan");
 
         let mut mismatched = served.clone();
         mismatched[0].c_metadata = "ffffffffffffffff".to_owned();
-        let error = build_upload_plan(&scanned, &mismatched, &dependency_task_ids())
-            .await
-            .expect_err("an identity the claim does not carry must not satisfy the edge");
+        let error = build_upload_plan(
+            &scanned,
+            &mismatched,
+            &dependency_task_ids(),
+            stow_types::node_profile::NodeProfile::Dev,
+            &crate::dep_scan::ProgramClaims::default(),
+        )
+        .await
+        .expect_err("an identity the claim does not carry must not satisfy the edge");
         assert!(
             error
                 .to_string()
@@ -933,9 +1045,15 @@ mod tests {
             original_out_dir: out_dir,
         });
 
-        let error = build_upload_plan(&[artifact], &[], &dependency_task_ids())
-            .await
-            .expect_err("an x86-64 object must not publish under an arm64 task");
+        let error = build_upload_plan(
+            &[artifact],
+            &[],
+            &dependency_task_ids(),
+            stow_types::node_profile::NodeProfile::Dev,
+            &crate::dep_scan::ProgramClaims::default(),
+        )
+        .await
+        .expect_err("an x86-64 object must not publish under an arm64 task");
         let message = error.to_string();
         assert!(
             message.contains("winarm-probe"),

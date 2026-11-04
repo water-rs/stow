@@ -432,6 +432,7 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
         crate::source_trees::load_optional_source_trees(args.source_trees.as_ref(), &repos)?;
     let published =
         tokio::runtime::Handle::current().block_on(substitution_pool(&targets, &rustc_version))?;
+    let coverage = crate::manual::PublishedCoverage::new(&published)?;
     let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
     let mut plan = ProjectsPlan {
         file: args.file.display().to_string(),
@@ -479,12 +480,12 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
                         return;
                     }
                 };
-                if let Some(edge) = edge
-                    && !tree.nodes.is_empty()
-                {
-                    match tokio::runtime::Handle::current()
-                        .block_on(submit_chunked(edge, std::slice::from_ref(&tree)))
-                    {
+                if let Some(edge) = edge {
+                    match tokio::runtime::Handle::current().block_on(submit_chunked(
+                        edge,
+                        std::slice::from_ref(&tree),
+                        &coverage,
+                    )) {
                         Ok(chunk_outcome) => {
                             outcome.batches += chunk_outcome.batches;
                             outcome.submitted += chunk_outcome.submitted;
@@ -1030,6 +1031,7 @@ pub fn resolve_project_dir(
 pub async fn submit_chunked(
     edge: &Edge,
     trees: &[stow_types::api::SubmissionTree],
+    published: &crate::manual::PublishedCoverage,
 ) -> stow_types::error::Result<SubmitOutcome> {
     let mut outcome = SubmitOutcome {
         batches: 0,
@@ -1038,7 +1040,7 @@ pub async fn submit_chunked(
         dropped: 0,
     };
     let bodies = stow_types::api::SubmissionTree::into_bodies(
-        trees,
+        published.uncovered_trees(trees),
         stow_types::api::REQUEST_BODY_LIMIT_BYTES,
     )?;
     for body in &bodies {

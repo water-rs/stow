@@ -86,7 +86,33 @@ async fn write_artifact_file(
         writers,
     )
     .await?;
+    mark_executable_if_build_script(output_path, file).await
+}
 
+/// A build script is run by cargo, so its served file carries the
+/// executable mode rustc would have given it: a bundle's pack records no
+/// modes, and the cache entry it unpacked into holds a plain file.
+async fn mark_executable_if_build_script(
+    output_path: &std::path::Path,
+    file: &ArtifactBundleFile,
+) -> stow_types::error::Result<()> {
+    if file.media_type != stow_types::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        async_fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "mark served build script {} executable",
+                    output_path.display()
+                )
+            })?;
+    }
+    #[cfg(not(unix))]
+    let _ = output_path;
     Ok(())
 }
 
@@ -112,6 +138,7 @@ pub async fn materialize_original_outputs(
             writers,
         )
         .await?;
+        mark_executable_if_build_script(&original_path, file).await?;
     }
     Ok(())
 }
@@ -139,10 +166,10 @@ pub async fn materialize_local_build_stable_aliases(
     .await?;
     materialize_optional_local_alias(
         parsed
-            .output_dynamic_library_path(host)
+            .output_linked_image_path(host)
             .map_err(stow_types::error::Error::msg)?,
         stable_parsed
-            .output_dynamic_library_path(host)
+            .output_linked_image_path(host)
             .map_err(stow_types::error::Error::msg)?,
         writers,
     )
@@ -174,10 +201,10 @@ async fn materialize_cached_bundle_stable_aliases(
     .await?;
     materialize_optional_local_alias(
         parsed
-            .output_dynamic_library_path(host)
+            .output_linked_image_path(host)
             .map_err(stow_types::error::Error::msg)?,
         stable_parsed
-            .output_dynamic_library_path(host)
+            .output_linked_image_path(host)
             .map_err(stow_types::error::Error::msg)?,
         writers,
     )
@@ -225,9 +252,10 @@ pub fn expected_output_path(
         parsed.output_rmeta_path()
     } else if file.media_type == stow_types::bundle::STOW_DYLIB_MEDIA_TYPE
         || file.media_type == stow_types::bundle::STOW_PROC_MACRO_MEDIA_TYPE
+        || file.media_type == stow_types::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE
     {
         parsed
-            .output_dynamic_library_path(host)
+            .output_linked_image_path(host)
             .map_err(stow_types::error::Error::msg)?
     } else {
         return Err(stow_types::stow_error!(
@@ -680,7 +708,7 @@ mod tests {
             .and_then(crate::file_lock::FileLock::shared)
             .expect("create lease lock");
         let manifest = ArtifactBundleManifest {
-            oci_reference: "ghcr.io/water-rs/stow-cache-1.91.1:itoa.test".to_owned(),
+            oci_reference: "ghcr.io/water-rs/stow-cache-v2-1.91.1:itoa.test".to_owned(),
             oci_digest: "sha256:test".to_owned(),
             config: ArtifactBlobConfig {
                 dependency_identity: stow_types::identity::DependencyIdentity::leaf()
@@ -753,6 +781,83 @@ mod tests {
             verified_marker_policy: None,
             _lease_lock: lease_lock,
         }
+    }
+
+    /// A served build script is a real file at the path cargo asked
+    /// rustc to write, runnable by the cargo that spawns it, whichever
+    /// invocation spelling and output directory asked: one bundle serves
+    /// the native and the `--target` builds alike.
+    #[test]
+    fn a_build_script_is_served_as_an_executable_file_for_every_spelling() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let cache_dir = tempdir.path().join("cache-entry");
+            std::fs::create_dir_all(cache_dir.join("files")).expect("cache files dir");
+            let image = b"#!/bin/sh\nexit 0\n";
+            let bundle_file = "build_script_build-0123abcd";
+            std::fs::write(cache_dir.join("files").join(bundle_file), image).expect("image");
+            let mut bundle = semantic_test_bundle(cache_dir, tempdir.path(), bundle_file);
+            bundle.outputs = vec![ArtifactBundleFile {
+                file_name: bundle_file.to_owned(),
+                media_type: stow_types::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE.to_owned(),
+                sha256: hex::encode(sha2::Sha256::digest(image)),
+            }];
+            bundle.kind = ArtifactKind::BuildScript;
+            bundle.crate_types = vec![stow_types::artifact::RustCrateType::Bin];
+
+            // A plain build, and a `--target` build whose cargo hands the
+            // host unit the target's debug settings.
+            for (label, codegen) in [
+                ("native", vec![]),
+                (
+                    "target",
+                    vec!["-C", "debuginfo=2", "-C", "split-debuginfo=unpacked"],
+                ),
+            ] {
+                let out_dir = tempdir.path().join(label).join("build/pkg-aaaa");
+                let out_dir_arg = out_dir.to_str().expect("utf8").to_owned();
+                let mut args = vec![
+                    "--crate-name",
+                    "build_script_build",
+                    "--edition=2021",
+                    "/root/.cargo/registry/src/index.crates.io-0123abcd/itoa-1.0.18/build.rs",
+                    "--crate-type",
+                    "bin",
+                    "--emit=dep-info,link",
+                    "-C",
+                    "metadata=expected",
+                    "-C",
+                    "extra-filename=-expected",
+                ];
+                args.extend(codegen);
+                args.extend(["--out-dir", out_dir_arg.as_str()]);
+                let args = args
+                    .into_iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>();
+                let parsed = ParsedRustcArgs::parse(&args).expect("parse build script");
+                assert!(parsed.is_build_script());
+
+                write_artifacts(
+                    &parsed,
+                    &bundle,
+                    "aarch64-apple-darwin",
+                    OutputDirWriters::StowOnly,
+                )
+                .await
+                .expect("serve the build script");
+
+                let served = out_dir.join("build_script_build-expected");
+                let metadata = std::fs::symlink_metadata(&served).expect("served file");
+                assert!(metadata.is_file(), "{label}: a real file, not a link");
+                assert_eq!(std::fs::read(&served).expect("read"), image, "{label}");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    assert_eq!(metadata.permissions().mode() & 0o111, 0o111, "{label}");
+                }
+            }
+        });
     }
 
     #[test]

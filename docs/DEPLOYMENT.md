@@ -78,7 +78,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    the reset: once the reset succeeds, `operations.yml` runs
    `stow-admin index published-rustcs`, which probes every stable
    release `static.rust-lang.org/manifests.txt` lists for a published
-   `stow-cache-<rustc>` package through the registry's anonymous tag
+   `stow-cache-v2-<rustc>` package through the registry's anonymous tag
    listing, then dispatches `index-publish.yml` on `main` with
    `report=true` for each rustc found (not `full`: a reset leaves the
    slices in GHCR as they were) and `preheat-cron.yml` on `main` with
@@ -422,9 +422,10 @@ crate with `contents: read` only — no secrets, no OIDC — and uploads
 its output directory as a workflow artifact. `publish` runs only when
 `build` succeeds: it downloads the output, validates it against the
 task and an independently resolved dependency closure, and only then
-pushes the bundle plus the build's `Vec<ArtifactRecord>` (as one signed
-OCI artifact tagged `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`,
-one per task) to GHCR, signing both keyless in process — one Fulcio
+pushes bundles plus the build's `BuildRecords` to GHCR. The records contain
+bundle entries and declarations of nonrelocatable proc macros, in one signed
+OCI artifact tagged `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`.
+Both are signed keyless in process — one Fulcio
 certificate per validity window, one Rekor entry per signature, the
 job's `id-token: write` identity — with every registry write held under
 `STOW_GHCR_WRITES_PER_MINUTE` (see [`ENVIRONMENT.md`](ENVIRONMENT.md)). The job never calls the edge — GitHub's
@@ -433,6 +434,20 @@ edge checks the records artifact each successful task published exists
 in GHCR before it forwards the completion. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries) for what the
 publisher checks.
+
+Build-script executables are outputs of their owning crate node, keyed for
+the host that runs them and reusable across target builds. Index format 7
+keeps them separate from library nodes. A program whose compiler dep-info
+records `CARGO_MANIFEST_DIR` is not published: its local cache entry includes
+the source directory. For a proc macro, the signed records instead declare
+the completed node; consumers compile the program locally and use its signed
+identity to validate the dependency closure. Its library dependencies remain
+cached. Records use `application/vnd.stow.records.v2+json`; the deployment
+uses a fresh `stow-cache-v2-<rustc>` package for this schema. Publish empty
+index slices there with `index-publish.yml` and `report=false`. Set the new
+package's visibility to public before resetting the scheduler and submitting
+a new preheat wave. Readers and writers use only this namespace; old packages are retired
+separately and never used as a fallback.
 
 `build-crate.yml` reads no repository variables — `run-name` carries
 `<rustc>-<task_id>` so the webhook's `display_title` parses back into
@@ -463,15 +478,14 @@ slice published in a format the current `stow-admin` can no longer
 decode is replaced rather than read.
 
 Every artifact is a tag of its rustc's GHCR package
-`ghcr.io/water-rs/stow-cache-<rustc>` —
+`ghcr.io/water-rs/stow-cache-v2-<rustc>` —
 `{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`.
 The edge pulls the package with no credential at all — public GHCR
-packages grant `repository:water-rs/stow-cache-<rustc>:pull` to the
+packages grant `repository:water-rs/stow-cache-v2-<rustc>:pull` to the
 anonymous `GET /token` exchange that `edge/src/ghcr.rs` drives on every
-`401` challenge. A rustc's package is created by the first
-`build-crate.yml` push that lands on it: the package links to the
-public `water-rs/stow` repository and inherits its visibility, so no
-manual step ever opens one. Until it exists, GHCR answers an anonymous
+`401` challenge. The first push creates a private package linked to
+`water-rs/stow`. It inherits repository access permissions, not visibility;
+set the package to public before anonymous pulls can succeed. Until it exists, GHCR answers an anonymous
 pull — the token exchange or an asset request — with `403 DENIED`
 rather than `404` (a package made private answers the same way), and
 every index reader classifies that answer as the package's absence: the
@@ -566,6 +580,16 @@ on `main`, and forwards only the deliveries the scheduler consumes (see
 `POST /tasks/complete-run`. A `success` conclusion counts only once the
 records artifact its publish job pushed (tagged by run id and attempt)
 exists in GHCR, so a spoofed success cannot mint a catalog entry.
+
+Failed completions carry the run id and attempt. The scheduler checks the
+attempt's `verify source failure` job before excluding an independently
+reproduced source failure from breaker counts. The failed build remains in
+history; unverified failures and verification lookup errors still count.
+The replay uses the original toolchain, manifest, lockfile and flags without
+stow cache artifacts. It runs only after a candidate source failure, so its
+additional compilation cost is confined to those failed builds. This does
+not clear an existing freeze: after addressing its cause, use
+`stow-admin watchdog clear`.
 
 ### newreleases.io webhook — `rust` releases
 
@@ -820,7 +844,7 @@ pending for re-dispatch).
   hostname down. `stow-admin maintenance status` prints all three
   rules' state.
 - **GHCR storage:** the whole cache is one
-  `ghcr.io/water-rs/stow-cache-<rustc>` package per rustc (every
+  `ghcr.io/water-rs/stow-cache-v2-<rustc>` package per rustc (every
   artifact a tag); monitor disk via the GitHub UI.
 - **Revoking trusted access:** there is no shared credential to rotate.
   A workflow's access to a mutating route is its entry in that route's
@@ -838,13 +862,15 @@ pending for re-dispatch).
 
 ### Cache packages
 
-The public cache is one GHCR package per rustc version:
-`ghcr.io/water-rs/stow-cache-<rustc>` holds every artifact, bundle,
+The public cache is one GHCR package per storage schema and rustc version:
+`ghcr.io/water-rs/stow-cache-v2-<rustc>` holds every artifact, bundle,
 signature, records artifact, index slice and folded set built for that
-rustc. A new rustc's package is created by the first `build-crate.yml`
-push that lands on it — the package links to the public `water-rs/stow`
-repository and inherits its visibility, so it is public with no manual
-step. stow never deletes single versions; when a rustc is no longer
+rustc. The first push creates the package with private visibility.
+Repository access permissions are inherited separately. In the package's
+GitHub settings, use **Danger Zone → Change visibility → Public** and confirm
+the package name before opening the lanes. This applies to every new schema
+or rustc package; making a package public cannot be reversed. See GitHub's
+[package visibility documentation](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility#configuring-visibility-of-packages-for-an-organization). stow never deletes single versions; when a rustc is no longer
 served, delete its package whole in the package settings, or through
 GitHub support when one of its versions passed 5,000 downloads —
 GitHub refuses self-service deletion then.

@@ -26,12 +26,8 @@ use crate::platform::Profile;
 /// The `format_version` this crate writes and the only one
 /// [`ArtifactIndex::decode`] accepts.
 ///
-/// v6 replaces the stored `dependency_identity` digest with
-/// `dependency_task_ids` — the sorted direct child task ids the digest
-/// hashes (stow#919). A v5 row's digest committed to edges the row did
-/// not carry, so no reader can reconstruct them; the preimage is the
-/// only form the substitution pool can join on.
-pub const ARTIFACT_INDEX_FORMAT_VERSION: u32 = 6;
+/// v7 carries host-keyed build-script outputs beside the node rows.
+pub const ARTIFACT_INDEX_FORMAT_VERSION: u32 = 7;
 
 /// Media type of the index's single OCI layer — the zstd-compressed
 /// [`ArtifactIndex`] JSON.
@@ -54,6 +50,15 @@ pub struct ArtifactIndex {
     pub header: ArtifactIndexHeader,
     /// Every servable row of the slice, ordered by `c_metadata`.
     pub rows: Vec<ArtifactIndexRow>,
+    /// The build-script executables the slice serves, ordered by
+    /// `c_metadata`. A build script is an output of its crate's node, not
+    /// a node of its own, so it never joins `rows` — everything that
+    /// derives nodes, edges and servable shapes from a slice reads `rows`
+    /// alone, and only the exact `c_metadata` lookup of a build-script
+    /// compile reads these.
+    pub build_scripts: Vec<ArtifactIndexRow>,
+    /// Completed proc macros compiled locally by each consumer.
+    pub local_programs: Vec<crate::records::LocalProcMacro>,
 }
 
 /// The index's self-describing header.
@@ -119,6 +124,12 @@ pub struct ArtifactIndexRow {
     pub crate_types: Vec<RustCrateType>,
     /// Compilation profile observed from the captured rustc invocation.
     pub profile: Profile,
+    /// The named profile of the node that built the artifact.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::node_profile::NodeProfile::is_dev"
+    )]
+    pub node_profile: crate::node_profile::NodeProfile,
     /// Sorted, deduplicated `--emit` modes observed from the invocation.
     pub emit: Vec<String>,
     /// The unit shape the builder recorded for this artifact — which side
@@ -153,7 +164,7 @@ impl ArtifactIndexRow {
 }
 
 /// The OCI tag of the index artifact for one slice:
-/// `index.<target>.<rustc_short>` on `ghcr.io/water-rs/stow-cache-<rustc>`.
+/// `index.<target>.<rustc_short>` on `ghcr.io/water-rs/stow-cache-v2-<rustc>`.
 ///
 /// `rustc_short` is the same short form artifact tags carry — the semver
 /// rendering `RustcVersion::short` produces, which is exactly the wire
@@ -209,6 +220,8 @@ pub fn content_sha256(index: &ArtifactIndex) -> Result<String, serde_json::Error
         &index.header.target,
         &index.header.rustc_version,
         &index.rows,
+        &index.build_scripts,
+        &index.local_programs,
     ))?;
     Ok(crate::registry::sha256_digest(&canonical))
 }
@@ -312,6 +325,28 @@ pub fn encode(
 ) -> Result<Vec<u8>, IndexError> {
     let json = serde_json::to_vec(index).map_err(IndexError::Serialize)?;
     compress(&json).map_err(IndexError::Compress)
+}
+
+/// Split folded rows into the node rows and the build-script rows.
+///
+/// Several nodes (other dependency contexts, other node profiles) publish
+/// one build script under the same `c_metadata`; the key is host-only, so
+/// one row per `c_metadata` is kept — the last in the input order —
+/// sorted by `c_metadata`.
+#[must_use]
+pub fn partition_build_scripts(
+    rows: Vec<ArtifactIndexRow>,
+) -> (Vec<ArtifactIndexRow>, Vec<ArtifactIndexRow>) {
+    let (scripts, rows): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|row| row.artifact_kind == ArtifactKind::BuildScript);
+    let scripts = scripts
+        .into_iter()
+        .map(|row| (row.c_metadata.clone(), row))
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into_values()
+        .collect();
+    (rows, scripts)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -424,6 +459,8 @@ mod tests {
                 row_count: rows.len() as u64,
             },
             rows,
+            build_scripts: Vec::new(),
+            local_programs: Vec::new(),
         }
     }
 
@@ -456,7 +493,39 @@ mod tests {
                 invocation: crate::public_cache::UnitInvocation::Native,
                 kind: crate::public_cache::UnitKind::Linked,
             },
+            node_profile: crate::node_profile::NodeProfile::Dev,
         }
+    }
+
+    #[test]
+    fn build_scripts_round_trip_beside_the_rows_and_move_the_digest() {
+        let mut script = row("cccc");
+        script.artifact_kind = ArtifactKind::BuildScript;
+        script.crate_types = vec![RustCrateType::Bin];
+        let mut with = index(vec![row("aaaa")]);
+        with.build_scripts = vec![script];
+        let bytes = encode_for_test(&with).expect("encode");
+        assert_eq!(ArtifactIndex::decode(&bytes).expect("decode"), with);
+        let without = index(vec![row("aaaa")]);
+        assert_ne!(
+            content_sha256(&with).expect("digest"),
+            content_sha256(&without).expect("digest")
+        );
+    }
+
+    /// Several nodes publish one host-keyed script; one row per
+    /// `c_metadata` survives and none stays among the node rows.
+    #[test]
+    fn partitioning_keeps_one_build_script_row_per_key() {
+        let mut first = row("cccc");
+        first.artifact_kind = ArtifactKind::BuildScript;
+        first.bundle_size = 1;
+        let mut second = first.clone();
+        second.bundle_size = 2;
+        let (rows, scripts) = partition_build_scripts(vec![row("aaaa"), first, second]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].bundle_size, 2);
     }
 
     #[test]

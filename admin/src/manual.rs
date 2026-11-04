@@ -110,7 +110,7 @@ pub async fn run(
         return Ok(());
     }
     // The plan renders the substituted ids, so substitute before it.
-    substitute_against_published(&mut trees).await?;
+    let published = substitute_against_published(&mut trees).await?;
     render::mutation(
         output,
         trees,
@@ -146,7 +146,7 @@ pub async fn run(
         },
         edge.as_ref().map(|edge| {
             async move |trees: &Vec<SubmissionTree>| {
-                crate::projects::submit_chunked(edge, trees).await
+                crate::projects::submit_chunked(edge, trees, &published).await
             }
         }),
     )
@@ -447,21 +447,23 @@ pub async fn covered_nodes(
     let mut covered = BTreeSet::new();
     // Slice pulls are reads — fan them out under the bounded
     // concurrency every index pull in this crate shares.
-    let rows_per_target: Vec<Option<Vec<ArtifactIndexRow>>> = futures_util::stream::iter(
-        targets
-            .iter()
-            .map(|target| published_slice_rows(index, target, rustc_version)),
-    )
-    .buffered(SLICE_PULL_CONCURRENCY)
-    .try_collect()
-    .await?;
+    let rows_per_target: Vec<Option<stow_types::index::ArtifactIndex>> =
+        futures_util::stream::iter(
+            targets
+                .iter()
+                .map(|target| published_slice(index, target, rustc_version)),
+        )
+        .buffered(SLICE_PULL_CONCURRENCY)
+        .try_collect()
+        .await?;
     for (target, rows) in targets.iter().zip(rows_per_target) {
         let Some(rows) = rows else { continue };
         covered.extend(covered_slice_nodes(
-            &rows,
+            &rows.rows,
             target,
             rustc_version,
-            spellings,
+            |id| spellings.get(id).copied().unwrap_or_default(),
+            &rows.local_programs,
         )?);
     }
     Ok(covered)
@@ -471,7 +473,8 @@ fn covered_slice_nodes(
     rows: &[ArtifactIndexRow],
     target: &TargetTriple,
     rustc_version: &WireRustcVersion,
-    spellings: &BTreeMap<String, stow_types::public_cache::ExplicitSpelling>,
+    spelling: impl Fn(&str) -> stow_types::public_cache::ExplicitSpelling,
+    local_programs: &[stow_types::records::LocalProcMacro],
 ) -> stow_types::error::Result<BTreeSet<String>> {
     let mut shapes = HashMap::<_, BTreeSet<_>>::new();
     for row in rows {
@@ -488,11 +491,21 @@ fn covered_slice_nodes(
             target: target.clone(),
             rustc_version: rustc_version.clone(),
             host_side,
+            profile: row.node_profile,
         };
         shapes
             .entry((identity, dependency_identity.clone()))
             .or_default()
             .insert(shape);
+    }
+    for program in local_programs {
+        if program.node.target != *target || program.node.rustc_version != *rustc_version {
+            return Err(stow_error!("local program is in the wrong index slice"));
+        }
+        shapes
+            .entry((program.node.clone(), program.dependency_identity()?))
+            .or_default()
+            .insert(program.unit_shape);
     }
     let invocation = if host_triple(target) == target.as_str() {
         UnitInvocation::Native
@@ -504,10 +517,7 @@ fn covered_slice_nodes(
         .filter(|((identity, context), served)| {
             // The flag the node's own request carries — rows for nodes
             // nothing asked about answer the historical two-shape rule.
-            let spelling = spellings
-                .get(&identity.task_id(context))
-                .copied()
-                .unwrap_or_default();
+            let spelling = spelling(&identity.task_id(context));
             required_unit_shapes(identity.host_side, invocation, spelling)
                 .iter()
                 .all(|shape| served.contains(shape))
@@ -565,20 +575,22 @@ pub async fn published_slices(
             repository: &repository,
             trust: &trust,
         };
-        let rows_per_target: Vec<Option<Vec<ArtifactIndexRow>>> = futures_util::stream::iter(
-            targets
-                .iter()
-                .map(|target| published_slice_rows(&index, target, rustc_version)),
-        )
-        .buffered(SLICE_PULL_CONCURRENCY)
-        .try_collect()
-        .await?;
+        let rows_per_target: Vec<Option<stow_types::index::ArtifactIndex>> =
+            futures_util::stream::iter(
+                targets
+                    .iter()
+                    .map(|target| published_slice(&index, target, rustc_version)),
+            )
+            .buffered(SLICE_PULL_CONCURRENCY)
+            .try_collect()
+            .await?;
         for (target, rows) in targets.iter().zip(rows_per_target) {
             if let Some(rows) = rows {
                 slices.push(stow_types::api::PublishedIndexSlice {
                     target: (*target).clone(),
                     rustc_version: rustc_version.clone(),
-                    rows,
+                    rows: rows.rows,
+                    local_programs: rows.local_programs,
                 });
             }
         }
@@ -593,14 +605,80 @@ pub async fn published_slices(
 /// the pairs cover host slices too.
 pub async fn substitute_against_published(
     trees: &mut [SubmissionTree],
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<PublishedCoverage> {
+    let published = slices_for_trees(trees).await?;
+    SubmissionTree::substitute_contained_sets(trees, &published)?;
+    PublishedCoverage::new(&published)
+}
+
+async fn slices_for_trees(
+    trees: &[SubmissionTree],
+) -> stow_types::error::Result<Vec<stow_types::api::PublishedIndexSlice>> {
     let pairs = trees
         .iter()
         .flat_map(|tree| &tree.nodes)
         .map(|node| (node.target.clone(), node.rustc_version.clone()))
         .collect::<BTreeSet<_>>();
-    let published = published_slices(&pairs).await?;
-    SubmissionTree::substitute_contained_sets(trees, &published)
+    published_slices(&pairs).await
+}
+
+/// Pull the verified slices once per lane, including its host-side nodes.
+pub async fn coverage_for_trees(
+    trees: &[SubmissionTree],
+) -> stow_types::error::Result<PublishedCoverage> {
+    PublishedCoverage::new(&slices_for_trees(trees).await?)
+}
+
+/// Complete exact node identities for each required invocation shape.
+/// Constructed once per lane, then shared by all of its source submissions.
+pub struct PublishedCoverage {
+    native: BTreeSet<String>,
+    explicit: BTreeSet<String>,
+}
+
+impl PublishedCoverage {
+    pub fn new(
+        published: &[stow_types::api::PublishedIndexSlice],
+    ) -> stow_types::error::Result<Self> {
+        use stow_types::public_cache::ExplicitSpelling;
+        let mut coverage = Self {
+            native: BTreeSet::new(),
+            explicit: BTreeSet::new(),
+        };
+        for slice in published {
+            for (spelling, covered) in [
+                (ExplicitSpelling::KeysAsNative, &mut coverage.native),
+                (ExplicitSpelling::KeysApart, &mut coverage.explicit),
+            ] {
+                covered.extend(covered_slice_nodes(
+                    &slice.rows,
+                    &slice.target,
+                    &slice.rustc_version,
+                    |_| spelling,
+                    &slice.local_programs,
+                )?);
+            }
+        }
+        Ok(coverage)
+    }
+
+    /// A published root alone is insufficient: every exact dependency
+    /// and required output of the source's tree must be served.
+    pub fn uncovered_trees<'a>(
+        &'a self,
+        trees: &'a [SubmissionTree],
+    ) -> impl Iterator<Item = &'a SubmissionTree> + 'a {
+        trees.iter().filter(|tree| {
+            tree.nodes.iter().any(|node| {
+                use stow_types::public_cache::ExplicitSpelling;
+                let covered = match node.explicit_spelling {
+                    ExplicitSpelling::KeysAsNative => &self.native,
+                    ExplicitSpelling::KeysApart => &self.explicit,
+                };
+                !covered.contains(&node.task_id)
+            })
+        })
+    }
 }
 
 /// The three handles the index-slice pulls share — `pub` so the
@@ -614,11 +692,11 @@ pub struct Index<'a> {
 /// Pull and verify the published `index.<target>.<rustc>` slice —
 /// `None` when the tag does not exist (a fresh registry serves an empty
 /// catalog, not an error).
-pub async fn published_slice_rows(
+pub async fn published_slice(
     index: &Index<'_>,
     target: &TargetTriple,
     rustc_version: &WireRustcVersion,
-) -> stow_types::error::Result<Option<Vec<ArtifactIndexRow>>> {
+) -> stow_types::error::Result<Option<stow_types::index::ArtifactIndex>> {
     let tag = index_tag(target.as_str(), rustc_version.as_str());
     let reference = index.session.reference(&tag)?;
     let (bytes, manifest_digest) = match index.session.pull_manifest(&reference).await {
@@ -660,12 +738,187 @@ pub async fn published_slice_rows(
             index.header.rustc_version.as_str()
         ));
     }
-    Ok(Some(index.rows))
+    Ok(Some(index))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn uncovered_count(
+        trees: &[SubmissionTree],
+        slices: &[stow_types::api::PublishedIndexSlice],
+    ) -> usize {
+        PublishedCoverage::new(slices)
+            .expect("coverage")
+            .uncovered_trees(trees)
+            .count()
+    }
+
+    fn coverage_tree() -> SubmissionTree {
+        use stow_types::identity::{DependencyIdentity, FeaturesJson};
+        let identity = |name: &str| TaskNodeIdentity {
+            crate_name: name.parse().expect("crate"),
+            version: CrateVersion::new(semver::Version::new(1, 0, 0)),
+            features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
+            target: TargetTriple::parse("wasm32-unknown-unknown").expect("target"),
+            rustc_version: WireRustcVersion::parse("1.99.1").expect("rustc"),
+            host_side: false,
+            profile: stow_types::node_profile::NodeProfile::Dev,
+        };
+        let node = |identity: TaskNodeIdentity, context, deps| stow_types::api::SubmissionNode {
+            task_id: identity.task_id(&context),
+            crate_name: identity.crate_name,
+            version: identity.version,
+            features_json: identity.features_json,
+            target: identity.target,
+            rustc_version: identity.rustc_version,
+            host_side: identity.host_side,
+            profile: identity.profile,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::default(),
+            preserve_lockfile: false,
+            dependency_identity: context,
+            deps,
+            downloads: 0,
+        };
+        let dep = node(
+            identity("itoa"),
+            DependencyIdentity::leaf().expect("leaf"),
+            vec![],
+        );
+        let context = DependencyIdentity::from_task_ids([dep.task_id.as_str()]).expect("context");
+        let root = node(identity("serde_json"), context, vec![0]);
+        SubmissionTree {
+            source: SubmissionSource::Preheat,
+            roots: vec![1],
+            nodes: vec![dep, root],
+        }
+    }
+
+    fn coverage_slice(tree: &SubmissionTree) -> stow_types::api::PublishedIndexSlice {
+        use stow_types::artifact::{ArtifactKind, RustCrateType};
+        use stow_types::identity::{CMetadata, DependencyCMetadataJson};
+        use stow_types::platform::{PanicStrategy, Profile, StripLevel};
+        use stow_types::public_cache::{UnitKind, UnitShape, UnitSide};
+        let rows = tree
+            .nodes
+            .iter()
+            .flat_map(|node| {
+                [UnitKind::Linked, UnitKind::Unlinked].map(|kind| ArtifactIndexRow {
+                    crate_name: node.crate_name.clone(),
+                    version: node.version.clone(),
+                    features_json: node.features_json.clone(),
+                    dependency_c_metadata_json: DependencyCMetadataJson::default(),
+                    dependency_task_ids: node
+                        .deps
+                        .iter()
+                        .map(|index| tree.nodes[*index as usize].task_id.clone())
+                        .collect(),
+                    c_metadata: CMetadata::parse("0123456789abcdef0123456789abcdef")
+                        .expect("metadata"),
+                    compile_key: "01".repeat(32),
+                    bundle_digest: format!("sha256:{}", "02".repeat(32)),
+                    bundle_size: 1234,
+                    artifact_kind: ArtifactKind::Rlib,
+                    crate_types: vec![RustCrateType::Rlib],
+                    profile: Profile {
+                        opt_level: "0".to_owned(),
+                        debuginfo: 2,
+                        debug_assertions: true,
+                        overflow_checks: true,
+                        panic: PanicStrategy::Unwind,
+                        strip: StripLevel::None,
+                    },
+                    node_profile: node.profile,
+                    emit: vec!["metadata".to_owned()],
+                    unit_shape: UnitShape {
+                        side: UnitSide::Target,
+                        invocation: UnitInvocation::Target,
+                        kind,
+                    },
+                    min_glibc: None,
+                })
+            })
+            .collect();
+        stow_types::api::PublishedIndexSlice {
+            target: tree.nodes[0].target.clone(),
+            rustc_version: tree.nodes[0].rustc_version.clone(),
+            rows,
+            local_programs: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn covered_submissions_send_nothing_and_incomplete_ones_keep_their_closure() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 200,
+            retry_after: None,
+            body: r#"{"submitted":2,"inserted":1,"dropped":0}"#,
+        }])
+        .await;
+        let edge = crate::Edge::for_test(server.url.clone());
+        let trees = [coverage_tree()];
+        let mut published = [coverage_slice(&trees[0])];
+        let covered = crate::projects::submit_chunked(
+            &edge,
+            &trees,
+            &PublishedCoverage::new(&published).expect("coverage"),
+        )
+        .await
+        .expect("covered submission");
+        assert_eq!(covered.batches, 0);
+        assert_eq!(covered.submitted, 0);
+        published[0].rows.remove(0);
+        let incomplete = crate::projects::submit_chunked(
+            &edge,
+            &trees,
+            &PublishedCoverage::new(&published).expect("coverage"),
+        )
+        .await
+        .expect("incomplete submission");
+        assert_eq!(incomplete.batches, 1);
+        assert_eq!(incomplete.submitted, 2);
+        let requests = server.join().await;
+        assert_eq!(requests.len(), 1);
+        let submitted: Vec<SubmissionTree> =
+            serde_json::from_slice(&requests[0].body).expect("submitted trees");
+        assert_eq!(submitted, trees);
+    }
+
+    #[test]
+    fn a_complete_exact_published_closure_needs_no_submission() {
+        let trees = [coverage_tree()];
+        let published = [coverage_slice(&trees[0])];
+        assert_eq!(uncovered_count(&trees, &published), 0);
+        assert_eq!(uncovered_count(&trees, &[]), 1);
+    }
+
+    #[test]
+    fn a_published_root_does_not_hide_an_unpublished_dependency_or_shape() {
+        let trees = [coverage_tree()];
+        let mut slice = coverage_slice(&trees[0]);
+        slice.rows.remove(0);
+        assert_eq!(uncovered_count(&trees, &[slice.clone()]), 1);
+        slice
+            .rows
+            .retain(|row| row.crate_name != trees[0].nodes[0].crate_name);
+        assert_eq!(uncovered_count(&trees, &[slice]), 1);
+    }
+
+    #[test]
+    fn published_profiles_and_dependency_contexts_do_not_cover_other_nodes() {
+        let trees = [coverage_tree()];
+        let mut profile = coverage_slice(&trees[0]);
+        for row in &mut profile.rows {
+            row.node_profile = stow_types::node_profile::NodeProfile::Release;
+        }
+        assert_eq!(uncovered_count(&trees, &[profile]), 1);
+        let mut context = coverage_slice(&trees[0]);
+        for row in &mut context.rows {
+            row.dependency_task_ids.clear();
+        }
+        assert_eq!(uncovered_count(&trees, &[context]), 1);
+    }
 
     /// The manual wave's only reach toward builds is the trusted
     /// submit: one POST of the resolved trees to
@@ -697,6 +950,7 @@ mod tests {
                 .expect("leaf identity"),
             deps: vec![],
             downloads: 0,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         let tree = SubmissionTree {
             source: SubmissionSource::Operations { priority: 3_000 },
@@ -717,11 +971,11 @@ mod tests {
         );
     }
 
-    /// stow#844: `published_slice_rows` treats a package that does not
+    /// stow#844: `published_slice` treats a package that does not
     /// exist as the empty index — GHCR's `403 DENIED` on the anonymous
     /// token exchange reads `None`, the same answer a missing tag gives.
     #[tokio::test]
-    async fn published_slice_rows_reads_a_missing_package_as_none() {
+    async fn published_slice_reads_a_missing_package_as_none() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -760,7 +1014,7 @@ mod tests {
             trust: &trust,
         };
 
-        let rows = published_slice_rows(
+        let rows = published_slice(
             &index,
             &TargetTriple::parse("x86_64-unknown-linux-gnu").expect("target"),
             &rustc_version,

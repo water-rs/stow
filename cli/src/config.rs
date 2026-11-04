@@ -10,6 +10,9 @@ use sqlx::SqlitePool;
 use stow_types::error::Context;
 use tokio::sync::OnceCell;
 
+use stow_types::public_cache::UnitSource;
+
+use crate::artifact_cache::ArtifactProvenance;
 use crate::state_db::StateDb;
 use crate::wrapper_shim;
 
@@ -43,52 +46,80 @@ const DEFAULT_INDEX_REFRESH_SECS: u64 = 600;
 /// eight stalled attempts (stow#977). Publishing keeps
 /// [`stow_oci::TransportPolicy::PATIENT`].
 const REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-/// What the cache is allowed to touch (stow#1059): the `cache_mode` option of
-/// the global config, read by every stow process. It is independent of the
-/// build isolation level: a build with the cache off still runs its build
-/// scripts and proc macros at the configured level.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CacheMode {
-    /// The public cache and the local cache. The default.
-    #[default]
-    Public,
-    /// The local cache only: no stow process makes a network request.
-    Local,
-    /// No cache at all: the local cache is neither read nor written, and no
-    /// stow process makes a network request.
-    Off,
+/// Which cache layers a stow process may use (stow#1007): the `[cache]` table
+/// of the global config, read by every stow process, with a flag on each
+/// cargo-running command overriding it for one run. The layers are
+/// independent of the build isolation level: a build with every layer off
+/// still runs its build scripts and proc macros at the configured level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheLayers {
+    /// The remote cache: every edge and registry request, the miss journal,
+    /// the inexact reports, and the entries downloaded from the remote
+    /// earlier. Off, no remote-built artifact takes part in the build and
+    /// nothing about its graph leaves the machine.
+    pub remote: bool,
+    /// Lookup and store of locally built crates.io units.
+    pub local_crates_io: bool,
+    /// Lookup and store of locally built git units.
+    pub local_git: bool,
 }
 
-impl CacheMode {
-    /// The name the config file spells.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Public => "public",
-            Self::Local => "local",
-            Self::Off => "off",
+impl Default for CacheLayers {
+    fn default() -> Self {
+        Self {
+            remote: true,
+            local_crates_io: true,
+            local_git: true,
         }
     }
+}
 
+impl CacheLayers {
     /// Whether stow may reach the index registry and the edge: the one
     /// predicate every network call site is gated on.
     pub const fn reaches_network(self) -> bool {
-        matches!(self, Self::Public)
+        self.remote
     }
 
-    /// Whether the local artifact and C/C++ caches are read and written.
-    pub const fn uses_local_cache(self) -> bool {
-        !matches!(self, Self::Off)
+    /// Whether locally built units of this source are looked up and stored.
+    pub const fn local(self, source: &UnitSource) -> bool {
+        match source {
+            UnitSource::CratesIo { .. } => self.local_crates_io,
+            UnitSource::Git { .. } => self.local_git,
+        }
+    }
+
+    /// Whether an entry of this provenance may serve a unit of this source:
+    /// a downloaded entry belongs to the remote layer, a self-built one to
+    /// the local layer of its source.
+    pub const fn serves(self, provenance: ArtifactProvenance, source: &UnitSource) -> bool {
+        match provenance {
+            ArtifactProvenance::Remote => self.remote,
+            ArtifactProvenance::Local => self.local(source),
+        }
+    }
+
+    /// Every layer is off: nothing is looked up, recorded or stored.
+    pub const fn is_off(self) -> bool {
+        !self.remote && !self.local_crates_io && !self.local_git
+    }
+
+    /// Whether the C/C++ object cache is used: it has no source kind, so it
+    /// stays on while any local layer is.
+    pub const fn uses_cc_cache(self) -> bool {
+        self.local_crates_io || self.local_git
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowConfig {
-    /// The global config's `cache_mode`. Every network request goes through
+    /// The resolved cache layers: the global config's `[cache]` table, then
+    /// the run's flags. Every network request goes through
     /// [`Self::registry_http`] or [`crate::edge_client::client`], which both
-    /// refuse a mode that does not reach the network.
+    /// refuse a config whose remote layer is off.
     #[serde(default)]
-    pub cache_mode: CacheMode,
+    pub cache: CacheLayers,
     pub edge_url: String,
     /// OCI registry root every index/artifact pull hits, in
     /// `scheme://host[:port]` form — the pull appends `/v2/<repository>`
@@ -171,20 +202,19 @@ impl StowConfig {
         Ok(Arc::clone(material))
     }
 
-    /// Refuse a network request in a cache mode that does not reach the
-    /// network. Callers gate on [`CacheMode::reaches_network`] first, so the
-    /// failure is a wiring bug, never a path a build takes.
+    /// Refuse a network request while the remote cache is off. Callers gate
+    /// on [`CacheLayers::reaches_network`] first, so the failure is a wiring
+    /// bug, never a path a build takes.
     ///
     /// # Errors
     ///
-    /// The cache mode is `local` or `off`.
+    /// The remote cache layer is off.
     pub fn require_network(&self, what: &str) -> stow_types::error::Result<()> {
-        if self.cache_mode.reaches_network() {
+        if self.cache.reaches_network() {
             return Ok(());
         }
         Err(stow_types::stow_error!(
-            "{what} needs the network, but `cache_mode` is `{}`; set `cache_mode = \"public\"` in the stow config to allow it",
-            self.cache_mode.as_str()
+            "{what} needs the network, but the remote cache is off; set `remote = true` in the `[cache]` table of the stow config and drop `--no-remote-cache` to allow it"
         ))
     }
 
@@ -312,9 +342,9 @@ impl StowConfig {
         let verify_mode = load_verify_mode(file_config.as_ref())?;
 
         Ok(Self {
-            cache_mode: file_config
+            cache: file_config
                 .as_ref()
-                .and_then(|config| config.cache_mode)
+                .and_then(|config| config.cache)
                 .unwrap_or_default(),
             edge_url,
             registry_base_url: resolve_registry_base_url(file_config.as_ref()),
@@ -358,9 +388,9 @@ impl StowConfig {
         let file_config = load_user_config()?;
         let verify_mode = load_verify_mode(file_config.as_ref())?;
         Ok(Self {
-            cache_mode: file_config
+            cache: file_config
                 .as_ref()
-                .and_then(|config| config.cache_mode)
+                .and_then(|config| config.cache)
                 .unwrap_or_default(),
             edge_url: resolve_edge_url(file_config.as_ref()),
             registry_base_url: resolve_registry_base_url(file_config.as_ref()),
@@ -446,19 +476,20 @@ pub fn load_isolation_config() -> stow_types::error::Result<crate::isolation::Is
         .unwrap_or_default())
 }
 
-/// The `cache_mode` of the global config, `public` when the file or the
-/// option is absent. A driver's `STOW_CONFIG_BLOB` carries it already, so a
-/// wrapper under a driver never re-reads the file.
+/// The `[cache]` table of the global config, every layer on when the file or
+/// the table is absent. A driver's `STOW_CONFIG_BLOB` carries the resolved
+/// layers already, flags included, so a wrapper under a driver never re-reads
+/// the file.
 ///
 /// # Errors
 ///
 /// A config file that exists and cannot be read or parsed, or a blob that
 /// cannot be decoded.
-pub fn load_cache_mode() -> stow_types::error::Result<CacheMode> {
+pub fn load_cache_layers() -> stow_types::error::Result<CacheLayers> {
     #[derive(serde::Deserialize)]
     struct Blob {
         #[serde(default)]
-        cache_mode: CacheMode,
+        cache: CacheLayers,
     }
     if let Some(raw) = std::env::var_os(STOW_CONFIG_BLOB_ENV) {
         let raw = raw
@@ -466,10 +497,10 @@ pub fn load_cache_mode() -> stow_types::error::Result<CacheMode> {
             .map_err(|_| stow_types::stow_error!("{STOW_CONFIG_BLOB_ENV} must be valid UTF-8"))?;
         let blob: Blob = serde_json::from_str(&raw)
             .wrap_err_with(|| format!("parse {STOW_CONFIG_BLOB_ENV} as JSON"))?;
-        return Ok(blob.cache_mode);
+        return Ok(blob.cache);
     }
     Ok(load_user_config()?
-        .and_then(|config| config.cache_mode)
+        .and_then(|config| config.cache)
         .unwrap_or_default())
 }
 
@@ -620,8 +651,9 @@ fn load_user_config() -> stow_types::error::Result<Option<StowUserConfig>> {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StowUserConfig {
-    cache_mode: Option<CacheMode>,
+    cache: Option<CacheLayers>,
     edge_url: Option<String>,
     registry_base_url: Option<String>,
     cache_dir: Option<String>,
@@ -709,6 +741,41 @@ fn load_artifact_cache_max_bytes(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_layer_serves_only_the_entries_it_owns() {
+        use super::{ArtifactProvenance as Provenance, CacheLayers, UnitSource};
+        let crates_io = UnitSource::CratesIo {
+            package: "demo".to_owned(),
+            version: "1.0.0".to_owned(),
+        };
+        let git = UnitSource::Git {
+            commit: "0".repeat(40),
+            manifest_path_in_repo: String::new(),
+        };
+        for bits in 0..8u8 {
+            let layers = CacheLayers {
+                remote: bits & 1 != 0,
+                local_crates_io: bits & 2 != 0,
+                local_git: bits & 4 != 0,
+            };
+            // A downloaded entry belongs to the remote layer whatever its
+            // source; a self-built one to the local layer of its source.
+            for source in [&crates_io, &git] {
+                assert_eq!(layers.serves(Provenance::Remote, source), layers.remote);
+            }
+            assert_eq!(
+                layers.serves(Provenance::Local, &crates_io),
+                layers.local_crates_io
+            );
+            assert_eq!(layers.serves(Provenance::Local, &git), layers.local_git);
+            assert_eq!(layers.local(&crates_io), layers.local_crates_io);
+            assert_eq!(layers.local(&git), layers.local_git);
+            assert_eq!(layers.reaches_network(), layers.remote);
+            assert_eq!(layers.is_off(), bits == 0);
+            assert_eq!(layers.uses_cc_cache(), bits & 6 != 0);
+        }
+    }
+
     use std::path::Path;
 
     #[test]

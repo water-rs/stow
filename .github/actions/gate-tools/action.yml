@@ -1,0 +1,28 @@
+name: Restore gate tools
+description: Extract the selected tool variant built by this workflow.
+inputs:
+  variant:
+    description: Tool variant (production, preheat or mock).
+    required: true
+  runtime-cache:
+    description: Restore Cargo downloads and compiled dependencies for mock-stack builds.
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      if: inputs.runtime-cache == 'true'
+      with:
+        shared-key: mock-e2e
+        save-if: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: gate-tools-${{ inputs.variant }}
+        path: ${{ runner.temp }}/gate-tools-archive
+    - shell: bash
+      run: |
+        STOW_GATE_BIN_DIR="$RUNNER_TEMP/gate-tools"
+        mkdir -p "$STOW_GATE_BIN_DIR"
+        tar -xzf "$RUNNER_TEMP/gate-tools-archive/gate-tools.tar.gz" -C "$STOW_GATE_BIN_DIR"
+        echo "STOW_GATE_BIN_DIR=$STOW_GATE_BIN_DIR" >> "$GITHUB_ENV"

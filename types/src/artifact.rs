@@ -29,6 +29,9 @@ pub enum RustCrateType {
     Staticlib,
     /// `proc-macro` — a procedural macro crate.
     ProcMacro,
+    /// `bin` — an executable: the only binary the cache holds is a
+    /// crate's build script.
+    Bin,
 }
 
 // Order by the wire string, not declaration order: producers sort
@@ -58,6 +61,7 @@ impl RustCrateType {
             Self::Cdylib => "cdylib",
             Self::Staticlib => "staticlib",
             Self::ProcMacro => "proc-macro",
+            Self::Bin => "bin",
         }
     }
 }
@@ -74,17 +78,23 @@ pub enum ArtifactKind {
     /// Dynamic library for proc-macro crates (compiled for HOST).
     /// Contains .so (Linux), .dylib (macOS), or .dll (Windows).
     ProcMacro,
+    /// A crate's build-script executable (compiled for the HOST): an
+    /// output of the crate's node, keyed by the host it runs on and the
+    /// crate's build-dependencies, never by the target the crate is
+    /// built for.
+    BuildScript,
 }
 
 impl ArtifactKind {
     /// The lowercase wire string for this kind (`rlib`, `dylib`,
-    /// `proc-macro`).
+    /// `proc-macro`, `build-script`).
     #[must_use]
     pub const fn as_str(&self) -> &str {
         match self {
             Self::Rlib => "rlib",
             Self::Dylib => "dylib",
             Self::ProcMacro => "proc-macro",
+            Self::BuildScript => "build-script",
         }
     }
 
@@ -92,7 +102,7 @@ impl ArtifactKind {
     /// `artifacts.artifact_kind` column is read back.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
-        [Self::Rlib, Self::Dylib, Self::ProcMacro]
+        [Self::Rlib, Self::Dylib, Self::ProcMacro, Self::BuildScript]
             .into_iter()
             .find(|kind| kind.as_str() == value)
     }
@@ -198,6 +208,7 @@ mod tests {
             ArtifactKind::Rlib,
             ArtifactKind::Dylib,
             ArtifactKind::ProcMacro,
+            ArtifactKind::BuildScript,
         ] {
             assert_eq!(ArtifactKind::parse(kind.as_str()), Some(kind));
         }
@@ -214,6 +225,7 @@ mod tests {
             RustCrateType::Cdylib,
             RustCrateType::Staticlib,
             RustCrateType::ProcMacro,
+            RustCrateType::Bin,
         ];
         all.sort();
         let strings: Vec<&str> = all.iter().map(RustCrateType::as_str).collect();

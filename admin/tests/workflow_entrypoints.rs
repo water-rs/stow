@@ -1032,40 +1032,6 @@ fn index_publish_title_with_extra_dashes_keeps_rustc_prefix() {
 // build-crate.yml — the dispatched per-task build
 // ---------------------------------------------------------------------------
 
-/// The scheduler's deliveries-stopped bound (stow#860) is the sum of the
-/// timeouts of the `build-crate.yml` jobs a task run executes; a timeout
-/// change must move it. The operator's repack job never runs in a task
-/// run, so its bound is not part of the scheduler's.
-#[test]
-fn build_crate_run_timeout_matches_the_jobs() {
-    let wf = load_workflow("build-crate.yml");
-    let jobs = field(&wf, "jobs")
-        .and_then(serde_yml::Value::as_mapping)
-        .expect("jobs mapping");
-    let mut minutes = 0;
-    for (name, job) in jobs {
-        let condition = field(job, "if")
-            .map(scalar)
-            .expect("every build-crate.yml job states which run kind executes it");
-        let timeout = field(job, "timeout-minutes")
-            .map(scalar)
-            .expect("every build-crate.yml job sets timeout-minutes")
-            .parse::<i64>()
-            .expect("timeout-minutes is an integer");
-        if condition.starts_with("inputs.repack_rustc == ''") {
-            minutes += timeout;
-        } else {
-            assert_eq!(
-                condition,
-                "inputs.repack_rustc != ''",
-                "job {} runs in neither a task run nor a repack run",
-                scalar(name)
-            );
-        }
-    }
-    assert_eq!(minutes, stow_types::api::BUILD_CRATE_RUN_TIMEOUT_MINUTES);
-}
-
 /// `build-crate.yml` is the dispatched per-task build: one
 /// `workflow_dispatch` input `task` carries the whole `BuildTaskPayload`,
 /// the run's `run-name` stamps `<rustc>-<task_id>` for the completion

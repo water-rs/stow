@@ -499,7 +499,7 @@ mod tests {
 
     fn test_config(cache_dir: PathBuf) -> StowConfig {
         StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             edge_url: "https://stow.waterui.dev".to_owned(),
             registry_base_url: stow_types::registry::GHCR_REGISTRY_URL.to_owned(),
             cache_dir,

@@ -23,8 +23,10 @@ anyone integrating with or modifying the trust-critical paths.
   the admissions/enqueue endpoints, the Turnstile-admitted request lane
   and the trusted admin routes; `dependency_resolver.rs` holds the
   edge's crates.io reads; `scheduler/` is the DO — queue, dispatch
-  and request records (schema at
-  `edge/src/scheduler/schema.sql`).
+  and request state in an in-memory graph. SQLite persists the append-only
+  event log, chunked snapshots and metering checkpoint
+  (`edge/src/scheduler/schema.sql`); accepted events are appended before
+  acknowledgment.
   The crate is split by target: pure catalog/scheduler logic compiles
   and unit-tests on the host, Cloudflare-bound modules are
   `wasm32`-gated, and crates.io access goes through the
@@ -203,6 +205,20 @@ lane and raises its priority to the human class; a node reached from
 several entry points keeps the highest priority and its first-requested
 time.
 
+Release-profile nodes (stow#1012) rank inside the same aging rank at a
+fixed share of their entry point's priority: a release node's rank is
+`priority × multiplier × time waited`, the multiplier an operator
+setting (default 10%, `stow-admin release-priority set --percent N`,
+read at claim time so a change re-ranks queued nodes). Release work
+therefore queues behind dev work of the same age and entry point, while
+a release node that keeps waiting — a popular library many `--release`
+consumers miss — overtakes fresher dev work instead of starving behind
+it. Preheat submits every source's dev and release node sets; a CLI
+cache miss of a release-profile unit enters as a release node at the
+CLI miss's priority. A `--release` consumer's host units (proc macros,
+build-dependency libraries) are release-profile nodes of their own,
+distinct from the dev host nodes.
+
 The crate named in the request is itself only a name source: the
 expansion drops any package crates.io's version record marks
 `has_lib: false` — the requested root and a bin-only package reachable
@@ -376,14 +392,14 @@ alone — nothing reads an older shape of a store.
 
 Every artifact is a tag of its rustc's GHCR package — one package per
 rustc version — referenced as
-`ghcr.io/water-rs/stow-cache-<rustc>:{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`
+`ghcr.io/water-rs/stow-cache-v2-<rustc>:{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`
 (see `types/src/registry.rs`). The crate name is the tag's first
 `.`-separated segment — crates.io names never contain `.`, so the split is
 unambiguous (`sha-1.0.10.0-…` is crate `sha-1`, version `0.10.0`). A new
-rustc's package is created by its first `build-crate.yml` push: it links
-to the public `water-rs/stow` repository and inherits its visibility, so
-no manual step ever opens one, and a retired rustc's package is deleted
-whole. Before it exists — or after a deletion — GHCR answers an
+rustc's package is created by its first push: it links to `water-rs/stow`
+and inherits repository access permissions, but starts private. An operator
+sets its visibility to public before anonymous readers can use it. A retired
+rustc's package is deleted whole. Before it exists — or after a deletion — GHCR answers an
 anonymous pull of it with `403 DENIED` rather than `404`; every index
 reader treats that answer as the empty index, the same result a missing
 tag gives, so a fresh rustc's first builds can start it and a deleted
@@ -453,7 +469,7 @@ id, so the scheduler logs the completion as an orphan run.
 Every servable artifact row is additionally published as a signed,
 per-slice index so a client resolves cache coverage locally instead of
 querying the edge (#188). One index exists per `(target, rustc_version)`
-pair: the tag `index.<target>.<rustc>` on `ghcr.io/water-rs/stow-cache-<rustc>`
+pair: the tag `index.<target>.<rustc>` on `ghcr.io/water-rs/stow-cache-v2-<rustc>`
 (`stow_types::index::index_tag`) names a single-layer OCI artifact whose
 layer is the zstd-compressed JSON `ArtifactIndex` (media type
 `application/vnd.stow.index.v1+zstd`; config
@@ -517,7 +533,7 @@ republish untags the previous manifest, a rebuilt task's older
 signature manifest accumulates under no retention of its own. GitHub's
 package-versions API cannot enumerate a package at the cache's size, so
 stow never deletes single versions: when a rustc is retired its whole
-`stow-cache-<rustc>` package is deleted, and a served rustc's cache
+`stow-cache-v2-<rustc>` package is deleted, and a served rustc's cache
 rebuilds into its package from empty if the package is ever reset.
 `docs/DEPLOYMENT.md` carries the procedure.
 
@@ -585,16 +601,31 @@ run's outcome to the scheduler's `POST /tasks/complete-run`. A
 job pushed exists in GHCR; the edge checks that before it forwards. `stow-admin index export` rebuilds each index slice
 from those signed records — the slices are the only catalog.
 
+A failed build may run the separate `verify source failure` job. It rebuilds
+without stow cache artifacts using the same toolchain, wrapper manifest,
+frozen dependency lock and compilation flags. Only identical, nonempty
+source diagnostics produce verified evidence; mixed tool or unknown errors
+remain infrastructure failures. Artifacts and evidence are bound to the
+GitHub run id and attempt. The original build remains failed and publishes
+nothing.
+
+For each failed completion, the scheduler queries that attempt's GitHub
+jobs through the CI interface. A successful verification job excludes the
+failure from breaker counts while retaining its failure history. Missing
+or failed verification, including a failed jobs query, still counts. This
+adds a jobs query on failed completions, with pagination only when needed;
+it adds no idle polling or stored-graph scan.
+
 What each hop is allowed to do:
 
 | Hop | Reads | Writes |
 |---|---|---|
 | stow CLI (`cli/`) | GHCR: signed `index.*` slices (anonymous pull); edge: bundle blobs streamed through `GET /api/v1/bundles/{rustc_version}/{digest}`, `/api/v1/admissions` + `/api/v1/enqueue` responses | local cache only |
 | edge worker (`edge/`) | crates.io, GHCR, Analytics Engine SQL API | scheduler queue (enqueue submits only); `stow_cache_misses` Analytics Engine points (every miss) |
-| scheduler DO | its SQLite store | its SQLite store; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
+| scheduler DO | its in-memory graph, restored from the SQLite snapshot and event log | its SQLite event log and snapshots; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — keyless signing) | GHCR objects (bundles + `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifacts); sigstore signatures |
-| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-<rustc>`; the scheduler's published membership via `/api/v1/admin/index/published` when its `report` input is set |
+| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-v2-<rustc>`; the scheduler's published membership via `/api/v1/admin/index/published` when its `report` input is set |
 
 The edge's remaining crates.io reads are the request route's version and
 rustc lookups, the site pickers (`crates/search`, `crates/{name}/versions`,
@@ -625,6 +656,16 @@ attacker-influenced, so the publisher (`ci/src/stage.rs`, `ci/src/closure.rs`,
   and is rejected;
 - every `oci_reference` equals the reference the artifact's own identity
   fields produce, so a plan cannot push under another artifact's name.
+
+Build-script executables belong to their crate node and are keyed for the
+host. The index stores them in `build_scripts`, separate from library rows;
+consuming a script never counts as completing its library. A script or proc
+macro whose compiler dep-info reads `CARGO_MANIFEST_DIR` stays in the local
+cache under a key that includes its source directory. A nonrelocatable proc
+macro completes with a signed `local_programs` declaration instead of a
+bundle. Consumers may compile that exact declared dependency locally while
+serving its library dependencies. The publisher checks the declaration
+against the resolved proc-macro closure and the signed index.
 
 Inside the build job, the untrusted half of the pipeline is additionally
 confined. `cargo fetch` resolves and downloads the dependency closure on the
@@ -908,13 +949,14 @@ unauthorized POSTs short-circuit before deserialization.
 | POST `/api/v1/admin/dispatch-freeze` | Bearer: `operations.yml` OIDC on `main` | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|engage\|clear`) |
 | GET `/api/v1/admin/dispatch-cap` | Bearer: repo-workflow OIDC or push user | — | `DispatchCaps` | The dispatch caps in force plus the operator setting behind them (stow#1039) |
 | POST `/api/v1/admin/dispatch-cap` | Bearer: `operations.yml` OIDC on `main` | `DispatchCapSet` | `DispatchCaps` | The operator's `set` — replaces the cap bindings at claim time until the next `set` (`stow-admin dispatch-cap status\|set`) |
+| GET `/api/v1/admin/release-priority` | Bearer: repo-workflow OIDC or push user | — | `ReleasePriority` | The multiplier release-profile nodes rank under plus the operator setting behind it (stow#1012) |
+| POST `/api/v1/admin/release-priority` | Bearer: `operations.yml` OIDC on `main` | `ReleasePrioritySet` | `ReleasePriority` | The operator's `set` — the multiplier in force until the next `set` (`stow-admin release-priority status\|set`) |
 | GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes — `stow-admin status` |
 | GET `/api/v1/admin/queue?task_ids=…&status=&target=&rustc=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
 | POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: `operations.yml` OIDC on `main` | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |
 | GET `/api/v1/admin/coverage/{crate_name}?version=&target=` | Bearer: repo-workflow OIDC or push user | — | `CrateCoverage` | Per-CI-target servable identities for one crate — `coverage` |
 | GET `/api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<ArtifactRecord>` | Bounded catalog listing (≤1000) — the prune preview |
 | GET `/api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}` | Bearer: repo-workflow OIDC or push user | — | `ArtifactInspection` | Catalog row plus the bundle's OCI manifest from GHCR — `artifacts inspect` |
-| POST `/api/v1/admin/artifacts/prune` | Bearer: repo-workflow OIDC or push user | `ArtifactPruneRequest` | `ArtifactPruneResponse` | Delete a retired toolchain's catalog rows; GHCR tags are not deleted — `artifacts prune` |
 | POST `/api/v1/admissions` | none | `AdmissionRequest` | `Vec<EnqueueAdmission>` | Mint enqueue admissions for a posted miss or inexact-hit report (`source`) — the only call that ships the dependency graph off the machine |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestStatus` | Human request: admit and dispatch a `resolve-request.yml` run that enqueues the crate's closure on every CI target in the human lane |

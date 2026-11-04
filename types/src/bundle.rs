@@ -35,6 +35,8 @@ pub const STOW_RMETA_MEDIA_TYPE: &str = "application/vnd.stow.rmeta.v1";
 pub const STOW_DYLIB_MEDIA_TYPE: &str = "application/vnd.stow.dylib.v1";
 /// Media type of a proc-macro dynamic library inside a bundle.
 pub const STOW_PROC_MACRO_MEDIA_TYPE: &str = "application/vnd.stow.proc-macro.v1";
+/// Media type of a crate's build-script executable inside a bundle.
+pub const STOW_BUILD_SCRIPT_MEDIA_TYPE: &str = "application/vnd.stow.build-script.v1";
 /// A tar of the build script's `OUT_DIR` tree, carried as a file of the pack.
 pub const STOW_NATIVE_ARCHIVE_MEDIA_TYPE: &str = "application/vnd.stow.native-out-dir.v1+tar";
 /// Path of the per-artifact manifest inside a bundle tar.

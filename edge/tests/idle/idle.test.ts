@@ -280,6 +280,7 @@ describe("scheduler idle proof (stow#593)", () => {
 				task_id: task.task_id,
 				success: true,
 				github_run_id: runId,
+				github_run_attempt: 1,
 			}),
 		});
 		expect(res.status).toBe(200);

@@ -280,7 +280,7 @@ check_children_alive() {
 # what this lane tests.
 isolated_env() {
     local name
-    local -a dropped=()
+    local -a dropped=(-u CARGO_TARGET_DIR)
     for name in $(compgen -e); do
         case "$name" in
             CARGO_PROFILE_*) dropped+=(-u "$name") ;;
@@ -361,12 +361,12 @@ for s in json.load(open(sys.argv[1])):
     [ -f "$WORK_DIR/index-export/new-records.json" ] \
         || die "index export wrote no new-records.json"
     if [ -f "$WORK_DIR/catalog.json" ]; then
-        jq -s add "$WORK_DIR/index-export/new-records.json" \
+        jq -s ".[0].artifacts + .[1]" "$WORK_DIR/index-export/new-records.json" \
             "$WORK_DIR/catalog.json" >"$WORK_DIR/catalog.next.json" \
             || die "catalog merge failed"
         mv "$WORK_DIR/catalog.next.json" "$WORK_DIR/catalog.json"
     else
-        cp "$WORK_DIR/index-export/new-records.json" "$WORK_DIR/catalog.json"
+        jq .artifacts "$WORK_DIR/index-export/new-records.json" > "$WORK_DIR/catalog.json"
     fi
 }
 
@@ -396,6 +396,12 @@ prepare_consumer() {
         || die "stow setup wrote no $WORK_DIR/cargo-home/config.toml"
 }
 
+# Detached journal work can still hold the state database after a check
+# exits. Let SQLite wait for that transaction, with a bounded failure.
+read_cache_stats() {
+    sqlite3 -cmd '.timeout 5000' "$WORK_DIR/stow-cache/state-v3.sqlite3" "$@"
+}
+
 # crate_stats is the CLI's own evidence a unit was served from the
 # signed slice rather than compiled: every named crate (canonical rustc
 # spelling — dashes are underscores) must show at least $1 cumulative
@@ -407,8 +413,8 @@ assert_served() {
     [ -f "$state_db" ] || die "stow state DB missing at $state_db"
     for dep in "$@"; do
         canonical="${dep//-/_}"
-        hits="$(sqlite3 "$state_db" "SELECT COALESCE(SUM(hits),0) FROM crate_stats WHERE crate_name='$canonical'")"
-        errors="$(sqlite3 "$state_db" "SELECT COALESCE(SUM(errors),0) FROM crate_stats WHERE crate_name='$canonical'")"
+        hits="$(read_cache_stats "SELECT COALESCE(SUM(hits),0) FROM crate_stats WHERE crate_name='$canonical'")"
+        errors="$(read_cache_stats "SELECT COALESCE(SUM(errors),0) FROM crate_stats WHERE crate_name='$canonical'")"
         echo "[mock-e2e] $dep: hits=$hits errors=$errors"
         [ "$hits" -ge "$min_hits" ] \
             || die "$dep was not served from the cache (hits=$hits, expected at least $min_hits)"
@@ -443,12 +449,15 @@ RUSTC_VERSION="$(rustc --version | awk '{print $2}')"
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 RUSTUP_HOME_REAL="$(rustup show home)"
 # The environment every stow process of this run gets: its own home,
-# config and cargo home, with the real rustup toolchains.
+# config and cargo home, with the real rustup toolchains. Log assertions
+# read tracing fields as text, so the caller's color policy cannot apply.
 ISOLATED_ENV=(
     HOME="$WORK_DIR/home"
     XDG_CONFIG_HOME="$WORK_DIR/config"
     CARGO_HOME="$WORK_DIR/cargo-home"
     RUSTUP_HOME="$RUSTUP_HOME_REAL"
+    NO_COLOR=1
+    CARGO_TERM_COLOR=never
 )
 [ -n "$RUSTC_VERSION" ] && [ -n "$HOST_TARGET" ] || die "could not detect rustc version/host"
 
@@ -486,14 +495,9 @@ for toolchain in "$RUSTUP_TOOLCHAIN" "$RUSTC_VERSION"; do
 done
 
 cd "$REPO_ROOT"
-echo "[mock-e2e] building stow-cli, stow-build, stow-mock-registry, stow-admin"
-fg cargo build --release -p stow-cli --features mock-verify -p stow-build -p stow-mock-registry -p stow-admin \
-    >"$LOG_DIR/cargo-build.log" 2>&1 \
-    || die "cargo build failed — see $LOG_DIR/cargo-build.log"
-fg cargo build --release -p stow-mock-registry --example demand_feed_fixture \
-    >>"$LOG_DIR/cargo-build.log" 2>&1 \
-    || die "cargo build (demand_feed_fixture example) failed — see $LOG_DIR/cargo-build.log"
-BIN="$REPO_ROOT/target/release"
+source "$REPO_ROOT/scripts/gate-tools.sh"
+gate_tools mock "$LOG_DIR/cargo-build.log" fg \
+    || die "gate tools unavailable — see $LOG_DIR/cargo-build.log"
 
 # stow#523: typed demand-feed fixtures — the example writes the
 # enqueue/queue document, per-hour provider documents, typed
@@ -1300,14 +1304,14 @@ cap_json() {
 }
 
 echo "[mock-e2e] dispatch-cap: status reads the deploy bindings"
-cap_json status >"$WORK_DIR/dispatch-cap-status.json" 2>&1 \
+cap_json status >"$WORK_DIR/dispatch-cap-status.json" 2>"$LOG_DIR/dispatch-cap-status.log" \
     || die "dispatch-cap status failed — see $WORK_DIR/dispatch-cap-status.json"
 jq -e '.max_concurrent_jobs == 3 and .max_concurrent_macos_jobs == 11
        and (.setting | not)' "$WORK_DIR/dispatch-cap-status.json" >/dev/null \
     || die "dispatch-cap status before set: $(cat "$WORK_DIR/dispatch-cap-status.json")"
 
 # Without `--yes` the command prints the plan and changes nothing.
-cap_json set --jobs 2 >"$WORK_DIR/dispatch-cap-plan.json" 2>&1 \
+cap_json set --jobs 2 >"$WORK_DIR/dispatch-cap-plan.json" 2>"$LOG_DIR/dispatch-cap-plan.log" \
     || die "dispatch-cap set (plan only) failed — see $WORK_DIR/dispatch-cap-plan.json"
 jq -e '.dry_run == true and .plan.max_concurrent_jobs == 2' \
     "$WORK_DIR/dispatch-cap-plan.json" >/dev/null \
@@ -1349,7 +1353,7 @@ while :; do
     sleep 5
 done
 
-cap_json set --jobs 1 --macos 1 --yes >"$WORK_DIR/dispatch-cap-set.json" 2>&1 \
+cap_json set --jobs 1 --macos 1 --yes >"$WORK_DIR/dispatch-cap-set.json" 2>"$LOG_DIR/dispatch-cap-set.log" \
     || die "dispatch-cap set failed — see $WORK_DIR/dispatch-cap-set.json"
 jq -e '.dry_run == false and .result.max_concurrent_jobs == 1
        and .result.max_concurrent_macos_jobs == 1
@@ -1399,7 +1403,7 @@ wait_for "edge listener (restart)" "$READY_DEADLINE" "${CHILD_PIDS[$edge_index]}
     http_listening "$SCHEDULER_URL/status"
 wait_for "edge scheduler status (restart)" "$READY_DEADLINE" "${CHILD_PIDS[$edge_index]}" \
     curl -fsS "$SCHEDULER_URL/status"
-cap_json status >"$WORK_DIR/dispatch-cap-restart.json" 2>&1 \
+cap_json status >"$WORK_DIR/dispatch-cap-restart.json" 2>"$LOG_DIR/dispatch-cap-restart.log" \
     || die "dispatch-cap status after restart failed"
 jq -e '.max_concurrent_jobs == 1 and .max_concurrent_macos_jobs == 1
        and .setting.actor != null' "$WORK_DIR/dispatch-cap-restart.json" >/dev/null \
@@ -1441,7 +1445,7 @@ $saw_capped_wait \
 # Restore the binding values: a set has no clear, so the recorded
 # setting names exactly what the bindings say — the later waves read
 # the same caps either way.
-cap_json set --jobs 3 --macos 11 --yes >"$WORK_DIR/dispatch-cap-restore.json" 2>&1 \
+cap_json set --jobs 3 --macos 11 --yes >"$WORK_DIR/dispatch-cap-restore.json" 2>"$LOG_DIR/dispatch-cap-restore.log" \
     || die "dispatch-cap restore failed — see $WORK_DIR/dispatch-cap-restore.json"
 jq -e '.dry_run == false and .result.max_concurrent_jobs == 3
        and .result.max_concurrent_macos_jobs == 11' \
@@ -1468,8 +1472,8 @@ index_rows="$(awk '/^rows: /{print $2}' "$LOG_DIR/index-status.log" | head -1)"
 # list in-process and submits one tree per source to the scheduler's
 # operations lane (stow#880) — the scheduler then claims and dispatches
 # to the local CI server, exactly as the stow-admin submit wave did.
-# walkdir carries one unix dep (same-file), so the wave holds two
-# tasks in two layers. `--json` puts the submitted plan, task ids
+# walkdir carries one unix dep (same-file), so each of the dev and
+# release graphs holds two tasks. `--json` puts the submitted plan, task ids
 # included, on stdout: the wait below follows exactly those ids.
 printf 'walkdir\n' >"$WORK_DIR/manual-crates.txt"
 fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
@@ -1487,8 +1491,10 @@ fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
 manual_ids="$(jq -c '[.plan[].nodes[].task_id] | unique' "$WORK_DIR/preheat-manual.json")" \
     || die "preheat manual printed no plan — see $WORK_DIR/preheat-manual.json"
 manual_total="$(jq 'length' <<<"$manual_ids")"
-[ "$manual_total" -eq 2 ] \
-    || die "manual wave planned $manual_total task(s), expected walkdir and same-file: $manual_ids"
+jq -e '[.plan[].nodes[] | [.crate_name, (.profile // "dev")]] | sort ==
+    [["same-file", "dev"], ["same-file", "release"], ["walkdir", "dev"], ["walkdir", "release"]]' \
+    "$WORK_DIR/preheat-manual.json" >/dev/null \
+    || die "manual wave must contain walkdir and same-file in both dev and release: $manual_ids"
 
 # How the scheduler releases this wave, layer by layer:
 #   - the submit claims nothing inline; it arms the alarm, whose pass
@@ -1551,20 +1557,19 @@ done
 # The mock registry, like GHCR, serves /v2 only to an anonymous bearer
 # minted by its token endpoint.
 registry_token="$(curl -fsS --max-time 10 \
-    "http://${REGISTRY_ADDR}/token?service=${REGISTRY_ADDR}&scope=repository:water-rs/stow-cache-${RUSTC_VERSION}:pull" \
+    "http://${REGISTRY_ADDR}/token?service=${REGISTRY_ADDR}&scope=repository:water-rs/stow-cache-v2-${RUSTC_VERSION}:pull" \
     | jq -er .token)" \
     || die "mock registry token exchange failed"
 curl -fsS --max-time 10 -H "Authorization: Bearer ${registry_token}" \
-    "http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-${RUSTC_VERSION}/manifests/index.${HOST_TARGET}.${RUSTC_VERSION}" \
+    "http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-v2-${RUSTC_VERSION}/manifests/index.${HOST_TARGET}.${RUSTC_VERSION}" \
     -o /dev/null \
     || die "index slice index.${HOST_TARGET}.${RUSTC_VERSION} missing after the manual wave"
 
 # stow#880 — one task id, one build, however many submissions.
 # `preheat manual` resolves unicode-ident and submits it through the
-# operations lane; `stow-admin submit` posts the identical task right
-# behind. The scheduler merges by task id, so the second submit
-# inserts nothing and exactly one run exists — `built` across the
-# task's runs counts exactly one.
+# operations lane in both profiles; `stow-admin submit` posts the identical
+# dev task right behind. The scheduler merges by task id, so the second
+# submit inserts nothing and each profile has exactly one built run.
 UNICODE_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
     'https://index.crates.io/un/ic/unicode-ident' \
     | jq -rs '[.[] | select(.yanked | not) | .vers] | sort_by(split(".") | map(tonumber)) | last // empty')"
@@ -1581,13 +1586,19 @@ isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
     STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
-    "$BIN/stow-admin" preheat manual \
+    "$BIN/stow-admin" --json preheat manual \
     --crates "$WORK_DIR/dual-crates.txt" \
     --rustc-version "$RUSTC_VERSION" \
     --targets "$HOST_TARGET" \
     --yes \
-    >"$LOG_DIR/preheat-manual-dual.log" 2>&1 \
+    >"$WORK_DIR/preheat-manual-dual.json" 2>"$LOG_DIR/preheat-manual-dual.log" \
     || { cat "$LOG_DIR/preheat-manual-dual.log"; die "stow-admin preheat manual (dual) failed"; }
+dual_ids="$(jq -ce '[.plan[].nodes[].task_id] | unique' "$WORK_DIR/preheat-manual-dual.json")"
+jq -e '[.plan[].nodes[] | [.crate_name, (.profile // "dev")]] | sort ==
+    [["unicode-ident", "dev"], ["unicode-ident", "release"]]' \
+    "$WORK_DIR/preheat-manual-dual.json" >/dev/null \
+    || die "dual wave must contain unicode-ident in both profiles"
+dual_total="$(jq 'length' <<<"$dual_ids")"
 
 # The identical task submitted the second way: the scheduler merges by
 # task id, so the operations submit behind it inserts nothing and no
@@ -1605,21 +1616,21 @@ fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
 grep -q "inserted 0" "$LOG_DIR/admin-submit-dual.log" \
     || { cat "$LOG_DIR/admin-submit-dual.log"; die "dual submit inserted a second task — the merge should hold one"; }
 
-# The task's one run exists and settles — the alarm dispatches it after
-# the submit returns, so "no open run" alone holds before it exists.
+# Both profiles exist and settle — the alarm dispatches after the
+# submit returns, so "no open run" alone holds before they exist.
 deadline=$((SECONDS + TASK_DEADLINE))
 while :; do
     check_children_alive
     read -r dual_seen open_runs <<<"$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
-        | jq -r '[.tasks[] | select(.task_id != null and (.task_id | test("unicode-ident")))]
+        | jq -r --argjson ids "$dual_ids" '[.tasks[] | select(.task_id as $id | $ids | index($id))]
             | "\(length) \(map(select(.status != "completed")) | length)"')"
-    [ "$dual_seen" -ge 1 ] && [ "$open_runs" -eq 0 ] && break
+    [ "$dual_seen" -ge "$dual_total" ] && [ "$open_runs" -eq 0 ] && break
     [ "$SECONDS" -ge "$deadline" ] && die "dual task has $dual_seen run(s), $open_runs open, after ${TASK_DEADLINE}s"
     sleep 5
 done
 
 # The scheduler's own completion arrived over the run's webhook —
-# completed ticks up by exactly one and nothing failed.
+# completed covers both profiles and nothing failed.
 deadline=$((SECONDS + 300))
 while :; do
     status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
@@ -1627,20 +1638,22 @@ while :; do
         echo "[mock-e2e] scheduler (dual): $status_json"
         [ "$(( $(jq -r '.failed' <<<"$status_json") - BASE_FAILED ))" -ge 1 ] \
             && die "scheduler failed the dual task: $status_json"
-        [ "$(jq -r '.completed' <<<"$status_json")" -gt "$completed_before" ] && break
+        [ "$(jq -r '.completed' <<<"$status_json")" -ge "$((completed_before + dual_total))" ] && break
     fi
     [ "$SECONDS" -ge "$deadline" ] && die "scheduler did not complete the dual task within 300s"
     sleep 5
 done
 
 dual_runs="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
-    | jq '[.tasks[] | select(.task_id != null and (.task_id | test("unicode-ident")))]')"
+    | jq --argjson ids "$dual_ids" '[.tasks[] | select(.task_id as $id | $ids | index($id))]')"
 dual_count="$(jq 'length' <<<"$dual_runs")"
 dual_built="$(jq '[.[] | select(.built)] | length' <<<"$dual_runs")"
 dual_failed="$(jq '[.[] | select(.conclusion != null and .conclusion != "success")] | length' <<<"$dual_runs")"
 echo "[mock-e2e] dual task: $dual_count dispatches, $dual_built compiled, $dual_failed non-success"
-[ "$dual_count" -eq 1 ] || die "expected exactly 1 dispatch for the dual-submitted task, saw $dual_count"
-[ "$dual_built" -eq 1 ] || die "dual task compiled $dual_built times across $dual_count dispatches — expected 1"
+jq -e --argjson ids "$dual_ids" '[.[].task_id] | sort == ($ids | sort)' <<<"$dual_runs" >/dev/null \
+    || die "expected exactly one dispatch per dual-wave node: $dual_runs"
+[ "$dual_built" -eq "$dual_total" ] \
+    || die "dual wave compiled $dual_built times across $dual_count dispatches — expected $dual_total"
 [ "$dual_failed" -eq 0 ] || die "a dual dispatch did not conclude success: $dual_runs"
 
 # Throwaway consumer pinned to the exact version the scheduler just built.
@@ -1710,7 +1723,7 @@ fg publish_slices "superset"
 fg stow_cli index refresh >"$LOG_DIR/index-refresh-superset.log" 2>&1 \
     || die "stow index refresh (superset) failed — see $LOG_DIR/index-refresh-superset.log"
 
-superset_stats_before="$(sqlite3 "$WORK_DIR/stow-cache/state-v3.sqlite3" \
+superset_stats_before="$(read_cache_stats \
     "SELECT COALESCE(SUM(misses),0), COALESCE(SUM(local_dependency_builds),0) \
      FROM crate_stats WHERE crate_name='once_cell'")"
 SUPERSET_CONSUMER="$WORK_DIR/once_cell-subset-consumer"
@@ -1729,7 +1742,7 @@ inexact_enqueues_before="$(grep -c 'POST /api/v1/enqueue' "$LOG_DIR/edge.log" 2>
 fg in_dir "$SUPERSET_CONSUMER" stow_cli check >"$LOG_DIR/stow-check-subset.log" 2>&1 \
     || die "stow check (subset) failed — see $LOG_DIR/stow-check-subset.log"
 
-superset_stats_after="$(sqlite3 "$WORK_DIR/stow-cache/state-v3.sqlite3" \
+superset_stats_after="$(read_cache_stats \
     "SELECT COALESCE(SUM(hits),0), COALESCE(SUM(misses),0), COALESCE(SUM(local_dependency_builds),0) \
      FROM crate_stats WHERE crate_name='once_cell'")"
 echo "[mock-e2e] once_cell subset serve: before={misses,local}=$superset_stats_before after={hits,misses,local}=$superset_stats_after"
@@ -1784,7 +1797,7 @@ rm -rf "$SUPERSET_CONSUMER/target"
 enqueues_before_exact="$(grep -c 'POST /api/v1/enqueue' "$LOG_DIR/edge.log")"
 fg in_dir "$SUPERSET_CONSUMER" stow_cli check >"$LOG_DIR/stow-check-exact.log" 2>&1 \
     || die "stow check (exact) failed — see $LOG_DIR/stow-check-exact.log"
-exact_stats="$(sqlite3 "$WORK_DIR/stow-cache/state-v3.sqlite3" \
+exact_stats="$(read_cache_stats \
     "SELECT COALESCE(SUM(hits),0), COALESCE(SUM(misses),0), COALESCE(SUM(local_dependency_builds),0) \
      FROM crate_stats WHERE crate_name='once_cell'")"
 echo "[mock-e2e] once_cell exact serve: after={hits,misses,local}=$exact_stats"
@@ -1876,6 +1889,7 @@ admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
                 features: [],
                 dependencies: [],
                 dependency_subgraph: {n: []},
+                profile: "dev",
                 explicit_spelling: "keys-as-native"
             }]
         }')")"
@@ -1904,6 +1918,7 @@ admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
                 features: ["default"],
                 dependencies: [],
                 dependency_subgraph: {n: []},
+                profile: "dev",
                 explicit_spelling: "keys-as-native"
             }]
         }')")"
@@ -1916,6 +1931,53 @@ jq -e '.[0].tree.nodes[.[0].tree.roots[0]].crate_name == "libc"' <<<"$admissions
 echo "[mock-e2e] uncovered graph: 1 admission with PoW challenge (expected)"
 
 echo "[mock-e2e] OK — $TASK_CRATE $TASK_VERSION served from the mock cache via the local index"
+
+# --- stow#1009: remote and local build-script binaries -----------------
+script_before="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status")"
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
+    "$BIN/stow-admin" submit --crate-name serde_core --version 1.0.229 \
+    --features-json '[]' --target "$HOST_TARGET" --rustc-version "$RUSTC_VERSION" --yes \
+    >"$LOG_DIR/build-script-submit.log" 2>&1 \
+    || die "build-script submit failed — see $LOG_DIR/build-script-submit.log"
+deadline=$((SECONDS + TASK_DEADLINE))
+while :; do
+    check_children_alive
+    status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status")"
+    [ "$(jq -r '.failed' <<<"$status_json")" -eq "$(jq -r '.failed' <<<"$script_before")" ] \
+        || die "build-script task failed: $status_json"
+    [ "$(jq -r '.completed' <<<"$status_json")" -gt "$(jq -r '.completed' <<<"$script_before")" ] && break
+    [ "$SECONDS" -lt "$deadline" ] || die "build-script task exceeded ${TASK_DEADLINE}s"
+    sleep 5
+done
+fg publish_slices build-script
+jq -e '[.[] | select(.crate_name == "serde_core" and .artifact_kind == "BuildScript")] | length > 0' \
+    "$WORK_DIR/catalog.json" >/dev/null || die "serde_core published no build-script artifact"
+SCRIPT_CONSUMER="$WORK_DIR/build-script-consumer"
+isolated_env cargo new --lib --vcs none "$SCRIPT_CONSUMER" >"$LOG_DIR/build-script-new.log" 2>&1
+printf 'serde_core = { version = "=1.0.229", default-features = false }\n' >>"$SCRIPT_CONSUMER/Cargo.toml"
+fg prepare_consumer "$SCRIPT_CONSUMER" build-script
+fg in_dir "$SCRIPT_CONSUMER" stow_cli index refresh >"$LOG_DIR/build-script-refresh.log" 2>&1
+RUST_LOG=stow_cli=info fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-remote.log" 2>&1 \
+    || die "remote build-script consumer failed — see $LOG_DIR/build-script-remote.log"
+grep 'served rustc invocation from downloaded stow artifact cache' "$LOG_DIR/build-script-remote.log" \
+    | grep 'crate_name=build_script_build' >/dev/null || die "build script was not served remotely"
+fg in_dir "$SCRIPT_CONSUMER" isolated_env cargo clean >"$LOG_DIR/build-script-clean.log" 2>&1
+RUST_LOG=stow_cli=info fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-local.log" 2>&1 \
+    || die "local build-script consumer failed — see $LOG_DIR/build-script-local.log"
+grep 'served rustc invocation from local stow artifact cache' "$LOG_DIR/build-script-local.log" \
+    | grep 'crate_name=build_script_build' >/dev/null || die "build script was not served locally"
+RUST_LOG=stow_cli=info fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-fresh.log" 2>&1 \
+    || die "fresh build-script consumer failed — see $LOG_DIR/build-script-fresh.log"
+grep 'Fresh serde_core v1.0.229' "$LOG_DIR/build-script-fresh.log" >/dev/null \
+    || die "Cargo did not keep the restored build script fresh"
+for stage in remote local; do
+    runs="$(grep -c 'Running .*build-script-build' "$LOG_DIR/build-script-$stage.log" || true)"
+    [ "$runs" -eq 1 ] || die "$stage script restore ran the script $runs times instead of once"
+done
+if grep -q 'Running .*build-script-build' "$LOG_DIR/build-script-fresh.log"; then
+    die "Cargo reran the fresh build script"
+fi
+echo "[mock-e2e] OK — build script served remotely and locally, then kept fresh by Cargo"
 
 # --- stow#774: host-side nodes ------------------------------------------
 #
@@ -2199,7 +2261,8 @@ jq --arg target "$OVERSIZED_TARGET" --argjson rows "$OVERSIZED_ROWS" '
     | [range($rows) as $i
         | $base[$i % ($base | length)]
         | .target = $target
-        | .dependency_task_ids = ["oversized-report-\($i)"]]' \
+        | .dependency_task_ids = ["oversized-report-\($i)"]]
+    | {artifacts: ., local_programs: []}' \
     "$WORK_DIR/catalog.json" >"$WORK_DIR/oversized-records.json" \
     || die "building the oversized slice's records failed"
 isolated_env "$BIN/stow-mock-registry" index-from-records \
@@ -2223,3 +2286,30 @@ oversized_generation="$(curl -fsS --max-time 30 "$EDGE_URL/api/v1/admin/status" 
 [ "$oversized_generation" = "1" ] \
     || die "the scheduler holds the oversized slice at generation $oversized_generation, expected 1"
 echo "[mock-e2e] OK — a $OVERSIZED_ROWS-row slice report over the request-body limit reconciled in parts and the scheduler holds it at generation $oversized_generation"
+
+# A real registry source failure stays failed after a cache-free replay.
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
+    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
+    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
+    "$BIN/stow-admin" submit --crate-name uuid --version 1.29.0 \
+    --features-json '["rng","v4"]' --target wasm32-unknown-unknown \
+    --rustc-version "$RUSTC_VERSION" --yes \
+    >"$LOG_DIR/source-failure-submit.log" 2>&1 \
+    || die "source-failure submit failed — see $LOG_DIR/source-failure-submit.log"
+deadline=$((SECONDS + TASK_DEADLINE))
+while :; do
+    check_children_alive
+    source_runs="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
+        | jq '[.tasks[] | select((.task_id // "") | startswith("uuid-1.29.0-"))]')"
+    source_run="$(jq -r '[.[] | select(.status == "completed" and .conclusion == "failure")][0].workflow_run_id // empty' <<<"$source_runs")"
+    [ -n "$source_run" ] && break
+    [ "$SECONDS" -ge "$deadline" ] && die "source failure did not complete: $source_runs"
+    sleep 5
+done
+curl -fsS --max-time 10 \
+    "http://${LOCAL_CI_ADDR}/repos/water-rs/stow/actions/runs/$source_run/attempts/1/jobs" \
+    >"$WORK_DIR/source-failure-jobs.json"
+jq -e '[.jobs[] | select(.name == "verify source failure" and .conclusion == "success")] | length == 1' \
+    "$WORK_DIR/source-failure-jobs.json" >/dev/null \
+    || die "source failure had no successful independent replay — see $WORK_DIR/source-failure-jobs.json"
+echo "[mock-e2e] OK — uuid wasm source failure reproduced independently and remained a failed run"

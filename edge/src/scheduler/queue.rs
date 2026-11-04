@@ -42,6 +42,29 @@ pub const PREHEAT_PRIORITY: i64 = 10;
 /// The inexact-hit report — a hundredth of the CLI's priority.
 pub const INEXACT_PRIORITY: i64 = 1;
 
+/// The scale a profile's weight is a share of: the dev profile ranks at
+/// the whole scale, so a rank is `priority × weight × waited` with the
+/// weight a whole number of hundredths (stow#1012).
+pub const PRIORITY_SCALE: u32 = 100;
+/// Default for the operator's `release-priority set`: release-profile
+/// nodes rank at this percent of their entry point's priority, inside
+/// the same aging rank as every other node. Provisional.
+pub const DEFAULT_RELEASE_PRIORITY_PERCENT: u32 = 10;
+
+/// A node's weight in the claim rank: its profile's share of
+/// [`PRIORITY_SCALE`], `release_percent` being the operator's release
+/// multiplier.
+pub const fn profile_weight(
+    profile: stow_types::node_profile::NodeProfile,
+    release_percent: u32,
+) -> u32 {
+    use stow_types::node_profile::NodeProfile as P;
+    match profile {
+        P::Dev => PRIORITY_SCALE,
+        P::Release => release_percent,
+    }
+}
+
 /// The priority operand a submission tree's nodes enter the rank with
 /// (stow#879): the source's class, or the caller's own value for
 /// operations. The operand is what `rank = operand × waited` reads.
@@ -856,7 +879,7 @@ pub fn evaluate_freeze_trip(
     let cutoff = now_ms - i64::from(settings.window_minutes) * 60_000;
     let mut by_target: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
     for outcome in &graph.attempt_outcomes {
-        if outcome.finished_at_ms < cutoff {
+        if outcome.finished_at_ms < cutoff || outcome.source_failure.is_some() {
             continue;
         }
         let entry = by_target.entry(outcome.target.as_str()).or_default();
@@ -879,7 +902,7 @@ pub fn evaluate_freeze_trip(
     let mut classes_map: BTreeMap<String, u64> = BTreeMap::new();
     let mut run_ids: Vec<(i64, String)> = Vec::new();
     for outcome in &graph.attempt_outcomes {
-        if outcome.finished_at_ms < cutoff {
+        if outcome.finished_at_ms < cutoff || outcome.source_failure.is_some() {
             continue;
         }
         if let Some(class) = &outcome.failure_class {
@@ -1001,6 +1024,47 @@ fn u64_to_u32(value: u64, field: &'static str) -> Result<u32, QueueError> {
 #[cfg(test)]
 mod tests {
     use super::seconds_until_utc_midnight;
+
+    #[test]
+    fn reproduced_source_failures_stay_in_history_but_not_the_breaker() {
+        use crate::scheduler::graph::{AttemptOutcome, Graph};
+        let mut graph = Graph::default();
+        let settings = crate::freeze::FreezeSettings {
+            window_minutes: 60,
+            min_outcomes: 2,
+            fail_percent: 50,
+        };
+        for run in 1..=2 {
+            graph.attempt_outcomes.push_back(AttemptOutcome {
+                task_id: format!("test-{run}"),
+                generation_id: "1".to_owned(),
+                attempt: 1,
+                target: "wasm32-unknown-unknown".to_owned(),
+                failure_class: Some("source failure".to_owned()),
+                source_failure: Some(stow_types::api::SourceFailureVerification {
+                    run_id: run,
+                    run_attempt: 1,
+                    job_id: run + 10,
+                }),
+                run_id: run.to_string(),
+                finished_at_ms: 1000,
+            });
+        }
+        assert!(
+            super::evaluate_freeze_trip(&graph, &settings, 1000)
+                .expect("evaluate")
+                .is_none()
+        );
+        assert_eq!(graph.attempt_outcomes.len(), 2);
+        for outcome in &mut graph.attempt_outcomes {
+            outcome.source_failure = None;
+        }
+        assert!(
+            super::evaluate_freeze_trip(&graph, &settings, 1000)
+                .expect("evaluate")
+                .is_some()
+        );
+    }
 
     #[test]
     fn seconds_until_midnight_counts_to_day_end() {

@@ -95,7 +95,7 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
     // `ensure_slice` `stow build` uses — a failed fetch is the
     // command's error, never a fallback. The local-only and off cache modes
     // reach no registry, so setup fetches nothing under them.
-    if stow_config.cache_mode.reaches_network() {
+    if stow_config.cache.reaches_network() {
         index::ensure_slice(&stow_config, &host_target, &rustc_version)
             .await
             .map_err(|error| {
@@ -1197,7 +1197,7 @@ mod tests {
 
     fn test_config(verify_mode: VerifyMode) -> StowConfig {
         StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             edge_url: "https://stow.waterui.dev".to_owned(),
             registry_base_url: stow_types::registry::GHCR_REGISTRY_URL.to_owned(),
             cache_dir: PathBuf::from("/tmp/stow-cache"),

@@ -43,6 +43,7 @@ const ADMISSIONS_RESPONSE: &str = r#"[{
             "target": "x86_64-unknown-linux-gnu",
             "rustc_version": "1.85.0",
             "explicit_spelling": "keys-as-native",
+            "profile": "dev",
             "dependency_identity": "0000000000000000000000000000000000000000000000000000000000000000"
         }]
     }
@@ -64,6 +65,8 @@ fn seed_empty_index_slice(cache_dir: &Path) {
             row_count: 0,
         },
         rows: Vec::new(),
+        build_scripts: Vec::new(),
+        local_programs: Vec::new(),
     };
     let blob = stow_shim::encode_index(&index).expect("encode index");
     let manifest_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";

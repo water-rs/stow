@@ -42,6 +42,7 @@ use crate::emit::emit_units;
 use crate::enqueue::enqueue_requests_from_output;
 use crate::select::select_ws_with_opts;
 use crate::units::{StowResolveOutput, StowUnitKind};
+use stow_types::node_profile::NodeProfile;
 
 /// Feature set + lockfile inputs for one resolve — the knobs the lanes
 /// carry into `resolve_crate`/`resolve_github_project` today.
@@ -674,12 +675,22 @@ impl Resolver {
                 has_library = true;
             }
             has_binary |= output.has_binary;
-            let (requests, _) = enqueue_requests_from_output(
-                &output.units,
-                rustc_version,
-                EnqueueSource::CrateUpdate,
-                downloads,
-            )?;
+            // Every profile's nodes of the one resolved graph: the dev
+            // set and the release set a `--release` consumer is served
+            // from (stow#1012).
+            let mut requests = Vec::new();
+            for profile in NodeProfile::ALL {
+                requests.extend(
+                    enqueue_requests_from_output(
+                        &output.units,
+                        rustc_version,
+                        EnqueueSource::CrateUpdate,
+                        downloads,
+                        profile,
+                    )?
+                    .0,
+                );
+            }
             batches.push((target.clone(), requests));
         }
         Ok(SourceResolve {

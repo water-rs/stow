@@ -282,6 +282,10 @@ struct SnapshotHead {
     /// The operator's dispatch-cap setting (stow#1039) — `None` until
     /// the first `set`, when the deploy bindings apply.
     dispatch_cap: Option<stow_types::api::DispatchCapSetting>,
+    /// The operator's release-priority setting (stow#1012) — `None`
+    /// until the first `set`, when the default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    release_priority: Option<stow_types::api::ReleasePrioritySetting>,
     external_runs: Vec<(u64, u8)>,
     /// The generation of the index each reported slice last applied,
     /// by target and rustc id.
@@ -896,6 +900,7 @@ impl Graph {
             seeded_rows: self.seeded_rows,
             freeze: self.freeze.clone(),
             dispatch_cap: self.dispatch_cap.clone(),
+            release_priority: self.release_priority.clone(),
             external_runs: self.external_runs.iter().map(|(&k, &v)| (k, v)).collect(),
             slice_generations: self
                 .slice_generations
@@ -1155,6 +1160,7 @@ impl SnapshotLoader {
         graph.seeded_rows = head.seeded_rows;
         graph.freeze = head.freeze;
         graph.dispatch_cap = head.dispatch_cap;
+        graph.release_priority = head.release_priority;
         graph.external_runs = head.external_runs.into_iter().collect();
         graph.slice_generations = head.slice_generations.into_iter().collect();
         graph.human_budget = head.human_budget;

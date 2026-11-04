@@ -68,8 +68,8 @@ without overloading the scheduler. In one stack start it:
 5. judges the run (`stow-admin traffic-cost verdict`): row budgets,
    growth with stored rows, and peak serialized Durable Object wall.
 
-The monthly projection against 80% of each product's allowance is the
-release gate's separate `Monthly projection` job (`stow-admin
+The monthly projection uses 90% of the Durable Object request allowance
+and 80% of every other allowance. It runs in the release gate's separate `Monthly projection` job (`stow-admin
 traffic-cost project`): it prices user traffic from this run's
 `reports/budget-small.json`, `budget-after.json` and `worker-cpu.json`
 at the launch model's rates, then adds the preheat the Preheat cost job
@@ -121,10 +121,10 @@ scheduler-budget tolerance, a fixed-size event exceeds its drive
 budget, a node is dispatched before its dependencies are published, a
 submitted node never publishes, the object answers `overloaded`, a
 build is dispatched while the edge restarts, or a
-lane's submit fails. The wave and resubmit totals are bounded where the
-production node count exists: the monthly projection scales them to
-`production-wave.json` against the preheat budget in
-`types/src/do_budgets.rs`. The full wave is CI-sized; locally, reduce
+lane's submit fails. The monthly projection scales wave and resubmit
+totals to `production-wave.json` and their monthly cadence, combines
+them with user traffic, and checks the total against 90% of the Durable
+Object request allowance and 80% of every other monthly allowance. The runtime daily breaker remains a separate guard. The full wave is CI-sized; locally, reduce
 it:
 
 ```sh
@@ -161,8 +161,8 @@ report's wave and resubmit totals by the reduced wave's node count and
 multiplies by the production count: one wave per stable rustc release
 (`[cadence]` in `launch-model.toml`, counted from Rust's release
 history by `stow-admin launch-model export`) plus one resubmit per day,
-added to each product's traffic before comparing with 80% of its
-allowance. `stow-admin traffic-cost project` takes the report as
+added to each product's traffic before comparing with its allowance:
+90% for Durable Object requests and 80% for every other dimension. `stow-admin traffic-cost project` takes the report as
 `--preheat` and the count as `--production`. Only the scheduler Durable
 Object's billed calls and rows are measured; the table marks every
 other dimension `n/m` and prices it from traffic alone.

@@ -28,8 +28,9 @@ use stow_types::api::{
     SubmissionNode, SubmissionTree, SubmitTaskIdEntry, TaskSubgraph, runner_family,
 };
 use stow_types::ci::{CiRunListing, CiRunStatus};
+use stow_types::node_profile::NodeProfile;
 use stow_types::public_cache::{ExplicitSpelling, UnitShape};
-use stow_types::task_graph::canonical_task_id;
+use stow_types::task_graph::{TaskIdFields, canonical_task_id};
 
 use crate::errors::QueueError;
 use crate::scheduler::queue;
@@ -41,7 +42,8 @@ mod snapshot;
 
 use edges::Edges;
 use index::{Interner, IxTable, hash_of};
-use node::{Extra, Flags, Lane, NO_STATE, Node, ParkedCompletion, State, Status};
+pub use node::RunCompletion;
+use node::{Extra, Flags, Lane, NO_STATE, Node, State, Status};
 
 pub use snapshot::{ChunkSpan, SNAPSHOT_SPAN_ROWS, SnapshotLoader, SnapshotPlan, SpanEncoder};
 
@@ -224,8 +226,15 @@ impl TargetInfo {
 /// One operand class's candidate in a claim's k-way merge: its claim
 /// key (rank, then request instant, then arrival — descending) and the
 /// node index.
-/// One ready queue: rank operand → age-ordered `(first_requested, ix)`.
-type ReadyClasses = BTreeMap<i64, BTreeSet<(i64, u32)>>;
+/// One ready queue: rank class → age-ordered `(first_requested, ix)`.
+///
+/// A class is the node's rank operand (its priority) and its profile,
+/// so the operator's release multiplier scales a whole class at claim
+/// time and never re-keys the queue (stow#1012).
+type ReadyClasses = BTreeMap<ReadyClass, BTreeSet<(i64, u32)>>;
+
+/// The key of one ready queue: `(operand, profile)`.
+type ReadyClass = (i64, NodeProfile);
 
 type Candidate = ((i128, std::cmp::Reverse<i64>, std::cmp::Reverse<u32>), u32);
 
@@ -374,6 +383,8 @@ pub struct AttemptOutcome {
     pub target: String,
     /// `Some(first error line)` on failure, `None` on success.
     pub failure_class: Option<String>,
+    /// Verified source failures stay in history but do not enter the breaker.
+    pub source_failure: Option<stow_types::api::SourceFailureVerification>,
     /// The platform run id, when the binding carried one.
     pub run_id: String,
     /// When the completion landed (unix ms).
@@ -502,6 +513,11 @@ pub struct Graph {
     /// `STOW_MAX_CONCURRENT_MACOS_JOBS` at claim time until the next
     /// `set`. `None` until the first one.
     dispatch_cap: Option<stow_types::api::DispatchCapSetting>,
+    /// The operator's release-priority setting (stow#1012): the
+    /// multiplier release-profile nodes rank under. `None` until the
+    /// first `set`, when [`queue::DEFAULT_RELEASE_PRIORITY_PERCENT`]
+    /// applies.
+    release_priority: Option<stow_types::api::ReleasePrioritySetting>,
 
     /// Completions and failures per UTC hour and target byte — the
     /// admin status's trailing-day tally, since a published node keeps
@@ -637,15 +653,16 @@ fn digest_bytes(identity: &stow_types::identity::DependencyIdentity) -> [u8; 32]
 
 /// The canonical task id a submission node's identity columns spell.
 fn minted_id(sub: &SubmissionNode) -> String {
-    canonical_task_id(
-        sub.crate_name.as_str(),
-        &sub.version.to_string(),
-        &sub.features_json.raw(),
-        sub.target.as_str(),
-        sub.rustc_version.as_str(),
-        sub.dependency_identity.as_str(),
-        sub.host_side,
-    )
+    canonical_task_id(&TaskIdFields {
+        crate_name: sub.crate_name.as_str(),
+        version: &sub.version.to_string(),
+        features_json: &sub.features_json.raw(),
+        target: sub.target.as_str(),
+        rustc_version: sub.rustc_version.as_str(),
+        dependency_identity: sub.dependency_identity.as_str(),
+        host_side: sub.host_side,
+        profile: sub.profile,
+    })
 }
 
 /// The identity-index hash of a node's five-field identity.
@@ -738,8 +755,40 @@ impl Graph {
     /// The node's claim rank: `operand × (now − first_requested)`,
     /// exact in i128 (stow#879).
     fn rank_at(&self, ix: u32, now: i64) -> i128 {
-        i128::from(self.operand_of(ix))
-            * i128::from(now.saturating_sub(self.state(ix).first_requested).max(0))
+        let (operand, profile) = self.ready_class_of(ix);
+        self.rank_of_class(operand, profile, self.state(ix).first_requested, now)
+    }
+
+    /// The rank class a node queues under.
+    fn ready_class_of(&self, ix: u32) -> ReadyClass {
+        (self.operand_of(ix), self.node(ix).flags.profile())
+    }
+
+    /// The claim rank of a node of `(operand, profile)` first requested
+    /// at `first`: `operand × weight(profile) × waited`, exact in i128.
+    /// The weight is the profile's share of the priority scale — the
+    /// dev profile's is the whole scale, the release profile's is the
+    /// operator's multiplier (stow#1012) — so every rank carries the
+    /// same constant factor and dev ranks order as `operand × waited`.
+    fn rank_of_class(&self, operand: i64, profile: NodeProfile, first: i64, now: i64) -> i128 {
+        i128::from(operand)
+            * i128::from(queue::profile_weight(
+                profile,
+                self.release_priority_percent(),
+            ))
+            * i128::from(now.saturating_sub(first).max(0))
+    }
+
+    /// Whether the node's weighted value, `priority × weight / 100`,
+    /// reaches the admission floor — the value the rank multiplies by
+    /// time waited (stow#1012). Compared cross-multiplied, so the dev
+    /// weight (the whole scale) reduces to `priority >= floor`.
+    fn meets_floor(&self, ix: u32) -> bool {
+        let (operand, profile) = self.ready_class_of(ix);
+        let weight = queue::profile_weight(profile, self.release_priority_percent());
+        let weighted = i128::from(operand) * i128::from(weight);
+        let floor = i128::from(self.floor) * i128::from(queue::PRIORITY_SCALE);
+        weighted >= floor
     }
 
     /// Whether a node may dispatch apart from its age/backoff gate.
@@ -748,7 +797,7 @@ impl Graph {
         node.status == Status::Pending
             && node.unmet == 0
             && !node.flags.blocked()
-            && (node.flags.lane() == Lane::Human || self.operand_of(ix) >= self.floor)
+            && (node.flags.lane() == Lane::Human || self.meets_floor(ix))
     }
 
     /// Drop a node's ready-set entry, whatever class it sits in.
@@ -759,17 +808,17 @@ impl Graph {
         if !self.node(ix).status.has_state() {
             return;
         }
-        let operand = self.operand_of(ix);
+        let class_key = self.ready_class_of(ix);
         let key = (self.state(ix).first_requested, ix);
         let ready = if self.is_macos(ix) {
             &mut self.ready_macos
         } else {
             &mut self.ready
         };
-        if let Some(class) = ready.get_mut(&operand) {
+        if let Some(class) = ready.get_mut(&class_key) {
             class.remove(&key);
             if class.is_empty() {
-                ready.remove(&operand);
+                ready.remove(&class_key);
             }
         }
     }
@@ -800,14 +849,14 @@ impl Graph {
     /// current operand when dispatchable, leaves it otherwise.
     fn refresh_ready(&mut self, ix: u32) {
         if self.dispatchable(ix) {
-            let operand = self.operand_of(ix);
+            let class = self.ready_class_of(ix);
             let first = self.state(ix).first_requested;
             let ready = if self.is_macos(ix) {
                 &mut self.ready_macos
             } else {
                 &mut self.ready
             };
-            ready.entry(operand).or_default().insert((first, ix));
+            ready.entry(class).or_default().insert((first, ix));
         } else {
             self.remove_ready(ix);
         }
@@ -972,15 +1021,16 @@ impl Graph {
     /// Re-mint a node's canonical task id from its fields.
     fn task_id_of(&self, ix: u32) -> String {
         let node = self.node(ix);
-        canonical_task_id(
-            self.intern.at(node.crate_name),
-            self.intern.at(node.version),
-            self.intern.at(node.features),
-            &self.targets[usize::from(node.target)].name,
-            &self.rustcs[usize::from(node.rustc)],
-            &hex::encode(node.digest),
-            node.flags.host(),
-        )
+        canonical_task_id(&TaskIdFields {
+            crate_name: self.intern.at(node.crate_name),
+            version: self.intern.at(node.version),
+            features_json: self.intern.at(node.features),
+            target: &self.targets[usize::from(node.target)].name,
+            rustc_version: &self.rustcs[usize::from(node.rustc)],
+            dependency_identity: &hex::encode(node.digest),
+            host_side: node.flags.host(),
+            profile: node.flags.profile(),
+        })
     }
 
     /// The live node whose canonical task id is `task_id`.
@@ -1381,7 +1431,13 @@ impl Graph {
             rustc: sub.rustc_version.as_str(),
             digest: digest_bytes(&sub.dependency_identity),
             keys,
-            flags: Flags::new(sub.host_side, explicit, sub.preserve_lockfile, lane),
+            flags: Flags::new(
+                sub.host_side,
+                explicit,
+                sub.preserve_lockfile,
+                lane,
+                sub.profile,
+            ),
             state,
         })
     }
@@ -1756,15 +1812,16 @@ impl Graph {
 
     /// A slice row's published-map key and shape bit.
     fn slice_row_key(target: &str, rustc: &str, row: &PublishedSliceRow) -> (IdKeys, u8) {
-        let task_id = canonical_task_id(
-            row.crate_name.as_str(),
-            &row.version.to_string(),
-            &row.features_json.raw(),
+        let task_id = canonical_task_id(&TaskIdFields {
+            crate_name: row.crate_name.as_str(),
+            version: &row.version.to_string(),
+            features_json: &row.features_json.raw(),
             target,
-            rustc,
-            row.dependency_identity.as_str(),
-            row.unit_shape.side == stow_types::public_cache::UnitSide::Host,
-        );
+            rustc_version: rustc,
+            dependency_identity: row.dependency_identity.as_str(),
+            host_side: row.unit_shape.side == stow_types::public_cache::UnitSide::Host,
+            profile: row.node_profile,
+        });
         (IdKeys::of(&task_id), shape_bit(row.unit_shape))
     }
 
@@ -1931,7 +1988,7 @@ impl Graph {
         // pass, and a family whose cap is spent is left out of the
         // pass whole, so the pass is linear in the entries it examines
         // (stow#1052).
-        let mut cursors: BTreeMap<(bool, i64), Option<(i64, u32)>> = BTreeMap::new();
+        let mut cursors: BTreeMap<(bool, ReadyClass), Option<(i64, u32)>> = BTreeMap::new();
         let mut claimed = Vec::new();
         let mut macos_taken = 0u32;
         while claimed.len() < total_free as usize {
@@ -1940,9 +1997,9 @@ impl Graph {
                 if macos && macos_taken >= macos_free {
                     continue;
                 }
-                for (&operand, class) in ready {
+                for (&(operand, profile), class) in ready {
                     let cursor = cursors
-                        .entry((macos, operand))
+                        .entry((macos, (operand, profile)))
                         .or_insert(Some((i64::MIN, 0)));
                     let Some(from) = *cursor else {
                         continue;
@@ -1963,7 +2020,7 @@ impl Graph {
                     // first_requested, then the earlier arrival
                     // (stow#879).
                     let key = (
-                        i128::from(operand) * i128::from(now - first),
+                        self.rank_of_class(operand, profile, first, now),
                         std::cmp::Reverse(first),
                         std::cmp::Reverse(ix),
                     );
@@ -2037,7 +2094,14 @@ impl Graph {
         if let Some(parked) = parked
             && parked.run_id == run_id
         {
-            self.finish_run_inner(ix, parked.success, parked.cancelled, parked.error, now);
+            self.finish_run_inner(
+                ix,
+                parked.success,
+                parked.cancelled,
+                parked.error,
+                parked.source_failure,
+                now,
+            );
         }
         true
     }
@@ -2166,12 +2230,16 @@ impl Graph {
     pub fn run_finished(
         &mut self,
         task_id: &str,
-        run_id: u64,
-        success: bool,
-        cancelled: bool,
-        error: Option<String>,
+        completion: RunCompletion,
         now: i64,
     ) -> FinishOutcome {
+        let RunCompletion {
+            run_id,
+            success,
+            cancelled,
+            source_failure,
+            error,
+        } = completion;
         let was_external = self.external_runs.remove(&run_id).is_some();
         let stale = if was_external {
             FinishOutcome::External
@@ -2191,10 +2259,11 @@ impl Graph {
                 // settle — the binding lands in this isolate, so the
                 // completion waits on it.
                 self.edit_extra(ix, |extra| {
-                    extra.parked = Some(ParkedCompletion {
+                    extra.parked = Some(RunCompletion {
                         run_id,
                         success,
                         cancelled,
+                        source_failure,
                         error,
                     });
                 });
@@ -2207,13 +2276,13 @@ impl Graph {
             // run itself, exactly as `run_started`'s `bound == 0`
             // path does (stow#940).
             self.edit_extra(ix, |extra| extra.run_id = run_id);
-            self.finish_run_inner(ix, success, cancelled, error, now);
+            self.finish_run_inner(ix, success, cancelled, error, source_failure, now);
             return FinishOutcome::Applied;
         }
         if bound != run_id {
             return FinishOutcome::Stale;
         }
-        self.finish_run_inner(ix, success, cancelled, error, now);
+        self.finish_run_inner(ix, success, cancelled, error, source_failure, now);
         FinishOutcome::Applied
     }
 
@@ -2225,6 +2294,7 @@ impl Graph {
         success: bool,
         cancelled: bool,
         error: Option<String>,
+        source_failure: Option<stow_types::api::SourceFailureVerification>,
         now: i64,
     ) {
         self.state_mut(ix).updated = now;
@@ -2238,6 +2308,7 @@ impl Graph {
                 attempt: u32::from(attempt.saturating_add(u8::from(!success))),
                 target: self.targets[usize::from(target)].name.to_string(),
                 failure_class: failure_class_of(success, error.as_deref()),
+                source_failure,
                 run_id: self.run_id_of(ix).to_string(),
                 finished_at_ms: now,
             });
@@ -2558,6 +2629,7 @@ impl Graph {
                 version: identity.version,
                 features_json: identity.features_json,
                 host_side: node.flags.host(),
+                profile: node.flags.profile(),
                 keys_apart: node.flags.explicit(),
                 deps: self.deps_of(dep).map(|child| seen[&child]).collect(),
             });
@@ -2574,6 +2646,7 @@ impl Graph {
             rustc_version: identity.rustc_version,
             preserve_lockfile: node.flags.preserve(),
             host_side: node.flags.host(),
+            profile: node.flags.profile(),
             explicit_spelling: if node.flags.explicit() {
                 ExplicitSpelling::KeysApart
             } else {
@@ -2673,6 +2746,36 @@ impl Graph {
     /// own cap reads take those settings as given.
     pub const fn dispatch_cap(&self) -> Option<&stow_types::api::DispatchCapSetting> {
         self.dispatch_cap.as_ref()
+    }
+
+    /// The release multiplier in force, in percent of the dev
+    /// profile's priority: the operator's stored `release-priority set`
+    /// or the default.
+    pub fn release_priority_percent(&self) -> u32 {
+        self.release_priority
+            .as_ref()
+            .map_or(queue::DEFAULT_RELEASE_PRIORITY_PERCENT, |set| set.percent)
+    }
+
+    /// The operator's stored `release-priority set` (stow#1012), `None`
+    /// until the first one.
+    pub const fn release_priority(&self) -> Option<&stow_types::api::ReleasePrioritySetting> {
+        self.release_priority.as_ref()
+    }
+
+    /// `GET /release-priority`'s body.
+    pub fn release_priority_view(&self) -> stow_types::api::ReleasePriority {
+        stow_types::api::ReleasePriority {
+            setting: self.release_priority.clone(),
+            percent: self.release_priority_percent(),
+        }
+    }
+
+    /// Drop the stored release-priority setting — the budget drives'
+    /// restore of the unset state the fixture seed wrote. No route
+    /// reaches it: an operator `set` has no clear.
+    pub fn restore_unset_release_priority(&mut self) {
+        self.release_priority = None;
     }
 
     /// Drop the stored dispatch-cap setting — the budget drives'
@@ -2952,6 +3055,33 @@ impl Graph {
     /// Apply one decoded log event — the replay half of wake. The
     /// submit reassembly buffer lives in `store.rs`; this handles the
     /// one-row-per-event kinds.
+    fn apply_finished_event(&mut self, event: &SchedulerEvent, now: i64) {
+        if let SchedulerEvent::RunFinished {
+            run_id,
+            task_id,
+            success,
+            source_failure,
+            cancelled,
+            error,
+        } = event
+        {
+            self.last_run_update_ms = Some(now);
+            if let Ok(run_id) = run_id.parse::<u64>() {
+                self.run_finished(
+                    task_id,
+                    RunCompletion {
+                        run_id,
+                        success: *success,
+                        cancelled: *cancelled,
+                        source_failure: source_failure.clone(),
+                        error: error.clone(),
+                    },
+                    now,
+                );
+            }
+        }
+    }
+
     pub fn apply(&mut self, event: &SchedulerEvent, now: i64) {
         self.log_since_snapshot += 1;
         match event {
@@ -2991,18 +3121,7 @@ impl Graph {
                     self.external_runs.insert(run_id, 1u8 << (*family as u8));
                 }
             }
-            SchedulerEvent::RunFinished {
-                run_id,
-                task_id,
-                success,
-                cancelled,
-                error,
-            } => {
-                self.last_run_update_ms = Some(now);
-                if let Ok(run_id) = run_id.parse::<u64>() {
-                    self.run_finished(task_id, run_id, *success, *cancelled, error.clone(), now);
-                }
-            }
+            SchedulerEvent::RunFinished { .. } => self.apply_finished_event(event, now),
             // `Submit` parts are reassembled by the replay loop in
             // `store.rs` before this is reached.
             SchedulerEvent::StoreReset | SchedulerEvent::Submit { .. } => {}
@@ -3034,6 +3153,16 @@ impl Graph {
             }
             SchedulerEvent::DispatchCap { setting } => {
                 self.dispatch_cap = Some((**setting).clone());
+            }
+            SchedulerEvent::ReleasePriority { setting } => {
+                self.release_priority = Some((**setting).clone());
+                // The floor reads the weighted value, so a moved
+                // multiplier re-evaluates every node's admission.
+                if self.floor > 0 {
+                    for ix in 0..u32::try_from(self.nodes.len()).expect("node indexes fit u32") {
+                        self.refresh_ready(ix);
+                    }
+                }
             }
             SchedulerEvent::Freeze {
                 record,
@@ -3939,6 +4068,21 @@ mod tests {
     };
     use stow_types::public_cache::{UnitInvocation, UnitKind, UnitSide};
 
+    fn completion(
+        run_id: u64,
+        success: bool,
+        cancelled: bool,
+        error: Option<String>,
+    ) -> RunCompletion {
+        RunCompletion {
+            run_id,
+            success,
+            cancelled,
+            source_failure: None,
+            error,
+        }
+    }
+
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.85.0";
 
@@ -3956,6 +4100,7 @@ mod tests {
             dependency_identity: DependencyIdentity::from_task_ids([name]).expect("dep identity"),
             deps: Vec::new(),
             downloads: 10,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         node.task_id = minted_id(&node);
         node
@@ -3964,6 +4109,73 @@ mod tests {
     /// The canonical task id of the test node `name`.
     fn id(name: &str) -> String {
         sub(name).task_id
+    }
+
+    /// The profile is part of a node's identity: the same crate under two
+    /// profiles is two nodes with distinct ids, and a dispatched payload
+    /// carries the node's own profile (stow#1008).
+    #[test]
+    fn source_verification_survives_event_replay_and_snapshot() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let claim = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        let task_id = claim[0].task_id.clone();
+        graph.bind(&task_id, claim[0].generation, 77, 1000);
+        let proof = stow_types::api::SourceFailureVerification {
+            run_id: 77,
+            run_attempt: 2,
+            job_id: 88,
+        };
+        graph.apply(
+            &SchedulerEvent::RunFinished {
+                run_id: "77".to_owned(),
+                task_id,
+                success: false,
+                source_failure: Some(proof.clone()),
+                cancelled: false,
+                error: Some("workflow failed".to_owned()),
+            },
+            2000,
+        );
+        let restored = round_trip(&graph);
+        let failure = restored.attempt_outcomes.back().expect("failure retained");
+        assert_eq!(failure.source_failure.as_ref(), Some(&proof));
+        assert!(failure.failure_class.is_some());
+        let settings = crate::freeze::FreezeSettings {
+            min_outcomes: 1,
+            ..Default::default()
+        };
+        assert!(
+            queue::evaluate_freeze_trip(&restored, &settings, 2000)
+                .expect("evaluate")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_node_keeps_its_profile_in_its_id_and_payload() {
+        let mut graph = Graph::default();
+        let dev = sub("a");
+        let mut release = sub("a");
+        release.profile = stow_types::node_profile::NodeProfile::Release;
+        release.task_id = minted_id(&release);
+        assert_ne!(dev.task_id, release.task_id);
+        assert!(release.task_id.ends_with("-release"), "{}", release.task_id);
+        let tree = |node: SubmissionNode| SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![0],
+            nodes: vec![node],
+        };
+        graph.merge(&tree(dev.clone()), 0).expect("merge dev");
+        graph
+            .merge(&tree(release.clone()), 0)
+            .expect("merge release");
+        for node in [&dev, &release] {
+            let ix = graph.node_ix(&node.task_id).expect("node by id");
+            let payload = graph.task_payload(ix).expect("payload");
+            assert_eq!(payload.profile, node.profile);
+            assert_eq!(payload.task_id, node.task_id);
+        }
     }
 
     /// A → B → C chain (a depends on b, b on c), nodes in leaf order.
@@ -3999,6 +4211,7 @@ mod tests {
                 kind,
             },
             dependency_identity: DependencyIdentity::from_task_ids([name]).expect("dep identity"),
+            node_profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -4380,7 +4593,7 @@ mod tests {
         let mut graph = Graph::default();
         graph.merge(&chain(), 0).expect("merge");
         graph.claim(45, 16, 0, 3_600_000).expect("claim c");
-        graph.run_finished(&id("c"), 100, true, false, None, 50_000);
+        graph.run_finished(&id("c"), completion(100, true, false, None), 50_000);
         let flips = publish(&mut graph, "c");
         assert_eq!(flips, 1, "b's edge to c flips");
         // b still depends on c, so c is retained without queue state.
@@ -4559,7 +4772,7 @@ mod tests {
         graph.merge(&solo(), 0).expect("merge");
         let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
         let generation = claimed[0].generation;
-        let outcome = graph.run_finished(&id("solo"), 4242, true, false, None, 10_000);
+        let outcome = graph.run_finished(&id("solo"), completion(4242, true, false, None), 10_000);
         assert_eq!(outcome, FinishOutcome::Parked);
         assert!(graph.bind(&id("solo"), generation, 4242, 11_000));
         assert_eq!(status_of(&graph, "solo"), Some(Status::Completed));
@@ -4821,7 +5034,7 @@ mod tests {
         graph.merge(&solo(), 0).expect("merge");
         let ix = graph.node_ix(&id("solo")).expect("node");
         graph.mark_claimed(ix, 7, 0);
-        let outcome = graph.run_finished(&id("solo"), 4242, true, false, None, 10_000);
+        let outcome = graph.run_finished(&id("solo"), completion(4242, true, false, None), 10_000);
         assert_eq!(outcome, FinishOutcome::Applied);
         assert_eq!(graph.run_id_of(ix), 4242);
         assert_eq!(status_of(&graph, "solo"), Some(Status::Completed));
@@ -4845,7 +5058,7 @@ mod tests {
         // The reclaim pass's settle never lands (an eviction, a lost
         // answer): a woken graph carries no settling set.
         graph.settling.clear();
-        let outcome = graph.run_finished(&id("solo"), 4242, true, false, None, 10_000);
+        let outcome = graph.run_finished(&id("solo"), completion(4242, true, false, None), 10_000);
         assert_eq!(outcome, FinishOutcome::Applied);
         assert_eq!(graph.run_id_of(ix), 4242);
         assert_eq!(status_of(&graph, "solo"), Some(Status::Completed));
@@ -4884,6 +5097,142 @@ mod tests {
             ids,
             vec![id("missed"), id("asked")],
             "tied rank, older first"
+        );
+    }
+
+    /// A release-profile leaf `name`, minted under its own id.
+    fn release_single(name: &str, source: SubmissionSource) -> SubmissionTree {
+        let mut node = sub(name);
+        node.profile = stow_types::node_profile::NodeProfile::Release;
+        node.task_id = minted_id(&node);
+        SubmissionTree {
+            source,
+            roots: vec![0],
+            nodes: vec![node],
+        }
+    }
+
+    fn release_id(name: &str) -> String {
+        release_single(name, SubmissionSource::CacheMiss).nodes[0]
+            .task_id
+            .clone()
+    }
+
+    fn first_claim(graph: &mut Graph, now: i64) -> String {
+        graph
+            .claim(1, 16, now, 3_600_000)
+            .expect("claim")
+            .remove(0)
+            .task_id
+    }
+
+    /// stow#1012: a release node ranks at the multiplier's share of its
+    /// entry point's priority inside the same aging rank. At the default
+    /// 10% a release miss first requested at 0 leads a dev miss first
+    /// requested at 3 minutes until 3m20s (`10 × t == 100 × (t − 3)`),
+    /// and trails it after — a waiting release node overtakes fresher dev
+    /// work, equally old dev work stays ahead of it.
+    #[test]
+    fn a_release_node_ranks_at_the_multiplier_inside_the_aging_rank() {
+        let build = || {
+            let mut graph = Graph::default();
+            graph
+                .merge(&release_single("lib", SubmissionSource::CacheMiss), 0)
+                .expect("release merge");
+            graph
+                .merge(&single("dev", SubmissionSource::CacheMiss), 3 * 60_000)
+                .expect("dev merge");
+            graph
+        };
+        assert_eq!(first_claim(&mut build(), 190_000), release_id("lib"));
+        assert_eq!(first_claim(&mut build(), 300_000), id("dev"));
+
+        // Equal age: the dev node leads whatever the wait.
+        let mut graph = Graph::default();
+        graph
+            .merge(&release_single("lib", SubmissionSource::CacheMiss), 0)
+            .expect("release merge");
+        graph
+            .merge(&single("dev", SubmissionSource::CacheMiss), 0)
+            .expect("dev merge");
+        assert_eq!(first_claim(&mut graph, 3_600_000), id("dev"));
+    }
+
+    /// stow#1012: the operator's `release-priority set` is read at claim
+    /// time — it re-ranks nodes already queued, with no re-keying, and a
+    /// release multiplier of 100% ties the dev rank (the older node
+    /// leads).
+    #[test]
+    fn the_operator_multiplier_reranks_queued_release_nodes() {
+        let mut graph = Graph::default();
+        graph
+            .merge(&single("dev", SubmissionSource::CacheMiss), 0)
+            .expect("dev merge");
+        graph
+            .merge(&release_single("lib", SubmissionSource::CacheMiss), 60_000)
+            .expect("release merge");
+        assert_eq!(
+            graph.release_priority_percent(),
+            queue::DEFAULT_RELEASE_PRIORITY_PERCENT
+        );
+        assert!(graph.release_priority().is_none());
+        graph.apply(
+            &SchedulerEvent::ReleasePriority {
+                setting: Box::new(stow_types::api::ReleasePrioritySetting {
+                    percent: 1_000,
+                    set_at: "2026-01-01T00:00:00Z".to_owned(),
+                    actor: "ops".to_owned(),
+                }),
+            },
+            0,
+        );
+        assert_eq!(graph.release_priority_percent(), 1_000);
+        let view = graph.release_priority_view();
+        assert_eq!(view.percent, 1_000);
+        assert_eq!(view.setting.expect("setting").actor, "ops");
+        // 1000% makes the one-minute-younger release node outrank the
+        // dev node after two minutes.
+        assert_eq!(first_claim(&mut graph, 180_000), release_id("lib"));
+    }
+
+    /// stow#1012: the admission floor compares the weighted value. At
+    /// the default 10% a release miss (value 10) is held by a floor of
+    /// 50 while a dev miss (value 100) passes, and a raised multiplier
+    /// admits the held node.
+    #[test]
+    fn the_floor_holds_a_release_node_below_it_and_admits_the_dev_node() {
+        let mut graph = Graph::default();
+        graph
+            .merge(&release_single("lib", SubmissionSource::CacheMiss), 0)
+            .expect("release merge");
+        graph
+            .merge(&single("dev", SubmissionSource::CacheMiss), 0)
+            .expect("dev merge");
+        graph.set_floor(50);
+        assert_eq!(
+            graph
+                .claim(2, 16, 3_600_000, 3_600_000)
+                .expect("claim")
+                .len(),
+            1
+        );
+        assert!(graph.has_task(&release_id("lib")));
+        let ix = graph.node_ix(&release_id("lib")).expect("node");
+        assert_eq!(graph.node(ix).status, Status::Pending, "held by the floor");
+        graph.apply(
+            &SchedulerEvent::ReleasePriority {
+                setting: Box::new(stow_types::api::ReleasePrioritySetting {
+                    percent: 50,
+                    set_at: "2026-01-01T00:00:00Z".to_owned(),
+                    actor: "ops".to_owned(),
+                }),
+            },
+            0,
+        );
+        assert_eq!(
+            first_claim(&mut graph, 3_600_000),
+            release_id("lib"),
+            "a raised multiplier admits it"
         );
     }
 
@@ -5074,7 +5423,11 @@ mod tests {
         let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim c");
         graph.bind(&id("c"), claimed[0].generation, 77, 1_000);
         for _ in 1..queue::MAX_BUILD_ATTEMPTS {
-            graph.run_finished(&id("c"), 77, false, false, Some("boom".into()), 2_000);
+            graph.run_finished(
+                &id("c"),
+                completion(77, false, false, Some("boom".into())),
+                2_000,
+            );
             let ix = graph.node_ix(&id("c")).expect("node");
             assert_eq!(graph.node(ix).status, Status::Pending);
             graph.edit_extra(ix, |extra| extra.not_before = 0);
@@ -5082,7 +5435,11 @@ mod tests {
             let claimed = graph.claim(45, 16, 3_000, 3_600_000).expect("reclaim");
             graph.bind(&id("c"), claimed[0].generation, 77, 4_000);
         }
-        graph.run_finished(&id("c"), 77, false, false, Some("boom".into()), 5_000);
+        graph.run_finished(
+            &id("c"),
+            completion(77, false, false, Some("boom".into())),
+            5_000,
+        );
         assert_eq!(status_of(&graph, "c"), Some(Status::Failed));
         let b = graph.node_ix(&id("b")).expect("b");
         assert!(graph.node(b).flags.blocked());
@@ -5220,7 +5577,11 @@ mod tests {
         graph.bind(&id("c"), claimed[0].generation, 77, 1_000);
         assert_pending_index(&graph);
         for _ in 1..queue::MAX_BUILD_ATTEMPTS {
-            graph.run_finished(&id("c"), 77, false, false, Some("boom".into()), 2_000);
+            graph.run_finished(
+                &id("c"),
+                completion(77, false, false, Some("boom".into())),
+                2_000,
+            );
             assert_pending_index(&graph);
             let ix = graph.node_ix(&id("c")).expect("node");
             graph.edit_extra(ix, |extra| extra.not_before = 0);
@@ -5228,7 +5589,11 @@ mod tests {
             let claimed = graph.claim(45, 16, 3_000, 3_600_000).expect("reclaim");
             graph.bind(&id("c"), claimed[0].generation, 77, 4_000);
         }
-        graph.run_finished(&id("c"), 77, false, false, Some("boom".into()), 5_000);
+        graph.run_finished(
+            &id("c"),
+            completion(77, false, false, Some("boom".into())),
+            5_000,
+        );
         assert_pending_index(&graph);
         assert_eq!(graph.status().blocked, 1, "b waits on the failed c");
 
@@ -5266,7 +5631,7 @@ mod tests {
         let claimed = graph.claim(45, 16, 12_000, 3_600_000).expect("claim");
         for (run, task) in (100u64..).zip(&claimed) {
             graph.bind(&task.task_id, task.generation, run, 12_000);
-            graph.run_finished(&task.task_id, run, true, false, None, 13_000);
+            graph.run_finished(&task.task_id, completion(run, true, false, None), 13_000);
         }
         assert_pending_index(&graph);
         // A human node behind the purged h1's slot: the compaction
@@ -5326,7 +5691,7 @@ mod tests {
         let mut graph = Graph::default();
         graph.merge(&chain(), 0).expect("merge");
         graph.claim(45, 16, 0, 3_600_000).expect("claim");
-        graph.run_finished(&id("c"), 100, true, false, None, 10_000);
+        graph.run_finished(&id("c"), completion(100, true, false, None), 10_000);
         publish(&mut graph, "c");
         graph.meter.roll_to("2026-10-23");
         graph.meter.record("test", 7, 11);
@@ -5361,7 +5726,7 @@ mod tests {
         graph.merge(&solo(), 0).expect("merge");
         let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
         graph.bind(&id("solo"), claimed[0].generation, 9, 1_000);
-        let outcome = graph.run_finished(&id("solo"), 9, false, true, None, 2_000);
+        let outcome = graph.run_finished(&id("solo"), completion(9, false, true, None), 2_000);
         assert_eq!(outcome, FinishOutcome::Applied);
         let ix = graph.node_ix(&id("solo")).expect("node");
         assert_eq!(graph.node(ix).status, Status::Pending);
@@ -5374,7 +5739,7 @@ mod tests {
         let outcome = graph.run_started("nobodys-task", 555, RunnerFamily::Linux, 0);
         assert_eq!(outcome, StartOutcome::External);
         assert_eq!(graph.external_total(), 1);
-        graph.run_finished("nobodys-task", 555, true, false, None, 0);
+        graph.run_finished("nobodys-task", completion(555, true, false, None), 0);
         assert_eq!(graph.external_total(), 0);
     }
 

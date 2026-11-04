@@ -254,6 +254,7 @@ fn published_task_ids(records: &[ArtifactRecord]) -> stow_types::error::Result<B
                 target: record.target.clone(),
                 rustc_version: record.rustc_version.clone(),
                 host_side: record.unit_shape.side == UnitSide::Host,
+                profile: record.node_profile,
             }
             .task_id(&record.dependency_identity()?))
         })
@@ -357,7 +358,10 @@ async fn phase(
     }
     let mut rounds = Vec::new();
     for round_dir in sorted_entries(&dir.join("rounds")).await? {
-        let records: Vec<ArtifactRecord> = read_json(&round_dir.join("new-records.json")).await?;
+        let records =
+            read_json::<stow_types::records::BuildRecords>(&round_dir.join("new-records.json"))
+                .await?
+                .artifacts;
         rounds.push(Round {
             before_report: read_json(&round_dir.join("before-report.json")).await?,
             end: read_json(&round_dir.join("end.json")).await?,

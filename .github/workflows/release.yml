@@ -119,6 +119,10 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
+    permissions:
+      "attestations": "write"
+      "contents": "read"
+      "id-token": "write"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
@@ -167,6 +171,10 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.cargo-dist.outputs.paths }}
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v7
         with:
@@ -181,6 +189,10 @@ jobs:
       - plan
       - build-local-artifacts
     runs-on: "ubuntu-22.04"
+    permissions:
+      "attestations": "write"
+      "contents": "read"
+      "id-token": "write"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
@@ -214,6 +226,10 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.cargo-dist.outputs.paths }}
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v7
         with:

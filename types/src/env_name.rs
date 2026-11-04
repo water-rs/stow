@@ -94,9 +94,49 @@ pub fn canonical(name: &str) -> String {
     }
 }
 
+/// Whether a toolchain variable names an executable rather than a
+/// directory or compilation flags. Cargo's target prefix alone also
+/// matches `CARGO_TARGET_DIR` and must never grant filesystem access.
+#[must_use]
+pub fn toolchain_executable(name: impl AsRef<OsStr>) -> bool {
+    let name = name.as_ref();
+    eq_any(name, &["CC", "CXX", "AR", "RANLIB", "LD"])
+        || starts_with_any(name, &["CC_", "CXX_", "AR_", "RANLIB_"])
+        || (starts_with(name, "CARGO_TARGET_")
+            && ["_LINKER", "_AR", "_RUNNER"]
+                .iter()
+                .any(|suffix| ends_with(name, suffix)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toolchain_executables_exclude_directories_and_flags() {
+        for name in [
+            "CARGO_TARGET_DIR",
+            "CARGO_TARGET_TMPDIR",
+            "CARGO_TARGET_X_RUSTFLAGS",
+            "LDFLAGS",
+            "LD_LIBRARY_PATH",
+        ] {
+            assert!(!toolchain_executable(name), "{name}");
+        }
+        for name in [
+            "CC",
+            "CXX",
+            "AR",
+            "RANLIB",
+            "LD",
+            "CC_aarch64_linux_android",
+            "CARGO_TARGET_X_LINKER",
+            "CARGO_TARGET_X_AR",
+            "CARGO_TARGET_X_RUNNER",
+        ] {
+            assert!(toolchain_executable(name), "{name}");
+        }
+    }
 
     #[test]
     fn equality_matches_under_host_rules() {

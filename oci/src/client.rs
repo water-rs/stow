@@ -448,7 +448,7 @@ pub struct RegistrySession {
     /// `host[:port]` — the reference-form half of `origin`.
     registry: String,
     /// The repository every request addresses
-    /// (`water-rs/stow-cache-<rustc>`).
+    /// (`water-rs/stow-cache-v2-<rustc>`).
     repository: String,
     credential: SessionCredential,
     /// OAuth scope the bearer requests: `pull` for anonymous sessions,

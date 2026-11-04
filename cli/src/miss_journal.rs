@@ -160,6 +160,16 @@ pub fn observed_unit(parsed: &ParsedRustcArgs, build: &LocalBuildArtifact) -> Op
         );
         return None;
     }
+    // A build script is an output of its crate's node, not a node: its
+    // miss names nothing the admissions post could enqueue — the crate's
+    // library unit reports the node.
+    if parsed.is_build_script() {
+        tracing::debug!(
+            crate_name = %parsed.crate_name,
+            "build script; not journaled"
+        );
+        return None;
+    }
     let externs = match serde_json::from_str(&build.dependencies.c_metadata_json) {
         Ok(externs) => externs,
         Err(error) => {
@@ -628,7 +638,7 @@ pub fn drain_finished_builds(out_dir: &Path) {
 /// (stow#667).
 pub async fn drain(target_dir: &Path, state_db: &StateDb) -> stow_types::error::Result<()> {
     let config = StowConfig::load_local(state_db.clone())?;
-    if !config.cache_mode.reaches_network() {
+    if !config.cache.reaches_network() {
         // Journals were written under a mode that reached the network; they
         // wait for it to return.
         return Ok(());
@@ -1428,7 +1438,7 @@ mod tests {
 
     fn test_config(cache_dir: &Path) -> StowConfig {
         StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: cache_dir.to_path_buf(),
@@ -1979,6 +1989,7 @@ mod tests {
             preserve_lockfile: false,
             host_side: false,
             explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         stow_types::api::EnqueueAdmission {
             task_id: "once_cell-task".to_owned(),

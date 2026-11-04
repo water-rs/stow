@@ -37,8 +37,8 @@
 #      node never published, an `overloaded` answer, a failed submit, or
 #      a resubmit that rebuilt anything. The wave and resubmit totals it
 #      reports are bounded by the monthly projection — scaled to the
-#      production wave's node count against the preheat budget
-#      (types/src/do_budgets.rs)
+#      production wave's node count and monthly cadence, combined with
+#      user traffic against 80% of each monthly allowance.
 #
 # The monthly projection (`stow-admin traffic-cost project`, the release
 # gate's `Monthly projection` job) also needs the production wave's node
@@ -289,14 +289,9 @@ log "rustc $RUSTC_VERSION; top-binaries limit $LIMIT; projects ${PROJECTS:-all};
 log "dispatch caps: $MAX_JOBS ($MAX_MACOS_JOBS macOS)"
 
 cd "$REPO_ROOT"
-log "building stow-cli, stow-build (mock compiler), stow-mock-registry, stow-admin"
-cargo build --release \
-    -p stow-cli --features stow-cli/mock-verify \
-    -p stow-build --features stow-build/mock-verify,stow-build/mock-compile \
-    -p stow-mock-registry -p stow-admin \
-    >"$LOG_DIR/cargo-build.log" 2>&1 \
-    || die "cargo build failed — see $LOG_DIR/cargo-build.log"
-BIN="$REPO_ROOT/target/release"
+source "$REPO_ROOT/scripts/gate-tools.sh"
+gate_tools preheat "$LOG_DIR/cargo-build.log" \
+    || die "gate tools unavailable — see $LOG_DIR/cargo-build.log"
 
 mkdir -p "$WORK_DIR/keys"
 openssl ecparam -name prime256v1 -genkey -noout -out "$WORK_DIR/keys/private.pem"
@@ -555,7 +550,7 @@ publish_round() {
         >>"$LOG_DIR/index-report.log" 2>&1 \
         || die "index report failed — see $LOG_DIR/index-report.log"
     snapshot "$dir/end.json"
-    log "$phase round $tag: $(jq length "$dir/new-records.json") records, $(jq length "$WORK_DIR/index-export/slices.json") slices"
+    log "$phase round $tag: $(jq ".artifacts | length" "$dir/new-records.json") records, $(jq length "$WORK_DIR/index-export/slices.json") slices"
 }
 
 # Drive a phase until its lanes are done and nothing is pending or in
@@ -606,6 +601,11 @@ drive_phase() {
         sleep "$POLL_SECS"
     done
 }
+
+# Build-script consumption reads signed slices even for a node with no
+# library dependencies. Initialize the empty store before the measured wave
+# so its first builds never race the first nonempty index publication.
+publish_round bootstrap
 
 # --- the wave ---------------------------------------------------------------
 

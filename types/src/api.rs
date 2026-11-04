@@ -16,6 +16,7 @@ use crate::identity::{
     TargetTriple, WireRustcVersion,
 };
 use crate::index::ArtifactIndexRow;
+use crate::node_profile::NodeProfile;
 use crate::platform::Profile;
 use crate::stow_error;
 use crate::task_graph::{ResolvedTaskGraph, ResolvedTaskNode, TaskNodeIdentity};
@@ -162,6 +163,9 @@ pub struct BuildTaskPayload {
     /// as target-side tasks.
     #[serde(default)]
     pub host_side: bool,
+    /// The named profile the node builds under; part of its identity.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub profile: NodeProfile,
     /// Whether this node keys differently under the explicit
     /// `--target <host>` spelling — `KeysApart` exactly when a proc-macro
     /// sits in its `--extern` closure (stow#736). A target-side task at
@@ -235,6 +239,10 @@ pub struct SubgraphNode {
     /// graph.
     #[serde(rename = "h", default, skip_serializing_if = "std::ops::Not::not")]
     pub host_side: bool,
+    /// The named profile the node builds under. Absent on the wire means
+    /// dev: the compact encoding writes only another profile.
+    #[serde(rename = "p", default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub profile: NodeProfile,
     /// Whether the node keys differently under the explicit `--target`
     /// spelling — `ExplicitSpelling::KeysApart` (stow#736). Absent on the
     /// wire means `KeysAsNative`: the compact encoding writes only `true`.
@@ -307,6 +315,7 @@ impl TaskSubgraph {
                 version: node.identity.version.clone(),
                 features_json: node.identity.features_json.clone(),
                 host_side: node.identity.host_side,
+                profile: node.identity.profile,
                 keys_apart: node.explicit_spelling
                     == crate::public_cache::ExplicitSpelling::KeysApart,
                 deps: node
@@ -375,6 +384,7 @@ impl TaskSubgraph {
                     })?,
                     rustc_version: root.rustc_version.clone(),
                     host_side: node.host_side,
+                    profile: node.profile,
                 },
                 explicit_spelling: if node.keys_apart {
                     crate::public_cache::ExplicitSpelling::KeysApart
@@ -406,6 +416,7 @@ impl BuildTaskPayload {
             target: self.target.clone(),
             rustc_version: self.rustc_version.clone(),
             host_side: self.host_side,
+            profile: self.profile,
         }
     }
 
@@ -577,6 +588,10 @@ pub struct ArtifactRecord {
     pub rustc_version: WireRustcVersion,
     /// Exact profile observed from the captured rustc invocation.
     pub profile: Profile,
+    /// The named profile of the task that built the artifact — the
+    /// profile field of its node identity.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub node_profile: NodeProfile,
     /// Exact `--emit` modes observed from the captured rustc invocation.
     /// Must be strictly sorted and deduplicated.
     pub emit: Vec<String>,
@@ -594,7 +609,7 @@ pub struct ArtifactRecord {
     /// are the node's task-graph edges: build-dependency libs and shadow
     /// twins included, which the `--extern` list never names.
     pub dependency_task_ids: Vec<String>,
-    /// OCI reference (e.g., "ghcr.io/water-rs/stow-cache-<rustc>:serde.1.0.0-...").
+    /// OCI reference (e.g., "ghcr.io/water-rs/stow-cache-v2-<rustc>:serde.1.0.0-...").
     pub oci_reference: String,
     /// OCI manifest digest (e.g., "sha256:...").
     pub oci_digest: String,
@@ -678,6 +693,9 @@ pub struct EnqueueRequest {
     /// decode as target-side tasks.
     #[serde(default)]
     pub host_side: bool,
+    /// The named profile the node builds under; part of its identity.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub profile: NodeProfile,
     /// Whether this node keys differently under the explicit
     /// `--target <host>` spelling — `KeysApart` exactly when a proc-macro
     /// sits in its `--extern` closure (stow#736). A target-side task at
@@ -713,6 +731,9 @@ pub struct EnqueueDependency {
     /// compile host units at. Defaults to false — a target-side dep.
     #[serde(default)]
     pub host_side: bool,
+    /// The named profile the node builds under; part of its identity.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub profile: NodeProfile,
     /// The dep's own dependency digest — the Merkle context its task id
     /// commits to (stow#588). No default: the digest is derived from the
     /// dep's actual resolved subgraph.
@@ -735,6 +756,7 @@ impl EnqueueDependency {
             target: self.target.clone(),
             rustc_version: self.rustc_version.clone(),
             host_side: self.host_side,
+            profile: self.profile,
         }
         .task_id(&self.dependency_identity)
     }
@@ -751,6 +773,7 @@ impl EnqueueRequest {
             target: self.target.clone(),
             rustc_version: self.rustc_version.clone(),
             host_side: self.host_side,
+            profile: self.profile,
         }
     }
 
@@ -810,6 +833,7 @@ impl EnqueueRequest {
                     target: node.identity.target.clone(),
                     rustc_version: node.identity.rustc_version.clone(),
                     host_side: node.identity.host_side,
+                    profile: node.identity.profile,
                     dependency_identity: graph.dependency_identity(dep).cloned().ok_or_else(
                         || stow_error!("resolved dependency graph yields no digest for node {dep}"),
                     )?,
@@ -965,7 +989,8 @@ pub fn task_id_segment(value: &str) -> String {
 
 /// The `<crate>-<version>-<features hash>-<target>-<rustc>` prefix every
 /// task id shares — [`crate::task_graph::TaskNodeIdentity::task_id`]
-/// inserts the `-d<dependency digest>` segment and appends `-host` —
+/// inserts the `-d<dependency digest>` segment and appends `-host` and the
+/// profile's segment —
 /// there is no digest-less spelling of a task id (stow#588).
 pub(crate) fn task_id_prefix(
     crate_name: &str,
@@ -985,6 +1010,17 @@ pub(crate) fn task_id_prefix(
     )
 }
 
+/// GitHub's successful, isolated cache-free verification job for this run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SourceFailureVerification {
+    /// The run whose failure was replayed.
+    pub run_id: u64,
+    /// Attempts cannot borrow verification from an earlier rerun.
+    pub run_attempt: u32,
+    /// The successful verification job.
+    pub job_id: u64,
+}
+
 /// Completion the edge's `POST /api/v1/github/workflow-run` handler
 /// forwards to the scheduler Durable Object's `POST /tasks/complete-run`
 /// for a finished `build-crate.yml` run.
@@ -996,6 +1032,10 @@ pub struct WorkflowRunComplete {
     /// finished green *and* whose run's records artifact exists in GHCR
     /// counts as a completed build.
     pub success: bool,
+    /// Independent verification of a source failure; the build remains failed.
+    pub source_failure: Option<SourceFailureVerification>,
+    /// GitHub attempt used to locate this run's verification job.
+    pub github_run_attempt: u32,
     /// Failure description when `success` is false — the conclusion and,
     /// on a missing records artifact, which tag the edge looked for.
     pub error: Option<String>,
@@ -1051,6 +1091,9 @@ pub struct ResolvedDependencyGraphDependency {
     /// keep minting the shape they always did.
     #[serde(default)]
     pub host_side: bool,
+    /// The named profile the node builds under; part of its identity.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub profile: NodeProfile,
 }
 
 /// One exact crates.io package node resolved from the client's current lockfile graph.
@@ -1072,6 +1115,9 @@ pub struct ResolvedDependencyGraphEntry {
     /// Defaults to the target side for clients predating the flag.
     #[serde(default)]
     pub host_side: bool,
+    /// The named profile the node builds under; part of its identity.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub profile: NodeProfile,
     /// Direct dependencies of this package.
     pub dependencies: Vec<ResolvedDependencyGraphDependency>,
     /// This node's dependency subgraph, projected from the build's own
@@ -1117,12 +1163,11 @@ pub const DISPATCH_FREEZE_INCIDENT_KEY: &str = "dispatch-freeze";
 
 /// The longest a started `build-crate.yml` run lasts.
 ///
-/// Its `build` job's `timeout-minutes` plus its `publish` job's, both
-/// enforced by GitHub, so the run's `completed` delivery lands within
-/// it. The scheduler's
+/// Its `build` job's `timeout-minutes` plus the longer of `publish`
+/// and `verify-failure`, enforced by GitHub. The scheduler's
 /// health check (stow#860) calls deliveries stopped past it; the admin
 /// workflow tests pin it to the workflow file.
-pub const BUILD_CRATE_RUN_TIMEOUT_MINUTES: i64 = 120 + 60;
+pub const BUILD_CRATE_RUN_TIMEOUT_MINUTES: i64 = 120 + 120;
 
 /// How often, at most, the scheduler reconciles its run set against the
 /// CI listing.
@@ -1436,6 +1481,46 @@ pub struct DispatchCapSetting {
     /// The macOS bound the set named, when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_macos_jobs: Option<u32>,
+    /// ISO 8601 timestamp of the set.
+    pub set_at: String,
+    /// The verified `actor` claim of the operations run that set it.
+    pub actor: String,
+}
+
+/// The release multiplier the scheduler ranks release-profile nodes
+/// under — wire shape of `GET`/`POST /api/v1/admin/release-priority`
+/// and of the scheduler object's `/release-priority` routes
+/// (stow#1012).
+///
+/// A release node's rank is `priority × percent / 100 × time waited`,
+/// so it queues behind equally-aged dev work yet overtakes fresher dev
+/// work once it has waited long enough. Until the first `set` the
+/// scheduler's default applies; there is no clear and no expiry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReleasePriority {
+    /// The operator setting in force — absent until the first `set`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setting: Option<ReleasePrioritySetting>,
+    /// The multiplier in force, in percent of the dev profile's
+    /// priority (`25` is a quarter).
+    pub percent: u32,
+}
+
+/// What an operator's `release-priority set` wrote — `POST`'s request
+/// body. No ceiling is checked: the operator is trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReleasePrioritySet {
+    /// The multiplier, in percent of the dev profile's priority.
+    pub percent: u32,
+}
+
+/// The operator setting a `set` appended to the scheduler's log — the
+/// `SchedulerEvent::ReleasePriority` payload, the graph's in-memory
+/// copy and the snapshot's field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReleasePrioritySetting {
+    /// The multiplier the set named, in percent.
+    pub percent: u32,
     /// ISO 8601 timestamp of the set.
     pub set_at: String,
     /// The verified `actor` claim of the operations run that set it.
@@ -1958,6 +2043,9 @@ pub struct PublishedSliceRow {
     pub version: CrateVersion,
     /// Canonicalized features list.
     pub features_json: FeaturesJson,
+    /// The named profile of the node the row serves.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub node_profile: NodeProfile,
     /// The unit shape the builder recorded for the row — its side, the
     /// cargo invocation spelling that produced it, and whether it links.
     pub unit_shape: crate::public_cache::UnitShape,
@@ -3695,6 +3783,7 @@ mod tests {
             dependency_identity: crate::identity::DependencyIdentity::leaf().expect("leaf digest"),
             deps: deps.to_vec(),
             downloads: 0,
+            profile: crate::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -3929,6 +4018,7 @@ mod tests {
                 kind: crate::public_cache::UnitKind::Linked,
             },
             min_glibc: None,
+            node_profile: crate::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -3953,6 +4043,7 @@ mod tests {
             target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: "1.85.0".parse().expect("rustc"),
             host_side: false,
+            profile: crate::node_profile::NodeProfile::Dev,
         };
         // The published slice: leaf `d` and `dep@{a,b}` built against it.
         let leaf = DependencyIdentity::leaf().expect("leaf digest");
@@ -3961,6 +4052,7 @@ mod tests {
             DependencyIdentity::from_task_ids([d_task_id.as_str()]).expect("digest");
         let t_task_id = identity("dep", &["a", "b"]).task_id(&t_dep_identity);
         let published = vec![crate::api::PublishedIndexSlice {
+            local_programs: Vec::new(),
             target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: "1.85.0".parse().expect("rustc"),
             rows: vec![
@@ -4065,6 +4157,7 @@ mod tests {
             },
             rustc_version: "1.85.0".parse().expect("rustc"),
             host_side,
+            profile: crate::node_profile::NodeProfile::Dev,
         };
         let leaf = DependencyIdentity::leaf().expect("leaf digest");
         let lib_task_id = identity("lib", &[], false).task_id(&leaf);
@@ -4075,6 +4168,7 @@ mod tests {
         let dep_task_id = identity("dep", &["a", "b"], false).task_id(&dep_identity);
         let published = vec![
             crate::api::PublishedIndexSlice {
+                local_programs: Vec::new(),
                 target: TARGET.parse().expect("target"),
                 rustc_version: "1.85.0".parse().expect("rustc"),
                 rows: vec![
@@ -4090,6 +4184,7 @@ mod tests {
                 ],
             },
             crate::api::PublishedIndexSlice {
+                local_programs: Vec::new(),
                 target: HOST.parse().expect("host"),
                 rustc_version: "1.85.0".parse().expect("rustc"),
                 rows: vec![published_row(
@@ -4146,6 +4241,7 @@ mod tests {
             },
             rustc_version: "1.85.0".parse().expect("rustc"),
             host_side,
+            profile: crate::node_profile::NodeProfile::Dev,
         };
         let leaf = DependencyIdentity::leaf().expect("leaf digest");
         let helper_host_id = identity("helper", &[], true).task_id(&leaf);
@@ -4156,6 +4252,7 @@ mod tests {
         let dep_task_id = identity("dep", &["a", "b"], false).task_id(&dep_identity);
         let published = vec![
             crate::api::PublishedIndexSlice {
+                local_programs: Vec::new(),
                 target: TARGET.parse().expect("target"),
                 rustc_version: "1.85.0".parse().expect("rustc"),
                 rows: vec![
@@ -4171,6 +4268,7 @@ mod tests {
                 ],
             },
             crate::api::PublishedIndexSlice {
+                local_programs: Vec::new(),
                 target: HOST.parse().expect("host"),
                 rustc_version: "1.85.0".parse().expect("rustc"),
                 rows: vec![published_row("helper", &[], &[], Vec::new(), "33", true)],
@@ -4220,6 +4318,7 @@ mod tests {
             },
             rustc_version: "1.85.0".parse().expect("rustc"),
             host_side,
+            profile: crate::node_profile::NodeProfile::Dev,
         };
         let leaf = DependencyIdentity::leaf().expect("leaf digest");
         let helper_host_id = identity("helper", &[], true).task_id(&leaf);
@@ -4231,6 +4330,7 @@ mod tests {
         // `c_metadata` join binds it, the task-id join cannot.
         let published = vec![
             crate::api::PublishedIndexSlice {
+                local_programs: Vec::new(),
                 target: TARGET.parse().expect("target"),
                 rustc_version: "1.85.0".parse().expect("rustc"),
                 rows: vec![
@@ -4246,6 +4346,7 @@ mod tests {
                 ],
             },
             crate::api::PublishedIndexSlice {
+                local_programs: Vec::new(),
                 target: HOST.parse().expect("host"),
                 rustc_version: "1.85.0".parse().expect("rustc"),
                 rows: vec![published_row("helper", &[], &[], Vec::new(), "33", true)],
@@ -4288,6 +4389,7 @@ mod tests {
         x_h.host_side = true;
         let x_t = submission_node("x", &[], &[], "x-t");
         let published = vec![crate::api::PublishedIndexSlice {
+            local_programs: Vec::new(),
             target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: "1.85.0".parse().expect("rustc"),
             rows: vec![published_row("x", &["std"], &[], Vec::new(), "33", true)],
@@ -4312,6 +4414,7 @@ mod tests {
             target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: "1.85.0".parse().expect("rustc"),
             host_side,
+            profile: crate::node_profile::NodeProfile::Dev,
         };
         let leaf = DependencyIdentity::leaf().expect("leaf digest");
         let target_id = identity(false).task_id(&leaf);
@@ -4319,6 +4422,7 @@ mod tests {
             DependencyIdentity::from_task_ids([target_id.as_str()]).expect("host dep digest");
         let host_id = identity(true).task_id(&host_dep_identity);
         let published = vec![crate::api::PublishedIndexSlice {
+            local_programs: Vec::new(),
             target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: "1.85.0".parse().expect("rustc"),
             rows: vec![
@@ -4365,6 +4469,7 @@ mod tests {
         let x_t = submission_node("x", &[], &[], "x-t");
         let parent = submission_node("p", &[], &[1, 2], "p");
         let published = vec![crate::api::PublishedIndexSlice {
+            local_programs: Vec::new(),
             target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: "1.85.0".parse().expect("rustc"),
             rows: vec![published_row("x", &["std"], &[], Vec::new(), "66", false)],
@@ -4403,6 +4508,7 @@ mod tests {
                 kind: crate::public_cache::UnitKind::Linked,
             },
             dependency_identity: format!("{i:064x}").parse().expect("digest"),
+            node_profile: crate::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -4622,6 +4728,9 @@ pub struct SubmissionNode {
     /// Whether the node compiles for the build host.
     #[serde(default)]
     pub host_side: bool,
+    /// The named profile the node builds under.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub profile: NodeProfile,
     /// The explicit `--target` spelling flag (stow#736).
     pub explicit_spelling: crate::public_cache::ExplicitSpelling,
     /// Build against the binary's published `Cargo.lock` (overlay lane).
@@ -4732,6 +4841,7 @@ impl SubmissionTree {
                     target: node.identity.target.clone(),
                     rustc_version: node.identity.rustc_version.clone(),
                     host_side: node.identity.host_side,
+                    profile: node.identity.profile,
                     explicit_spelling: node.explicit_spelling,
                     preserve_lockfile: request.preserve_lockfile && ix == 0,
                     dependency_identity,
@@ -4769,7 +4879,10 @@ impl SubmissionTree {
     /// # Errors
     /// `Error` when one node's dependency subtree alone serializes past
     /// `max_bytes` — no split can carry it.
-    pub fn into_bodies(trees: &[Self], max_bytes: usize) -> crate::error::Result<Vec<Vec<Self>>> {
+    pub fn into_bodies<'a>(
+        trees: impl IntoIterator<Item = &'a Self>,
+        max_bytes: usize,
+    ) -> crate::error::Result<Vec<Vec<Self>>> {
         // A body's `[` and `]`; trees inside it are `,`-separated.
         let budget = max_bytes
             .checked_sub(2)
@@ -5004,6 +5117,11 @@ impl SubmissionTree {
         // published slices, and the serving map over them: a set
         // contained in no other is built; every other set is served by
         // the smallest built set containing it.
+        let node_slices = published
+            .iter()
+            .map(PublishedIndexSlice::node_slice)
+            .collect::<Vec<_>>();
+        let published = node_slices.as_slice();
         let mut families = BTreeMap::<SubstitutionGroupKey, BTreeSet<Vec<String>>>::new();
         for tree in trees.iter() {
             for node in &tree.nodes {
@@ -5132,12 +5250,69 @@ impl SubmissionTree {
 /// slice's coordinates, which rows do not themselves carry.
 #[derive(Debug, Clone)]
 pub struct PublishedIndexSlice {
+    /// Signed nodes whose programs each consumer compiles locally.
+    pub local_programs: Vec<crate::records::LocalProcMacro>,
     /// The slice's target triple — every row's `TaskNodeIdentity.target`.
     pub target: TargetTriple,
     /// The slice's rustc — every row's `TaskNodeIdentity.rustc_version`.
     pub rustc_version: WireRustcVersion,
     /// The verified rows.
     pub rows: Vec<ArtifactIndexRow>,
+}
+
+/// Node-only projection shared by downloadable artifacts and local programs.
+struct PublishedNodeRow {
+    crate_name: CrateName,
+    version: CrateVersion,
+    features_json: FeaturesJson,
+    node_profile: NodeProfile,
+    unit_shape: crate::public_cache::UnitShape,
+    dependency_task_ids: Vec<String>,
+    proc_macro: bool,
+}
+
+impl PublishedNodeRow {
+    fn dependency_identity(&self) -> crate::error::Result<DependencyIdentity> {
+        DependencyIdentity::from_task_ids(self.dependency_task_ids.iter().map(String::as_str))
+    }
+}
+
+struct PublishedNodeSlice {
+    target: TargetTriple,
+    rustc_version: WireRustcVersion,
+    rows: Vec<PublishedNodeRow>,
+}
+
+impl PublishedIndexSlice {
+    fn node_slice(&self) -> PublishedNodeSlice {
+        let rows = self
+            .rows
+            .iter()
+            .map(|row| PublishedNodeRow {
+                crate_name: row.crate_name.clone(),
+                version: row.version.clone(),
+                features_json: row.features_json.clone(),
+                node_profile: row.node_profile,
+                unit_shape: row.unit_shape,
+                dependency_task_ids: row.dependency_task_ids.clone(),
+                proc_macro: row.artifact_kind == ArtifactKind::ProcMacro,
+            })
+            .chain(self.local_programs.iter().map(|program| PublishedNodeRow {
+                crate_name: program.node.crate_name.clone(),
+                version: program.node.version.clone(),
+                features_json: program.node.features_json.clone(),
+                node_profile: program.node.profile,
+                unit_shape: program.unit_shape,
+                dependency_task_ids: program.dependency_task_ids.clone(),
+                proc_macro: true,
+            }))
+            .collect();
+        PublishedNodeSlice {
+            target: self.target.clone(),
+            rustc_version: self.rustc_version.clone(),
+            rows,
+        }
+    }
 }
 
 /// The identity group the superset-serving rule keys on (stow#881) —
@@ -5148,6 +5323,7 @@ type SubstitutionGroupKey = (
     TargetTriple,
     WireRustcVersion,
     bool,
+    NodeProfile,
 );
 
 fn substitution_group_key(node: &SubmissionNode) -> SubstitutionGroupKey {
@@ -5157,12 +5333,19 @@ fn substitution_group_key(node: &SubmissionNode) -> SubstitutionGroupKey {
         node.target.clone(),
         node.rustc_version.clone(),
         node.host_side,
+        node.profile,
     )
 }
 
 /// The `(crate, version, target, rustc)` a twin pair shares — the
 /// group key with the side stripped (stow#723).
-type TwinPairKey = (CrateName, CrateVersion, TargetTriple, WireRustcVersion);
+type TwinPairKey = (
+    CrateName,
+    CrateVersion,
+    TargetTriple,
+    WireRustcVersion,
+    NodeProfile,
+);
 
 /// stow#723: the two endpoints of a twin pair move to the same serving
 /// set or neither. A pair is named wherever an edge binds the
@@ -5182,7 +5365,7 @@ type TwinPairKey = (CrateName, CrateVersion, TargetTriple, WireRustcVersion);
 #[allow(clippy::too_many_lines)] // one pass over both pools; split hurts the shape
 fn patch_twin_pair_serving(
     trees: &[SubmissionTree],
-    published: &[PublishedIndexSlice],
+    published: &[PublishedNodeSlice],
     by_task_id: &std::collections::HashMap<&str, (usize, usize)>,
     serving: &mut BTreeMap<SubstitutionGroupKey, BTreeMap<Vec<String>, Vec<String>>>,
 ) {
@@ -5196,6 +5379,7 @@ fn patch_twin_pair_serving(
             parent.version.clone(),
             parent.target.clone(),
             parent.rustc_version.clone(),
+            parent.profile,
         );
         if parent.host_side {
             for dep in deps {
@@ -5204,6 +5388,7 @@ fn patch_twin_pair_serving(
                     && dep.version == parent.version
                     && dep.target == parent.target
                     && dep.rustc_version == parent.rustc_version
+                    && dep.profile == parent.profile
                     && dep.features_json == parent.features_json
                 {
                     paired.insert((parent_key.clone(), parent.features_json.features().to_vec()));
@@ -5221,6 +5406,7 @@ fn patch_twin_pair_serving(
                         dep.version.clone(),
                         dep.target.clone(),
                         dep.rustc_version.clone(),
+                        dep.profile,
                     ),
                     dep.features_json.features().to_vec(),
                 ))
@@ -5247,6 +5433,7 @@ fn patch_twin_pair_serving(
                 target: node.target.clone(),
                 rustc_version: node.rustc_version.clone(),
                 host_side: node.host_side,
+                profile: node.profile,
             };
             let deps: Vec<TaskNodeIdentity> = node
                 .deps
@@ -5260,6 +5447,7 @@ fn patch_twin_pair_serving(
                         target: dep.target.clone(),
                         rustc_version: dep.rustc_version.clone(),
                         host_side: dep.host_side,
+                        profile: dep.profile,
                     }
                 })
                 .collect();
@@ -5297,6 +5485,7 @@ fn patch_twin_pair_serving(
                     key.2.clone(),
                     key.3.clone(),
                     host_side,
+                    key.4,
                 ))
                 .map(|map| {
                     map.iter()
@@ -5319,6 +5508,7 @@ fn patch_twin_pair_serving(
                 key.2.clone(),
                 key.3.clone(),
                 host_side,
+                key.4,
             )) && map.contains_key(&features)
             {
                 map.insert(features.clone(), joint.clone());
@@ -5330,8 +5520,8 @@ fn patch_twin_pair_serving(
 /// A published row's identity group — the slice supplies the two
 /// identity columns a row does not carry.
 fn substitution_row_key(
-    slice: &PublishedIndexSlice,
-    row: &ArtifactIndexRow,
+    slice: &PublishedNodeSlice,
+    row: &PublishedNodeRow,
 ) -> SubstitutionGroupKey {
     (
         row.crate_name.clone(),
@@ -5339,12 +5529,13 @@ fn substitution_row_key(
         slice.target.clone(),
         slice.rustc_version.clone(),
         row.unit_shape.side == crate::public_cache::UnitSide::Host,
+        row.node_profile,
     )
 }
 
 /// A published row's task identity — same field split as
 /// [`substitution_row_key`].
-fn published_row_identity(slice: &PublishedIndexSlice, row: &ArtifactIndexRow) -> TaskNodeIdentity {
+fn published_row_identity(slice: &PublishedNodeSlice, row: &PublishedNodeRow) -> TaskNodeIdentity {
     TaskNodeIdentity {
         crate_name: row.crate_name.clone(),
         version: row.version.clone(),
@@ -5352,6 +5543,7 @@ fn published_row_identity(slice: &PublishedIndexSlice, row: &ArtifactIndexRow) -
         target: slice.target.clone(),
         rustc_version: slice.rustc_version.clone(),
         host_side: row.unit_shape.side == crate::public_cache::UnitSide::Host,
+        profile: row.node_profile,
     }
 }
 
@@ -5363,7 +5555,7 @@ fn published_row_identity(slice: &PublishedIndexSlice, row: &ArtifactIndexRow) -
 /// `dependency_task_ids` edges name (stow#919).
 #[allow(clippy::type_complexity)]
 fn published_pool_index(
-    published: &[PublishedIndexSlice],
+    published: &[PublishedNodeSlice],
     serving: &BTreeMap<SubstitutionGroupKey, BTreeMap<Vec<String>, Vec<String>>>,
 ) -> crate::error::Result<(
     BTreeMap<(SubstitutionGroupKey, Vec<String>), (usize, usize, String)>,
@@ -5401,7 +5593,7 @@ fn published_pool_index(
 /// and the memoized per-occurrence answers.
 struct Substitution<'a> {
     trees: &'a [SubmissionTree],
-    published: &'a [PublishedIndexSlice],
+    published: &'a [PublishedNodeSlice],
     serving: &'a BTreeMap<SubstitutionGroupKey, BTreeMap<Vec<String>, Vec<String>>>,
     representatives: &'a BTreeMap<(SubstitutionGroupKey, Vec<String>), (usize, usize)>,
     /// `(slice, row, task id)` of each serving set's published pick.
@@ -5488,6 +5680,7 @@ impl Substitution<'_> {
                 target: node.target.clone(),
                 rustc_version: node.rustc_version.clone(),
                 host_side: node.host_side,
+                profile: node.profile,
             },
             node.explicit_spelling,
             dependencies,
@@ -5555,8 +5748,7 @@ impl Substitution<'_> {
                 explicit_spelling: intern_key.1,
                 dependencies: intern_key.2.clone(),
             });
-            self.closure_pm
-                .push(row.artifact_kind == ArtifactKind::ProcMacro || keys_apart);
+            self.closure_pm.push(row.proc_macro || keys_apart);
             self.interned.insert(intern_key, index);
             index
         };
@@ -5641,6 +5833,7 @@ fn reemit_substituted_tree(
             target: node.identity.target.clone(),
             rustc_version: node.identity.rustc_version.clone(),
             host_side: node.identity.host_side,
+            profile: node.identity.profile,
             explicit_spelling: node.explicit_spelling,
             preserve_lockfile,
             dependency_identity,
@@ -5874,6 +6067,8 @@ pub enum SchedulerEvent {
         task_id: String,
         /// The mapped conclusion.
         success: bool,
+        /// Isolated source-failure verification tied to this run.
+        source_failure: Option<SourceFailureVerification>,
         /// The conclusion was `cancelled`.
         #[serde(default)]
         cancelled: bool,
@@ -5930,6 +6125,13 @@ pub enum SchedulerEvent {
     DispatchCap {
         /// The setting the log row recorded.
         setting: Box<DispatchCapSetting>,
+    },
+    /// An operator's release-priority setting (stow#1012): the
+    /// multiplier release-profile nodes rank under, in force until the
+    /// next `set`. There is no clear.
+    ReleasePriority {
+        /// The setting the log row recorded.
+        setting: Box<ReleasePrioritySetting>,
     },
     /// The dispatch freeze's transition record (`None` = cleared).
     Freeze {

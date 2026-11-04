@@ -23,11 +23,14 @@
 //! `{base_generation, added, retired}` delta diffs against.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use stow_types::records::{BuildRecords, LocalProcMacro};
 
 use clap::{Args, Subcommand};
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use keyring_core::api::CredentialStoreApi;
-use stow_types::api::{ArtifactRecord, CI_TARGET_TRIPLES, PublishedSliceRow};
+#[cfg(test)]
+use stow_types::api::ArtifactRecord;
+use stow_types::api::{CI_TARGET_TRIPLES, PublishedSliceRow};
 use stow_types::identity::{DependencyIdentity, TargetTriple, WireRustcVersion};
 use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
@@ -98,7 +101,7 @@ pub enum IndexCommand {
     /// export so the next run converges on the published state.
     Reconcile(IndexReconcileArgs),
     /// Print every stable rustc with a published
-    /// `ghcr.io/water-rs/stow-cache-<rustc>` package, one per line: the
+    /// `ghcr.io/water-rs/stow-cache-v2-<rustc>` package, one per line: the
     /// releases `static.rust-lang.org/manifests.txt` lists, each probed
     /// through the registry's anonymous tag listing. `operations.yml`
     /// reports each one's slices after a scheduler reset. Fails when a
@@ -398,7 +401,7 @@ impl PullContext {
     /// Pull and verify one records artifact — a signature that fails the
     /// pinned identity is fatal: the alternative, silently dropping it,
     /// would export a slice that quietly misses crates.
-    async fn records(&self, tag: &str) -> stow_types::error::Result<Vec<ArtifactRecord>> {
+    async fn records(&self, tag: &str) -> stow_types::error::Result<BuildRecords> {
         let pulled = stow_oci::pull_records_by_tag(&self.session, tag).await?;
         let reference = self.session.reference(tag)?;
         verify_artifact(
@@ -451,7 +454,7 @@ struct ExportPass {
     /// Slices that changed — the only ones publish needs to touch.
     slices: Vec<SliceExport>,
     /// Every record this pass pulled — the folded delta.
-    new_records: Vec<ArtifactRecord>,
+    new_records: BuildRecords,
     /// Records artifacts pulled — the O(change) meter the gate counts.
     pulled: usize,
 }
@@ -461,22 +464,31 @@ struct ExportPass {
 type PullFut<'a, T> =
     std::pin::Pin<Box<dyn Future<Output = stow_types::error::Result<T>> + Send + 'a>>;
 
-/// Index rows keyed by the `(c_metadata, unit_shape, dependency_identity)`
+/// Index rows keyed by the `(c_metadata, profile, unit_shape, dependency_identity)`
 /// node a unit was published for. The `(c_metadata, unit_shape)` pair is
 /// what a consumer's key space identifies, but it is not the row key:
 /// two nodes that differ only in dependency context can compile to the
 /// same unit, and each keeps a row so the slice answers for both
 /// (stow#657).
-type RowsByIdentity = BTreeMap<(String, UnitShape, DependencyIdentity), ArtifactIndexRow>;
+type RowsByIdentity = BTreeMap<
+    (
+        String,
+        stow_types::node_profile::NodeProfile,
+        UnitShape,
+        DependencyIdentity,
+    ),
+    ArtifactIndexRow,
+>;
 
 /// Fold `row` into `rows` under its
-/// `(c_metadata, unit_shape, dependency_identity)` key — a rebuilt unit
+/// `(c_metadata, profile, unit_shape, dependency_identity)` key — a rebuilt unit
 /// replaces its node's row, a second node publishing the same unit adds
 /// a row beside it.
 fn fold_row(rows: &mut RowsByIdentity, row: ArtifactIndexRow) -> stow_types::error::Result<()> {
     rows.insert(
         (
             row.c_metadata.as_str().to_owned(),
+            row.node_profile,
             row.unit_shape,
             row.dependency_identity()?,
         ),
@@ -512,7 +524,7 @@ where
     P: Fn(&str) -> PullFut<'static, Option<((TargetTriple, WireRustcVersion), PrevSlice)>>
         + Send
         + Sync,
-    R: Fn(&str) -> PullFut<'static, Vec<ArtifactRecord>> + Send + Sync,
+    R: Fn(&str) -> PullFut<'static, BuildRecords> + Send + Sync,
 {
     let is_own_rustc =
         |tag_rustc: &str| WireRustcVersion::parse(tag_rustc).is_ok_and(|v| v == *rustc);
@@ -573,7 +585,9 @@ where
     let mut new_rows: BTreeMap<(TargetTriple, WireRustcVersion), RowsByIdentity> = BTreeMap::new();
     let mut new_folded: BTreeMap<(TargetTriple, WireRustcVersion), BTreeSet<String>> =
         BTreeMap::new();
-    let mut new_records: Vec<ArtifactRecord> = Vec::new();
+    let mut new_records = BuildRecords::default();
+    let mut new_programs: BTreeMap<(TargetTriple, WireRustcVersion), Vec<LocalProcMacro>> =
+        BTreeMap::new();
     let per_tag = futures_util::stream::iter(missing.iter().map(|entry| pull_records(entry.2)))
         .buffered(RECORDS_PULL_CONCURRENCY)
         .try_collect::<Vec<_>>()
@@ -583,23 +597,32 @@ where
         // a records artifact is immutable per build, so the tag is never
         // pulled again once marked.
         let mut named = BTreeSet::new();
-        for record in &records {
+        for record in &records.artifacts {
             let key = (record.target.clone(), record.rustc_version.clone());
             named.insert(key.clone());
             let row = record_to_index_row(record);
             fold_row(new_rows.entry(key).or_default(), row)?;
         }
+        for program in &records.local_programs {
+            let key = (
+                program.node.target.clone(),
+                program.node.rustc_version.clone(),
+            );
+            named.insert(key.clone());
+            new_programs.entry(key).or_default().push(program.clone());
+        }
         for key in named {
             new_folded.entry(key).or_default().insert((*tag).to_owned());
         }
-        new_records.extend(records);
+        new_records.artifacts.extend(records.artifacts);
+        new_records.local_programs.extend(records.local_programs);
     }
 
     // A slice is rewritten when new records routed to it — by index row
     // or by folded mark alone (all-unbundled artifacts produce no rows
     // but must still be marked so they are never re-pulled).
     Ok(ExportPass {
-        slices: merge_exports(prev, &new_rows, &new_folded, rustc)?,
+        slices: merge_exports(prev, &new_rows, &new_programs, &new_folded, rustc)?,
         new_records,
         pulled: pulled_count,
     })
@@ -613,6 +636,7 @@ where
 fn merge_exports(
     mut prev: BTreeMap<(TargetTriple, WireRustcVersion), PrevSlice>,
     new_rows: &BTreeMap<(TargetTriple, WireRustcVersion), RowsByIdentity>,
+    new_programs: &BTreeMap<(TargetTriple, WireRustcVersion), Vec<LocalProcMacro>>,
     new_folded: &BTreeMap<(TargetTriple, WireRustcVersion), BTreeSet<String>>,
     rustc: &WireRustcVersion,
 ) -> stow_types::error::Result<Vec<SliceExport>> {
@@ -624,7 +648,7 @@ fn merge_exports(
         let prev_slice = prev.remove(key);
         let mut merged = RowsByIdentity::new();
         if let Some(slice) = prev_slice.as_ref() {
-            for row in &slice.index.rows {
+            for row in slice.index.rows.iter().chain(&slice.index.build_scripts) {
                 fold_row(&mut merged, row.clone())?;
             }
         }
@@ -686,6 +710,11 @@ fn merge_exports(
     slices
         .into_iter()
         .map(|((target, rustc_version), rows, folded, prev_slice)| {
+            let programs = merge_local_programs(
+                prev_slice.as_ref(),
+                new_programs.get(&(target.clone(), rustc_version.clone())),
+            )?;
+            let (rows, build_scripts) = stow_types::index::partition_build_scripts(rows);
             // The generation increments the index the pass extends; a
             // `--full` pass pulled no prev, and a first publish has
             // none, so both stamp `1`.
@@ -705,6 +734,8 @@ fn merge_exports(
                         row_count,
                     },
                     rows,
+                    build_scripts,
+                    local_programs: programs,
                 },
                 folded,
                 prev: prev_slice.map(|slice| slice.index),
@@ -713,6 +744,28 @@ fn merge_exports(
             })
         })
         .collect()
+}
+
+fn merge_local_programs(
+    previous: Option<&PrevSlice>,
+    incoming: Option<&Vec<LocalProcMacro>>,
+) -> stow_types::error::Result<Vec<LocalProcMacro>> {
+    let mut programs = BTreeMap::new();
+    for program in previous
+        .into_iter()
+        .flat_map(|slice| &slice.index.local_programs)
+        .chain(incoming.into_iter().flatten())
+    {
+        programs.insert(
+            (
+                program.task_id()?,
+                program.unit_shape,
+                program.compile_key.clone(),
+            ),
+            program.clone(),
+        );
+    }
+    Ok(programs.into_values().collect())
 }
 
 /// One export pass over the whole registry: writes each changed slice as
@@ -757,7 +810,7 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
     tracing::info!(
         pulled = pass.pulled,
         slices = pass.slices.len(),
-        new_records = pass.new_records.len(),
+        new_records = pass.new_records.artifacts.len(),
         "exported artifact index"
     );
 
@@ -868,7 +921,7 @@ async fn read_prev_sidecar(
 /// The index file's semantic rows as [`PublishedSliceRow`]s — the
 /// scheduler's slice membership. Artifact rows collapse onto semantic
 /// identity + unit shape — several `c_metadata`/`compile_key` rows can name
-/// one `(crate, version, features, shape)` — so the report
+/// one `(crate, version, features, profile, shape)` — so the report
 /// deduplicates. Two rows of the same identity at different unit shapes
 /// stay separate: the gate compares each shape an edge requires against
 /// its own row. A measured row above the sysroot's glibc floor
@@ -889,19 +942,24 @@ fn semantic_rows(index: &ArtifactIndex) -> stow_types::error::Result<Vec<Publish
                 crate_name: row.crate_name.clone(),
                 version: row.version.clone(),
                 features_json: row.features_json.clone(),
+                node_profile: row.node_profile,
                 unit_shape: row.unit_shape,
                 dependency_identity: row.dependency_identity()?,
             })
         })
+        .chain(index.local_programs.iter().map(|program| {
+            Ok(PublishedSliceRow {
+                crate_name: program.node.crate_name.clone(),
+                version: program.node.version.clone(),
+                features_json: program.node.features_json.clone(),
+                node_profile: program.node.profile,
+                unit_shape: program.unit_shape,
+                dependency_identity: program.dependency_identity()?,
+            })
+        }))
         .filter(|row| {
             let Ok(row) = row else { return true };
-            seen.insert((
-                row.crate_name.as_str().to_owned(),
-                row.version.to_string(),
-                row.features_json.raw(),
-                row.dependency_identity.clone(),
-                row.unit_shape,
-            ))
+            seen.insert(row_key(row))
         })
         .collect()
 }
@@ -914,6 +972,7 @@ fn row_key(
     String,
     String,
     String,
+    stow_types::node_profile::NodeProfile,
     stow_types::identity::DependencyIdentity,
     stow_types::public_cache::UnitShape,
 ) {
@@ -921,6 +980,7 @@ fn row_key(
         row.crate_name.as_str().to_owned(),
         row.version.to_string(),
         row.features_json.raw(),
+        row.node_profile,
         row.dependency_identity.clone(),
         row.unit_shape,
     )
@@ -1276,11 +1336,12 @@ async fn probe_published(
     use futures_util::{StreamExt as _, TryStreamExt as _};
     let published: Vec<WireRustcVersion> = futures_util::stream::iter(candidates)
         .map(|rustc| async move {
+            let repository = cache_repository(&rustc);
             let holds_tags = base
-                .session(&cache_repository(&rustc), http)
+                .session(&repository, http)
                 .has_tags()
                 .await
-                .map_err(|error| stow_error!("probe stow-cache-{rustc}: {error}"))?;
+                .map_err(|error| stow_error!("probe {repository}: {error}"))?;
             Ok::<_, stow_types::error::Error>(holds_tags.then_some(rustc))
         })
         .buffered(concurrency)
@@ -1583,9 +1644,9 @@ mod tests {
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.88.0";
-    /// The canonical `ghcr.io/water-rs/stow-cache-<RUSTC>` signed
+    /// The canonical `ghcr.io/water-rs/stow-cache-v2-<RUSTC>` signed
     /// references bind.
-    const REFERENCE_BASE: &str = "ghcr.io/water-rs/stow-cache-1.88.0";
+    const REFERENCE_BASE: &str = "ghcr.io/water-rs/stow-cache-v2-1.88.0";
     /// A second rustc's tags the pass must never pull.
     const OTHER_RUSTC: &str = "1.99.0";
 
@@ -1639,6 +1700,7 @@ mod tests {
                 kind: stow_types::public_cache::UnitKind::Linked,
             },
             min_glibc: None,
+            node_profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -1654,7 +1716,66 @@ mod tests {
                 row_count: u64::try_from(rows.len()).expect("row count"),
             },
             rows,
+            build_scripts: Vec::new(),
+            local_programs: Vec::new(),
         }
+    }
+
+    /// A build script is an output of its crate's node: its record joins
+    /// the slice's `build_scripts`, never its node `rows`, whether it
+    /// arrives in a new pass or rides in the published slice it extends,
+    /// and a script published by several nodes is one row.
+    #[test]
+    fn build_script_records_fold_beside_the_node_rows() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let key = (TargetTriple::parse(TARGET).expect("target"), rustc.clone());
+        let script = |task_id: &str, c_metadata: &str| {
+            let mut script = record(task_id);
+            script.c_metadata = CMetadata::parse(c_metadata).expect("c_metadata");
+            script.artifact_kind = ArtifactKind::BuildScript;
+            script.crate_types = vec![RustCrateType::Bin];
+            script
+        };
+        let carried = record_to_index_row(&script("aaaa1111", "b5c00001"));
+        let mut prev_index = prev_index(vec![record_to_index_row(&record("bbbb2222"))], 3);
+        prev_index.build_scripts = vec![carried];
+        let prev = BTreeMap::from([(
+            key.clone(),
+            PrevSlice {
+                index: prev_index,
+                folded: BTreeSet::new(),
+            },
+        )]);
+        let mut new_rows = BTreeMap::<_, RowsByIdentity>::new();
+        let rows = new_rows.entry(key.clone()).or_default();
+        // The same script published by two nodes, and a fresh one.
+        fold_row(rows, record_to_index_row(&script("cccc3333", "b5c00001"))).expect("fold");
+        fold_row(rows, record_to_index_row(&script("dddd4444", "b5c00002"))).expect("fold");
+        fold_row(rows, record_to_index_row(&record("eeee5555"))).expect("fold");
+
+        let slices = merge_exports(prev, &new_rows, &BTreeMap::new(), &BTreeMap::new(), &rustc)
+            .expect("merge");
+        let slice = slices
+            .iter()
+            .find(|slice| (slice.target.clone(), slice.rustc_version.clone()) == key)
+            .expect("the slice");
+        assert!(
+            slice
+                .index
+                .rows
+                .iter()
+                .all(|row| row.artifact_kind != ArtifactKind::BuildScript),
+            "a build script is not a node row"
+        );
+        assert_eq!(slice.index.rows.len(), 2);
+        assert_eq!(slice.index.header.row_count, 2);
+        let scripts: Vec<&str> = slice
+            .index
+            .build_scripts
+            .iter()
+            .map(|row| row.c_metadata.as_str())
+            .collect();
+        assert_eq!(scripts, ["b5c00001", "b5c00002"]);
     }
 
     /// The O(change) gate: a second export over N folded records plus k
@@ -1662,6 +1783,46 @@ mod tests {
     /// the store, is what a pass re-reads. And a second rustc's tags —
     /// its records, and its own folded/index pair — are never pulled by
     /// R's pass at all.
+    #[test]
+    fn a_local_program_is_folded_and_reported_without_a_bundle() {
+        let row = record("aaaa1111");
+        let key = (row.target.clone(), row.rustc_version.clone());
+        let program = LocalProcMacro {
+            node: stow_types::task_graph::TaskNodeIdentity {
+                crate_name: row.crate_name,
+                version: row.version,
+                features_json: row.features_json,
+                target: row.target,
+                rustc_version: row.rustc_version.clone(),
+                host_side: row.unit_shape.side == stow_types::public_cache::UnitSide::Host,
+                profile: row.node_profile,
+            },
+            dependency_task_ids: row.dependency_task_ids,
+            dependency_c_metadata_json: row.dependency_c_metadata_json,
+            compile_key: row.compile_key,
+            c_metadata: row.c_metadata,
+            unit_shape: row.unit_shape,
+        };
+        let programs = BTreeMap::from([(key.clone(), vec![program.clone()])]);
+        let marks = BTreeMap::from([(key.clone(), BTreeSet::from(["records-test".to_owned()]))]);
+        let slices = merge_exports(
+            BTreeMap::new(),
+            &BTreeMap::new(),
+            &programs,
+            &marks,
+            &row.rustc_version,
+        )
+        .unwrap();
+        let slice = slices
+            .iter()
+            .find(|slice| (slice.target.clone(), slice.rustc_version.clone()) == key)
+            .unwrap();
+        assert_eq!(slice.index.rows, []);
+        assert_eq!(slice.index.local_programs, [program]);
+        assert_eq!(semantic_rows(&slice.index).unwrap().len(), 1);
+        assert_eq!(slice.folded, ["records-test"]);
+    }
+
     #[test]
     fn second_export_pulls_only_new_records() {
         let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
@@ -1685,8 +1846,12 @@ mod tests {
             let tag = tag.to_owned();
             pulled.lock().unwrap().push(tag.clone());
             let task_id = ids_by_tag.get(&tag).expect("known tag").clone();
-            Box::pin(async move { Ok(vec![record(&task_id)]) })
-                as PullFut<'static, Vec<ArtifactRecord>>
+            Box::pin(async move {
+                Ok(BuildRecords {
+                    artifacts: vec![record(&task_id)],
+                    local_programs: Vec::new(),
+                })
+            }) as PullFut<'static, BuildRecords>
         };
         let prev = PrevSlice {
             index: prev_index(prev_rows, 7),
@@ -1762,7 +1927,7 @@ mod tests {
             .expect("slice emitted");
         assert_eq!(slice.index.rows.len(), 4);
         assert_eq!(slice.folded.len(), 4);
-        assert_eq!(pass.new_records.len(), 2);
+        assert_eq!(pass.new_records.artifacts.len(), 2);
         // The stamp extends the published slice's sequence, and the
         // report's delta base rides along.
         assert_eq!(slice.index.header.generation, 8);
@@ -1787,8 +1952,12 @@ mod tests {
             let ids_by_tag = ids_by_tag.clone();
             move |tag: &str| {
                 let task_id = ids_by_tag.get(&tag.to_owned()).expect("known tag").clone();
-                Box::pin(async move { Ok(vec![record(&task_id)]) })
-                    as PullFut<'static, Vec<ArtifactRecord>>
+                Box::pin(async move {
+                    Ok(BuildRecords {
+                        artifacts: vec![record(&task_id)],
+                        local_programs: Vec::new(),
+                    })
+                }) as PullFut<'static, BuildRecords>
             }
         };
         let no_prev = |_tag: &str| {
@@ -1851,8 +2020,12 @@ mod tests {
             .collect();
         let pull_records = move |tag: &str| {
             let task_id = ids_by_tag.get(&tag.to_owned()).expect("known tag").clone();
-            Box::pin(async move { Ok(vec![record(&task_id)]) })
-                as PullFut<'static, Vec<ArtifactRecord>>
+            Box::pin(async move {
+                Ok(BuildRecords {
+                    artifacts: vec![record(&task_id)],
+                    local_programs: Vec::new(),
+                })
+            }) as PullFut<'static, BuildRecords>
         };
         let pass = block_on(export_pass(&tags, pull_prev, pull_records, false, &rustc))
             .expect("export pass");
@@ -1912,7 +2085,12 @@ mod tests {
         let pull_records = |tag: &str| {
             pulled.lock().unwrap().push(tag.to_owned());
             let second = second.clone();
-            Box::pin(async move { Ok(vec![second]) }) as PullFut<'static, Vec<ArtifactRecord>>
+            Box::pin(async move {
+                Ok(BuildRecords {
+                    artifacts: vec![second],
+                    local_programs: Vec::new(),
+                })
+            }) as PullFut<'static, BuildRecords>
         };
         let build2_tag = records_tag(RUSTC, "aaaa1111", build(2));
         let tags: Vec<String> = vec![
@@ -1952,8 +2130,11 @@ mod tests {
                 let build = parse_records_tag(&tag).expect("records tag").build;
                 let mut record = record("aaaa1111");
                 record.bundle_size = build.map_or(0, |build| build.run_id);
-                Ok(vec![record])
-            }) as PullFut<'static, Vec<ArtifactRecord>>
+                Ok(BuildRecords {
+                    artifacts: vec![record],
+                    local_programs: Vec::new(),
+                })
+            }) as PullFut<'static, BuildRecords>
         };
         // The listing hands the pass run 10's tag before run 9's.
         let tags = vec![
@@ -1996,8 +2177,11 @@ mod tests {
                 let build = parse_records_tag(&tag).expect("records tag").build;
                 let mut record = record("aaaa1111");
                 record.bundle_size = build.map_or(0, |build| build.run_id);
-                Ok(vec![record])
-            }) as PullFut<'static, Vec<ArtifactRecord>>
+                Ok(BuildRecords {
+                    artifacts: vec![record],
+                    local_programs: Vec::new(),
+                })
+            }) as PullFut<'static, BuildRecords>
         };
         for full in [false, true] {
             let pass = block_on(export_pass(
@@ -2034,13 +2218,18 @@ mod tests {
     /// records artifact it stands for.
     fn pull_records_by_tag(
         by_tag: BTreeMap<String, Vec<ArtifactRecord>>,
-    ) -> impl Fn(&str) -> PullFut<'static, Vec<ArtifactRecord>> + Send + Sync {
+    ) -> impl Fn(&str) -> PullFut<'static, BuildRecords> + Send + Sync {
         move |tag: &str| {
             let records = by_tag
                 .get(tag)
                 .unwrap_or_else(|| panic!("unknown records tag {tag}"))
                 .clone();
-            Box::pin(async move { Ok(records) }) as PullFut<'static, Vec<ArtifactRecord>>
+            Box::pin(async move {
+                Ok(BuildRecords {
+                    artifacts: records,
+                    local_programs: Vec::new(),
+                })
+            }) as PullFut<'static, BuildRecords>
         }
     }
 
@@ -2189,6 +2378,73 @@ mod tests {
         assert!(identities.contains(&right.dependency_identity().expect("row digest")));
     }
 
+    #[test]
+    fn fold_row_preserves_profiles_of_a_shared_unit() {
+        use stow_types::node_profile::NodeProfile;
+        let dev = record_to_index_row(&shared_unit_record(&["dep-left"]));
+        let mut release = dev.clone();
+        release.node_profile = NodeProfile::Release;
+        let mut rows = RowsByIdentity::new();
+        for row in [dev.clone(), release.clone(), dev.clone()] {
+            fold_row(&mut rows, row).expect("fold row");
+        }
+        assert_eq!(rows.len(), 2);
+        assert!(rows.values().any(|row| row == &dev));
+        assert!(rows.values().any(|row| row == &release));
+    }
+
+    #[test]
+    fn semantic_rows_preserves_each_profile() {
+        use stow_types::node_profile::NodeProfile;
+        let dev = record_to_index_row(&shared_unit_record(&["dep-left"]));
+        let mut release = dev.clone();
+        release.node_profile = NodeProfile::Release;
+        let rows =
+            semantic_rows(&prev_index(vec![dev.clone(), release, dev], 3)).expect("semantic rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.node_profile)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([NodeProfile::Dev, NodeProfile::Release]),
+        );
+    }
+
+    #[tokio::test]
+    async fn slice_report_tracks_profile_additions_and_retirements() {
+        use stow_types::node_profile::NodeProfile;
+        let dir = tempfile::tempdir().expect("report fixture dir");
+        let file = dir.path().join(index_tag(TARGET, RUSTC));
+        let dev = record_to_index_row(&shared_unit_record(&["dep-left"]));
+        let mut release = dev.clone();
+        release.node_profile = NodeProfile::Release;
+        for retain_dev in [true, false] {
+            let current = if retain_dev {
+                vec![dev.clone(), release.clone()]
+            } else {
+                vec![release.clone()]
+            };
+            std::fs::write(
+                &file,
+                stow_shim::encode_index(&prev_index(current, 3)).expect("encode index"),
+            )
+            .expect("write index");
+            std::fs::write(
+                prev_path(&file),
+                stow_shim::encode_index(&prev_index(vec![dev.clone()], 2)).expect("encode prev"),
+            )
+            .expect("write previous index");
+            let report = slice_report_for(&file, false).await.expect("delta report");
+            assert_eq!(report.base_generation, Some(2));
+            assert_eq!(report.added.len(), 1);
+            assert_eq!(report.added[0].node_profile, NodeProfile::Release);
+            assert_eq!(report.retired.len(), usize::from(!retain_dev));
+            if !retain_dev {
+                assert_eq!(report.retired[0].node_profile, NodeProfile::Dev);
+            }
+        }
+    }
+
     /// The publish delta already diffs on the dependency identity: a
     /// pass that adds a second node's row for a unit the slice already
     /// serves under another context reports exactly that row as added
@@ -2281,7 +2537,7 @@ mod tests {
 
         // The transport pull reference the signature materials fetch
         // through — the value verification compared before the fix.
-        let transport = format!("127.0.0.1:28123/water-rs/stow-cache-1.88.0:{tag}");
+        let transport = format!("127.0.0.1:28123/water-rs/stow-cache-v2-1.88.0:{tag}");
         assert!(stow_oci::verify::verify_payload_identity(&payload, &transport, digest).is_err());
     }
 
@@ -2678,7 +2934,10 @@ mod tests {
                 steps.extend(probe_steps(
                     base,
                     respond(200, TOKEN),
-                    respond(200, r#"{"name":"water-rs/stow-cache-1.101.0","tags":null}"#),
+                    respond(
+                        200,
+                        r#"{"name":"water-rs/stow-cache-v2-1.101.0","tags":null}"#,
+                    ),
                 ));
                 steps.extend(probe_steps(
                     base,
@@ -2707,6 +2966,9 @@ mod tests {
             &["1.98.0"],
         ))
         .expect_err("a refusal is not 'unpublished'");
-        assert!(error.to_string().contains("stow-cache-1.98.0"), "{error}");
+        assert!(
+            error.to_string().contains("stow-cache-v2-1.98.0"),
+            "{error}"
+        );
     }
 }

@@ -51,6 +51,11 @@ pub struct UnitNode {
     /// `None` when the node was re-split from a unit whose compile is
     /// the other side's (a merged native twin — stow#596).
     pub profile: Option<Profile>,
+    /// Whether the unit is a node. A unit under settings no named profile
+    /// defines is listed so a compile of its side resolves to it — and so
+    /// to no node — instead of to the package's other side; its
+    /// `features` are empty and meaningless.
+    pub named: bool,
 }
 
 impl UnitNode {
@@ -62,6 +67,7 @@ impl UnitNode {
             host_side: self.host_side,
             features: &self.features,
             profile: self.profile.as_ref(),
+            named: self.named,
         }
     }
 }
@@ -93,24 +99,48 @@ impl UnitNodeTable {
         profiles: &NodeProfiles,
         consumer_spelled_target: bool,
     ) -> Self {
+        let named = entries
+            .iter()
+            .map(|entry| UnitNode {
+                crate_name: entry.crate_name.clone(),
+                version: entry.version.clone(),
+                host_side: entry.host_side,
+                features: entry.features.clone(),
+                profile: profiles
+                    .get(&(
+                        entry.crate_name.clone(),
+                        entry.version.clone(),
+                        entry.host_side,
+                    ))
+                    .cloned(),
+                named: true,
+            })
+            .collect::<Vec<_>>();
+        let held = named
+            .iter()
+            .map(|node| {
+                (
+                    node.crate_name.clone(),
+                    node.version.clone(),
+                    node.host_side,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let unnamed = profiles
+            .iter()
+            .filter(|(key, _)| !held.contains(*key))
+            .map(|(key, profile)| UnitNode {
+                crate_name: key.0.clone(),
+                version: key.1.clone(),
+                host_side: key.2,
+                features: Vec::new(),
+                profile: Some(profile.clone()),
+                named: false,
+            })
+            .collect::<Vec<_>>();
         Self {
             consumer_spelled_target,
-            nodes: entries
-                .iter()
-                .map(|entry| UnitNode {
-                    crate_name: entry.crate_name.clone(),
-                    version: entry.version.clone(),
-                    host_side: entry.host_side,
-                    features: entry.features.clone(),
-                    profile: profiles
-                        .get(&(
-                            entry.crate_name.clone(),
-                            entry.version.clone(),
-                            entry.host_side,
-                        ))
-                        .cloned(),
-                })
-                .collect(),
+            nodes: named.into_iter().chain(unnamed).collect(),
         }
     }
 
@@ -138,9 +168,23 @@ pub struct NodeCoordinates<'a> {
     /// target-side compile: it has no compile of its own in this build,
     /// so nothing on the invocation could prove it (stow#596).
     pub profile: Option<&'a Profile>,
+    /// Whether the unit is a node (see [`UnitNode::named`]).
+    pub named: bool,
 }
 
 impl<'a> NodeCoordinates<'a> {
+    /// The coordinates of a unit under no named profile.
+    pub fn unnamed(key: &'a (CrateName, Version, bool), profile: &'a Profile) -> Self {
+        Self {
+            crate_name: key.0.as_str(),
+            version: &key.1,
+            host_side: key.2,
+            features: &[],
+            profile: Some(profile),
+            named: false,
+        }
+    }
+
     /// A task graph node's coordinates, with its compile profile looked
     /// up in `profiles` — the same unit graph's [`NodeProfiles`].
     pub fn from_task_node(
@@ -157,6 +201,7 @@ impl<'a> NodeCoordinates<'a> {
                 node.identity.version.as_semver().clone(),
                 node.identity.host_side,
             )),
+            named: true,
         }
     }
 }
@@ -219,6 +264,9 @@ impl<'a> UnitEvidence<'a> {
 ///    scan's, and anything left is an error — the side is never
 ///    guessed (stow#596).
 ///
+/// A node that is not `named` (a unit under no named profile) resolves
+/// like any other, then is refused: its compile has no node.
+///
 /// The profile comparison is general: it compares full normalized
 /// profiles, so it holds whatever profile either side compiles at —
 /// dev, release, or a `build-override` of either (stow#596). A node
@@ -240,6 +288,23 @@ impl<'a> UnitEvidence<'a> {
 /// one side carrying two different feature sets — the projection
 /// enforces the same invariant [`crate::workspace_deps`] builds under.
 pub fn resolve_unit_node<'a>(
+    nodes: impl IntoIterator<Item = NodeCoordinates<'a>>,
+    consumer_spelled_target: bool,
+    unit: &UnitEvidence<'_>,
+) -> stow_types::error::Result<NodeCoordinates<'a>> {
+    let node = pick_unit_node(nodes, consumer_spelled_target, unit)?;
+    if node.named {
+        return Ok(node);
+    }
+    Err(stow_types::stow_error!(
+        "the {} compile of {} {} is under no named profile; it is built and served locally only",
+        if node.host_side { "host" } else { "target" },
+        unit.crate_name,
+        unit.version,
+    ))
+}
+
+fn pick_unit_node<'a>(
     nodes: impl IntoIterator<Item = NodeCoordinates<'a>>,
     consumer_spelled_target: bool,
     unit: &UnitEvidence<'_>,
@@ -380,6 +445,7 @@ mod tests {
             host_side,
             features,
             profile,
+            named: true,
         }
     }
 

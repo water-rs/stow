@@ -1,7 +1,7 @@
 //! stow#588 stage 4: the dependency-context machinery end to end,
 //! offline — a `local-registry` directory stands in for crates.io (the
 //! `resolver/tests/offline.rs` harness shape), the wrapper package is
-//! the real `write_wrapper_package` output, and the verification is the
+//! the real `write_wrapper_archive` output, and the verification is the
 //! real `cargo <phase> --unit-graph` + `verify_dependency_context`
 //! chain.
 //!
@@ -121,9 +121,13 @@ fn publish_manifest(reg: &Path, fixture: &Fixture, manifest: &Value) -> String {
     if fixture.proc_macro {
         lib.push_str("extern crate proc_macro;\n");
     }
+    publish_manifest_source(reg, fixture, manifest, &lib)
+}
+
+fn publish_manifest_source(reg: &Path, fixture: &Fixture, manifest: &Value, lib: &str) -> String {
     let build_script =
         !fixture.build_deps.is_empty() && manifest["package"]["build"] != json!(false);
-    let cksum = write_crate_tarball(reg, fixture, manifest, &lib, build_script);
+    let cksum = write_crate_tarball(reg, fixture, manifest, lib, build_script);
 
     // The index line's deps are the manifest's own tables, so the two
     // can never disagree: a `req` is the declared `version` made exact,
@@ -623,6 +627,18 @@ fn consumer_project(dir: &Path, deps: &Value, build_deps: &Value) -> PathBuf {
 /// Resolve `manifest` on the host triple and return the minted
 /// `EnqueueRequest`s — the resolver path's task ids.
 fn resolve_requests(cargo_home: &Path, manifest: &Path) -> Vec<EnqueueRequest> {
+    resolve_requests_for_profile(
+        cargo_home,
+        manifest,
+        stow_types::node_profile::NodeProfile::Dev,
+    )
+}
+
+fn resolve_requests_for_profile(
+    cargo_home: &Path,
+    manifest: &Path,
+    profile: stow_types::node_profile::NodeProfile,
+) -> Vec<EnqueueRequest> {
     let resolver = resolver_at(cargo_home);
     let host = host_triple();
     let out = resolver
@@ -638,7 +654,7 @@ fn resolve_requests(cargo_home: &Path, manifest: &Path) -> Vec<EnqueueRequest> {
         .expect("host triple resolve")
         .1
         .units;
-    stow_resolver::resolved_task_graph(units, pinned_rustc_version())
+    stow_resolver::resolved_task_graph(units, pinned_rustc_version(), profile)
         .and_then(|graph| {
             stow_resolver::enqueue_requests_inner(
                 &graph,
@@ -706,34 +722,19 @@ fn payload_for(request: &EnqueueRequest) -> BuildTaskPayload {
         host_side: request.host_side,
         explicit_spelling: request.explicit_spelling,
         dependency_subgraph: request.dependency_subgraph.clone(),
+        profile: request.profile,
     }
 }
 
-/// The real wrapper workspace for `task`: its crate's `.crate` archive
-/// unpacked under `root`, `write_wrapper_package`'s manifest and
-/// lockfile, `BuildWorkspace` as the build job sees it.
+/// The real wrapper workspace for `task`, initialized from the local registry's
+/// archive through the same path as the build and publish jobs.
 async fn wrapper_workspace(reg: &Path, task: &BuildTaskPayload) -> (TempDir, BuildWorkspace) {
     let root = tempfile::tempdir().expect("workspace root");
     let archive = std::fs::read(reg.join(format!("{}-{}.crate", task.crate_name, task.version)))
         .expect("crate archive in local registry");
-    let crate_name = task.crate_name.as_str().to_owned();
-    let crate_version = task.version.to_string();
-    let unpack_root = root.path().to_path_buf();
-    let (manifest_path, checksum) = smol::unblock(move || {
-        task::unpack_crate_archive(&unpack_root, &crate_name, &crate_version, &archive)
-            .map(|manifest| (manifest, hex::encode(sha2::Sha256::digest(&archive))))
-    })
-    .await
-    .expect("unpack crate archive");
-    let source_root = manifest_path
-        .parent()
-        .expect("unpacked manifest has a parent")
-        .to_path_buf();
-    let wrapper_root = root.path().join("wrapper");
-    let (manifest_path, _) =
-        task::write_wrapper_package(task, &wrapper_root, &checksum, &source_root)
-            .await
-            .expect("write wrapper package");
+    let (manifest_path, _) = task::write_wrapper_archive(task, root.path(), archive)
+        .await
+        .expect("write wrapper archive");
     let workspace = task::resolution_build_workspace(
         manifest_path.clone(),
         manifest_path.parent().expect("wrapper dir").to_path_buf(),
@@ -1469,6 +1470,26 @@ async fn capture_build_dep_keys(
     runtime: &Path,
     capture: &Path,
 ) -> (String, String) {
+    let records = capture_task_units(cargo_home, reg, task, runtime, capture).await;
+    let build_script = records
+        .iter()
+        .find(|record| record.crate_name == "build_script_build")
+        .expect("build-script rustc invocation recorded");
+    let bd = records
+        .iter()
+        .find(|record| record.crate_name == "bd")
+        .expect("bd rustc invocation recorded");
+    (build_script.compile_key.clone(), bd.c_metadata.clone())
+}
+
+/// Compile through the real sandbox and return the host collector's evidence.
+async fn capture_task_units(
+    cargo_home: &Path,
+    reg: &Path,
+    task: &BuildTaskPayload,
+    runtime: &Path,
+    capture: &Path,
+) -> Vec<stow_types::capture::CapturedRustcArtifact> {
     let (root, workspace) = wrapper_workspace(reg, task).await;
     let capture_dir = root.path().join(".stow-rustc-capture");
     std::fs::create_dir_all(&capture_dir).expect("capture dir");
@@ -1509,7 +1530,7 @@ async fn capture_build_dep_keys(
         ipc_endpoint: &ipc_endpoint,
         msvc: &msvc,
     };
-    run_sandboxed_phase(
+    let failure = run_sandboxed_phase(
         &run,
         task,
         CargoSubcommand::Check,
@@ -1519,16 +1540,57 @@ async fn capture_build_dep_keys(
     )
     .await
     .expect("sandboxed check phase");
-    let records = collector.into_records().expect("capture records");
-    let build_script = records
+    assert!(failure.is_none(), "sandboxed check compiled successfully");
+    collector.into_records().expect("capture records")
+}
+
+#[test]
+fn manifest_relative_proc_macro_is_identified_by_real_capture() {
+    let (cargo_home, reg) = registry_home();
+    let scratch = tempfile::tempdir().unwrap();
+    let fixture = Fixture {
+        name: "manifest-probe",
+        version: "1.0.0",
+        deps: vec![],
+        build_deps: vec![],
+        features: &[],
+        proc_macro: true,
+    };
+    publish_manifest_source(
+        &reg,
+        &fixture,
+        &fixture_manifest(&fixture, &[]),
+        include_str!("../../cli/tests/fixtures/manifest-proc-macro/lib.rs"),
+    );
+    let manifest = consumer_project(
+        &scratch.path().join("consumer"),
+        &json!({ "manifest-probe": "1" }),
+        &json!({}),
+    );
+    let requests = resolve_requests(cargo_home.path(), &manifest);
+    let task = payload_for(&request_for(&requests, "manifest-probe"));
+    let (runtime, capture) = build_binaries();
+    let records = smol::block_on(capture_task_units(
+        cargo_home.path(),
+        &reg,
+        &task,
+        &runtime,
+        &capture,
+    ));
+    let program = records
         .iter()
-        .find(|record| record.crate_name == "build_script_build")
-        .expect("build-script rustc invocation recorded");
-    let bd = records
-        .iter()
-        .find(|record| record.crate_name == "bd")
-        .expect("bd rustc invocation recorded");
-    (build_script.compile_key.clone(), bd.c_metadata.clone())
+        .find(|record| record.crate_name == "manifest_probe")
+        .expect("macro was compiled");
+    assert!(program.reads_manifest_dir);
+    assert!(program.restorable);
+    assert!(program.crate_types.iter().any(|kind| kind == "proc-macro"));
+    assert!(
+        program
+            .outputs
+            .iter()
+            .any(|output| output.kind
+                == stow_types::capture::CapturedRustcOutputKind::DynamicLibrary)
+    );
 }
 
 /// `parent`'s target-side child crate names and node index in one task
@@ -1625,8 +1687,12 @@ fn platform_gated_dependencies_match_the_cargo_unit_graph() {
                 .iter()
                 .find(|(t, _)| t == target)
                 .unwrap_or_else(|| panic!("resolver emits {target}"));
-            let resolver_graph = stow_resolver::resolved_task_graph(&out.units, rustc)
-                .unwrap_or_else(|error| panic!("{target} resolver graph: {error}"));
+            let resolver_graph = stow_resolver::resolved_task_graph(
+                &out.units,
+                rustc,
+                stow_types::node_profile::NodeProfile::Dev,
+            )
+            .unwrap_or_else(|error| panic!("{target} resolver graph: {error}"));
             let graph = stow_cli::resolve_exact_dependency_graph(
                 &manifest,
                 "check",
@@ -1737,7 +1803,7 @@ fn a_build_edge_out_of_a_scriptless_package_mints_no_units() {
                 .await
                 .expect("phase unit graphs");
         task::verify_dependency_context(&task, &graphs).expect("the dispatched context verifies");
-        let (packages, lib_packages) =
+        let (packages, lib_packages, _) =
             crate::closure::package_sets(&task, &graphs).expect("closure");
         for demanded in ["derive_more", "derive_more-impl"] {
             assert!(
@@ -2076,5 +2142,49 @@ fn outcome3_host_task_mints_a_distinct_id_and_verifies() {
             host_task_ids[0], host_task_ids[2],
             "the outcome-3 self-twin edge re-mints the host task id"
         );
+    });
+}
+
+/// A release host lib keeps opt-level 0 even when its target twin uses
+/// opt-level 3. Resolve and verify both profiles through real Cargo.
+#[test]
+fn native_twin_contexts_preserve_each_profiles_host_settings() {
+    let (cargo_home, reg) = registry_home();
+    let scratch = tempfile::tempdir().unwrap();
+    for (name, deps) in [("leaf", vec![]), ("owner", vec![("leaf", "1", &[][..])])] {
+        publish(
+            &reg,
+            &Fixture {
+                name,
+                version: "1.0.0",
+                deps,
+                build_deps: vec![],
+                features: &[],
+                proc_macro: false,
+            },
+        );
+    }
+    let manifest = consumer_project(
+        scratch.path(),
+        &json!({ "owner": "1" }),
+        &json!({ "owner": "1" }),
+    );
+    smol::block_on(async {
+        for profile in stow_types::node_profile::NodeProfile::ALL {
+            let requests = resolve_requests_for_profile(cargo_home.path(), &manifest, profile);
+            let owners = requests
+                .iter()
+                .filter(|request| request.crate_name.as_str() == "owner")
+                .collect::<Vec<_>>();
+            assert_eq!(owners.len(), 2, "{profile} has host and target tasks");
+            for request in owners {
+                let task = payload_for(request);
+                let (_root, workspace) = wrapper_workspace(&reg, &task).await;
+                let own = verify(cargo_home.path(), &task, &workspace)
+                    .await
+                    .unwrap_or_else(|error| panic!("{profile} host={}: {error}", task.host_side));
+                assert_eq!(own.len(), if task.host_side { 4 } else { 2 });
+            }
+        }
     });
 }

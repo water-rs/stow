@@ -222,7 +222,7 @@ async fn submit_plan(
     // whole batch before the plan renders and before anything submits —
     // the plan-only output is the production wave count's input, so it
     // must carry the substituted task ids.
-    crate::manual::substitute_against_published(&mut trees).await?;
+    let published = crate::manual::substitute_against_published(&mut trees).await?;
     // The fetch phase ended before this call — the count cannot change.
     let api_requests = crates_io.api_requests();
     render::mutation(
@@ -252,7 +252,7 @@ async fn submit_plan(
         },
         edge.map(|edge| {
             async move |trees: &Vec<stow_types::api::SubmissionTree>| {
-                crate::projects::submit_chunked(edge, trees).await
+                crate::projects::submit_chunked(edge, trees, &published).await
             }
         }),
     )
@@ -516,6 +516,7 @@ async fn top_binaries(
         %rustc_version,
         "planned top-binaries preheat tasks"
     );
+    let published = crate::manual::coverage_for_trees(&plan.trees).await?;
     render::mutation(
         output,
         plan,
@@ -555,7 +556,7 @@ async fn top_binaries(
         },
         edge.map(|edge| {
             async move |plan: &BinariesPlan| {
-                crate::projects::submit_chunked(edge, &plan.trees).await
+                crate::projects::submit_chunked(edge, &plan.trees, &published).await
             }
         }),
     )

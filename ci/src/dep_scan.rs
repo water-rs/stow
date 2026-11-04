@@ -22,6 +22,8 @@ use stow_types::capture::{
 /// record can never masquerade as a complete scan.
 #[derive(Debug, serde::Serialize)]
 pub struct ScanReport {
+    /// Completed local programs and signed dependencies compiled locally.
+    pub programs: ProgramClaims,
     /// Restorable rustc-unit records the host collector delivered.
     pub restorable_captures: usize,
     /// One planned artifact per restorable record — enforced, not assumed.
@@ -34,6 +36,15 @@ pub struct ScanReport {
     pub consumed: Vec<ConsumedArtifact>,
 }
 
+/// Program identities carried across the build/publish boundary.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ProgramClaims {
+    /// This task's nonrelocatable proc-macro units.
+    pub completed: Vec<stow_types::records::LocalProcMacro>,
+    /// Dependency units compiled under a signed local-program declaration.
+    pub compiled: Vec<stow_types::records::LocalProcMacro>,
+}
+
 /// A verified published artifact the build served instead of compiling the
 /// crate: produced by no rustc invocation here, so nothing is planned from
 /// it. The record exists so dependents resolve `--extern` edges against
@@ -42,6 +53,8 @@ pub struct ScanReport {
 /// resolved closure is still refused.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConsumedArtifact {
+    /// Distinguishes library coverage from a served build-script output.
+    pub kind: ArtifactKind,
     /// Canonical package name the capture attributed to.
     pub crate_name: String,
     /// The published artifact's crate version.
@@ -77,6 +90,19 @@ enum OutputOwner {
     Consumed(usize),
 }
 
+/// Manifest-relative build scripts remain local. Every other compiled
+/// script reaches the own-node check, so a dependency cache miss cannot
+/// silently compile a relocatable program again.
+fn scannable_captures(captures: &[CapturedRustcArtifact]) -> Vec<CapturedRustcArtifact> {
+    captures
+        .iter()
+        .filter(|captured| {
+            !(captured.restorable && captured.is_build_script() && captured.reads_manifest_dir)
+        })
+        .cloned()
+        .collect()
+}
+
 pub async fn scan_artifacts(
     built: &BuiltWorkspace,
     task: &BuildTaskPayload,
@@ -92,13 +118,14 @@ pub async fn scan_artifacts(
     let package_index = package_index(&metadata, task);
     // The records the host collector received over IPC — the only capture
     // source the scan trusts. Nothing the sandbox wrote to disk qualifies.
-    let captured_artifacts = built.captures();
+    let captured_artifacts = scannable_captures(built.captures());
+    let captured_artifacts = captured_artifacts.as_slice();
     let restorable_captures = captured_artifacts
         .iter()
         .filter(|captured| captured.restorable)
         .count();
 
-    let selected = select_captured_artifacts(&package_index, captured_artifacts)?;
+    let selected = select_captured_artifacts(&package_index, captured_artifacts, &host_target)?;
     // Merges whose rlib digests differed are not settled yet: the
     // archives must agree on what rustc wrote before the merged halves
     // can be treated as one unit's captures.
@@ -130,6 +157,7 @@ pub async fn scan_artifacts(
         &consumed_captures,
         &output_owners,
         &own_units,
+        built.local_programs(),
     )?;
     reject_unflagged_proc_macro_extern(task, &selected, &consumed_captures, &output_owners)?;
     let phase_units = phase_feature_sets(task, built)?;
@@ -145,18 +173,29 @@ pub async fn scan_artifacts(
         visiting: &mut visiting,
     };
 
-    let mut artifacts = Vec::with_capacity(selected.len());
-    for index in 0..selected.len() {
-        artifacts.push(
-            build_scanned_artifact(task, &rustc_version, &host_target, &mut cx, index).await?,
-        );
-    }
+    let (mut artifacts, programs) = plan_selected(
+        task,
+        &rustc_version,
+        &host_target,
+        &mut cx,
+        built.local_programs(),
+    )
+    .await?;
     // One artifact per restorable record is the completeness invariant the
     // whole scan exists to keep: every path that could drop one is an error
     // above, so reaching a different count is a bug in this file, not data.
     // The one deliberate exclusion is the proven-identical same-unit
     // captures a unit leaves in several phases.
-    if artifacts.len() != plan_eligible_captures {
+    if artifacts.len()
+        + programs
+            .completed
+            .iter()
+            .map(|program| &program.compile_key)
+            .collect::<BTreeSet<_>>()
+            .len()
+        + programs.compiled.len()
+        != plan_eligible_captures
+    {
         return Err(stow_types::stow_error!(
             "dep_scan received {plan_eligible_captures} restorable capture records but planned {} artifacts",
             artifacts.len()
@@ -186,10 +225,59 @@ pub async fn scan_artifacts(
         .collect();
 
     Ok(ScanReport {
+        programs,
         restorable_captures,
         artifacts,
         consumed,
     })
+}
+
+async fn plan_selected(
+    task: &BuildTaskPayload,
+    rustc_version: &str,
+    host_target: &str,
+    cx: &mut ResolveCx<'_>,
+    local_programs: &[stow_types::records::LocalProcMacro],
+) -> stow_types::error::Result<(Vec<ScannedArtifact>, ProgramClaims)> {
+    let selected = cx.selected;
+    let mut artifacts = Vec::with_capacity(selected.len());
+    let mut programs = ProgramClaims::default();
+    for (index, selected_artifact) in selected.iter().enumerate() {
+        if let Some(program) = local_dependency(selected_artifact, local_programs) {
+            programs.compiled.push(program.clone());
+            continue;
+        }
+        let artifact = build_scanned_artifact(task, rustc_version, host_target, cx, index).await?;
+        if selected_artifact.artifact_kind == ArtifactKind::ProcMacro
+            && selected_artifact.captured.reads_manifest_dir
+        {
+            let program = stow_types::records::LocalProcMacro {
+                node: task.task_node_identity(),
+                dependency_task_ids: task
+                    .verified_dependency_graph()?
+                    .dependency_task_ids(0)
+                    .ok_or_else(|| stow_types::stow_error!("verified graph has no root"))?,
+                dependency_c_metadata_json: crate::plan::dependency_c_metadata_json(
+                    &artifact.dependencies,
+                )?,
+                compile_key: artifact.captured_compile_key,
+                c_metadata: stow_types::identity::CMetadata::parse(artifact.c_metadata)?,
+                unit_shape: artifact.unit_shape,
+            };
+            programs.completed.extend(
+                program
+                    .unit_shape
+                    .invocation_shapes(artifact.shared_invocations)
+                    .map(|unit_shape| stow_types::records::LocalProcMacro {
+                        unit_shape,
+                        ..program.clone()
+                    }),
+            );
+        } else {
+            artifacts.push(artifact);
+        }
+    }
+    Ok((artifacts, programs))
 }
 
 /// The consumable set: every registry unit this build's own cargo unit
@@ -228,6 +316,12 @@ pub fn consumable_packages(
             host_side: entry.host_side,
         })
         .collect()
+}
+
+/// The library nodes and build-script outputs this task may consume.
+pub struct ConsumablePackages {
+    pub libraries: Vec<ConsumablePackage>,
+    pub scripts: Vec<ConsumablePackage>,
 }
 
 /// One unit of the build workspace's own unit graph — a
@@ -362,17 +456,10 @@ async fn verify_rlib_pair(pair: &RlibPair) -> stow_types::error::Result<()> {
 fn select_captured_artifacts(
     package_index: &PackageIndex,
     captured_artifacts: &[CapturedRustcArtifact],
+    host_target: &str,
 ) -> stow_types::error::Result<SelectedCaptures> {
-    let mut selected = BTreeMap::<
-        (
-            String,
-            String,
-            String,
-            String,
-            Option<stow_types::public_cache::UnitInvocation>,
-        ),
-        SelectedCapturedArtifact,
-    >::new();
+    let mut selected =
+        BTreeMap::<(String, String, String, String), SelectedCapturedArtifact>::new();
     let mut absorbed_duplicates = 0usize;
     let mut rlib_pairs = Vec::new();
     for captured in captured_artifacts {
@@ -402,19 +489,19 @@ fn select_captured_artifacts(
         })?;
         let key = (
             package.name.clone(),
-            captured.c_metadata.clone(),
+            captured.compile_key.clone(),
             artifact_kind.as_str().to_owned(),
             serde_json::to_string(&captured.emit)
                 .expect("captured emit serialization must succeed"),
-            captured.invocation,
         );
         let candidate = SelectedCapturedArtifact {
             package: package.clone(),
             artifact_kind,
             captured: captured.clone(),
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
-        match select_captured_artifact(&mut selected, key, candidate)? {
+        match select_captured_artifact(&mut selected, key, candidate, host_target)? {
             Selection::Selected => {}
             Selection::Merged(pairs) => {
                 absorbed_duplicates += 1;
@@ -481,24 +568,10 @@ enum Selection {
 /// whose digests differ defers to the member-level check the returned
 /// [`Selection::Merged`] still owes.
 fn select_captured_artifact(
-    selected: &mut BTreeMap<
-        (
-            String,
-            String,
-            String,
-            String,
-            Option<stow_types::public_cache::UnitInvocation>,
-        ),
-        SelectedCapturedArtifact,
-    >,
-    key: (
-        String,
-        String,
-        String,
-        String,
-        Option<stow_types::public_cache::UnitInvocation>,
-    ),
+    selected: &mut BTreeMap<(String, String, String, String), SelectedCapturedArtifact>,
+    key: (String, String, String, String),
     candidate: SelectedCapturedArtifact,
+    host_target: &str,
 ) -> stow_types::error::Result<Selection> {
     let Some(existing) = selected.get_mut(&key) else {
         selected.insert(key, candidate);
@@ -506,7 +579,7 @@ fn select_captured_artifact(
     };
     // Two restorable records under one selection key are a duplicate: the
     // key already carries every identity dimension (crate, stable
-    // metadata, kind, emit, invocation), so a second record claiming it
+    // compile key, kind, emit), so a second record claiming it
     // is either the same rustc unit seen twice — a unit that links in
     // every cargo phase, like a build dependency or a proc macro, is
     // captured once per phase into that phase's own `CARGO_TARGET_DIR`,
@@ -516,7 +589,8 @@ fn select_captured_artifact(
     // anything else is a collision and aborts the scan, with both
     // records in the error so the field that tells them apart is on
     // the page.
-    let Some(rlib_pairs) = same_captured_unit(&existing.captured, &candidate.captured) else {
+    let Some(rlib_pairs) = same_captured_unit(&existing.captured, &candidate.captured, host_target)
+    else {
         return Err(stow_types::stow_error!(
             "dep_scan captured two different restorable artifacts for {} {} (c_metadata {}) emit {:?} — a duplicate identity means a forged or colliding record:\n{}\n{}",
             candidate.captured.crate_name,
@@ -538,6 +612,8 @@ fn select_captured_artifact(
     // per-phase. The dropped half's output paths stay resolvable as
     // aliases, so a dependent whose `--extern` names the other phase's
     // `deps` dir still finds its owner.
+    existing.shared_invocations |= candidate.shared_invocations
+        || existing.captured.invocation != candidate.captured.invocation;
     let dropped_output_paths = candidate
         .captured
         .outputs
@@ -581,10 +657,12 @@ fn select_captured_artifact(
 fn same_captured_unit(
     left: &CapturedRustcArtifact,
     right: &CapturedRustcArtifact,
+    host_target: &str,
 ) -> Option<Vec<RlibPair>> {
     let same_unit = left.crate_version == right.crate_version
         && left.crate_types == right.crate_types
-        && left.target == right.target
+        && left.target.as_deref().unwrap_or(host_target)
+            == right.target.as_deref().unwrap_or(host_target)
         && left.compile_key == right.compile_key
         && left.extra_filename == right.extra_filename
         && left.profile == right.profile
@@ -665,7 +743,7 @@ fn captured_outputs_match(
         match output.kind {
             // The linker wrote the output path into the file; digest
             // equality is not the rule.
-            CapturedRustcOutputKind::DynamicLibrary => {}
+            CapturedRustcOutputKind::DynamicLibrary | CapturedRustcOutputKind::Executable => {}
             // The digest can only differ through the native members a
             // build script archived — the member-level check decides.
             CapturedRustcOutputKind::Rlib if output.sha256 != peer.sha256 => {
@@ -904,6 +982,22 @@ fn own_unit_record(
     Ok(phase.own_deps.iter().all(|key| possible.contains(&key)))
 }
 
+/// Match a captured nonrelocatable macro to its signed dependency declaration.
+fn local_dependency<'a>(
+    artifact: &SelectedCapturedArtifact,
+    programs: &'a [stow_types::records::LocalProcMacro],
+) -> Option<&'a stow_types::records::LocalProcMacro> {
+    if artifact.artifact_kind != ArtifactKind::ProcMacro || !artifact.captured.reads_manifest_dir {
+        return None;
+    }
+    programs.iter().find(|program| {
+        program.node.crate_name.as_str() == artifact.package.name
+            && program.node.version.as_semver() == &artifact.package.version
+            && program.compile_key == artifact.captured.compile_key
+            && program.c_metadata.as_str() == artifact.captured.c_metadata
+    })
+}
+
 /// The build's half of the graph contract: this task compiles its own
 /// unit and is *served* every other node. A restorable record attributed
 /// to any other package means cargo compiled a unit the consume store was
@@ -921,22 +1015,27 @@ fn own_unit_record(
 /// of registering under the task's rows.
 ///
 /// Only restorable records reach this check — the selected set — so the
-/// generated wrapper package, build-script compiles and binaries are out
-/// by construction rather than filtered by name: they are never restorable
-/// to begin with.
+/// generated wrapper package and project binaries are excluded. Build
+/// scripts belong to their named package; declared nonrelocatable macros
+/// may compile in a consumer task.
 fn reject_foreign_compiled_units(
     task: &BuildTaskPayload,
     selected: &[SelectedCapturedArtifact],
     consumed: &[ConsumedCapture],
     output_owners: &BTreeMap<PathBuf, OutputOwner>,
     own_units: &BTreeMap<PathBuf, PhaseOwnUnit>,
+    local_programs: &[stow_types::records::LocalProcMacro],
 ) -> stow_types::error::Result<()> {
     let mut units = Vec::new();
     for artifact in selected {
+        if local_dependency(artifact, local_programs).is_some() {
+            continue;
+        }
         let package = &artifact.package;
         if package.name == task.crate_name.as_str()
             && package.version == *task.version.as_semver()
-            && own_unit_record(task, artifact, selected, consumed, output_owners, own_units)?
+            && (artifact.artifact_kind == ArtifactKind::BuildScript
+                || own_unit_record(task, artifact, selected, consumed, output_owners, own_units)?)
         {
             continue;
         }
@@ -1032,6 +1131,9 @@ fn collect_consumed_captures(
             let index = captures.len();
             captures.push(ConsumedCapture {
                 artifact: ConsumedArtifact {
+                    kind: artifact_kind_for_capture(captured).ok_or_else(|| {
+                        stow_types::stow_error!("consumed capture has no artifact kind")
+                    })?,
                     crate_name: package.name.clone(),
                     crate_version: package.version.to_string(),
                     compile_key: captured.compile_key.clone(),
@@ -1092,6 +1194,7 @@ async fn build_scanned_artifact(
             task.target
         ));
     }
+    let build_script = artifact.artifact_kind == ArtifactKind::BuildScript;
     let resolved_artifact = resolve_artifact(cx, artifact_index)?;
     let dependencies = resolved_artifact.dependencies.clone();
     let mut outputs = Vec::with_capacity(artifact.captured.outputs.len());
@@ -1140,34 +1243,57 @@ async fn build_scanned_artifact(
         artifact_size,
         compile_millis: artifact.captured.compile_millis,
         kind: artifact.artifact_kind.clone(),
-        crate_types: artifact.package.crate_types.clone(),
+        crate_types: if build_script {
+            vec![RustCrateType::Bin]
+        } else {
+            artifact.package.crate_types.clone()
+        },
         outputs,
         // The shape the edge's gate checks: the task's own side, the
         // invocation spelling the collector stamped on the capture, and
         // the emit set's link membership.
-        unit_shape: stow_types::public_cache::UnitShape {
-            // Every registered unit is the task's own crate's library
-            // product — the own-node check bounds the registered set to
-            // the crate the task owns, and `restorable` keeps
-            // build-script compiles out — so the unit's side is the
-            // node's side. `--target` presence cannot name it: under a
-            // native invocation no unit carries one.
-            side: if task.host_side {
-                stow_types::public_cache::UnitSide::Host
-            } else {
-                stow_types::public_cache::UnitSide::Target
-            },
-            invocation: artifact.captured.invocation.ok_or_else(|| {
-                stow_types::stow_error!(
-                    "capture for {} {} carries no invocation stamp — the collector never saw it drain",
-                    artifact.captured.crate_name,
-                    artifact.captured.compile_key
-                )
-            })?,
-            kind: stow_types::public_cache::UnitKind::from_emit(&artifact.captured.emit),
-        },
+        unit_shape: unit_shape(task, artifact)?,
+        shared_invocations: !build_script && artifact.shared_invocations,
         build_script_out_dir: artifact.captured.build_script_out_dir.clone(),
         native: None,
+    })
+}
+
+/// The shape the edge's gate checks: the task's own side, the invocation
+/// spelling the collector stamped on the capture, and the emit set's link
+/// membership. A build script is keyed by the host it runs on, whichever
+/// spelling compiled it.
+fn unit_shape(
+    task: &BuildTaskPayload,
+    artifact: &SelectedCapturedArtifact,
+) -> stow_types::error::Result<stow_types::public_cache::UnitShape> {
+    use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+    if artifact.artifact_kind == ArtifactKind::BuildScript {
+        return Ok(UnitShape {
+            side: UnitSide::Host,
+            invocation: UnitInvocation::Native,
+            kind: UnitKind::Linked,
+        });
+    }
+    Ok(UnitShape {
+        // Every other registered unit is the task's own crate's library
+        // product — the own-node check bounds the registered set to the
+        // crate the task owns, and `restorable` keeps the rest out — so
+        // the unit's side is the node's side. `--target` presence cannot
+        // name it: under a native invocation no unit carries one.
+        side: if task.host_side {
+            UnitSide::Host
+        } else {
+            UnitSide::Target
+        },
+        invocation: artifact.captured.invocation.ok_or_else(|| {
+            stow_types::stow_error!(
+                "capture for {} {} carries no invocation stamp — the collector never saw it drain",
+                artifact.captured.crate_name,
+                artifact.captured.compile_key
+            )
+        })?,
+        kind: UnitKind::from_emit(&artifact.captured.emit),
     })
 }
 
@@ -1275,6 +1401,12 @@ fn unit_features_json(
     cx: &ResolveCx<'_>,
     artifact: &SelectedCapturedArtifact,
 ) -> stow_types::error::Result<String> {
+    // A build script has no unit-graph lib unit to label it: its features
+    // are the `--cfg feature` set cargo compiled it under, the same set
+    // its compile key was computed from.
+    if artifact.artifact_kind == ArtifactKind::BuildScript {
+        return stow_types::unit_graph::serialize_feature_set(&artifact.captured.features);
+    }
     let Some(phase) = cx.phase_units.get(&artifact.captured.target_dir) else {
         return Err(stow_types::stow_error!(
             "dep_scan capture of {} {} recorded target dir {}, which is no phase of this build",
@@ -1457,6 +1589,9 @@ fn reject_unflagged_proc_macro_extern(
         }
     };
     for artifact in selected {
+        if artifact.artifact_kind == ArtifactKind::BuildScript {
+            continue;
+        }
         for dependency in &artifact.captured.dependencies {
             let owner = output_owners.get(&dependency.path).copied();
             if owner.is_some_and(is_proc_macro) {
@@ -1630,6 +1765,15 @@ fn package_for_capture<'a>(
     index: &'a PackageIndex,
     captured: &CapturedRustcArtifact,
 ) -> Option<&'a IndexedPackage> {
+    if captured.is_build_script() {
+        // `--crate-name` names no package for a build script; the
+        // registry source path the wrapper read does.
+        let package = captured.package.as_deref()?;
+        let version = captured.crate_version.as_deref()?;
+        return index.values().flat_map(BTreeMap::values).find(|candidate| {
+            candidate.name == package && candidate.version.to_string() == version
+        });
+    }
     let by_version = index.get(captured.crate_name.as_str())?;
     match captured.crate_version.as_deref() {
         Some(version) => by_version.get(version),
@@ -1733,6 +1877,9 @@ fn artifact_kind(crate_types: &BTreeSet<RustCrateType>) -> Option<ArtifactKind> 
 }
 
 fn artifact_kind_for_capture(captured: &CapturedRustcArtifact) -> Option<ArtifactKind> {
+    if captured.is_build_script() {
+        return Some(ArtifactKind::BuildScript);
+    }
     if captured
         .crate_types
         .iter()
@@ -1762,6 +1909,7 @@ const fn parsed_file_kind(kind: CapturedRustcOutputKind) -> ParsedFileKind {
         CapturedRustcOutputKind::Rlib => ParsedFileKind::Rlib,
         CapturedRustcOutputKind::Rmeta => ParsedFileKind::Rmeta,
         CapturedRustcOutputKind::DynamicLibrary => ParsedFileKind::DynamicLibrary,
+        CapturedRustcOutputKind::Executable => ParsedFileKind::Executable,
     }
 }
 
@@ -1788,6 +1936,8 @@ pub struct ScannedArtifact {
     /// side, the invocation spelling the collector stamped, and the emit
     /// set's link membership.
     pub unit_shape: stow_types::public_cache::UnitShape,
+    /// Verified captures covered both outer Cargo invocations.
+    pub shared_invocations: bool,
     /// Exact build-script `OUT_DIR` recorded at capture time, when the crate
     /// has a build script.
     pub build_script_out_dir: Option<PathBuf>,
@@ -1829,6 +1979,7 @@ struct SelectedCapturedArtifact {
     artifact_kind: ArtifactKind,
     captured: CapturedRustcArtifact,
     dependency_aliases: Vec<PathBuf>,
+    shared_invocations: bool,
 }
 
 impl SelectedCapturedArtifact {
@@ -1868,6 +2019,7 @@ pub enum ParsedFileKind {
     Rlib,
     Rmeta,
     DynamicLibrary,
+    Executable,
 }
 
 #[cfg(test)]
@@ -1907,7 +2059,6 @@ mod tests {
             "ef4a079a8dc04c32".to_owned(),
             ArtifactKind::Rlib.as_str().to_owned(),
             "[\"dep-info\",\"link\"]".to_owned(),
-            Some(UnitInvocation::Target),
         );
         let mut selected = BTreeMap::new();
         let package = IndexedPackage {
@@ -1926,6 +2077,7 @@ mod tests {
                 "/tmp/workspace/target-check/debug/deps",
             ),
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
         let mut duplicate = first.captured.clone();
         duplicate.out_dir = PathBuf::from("/tmp/workspace/target-build/debug/deps");
@@ -1937,13 +2089,15 @@ mod tests {
             package,
             artifact_kind: ArtifactKind::Rlib,
             captured: duplicate,
+            shared_invocations: false,
             dependency_aliases: vec![PathBuf::from(
                 "/tmp/workspace/target-check/debug/deps/libitoa-1234.rmeta",
             )],
         };
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        select_captured_artifact(&mut selected, key.clone(), second)
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        select_captured_artifact(&mut selected, key.clone(), second, "aarch64-apple-darwin")
             .expect("the same unit in another phase dir merges");
 
         let stored = selected.get(&key).expect("selected capture");
@@ -1972,7 +2126,6 @@ mod tests {
             "0c5856ca18b3a9e0".to_owned(),
             ArtifactKind::ProcMacro.as_str().to_owned(),
             "[\"dep-info\",\"link\"]".to_owned(),
-            Some(UnitInvocation::Target),
         );
         let mut selected = BTreeMap::new();
         let package = IndexedPackage {
@@ -1991,6 +2144,7 @@ mod tests {
                 &"cd".repeat(32),
             ),
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
         let second = SelectedCapturedArtifact {
             package,
@@ -2001,10 +2155,12 @@ mod tests {
                 &"ef".repeat(32),
             ),
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        select_captured_artifact(&mut selected, key.clone(), second)
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        select_captured_artifact(&mut selected, key.clone(), second, "aarch64-apple-darwin")
             .expect("the same unit in another phase dir merges");
 
         let stored = selected.get(&key).expect("selected capture");
@@ -2048,6 +2204,8 @@ mod tests {
             consumed: false,
             invocation: Some(stow_types::public_cache::UnitInvocation::Target),
             compile_millis: 0,
+            package: None,
+            reads_manifest_dir: false,
         }
     }
 
@@ -2058,7 +2216,6 @@ mod tests {
             "ef4a079a8dc04c32".to_owned(),
             ArtifactKind::Rlib.as_str().to_owned(),
             "[\"dep-info\",\"link\"]".to_owned(),
-            Some(UnitInvocation::Target),
         );
         let mut selected = BTreeMap::new();
         let package = IndexedPackage {
@@ -2077,6 +2234,7 @@ mod tests {
                 "/tmp/workspace/target/debug/deps",
             ),
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
         let mut different_outputs = first.captured.clone();
         different_outputs.outputs[0].sha256 = "ff".repeat(32);
@@ -2085,10 +2243,12 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: different_outputs,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        let error = select_captured_artifact(&mut selected, key, second)
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        let error = select_captured_artifact(&mut selected, key, second, "aarch64-apple-darwin")
             .expect_err("different outputs under one key must fail");
         assert!(error.to_string().contains("duplicate identity"), "{error}");
         // Both records travel in the error: which field tells them apart
@@ -2114,7 +2274,6 @@ mod tests {
             "788c0f768456711f".to_owned(),
             ArtifactKind::Rlib.as_str().to_owned(),
             "[\"dep-info\",\"link\",\"metadata\"]".to_owned(),
-            Some(UnitInvocation::Target),
         );
         let mut selected = BTreeMap::new();
         let package = IndexedPackage {
@@ -2166,16 +2325,19 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: check_capture,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
         let second = SelectedCapturedArtifact {
             package,
             artifact_kind: ArtifactKind::Rlib,
             captured: build_capture,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        let outcome = select_captured_artifact(&mut selected, key, second)
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        let outcome = select_captured_artifact(&mut selected, key, second, "aarch64-apple-darwin")
             .expect("differing rlib digests defer to the member check");
         let Selection::Merged(pairs) = outcome else {
             panic!("the second capture merges: {outcome:?}");
@@ -2208,7 +2370,6 @@ mod tests {
             "ef4a079a8dc04c32".to_owned(),
             ArtifactKind::Rlib.as_str().to_owned(),
             "[\"dep-info\",\"link\"]".to_owned(),
-            Some(UnitInvocation::Target),
         );
         let mut selected = BTreeMap::new();
         let package = IndexedPackage {
@@ -2229,6 +2390,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: first_capture,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
         let mut different_unit = first.captured.clone();
         different_unit.out_dir =
@@ -2239,10 +2401,12 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: different_unit,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        let error = select_captured_artifact(&mut selected, key, second)
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        let error = select_captured_artifact(&mut selected, key, second, "aarch64-apple-darwin")
             .expect_err("a different compile key under one key must fail");
         assert!(error.to_string().contains("duplicate identity"), "{error}");
     }
@@ -2266,9 +2430,11 @@ mod tests {
             "a40c71aa8d26bf90",
         ));
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        let merged = select_captured_artifact(&mut selected, key.clone(), second)
-            .expect("captures differing only in the alias name are one unit");
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        let merged =
+            select_captured_artifact(&mut selected, key.clone(), second, "aarch64-apple-darwin")
+                .expect("captures differing only in the alias name are one unit");
         let Selection::Merged(pairs) = merged else {
             panic!("the second capture merges into the first");
         };
@@ -2300,8 +2466,9 @@ mod tests {
         build_capture.outputs[2].sha256 = "ff".repeat(32);
         let second = psm_selection(build_capture);
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        let outcome = select_captured_artifact(&mut selected, key, second)
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        let outcome = select_captured_artifact(&mut selected, key, second, "aarch64-apple-darwin")
             .expect("differing alias bytes defer to the member check");
         let Selection::Merged(pairs) = outcome else {
             panic!("the second capture merges: {outcome:?}");
@@ -2344,20 +2511,20 @@ mod tests {
         );
         let second = psm_selection(build_capture);
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        let error = select_captured_artifact(&mut selected, key, second)
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        let error = select_captured_artifact(&mut selected, key, second, "aarch64-apple-darwin")
             .expect_err("a stable output under another name must fail");
         assert!(error.to_string().contains("duplicate identity"), "{error}");
     }
 
     /// The selection key the `psm 0.1.24` host-side captures share.
-    fn psm_key() -> (String, String, String, String, Option<UnitInvocation>) {
+    fn psm_key() -> (String, String, String, String) {
         (
             "psm".to_owned(),
             "cc065d16221ef4be".to_owned(),
             ArtifactKind::Rlib.as_str().to_owned(),
             "[\"dep-info\",\"link\"]".to_owned(),
-            Some(UnitInvocation::Native),
         )
     }
 
@@ -2374,6 +2541,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }
     }
 
@@ -2439,6 +2607,7 @@ mod tests {
         );
         native.crate_version = Some("1.1.4".to_owned());
         native.compile_key = "aa".repeat(32);
+        native.target = None;
         native.invocation = Some(stow_types::public_cache::UnitInvocation::Native);
 
         let mut explicit = captured(
@@ -2448,12 +2617,205 @@ mod tests {
         );
         explicit.crate_version = Some("1.1.4".to_owned());
         explicit.compile_key = "bb".repeat(32);
+        explicit.target = None;
         explicit.invocation = Some(stow_types::public_cache::UnitInvocation::Target);
 
-        let selected = select_captured_artifacts(&index, &[native, explicit])
-            .expect("the two invocation spellings are two selected artifacts");
+        let selected =
+            select_captured_artifacts(&index, &[native, explicit], "aarch64-apple-darwin")
+                .expect("the two invocation spellings are two selected artifacts");
         assert_eq!(selected.artifacts.len(), 2);
         assert_eq!(selected.absorbed_duplicates, 0);
+        assert!(
+            selected
+                .artifacts
+                .iter()
+                .all(|artifact| !artifact.shared_invocations)
+        );
+    }
+
+    #[test]
+    fn identical_host_release_units_merge_across_cargo_spellings() {
+        let mut index = super::PackageIndex::new();
+        index
+            .entry("psm".to_owned())
+            .or_default()
+            .insert("0.1.24".to_owned(), indexed("psm", "0.1.24"));
+        let mut native = psm_capture("/tmp/workspace/target-native", "8e5bdc87bc91e8f0");
+        native.target = None;
+        native.profile.debug_assertions = false;
+        native.profile.overflow_checks = false;
+        native.invocation = Some(UnitInvocation::Native);
+        let mut explicit = psm_capture("/tmp/workspace/target-target", "a40c71aa8d26bf90");
+        explicit.target = None;
+        explicit.profile = native.profile.clone();
+        explicit.invocation = Some(UnitInvocation::Target);
+
+        let selected =
+            select_captured_artifacts(&index, &[native, explicit], "aarch64-apple-darwin")
+                .expect("identical host compilation survives both Cargo spellings");
+        assert!(selected.artifacts[0].shared_invocations);
+        assert_eq!(selected.artifacts.len(), 1);
+        assert_eq!(selected.absorbed_duplicates, 1);
+        assert!(selected.rlib_pairs.is_empty());
+        assert!(selected.artifacts[0].dependency_aliases.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "libpsm-a40c71aa8d26bf90.rlib")
+        }));
+    }
+
+    #[test]
+    fn identical_target_release_units_merge_across_cargo_spellings() {
+        let mut index = super::PackageIndex::new();
+        index
+            .entry("psm".to_owned())
+            .or_default()
+            .insert("0.1.24".to_owned(), indexed("psm", "0.1.24"));
+        let mut native = psm_capture("/tmp/workspace/target-native", "8e5bdc87bc91e8f0");
+        native.target = None;
+        native.profile.opt_level = "3".to_owned();
+        native.profile.debug_assertions = false;
+        native.profile.overflow_checks = false;
+        let mut explicit = native.clone();
+        explicit.target = Some("aarch64-apple-darwin".to_owned());
+        explicit.invocation = Some(UnitInvocation::Target);
+        explicit.outputs = psm_capture("/tmp/workspace/target-target", "a40c71aa8d26bf90").outputs;
+
+        let selected =
+            select_captured_artifacts(&index, &[native, explicit], "aarch64-apple-darwin")
+                .expect("identical target compilation survives both Cargo spellings");
+        assert_eq!(selected.artifacts.len(), 1);
+        assert_eq!(selected.absorbed_duplicates, 1);
+        assert!(selected.artifacts[0].shared_invocations);
+        assert!(selected.artifacts[0].dependency_aliases.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "libpsm-a40c71aa8d26bf90.rlib")
+        }));
+    }
+
+    #[test]
+    fn native_and_foreign_targets_with_one_compile_key_are_rejected() {
+        let mut selected = BTreeMap::new();
+        let mut native = psm_capture("/tmp/workspace/target-native", "8e5bdc87bc91e8f0");
+        native.target = None;
+        let mut foreign = native.clone();
+        foreign.target = Some("wasm32-unknown-unknown".to_owned());
+        foreign.invocation = Some(UnitInvocation::Target);
+        select_captured_artifact(
+            &mut selected,
+            psm_key(),
+            psm_selection(native),
+            "aarch64-apple-darwin",
+        )
+        .expect("select native unit");
+        let error = select_captured_artifact(
+            &mut selected,
+            psm_key(),
+            psm_selection(foreign),
+            "aarch64-apple-darwin",
+        )
+        .expect_err("a foreign target is a different compiler identity");
+        assert!(error.to_string().contains("duplicate identity"), "{error}");
+    }
+
+    /// A package's `build.rs` compile as the wrapper records it: the
+    /// crate name is always `build_script_build`, so the owning package
+    /// rides on the record.
+    fn build_script_capture(
+        package: &str,
+        version: &str,
+        target_dir: &str,
+        invocation: UnitInvocation,
+    ) -> CapturedRustcArtifact {
+        let out_dir = format!("{target_dir}/debug/build/{package}-0000/");
+        let mut capture = captured("build_script_build", "aaaaaaaaaaaaaaaa", &out_dir);
+        capture.target = None;
+        capture.crate_version = Some(version.to_owned());
+        capture.package = Some(package.to_owned());
+        capture.crate_types = vec!["bin".to_owned()];
+        capture.emit = vec!["dep-info".to_owned(), "link".to_owned()];
+        capture.compile_key = "cc".repeat(32);
+        capture.invocation = Some(invocation);
+        capture.target_dir = PathBuf::from(target_dir);
+        capture.outputs = vec![
+            CapturedRustcOutput {
+                kind: CapturedRustcOutputKind::Executable,
+                path: PathBuf::from(format!("{out_dir}build_script_build-aaaaaaaaaaaaaaaa")),
+                snapshot_path: None,
+                sha256: "11".repeat(32),
+            },
+            CapturedRustcOutput {
+                kind: CapturedRustcOutputKind::Executable,
+                path: PathBuf::from(format!("{out_dir}build_script_build-{invocation:?}")),
+                snapshot_path: None,
+                sha256: "11".repeat(32),
+            },
+        ];
+        capture
+    }
+
+    /// One build script compiled under the native and the `--target`
+    /// spelling is one host-keyed artifact: the spelling is no part of
+    /// its identity, and its executable's digest — the linker writes
+    /// paths into it — never separates the two.
+    #[test]
+    fn a_build_script_compiled_under_both_spellings_is_one_artifact() {
+        let mut index = super::PackageIndex::new();
+        index
+            .entry("serde_json".to_owned())
+            .or_default()
+            .insert("1.0.149".to_owned(), indexed("serde_json", "1.0.149"));
+        let mut native = build_script_capture(
+            "serde_json",
+            "1.0.149",
+            "/tmp/w/target-native",
+            UnitInvocation::Native,
+        );
+        let mut targeted = build_script_capture(
+            "serde_json",
+            "1.0.149",
+            "/tmp/w/target-target",
+            UnitInvocation::Target,
+        );
+        // The linker wrote the output path into each image.
+        targeted.outputs[0].sha256 = "22".repeat(32);
+        targeted.outputs[1].sha256 = "22".repeat(32);
+        native.outputs[0].path =
+            PathBuf::from("/tmp/w/target-native/stable/build_script_build-aaaaaaaaaaaaaaaa");
+        targeted.outputs[0].path =
+            PathBuf::from("/tmp/w/target-target/stable/build_script_build-aaaaaaaaaaaaaaaa");
+
+        let selected =
+            select_captured_artifacts(&index, &[native, targeted], "aarch64-apple-darwin")
+                .expect("both spellings select");
+        assert_eq!(selected.artifacts.len(), 1);
+        assert_eq!(selected.absorbed_duplicates, 1);
+        let artifact = &selected.artifacts[0];
+        assert_eq!(artifact.artifact_kind, ArtifactKind::BuildScript);
+        assert_eq!(artifact.package.name, "serde_json");
+    }
+
+    /// Relocatable foreign scripts must reach the own-node check too.
+    #[test]
+    fn relocatable_build_scripts_reach_the_own_node_check() {
+        let own = build_script_capture(
+            "serde_json",
+            "1.0.149",
+            "/tmp/w/target",
+            UnitInvocation::Native,
+        );
+        let foreign =
+            build_script_capture("libc", "0.2.180", "/tmp/w/target", UnitInvocation::Native);
+        let mut manifest_dir = own.clone();
+        manifest_dir.reads_manifest_dir = true;
+        let library = captured("serde_json", "bbbbbbbbbbbbbbbb", "/tmp/w/target/debug/deps");
+
+        let kept = super::scannable_captures(&[
+            own.clone(),
+            foreign.clone(),
+            manifest_dir,
+            library.clone(),
+        ]);
+        assert_eq!(kept, vec![own, foreign, library]);
     }
 
     #[test]
@@ -2469,7 +2831,7 @@ mod tests {
         );
         captured.crate_version = Some("1.0.15".to_owned());
 
-        let error = select_captured_artifacts(&index, &[captured])
+        let error = select_captured_artifacts(&index, &[captured], "aarch64-apple-darwin")
             .expect_err("an unattributable restorable record must fail");
         assert!(error.to_string().contains("could not attribute"), "{error}");
     }
@@ -2491,7 +2853,7 @@ mod tests {
         captured.crate_version = Some("1.0.15".to_owned());
         captured.crate_types = vec!["bin".to_owned()];
 
-        let error = select_captured_artifacts(&index, &[captured])
+        let error = select_captured_artifacts(&index, &[captured], "aarch64-apple-darwin")
             .expect_err("an unclassifiable restorable record must fail");
         assert!(error.to_string().contains("could not classify"), "{error}");
     }
@@ -2591,6 +2953,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }
     }
 
@@ -2634,9 +2997,15 @@ mod tests {
             std::slice::from_ref(&itoa),
             std::slice::from_ref(&itoa),
         );
-        let error =
-            super::reject_foreign_compiled_units(&task, &selected, &consumed, &owners, &own_units)
-                .expect_err("compiled foreign units fail the build");
+        let error = super::reject_foreign_compiled_units(
+            &task,
+            &selected,
+            &consumed,
+            &owners,
+            &own_units,
+            &[],
+        )
+        .expect_err("compiled foreign units fail the build");
         let message = error.to_string();
         assert!(message.contains("3 unit(s)"), "{message}");
         assert!(message.contains("itoa 1.0.18"), "{message}");
@@ -2690,6 +3059,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: link_capture,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
         let leaf_output = PathBuf::from(
             "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libitoa-raw.rmeta",
@@ -2703,9 +3073,9 @@ mod tests {
             std::slice::from_ref(&itoa),
             std::slice::from_ref(&itoa),
         );
-        super::reject_foreign_compiled_units(&task, &selected, &consumed, &owners, &own_units)
+        super::reject_foreign_compiled_units(&task, &selected, &consumed, &owners, &own_units, &[])
             .expect("a build compiling only the task's own crate is legal");
-        super::reject_foreign_compiled_units(&task, &[], &consumed, &owners, &own_units)
+        super::reject_foreign_compiled_units(&task, &[], &consumed, &owners, &own_units, &[])
             .expect("an empty compiled set carries no foreign unit");
     }
 
@@ -2747,6 +3117,7 @@ mod tests {
                 artifact_kind: ArtifactKind::Rlib,
                 captured,
                 dependency_aliases: Vec::new(),
+                shared_invocations: false,
             }
         };
         let mut twin = make(&twin_dep_path, "libserde_json-twin.rlib");
@@ -2775,6 +3146,7 @@ mod tests {
             &consumed,
             &owners,
             &own_units,
+            &[],
         )
         .expect_err("a compiled twin unit is foreign");
         assert!(error.to_string().contains("serde_json"), "{error}");
@@ -2784,6 +3156,7 @@ mod tests {
             &consumed,
             &owners,
             &own_units,
+            &[],
         )
         .expect("the own unit passes");
     }
@@ -2812,6 +3185,7 @@ mod tests {
                 .collect(),
             is_crates_io: true,
             deps: Vec::new(),
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -2830,6 +3204,7 @@ mod tests {
         record.consumed = true;
         super::ConsumedCapture {
             artifact: super::ConsumedArtifact {
+                kind: ArtifactKind::Rlib,
                 crate_name: name.to_owned(),
                 crate_version: version.to_owned(),
                 compile_key: "served".to_owned(),
@@ -2900,6 +3275,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: raw_lib_capture("itoa", "leaf-raw", Vec::new(), leaf_output.to_owned()),
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }
     }
 
@@ -2932,6 +3308,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }
     }
 
@@ -2968,6 +3345,8 @@ mod tests {
             consumed: false,
             invocation: Some(stow_types::public_cache::UnitInvocation::Target),
             compile_millis: 0,
+            package: None,
+            reads_manifest_dir: false,
         }
     }
 
@@ -2994,6 +3373,7 @@ mod tests {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
             },
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -3094,6 +3474,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: capture,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }];
         let phase_units = phase_units(
             "/tmp/workspace/target",
@@ -3141,6 +3522,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: capture,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }];
         let phase_units = phase_units(
             "/tmp/workspace/target",
@@ -3178,6 +3560,7 @@ mod tests {
                 "/tmp/workspace/target/deps",
             ),
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }];
         let phase_units = phase_units(
             "/tmp/workspace/target",
@@ -3254,6 +3637,8 @@ mod tests {
             consumed: false,
             invocation: Some(stow_types::public_cache::UnitInvocation::Target),
             compile_millis: 0,
+            package: None,
+            reads_manifest_dir: false,
         }
     }
 
@@ -3298,8 +3683,11 @@ mod tests {
                 consumed: false,
                 invocation: Some(stow_types::public_cache::UnitInvocation::Target),
                 compile_millis: 0,
+                package: None,
+                reads_manifest_dir: false,
             },
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }
     }
 
@@ -3554,6 +3942,7 @@ mod tests {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
             },
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         let packages = super::consumable_packages(&task, &graph.entries);
         let found = packages
@@ -3606,7 +3995,7 @@ mod tests {
                 "target": {"kind": ["lib"]},
                 "platform": "aarch64-apple-darwin",
                 "mode": "build",
-                "profile": {"opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
+                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
                 "features": [],
                 "dependencies": [
                     {"index": 1, "extern_crate_name": "stow_ci_wrapper"},
@@ -3618,7 +4007,7 @@ mod tests {
                 "target": {"kind": ["custom-build"]},
                 "platform": "aarch64-apple-darwin",
                 "mode": "build",
-                "profile": {"opt_level": "0", "debuginfo": 0, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
+                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
                 "features": [],
                 "dependencies": [
                     {"index": 4, "extern_crate_name": "host_dep"}
@@ -3629,7 +4018,7 @@ mod tests {
                 "target": {"kind": ["lib"]},
                 "platform": "aarch64-apple-darwin",
                 "mode": "build",
-                "profile": {"opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
+                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
                 "features": ["std"],
                 "dependencies": [
                     {"index": 3, "extern_crate_name": "direct_dep"}
@@ -3640,7 +4029,7 @@ mod tests {
                 "target": {"kind": ["lib"]},
                 "platform": "aarch64-apple-darwin",
                 "mode": "build",
-                "profile": {"opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
+                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
                 "features": ["compress"],
                 "dependencies": [
                     {"index": 5, "extern_crate_name": "transitive_dep"}
@@ -3651,7 +4040,7 @@ mod tests {
                 "target": {"kind": ["lib"]},
                 "platform": "aarch64-apple-darwin",
                 "mode": "build",
-                "profile": {"opt_level": "0", "debuginfo": 0, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
+                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
                 "features": [],
                 "dependencies": []
             },
@@ -3660,7 +4049,7 @@ mod tests {
                 "target": {"kind": ["lib"]},
                 "platform": "aarch64-apple-darwin",
                 "mode": "build",
-                "profile": {"opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
+                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
                 "features": [],
                 "dependencies": []
             }
@@ -3693,6 +4082,7 @@ mod tests {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
             },
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         // The proc-macro dep was served, not compiled: a consumed record
         // whose dylib output is the path the own unit's `--extern` names.
@@ -3708,6 +4098,7 @@ mod tests {
         }];
         let consumed = vec![ConsumedCapture {
             artifact: super::ConsumedArtifact {
+                kind: ArtifactKind::ProcMacro,
                 crate_name: "derive".to_owned(),
                 crate_version: "1.0.0".to_owned(),
                 compile_key: "f".repeat(64),
@@ -3734,6 +4125,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: own,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }];
         let owners = output_owner_index(&selected, &consumed).expect("owners");
 

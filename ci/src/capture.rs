@@ -48,11 +48,12 @@ pub async fn run_rustc_capture_wrapper(
     if let Some(code) = answer_mock_host_probe(rustc, &args[3..]).await? {
         std::process::exit(code);
     }
-    let args = remapped_target_dir_args(
+    let mut args = remapped_target_dir_args(
         &args[3..],
         std::env::var_os(STOW_BUILD_TARGET_DIR_REMAP_ENV).as_deref(),
         std::env::var_os("CARGO_TARGET_DIR").as_deref(),
     );
+    stow_types::rustc::remap_build_output(&mut args, std::env::var_os("OUT_DIR").as_deref());
     let original_parsed = match ParsedRustcArgs::parse(&args) {
         Ok(mut parsed) => {
             // Cargo exports OUT_DIR on the rustc invocation of a links crate's
@@ -409,6 +410,10 @@ async fn serve_consumed_artifact(
 
     stow_cli::build_consume::serve_bundle_outputs(original_parsed, &bundle, effective_target)
         .await?;
+    #[cfg(feature = "mock-compile")]
+    if crate::mock_compile::enabled() {
+        crate::mock_compile::materialize_build_script_run_alias(original_parsed, effective_target)?;
+    }
     let original_alias_source =
         Some(original_parsed).filter(|original| *original != rewritten_parsed);
     record_capture_output_identities(
@@ -457,10 +462,11 @@ async fn consumed_capture_record(
     }
     let dependencies = load_recorded_dependencies(capture_dir, rewritten_parsed).await?;
 
+    let registry_identity =
+        stow_types::public_cache::detect_registry_crate_version(original_parsed)?;
     Ok(CapturedRustcArtifact {
         crate_name: original_parsed.crate_name.clone(),
-        crate_version: stow_types::public_cache::detect_registry_crate_version(original_parsed)?
-            .map(|(_, version)| version),
+        crate_version: registry_identity.clone().map(|(_, version)| version),
         crate_types: original_parsed.crate_types.clone(),
         emit: rewritten_parsed.emit.iter().cloned().collect(),
         features: original_parsed.features.clone(),
@@ -481,6 +487,8 @@ async fn consumed_capture_record(
         consumed: true,
         invocation: None,
         compile_millis: 0,
+        package: registry_identity.map(|(package, _)| package),
+        reads_manifest_dir: false,
     })
 }
 
@@ -508,6 +516,11 @@ fn is_generated_wrapper_unit(
     };
     if !primary_package {
         return false;
+    }
+    // The wrapper's own build script is a unit of the wrapper package too,
+    // though its `--crate-name` is always `build_script_build`.
+    if parsed.is_build_script() {
+        return true;
     }
     wrapper_name.to_str().is_some_and(|wrapper_name| {
         stow_types::public_cache::canonical_crate_name(&parsed.crate_name)
@@ -574,6 +587,8 @@ fn observed_capture_record(
         // claims its own invocation spelling.
         invocation: None,
         compile_millis,
+        package: None,
+        reads_manifest_dir: false,
     })
 }
 
@@ -850,10 +865,10 @@ async fn materialize_original_output_aliases(
     .await?;
     materialize_optional_alias(
         rewritten_parsed
-            .output_dynamic_library_path(host)
+            .output_linked_image_path(host)
             .map_err(stow_types::error::Error::msg)?,
         original_parsed
-            .output_dynamic_library_path(host)
+            .output_linked_image_path(host)
             .map_err(stow_types::error::Error::msg)?,
         &identity.compile_key,
         &identity.c_metadata,
@@ -1131,11 +1146,12 @@ async fn build_capture_record(
         ));
     }
     let dependencies = load_recorded_dependencies(capture_dir, parsed).await?;
+    let registry_identity = stow_types::public_cache::detect_registry_crate_version(parsed)?;
+    let reads_manifest_dir = reads_manifest_dir(parsed).await?;
 
     Ok(CapturedRustcArtifact {
         crate_name: parsed.crate_name.clone(),
-        crate_version: stow_types::public_cache::detect_registry_crate_version(parsed)?
-            .map(|(_, version)| version),
+        crate_version: registry_identity.clone().map(|(_, version)| version),
         crate_types: parsed.crate_types.clone(),
         emit: parsed.emit.iter().cloned().collect(),
         features: parsed.features.clone(),
@@ -1164,7 +1180,30 @@ async fn build_capture_record(
         // claims its own invocation spelling.
         invocation: None,
         compile_millis,
+        package: registry_identity.map(|(package, _)| package),
+        reads_manifest_dir,
     })
+}
+
+/// Whether the compile that just ran read `CARGO_MANIFEST_DIR` through
+/// `env!`: rustc records every environment variable a compile reads as an
+/// `env-dep` line of the dep-info it wrote beside the output. Only a unit
+/// that links an image is asked — an rlib's embedded path is the
+/// documented, relocatable-by-remap `CARGO_MANIFEST_DIR` of any library.
+async fn reads_manifest_dir(parsed: &ParsedRustcArgs) -> stow_types::error::Result<bool> {
+    if !(parsed.is_build_script() || parsed.is_proc_macro()) {
+        return Ok(false);
+    }
+    let dep_info_path = parsed.output_dep_info_path().ok_or_else(|| {
+        stow_types::stow_error!(
+            "cacheable rustc invocation for `{}` has no dep-info path",
+            parsed.crate_name
+        )
+    })?;
+    let dep_info = async_fs::read_to_string(&dep_info_path)
+        .await
+        .wrap_err_with(|| format!("read dep-info {}", dep_info_path.display()))?;
+    Ok(stow_types::rustc::dep_info_reads_manifest_dir(&dep_info))
 }
 
 async fn load_recorded_dependencies(
@@ -1211,8 +1250,13 @@ fn collect_outputs(
     let stable_rlib_exists = stable_rlib_path.as_ref().is_some_and(|path| path.exists());
     let stable_rmeta_path = parsed.output_rmeta_path();
     let stable_rmeta_exists = stable_rmeta_path.as_ref().is_some_and(|path| path.exists());
+    let linked_image_kind = if parsed.is_build_script() {
+        CapturedRustcOutputKind::Executable
+    } else {
+        CapturedRustcOutputKind::DynamicLibrary
+    };
     let stable_dynamic_library_path = parsed
-        .output_dynamic_library_path(host)
+        .output_linked_image_path(host)
         .map_err(stow_types::error::Error::msg)?;
     let stable_dynamic_library_exists = stable_dynamic_library_path
         .as_ref()
@@ -1236,7 +1280,7 @@ fn collect_outputs(
         &mut outputs,
         &mut seen_paths,
         stable_dynamic_library_path,
-        CapturedRustcOutputKind::DynamicLibrary,
+        linked_image_kind,
         require_dynamic_library,
     )?;
 
@@ -1259,9 +1303,9 @@ fn collect_outputs(
             &mut outputs,
             &mut seen_paths,
             original_alias_source
-                .output_dynamic_library_path(host)
+                .output_linked_image_path(host)
                 .map_err(stow_types::error::Error::msg)?,
-            CapturedRustcOutputKind::DynamicLibrary,
+            linked_image_kind,
             require_dynamic_library && stable_dynamic_library_exists,
         )?;
     }
@@ -2070,6 +2114,8 @@ mod tests {
             consumed: false,
             invocation: None,
             compile_millis: 0,
+            package: None,
+            reads_manifest_dir: false,
         }
     }
 

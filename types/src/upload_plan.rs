@@ -46,6 +46,8 @@ pub struct PlannedArtifact {
     pub rustc_version: WireRustcVersion,
     /// Cargo profile.
     pub profile: Profile,
+    /// The named profile of the task that builds the artifact.
+    pub node_profile: crate::node_profile::NodeProfile,
     /// Sorted, deduplicated emit modes.
     pub emit: Vec<String>,
     /// OCI reference where this artifact will be pushed.
@@ -64,6 +66,8 @@ pub struct PlannedArtifact {
     /// of the host/target boundary it serves, the cargo invocation
     /// spelling that produced it, and whether it links.
     pub unit_shape: crate::public_cache::UnitShape,
+    /// Both Cargo invocations produced this same verified compiler artifact.
+    pub shared_invocations: bool,
     /// Optional native (C/C++) artifacts captured from the build script.
     pub native: Option<NativeArtifacts>,
     /// The packed `OUT_DIR` tree for `native`, pushed as an extra OCI layer
@@ -142,31 +146,34 @@ pub fn build_artifact_records(
             ));
         };
 
-        records.push(ArtifactRecord {
-            compile_key: plan.compile_key.clone(),
-            c_metadata: plan.c_metadata.clone(),
-            extra_filename: plan.extra_filename.clone(),
-            target: plan.target.clone(),
-            rustc_version: plan.rustc_version.clone(),
-            profile: plan.profile.clone(),
-            emit: plan.emit.clone(),
-            crate_name: plan.crate_name.clone(),
-            version: plan.crate_version.clone(),
-            features_json: plan.features_json.clone(),
-            dependency_c_metadata_json: plan.dependency_c_metadata_json.clone(),
-            dependency_task_ids: plan.dependency_task_ids.clone(),
-            oci_reference: plan.oci_reference.clone(),
-            oci_digest: published.oci_digest.clone(),
-            has_native: plan.native.is_some(),
-            artifact_kind: plan.kind.clone(),
-            crate_types: plan.crate_types.clone(),
-            artifact_size: plan.artifact_size,
-            bundle_digest: published.bundle_digest.clone(),
-            bundle_size: published.bundle_size,
-            compile_millis: plan.compile_millis,
-            unit_shape: plan.unit_shape,
-            min_glibc: *min_glibc,
-        });
+        for unit_shape in plan.unit_shape.invocation_shapes(plan.shared_invocations) {
+            records.push(ArtifactRecord {
+                compile_key: plan.compile_key.clone(),
+                c_metadata: plan.c_metadata.clone(),
+                extra_filename: plan.extra_filename.clone(),
+                target: plan.target.clone(),
+                rustc_version: plan.rustc_version.clone(),
+                profile: plan.profile.clone(),
+                node_profile: plan.node_profile,
+                emit: plan.emit.clone(),
+                crate_name: plan.crate_name.clone(),
+                version: plan.crate_version.clone(),
+                features_json: plan.features_json.clone(),
+                dependency_c_metadata_json: plan.dependency_c_metadata_json.clone(),
+                dependency_task_ids: plan.dependency_task_ids.clone(),
+                oci_reference: plan.oci_reference.clone(),
+                oci_digest: published.oci_digest.clone(),
+                has_native: plan.native.is_some(),
+                artifact_kind: plan.kind.clone(),
+                crate_types: plan.crate_types.clone(),
+                artifact_size: plan.artifact_size,
+                bundle_digest: published.bundle_digest.clone(),
+                bundle_size: published.bundle_size,
+                compile_millis: plan.compile_millis,
+                unit_shape,
+                min_glibc: *min_glibc,
+            });
+        }
     }
 
     Ok(records)

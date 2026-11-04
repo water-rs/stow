@@ -392,9 +392,9 @@ async fn fetch_slice(
     })
 }
 
-/// The slice a missing `stow-cache-<rustc>` package resolves to: no
+/// The slice a missing `stow-cache-v2-<rustc>` package resolves to: no
 /// published manifest, zero rows — every lookup misses, which is exactly
-/// what a rustc nothing has published for means. `stow-cache-<rustc>`
+/// what a rustc nothing has published for means. `stow-cache-v2-<rustc>`
 /// deleted and rebuilt reads the same until the first publish lands.
 fn empty_slice(target: &str, rustc_version: &str) -> stow_types::error::Result<IndexSlice> {
     Ok(IndexSlice {
@@ -412,6 +412,8 @@ fn empty_slice(target: &str, rustc_version: &str) -> stow_types::error::Result<I
                 row_count: 0,
             },
             rows: Vec::new(),
+            build_scripts: Vec::new(),
+            local_programs: Vec::new(),
         },
     })
 }
@@ -871,6 +873,7 @@ pub fn index_test_row(c_metadata: &str) -> stow_types::index::ArtifactIndexRow {
             invocation: UnitInvocation::Native,
             kind: UnitKind::Linked,
         },
+        node_profile: stow_types::node_profile::NodeProfile::Dev,
     }
 }
 
@@ -889,7 +892,7 @@ mod tests {
 
     fn test_config(cache_dir: &Path) -> StowConfig {
         StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             edge_url: "http://127.0.0.1:8787".to_owned(),
             registry_base_url: "http://127.0.0.1:8787".to_owned(),
             cache_dir: cache_dir.to_path_buf(),
@@ -922,6 +925,8 @@ mod tests {
                 row_count: rows.len() as u64,
             },
             rows,
+            build_scripts: Vec::new(),
+            local_programs: Vec::new(),
         }
     }
 
@@ -1215,7 +1220,7 @@ mod tests {
             }
         });
         let config = StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             registry_base_url: format!("http://{address}"),
             ..test_config(tempdir.path())
         };
@@ -1241,7 +1246,7 @@ mod tests {
         );
     }
 
-    /// stow#844: a registry whose `stow-cache-<rustc>` package does not
+    /// stow#844: a registry whose `stow-cache-v2-<rustc>` package does not
     /// exist answers the anonymous token exchange `403 DENIED` — the
     /// slice it resolves to is the empty index, not an error, on every
     /// pull path.
@@ -1286,7 +1291,7 @@ mod tests {
             }
         });
         let config = StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             registry_base_url: format!("http://{address}"),
             ..test_config(tempdir.path())
         };

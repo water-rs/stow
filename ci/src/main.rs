@@ -26,6 +26,7 @@ mod consume;
 #[cfg(test)]
 mod context_tests;
 mod dep_scan;
+mod failure;
 mod handle_copy;
 mod local_server;
 #[cfg(feature = "mock-compile")]
@@ -70,6 +71,13 @@ enum Stage {
     /// Untrusted stage: compile the task's crate and write the build output.
     Build {
         /// Directory to write the build output into (created if missing).
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    /// Independently replay a failed compilation without stow cache artifacts.
+    VerifyFailure {
+        #[arg(long)]
+        input_dir: PathBuf,
         #[arg(long)]
         output_dir: PathBuf,
     },
@@ -126,6 +134,10 @@ fn main() -> stow_types::error::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Stage::Build { output_dir } => smol::block_on(build_stage(&output_dir)),
+        Stage::VerifyFailure {
+            input_dir,
+            output_dir,
+        } => smol::block_on(verify_failure_stage(&input_dir, &output_dir)),
         // `RegistrySession` drives reqwest/hyper, which needs a Tokio
         // reactor; the build stage is smol-only because cargo/rustc
         // capture never touches HTTP.
@@ -158,14 +170,36 @@ async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<
     }
     let task = load_task_payload()?;
     async_fs::create_dir_all(output_dir).await?;
-    let built = task::build(&task, output_dir).await?;
+    let built = match task::build(&task, output_dir).await? {
+        Ok(built) => built,
+        Err(candidate) => {
+            async_fs::write(
+                output_dir.join("failure-candidate.json"),
+                serde_json::to_vec(&failure::FailureReport {
+                    build: build_run_from_env()?,
+                    candidate,
+                })?,
+            )
+            .await?;
+            return Err(stow_types::stow_error!(
+                "compilation failed for {}; source diagnostics require independent replay",
+                task.task_id
+            ));
+        }
+    };
     let report = dep_scan::scan_artifacts(&built, &task).await?;
     let dependency_task_ids = task
         .verified_dependency_graph()?
         .dependency_task_ids(0)
         .ok_or_else(|| stow_types::stow_error!("verified dependency graph has no root node"))?;
-    let upload_plan =
-        plan::build_upload_plan(&report.artifacts, &report.consumed, &dependency_task_ids).await?;
+    let upload_plan = plan::build_upload_plan(
+        &report.artifacts,
+        &report.consumed,
+        &dependency_task_ids,
+        task.profile,
+        &report.programs,
+    )
+    .await?;
     stage::write_build_output(output_dir, &task, &report, &upload_plan).await?;
     tracing::info!(
         task_id = %task.task_id,
@@ -177,6 +211,29 @@ async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<
         upload_plan_entries = upload_plan.len(),
         "build stage completed"
     );
+    Ok(())
+}
+
+async fn verify_failure_stage(
+    input_dir: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> stow_types::error::Result<()> {
+    let task = load_task_payload()?;
+    let report: failure::FailureReport =
+        serde_json::from_slice(&async_fs::read(input_dir.join("failure-candidate.json")).await?)?;
+    let build = build_run_from_env()?;
+    let candidate = report.for_run(build)?;
+    async_fs::create_dir_all(output_dir).await?;
+    let verified = task::verify_source_failure(&task, candidate, output_dir).await?;
+    async_fs::write(
+        output_dir.join("verified-source-failure.json"),
+        serde_json::to_vec(&failure::VerifiedFailureReport {
+            build,
+            failure: verified,
+        })?,
+    )
+    .await?;
+    tracing::info!(task_id = %task.task_id, "source failure reproduced without cached artifacts");
     Ok(())
 }
 
@@ -379,7 +436,10 @@ async fn publish(
         &task.rustc_version,
         &task.task_id,
         build_run_from_env()?,
-        &artifact_records,
+        &stow_types::records::BuildRecords {
+            artifacts: artifact_records.clone(),
+            local_programs: output.programs.completed.clone(),
+        },
     )
     .await?;
 
@@ -413,16 +473,21 @@ async fn validated_build_output(
     // trusting the untrusted job's copy. No claims means the old failure
     // surface: never require the network the publish path did not need
     // before.
-    let index_slices = if output.consumed.is_empty() {
+    let index_slices = if output.consumed.is_empty() && output.programs.compiled.is_empty() {
         Vec::new()
     } else {
         let config = stow_cli::build_consume::ConsumeConfig::load()
             .map_err(|error| error.wrap_err("load config to verify consumed artifact claims"))?;
-        consume::slices_for_task(&config, task)
-            .await
-            .map_err(|error| {
-                error.wrap_err("fetch index slices to verify consumed artifact claims")
-            })?
+        consume::slices_for_task(
+            &config,
+            task,
+            output
+                .consumed
+                .iter()
+                .any(|claim| claim.kind == stow_types::artifact::ArtifactKind::BuildScript),
+        )
+        .await
+        .map_err(|error| error.wrap_err("fetch index slices to verify consumed artifact claims"))?
     };
     validate::validate_plan(
         task,
@@ -431,6 +496,7 @@ async fn validated_build_output(
         &closure,
         &output.consumed,
         &index_slices,
+        &output.programs,
     )?;
     Ok(output)
 }
@@ -611,6 +677,7 @@ mod task_fixture {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
             },
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 

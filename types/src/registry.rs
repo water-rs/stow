@@ -15,37 +15,38 @@ macro_rules! ghcr_host {
 }
 macro_rules! ghcr_cache_stem {
     () => {
-        "water-rs/stow-cache-"
+        "water-rs/stow-cache-v2-"
     };
 }
 
 /// The registry host every stow cache package lives under.
 pub const GHCR_HOST: &str = ghcr_host!();
 /// The repository stem every cache package is named from — the owner and
-/// the `stow-cache-` prefix the rustc version completes.
+/// the `stow-cache-v2-` prefix the rustc version completes.
 pub const GHCR_CACHE_STEM: &str = ghcr_cache_stem!();
 /// The production registry root — `scheme://host` with no repository; every
 /// pull or push appends `/v2/<repository>` for the rustc's own package.
 pub const GHCR_REGISTRY_URL: &str = concat!("https://", ghcr_host!());
 
 /// The GHCR package one rustc's whole cache lives in —
-/// `water-rs/stow-cache-<rustc>`, referenced as
-/// `ghcr.io/water-rs/stow-cache-<rustc>`.
+/// `water-rs/stow-cache-v2-<rustc>`, referenced as
+/// `ghcr.io/water-rs/stow-cache-v2-<rustc>`.
 ///
-/// The public cache is one package per rustc version: every artifact,
-/// bundle, signature, records artifact, index slice and folded set built
-/// for a rustc is a tag of its package. A new rustc's package is created
-/// by its first `build-crate.yml` push — the package links to the public
-/// `water-rs/stow` repository and inherits its visibility, so no manual
-/// step ever opens one. A retired rustc's package is deleted whole in the
+/// The public cache is one package per storage schema and rustc version:
+/// every artifact, bundle, signature, records artifact, index slice and folded set built
+/// for a rustc is a tag of its package. The first push creates a private
+/// package linked to `water-rs/stow`. Repository access permissions are
+/// inherited, but visibility is not: an operator makes the new package
+/// public before anonymous readers can use it. A retired rustc's package
+/// is deleted whole in the
 /// package settings; single versions are never deleted.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheRepository {
-    /// `water-rs/stow-cache-<rustc>` — the repository path.
+    /// `water-rs/stow-cache-v2-<rustc>` — the repository path.
     repository: String,
 }
 
-/// Derive the cache package of `rustc` — `water-rs/stow-cache-<rustc>`.
+/// Derive the cache package of `rustc` — `water-rs/stow-cache-v2-<rustc>`.
 #[must_use]
 pub fn cache_repository(rustc: &WireRustcVersion) -> CacheRepository {
     CacheRepository {
@@ -54,7 +55,7 @@ pub fn cache_repository(rustc: &WireRustcVersion) -> CacheRepository {
 }
 
 impl CacheRepository {
-    /// `water-rs/stow-cache-<rustc>` — the path `repository:…` token scopes
+    /// `water-rs/stow-cache-v2-<rustc>` — the path `repository:…` token scopes
     /// and `/v2/<repository>/…` request URLs name.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -67,14 +68,14 @@ impl CacheRepository {
         RepositoryPath(&self.repository)
     }
 
-    /// `ghcr.io/water-rs/stow-cache-<rustc>` — the canonical reference base
+    /// `ghcr.io/water-rs/stow-cache-v2-<rustc>` — the canonical reference base
     /// every tag of the package extends.
     #[must_use]
     pub fn reference_base(&self) -> String {
         format!("{GHCR_HOST}/{}", self.repository)
     }
 
-    /// The canonical `ghcr.io/water-rs/stow-cache-<rustc>:<tag>` reference —
+    /// The canonical `ghcr.io/water-rs/stow-cache-v2-<rustc>:<tag>` reference —
     /// the reference the publisher signs under.
     #[must_use]
     pub fn reference(&self, tag: &str) -> String {
@@ -89,7 +90,7 @@ impl std::fmt::Display for CacheRepository {
 }
 
 /// Tag suffix of the assembled bundle artifact published next to every
-/// signed artifact: `ghcr.io/water-rs/stow-cache-<rustc>:<tag>.bundle`
+/// signed artifact: `ghcr.io/water-rs/stow-cache-v2-<rustc>:<tag>.bundle`
 /// carries the bundle tar as its single layer.
 pub const BUNDLE_TAG_SUFFIX: &str = ".bundle";
 
@@ -108,13 +109,13 @@ fn is_oci_tag(tag: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
 }
 
-/// `ghcr.io/water-rs/stow-cache-` — what every canonical stow reference
+/// `ghcr.io/water-rs/stow-cache-v2-` — what every canonical stow reference
 /// starts with; the rustc version completes the repository and `:` splits
 /// it from the tag.
 const CANONICAL_REFERENCE_PREFIX: &str = concat!(ghcr_host!(), "/", ghcr_cache_stem!());
 
 /// The tag of a canonical stow `oci_reference` produced by [`oci_reference`]
-/// — everything after `ghcr.io/water-rs/stow-cache-<rustc>:`. The edge
+/// — everything after `ghcr.io/water-rs/stow-cache-v2-<rustc>:`. The edge
 /// builds `/manifests/<tag>` request URLs from it.
 ///
 /// Returns `None` when the reference lacks the canonical prefix, when the
@@ -138,7 +139,7 @@ pub fn oci_reference_tag(reference: &str) -> Option<&str> {
 /// unambiguously into crate `sha-1` and version `0.10.0`.
 ///
 /// Returns `None` when the reference lacks the canonical
-/// `ghcr.io/water-rs/stow-cache-<rustc>:` prefix, when the crate segment is
+/// `ghcr.io/water-rs/stow-cache-v2-<rustc>:` prefix, when the crate segment is
 /// empty, or when nothing follows the first `.`.
 #[must_use]
 pub fn oci_reference_name(reference: &str) -> Option<&str> {
@@ -150,8 +151,8 @@ pub fn oci_reference_name(reference: &str) -> Option<&str> {
 /// The repository path of an OCI reference.
 ///
 /// The segments between the registry host and the tag or digest
-/// (`water-rs/stow-cache-1.99.0` in
-/// `ghcr.io/water-rs/stow-cache-1.99.0:serde.1.0.0-…`).
+/// (`water-rs/stow-cache-v2-1.99.0` in
+/// `ghcr.io/water-rs/stow-cache-v2-1.99.0:serde.1.0.0-…`).
 /// Registry `pull` scopes name this path (`repository:<path>:pull`), not the
 /// crate segment inside the tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -173,8 +174,8 @@ impl std::fmt::Display for RepositoryPath<'_> {
 
 /// Extract the repository path from an OCI reference.
 ///
-/// `ghcr.io/water-rs/stow-cache-1.99.0:serde.1.0.0-…` →
-/// `water-rs/stow-cache-1.99.0`.
+/// `ghcr.io/water-rs/stow-cache-v2-1.99.0:serde.1.0.0-…` →
+/// `water-rs/stow-cache-v2-1.99.0`.
 /// Both `:tag` and `@digest` reference forms are accepted, and a leading
 /// `scheme://` is ignored.
 ///
@@ -249,9 +250,9 @@ pub fn verify_oci_digest(bytes: &[u8], expected: &str) -> Result<(), OciDigestMi
 
 /// Compute the OCI reference for an artifact.
 ///
-/// Format: `ghcr.io/water-rs/stow-cache-<rustc>:{name}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`
+/// Format: `ghcr.io/water-rs/stow-cache-v2-<rustc>:{name}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`
 ///
-/// Every artifact is a tag of its rustc's `water-rs/stow-cache-<rustc>`
+/// Every artifact is a tag of its rustc's `water-rs/stow-cache-v2-<rustc>`
 /// package; the crate name is the tag's first `.`-separated segment, so
 /// `sha-1.0.10.0-…` is crate `sha-1`, version `0.10.0`.
 ///
@@ -275,6 +276,7 @@ pub fn oci_reference(key: &ArtifactKey, c_metadata: &str) -> String {
         crate::artifact::ArtifactKind::Rlib => "",
         crate::artifact::ArtifactKind::Dylib => "-dy",
         crate::artifact::ArtifactKind::ProcMacro => "-pm",
+        crate::artifact::ArtifactKind::BuildScript => "-bs",
     };
 
     let tail = format!("-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}");
@@ -390,7 +392,7 @@ mod tests {
         };
 
         let reference = oci_reference(&key, "abcdef0123456789");
-        assert!(reference.starts_with("ghcr.io/water-rs/stow-cache-1.83.0:serde."));
+        assert!(reference.starts_with("ghcr.io/water-rs/stow-cache-v2-1.83.0:serde."));
         assert!(reference.contains("1.0.210"));
         assert!(reference.contains("x86_64-linux"));
         assert!(reference.contains("1.83.0"));
@@ -429,7 +431,7 @@ mod tests {
         };
 
         let reference = oci_reference(&key, "abcdef0123456789");
-        assert!(reference.starts_with("ghcr.io/water-rs/stow-cache-1.83.0:sha-1.0.10.0-"));
+        assert!(reference.starts_with("ghcr.io/water-rs/stow-cache-v2-1.83.0:sha-1.0.10.0-"));
         assert_eq!(oci_reference_name(&reference), Some("sha-1"));
     }
 
@@ -556,18 +558,18 @@ mod tests {
     #[test]
     fn illegal_tags_are_not_canonical_references() {
         let over_long = format!(
-            "ghcr.io/water-rs/stow-cache-1.91.1:s.{}",
+            "ghcr.io/water-rs/stow-cache-v2-1.91.1:s.{}",
             "1".repeat(MAX_OCI_TAG_LEN)
         );
         for reference in [
             // A second `:` — a tag cannot contain one.
-            "ghcr.io/water-rs/stow-cache-1.91.1:serde.1.0.0:extra",
+            "ghcr.io/water-rs/stow-cache-v2-1.91.1:serde.1.0.0:extra",
             // A digest form, not a tag.
-            "ghcr.io/water-rs/stow-cache-1.91.1:sha256@abc",
+            "ghcr.io/water-rs/stow-cache-v2-1.91.1:sha256@abc",
             // A path separator, which would escape the manifests URL.
-            "ghcr.io/water-rs/stow-cache-1.91.1:serde.1.0.0/../../evil",
+            "ghcr.io/water-rs/stow-cache-v2-1.91.1:serde.1.0.0/../../evil",
             // A tag may not start with `.` or `-`.
-            "ghcr.io/water-rs/stow-cache-1.91.1:.serde.1.0.0",
+            "ghcr.io/water-rs/stow-cache-v2-1.91.1:.serde.1.0.0",
             over_long.as_str(),
         ] {
             assert_eq!(oci_reference_tag(reference), None, "{reference}");
@@ -619,7 +621,7 @@ mod tests {
     fn oci_reference_tag_yields_the_tag() {
         assert_eq!(
             oci_reference_tag(
-                "ghcr.io/water-rs/stow-cache-1.91.1:serde.1.0.0-x86_64-linux-1.91.1-abcdef012345-0123"
+                "ghcr.io/water-rs/stow-cache-v2-1.91.1:serde.1.0.0-x86_64-linux-1.91.1-abcdef012345-0123"
             ),
             Some("serde.1.0.0-x86_64-linux-1.91.1-abcdef012345-0123")
         );
@@ -628,11 +630,14 @@ mod tests {
     #[test]
     fn canonical_parsers_reject_non_canonical_references() {
         for reference in [
+            // Previous storage schemas are never accepted as current artifacts.
+            "ghcr.io/water-rs/stow-cache-1.91.1:serde.1.0.0",
+            "ghcr.io/water-rs/stow-cache-v1-1.91.1:serde.1.0.0",
             // The retired per-crate layout.
-            "ghcr.io/water-rs/stow-cache-1.91.1/serde:1.0.0",
+            "ghcr.io/water-rs/stow-cache-v2-1.91.1/serde:1.0.0",
             "ghcr.io/water-rs/other:serde.1.0.0",
-            "ghcr.io/water-rs/stow-cache-1.91.1:",
-            "ghcr.io/water-rs/stow-cache-1.91.1",
+            "ghcr.io/water-rs/stow-cache-v2-1.91.1:",
+            "ghcr.io/water-rs/stow-cache-v2-1.91.1",
             "",
         ] {
             assert_eq!(
@@ -648,9 +653,9 @@ mod tests {
         }
         // The tag parses but there is no `{crate}.{rest}` split.
         for reference in [
-            "ghcr.io/water-rs/stow-cache-1.91.1:.1.0.0",
-            "ghcr.io/water-rs/stow-cache-1.91.1:serde",
-            "ghcr.io/water-rs/stow-cache-1.91.1:serde.",
+            "ghcr.io/water-rs/stow-cache-v2-1.91.1:.1.0.0",
+            "ghcr.io/water-rs/stow-cache-v2-1.91.1:serde",
+            "ghcr.io/water-rs/stow-cache-v2-1.91.1:serde.",
         ] {
             assert_eq!(
                 oci_reference_name(reference),
@@ -702,18 +707,18 @@ mod tests {
     #[test]
     fn repository_path_from_tag_reference() {
         let path = repository_path(
-            "ghcr.io/water-rs/stow-cache-1.91.1:serde.1.0.0-x86_64-linux-1.91.1-abcdef012345-0123",
+            "ghcr.io/water-rs/stow-cache-v2-1.91.1:serde.1.0.0-x86_64-linux-1.91.1-abcdef012345-0123",
         )
         .expect("canonical reference");
-        assert_eq!(path.as_str(), "water-rs/stow-cache-1.91.1");
-        assert_eq!(path.to_string(), "water-rs/stow-cache-1.91.1");
+        assert_eq!(path.as_str(), "water-rs/stow-cache-v2-1.91.1");
+        assert_eq!(path.to_string(), "water-rs/stow-cache-v2-1.91.1");
     }
 
     #[test]
     fn repository_path_from_digest_reference() {
-        let path = repository_path("ghcr.io/water-rs/stow-cache-1.91.1@sha256:deadbeef")
+        let path = repository_path("ghcr.io/water-rs/stow-cache-v2-1.91.1@sha256:deadbeef")
             .expect("digest reference");
-        assert_eq!(path.as_str(), "water-rs/stow-cache-1.91.1");
+        assert_eq!(path.as_str(), "water-rs/stow-cache-v2-1.91.1");
     }
 
     #[test]
@@ -766,27 +771,27 @@ mod tests {
         assert!(!tag.contains('+'));
     }
 
-    /// The cache package is derived from the rustc version alone:
-    /// `water-rs/stow-cache-<rustc>` under `ghcr.io`, one package per
+    /// The current schema's cache package is derived from the rustc version:
+    /// `water-rs/stow-cache-v2-<rustc>` under `ghcr.io`, one package per
     /// rustc.
     #[test]
     fn cache_repository_derives_per_rustc_package() {
         let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
         let repository = cache_repository(&rustc);
-        assert_eq!(repository.as_str(), "water-rs/stow-cache-1.99.0");
-        assert_eq!(repository.path().as_str(), "water-rs/stow-cache-1.99.0");
+        assert_eq!(repository.as_str(), "water-rs/stow-cache-v2-1.99.0");
+        assert_eq!(repository.path().as_str(), "water-rs/stow-cache-v2-1.99.0");
         assert_eq!(
             repository.reference_base(),
-            "ghcr.io/water-rs/stow-cache-1.99.0"
+            "ghcr.io/water-rs/stow-cache-v2-1.99.0"
         );
         assert_eq!(
             repository.reference("index.x86_64-unknown-linux-gnu.1.99.0"),
-            "ghcr.io/water-rs/stow-cache-1.99.0:index.x86_64-unknown-linux-gnu.1.99.0"
+            "ghcr.io/water-rs/stow-cache-v2-1.99.0:index.x86_64-unknown-linux-gnu.1.99.0"
         );
-        assert_eq!(repository.to_string(), "water-rs/stow-cache-1.99.0");
+        assert_eq!(repository.to_string(), "water-rs/stow-cache-v2-1.99.0");
 
         let beta = cache_repository(&WireRustcVersion::parse("1.93.0-beta.5").expect("beta"));
-        assert_eq!(beta.as_str(), "water-rs/stow-cache-1.93.0-beta.5");
+        assert_eq!(beta.as_str(), "water-rs/stow-cache-v2-1.93.0-beta.5");
     }
 
     /// stow#844: GHCR's `403 DENIED` envelope — on the token exchange or

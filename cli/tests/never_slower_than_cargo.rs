@@ -1049,7 +1049,7 @@ fn a_covered_unit_still_takes_the_plan_path() {
     );
 }
 
-/// `cache_mode = "local"` disables the public edge, not the local artifact
+/// `[cache] remote = false` disables the public edge, not the local artifact
 /// cache: a stored entry still serves in that mode.
 #[test]
 fn a_disabled_public_cache_still_serves_local_entries() {
@@ -1067,7 +1067,10 @@ fn a_disabled_public_cache_still_serves_local_entries() {
         listener.local_addr().expect("local addr").port()
     };
     let edge_url = format!("http://127.0.0.1:{port}");
-    support::write_global_config(&[&dir.path().join("stow-home")], "cache_mode = \"local\"\n");
+    support::write_global_config(
+        &[&dir.path().join("stow-home")],
+        "[cache]\nremote = false\n",
+    );
 
     // First build in local-only mode: no public lookup happens, but the
     // passthrough still stores cfg-if in the local artifact cache.

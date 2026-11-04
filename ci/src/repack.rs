@@ -163,7 +163,7 @@ impl Sweeper<'_> {
         let mut seen = BTreeSet::new();
         let live = pulled
             .iter()
-            .flat_map(|records| &records.records)
+            .flat_map(|records| &records.records.artifacts)
             .filter(|record| seen.insert(record.oci_reference.as_str()))
             .collect::<Vec<_>>();
 
@@ -197,7 +197,15 @@ impl Sweeper<'_> {
             self.rustc_version,
             &task_id,
             self.build,
-            &rows,
+            &stow_types::records::BuildRecords {
+                artifacts: rows,
+                local_programs: pulled
+                    .first()
+                    .expect("nonempty records")
+                    .records
+                    .local_programs
+                    .clone(),
+            },
             sign,
         )
         .await?;

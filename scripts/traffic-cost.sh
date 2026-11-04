@@ -284,11 +284,9 @@ if ! rustup target list --installed --toolchain "$RUSTUP_TOOLCHAIN" \
 fi
 
 cd "$REPO_ROOT"
-echo "[traffic] building stow-admin, stow-mock-registry and stow-build"
-fg cargo build --release -p stow-admin -p stow-mock-registry -p stow-build \
-    >"$LOG_DIR/cargo-build.log" 2>&1 \
-    || die "cargo build failed — see $LOG_DIR/cargo-build.log"
-BIN="$REPO_ROOT/target/release"
+source "$REPO_ROOT/scripts/gate-tools.sh"
+gate_tools production "$LOG_DIR/cargo-build.log" fg \
+    || die "gate tools unavailable — see $LOG_DIR/cargo-build.log"
 
 # P-256 PKCS#8 key pair — the format sigstore accepts (the same block
 # scripts/mock-e2e.sh runs; docs/MOCK.md).
@@ -323,9 +321,10 @@ BUNDLE_DIGEST="$("$BIN/stow-mock-registry" put-blob --size "$BUNDLE_BYTES" \
     --registry-root "$WORK_DIR/mock-registry" | jq -r .digest)"
 jq --arg rustc "$RUSTC_VERSION" --arg digest "$BUNDLE_DIGEST" --argjson size "$BUNDLE_BYTES" '
     map(.rustc_version = $rustc
-        | .oci_reference = "ghcr.io/water-rs/stow-cache-\($rustc):serde.1.0.219-x86_64-unknown-linux-gnu"
+        | .oci_reference = "ghcr.io/water-rs/stow-cache-v2-\($rustc):serde.1.0.219-x86_64-unknown-linux-gnu"
         | .bundle_digest = $digest
         | .bundle_size = $size)
+    | {artifacts: ., local_programs: []}
 ' "$REPO_ROOT/scripts/traffic-cost/index-records.json" >"$WORK_DIR/index-records.json"
 "$BIN/stow-mock-registry" index-from-records \
     --records "$WORK_DIR/index-records.json" \

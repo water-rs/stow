@@ -178,12 +178,13 @@ async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error:
     let bytes = read(&request.records).await.map_err(|error| {
         stow_types::stow_error!("read records {}: {error}", request.records.display())
     })?;
-    let records: Vec<ArtifactRecord> = serde_json::from_slice(&bytes).map_err(|error| {
-        stow_types::stow_error!("decode records {}: {error}", request.records.display())
-    })?;
+    let records: stow_types::records::BuildRecords =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            stow_types::stow_error!("decode records {}: {error}", request.records.display())
+        })?;
     let mut slices: BTreeMap<(TargetTriple, WireRustcVersion), Vec<ArtifactIndexRow>> =
         BTreeMap::new();
-    for record in records {
+    for record in records.artifacts {
         if record.bundle_digest.is_empty() {
             continue;
         }
@@ -193,8 +194,21 @@ async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error:
             .or_default()
             .push(row);
     }
+    let mut programs = BTreeMap::<_, Vec<_>>::new();
+    for program in records.local_programs {
+        let key = (
+            program.node.target.clone(),
+            program.node.rustc_version.clone(),
+        );
+        slices.entry(key.clone()).or_default();
+        programs.entry(key).or_default().push(program);
+    }
     for ((target, rustc_version), mut rows) in slices {
+        let local_programs = programs
+            .remove(&(target.clone(), rustc_version.clone()))
+            .unwrap_or_default();
         rows.sort_by(|a, b| a.c_metadata.cmp(&b.c_metadata));
+        let (rows, build_scripts) = stow_types::index::partition_build_scripts(rows);
         let index = ArtifactIndex {
             header: ArtifactIndexHeader {
                 format_version: ARTIFACT_INDEX_FORMAT_VERSION,
@@ -208,6 +222,8 @@ async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error:
                     .map_err(|_| stow_types::stow_error!("row count {} exceeds u64", rows.len()))?,
             },
             rows,
+            build_scripts,
+            local_programs,
         };
         let index_bytes = stow_shim::encode_index(&index)
             .map_err(|error| stow_types::stow_error!("encode index: {error}"))?;
@@ -224,7 +240,7 @@ async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error:
 
 /// `push-records` — write the task's signed records artifact the same
 /// shape `stow_oci::push_records` pushes to GHCR: the JSON layer under
-/// `application/vnd.stow.records.v1+json`, a `{}` config, the task-id
+/// `application/vnd.stow.records.v2+json`, a `{}` config, the task-id
 /// annotation on the manifest, and the mock signature image.
 /// The blob's bytes are blake3's extendable output over a fixed seed, so
 /// every run stores the same digest and the content does not compress
@@ -248,9 +264,10 @@ async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()>
     let bytes = read(&request.records).await.map_err(|error| {
         stow_types::stow_error!("read records {}: {error}", request.records.display())
     })?;
-    let records: Vec<ArtifactRecord> = serde_json::from_slice(&bytes).map_err(|error| {
-        stow_types::stow_error!("decode records {}: {error}", request.records.display())
-    })?;
+    let records: stow_types::records::BuildRecords =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            stow_types::stow_error!("decode records {}: {error}", request.records.display())
+        })?;
     // The signature binds the canonical GHCR reference — the same string
     // production's cosign signs — never the mock transport base.
     let rustc = WireRustcVersion::parse(&request.rustc_version)
@@ -325,7 +342,7 @@ async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()>
         oci_reference = %oci_reference,
         digest = %manifest_digest,
         task_id = %request.task_id,
-        records = records.len(),
+        records = records.artifacts.len(),
         "pushed mock records artifact"
     );
     Ok(())
@@ -1148,11 +1165,17 @@ async fn write_records_outputs(
         if let Some(parent) = path.parent() {
             create_dir_all(parent).await?;
         }
-        write(path, serde_json::to_vec_pretty(records)?)
-            .await
-            .map_err(|error| {
-                stow_types::stow_error!("write artifact records {}: {error}", path.display())
-            })?;
+        write(
+            path,
+            serde_json::to_vec_pretty(&stow_types::records::BuildRecords {
+                artifacts: records.to_vec(),
+                local_programs: Vec::new(),
+            })?,
+        )
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("write artifact records {}: {error}", path.display())
+        })?;
     }
     Ok(())
 }
@@ -1341,7 +1364,7 @@ struct PutBlobArgs {
 
 #[derive(Debug, Clone, Args)]
 struct PushRecordsArgs {
-    /// `populate --records-out` JSON file — the task's `Vec<ArtifactRecord>`.
+    /// `populate --records-out` JSON file — the task's `BuildRecords`.
     #[arg(long)]
     records: PathBuf,
     /// The task the records belong to — the tag and annotation carry it.
@@ -2591,7 +2614,7 @@ mod tests {
         split_reference, write, write_blob, write_manifest, write_mock_signature,
     };
 
-    const MANIFEST_URI: &str = "/v2/water-rs/stow-cache-1.98.0/manifests/latest";
+    const MANIFEST_URI: &str = "/v2/water-rs/stow-cache-v2-1.98.0/manifests/latest";
 
     fn manifest_request() -> Request<Body> {
         Request::builder()
@@ -2605,11 +2628,11 @@ mod tests {
     #[tokio::test]
     async fn challenge_exchange_then_served() {
         let root = tempfile::tempdir().expect("registry root");
-        std::fs::create_dir_all(root.path().join("manifests/water-rs/stow-cache-1.98.0"))
+        std::fs::create_dir_all(root.path().join("manifests/water-rs/stow-cache-v2-1.98.0"))
             .expect("manifest dir");
         std::fs::write(
             root.path()
-                .join("manifests/water-rs/stow-cache-1.98.0/latest"),
+                .join("manifests/water-rs/stow-cache-v2-1.98.0/latest"),
             b"{\"schemaVersion\":2}",
         )
         .expect("manifest file");
@@ -2623,7 +2646,7 @@ mod tests {
         for (request, challenge) in [
             (
                 manifest_request(),
-                "Bearer realm=\"http://127.0.0.1:28123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache-1.98.0:pull\"",
+                "Bearer realm=\"http://127.0.0.1:28123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache-v2-1.98.0:pull\"",
             ),
             (
                 Request::builder()
@@ -2650,7 +2673,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/token?service=mock-registry&scope=repository:water-rs/stow-cache-1.98.0:pull")
+                    .uri("/token?service=mock-registry&scope=repository:water-rs/stow-cache-v2-1.98.0:pull")
                     .body(Body::empty())
                     .expect("token request builds"),
             )
@@ -2704,7 +2727,7 @@ mod tests {
     async fn a_missing_package_denies_the_anonymous_exchange() {
         let root = tempfile::tempdir().expect("registry root");
         let app = registry_app_with_probe("127.0.0.1:28123", root.path().to_path_buf(), None, None);
-        let scope = "repository:water-rs/stow-cache-9.99.9:pull";
+        let scope = "repository:water-rs/stow-cache-v2-9.99.9:pull";
 
         let response = app
             .clone()
@@ -2751,7 +2774,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v2/water-rs/stow-cache-9.99.9/tags/list")
+                    .uri("/v2/water-rs/stow-cache-v2-9.99.9/tags/list")
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .expect("tags request builds"),
@@ -2918,10 +2941,10 @@ mod tests {
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.98.0";
-    /// The GHCR package `RUSTC` derives: `water-rs/stow-cache-<rustc>`.
-    const REPOSITORY: &str = "water-rs/stow-cache-1.98.0";
+    /// The GHCR package `RUSTC` derives: `water-rs/stow-cache-v2-<rustc>`.
+    const REPOSITORY: &str = "water-rs/stow-cache-v2-1.98.0";
     /// `ghcr.io/<repository>` — the base signed references are built on.
-    const REFERENCE_BASE: &str = "ghcr.io/water-rs/stow-cache-1.98.0";
+    const REFERENCE_BASE: &str = "ghcr.io/water-rs/stow-cache-v2-1.98.0";
     const C_METADATA: &str = "aabbccddeeff0011";
 
     /// `RUSTC`'s package as the session APIs want it.
@@ -2972,7 +2995,10 @@ mod tests {
                 },
                 emit: vec!["link".to_owned()],
                 min_glibc: None,
+                node_profile: stow_types::node_profile::NodeProfile::Dev,
             }],
+            build_scripts: Vec::new(),
+            local_programs: Vec::new(),
         };
         let index_bytes = stow_shim::encode_index(&index).expect("encode index");
         let layer_digest = sha256_digest(&index_bytes);
@@ -3117,6 +3143,7 @@ mod tests {
         let output_path = root.join(&file_name);
         std::fs::write(&output_path, &output_bytes).expect("output file");
         PlannedArtifact {
+            shared_invocations: false,
             compile_key: format!("{C_METADATA}{C_METADATA}"),
             crate_name: CrateName::parse("serde").expect("name"),
             crate_version: "1.0.0".parse().expect("version"),
@@ -3159,6 +3186,7 @@ mod tests {
             }],
             native: None,
             native_archive: None,
+            node_profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
