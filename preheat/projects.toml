@@ -687,3 +687,12 @@ repo = "https://github.com/xerj-org/xerj"
 [[project]]
 repo = "https://github.com/storytold/lightcraft"
 
+[[project]]
+repo = "https://github.com/meta/flow"
+
+[[project]]
+repo = "https://github.com/meta/relay"
+
+[[project]]
+repo = "https://github.com/akitaonrails/ai-memory"
+
