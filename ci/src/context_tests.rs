@@ -2210,7 +2210,7 @@ fn native_twin_contexts_preserve_each_profiles_host_settings() {
 
 /// Library keys can agree while the native and explicit build-script keys differ.
 #[test]
-fn native_equivalent_library_publishes_both_script_shapes_without_recompiling_its_library() {
+fn native_equivalent_library_produces_both_script_shapes_without_recompiling_its_library() {
     let (cargo_home, reg) = registry_home();
     let scratch = tempfile::tempdir().unwrap();
     for name in ["bd", "leaf", "owner"] {

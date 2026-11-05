@@ -1648,6 +1648,7 @@ async fn run_phase(
         .sandbox
         .command("cargo")
         .args(args)
+        .envs(invocation.environment())
         .env("RUSTUP_TOOLCHAIN", run_toolchain(task))
         .env("RUSTFLAGS", rustflags)
         .env(
@@ -1658,6 +1659,8 @@ async fn run_phase(
                 .unwrap_or_default(),
         )
         .env("RUSTC_WORKSPACE_WRAPPER", "")
+        .env(STOW_BUILD_WRAPPER_CRATE_NAME_ENV, WRAPPER_PACKAGE_NAME)
+        .env(STOW_BUILD_TARGET_DIR_REMAP_ENV, TARGET_DIR_VIRTUAL_ROOT)
         .env("CARGO_TARGET_DIR", path_arg(target_dir)?)
         .env(
             STOW_BUILD_CAPTURE_DIR_ENV,
@@ -1667,9 +1670,6 @@ async fn run_phase(
         .env("CARGO_HOME", path_arg(run.setup.cargo_home)?)
         .env("RUSTUP_HOME", path_arg(&rustup_home()?)?)
         .current_dir(setup.workspace.workspace_root());
-    if matches!(invocation, CargoInvocation::ExplicitCompileTime) {
-        command = command.env(stow_cli::CARGO_CHANNEL_OVERRIDE, "nightly");
-    }
     if let Some(store_dir) = setup.consume_store {
         command = command.env(STOW_BUILD_CONSUME_STORE_ENV, path_arg(store_dir)?);
     }
@@ -1679,11 +1679,6 @@ async fn run_phase(
     for (key, value) in &run.msvc.env {
         command = command.env(os_str_arg(key)?, os_str_arg(value)?);
     }
-    // The wrapper package is generated scaffolding: the capture wrapper
-    // records its units as observed so nothing forged under its name slips
-    // in, but it is never a publishable artifact.
-    command = command.env(STOW_BUILD_WRAPPER_CRATE_NAME_ENV, WRAPPER_PACKAGE_NAME);
-    command = command.env(STOW_BUILD_TARGET_DIR_REMAP_ENV, TARGET_DIR_VIRTUAL_ROOT);
     // The sandbox starts with no environment: a mock-compile run's switch
     // reaches the capture wrapper only through this grant.
     #[cfg(feature = "mock-compile")]
@@ -1779,6 +1774,13 @@ pub enum CargoInvocation {
 }
 
 impl CargoInvocation {
+    /// Cargo-only unstable options never change rustc's stable-channel probes.
+    fn environment(self) -> impl Iterator<Item = (&'static str, &'static str)> {
+        matches!(self, Self::ExplicitCompileTime)
+            .then_some((stow_cli::CARGO_CHANNEL_OVERRIDE, "nightly"))
+            .into_iter()
+    }
+
     /// The argv spelling, for error messages.
     const fn spelling(self) -> &'static str {
         match self {
