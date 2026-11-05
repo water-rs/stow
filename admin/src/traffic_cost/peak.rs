@@ -85,8 +85,9 @@ struct LoadReport {
 }
 
 /// Fire `fire` every `interval` until `duration` elapses — the pacing
-/// loop every lane runs. Beats are anchored to each event's start (a
-/// response slower than the interval waits nothing), but the tail
+/// loop every lane runs. Beats are anchored to the run's start, so a
+/// delayed response does not shift every later beat. A response slower
+/// than the interval waits nothing, and the tail
 /// sleep wakes AT the deadline rather than running on to the next
 /// beat: under the launch model's slowest lanes the rate floor
 /// (0.005eps) makes the interval 200s, so a lane that fired at 0/200/400
@@ -98,17 +99,18 @@ struct LoadReport {
 /// error-share gate. The clock is `tokio::time`'s so the boundary
 /// cases run under a paused clock.
 async fn run_paced(interval: Duration, duration: Duration, mut fire: impl AsyncFnMut(u64)) {
-    let deadline = tokio::time::Instant::now() + duration;
+    let mut next = tokio::time::Instant::now();
+    let deadline = next + duration;
     let mut counter = 0u64;
     loop {
-        let fired = tokio::time::Instant::now();
         fire(counter).await;
         counter += 1;
         let now = tokio::time::Instant::now();
         if now >= deadline {
             break;
         }
-        let wake = (fired + interval).min(deadline);
+        next += interval;
+        let wake = next.min(deadline);
         if now < wake {
             tokio::time::sleep_until(wake).await;
         }
@@ -429,8 +431,27 @@ mod tests {
         assert_eq!(elapsed, Duration::from_secs(30));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn delayed_event_does_not_shift_later_beats() {
+        let start = Instant::now();
+        let mut fires = Vec::new();
+        run_paced(
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            async |counter| {
+                fires.push(Instant::now() - start);
+                if counter == 0 {
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                }
+            },
+        )
+        .await;
+        assert_eq!(fires, [0, 1200, 2000, 3000].map(Duration::from_millis));
+        assert_eq!(Instant::now() - start, Duration::from_secs(4));
+    }
+
     /// An event slower than the interval waits nothing before the next
-    /// fire — pacing anchors to the fire's start — and an in-flight
+    /// fire, and an in-flight
     /// event at the deadline completes instead of being cut (cancelling
     /// would report a fake transport error).
     #[tokio::test(start_paused = true)]
