@@ -64,7 +64,8 @@ use stow_shim as wrapper_shim;
 /// `cargo --unit-graph` reads — the build stage computes its consumable
 /// set from the workspace's own unit graphs (stow#589).
 pub use workspace_deps::{
-    ExpandedDependencyGraph, expanded_dependency_graph, resolve_exact_dependency_graph,
+    CARGO_CHANNEL_OVERRIDE, ExpandedDependencyGraph, expanded_dependency_graph,
+    resolve_exact_dependency_graph,
 };
 
 /// What a supervisor exports beside its endpoint so a wrapper can tell

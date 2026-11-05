@@ -523,7 +523,7 @@ async fn cargo_channel_is_stable(current_dir: &Path) -> stow_types::error::Resul
 /// cargo's own channel override variable: `nightly` makes cargo accept
 /// `-Z` without `RUSTC_BOOTSTRAP`, and rustc never reads it — the
 /// probe keeps answering stable cfgs (stow#551).
-const CARGO_CHANNEL_OVERRIDE: &str = "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS";
+pub const CARGO_CHANNEL_OVERRIDE: &str = "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS";
 
 /// The extra environment the unit-graph child needs beyond the user's,
 /// reached only when stable cargo must accept `-Z` and the user's own

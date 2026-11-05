@@ -796,7 +796,8 @@ pub async fn phase_unit_graphs(
     };
     let mut graphs = Vec::new();
     for &phase in cargo_phases(cargo_subcommand) {
-        for &invocation in phase_invocations(task) {
+        let mut invocations = std::collections::VecDeque::from(phase_invocations(task).to_vec());
+        while let Some(invocation) = invocations.pop_front() {
             #[cfg_attr(not(feature = "mock-compile"), allow(unused_mut))]
             let mut phase_args = cargo_phase_args(workspace, task, phase, invocation).await?;
             #[cfg(feature = "mock-compile")]
@@ -822,12 +823,31 @@ pub async fn phase_unit_graphs(
                 Some(cargo_home),
             )
             .await?;
-            graphs.push(PhaseUnitGraph {
+            let planned = PhaseUnitGraph {
                 phase,
                 invocation,
                 target: passes_target.then(|| task.target.as_str().to_owned()),
                 graph,
-            });
+            };
+            // Library-key equivalence does not imply build-script-key
+            // equivalence. Cargo's compile-time-only mode produces the
+            // explicit script without recompiling the equivalent library.
+            if phase == CargoSubcommand::Check
+                && matches!(invocation, CargoInvocation::Task)
+                && !passes_target
+                && !task.host_side
+                && planned
+                    .task_units(runner_host_triple(task)?)?
+                    .iter()
+                    .any(|unit| {
+                        unit.key.kind == stow_types::unit_graph::TaskUnitKind::BuildScript
+                            && unit.name == task.crate_name.as_str()
+                            && unit.version == task.version.to_string()
+                    })
+            {
+                invocations.push_back(CargoInvocation::ExplicitCompileTime);
+            }
+            graphs.push(planned);
         }
     }
     Ok(graphs)
@@ -1324,7 +1344,6 @@ async fn compile_task(
     // outputs.
     let run_dir = TempDir::new()?;
     let (mut collector, capture_command) = CaptureCollector::channel();
-    let phases = cargo_phases(cargo_subcommand);
 
     let setup = PhaseSetup {
         workspace: &workspace,
@@ -1357,22 +1376,20 @@ async fn compile_task(
         ipc_endpoint: &ipc_endpoint,
         msvc: &msvc,
     };
-    for &phase in phases {
-        for &invocation in phase_invocations(task) {
-            let target_dir = phase_target_dir(run_dir.path(), phase, invocation);
-            if let Some(failure) = run_phase(
-                &run,
-                task,
-                phase,
-                invocation,
-                &target_dir,
-                &mut collector,
-                mode,
-            )
-            .await?
-            {
-                return Ok(Err(failure));
-            }
+    for graph in &unit_graphs {
+        let target_dir = graph.target_dir(run_dir.path());
+        if let Some(failure) = run_phase(
+            &run,
+            task,
+            graph.phase,
+            graph.invocation,
+            &target_dir,
+            &mut collector,
+            mode,
+        )
+        .await?
+        {
+            return Ok(Err(failure));
         }
     }
 
@@ -1631,6 +1648,7 @@ async fn run_phase(
         .sandbox
         .command("cargo")
         .args(args)
+        .envs(invocation.environment())
         .env("RUSTUP_TOOLCHAIN", run_toolchain(task))
         .env("RUSTFLAGS", rustflags)
         .env(
@@ -1659,11 +1677,6 @@ async fn run_phase(
     for (key, value) in &run.msvc.env {
         command = command.env(os_str_arg(key)?, os_str_arg(value)?);
     }
-    // The wrapper package is generated scaffolding: the capture wrapper
-    // records its units as observed so nothing forged under its name slips
-    // in, but it is never a publishable artifact.
-    command = command.env(STOW_BUILD_WRAPPER_CRATE_NAME_ENV, WRAPPER_PACKAGE_NAME);
-    command = command.env(STOW_BUILD_TARGET_DIR_REMAP_ENV, TARGET_DIR_VIRTUAL_ROOT);
     // The sandbox starts with no environment: a mock-compile run's switch
     // reaches the capture wrapper only through this grant.
     #[cfg(feature = "mock-compile")]
@@ -1753,15 +1766,32 @@ pub enum CargoInvocation {
     /// `-C debuginfo` to the host half whenever `--target` is present,
     /// even to the host triple itself).
     Explicit,
+    /// Explicit-target build scripts and their compile-time dependencies,
+    /// without rebuilding target libraries whose keys equal the native ones.
+    ExplicitCompileTime,
 }
 
 impl CargoInvocation {
+    /// Cargo-only unstable options never change rustc's stable-channel probes.
+    fn environment(self) -> impl Iterator<Item = (&'static str, &'static str)> {
+        [
+            (STOW_BUILD_WRAPPER_CRATE_NAME_ENV, WRAPPER_PACKAGE_NAME),
+            (STOW_BUILD_TARGET_DIR_REMAP_ENV, TARGET_DIR_VIRTUAL_ROOT),
+        ]
+        .into_iter()
+        .chain(
+            matches!(self, Self::ExplicitCompileTime)
+                .then_some((stow_cli::CARGO_CHANNEL_OVERRIDE, "nightly")),
+        )
+    }
+
     /// The argv spelling, for error messages.
     const fn spelling(self) -> &'static str {
         match self {
             Self::Task => "task-spelled",
             Self::Native => "native",
             Self::Explicit => "explicit --target",
+            Self::ExplicitCompileTime => "explicit --target compile-time dependencies",
         }
     }
 }
@@ -1801,6 +1831,9 @@ async fn cargo_phase_args(
         "--manifest-path".to_owned(),
         path_arg(workspace.manifest_path())?,
     ];
+    if matches!(invocation, CargoInvocation::ExplicitCompileTime) {
+        args.extend(["--compile-time-deps", "-Z", "unstable-options"].map(str::to_owned));
+    }
     if phase == CargoSubcommand::Test {
         args.push("--no-run".to_owned());
     }
@@ -1841,7 +1874,7 @@ async fn invocation_passes_target(
     Ok(match invocation {
         CargoInvocation::Task => !target_is_host(task.target.as_str()).await?,
         CargoInvocation::Native => false,
-        CargoInvocation::Explicit => true,
+        CargoInvocation::Explicit | CargoInvocation::ExplicitCompileTime => true,
     })
 }
 
@@ -2673,6 +2706,7 @@ pub fn phase_target_dir(
         CargoInvocation::Task => "",
         CargoInvocation::Native => "-native",
         CargoInvocation::Explicit => "-target",
+        CargoInvocation::ExplicitCompileTime => "-target-compile-time",
     };
     run_dir.join(format!("target-{}{suffix}", phase.as_str()))
 }
