@@ -504,6 +504,7 @@ fn profile_cpu_ms(profile: &CpuProfile) -> f64 {
 /// Profile whatever `work` drives and return the profile's CPU ms.
 async fn profiled(
     inspector: &Inspector,
+    label: &str,
     work: impl AsyncFnOnce() -> stow_types::error::Result<()>,
 ) -> stow_types::error::Result<f64> {
     inspector
@@ -521,6 +522,28 @@ async fn profiled(
             .ok_or_else(|| stow_error!("Profiler.stop returned no profile"))?,
     )
     .map_err(|error| stow_error!("decode the CPU profile: {error}"))?;
+    let names: std::collections::BTreeMap<_, _> = profile
+        .nodes
+        .iter()
+        .map(|node| (node.id, node.call_frame.function_name.as_str()))
+        .collect();
+    let mut counts = std::collections::BTreeMap::<&str, u64>::new();
+    for sample in &profile.samples {
+        let name = names
+            .get(sample)
+            .ok_or_else(|| stow_error!("CPU sample names absent profile node {sample}"))?;
+        if *name != "(idle)" {
+            *counts.entry(name).or_default() += 1;
+        }
+    }
+    let mut hotspots: Vec<_> = counts.into_iter().collect();
+    hotspots.sort_unstable_by_key(|(_, samples)| std::cmp::Reverse(*samples));
+    hotspots.truncate(10);
+    tracing::info!(
+        label,
+        ?hotspots,
+        "Worker CPU profile hotspots (function, samples)"
+    );
     Ok(profile_cpu_ms(&profile))
 }
 
@@ -594,7 +617,7 @@ async fn measure_lane(
     let mut rounds_cpu_ms = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
         ready(lane, edge, args.events_per_round).await?;
-        let cpu_ms = profiled(inspector, async || {
+        let cpu_ms = profiled(inspector, lane.name, async || {
             fire_events(lane, edge, &mut client, &mut counter, args.events_per_round).await
         })
         .await?;
@@ -613,7 +636,12 @@ async fn measure_reference(inspector: &Inspector) -> stow_types::error::Result<V
     inspector.run_reference().await?;
     let mut rounds_ms = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
-        rounds_ms.push(profiled(inspector, async || inspector.run_reference().await).await?);
+        rounds_ms.push(
+            profiled(inspector, "reference", async || {
+                inspector.run_reference().await
+            })
+            .await?,
+        );
     }
     Ok(rounds_ms)
 }
@@ -644,7 +672,7 @@ pub async fn run(edge: &Edge, args: &CpuArgs, output: Output) -> stow_types::err
         )
         .await?;
 
-    let idle_cpu_ms = profiled(&inspector, async || {
+    let idle_cpu_ms = profiled(&inspector, "idle", async || {
         tokio::time::sleep(IDLE_WINDOW).await;
         Ok(())
     })
