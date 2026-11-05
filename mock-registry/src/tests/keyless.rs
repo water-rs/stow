@@ -489,10 +489,9 @@ async fn a_keyless_signature_verifies_with_the_readers_verifier() {
 
     assert_eq!(stack.sigstore.certificates(), 1);
     assert_eq!(stack.sigstore.entries(), 1);
-    // Layer, config and manifest by digest; the signature's payload,
-    // config and manifest; the tag; the bundle's layer, config and
-    // manifest.
-    assert_eq!(stack.writes(), 10);
+    // Layer and config; the signature's payload, config and manifest;
+    // the signed tag; the bundle's layer, config and manifest.
+    assert_eq!(stack.writes(), 9);
     let log = stack.probe.request_log();
     assert_eq!(
         log.iter()
@@ -526,6 +525,62 @@ async fn a_keyless_signature_verifies_with_the_readers_verifier() {
         .as_str()
         .expect("chain");
     assert_eq!(chain, stack.sigstore.with(|state| state.ca.pem()));
+}
+
+/// Count a complete node publication, including its signed records, on
+/// a registry that requires the upload-session PUT for every new blob.
+#[tokio::test]
+async fn complete_publication_counts_artifacts_records_and_signatures() {
+    let stack = Stack::new().await;
+    stack.probe.refuse_single_post();
+    let session = stack.session(&unbounded());
+    let signer = stack.signer();
+    let rustc = stow_types::identity::WireRustcVersion::parse("1.85.0").expect("rustc");
+    for index in 0..2 {
+        let plan = plan(&stack.root, index);
+        let sign = |reference: String, digest: String| {
+            let (signer, session) = (&signer, &session);
+            async move { signer.sign(session, &reference, &digest).await }
+        };
+        let before = stack.writes();
+        let outcome = stow_oci::push_artifacts_with(&session, std::slice::from_ref(&plan), sign)
+            .await
+            .expect("artifacts");
+        let artifacts = stow_types::upload_plan::build_artifact_records(
+            std::slice::from_ref(&plan),
+            &outcome.published_by_reference,
+            &BTreeMap::from([(plan.oci_reference.clone(), None)]),
+        )
+        .expect("artifact records");
+        let records = stow_types::records::BuildRecords {
+            artifacts,
+            local_programs: Vec::new(),
+        };
+        stow_oci::push_records_with(
+            &session,
+            &rustc,
+            &format!("task-{index}"),
+            stow_types::records::BuildRun {
+                run_id: index as u64 + 1,
+                run_attempt: 1,
+            },
+            &records,
+            sign,
+        )
+        .await
+        .expect("signed records");
+        assert_eq!(
+            stack.writes() - before,
+            if index == 0 { 26 } else { 24 },
+            "the empty records config is shared after the first publication"
+        );
+    }
+    assert_eq!(stack.sigstore.certificates(), 1);
+    assert_eq!(
+        stack.sigstore.entries(),
+        4,
+        "artifact and records signed once per node"
+    );
 }
 
 /// One certificate serves every signature while it has more than the
@@ -614,7 +669,7 @@ async fn a_sweep_stays_under_the_write_budget() {
 
     assert_eq!(stack.probe.throttled_writes(), 0, "no write was refused");
     let arrivals = stack.probe.write_arrivals();
-    assert_eq!(arrivals.len(), 24 * 10);
+    assert_eq!(arrivals.len(), 24 * 9);
     let peak = peak(&arrivals, Duration::from_secs(1));
     assert!(peak <= 101, "{peak} writes in one second, over the budget");
     assert_eq!(stack.sigstore.certificates(), 1);
@@ -722,8 +777,8 @@ async fn a_refused_certificate_fails_fast_and_writes_no_signature() {
     assert!(message.contains("Fulcio refused"), "{message}");
     assert!(message.contains("401"), "{message}");
     assert!(message.contains("token audience rejected"), "{message}");
-    // The layer, the config and the manifest by digest — nothing more.
-    assert_eq!(stack.writes(), 3);
+    // The layer and config — no signature or manifest.
+    assert_eq!(stack.writes(), 2);
     assert_eq!(stack.sigstore.entries(), 0);
 }
 
@@ -744,5 +799,5 @@ async fn a_signature_the_trust_root_rejects_is_never_pushed() {
         message.contains("does not verify against the Sigstore trust root"),
         "{message}"
     );
-    assert_eq!(stack.writes(), 3, "no signature write");
+    assert_eq!(stack.writes(), 2, "no signature or manifest write");
 }
