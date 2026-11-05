@@ -556,7 +556,9 @@ pub struct Graph {
     /// The sliding-window evidence the dispatch-freeze trip reads —
     /// every applied run outcome, capped; the window filter happens
     /// at read so replay needs no setting.
-    pub attempt_outcomes: std::collections::VecDeque<AttemptOutcome>,
+    pub(super) attempt_outcomes: std::collections::VecDeque<AttemptOutcome>,
+    /// Derived minute/target counts over exactly the retained breaker history.
+    attempt_minutes: BTreeMap<i64, BTreeMap<String, (u64, u64)>>,
     /// Demand-feed hours by `YYYY-MM-DDTHH` — staging sessions carry
     /// their pages until `Deliver` folds them.
     pub feed_sessions: std::collections::BTreeMap<String, FeedSession>,
@@ -2304,6 +2306,79 @@ impl Graph {
         FinishOutcome::Applied
     }
 
+    /// Append retained history and update its derived breaker counts together.
+    pub(super) fn record_attempt_outcome(&mut self, outcome: AttemptOutcome) {
+        if outcome.source_failure.is_none() {
+            let count = self
+                .attempt_minutes
+                .entry(outcome.finished_at_ms.div_euclid(60_000))
+                .or_default()
+                .entry(outcome.target.clone())
+                .or_default();
+            count.0 += 1;
+            count.1 += u64::from(outcome.failure_class.is_some());
+        }
+        self.attempt_outcomes.push_back(outcome);
+        while self.attempt_outcomes.len() > ATTEMPT_OUTCOME_CAP {
+            let removed = self
+                .attempt_outcomes
+                .pop_front()
+                .expect("over-cap history is nonempty");
+            if removed.source_failure.is_some() {
+                continue;
+            }
+            let minute = removed.finished_at_ms.div_euclid(60_000);
+            let targets = self
+                .attempt_minutes
+                .get_mut(&minute)
+                .expect("retained outcome minute");
+            let count = targets
+                .get_mut(&removed.target)
+                .expect("retained outcome target");
+            count.0 -= 1;
+            count.1 -= u64::from(removed.failure_class.is_some());
+            if count.0 == 0 {
+                targets.remove(&removed.target);
+            }
+            if targets.is_empty() {
+                self.attempt_minutes.remove(&minute);
+            }
+        }
+    }
+
+    /// Exact timestamp window, aggregating full minutes only once per target.
+    pub(super) fn attempt_tallies_since(&self, cutoff: i64) -> BTreeMap<&str, (u64, u64)> {
+        let minute = cutoff.div_euclid(60_000);
+        let mut totals = BTreeMap::<&str, (u64, u64)>::new();
+        let first_full = minute + i64::from(cutoff.rem_euclid(60_000) != 0);
+        for targets in self
+            .attempt_minutes
+            .range(first_full..)
+            .map(|(_, targets)| targets)
+        {
+            for (target, &(outcomes, failures)) in targets {
+                let total = totals.entry(target.as_str()).or_default();
+                total.0 += outcomes;
+                total.1 += failures;
+            }
+        }
+        // Only a partially covered minute needs individual timestamps. Most
+        // records are rejected before any target lookup or aggregation.
+        if first_full != minute && self.attempt_minutes.contains_key(&minute) {
+            for outcome in &self.attempt_outcomes {
+                if outcome.finished_at_ms >= cutoff
+                    && outcome.finished_at_ms.div_euclid(60_000) == minute
+                    && outcome.source_failure.is_none()
+                {
+                    let total = totals.entry(outcome.target.as_str()).or_default();
+                    total.0 += 1;
+                    total.1 += u64::from(outcome.failure_class.is_some());
+                }
+            }
+        }
+        totals
+    }
+
     /// The completion's own transition — shared by the direct apply and
     /// the parked-consume path.
     fn finish_run_inner(
@@ -2321,7 +2396,7 @@ impl Graph {
         if !cancelled || success {
             let attempt = self.state(ix).attempt;
             self.dirty.outcomes = true;
-            self.attempt_outcomes.push_back(AttemptOutcome {
+            self.record_attempt_outcome(AttemptOutcome {
                 task_id: self.task_id_of(ix),
                 generation_id: self.generation_of(ix).to_string(),
                 attempt: u32::from(attempt.saturating_add(u8::from(!success))),
@@ -2331,9 +2406,6 @@ impl Graph {
                 run_id: self.run_id_of(ix).to_string(),
                 finished_at_ms: now,
             });
-            while self.attempt_outcomes.len() > ATTEMPT_OUTCOME_CAP {
-                self.attempt_outcomes.pop_front();
-            }
         }
         if cancelled && !success {
             // Superseded duplicate — re-queue without an attempt bump.
@@ -4606,6 +4678,63 @@ mod tests {
             }
         }
         loader.finish().expect("load")
+    }
+
+    #[test]
+    fn breaker_rollup_matches_exact_history_after_eviction_and_reload() {
+        let mut graph = Graph::default();
+        for index in 0..(ATTEMPT_OUTCOME_CAP + 300) {
+            let at = i64::try_from(index).expect("index") * 137;
+            graph.record_attempt_outcome(AttemptOutcome {
+                task_id: format!("task-{index}"),
+                generation_id: "1".to_owned(),
+                attempt: 1,
+                target: if index % 2 == 0 {
+                    "wasm32-unknown-unknown"
+                } else {
+                    "aarch64-apple-darwin"
+                }
+                .to_owned(),
+                failure_class: (index % 3 == 0).then(|| "compile failed".to_owned()),
+                source_failure: (index % 7 == 0).then_some(
+                    stow_types::api::SourceFailureVerification {
+                        run_id: 1,
+                        run_attempt: 1,
+                        job_id: 1,
+                    },
+                ),
+                run_id: index.to_string(),
+                // Completion timestamps need not arrive in sorted order.
+                finished_at_ms: if index % 5 == 0 { at - 90_000 } else { at },
+            });
+        }
+        assert_eq!(graph.attempt_outcomes.len(), ATTEMPT_OUTCOME_CAP);
+        graph.dirty.outcomes = true;
+        let restored = round_trip(&graph);
+        for source in [&graph, &restored] {
+            for cutoff in [
+                -90_001, -60_000, -1, 0, 1, 59_999, 60_000, 60_001, 120_000, 590_017, 999_999,
+            ] {
+                let mut expected = BTreeMap::<&str, (u64, u64)>::new();
+                for outcome in &source.attempt_outcomes {
+                    if outcome.finished_at_ms >= cutoff && outcome.source_failure.is_none() {
+                        let count = expected.entry(outcome.target.as_str()).or_default();
+                        count.0 += 1;
+                        count.1 += u64::from(outcome.failure_class.is_some());
+                    }
+                }
+                assert_eq!(
+                    source.attempt_tallies_since(cutoff),
+                    expected,
+                    "cutoff {cutoff}"
+                );
+                assert_eq!(
+                    source.attempt_tallies_since(cutoff),
+                    graph.attempt_tallies_since(cutoff),
+                    "reloaded cutoff {cutoff}"
+                );
+            }
+        }
     }
 
     #[test]
