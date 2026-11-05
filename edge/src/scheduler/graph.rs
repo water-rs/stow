@@ -2302,6 +2302,7 @@ impl Graph {
     ) {
         self.state_mut(ix).updated = now;
         let target = self.node(ix).target;
+        let source_failure_verified = source_failure.is_some();
         if !cancelled || success {
             let attempt = self.state(ix).attempt;
             self.dirty.outcomes = true;
@@ -2338,7 +2339,7 @@ impl Graph {
         let state = self.state_mut(ix);
         state.attempt = state.attempt.saturating_add(1);
         let attempt = u32::from(state.attempt);
-        if attempt > queue::MAX_BUILD_ATTEMPTS {
+        if source_failure_verified || attempt > queue::MAX_BUILD_ATTEMPTS {
             self.set_status(ix, Status::Failed);
             self.edit_extra(ix, |extra| extra.error = error.map(Into::into));
             self.tally_outcome(now, target, false);
@@ -4115,13 +4116,11 @@ mod tests {
         sub(name).task_id
     }
 
-    /// The profile is part of a node's identity: the same crate under two
-    /// profiles is two nodes with distinct ids, and a dispatched payload
-    /// carries the node's own profile (stow#1008).
+    /// A verified failure is terminal, including after event replay and reload.
     #[test]
     fn source_verification_survives_event_replay_and_snapshot() {
         let mut graph = Graph::default();
-        graph.merge(&solo(), 0).expect("merge");
+        graph.merge(&chain(), 0).expect("merge");
         let claim = graph
             .claim(&claim_settings(45, 16), 0, u32::MAX)
             .expect("claim");
@@ -4143,10 +4142,22 @@ mod tests {
             },
             2000,
         );
-        let restored = round_trip(&graph);
+        let mut restored = round_trip(&graph);
         let failure = restored.attempt_outcomes.back().expect("failure retained");
         assert_eq!(failure.source_failure.as_ref(), Some(&proof));
         assert!(failure.failure_class.is_some());
+        for state in [&graph, &restored] {
+            assert_eq!(status_of(state, "c"), Some(Status::Failed));
+            let dependent = state.node_ix(&id("b")).expect("dependent");
+            assert!(state.node(dependent).flags.blocked());
+            assert_eq!(ready_count(state), 0);
+        }
+        assert!(
+            restored
+                .claim(&claim_settings(45, 16), 86_400_000, u32::MAX)
+                .expect("no retry after backoff")
+                .is_empty()
+        );
         let settings = crate::freeze::FreezeSettings {
             min_outcomes: 1,
             ..Default::default()
