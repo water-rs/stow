@@ -765,17 +765,38 @@ impl RegistrySession {
     /// Returns [`RegistryError`] on a transport failure, a refusal, or an
     /// undecodable page body.
     pub async fn list_tags(&self) -> Result<Vec<String>, RegistryError> {
-        /// Tags per page — large enough that the records tag space is one
-        /// request for a long time.
+        self.collect_tags(None).await
+    }
+
+    /// List tags after `prefix` that remain in its namespace. The bare
+    /// prefix is the exclusive OCI cursor, not a member of the namespace.
+    /// Pages stop at the first tag outside it; matching follows OCI's
+    /// case-insensitive lexical ordering.
+    ///
+    /// # Errors
+    /// Returns the same transport and decoding errors as [`Self::list_tags`].
+    pub async fn list_tags_with_prefix(&self, prefix: &str) -> Result<Vec<String>, RegistryError> {
+        self.collect_tags(Some(prefix)).await
+    }
+
+    async fn collect_tags(&self, prefix: Option<&str>) -> Result<Vec<String>, RegistryError> {
         const PAGE_SIZE: u32 = 1000;
         let mut tags = Vec::new();
-        let mut last: Option<String> = None;
+        let mut last = prefix.map(str::to_owned);
         loop {
             let Some((page, has_next)) = self.tags_page(PAGE_SIZE, last.as_deref()).await? else {
                 break;
             };
             last = page.last().cloned();
-            tags.extend(page);
+            for tag in page {
+                if prefix.is_some_and(|prefix| {
+                    !tag.get(..prefix.len())
+                        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+                }) {
+                    return Ok(tags);
+                }
+                tags.push(tag);
+            }
             if !has_next || last.is_none() {
                 break;
             }
@@ -1482,5 +1503,60 @@ mod tests {
         let (session, _http) = session_on(&url).await;
         assert_eq!(session.list_tags().await.expect("list"), ["a", "b"]);
         task.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn prefixed_tags_follow_pages_and_stop_before_unrelated_tags() {
+        let (url, task) = scripted_registry(|url| {
+            let mut answers = script(url, false, vec![]);
+            answers.extend([
+                (
+                    200,
+                    "link: </v2/cache/tags/list?last=records-b>; rel=\"next\"\r\n".to_owned(),
+                    r#"{"tags":["records-a","records-b"]}"#,
+                ),
+                (
+                    200,
+                    "link: </v2/cache/tags/list?last=signature-a>; rel=\"next\"\r\n".to_owned(),
+                    r#"{"tags":["records-c","signature-a"]}"#,
+                ),
+            ]);
+            answers
+        })
+        .await;
+        let (session, _http) = session_on(&url).await;
+        assert_eq!(
+            session
+                .list_tags_with_prefix("records-")
+                .await
+                .expect("range"),
+            ["records-a", "records-b", "records-c"]
+        );
+        let lines = task.await.expect("server");
+        assert_eq!(lines.len(), 4, "two listing pages plus authentication");
+        assert!(lines[2].contains("last=records- "), "{lines:?}");
+        assert!(lines[3].contains("last=records-b "), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn prefixed_tags_handle_absence_empty_ranges_and_final_matching_pages() {
+        for (status, body, expected) in [
+            (404, NAME_UNKNOWN, vec![]),
+            (200, r#"{"tags":null}"#, vec![]),
+            (200, r#"{"tags":["signature-a"]}"#, vec![]),
+            (200, r#"{"tags":["records-a"]}"#, vec!["records-a"]),
+        ] {
+            let (url, task) =
+                scripted_registry(|url| script(url, false, vec![(status, body)])).await;
+            let (session, _http) = session_on(&url).await;
+            assert_eq!(
+                session
+                    .list_tags_with_prefix("records-")
+                    .await
+                    .expect("range"),
+                expected
+            );
+            task.await.expect("server");
+        }
     }
 }

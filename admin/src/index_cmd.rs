@@ -780,10 +780,14 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
     let repository = cache_repository(&rustc_version);
     let session = base.session(&repository, &http);
     let trust = stow_oci::verify::records_trust().await?;
-    let mut tags = session
-        .list_tags()
-        .await
-        .map_err(|error| stow_error!("list registry tags: {error}"))?;
+    // Three independent OCI namespaces, at most three listings in flight.
+    let (folded, indexes, records) = futures_util::try_join!(
+        session.list_tags_with_prefix("folded."),
+        session.list_tags_with_prefix("index."),
+        session.list_tags_with_prefix("records-"),
+    )
+    .map_err(|error| stow_error!("list registry tags: {error}"))?;
+    let mut tags: Vec<_> = folded.into_iter().chain(indexes).chain(records).collect();
     tags.sort();
     let ctx = std::sync::Arc::new(PullContext {
         session,
@@ -1252,7 +1256,7 @@ async fn index_reconcile(edge: &Edge, args: IndexReconcileArgs) -> stow_types::e
     let session = base.session(&repository, &http);
     let trust = stow_oci::verify::records_trust().await?;
     let tags = session
-        .list_tags()
+        .list_tags_with_prefix("index.")
         .await
         .map_err(|error| stow_error!("list registry tags: {error}"))?;
     let ctx = PullContext {
@@ -1567,7 +1571,7 @@ async fn index_join(args: IndexJoinArgs) -> stow_types::error::Result<()> {
         let repository = cache_repository(&rustc_version);
         let session = base.session(&repository, &http);
         let mut tags = session
-            .list_tags()
+            .list_tags_with_prefix("index.")
             .await
             .map_err(|error| stow_error!("list registry tags: {error}"))?;
         tags.sort();
