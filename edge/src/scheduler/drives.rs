@@ -2491,7 +2491,17 @@ pub const DRIVES: &[Drive] = &[
         setup: None,
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
+                let (occupied_before, macos_before) = occupied_slots(ctx);
                 let task_ids = pass(db, settings, ctx).await?;
+                let (occupied_after, macos_after) = occupied_slots(ctx);
+                tracing::info!(
+                    occupied_before,
+                    macos_before,
+                    occupied_after,
+                    macos_after,
+                    claimed = task_ids.len(),
+                    "budget dispatch occupancy"
+                );
                 ctx.record_claimed(task_ids);
                 let _plan = routes::wake_plan(ctx.loaded(), settings, now_ms());
                 Ok(())
