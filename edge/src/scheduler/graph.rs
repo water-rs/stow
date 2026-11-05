@@ -191,6 +191,9 @@ impl IdKeys {
 #[derive(Debug)]
 struct TargetInfo {
     name: Box<str>,
+    /// Derived from node transitions, rebuilt from the snapshot's nodes.
+    counts: [u32; Status::COUNT],
+    pending_blocked: u32,
     /// The runner family the target builds on.
     family: Option<RunnerFamily>,
 
@@ -214,6 +217,8 @@ impl TargetInfo {
         };
         Self {
             name: name.into(),
+            counts: [0; Status::COUNT],
+            pending_blocked: 0,
             family: runner_family(name),
             own_masks: [
                 [mask(false, false), mask(false, true)],
@@ -875,6 +880,9 @@ impl Graph {
         self.index_pending(ix, true);
         self.counts[from.index()] -= 1;
         self.counts[to.index()] += 1;
+        let target = &mut self.targets[usize::from(self.nodes[ix as usize].target)];
+        target.counts[from.index()] -= 1;
+        target.counts[to.index()] += 1;
         if from.in_flight() {
             self.inflight.remove(&ix);
         }
@@ -894,11 +902,13 @@ impl Graph {
             return;
         }
         let blocked = u32::from(node.flags.blocked());
+        let target = usize::from(node.target);
         let human = node.flags.lane() == Lane::Human;
         let miss = u32::from(node.flags.lane() == Lane::Miss);
         let first = self.state(ix).first_requested;
         if on {
             self.pending_blocked += blocked;
+            self.targets[target].pending_blocked += blocked;
             self.pending_miss += miss;
             if human {
                 self.human_pending.insert(ix);
@@ -906,6 +916,7 @@ impl Graph {
             *self.pending_ages.entry(first).or_default() += 1;
         } else {
             self.pending_blocked -= blocked;
+            self.targets[target].pending_blocked -= blocked;
             self.pending_miss -= miss;
             if human {
                 assert!(
@@ -1091,6 +1102,7 @@ impl Graph {
             flags: new.flags,
         });
         self.counts[status.index()] += 1;
+        self.targets[usize::from(target)].counts[status.index()] += 1;
         self.index_pending(ix, true);
         let nodes = &self.nodes;
         self.ids.insert(u64::from(new.keys.tag), ix, |held| {
@@ -1225,6 +1237,9 @@ impl Graph {
             .map(|(ix, extra)| (remap[ix as usize], extra))
             .collect();
         self.counts[Status::Free.index()] = 0;
+        for target in &mut self.targets {
+            target.counts[Status::Free.index()] = 0;
+        }
         self.rebuild_indexes_over_nodes();
     }
 
@@ -3751,14 +3766,20 @@ impl Graph {
                 tally.1 += failed;
             }
         }
-        let targets = by_target
-            .into_iter()
-            .filter(|(_, (completed, failed))| completed + failed > 0)
-            .map(|(target, (completed_24h, failed_24h))| {
+        let targets = self
+            .targets
+            .iter()
+            .enumerate()
+            .map(|(ix, target)| {
+                let ix = u8::try_from(ix).expect("target indexes fit u8");
+                let (completed_24h, failed_24h) = by_target.get(&ix).copied().unwrap_or_default();
                 Ok(stow_types::api::AdminTargetStats {
-                    target: stow_types::identity::TargetTriple::parse(
-                        &*self.targets[usize::from(target)].name,
-                    )?,
+                    target: stow_types::identity::TargetTriple::parse(&*target.name)?,
+                    pending: target.counts[Status::Pending.index()],
+                    dispatched: target.counts[Status::Dispatched.index()],
+                    running: target.counts[Status::Running.index()],
+                    failed: target.counts[Status::Failed.index()],
+                    blocked: target.pending_blocked,
                     completed_24h,
                     failed_24h,
                 })
@@ -3828,7 +3849,9 @@ impl Graph {
             let node = self.node_mut(ix);
             node.unmet = unmet;
             let status = node.status;
+            let target = usize::from(node.target);
             self.counts[status.index()] += 1;
+            self.targets[target].counts[status.index()] += 1;
             if status.in_flight() {
                 self.inflight.insert(ix);
             }
@@ -4504,15 +4527,19 @@ mod tests {
     /// The pending index recomputed by walking the arena — what
     /// `index_pending` keeps through every transition must equal it.
     fn assert_pending_index(graph: &Graph) {
+        let mut target_counts = vec![[0u32; Status::COUNT]; graph.targets.len()];
+        let mut target_blocked = vec![0u32; graph.targets.len()];
         let mut blocked = 0u32;
         let mut miss = 0u32;
         let mut human = BTreeSet::new();
         let mut ages: BTreeMap<i64, u32> = BTreeMap::new();
         for (ix, node) in (0u32..).zip(&graph.nodes) {
+            target_counts[usize::from(node.target)][node.status.index()] += 1;
             if node.status != Status::Pending {
                 continue;
             }
             blocked += u32::from(node.flags.blocked());
+            target_blocked[usize::from(node.target)] += u32::from(node.flags.blocked());
             miss += u32::from(node.flags.lane() == Lane::Miss);
             if node.flags.lane() == Lane::Human {
                 human.insert(ix);
@@ -4523,6 +4550,26 @@ mod tests {
         assert_eq!(graph.pending_miss, miss, "pending miss nodes");
         assert_eq!(graph.human_pending, human, "pending human nodes");
         assert_eq!(graph.pending_ages, ages, "pending request instants");
+        let status = graph.admin_status(0).expect("admin status");
+        assert_eq!(status.targets.len(), graph.targets.len());
+        for (ix, target) in graph.targets.iter().enumerate() {
+            assert_eq!(target.counts, target_counts[ix], "{} counts", target.name);
+            assert_eq!(
+                target.pending_blocked, target_blocked[ix],
+                "{} blocked",
+                target.name
+            );
+            let reported = &status.targets[ix];
+            assert_eq!(reported.target.as_str(), &*target.name);
+            assert_eq!(reported.pending, target_counts[ix][Status::Pending.index()]);
+            assert_eq!(
+                reported.dispatched,
+                target_counts[ix][Status::Dispatched.index()]
+            );
+            assert_eq!(reported.running, target_counts[ix][Status::Running.index()]);
+            assert_eq!(reported.failed, target_counts[ix][Status::Failed.index()]);
+            assert_eq!(reported.blocked, target_blocked[ix]);
+        }
     }
 
     /// What a wake decodes when the store holds exactly this graph's
@@ -5282,6 +5329,51 @@ mod tests {
     }
 
     const MACOS_TARGET: &str = "aarch64-apple-darwin";
+
+    #[test]
+    fn target_backlogs_survive_claims_and_snapshot_reload() {
+        let mut graph = Graph::default();
+        graph
+            .merge(
+                &forest(
+                    SubmissionSource::Preheat,
+                    vec![
+                        sub_on("linux", "x86_64-unknown-linux-gnu"),
+                        sub_on("macone", MACOS_TARGET),
+                        sub_on("mactwo", MACOS_TARGET),
+                        sub_on("windows", "x86_64-pc-windows-msvc"),
+                    ],
+                ),
+                1_000,
+            )
+            .expect("merge");
+        assert_pending_index(&graph);
+        let status = graph.admin_status(1_000).expect("status");
+        assert_eq!(
+            status
+                .targets
+                .iter()
+                .find(|row| row.target.as_str() == MACOS_TARGET)
+                .expect("macOS")
+                .pending,
+            2
+        );
+        assert!(status.targets.iter().all(|row| row.completed_24h == 0));
+        assert_eq!(
+            graph
+                .claim(&claim_settings(4, 1), 1_000, u32::MAX)
+                .expect("claim")
+                .len(),
+            3
+        );
+        assert_pending_index(&graph);
+        let restored = round_trip(&graph);
+        assert_pending_index(&restored);
+        assert_eq!(
+            graph.admin_status(1_000).expect("status"),
+            restored.admin_status(1_000).expect("restored status")
+        );
+    }
 
     /// stow#1052: with the macOS cap spent, thousands of ready macOS
     /// nodes cost the pass nothing; the non-macOS work is claimed in

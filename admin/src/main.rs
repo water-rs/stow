@@ -795,11 +795,21 @@ async fn status(edge: &Edge, args: StatusArgs, output: Output) -> stow_types::er
             }
             let _ = writeln!(out, "{}", table.render());
         }
-        let _ = writeln!(out, "24h outcomes");
+        let _ = writeln!(out, "target queues and 24h outcomes");
         if status.targets.is_empty() {
             let _ = write!(out, "  none");
         } else {
-            let mut table = Table::new(&["target", "completed", "failed", "success"]);
+            let mut table = Table::new(&[
+                "target",
+                "pending",
+                "dispatched",
+                "running",
+                "blocked",
+                "failed",
+                "completed 24h",
+                "failed 24h",
+                "success 24h",
+            ]);
             for target in &status.targets {
                 let total = target.completed_24h + target.failed_24h;
                 #[allow(clippy::cast_precision_loss)]
@@ -813,6 +823,11 @@ async fn status(edge: &Edge, args: StatusArgs, output: Output) -> stow_types::er
                 };
                 table.push([
                     target.target.as_str().to_owned(),
+                    target.pending.to_string(),
+                    target.dispatched.to_string(),
+                    target.running.to_string(),
+                    target.blocked.to_string(),
+                    target.failed.to_string(),
                     target.completed_24h.to_string(),
                     target.failed_24h.to_string(),
                     rate,
