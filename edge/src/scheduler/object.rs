@@ -2036,7 +2036,7 @@ pub(super) async fn dispatch_pass(
     let pool = crate::fetch_guard::OutboundPool::new();
     let interface = match &bindings.credential_source {
         CredentialSource::LocalCi(url) => {
-            tracing::info!(url = %url, "dispatching via local-CI endpoint");
+            tracing::debug!(url = %url, "dispatching via local-CI endpoint");
             dispatch::CiInterface::local_ci(url, dispatch::CfTransport::new(pool.clone()))
         }
         CredentialSource::GitHub(config) => {
@@ -2083,7 +2083,7 @@ pub(super) async fn dispatch_pass(
         .await
         .map_err(route_error)?;
     let task_ids: Vec<String> = claims.iter().map(|claim| claim.task_id.clone()).collect();
-    tracing::info!(
+    tracing::debug!(
         claimed = task_ids.len(),
         "scheduler dispatch_pending selected tasks"
     );

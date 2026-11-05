@@ -279,7 +279,7 @@ impl<T: CiTransport> CiInterface<T> {
         let body = String::from_utf8(response.body)
             .map_err(|error| DispatchError::Response(error.to_string()))?;
         decode_run_details(&body).inspect(|run| {
-            tracing::info!(
+            tracing::debug!(
                 run_id = run.workflow_run_id,
                 run_url = %run.run_url,
                 "submitted build task"
@@ -311,7 +311,7 @@ impl<T: CiTransport> CiInterface<T> {
             false,
         )?;
         self.send_checked(request).await.map(|_| ()).inspect(|()| {
-            tracing::info!(
+            tracing::debug!(
                 request_id = %dispatch.request_id,
                 attempt = dispatch.attempt,
                 "submitted resolve run"
