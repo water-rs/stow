@@ -613,6 +613,22 @@ pub struct Claimed {
     pub payload: BuildTaskPayload,
 }
 
+/// A tree whose shape and identity keys have been checked. The borrow
+/// keeps those facts valid across the log append and subsequent merge.
+pub(super) struct ValidatedSubmission<'a> {
+    tree: &'a SubmissionTree,
+    ids: Vec<IdKeys>,
+}
+
+impl<'a> ValidatedSubmission<'a> {
+    pub(super) fn new(tree: &'a SubmissionTree) -> Result<Self, QueueError> {
+        Ok(Self {
+            tree,
+            ids: Graph::validate_tree(tree)?,
+        })
+    }
+}
+
 /// What a merge changed.
 #[derive(Debug, Default)]
 pub struct MergeReport {
@@ -1311,7 +1327,15 @@ impl Graph {
     /// out of range, or a task id that does not re-derive from its
     /// identity columns).
     pub fn merge(&mut self, tree: &SubmissionTree, now: i64) -> Result<MergeReport, QueueError> {
-        let ids = Self::validate_tree(tree)?;
+        self.merge_validated(&ValidatedSubmission::new(tree)?, now)
+    }
+
+    pub(super) fn merge_validated(
+        &mut self,
+        validated: &ValidatedSubmission<'_>,
+        now: i64,
+    ) -> Result<MergeReport, QueueError> {
+        let ValidatedSubmission { tree, ids } = validated;
         let lane = Lane::from_source(tree.source);
         let priority = queue::source_priority(tree.source);
         let mut report = MergeReport::default();
@@ -1319,7 +1343,7 @@ impl Graph {
         let mut node_ixs = Vec::with_capacity(tree.nodes.len());
         let mut is_fresh = Vec::with_capacity(tree.nodes.len());
         let mut fresh = Vec::new();
-        for (sub, keys) in tree.nodes.iter().zip(&ids) {
+        for (sub, keys) in tree.nodes.iter().zip(ids) {
             if let Some(ix) = self.find_id(&sub.task_id, *keys) {
                 if self.node(ix).status.has_state() {
                     // A node reached from several entry points takes
@@ -1365,7 +1389,7 @@ impl Graph {
         // subtree is committed by its first submission.
         for (sub_at, sub) in tree.nodes.iter().enumerate() {
             if is_fresh[sub_at] {
-                self.merge_edges(tree, &ids, &node_ixs, sub, node_ixs[sub_at])?;
+                self.merge_edges(tree, ids, &node_ixs, sub, node_ixs[sub_at])?;
             }
         }
         // A node born published that nothing in the tree depends on
@@ -1380,8 +1404,7 @@ impl Graph {
         Ok(report)
     }
 
-    /// The tree's shape and identity check, shared by `merge` and
-    /// `merge_changes`: roots and deps in range, every task id the
+    /// The tree's shape and identity check: roots and deps in range, every task id the
     /// canonical id of its identity columns. Returns each node's probe
     /// keys.
     fn validate_tree(tree: &SubmissionTree) -> Result<Vec<IdKeys>, QueueError> {
@@ -1459,30 +1482,24 @@ impl Graph {
         })
     }
 
-    /// Whether merging `tree` would change the graph — a node it adds,
-    /// or a `downloads`/`priority` it would raise — after checking the
-    /// tree is well formed. A resubmission that changes nothing needs no
-    /// log row: replaying it would be a no-op.
-    ///
-    /// # Errors
-    /// `QueueError::Invariant` on a malformed tree, the same tree
-    /// [`Graph::merge`] refuses.
-    pub fn merge_changes(&self, tree: &SubmissionTree) -> Result<bool, QueueError> {
-        let ids = Self::validate_tree(tree)?;
+    /// Whether merging a validated tree adds a node or raises its
+    /// downloads or priority. A no-op resubmission needs no log row.
+    pub(super) fn merge_changes(&self, validated: &ValidatedSubmission<'_>) -> bool {
+        let ValidatedSubmission { tree, ids } = validated;
         let priority = queue::source_priority(tree.source);
-        for (sub, keys) in tree.nodes.iter().zip(&ids) {
+        for (sub, keys) in tree.nodes.iter().zip(ids) {
             let Some(ix) = self.find_id(&sub.task_id, *keys) else {
-                return Ok(true);
+                return true;
             };
             if !self.node(ix).status.has_state() {
                 continue;
             }
             let state = self.state(ix);
             if sub.downloads > state.downloads || state.priority < priority {
-                return Ok(true);
+                return true;
             }
         }
-        Ok(false)
+        false
     }
 
     /// One fresh node's edge list — `merge`'s second pass.
@@ -4763,7 +4780,7 @@ mod tests {
             Err(QueueError::Invariant(_))
         ));
         assert!(matches!(
-            graph.merge_changes(&tree),
+            super::ValidatedSubmission::new(&tree),
             Err(QueueError::Invariant(_))
         ));
     }
