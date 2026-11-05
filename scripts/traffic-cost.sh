@@ -488,12 +488,21 @@ LANE_ARGS=(
 )
 
 echo "[traffic] Worker CPU per lane"
+CPU_FAILED=0
 fg admin --json traffic-cost cpu "${LANE_ARGS[@]}" \
     --bundle-digest "$BUNDLE_DIGEST" \
     --inspector-url "$INSPECTOR_URL" \
     >"$REPORT_DIR/worker-cpu.json" 2>"$LOG_DIR/worker-cpu.log" \
-    || { cat "$LOG_DIR/worker-cpu.log" >&2; \
-         die "Worker CPU pass failed — see $REPORT_DIR/worker-cpu.json"; }
+    || {
+        cat "$LOG_DIR/worker-cpu.log" >&2
+        # A completed measurement can breach its budget without making
+        # the independent peak and post-load measurements unusable.
+        # Inspector, reference and transport errors produce no report.
+        jq -e 'any(.rows[]; .over_budget)' "$REPORT_DIR/worker-cpu.json" >/dev/null \
+            || die "Worker CPU measurement failed — see $LOG_DIR/worker-cpu.log"
+        CPU_FAILED=1
+        echo "[traffic] Worker CPU budget failed; collecting peak and post-load evidence before failing" >&2
+    }
 jq -r '"Worker CPU per event (idle window \(.idle_window_ms) ms collected \(.idle_cpu_ms) ms):",
        "  reference workload \(.reference.cpu_ms * 100 | round / 100) ms (before \(.reference.rounds_before | map(. * 100 | round / 100)), after \(.reference.rounds_after | map(. * 100 | round / 100)))",
        (.rows[] | "  \(.lane | . + " " * (20 - length)) \(.cpu_ms * 100 | round / 100) ms = \(.relative_cpu * 10000 | round / 10000) × reference (budget \(.budget_relative_cpu)) rounds \(.rounds_cpu_ms | map(. * 100 | round / 100))")' \
@@ -532,5 +541,8 @@ fg admin traffic-cost verdict \
     --after "$REPORT_DIR/budget-after.json" \
     --model "$REPO_ROOT/launch-model.toml" \
     || die "traffic cost over its bounds — see the verdict above"
+
+[ "$CPU_FAILED" -eq 0 ] \
+    || die "Worker CPU budget failed — see $REPORT_DIR/worker-cpu.json; peak and post-load reports collected"
 
 echo "[traffic] OK — within every budget and bound; reports for the projection: $REPORT_DIR"
