@@ -849,8 +849,8 @@ impl Watcher<'_> {
     /// share and dispatch-retry signals, with per-target and
     /// per-class evidence.
     ///
-    /// A task's outcome lives only on its run's jobs page — one read
-    /// per completed run, bounded-concurrent. A page that cannot be
+    /// A successful run's conclusion settles its outcome. Other runs
+    /// need their jobs page, read with bounded concurrency. A page that cannot be
     /// read or whose classification fails is a failed read: the
     /// collector returns `Err`, never an understated share.
     #[allow(clippy::too_many_lines)]
@@ -862,12 +862,16 @@ impl Watcher<'_> {
             ))
             .ok_or("window underflow")?;
         let runs = fetch_completed_runs(self.gh_token, since).await?;
-        // One jobs read per completed run, bounded-concurrent — a
+        // Successful runs need no jobs page: classify_page uses only
+        // their conclusion. Other reads remain bounded-concurrent — a
         // failed read or an unreadable page fails the reading rather
         // than understating the task share (a collector failure is an
         // incident of its own).
         let pages: Vec<Vec<RunJobRow>> =
             futures_util::stream::iter(runs.iter().map(|run| async move {
+                if run.conclusion.as_deref() == Some("success") {
+                    return Ok(Vec::new());
+                }
                 runs::fetch_run_jobs(self.gh_token, run.id, run.run_attempt)
                     .await
                     .map_err(|error| format!("run {}: jobs fetch: {error}", run.id))
