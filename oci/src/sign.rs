@@ -49,10 +49,10 @@ use crate::client::{RegistryHttp, RegistrySession, Response, SessionRequest};
 use crate::retry::retry_with_backoff;
 use crate::verify::{TrustMaterial, verify_logged_signature, verify_payload_identity};
 
-/// Push `manifest` so that `reference`'s tag never names an unsigned
-/// manifest: `sign` signs the bytes' digest under the tagged identity,
-/// and only then are the bytes published under the tag. Signing the
-/// digest needs no preliminary manifest upload.
+/// Sign `manifest` before publishing its tag, without a staging upload.
+///
+/// `sign` signs the bytes' digest under the tagged identity, and only then
+/// are the bytes published under the tag.
 ///
 /// Tagging first leaves a window, as long as signing takes, in which every
 /// reader resolves the tag to a digest whose `.sig` does not exist yet and
