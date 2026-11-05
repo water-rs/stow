@@ -491,7 +491,12 @@ async fn a_keyless_signature_verifies_with_the_readers_verifier() {
     assert_eq!(stack.sigstore.entries(), 1);
     // Layer and config; the signature's payload, config and manifest;
     // the signed tag; the bundle's layer, config and manifest.
-    assert_eq!(stack.writes(), 9);
+    assert_eq!(
+        stack.writes(),
+        9,
+        "requests: {:?}",
+        stack.probe.request_log()
+    );
     let log = stack.probe.request_log();
     assert_eq!(
         log.iter()
