@@ -858,16 +858,9 @@ pub struct FreezeTripDraft {
 /// enough to bury the counts.
 const TRIP_EXAMPLE_RUNS: i64 = 3;
 
-/// Sum the in-window outcome buckets per target and run the pure trip
-/// decision. The read is `attempt_outcome_buckets`, not the raw rows:
-/// the window is at most `window_minutes / 5 + 1` buckets per target
-/// (13 × 9 targets under the defaults) whatever the traffic, so the
-/// cost of the check is constant in the number of completions it
-/// covers. The sample is the outcome tally, not the queue rows: a
-/// retried task flips back to `pending` and would otherwise erase its
-/// earlier attempts from the window — exactly the retry-storm shape
-/// this breaker exists to catch. Dispatch failures never land there
-/// (no run was burned), so they are not the signal this watches.
+/// Evaluate retained attempts using derived minute/target totals and exact
+/// timestamps in the boundary minute. Retried attempts keep counting and
+/// verified source failures stay excluded. Evidence is scanned only on a trip.
 pub fn evaluate_freeze_trip(
     graph: &crate::scheduler::graph::Graph,
     settings: &crate::freeze::FreezeSettings,
@@ -877,15 +870,7 @@ pub fn evaluate_freeze_trip(
     // read-time fold: only rows inside the window count, the same
     // bound the `bucket >= unixepoch - window` predicate gave.
     let cutoff = now_ms - i64::from(settings.window_minutes) * 60_000;
-    let mut by_target: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
-    for outcome in &graph.attempt_outcomes {
-        if outcome.finished_at_ms < cutoff || outcome.source_failure.is_some() {
-            continue;
-        }
-        let entry = by_target.entry(outcome.target.as_str()).or_default();
-        entry.0 += 1;
-        entry.1 += u64::from(outcome.failure_class.is_some());
-    }
+    let by_target = graph.attempt_tallies_since(cutoff);
     let mut tallies = Vec::with_capacity(by_target.len());
     for (target, (outcomes, failures)) in by_target {
         tallies.push(crate::freeze::OutcomeTally {
@@ -1035,7 +1020,7 @@ mod tests {
             fail_percent: 50,
         };
         for run in 1..=2 {
-            graph.attempt_outcomes.push_back(AttemptOutcome {
+            graph.record_attempt_outcome(AttemptOutcome {
                 task_id: format!("test-{run}"),
                 generation_id: "1".to_owned(),
                 attempt: 1,
@@ -1056,11 +1041,13 @@ mod tests {
                 .is_none()
         );
         assert_eq!(graph.attempt_outcomes.len(), 2);
-        for outcome in &mut graph.attempt_outcomes {
+        let mut unverified = Graph::default();
+        for mut outcome in graph.attempt_outcomes.iter().cloned() {
             outcome.source_failure = None;
+            unverified.record_attempt_outcome(outcome);
         }
         assert!(
-            super::evaluate_freeze_trip(&graph, &settings, 1000)
+            super::evaluate_freeze_trip(&unverified, &settings, 1000)
                 .expect("evaluate")
                 .is_some()
         );
