@@ -1012,7 +1012,7 @@ impl SnapshotLoader {
                 Ok(())
             }),
             ChunkKind::Outcomes => decode_items(kind, payload, |outcome: AttemptOutcome| {
-                graph.attempt_outcomes.push_back(outcome);
+                graph.record_attempt_outcome(outcome);
                 Ok(())
             }),
             ChunkKind::Requests => {
