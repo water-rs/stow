@@ -3859,7 +3859,7 @@ mod tests {
         );
         assert_eq!(
             manifest_puts(),
-            puts_before + 2,
+            puts_before + 1,
             "a refused node pushes nothing; only the untrusted node's own manifest went up"
         );
     }
