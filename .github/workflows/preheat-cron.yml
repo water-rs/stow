@@ -36,8 +36,7 @@ on:
 
 permissions:
   contents: read
-  # `gh workflow run` mints the dispatches below with the run's own
-  # GITHUB_TOKEN.
+  # Dispatch with the run's own GITHUB_TOKEN.
   actions: write
 
 concurrency:
@@ -78,9 +77,9 @@ jobs:
           set -euo pipefail
           # The wave talks to the edge deployed from main, so its
           # stow-admin is built from main too (#973).
-          gh workflow run preheat-admin.yml --ref main \
-            -f rustc_version="$RUSTC_VERSION" \
-            -f projects=true
+          gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/preheat-admin.yml/dispatches" \
+            -f ref=main -f "inputs[rustc_version]=$RUSTC_VERSION" \
+            -f 'inputs[projects]=true'
           echo "$RUSTC_VERSION ${{ steps.channel.outputs.day }}" > .preheat-marker
       - name: Record the wave marker
         if: steps.marker.outputs.cache-hit != 'true'

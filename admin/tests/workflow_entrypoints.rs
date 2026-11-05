@@ -120,29 +120,61 @@ fn run_job<'a>(
     runner
 }
 
-fn gh_dispatch_args(call: &Call) -> Vec<String> {
-    assert_eq!(call.tool, "gh");
-    assert_eq!(
-        call.argv.first().map(String::as_str),
-        Some("workflow"),
-        "gh invocation is not a workflow call: {call}"
-    );
-    assert_eq!(call.argv.get(1).map(String::as_str), Some("run"), "{call}");
-    call.argv[2..].to_vec()
+struct Dispatch {
+    workflow: String,
+    reference: String,
+    inputs: BTreeMap<String, String>,
 }
 
-/// `-f name=value` entries of a `gh workflow run` argv tail.
-fn input_fields(argv: &[String]) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    let mut it = argv.iter();
-    while let Some(a) = it.next() {
-        if a == "-f" {
-            let pair = it.next().expect("-f without value");
-            let (k, v) = pair.split_once('=').expect("-f without `=`");
-            out.insert(k.to_owned(), v.to_owned());
+fn is_dispatch(call: &Call) -> bool {
+    call.argv.iter().any(|arg| arg.ends_with("/dispatches"))
+}
+
+fn gh_dispatch(call: &Call) -> Dispatch {
+    assert_eq!(call.tool, "gh");
+    assert_eq!(call.argv.first().map(String::as_str), Some("api"));
+    let method = call
+        .argv
+        .iter()
+        .position(|arg| arg == "--method")
+        .expect("method");
+    assert_eq!(call.argv[method + 1], "POST");
+    let endpoint = call
+        .argv
+        .iter()
+        .find(|arg| arg.ends_with("/dispatches"))
+        .expect("dispatch endpoint");
+    let workflow = endpoint
+        .strip_prefix("repos/water-rs/stow/actions/workflows/")
+        .and_then(|path| path.strip_suffix("/dispatches"))
+        .expect("repository workflow endpoint")
+        .to_owned();
+    let mut reference = None;
+    let mut inputs = BTreeMap::new();
+    let mut args = call.argv.iter();
+    while let Some(arg) = args.next() {
+        if arg == "-f" {
+            let (key, value) = args
+                .next()
+                .expect("field")
+                .split_once('=')
+                .expect("field value");
+            if key == "ref" {
+                assert!(reference.replace(value.to_owned()).is_none());
+            } else {
+                let key = key
+                    .strip_prefix("inputs[")
+                    .and_then(|key| key.strip_suffix(']'))
+                    .expect("nested input");
+                assert!(inputs.insert(key.to_owned(), value.to_owned()).is_none());
+            }
         }
     }
-    out
+    Dispatch {
+        workflow,
+        reference: reference.expect("dispatch ref"),
+        inputs,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +193,7 @@ fn cron_declarations() {
     assert!(at(&wf, "on.schedule").is_none());
     // The edge's Cron Trigger and an operator both dispatch it.
     assert!(at(&wf, "on.workflow_dispatch").is_some());
-    // `gh workflow run` needs actions:write; nothing else is granted.
+    // Workflow dispatch needs actions:write; nothing else is granted.
     assert_eq!(
         at(&wf, "permissions.contents").map(scalar).as_deref(),
         Some("read")
@@ -290,9 +322,9 @@ fn cron_cache_miss_dispatches_admin_once() {
     // the projects lane enabled.
     let gh = scn.calls_of("gh");
     assert_eq!(gh.len(), 1, "{gh:?}");
-    let args = gh_dispatch_args(&gh[0]);
-    assert_eq!(args.first().map(String::as_str), Some("preheat-admin.yml"));
-    let fields = input_fields(&args);
+    let dispatch = gh_dispatch(&gh[0]);
+    assert_eq!(dispatch.workflow, "preheat-admin.yml");
+    let fields = dispatch.inputs;
     assert_eq!(
         fields,
         BTreeMap::from([
@@ -366,10 +398,7 @@ fn cron_refresh_dispatches_on_a_cache_hit() {
     );
     let gh = scn.calls_of("gh");
     assert_eq!(gh.len(), 1, "{gh:?}");
-    assert_eq!(
-        gh_dispatch_args(&gh[0]).first().map(String::as_str),
-        Some("preheat-admin.yml")
-    );
+    assert_eq!(gh_dispatch(&gh[0]).workflow, "preheat-admin.yml");
 }
 
 #[test]
@@ -961,16 +990,11 @@ fn index_publish_completion_forwards_title_rustc() {
     );
     let gh = scn.calls_of("gh");
     assert_eq!(gh.len(), 1, "{gh:?}");
-    let args = gh_dispatch_args(&gh[0]);
-    assert_eq!(args[0], "index-publish.yml");
-    // Always --ref main: the signing identity lives on main only.
-    let ref_idx = args.iter().position(|a| a == "--ref").expect("--ref");
-    assert_eq!(args[ref_idx + 1], "main");
-    assert!(
-        !args.iter().any(|a| a == "dev"),
-        "index-publish dispatched on dev: {args:?}"
-    );
-    let fields = input_fields(&args);
+    let dispatch = gh_dispatch(&gh[0]);
+    assert_eq!(dispatch.workflow, "index-publish.yml");
+    // The signing identity lives on main only.
+    assert_eq!(dispatch.reference, "main");
+    let fields = dispatch.inputs;
     assert_eq!(
         fields.get("report").map(String::as_str),
         Some("true"),
@@ -998,15 +1022,14 @@ fn index_publish_cron_trigger_and_manual_carry_no_rustc() {
     );
     let gh = scn.calls_of("gh");
     assert_eq!(gh.len(), 1);
-    let args = gh_dispatch_args(&gh[0]);
-    let fields = input_fields(&args);
+    let dispatch = gh_dispatch(&gh[0]);
+    let fields = dispatch.inputs;
     assert!(
         !fields.contains_key("rustc_version"),
         "{event} forwarded a rustc: {fields:?}"
     );
     assert_eq!(fields.get("report").map(String::as_str), Some("true"));
-    let ref_idx = args.iter().position(|a| a == "--ref").expect("--ref");
-    assert_eq!(args[ref_idx + 1], "main");
+    assert_eq!(dispatch.reference, "main");
 }
 
 #[test]
@@ -1021,7 +1044,7 @@ fn index_publish_title_with_extra_dashes_keeps_rustc_prefix() {
         &Outcome::Ran(0)
     );
     let gh = scn.calls_of("gh");
-    let fields = input_fields(&gh_dispatch_args(&gh[0]));
+    let fields = gh_dispatch(&gh[0]).inputs;
     assert_eq!(
         fields.get("rustc_version").map(String::as_str),
         Some("1.99.0")
@@ -1454,21 +1477,15 @@ fn operations_refuses_what_it_does_not_run() {
 // operations.yml: the refill after a scheduler reset (stow#1094)
 // ---------------------------------------------------------------------------
 
-/// The `gh workflow run` calls of the refill step: workflow file, ref and
+/// The workflow dispatch POSTs of the refill step: workflow file, ref and
 /// input fields.
 fn refill_dispatches(scn: &Scenario) -> Vec<(String, String, BTreeMap<String, String>)> {
     scn.calls_of("gh")
         .iter()
-        .filter(|call| call.argv.first().map(String::as_str) == Some("workflow"))
+        .filter(|call| is_dispatch(call))
         .map(|call| {
-            let args = gh_dispatch_args(call);
-            let reference = args
-                .iter()
-                .position(|a| a == "--ref")
-                .and_then(|i| args.get(i + 1))
-                .cloned()
-                .expect("dispatch names its ref");
-            (args[0].clone(), reference, input_fields(&args))
+            let dispatch = gh_dispatch(call);
+            (dispatch.workflow, dispatch.reference, dispatch.inputs)
         })
         .collect()
 }
@@ -1515,7 +1532,7 @@ fn operations_reset_refills_every_published_rustc_and_forces_a_preheat() {
     let refill = scn
         .calls_of("gh")
         .into_iter()
-        .find(|c| c.argv.first().map(String::as_str) == Some("workflow"))
+        .find(is_dispatch)
         .expect("a dispatch");
     assert_eq!(
         refill.env.get("GH_TOKEN").map(String::as_str),
