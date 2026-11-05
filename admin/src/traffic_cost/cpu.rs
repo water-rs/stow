@@ -478,6 +478,9 @@ struct ProfileNode {
 #[serde(rename_all = "camelCase")]
 struct CallFrame {
     function_name: String,
+    url: String,
+    line_number: i64,
+    column_number: i64,
 }
 
 /// CPU milliseconds a profile holds: its non-`(idle)` samples times the
@@ -525,7 +528,18 @@ async fn profiled(
     let names: std::collections::BTreeMap<_, _> = profile
         .nodes
         .iter()
-        .map(|node| (node.id, node.call_frame.function_name.as_str()))
+        .map(|node| {
+            let frame = &node.call_frame;
+            let name = if frame.function_name.is_empty() {
+                format!(
+                    "{}:{}:{}",
+                    frame.url, frame.line_number, frame.column_number
+                )
+            } else {
+                frame.function_name.clone()
+            };
+            (node.id, name)
+        })
         .collect();
     let mut counts = std::collections::BTreeMap::<&str, u64>::new();
     for sample in &profile.samples {
@@ -533,7 +547,7 @@ async fn profiled(
             .get(sample)
             .ok_or_else(|| stow_error!("CPU sample names absent profile node {sample}"))?;
         if *name != "(idle)" {
-            *counts.entry(name).or_default() += 1;
+            *counts.entry(name.as_str()).or_default() += 1;
         }
     }
     let mut hotspots: Vec<_> = counts.into_iter().collect();
@@ -829,10 +843,10 @@ mod tests {
     fn idle_samples_do_not_count() {
         let profile: CpuProfile = serde_json::from_value(serde_json::json!({
             "nodes": [
-                {"id": 1, "callFrame": {"functionName": "(root)"}},
-                {"id": 2, "callFrame": {"functionName": "(idle)"}},
-                {"id": 3, "callFrame": {"functionName": "fetch"}},
-                {"id": 4, "callFrame": {"functionName": "(garbage collector)"}},
+                {"id": 1, "callFrame": {"functionName": "(root)", "url": "", "lineNumber": -1, "columnNumber": -1}},
+                {"id": 2, "callFrame": {"functionName": "(idle)", "url": "", "lineNumber": -1, "columnNumber": -1}},
+                {"id": 3, "callFrame": {"functionName": "fetch", "url": "", "lineNumber": -1, "columnNumber": -1}},
+                {"id": 4, "callFrame": {"functionName": "(garbage collector)", "url": "", "lineNumber": -1, "columnNumber": -1}},
             ],
             "samples": [2, 3, 3, 2, 4, 3],
             "timeDeltas": [100, 100, 9000, 100, 100, 100],
