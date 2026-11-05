@@ -14,7 +14,9 @@ use stow_types::api::{
     MutationKind, QueueSelector, SchedulerEvent, SubmissionTree, SubmitTaskIdEntry,
 };
 
-use super::graph::{Claimed, FinishOutcome, Graph, GraphCell, LoadedGraph, StartOutcome};
+use super::graph::{
+    Claimed, FinishOutcome, Graph, GraphCell, LoadedGraph, StartOutcome, ValidatedSubmission,
+};
 use super::queue::{self, AlarmPlan, SchedulerSettings};
 use super::store;
 use crate::errors::QueueError;
@@ -94,12 +96,16 @@ pub(super) async fn commit_trees(
     actor: Option<&str>,
     now: i64,
 ) -> Result<(u32, Vec<String>), QueueError> {
+    let validated = trees
+        .iter()
+        .map(ValidatedSubmission::new)
+        .collect::<Result<Vec<_>, _>>()?;
     let changing = graph.with(|graph| {
-        trees
+        validated
             .iter()
             .map(|tree| graph.merge_changes(tree))
-            .collect::<Result<Vec<_>, _>>()
-    })?;
+            .collect::<Vec<_>>()
+    });
     let events: Vec<_> = trees
         .iter()
         .zip(&changing)
@@ -108,10 +114,10 @@ pub(super) async fn commit_trees(
         .collect();
     append(graph, db, actor, &events, now).await?;
     graph.with(|graph| {
-        trees
+        validated
             .iter()
             .try_fold((0u32, Vec::new()), |(inserted, mut unpublished), tree| {
-                graph.merge(tree, now).map(|report| {
+                graph.merge_validated(tree, now).map(|report| {
                     unpublished.extend(report.unpublished);
                     (inserted.saturating_add(report.inserted), unpublished)
                 })
@@ -1810,6 +1816,55 @@ mod snapshot_trigger_tests {
             .await
             .map(|bytes| u64::try_from(bytes).expect("non-negative"))
             .expect("tail size")
+    }
+
+    #[tokio::test]
+    async fn overlapping_validated_submissions_replay_and_resubmit_without_writes() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = GraphCell::default();
+        let cell = owner.install(Graph::default());
+        let trees = [tree(FIRST_ROW, 3), tree(FIRST_ROW + 1, 3)];
+        let (inserted, unpublished) = commit_trees(cell, &db, &trees, None, HOST_NOW_MS)
+            .await
+            .expect("overlapping submit");
+        assert_eq!(inserted, 4);
+        assert_eq!(unpublished.len(), 6);
+        let before = tail_bytes(&db).await;
+        assert!(before > 0);
+        let (mut replayed, tail) = store::load(&db).await.expect("load");
+        store::apply_events(&mut replayed, &tail);
+        assert_eq!(replayed.status().pending, 4);
+        let replay_owner = GraphCell::default();
+        let replay_cell = replay_owner.install(replayed);
+        let (inserted, replay_unpublished) =
+            commit_trees(replay_cell, &db, &trees, None, HOST_NOW_MS + 1)
+                .await
+                .expect("resubmit after replay");
+        assert_eq!(inserted, 0);
+        assert_eq!(replay_unpublished, unpublished);
+        assert_eq!(tail_bytes(&db).await, before);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_later_tree_changes_neither_graph_nor_log() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = GraphCell::default();
+        let cell = owner.install(Graph::default());
+        let mut invalid_id = tree(FIRST_ROW + 10, 1);
+        invalid_id.nodes[0].task_id = "invalid".to_owned();
+        let mut invalid_root = tree(FIRST_ROW + 10, 1);
+        invalid_root.roots = vec![1];
+        let mut invalid_dep = tree(FIRST_ROW + 10, 1);
+        invalid_dep.nodes[0].deps = vec![1];
+        for invalid in [invalid_id, invalid_root, invalid_dep] {
+            let trees = [tree(FIRST_ROW, 3), invalid];
+            assert!(matches!(
+                commit_trees(cell, &db, &trees, None, HOST_NOW_MS).await,
+                Err(QueueError::Invariant(_))
+            ));
+            assert_eq!(cell.with(|graph| graph.status().pending), 0);
+            assert_eq!(tail_bytes(&db).await, 0);
+        }
     }
 
     /// Submissions of any weight leave a tail of at most the byte
