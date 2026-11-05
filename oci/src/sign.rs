@@ -50,8 +50,9 @@ use crate::retry::retry_with_backoff;
 use crate::verify::{TrustMaterial, verify_logged_signature, verify_payload_identity};
 
 /// Push `manifest` so that `reference`'s tag never names an unsigned
-/// manifest: the bytes go up by digest first, `sign` signs that digest
-/// under the tagged identity, and only then does the tag move to it.
+/// manifest: `sign` signs the bytes' digest under the tagged identity,
+/// and only then are the bytes published under the tag. Signing the
+/// digest needs no preliminary manifest upload.
 ///
 /// Tagging first leaves a window, as long as signing takes, in which every
 /// reader resolves the tag to a digest whose `.sig` does not exist yet and
@@ -63,7 +64,7 @@ use crate::verify::{TrustMaterial, verify_logged_signature, verify_payload_ident
 ///
 /// # Errors
 ///
-/// Returns an error when either manifest `PUT` or the signature fails.
+/// Returns an error when the manifest `PUT` or the signature fails.
 pub async fn put_signed_manifest<S, Fut>(
     session: &RegistrySession,
     reference: &Reference,
@@ -75,17 +76,6 @@ where
     Fut: Future<Output = stow_types::error::Result<()>>,
 {
     let digest = sha256_digest(manifest);
-    let by_digest: Reference = format!(
-        "{}/{}@{digest}",
-        reference.registry(),
-        reference.repository()
-    )
-    .parse()
-    .map_err(|error| stow_types::stow_error!("parse digest reference for {reference}: {error}"))?;
-    session
-        .put_manifest(&by_digest, manifest)
-        .await
-        .map_err(|error| stow_types::stow_error!("push manifest {by_digest}: {error}"))?;
     sign(digest.clone()).await?;
     session
         .put_manifest(reference, manifest)

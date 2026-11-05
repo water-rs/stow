@@ -3292,12 +3292,14 @@ mod tests {
             .collect();
         assert_eq!(
             manifest_puts.len(),
-            3,
-            "the artifact by digest, then its tag, then the bundle: {manifest_puts:?}"
+            2,
+            "the signed artifact tag, then the bundle: {manifest_puts:?}"
         );
         assert!(
-            manifest_puts[0].contains("/manifests/sha256:"),
-            "the artifact manifest goes up by digest before it is tagged: {manifest_puts:?}"
+            manifest_puts
+                .iter()
+                .all(|path| !path.contains("/manifests/sha256:")),
+            "no redundant digest upload: {manifest_puts:?}"
         );
         assert_eq!(
             count(Method::GET, "/manifests/"),
@@ -3313,12 +3315,11 @@ mod tests {
             !log.iter().any(|record| record.method == Method::PATCH),
             "no chunked upload session"
         );
-        assert_eq!(log.len(), 15, "the full push in fifteen requests");
+        assert_eq!(log.len(), 14, "the full push in fourteen requests");
     }
 
-    /// The signer runs while the artifact manifest is stored by digest
-    /// alone: the tag appears only once its signature exists, so no reader
-    /// can resolve the tag to an unsigned manifest.
+    /// The signer runs before either the digest or tag exists. Publishing
+    /// the tag once signing succeeds also makes the digest readable.
     #[tokio::test]
     async fn push_signs_before_it_tags() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -3342,17 +3343,66 @@ mod tests {
                     "{tag} was tagged before it was signed"
                 );
                 assert!(
-                    manifests
+                    !manifests
                         .join(&repo)
                         .join(manifest_file_name(&manifest_digest))
                         .exists(),
-                    "{manifest_digest} was signed before it was stored"
+                    "{manifest_digest} was uploaded before signing"
                 );
                 sign(oci_reference, manifest_digest)
             },
         )
         .await
         .expect("push succeeds");
+    }
+
+    /// Failed signing never writes a manifest, whether the destination
+    /// tag is new or already serves a signed artifact.
+    #[tokio::test]
+    async fn failed_signing_preserves_existing_and_absent_tags() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let plan = test_plan(root.path());
+        let reference = plan.oci_reference.parse().expect("reference");
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
+        let session = push_session(&listen, &http, &ample_writes());
+        stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
+            .await
+            .expect("initial signed artifact");
+        let (manifest, digest) = session.pull_manifest(&reference).await.expect("manifest");
+        let absent = session.reference("unpublished").expect("new reference");
+        let writes = || {
+            probe
+                .request_log()
+                .iter()
+                .filter(|request| request.method == Method::PUT)
+                .count()
+        };
+        let before = writes();
+        for destination in [&reference, &absent] {
+            let error =
+                stow_oci::put_signed_manifest(&session, destination, &manifest, |_| async {
+                    Err(stow_types::stow_error!("signing refused"))
+                })
+                .await
+                .expect_err("failed signature");
+            assert!(error.to_string().contains("signing refused"), "{error}");
+        }
+        assert_eq!(writes(), before, "failed signing uploads no manifest");
+        assert_eq!(
+            session.pull_manifest(&reference).await.expect("old tag"),
+            (manifest, digest)
+        );
+        assert!(
+            session
+                .pull_manifest(&absent)
+                .await
+                .expect_err("absent tag")
+                .is_not_found()
+        );
     }
 
     /// GHCR's cap shape — `429 TOOMANYREQUESTS` carrying
@@ -3423,8 +3473,8 @@ mod tests {
         );
         assert_eq!(
             count(Method::PUT, "/manifests/"),
-            3,
-            "manifest puts are unchanged by the upload fallback: the artifact by digest and by tag, then the bundle"
+            2,
+            "manifest puts are unchanged by the upload fallback: the signed artifact tag and the bundle"
         );
     }
 
@@ -3455,8 +3505,8 @@ mod tests {
             })
             .count();
         assert_eq!(
-            read_backs, 3,
-            "every manifest PUT verified by digest: the artifact's digest and tag pushes, and the bundle"
+            read_backs, 2,
+            "every manifest PUT verified by digest: the signed artifact tag and the bundle"
         );
     }
 
