@@ -245,6 +245,6 @@ pub async fn pull_records_by_tag(
 pub async fn list_records_tags(
     session: &RegistrySession,
 ) -> Result<Vec<String>, crate::client::RegistryError> {
-    let tags = session.list_tags().await?;
+    let tags = session.list_tags_with_prefix("records-").await?;
     Ok(tags.into_iter().filter(|tag| is_records_tag(tag)).collect())
 }
