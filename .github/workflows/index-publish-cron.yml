@@ -26,12 +26,12 @@ permissions:
   # Dispatch with the run's own GITHUB_TOKEN.
   actions: write
 
-# A wave of build completions queues one dispatch per run; a pending tick
-# is superseded by the next, and `index-publish.yml`'s own concurrency
-# group collapses the dispatches into at most one queued publish.
+# Keep the active dispatch alive during a wave of build completions.
+# GitHub supersedes only the pending tick; `index-publish.yml`'s own
+# concurrency group likewise retains one running and one pending publish.
 concurrency:
   group: index-publish-cron
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   dispatch:

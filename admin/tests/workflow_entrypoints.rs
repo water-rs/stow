@@ -946,7 +946,7 @@ fn index_publish_declarations() {
         at(&wf, "concurrency.cancel-in-progress")
             .map(scalar)
             .as_deref(),
-        Some("true")
+        Some("false")
     );
     assert_eq!(
         at(&wf, "permissions.actions").map(scalar).as_deref(),
