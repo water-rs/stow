@@ -102,10 +102,10 @@ impl CiTransport for CfTransport {
             .collect();
         let body = response
             .into_inner()
-            .text()
+            .bytes()
+            .into_send()
             .await
-            .map_err(DispatchError::Response)?
-            .into_bytes();
+            .map_err(|error| DispatchError::Response(error.to_string()))?;
         Ok(CiResponse {
             status,
             headers,
