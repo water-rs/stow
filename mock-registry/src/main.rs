@@ -3356,6 +3356,35 @@ mod tests {
         .expect("push succeeds");
     }
 
+    /// Either blob's refusal prevents signing and publishing the manifest.
+    #[tokio::test]
+    async fn failed_blob_upload_never_publishes_a_manifest() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let plan = test_plan(root.path());
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+        probe.refuse(
+            Method::POST,
+            "/blobs/uploads",
+            1,
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"errors": [{"code": "BLOB_UPLOAD_INVALID", "message": "refused"}]}),
+        );
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
+        let session = push_session(&listen, &http, &ample_writes());
+        let error = stow_oci::push_artifacts_with(&session, &[plan], |_, _| async {
+            panic!("failed blob must not reach signing");
+        })
+        .await
+        .expect_err("refused blob");
+        assert!(error.to_string().contains("400"), "{error}");
+        assert!(probe.request_log().iter().all(|request| {
+            request.method != Method::PUT || !request.path.contains("/manifests/")
+        }));
+    }
+
     /// Failed signing never writes a manifest, whether the destination
     /// tag is new or already serves a signed artifact.
     #[tokio::test]
