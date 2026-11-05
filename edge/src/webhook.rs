@@ -531,7 +531,7 @@ async fn update_task_run(
     };
     match forward.send_task_run_update(&update).await {
         Ok(()) => {
-            tracing::info!(task_id, run_id = run.id, "task run in_progress applied");
+            tracing::debug!(task_id, run_id = run.id, "task run in_progress applied");
         }
         Err(SchedulerClientError::Http {
             status: 404 | 409,
@@ -641,7 +641,7 @@ async fn forward_run_complete(
     };
     match forward.send_run_complete(&completion).await {
         Ok(()) => {
-            tracing::info!(task_id, success, "workflow_run completion applied");
+            tracing::debug!(task_id, success, "workflow_run completion applied");
         }
         // The queue's 404/409 mean the task is not live for this event —
         // consumed, never an error back to GitHub.
@@ -697,7 +697,7 @@ async fn update_request_run(
     };
     match forward.send_request_run_update(request_id, &update).await {
         Ok(()) => {
-            tracing::info!(request_id, attempt, %action, "request run update applied");
+            tracing::debug!(request_id, attempt, %action, "request run update applied");
         }
         // Unknown record or a superseded attempt — consumed, never an
         // error back to GitHub: a stale run's events cannot apply to
