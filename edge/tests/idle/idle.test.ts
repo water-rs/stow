@@ -263,12 +263,9 @@ describe("scheduler idle proof (stow#593)", () => {
 				status: "pending", run: null, attempts: 1,
 			});
 			expect(await getAlarm(stub)).toBeGreaterThan(Date.now());
-			if (name === "timeout-body") {
-				await expect.poll(async () => {
-					const response = await fetch(`http://127.0.0.1:28124/__control/cancelled-body/${name}`);
-					return response.json();
-				}, { timeout: 1000 }).toBe(true);
-			}
+			const recovery = `${name}-recovery`;
+			expect((await submit(stub, [enqueue(recovery)])).status).toBe(200);
+			expect(await waitForRun(stub, taskId(recovery))).not.toBeNull();
 		},
 		15_000,
 	);

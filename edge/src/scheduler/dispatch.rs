@@ -95,16 +95,22 @@ impl CiTransport for CfTransport {
                     .map(|value| (name.to_owned(), value))
             })
             .collect();
-        let body = response
-            .into_inner()
-            .bytes()
+        // CI answers are buffered JSON. Native arrayBuffer avoids a
+        // per-chunk Wasm reader and its releaseLock rejection on abort.
+        let body = {
+            let response: web_sys::Response = response.into_inner().into();
+            response
+                .array_buffer()
+                .map_err(|error| DispatchError::Response(worker::Error::from(error).to_string()))?
+        };
+        let body = wasm_bindgen_futures::JsFuture::from(body)
             .into_send()
             .await
-            .map_err(|error| DispatchError::Response(error.to_string()))?;
+            .map_err(|error| DispatchError::Response(worker::Error::from(error).to_string()))?;
         Ok(CiResponse {
             status,
             headers,
-            body,
+            body: js_sys::Uint8Array::new(&body).to_vec(),
         })
     }
 }

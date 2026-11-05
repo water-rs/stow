@@ -50,7 +50,6 @@ const PERIODIC_EVENTS = new Set([
 // counter keeps the run ids distinct anyway.
 const runs = new Map();
 let nextRunId = 4242;
-const cancelledBodies = new Set();
 
 // The key set the mock OIDC issuer serves, and how often it was read.
 let jwks = { keys: [] };
@@ -104,9 +103,6 @@ export default {
 		// STOW_LOCAL_CI_URL: the /dispatch event POST and the
 		// GitHub-shaped run endpoints under /repos/{owner}/{repo}/actions.
 		if (url.port === "28124") {
-			if (url.pathname.startsWith("/__control/cancelled-body/")) {
-				return Response.json(cancelledBodies.has(url.pathname.split("/").pop()));
-			}
 			if (url.pathname === "/__control/periodic") {
 				if (request.method === "POST") {
 					periodic.length = 0;
@@ -141,7 +137,6 @@ export default {
 						},
 						cancel() {
 							clearTimeout(timer);
-							cancelledBodies.add(name);
 						},
 					});
 					return new Response(stream, { headers: { "content-type": "application/json" } });
