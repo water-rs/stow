@@ -2970,15 +2970,16 @@ impl Graph {
     /// In-flight (dispatched + running) count, total and per family.
     pub fn inflight(&self) -> (u32, u32) {
         let macos = self
-            .inflight
+            .targets
             .iter()
-            .filter(|&&ix| {
-                self.targets[usize::from(self.node(ix).target)].family == Some(RunnerFamily::MacOs)
+            .filter(|target| target.family == Some(RunnerFamily::MacOs))
+            .map(|target| {
+                target.counts[Status::Dispatched.index()] + target.counts[Status::Running.index()]
             })
-            .count();
+            .sum();
         (
             u32::try_from(self.inflight.len()).unwrap_or(u32::MAX),
-            u32::try_from(macos).unwrap_or(u32::MAX),
+            macos,
         )
     }
 
@@ -4540,12 +4541,19 @@ mod tests {
     fn assert_pending_index(graph: &Graph) {
         let mut target_counts = vec![[0u32; Status::COUNT]; graph.targets.len()];
         let mut target_blocked = vec![0u32; graph.targets.len()];
+        let mut inflight = (0u32, 0u32);
         let mut blocked = 0u32;
         let mut miss = 0u32;
         let mut human = BTreeSet::new();
         let mut ages: BTreeMap<i64, u32> = BTreeMap::new();
         for (ix, node) in (0u32..).zip(&graph.nodes) {
             target_counts[usize::from(node.target)][node.status.index()] += 1;
+            if matches!(node.status, Status::Dispatched | Status::Running) {
+                inflight.0 += 1;
+                inflight.1 += u32::from(
+                    graph.targets[usize::from(node.target)].family == Some(RunnerFamily::MacOs),
+                );
+            }
             if node.status != Status::Pending {
                 continue;
             }
@@ -4558,6 +4566,7 @@ mod tests {
             *ages.entry(graph.state(ix).first_requested).or_default() += 1;
         }
         assert_eq!(graph.pending_blocked, blocked, "blocked pending nodes");
+        assert_eq!(graph.inflight(), inflight, "runner occupancy");
         assert_eq!(graph.pending_miss, miss, "pending miss nodes");
         assert_eq!(graph.human_pending, human, "pending human nodes");
         assert_eq!(graph.pending_ages, ages, "pending request instants");
