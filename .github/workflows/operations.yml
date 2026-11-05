@@ -160,12 +160,13 @@ jobs:
           # covers the slices of the rustc the run scopes to.
           rustcs="$(stow-admin index published-rustcs)"
           while IFS= read -r rustc; do
-            gh workflow run index-publish.yml --ref main \
-              -f report=true -f "rustc_version=$rustc"
+            gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/index-publish.yml/dispatches" \
+              -f ref=main -f 'inputs[report]=true' -f "inputs[rustc_version]=$rustc"
           done <<<"$rustcs"
           # `refresh` bypasses preheat-cron's per-day marker, which would
           # turn a same-day dispatch into a no-op.
-          gh workflow run preheat-cron.yml --ref main -f refresh=true
+          gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/preheat-cron.yml/dispatches" \
+            -f ref=main -f 'inputs[refresh]=true'
       - name: Run (analytics)
         if: steps.command.outputs.class == 'analytics'
         env:

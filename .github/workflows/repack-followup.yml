@@ -112,12 +112,13 @@ jobs:
             exit 0
           fi
           rustc="${BASH_REMATCH[1]}"
-          repo_args=(--repo "$GITHUB_REPOSITORY" --ref main)
+          dispatch_args=(--method POST -f ref=main)
 
           if [ "$RUN_CONCLUSION" = success ]; then
-            gh workflow run index-publish.yml "${repo_args[@]}" \
-              -f report=true -f "rustc_version=$rustc"
-            gh workflow run preheat-cron.yml "${repo_args[@]}" -f refresh=true
+            gh api "repos/$GITHUB_REPOSITORY/actions/workflows/index-publish.yml/dispatches" "${dispatch_args[@]}" \
+              -f 'inputs[report]=true' -f "inputs[rustc_version]=$rustc"
+            gh api "repos/$GITHUB_REPOSITORY/actions/workflows/preheat-cron.yml/dispatches" "${dispatch_args[@]}" \
+              -f 'inputs[refresh]=true'
             exit 0
           fi
 
@@ -166,8 +167,8 @@ jobs:
             echo "a '$rustc-repack' run is already queued or running; not dispatching another"
             exit 0
           fi
-          gh workflow run build-crate.yml "${repo_args[@]}" \
-            -f "repack_rustc=$rustc" -f "repack_concurrency=$concurrency"
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build-crate.yml/dispatches" "${dispatch_args[@]}" \
+            -f "inputs[repack_rustc]=$rustc" -f "inputs[repack_concurrency]=$concurrency"
 
   retry:
     if: github.event.workflow_run.path == '.github/workflows/index-publish.yml' && github.event.workflow_run.conclusion == 'success'
@@ -216,5 +217,6 @@ jobs:
               echo "$rustc: failed nodes already retried since the repack completed"
               continue
             fi
-            gh workflow run operations.yml --repo "$GITHUB_REPOSITORY" --ref main -f "argv=$argv"
+            gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/operations.yml/dispatches" \
+              -f ref=main -f "inputs[argv]=$argv"
           done <<<"$repacks"
