@@ -858,12 +858,26 @@ fn the_own_unit_is_named_for_every_task_shape() {
             let own_units = verify(cargo_home.path(), &task, &workspace)
                 .await
                 .unwrap_or_else(|error| panic!("{name} verifies: {error}"));
-            // A host task runs both spellings; a plain target task one.
+            let expected_phases: &[&str] = if host_side {
+                &[
+                    "build explicit --target",
+                    "build native",
+                    "check explicit --target",
+                    "check native",
+                ]
+            } else if name == "tbs" {
+                &[
+                    "build task-spelled",
+                    "check explicit --target compile-time dependencies",
+                    "check task-spelled",
+                ]
+            } else {
+                &["build task-spelled", "check task-spelled"]
+            };
             assert_eq!(
-                own_units.len(),
-                if host_side { 4 } else { 2 },
-                "{name}: check and build × its spellings: {:?}",
-                own_units.keys().collect::<Vec<_>>()
+                own_units.keys().map(String::as_str).collect::<Vec<_>>(),
+                expected_phases,
+                "{name}: every required phase names its own unit"
             );
             let expected = own_deps
                 .iter()
