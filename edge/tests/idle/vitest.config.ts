@@ -50,6 +50,7 @@ const PERIODIC_EVENTS = new Set([
 // counter keeps the run ids distinct anyway.
 const runs = new Map();
 let nextRunId = 4242;
+const cancelledBodies = new Set();
 
 // The key set the mock OIDC issuer serves, and how often it was read.
 let jwks = { keys: [] };
@@ -103,6 +104,9 @@ export default {
 		// STOW_LOCAL_CI_URL: the /dispatch event POST and the
 		// GitHub-shaped run endpoints under /repos/{owner}/{repo}/actions.
 		if (url.port === "28124") {
+			if (url.pathname.startsWith("/__control/cancelled-body/")) {
+				return Response.json(cancelledBodies.has(url.pathname.split("/").pop()));
+			}
 			if (url.pathname === "/__control/periodic") {
 				if (request.method === "POST") {
 					periodic.length = 0;
@@ -121,6 +125,27 @@ export default {
 				}
 				const runId = nextRunId++;
 				runs.set(runId, body.client_payload);
+				const name = body.client_payload.crate_name;
+				if (name === "timeout-headers") {
+					await new Promise((resolve) => setTimeout(resolve, 8000));
+				}
+				if (name === "timeout-body") {
+					let timer;
+					const stream = new ReadableStream({
+						start(controller) {
+							controller.enqueue(new TextEncoder().encode('{"workflow_run_id":'));
+							timer = setTimeout(() => {
+								controller.enqueue(new TextEncoder().encode(JSON.stringify(runId) + '}'));
+								controller.close();
+							}, 8000);
+						},
+						cancel() {
+							clearTimeout(timer);
+							cancelledBodies.add(name);
+						},
+					});
+					return new Response(stream, { headers: { "content-type": "application/json" } });
+				}
 				return Response.json({
 					workflow_run_id: runId,
 					run_url: origin + "/runs/" + runId,
