@@ -47,6 +47,8 @@ const ERROR_RATE_BOUND: f64 = 0.01;
 struct LaneStats {
     /// Requests the lane fired.
     requests: u64,
+    /// Minimum whole requests required by the configured rate and duration.
+    required_requests: u64,
     /// The rate it actually drove.
     effective_eps: f64,
     /// Median latency in milliseconds.
@@ -116,6 +118,17 @@ async fn run_paced(interval: Duration, duration: Duration, mut fire: impl AsyncF
     }
 }
 
+/// Whole requests due during the measurement window. Rounding down
+/// permits only the fractional request at the boundary, not a rate deficit.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "positive finite lane rates and bounded measurement duration"
+)]
+fn required_requests(eps: f64, duration: Duration) -> u64 {
+    (eps * duration.as_secs_f64()).floor() as u64
+}
+
 /// Run one lane to the deadline, pacing at `eps`.
 #[expect(
     clippy::cast_precision_loss,
@@ -125,7 +138,10 @@ async fn run_paced(interval: Duration, duration: Duration, mut fire: impl AsyncF
 )]
 async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> Result<LaneStats, String> {
     let mut client = zenwave::client();
-    let mut stats = LaneStats::default();
+    let mut stats = LaneStats {
+        required_requests: required_requests(lane.eps, duration),
+        ..LaneStats::default()
+    };
     // A lane the harness cannot make fireable stops firing and fails the
     // pass: an event fired anyway would be a different path than the one
     // the lane prices.
@@ -223,6 +239,12 @@ pub async fn run(edge: &Edge, args: &PeakArgs, output: Output) -> stow_types::er
     let mut lanes_map = BTreeMap::new();
     let mut breaches = Vec::new();
     for (lane, stats) in lanes.iter().zip(results) {
+        if stats.requests < stats.required_requests {
+            breaches.push(format!(
+                "{}: sent {} requests, below {} required at {:.6} eps",
+                lane.name, stats.requests, stats.required_requests, lane.eps
+            ));
+        }
         let total = stats.requests.max(1) as f64;
         let error_share = (stats.transport_errors + stats.server_errors) as f64 / total;
         if error_share > ERROR_RATE_BOUND {
@@ -325,7 +347,7 @@ fn render_report(report: &LoadReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Duration, run_paced};
+    use super::{Duration, required_requests, run_paced};
     use tokio::time::Instant;
 
     /// Run `run_paced` under the paused clock and return every event's
@@ -346,6 +368,13 @@ mod tests {
         })
         .await;
         (seen, Instant::now() - start)
+    }
+
+    #[test]
+    fn rate_requirement_rounds_only_the_partial_request() {
+        assert_eq!(required_requests(0.005, Duration::from_secs(450)), 2);
+        assert_eq!(required_requests(9.0, Duration::from_secs(450)), 4050);
+        assert_eq!(required_requests(0.005, Duration::from_secs(45)), 0);
     }
 
     /// The defect this fixes: a 0.005eps lane (200s interval) in a 450s
@@ -412,6 +441,7 @@ mod tests {
             Duration::from_millis(1500),
         )
         .await;
+        assert!((fires.len() as u64) < required_requests(1.0, Duration::from_secs(4)));
         assert_eq!(
             fires,
             [0, 1500, 3000].map(Duration::from_millis),
