@@ -1490,6 +1490,25 @@ async fn capture_task_units(
     runtime: &Path,
     capture: &Path,
 ) -> Vec<stow_types::capture::CapturedRustcArtifact> {
+    capture_task_invocation(
+        cargo_home,
+        reg,
+        task,
+        runtime,
+        capture,
+        task::CargoInvocation::Task,
+    )
+    .await
+}
+
+async fn capture_task_invocation(
+    cargo_home: &Path,
+    reg: &Path,
+    task: &BuildTaskPayload,
+    runtime: &Path,
+    capture: &Path,
+    invocation: task::CargoInvocation,
+) -> Vec<stow_types::capture::CapturedRustcArtifact> {
     let (root, workspace) = wrapper_workspace(reg, task).await;
     let capture_dir = root.path().join(".stow-rustc-capture");
     std::fs::create_dir_all(&capture_dir).expect("capture dir");
@@ -1534,7 +1553,7 @@ async fn capture_task_units(
         &run,
         task,
         CargoSubcommand::Check,
-        task::CargoInvocation::Task,
+        invocation,
         &target_dir.path().join("target"),
         &mut collector,
     )
@@ -2186,5 +2205,85 @@ fn native_twin_contexts_preserve_each_profiles_host_settings() {
                 assert_eq!(own.len(), if task.host_side { 4 } else { 2 });
             }
         }
+    });
+}
+
+/// Library keys can agree while the native and explicit build-script keys differ.
+#[test]
+fn native_equivalent_library_publishes_both_script_shapes_without_recompiling_its_library() {
+    let (cargo_home, reg) = registry_home();
+    let scratch = tempfile::tempdir().unwrap();
+    for name in ["bd", "leaf", "owner"] {
+        publish(
+            &reg,
+            &Fixture {
+                name,
+                version: "1.0.0",
+                deps: if name == "owner" {
+                    vec![("leaf", "1", &[])]
+                } else {
+                    vec![]
+                },
+                build_deps: if name == "owner" {
+                    vec![("bd", "1", &[])]
+                } else {
+                    vec![]
+                },
+                features: &[],
+                proc_macro: false,
+            },
+        );
+    }
+    let manifest = consumer_project(scratch.path(), &json!({"owner": "1"}), &json!({}));
+    let requests = resolve_requests(cargo_home.path(), &manifest);
+    let owner = payload_for(&request_for(&requests, "owner"));
+    assert!(!owner.host_side);
+    assert_eq!(
+        owner.explicit_spelling,
+        stow_types::public_cache::ExplicitSpelling::KeysAsNative
+    );
+    let (runtime, capture) = build_binaries();
+    smol::block_on(async {
+        let (_root, workspace) = wrapper_workspace(&reg, &owner).await;
+        let phases = verify(cargo_home.path(), &owner, &workspace)
+            .await
+            .expect("owner context");
+        assert_eq!(
+            phases.len(),
+            3,
+            "native check/build plus one script-only phase"
+        );
+        assert!(phases.contains_key("check explicit --target compile-time dependencies"));
+        let native = capture_task_units(cargo_home.path(), &reg, &owner, &runtime, &capture).await;
+        let explicit = capture_task_invocation(
+            cargo_home.path(),
+            &reg,
+            &owner,
+            &runtime,
+            &capture,
+            task::CargoInvocation::ExplicitCompileTime,
+        )
+        .await;
+        let native_script = native
+            .iter()
+            .find(|r| r.crate_name == "build_script_build")
+            .expect("native script");
+        let explicit_script = explicit
+            .iter()
+            .find(|r| r.crate_name == "build_script_build")
+            .expect("explicit script");
+        assert_ne!(native_script.compile_key, explicit_script.compile_key);
+        assert!(
+            explicit
+                .iter()
+                .all(|r| r.crate_name != "owner" && r.crate_name != "leaf"),
+            "compile-time-only phase must not compile target libraries"
+        );
+        let leaf = payload_for(&request_for(&requests, "leaf"));
+        let (_root, workspace) = wrapper_workspace(&reg, &leaf).await;
+        let phases = verify(cargo_home.path(), &leaf, &workspace)
+            .await
+            .expect("leaf context");
+        assert_eq!(phases.len(), 2, "scriptless task adds no phase");
     });
 }
