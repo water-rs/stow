@@ -356,6 +356,9 @@ fg in_dir "$REPO_ROOT/edge" \
     >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
 rm -f "$MOCK_MANIFEST"
+# Preserve the generated source locations named by the V8 CPU profile.
+cp "$REPO_ROOT/edge/stable-worker.js" "$LOG_DIR/stable-worker.js"
+cp "$REPO_ROOT/edge/stable-worker_bg.js" "$LOG_DIR/stable-worker_bg.js"
 # Wrangler writes its own ISO-timestamped log to WRANGLER_LOG_PATH.
 mkdir -p "$LOG_DIR/wrangler"
 export WRANGLER_LOG_PATH="$LOG_DIR/wrangler"
