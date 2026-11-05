@@ -292,6 +292,49 @@ async fn per_request_cost_gate() {
     }
 }
 
+#[tokio::test]
+async fn capacity_drives_include_external_occupancy() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let cell = GraphCell::default();
+    fixture::seed(&db, &cell, fixture::GATE, drives::HOST_NOW_MS)
+        .await
+        .expect("seed fixture");
+    let ctx = DriveContext::host(cell);
+    super::routes::task_run_update(
+        ctx.loaded(),
+        &db,
+        &stow_types::api::TaskRunUpdate {
+            task_id: stow_types::fixture::named_task_id(
+                "external-capacity",
+                1,
+                "x86_64-unknown-linux-gnu",
+            ),
+            github_run_id: "9000200000".to_owned(),
+        },
+        drives::HOST_NOW_MS,
+    )
+    .await
+    .expect("external run");
+    assert_eq!(ctx.loaded().with(|graph| graph.external_total()), 1);
+    for name in ["POST /dispatch-cap", "alarm pass (stale recovery)"] {
+        let drive = drives::DRIVES
+            .iter()
+            .find(|drive| drive.name == name)
+            .unwrap();
+        run_one_drive(
+            &db,
+            fixture::GATE,
+            &SchedulerSettings::default(),
+            &ctx,
+            &log,
+            drive,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(ctx.loaded().with(|graph| graph.external_total()), 1);
+    }
+}
+
 /// Event drives cost the same at any fixture size: two sizes, and no
 /// drive but the bulk ones may grow past the shared growth tolerance.
 #[tokio::test]
