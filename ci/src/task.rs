@@ -1659,8 +1659,6 @@ async fn run_phase(
                 .unwrap_or_default(),
         )
         .env("RUSTC_WORKSPACE_WRAPPER", "")
-        .env(STOW_BUILD_WRAPPER_CRATE_NAME_ENV, WRAPPER_PACKAGE_NAME)
-        .env(STOW_BUILD_TARGET_DIR_REMAP_ENV, TARGET_DIR_VIRTUAL_ROOT)
         .env("CARGO_TARGET_DIR", path_arg(target_dir)?)
         .env(
             STOW_BUILD_CAPTURE_DIR_ENV,
@@ -1776,9 +1774,15 @@ pub enum CargoInvocation {
 impl CargoInvocation {
     /// Cargo-only unstable options never change rustc's stable-channel probes.
     fn environment(self) -> impl Iterator<Item = (&'static str, &'static str)> {
-        matches!(self, Self::ExplicitCompileTime)
-            .then_some((stow_cli::CARGO_CHANNEL_OVERRIDE, "nightly"))
-            .into_iter()
+        [
+            (STOW_BUILD_WRAPPER_CRATE_NAME_ENV, WRAPPER_PACKAGE_NAME),
+            (STOW_BUILD_TARGET_DIR_REMAP_ENV, TARGET_DIR_VIRTUAL_ROOT),
+        ]
+        .into_iter()
+        .chain(
+            matches!(self, Self::ExplicitCompileTime)
+                .then_some((stow_cli::CARGO_CHANNEL_OVERRIDE, "nightly")),
+        )
     }
 
     /// The argv spelling, for error messages.
