@@ -373,7 +373,7 @@ async fn scheduler_budget_seed(
             .unwrap_or(stow_types::fixture::FixtureShape::PRODUCTION.queue_rows),
     };
     Ok(Json(
-        fixture::seed(&db, &graph, shape, now_ms())
+        fixture::seed(&db, &graph, shape, &binding_settings(&env)?, now_ms())
             .await
             .map_err(to_error)?,
     ))

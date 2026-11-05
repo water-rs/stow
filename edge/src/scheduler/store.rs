@@ -1022,7 +1022,8 @@ mod tests {
         for queue_rows in [1_000u32, 4_000] {
             let shape = stow_types::fixture::FixtureShape { queue_rows };
             let (db, log) = test_db::counting_memory_db().await.expect("db");
-            let mut graph = crate::scheduler::fixture::build(shape, 0).expect("build");
+            let mut graph =
+                crate::scheduler::fixture::build(shape, &claim_settings(45, 16), 0).expect("build");
             write_snapshot(&db, &mut graph, &GraphCell::default(), NOW_MS)
                 .await
                 .expect("seed snapshot");

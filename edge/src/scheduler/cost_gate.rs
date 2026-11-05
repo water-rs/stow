@@ -241,9 +241,15 @@ async fn measure_all(shape: FixtureShape) -> Vec<Measured> {
     let (db, log) = counting_memory_db().await.expect("counting db");
     let cell = GraphCell::default();
     let seed_base = log.lock().expect("log").len();
-    fixture::seed(&db, &cell, shape, drives::HOST_NOW_MS)
-        .await
-        .expect("seed fixture");
+    fixture::seed(
+        &db,
+        &cell,
+        shape,
+        &SchedulerSettings::default(),
+        drives::HOST_NOW_MS,
+    )
+    .await
+    .expect("seed fixture");
     // The fixture obeys the gate too: it is seeded with DML only.
     for statement in &log.lock().expect("log")[seed_base..] {
         assert!(
@@ -296,9 +302,15 @@ async fn per_request_cost_gate() {
 async fn capacity_drives_include_external_occupancy() {
     let (db, log) = counting_memory_db().await.expect("counting db");
     let cell = GraphCell::default();
-    fixture::seed(&db, &cell, fixture::GATE, drives::HOST_NOW_MS)
-        .await
-        .expect("seed fixture");
+    fixture::seed(
+        &db,
+        &cell,
+        fixture::GATE,
+        &SchedulerSettings::default(),
+        drives::HOST_NOW_MS,
+    )
+    .await
+    .expect("seed fixture");
     let ctx = DriveContext::host(cell);
     super::routes::task_run_update(
         ctx.loaded(),
@@ -374,9 +386,15 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     let shape = fixture::GATE;
     let mut runs = Vec::new();
     for _ in 0..2 {
-        fixture::seed(&db, &cell, shape, drives::HOST_NOW_MS)
-            .await
-            .expect("seed fixture");
+        fixture::seed(
+            &db,
+            &cell,
+            shape,
+            &SchedulerSettings::default(),
+            drives::HOST_NOW_MS,
+        )
+        .await
+        .expect("seed fixture");
         let ctx = DriveContext::host(cell.clone());
         let mut measured = Vec::new();
         for drive in drives::DRIVES {
@@ -436,9 +454,15 @@ fn injected_cleanup_failure<'a>(
 async fn cleanup_still_runs_after_a_failing_drive() {
     let (db, log) = counting_memory_db().await.expect("counting db");
     let cell = GraphCell::default();
-    fixture::seed(&db, &cell, fixture::GATE, drives::HOST_NOW_MS)
-        .await
-        .expect("seed fixture");
+    fixture::seed(
+        &db,
+        &cell,
+        fixture::GATE,
+        &SchedulerSettings::default(),
+        drives::HOST_NOW_MS,
+    )
+    .await
+    .expect("seed fixture");
     let ctx = DriveContext::host(cell);
     let settings = SchedulerSettings::default();
     let drive = drives::Drive {
@@ -482,9 +506,15 @@ async fn rearm_restores_the_seeded_state() {
     let db = crate::scheduler::test_db::memory_db().await.expect("db");
     let cell = GraphCell::default();
     let shape = FixtureShape { queue_rows: 5_000 };
-    fixture::seed(&db, &cell, shape, drives::HOST_NOW_MS)
-        .await
-        .expect("seed fixture");
+    fixture::seed(
+        &db,
+        &cell,
+        shape,
+        &SchedulerSettings::default(),
+        drives::HOST_NOW_MS,
+    )
+    .await
+    .expect("seed fixture");
     let cell = cell.loaded().expect("seeded");
     let seeded = cell.with(|graph| graph.status());
     let run = shape.in_flight_run(0);
@@ -507,4 +537,26 @@ async fn rearm_restores_the_seeded_state() {
         .await
         .expect("rearm");
     assert_eq!(cell.with(|graph| graph.status()), seeded);
+}
+
+#[tokio::test]
+async fn capacity_fixture_fills_enterprise_dispatch_slots() {
+    let settings = fixture::claim_settings(500, 50);
+    let db = crate::scheduler::test_db::memory_db().await.expect("db");
+    let cell = GraphCell::default();
+    fixture::seed(&db, &cell, fixture::GATE, &settings, drives::HOST_NOW_MS)
+        .await
+        .expect("seed fixture");
+    let claims = cell.loaded().expect("loaded").with(|graph| {
+        graph
+            .claim(&settings, drives::HOST_NOW_MS, u32::MAX)
+            .expect("claim")
+    });
+    assert_eq!(claims.len(), 500 - FixtureShape::IN_FLIGHT_ROWS as usize);
+    assert_eq!(
+        cell.loaded()
+            .expect("loaded")
+            .with(|graph| graph.inflight()),
+        (500, 50)
+    );
 }

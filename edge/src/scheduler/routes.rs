@@ -815,9 +815,15 @@ mod eviction_tests {
     async fn seeded() -> (DurableDb, GraphCell) {
         let db = test_db::memory_db().await.expect("memory db");
         let cell = GraphCell::default();
-        fixture::seed(&db, &cell, SHAPE, HOST_NOW_MS)
-            .await
-            .expect("seed");
+        fixture::seed(
+            &db,
+            &cell,
+            SHAPE,
+            &crate::scheduler::queue::SchedulerSettings::default(),
+            HOST_NOW_MS,
+        )
+        .await
+        .expect("seed");
         (db, cell)
     }
 
@@ -958,9 +964,15 @@ mod inline_dispatch_tests {
     async fn seeded() -> (DurableDb, GraphCell) {
         let db = test_db::memory_db().await.expect("memory db");
         let cell = GraphCell::default();
-        fixture::seed(&db, &cell, SHAPE, HOST_NOW_MS)
-            .await
-            .expect("seed");
+        fixture::seed(
+            &db,
+            &cell,
+            SHAPE,
+            &crate::scheduler::queue::SchedulerSettings::default(),
+            HOST_NOW_MS,
+        )
+        .await
+        .expect("seed");
         (db, cell)
     }
 
