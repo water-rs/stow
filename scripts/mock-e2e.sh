@@ -302,9 +302,7 @@ consumer_check() {
 stow_cli() {
     isolated_env \
         STOW_EDGE_URL="$EDGE_URL" \
-        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
         STOW_VERIFY_MODE="mock-key" \
-        STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         STOW_CACHE_DIR="$WORK_DIR/stow-cache" \
         "$BIN/stow-cli" "$@"
 }
@@ -322,8 +320,6 @@ stow_cli() {
 publish_slices() {
     local tag="$1"
     isolated_env \
-        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
-        STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         "$BIN/stow-admin" index export \
         --out-dir "$WORK_DIR/index-export" \
         --rustc-version "$RUSTC_VERSION" \
@@ -456,6 +452,8 @@ ISOLATED_ENV=(
     XDG_CONFIG_HOME="$WORK_DIR/config"
     CARGO_HOME="$WORK_DIR/cargo-home"
     RUSTUP_HOME="$RUSTUP_HOME_REAL"
+    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}"
+    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem"
     NO_COLOR=1
     CARGO_TERM_COLOR=never
 )
@@ -1230,14 +1228,12 @@ fi
     # isolated stow cache, never GHCR or the developer's ~/.stow.
     [ -z "$SYSROOT" ] || eval "$("$REPO_ROOT/ci/glibc-sysroot/env.sh" "$SYSROOT" ${SYS_LIBS:+"$SYS_LIBS"})"
     exec env "${ISOLATED_ENV[@]}" \
-        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
         STOW_VERIFY_MODE="mock-key" \
         STOW_CACHE_DIR="$WORK_DIR/ci-cache" \
         SCHEDULER_URL="$SCHEDULER_URL" \
         STOW_EDGE_URL="$EDGE_URL" \
         STOW_GITHUB_WEBHOOK_SECRET="mock-github-webhook-secret" \
         GITHUB_APP_SLUG="mock-stow-ci" \
-        STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
         STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
         GH_TOKEN="$EDGE_BEARER" \
@@ -1477,8 +1473,6 @@ index_rows="$(awk '/^rows: /{print $2}' "$LOG_DIR/index-status.log" | head -1)"
 # included, on stdout: the wait below follows exactly those ids.
 printf 'walkdir\n' >"$WORK_DIR/manual-crates.txt"
 fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
-    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
-    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
     STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
     "$BIN/stow-admin" --json preheat manual \
@@ -1582,8 +1576,6 @@ status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status")" \
     || die "scheduler status read before the dual submit failed"
 completed_before="$(jq -r '.completed' <<<"$status_json")"
 isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
-    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
-    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
     STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
     "$BIN/stow-admin" --json preheat manual \
@@ -2001,8 +1993,6 @@ echo "[mock-e2e] OK — build script served remotely and locally, then kept fres
 # artifacts, so it skips with them.
 if [ "$(uname -s)" = "Linux" ]; then
 fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
-    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     "$BIN/stow-admin" --json preheat plan \
     "${HOST_DEPS_CRATE}@${HOST_DEPS_VERSION}" \
     --features-json '[]' \
@@ -2272,8 +2262,6 @@ isolated_env "$BIN/stow-mock-registry" index-from-records \
     >"$LOG_DIR/oversized-index.log" 2>&1 \
     || die "publishing the oversized slice failed — see $LOG_DIR/oversized-index.log"
 isolated_env \
-    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
-    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc index-publish.yml)" \
     "$BIN/stow-admin" index reconcile --rustc-version "$RUSTC_VERSION" \
     >"$LOG_DIR/index-reconcile-oversized.log" 2>&1 \
@@ -2289,8 +2277,6 @@ echo "[mock-e2e] OK — a $OVERSIZED_ROWS-row slice report over the request-body
 
 # A real registry source failure stays failed after a cache-free replay.
 fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
-    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
-    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     "$BIN/stow-admin" submit --crate-name uuid --version 1.29.0 \
     --features-json '["rng","v4"]' --target wasm32-unknown-unknown \
     --rustc-version "$RUSTC_VERSION" --yes \

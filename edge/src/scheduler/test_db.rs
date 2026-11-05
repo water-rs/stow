@@ -489,6 +489,7 @@ fn check_do_statements(sql: &str, ddl_permitted: bool) -> Result<(), DurableDbEr
 
 impl DurableDbBackend for SqliteBackend {
     async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
+        check_do_bindings(params)?;
         check_do_statements(query, self.ddl_permitted.load(Ordering::Relaxed))?;
         // `fetch_all` hands back rows but no `changes()` — yet a write
         // issued through the read path (an `INSERT … RETURNING`, the
@@ -533,6 +534,7 @@ impl DurableDbBackend for SqliteBackend {
         query: &str,
         params: &[DbValue],
     ) -> Result<DbExecResult, DurableDbError> {
+        check_do_bindings(params)?;
         check_do_statements(query, self.ddl_permitted.load(Ordering::Relaxed))?;
         let result = bind_params(sqlx::query(sqlx::AssertSqlSafe(query)), params)
             .execute(&self.pool)
@@ -561,6 +563,18 @@ impl DurableDbBackend for SqliteBackend {
         let _ = self;
         std::future::ready(Ok(()))
     }
+}
+
+/// The documented DO SQLite bound-parameter limit, independent of the
+/// host SQLite build's much larger limit.
+/// <https://developers.cloudflare.com/durable-objects/platform/limits/#sql-storage-limits>
+fn check_do_bindings(params: &[DbValue]) -> Result<(), DurableDbError> {
+    if params.len() > 100 {
+        return Err(backend_error(
+            "too many SQL variables: Durable Objects allow 100 bound parameters",
+        ));
+    }
+    Ok(())
 }
 
 fn backend_error(error: impl std::fmt::Display) -> DurableDbError {

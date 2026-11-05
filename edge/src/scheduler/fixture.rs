@@ -62,6 +62,18 @@ use crate::errors::QueueError;
 #[cfg(test)]
 pub const GATE: FixtureShape = FixtureShape { queue_rows: 10_000 };
 
+/// Dispatch limits shared by host graph and store fixtures.
+#[cfg(test)]
+pub fn claim_settings(total: u32, macos: u32) -> super::queue::SchedulerSettings {
+    super::queue::SchedulerSettings {
+        dispatch: super::queue::Dispatch::Limited(
+            std::num::NonZeroU32::new(total).expect("positive cap"),
+        ),
+        max_concurrent_macos_jobs: macos,
+        ..super::queue::SchedulerSettings::default()
+    }
+}
+
 /// The stored `demand` every window node carries — folded straight
 /// onto the node's rank operand (stow#879), so a window node sits at
 /// `MISS_PRIORITY + 1000` while the bulk stays at `MISS_PRIORITY`.

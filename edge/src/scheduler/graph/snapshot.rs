@@ -1216,3 +1216,74 @@ impl SnapshotLoader {
         Ok(graph)
     }
 }
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use crate::scheduler::{graph::GraphCell, store, test_db};
+
+    #[tokio::test]
+    async fn incremental_snapshot_clears_many_spans_without_exceeding_sql_bindings() {
+        let db = test_db::memory_db().await.expect("db");
+        let spans: Vec<_> = (0..65)
+            .map(|range| ChunkSpan::new(ChunkKind::Nodes, range))
+            .collect();
+        for span in &spans {
+            for sub in 0..2 {
+                db.query("INSERT INTO snapshot_chunks(chunk, payload) VALUES (?, ?)")
+                    .bind(span.lo_key() + sub)
+                    .bind("old")
+                    .execute()
+                    .await
+                    .expect("seed old rows");
+            }
+        }
+        let plan = SnapshotPlan {
+            all: false,
+            spans: spans[..64].to_vec(),
+        };
+        let mut current = None;
+        let mut emitted = 0;
+        store::write_snapshot_parts(
+            &db,
+            &plan,
+            |span, _| {
+                if current != Some(span) {
+                    current = Some(span);
+                    emitted = 0;
+                }
+                if emitted == span.range % 3 {
+                    return Ok(None);
+                }
+                emitted += 1;
+                Ok(Some("new".to_owned()))
+            },
+            &Graph::default().meter,
+            &GraphCell::default(),
+            0,
+        )
+        .await
+        .expect("incremental snapshot");
+        for span in &spans {
+            let rows = db
+                .query("SELECT payload FROM snapshot_chunks WHERE chunk BETWEEN ? AND ? ORDER BY chunk")
+                .bind(span.lo_key())
+                .bind(span.hi_key())
+                .fetch_all::<Payload>()
+                .await
+                .expect("read span");
+            let (count, payload) = if span.range == 64 {
+                (2, "old")
+            } else {
+                (span.range % 3, "new")
+            };
+            assert_eq!(rows.len(), count as usize, "span {}", span.range);
+            assert!(rows.iter().all(|row| row.payload == payload));
+        }
+    }
+
+    #[derive(skyzen::FromRow)]
+    struct Payload {
+        payload: String,
+    }
+}

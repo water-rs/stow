@@ -486,27 +486,30 @@ pub async fn write_snapshot_parts(
             sub += 1;
         }
         // The span's emitted rows stay; anything past them is a stale
-        // sub-row of a longer previous encoding — cleared with every
-        // span's tail in one statement below, not one per span.
-        stale.push((span.lo_key() + sub, span.hi_key()));
+        // sub-row of a longer previous encoding. Empty neighboring
+        // spans share a range, without deleting any newly emitted row.
+        let lo = span.lo_key() + sub;
+        if let Some((_, hi)) = stale.last_mut()
+            && *hi + 1 == lo
+        {
+            *hi = span.hi_key();
+        } else {
+            stale.push((lo, span.hi_key()));
+        }
     }
     flush_upserts(db, &mut pending).await?;
-    if !plan.all && !stale.is_empty() {
-        let mut clear = String::from("DELETE FROM snapshot_chunks WHERE ");
-        for at in 0..stale.len() {
-            if at != 0 {
-                clear.push_str(" OR ");
-            }
-            clear.push_str("(chunk >= ? AND chunk <= ?)");
-        }
-        let mut query = db.query(&clear);
+    if !plan.all {
+        // A fixed pair of bindings per range stays independent of the
+        // dirty-set size. Storage-only awaits retain the input gate;
+        // the watermark cannot commit until every stale tail is gone.
         for (lo, hi) in stale {
-            query = query.bind(lo).bind(hi);
+            db.query("DELETE FROM snapshot_chunks WHERE chunk BETWEEN ? AND ?")
+                .bind(lo)
+                .bind(hi)
+                .execute()
+                .await
+                .map_err(|error| QueueError::Sql(format!("snapshot span clear: {error}")))?;
         }
-        query
-            .execute()
-            .await
-            .map_err(|error| QueueError::Sql(format!("snapshot span clear: {error}")))?;
     }
     db.query(
         "INSERT INTO store_meta(key, value) VALUES ('snapshot_seq', ?) \
@@ -726,6 +729,7 @@ pub fn apply_events(graph: &mut Graph, events: &[(i64, Logged)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::fixture::claim_settings;
     use crate::scheduler::test_db;
     use stow_types::api::{
         DispatchBinding, DispatchClaim, MutationKind, PublishedSliceRow, RunnerFamily,
@@ -845,7 +849,9 @@ mod tests {
         let db = store().await;
         let mut graph = Graph::default();
         graph.merge(&chain(), 0).expect("merge");
-        let claims = graph.claim(45, 16, 0, 3_600_000).expect("claim c");
+        let claims = graph
+            .claim(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim c");
         let generation = claims[0].generation;
         graph.bind(&id("c"), generation, 700, 1_000);
         graph.run_finished(
@@ -898,7 +904,9 @@ mod tests {
         assert!(tail.is_empty(), "snapshot covered the whole log");
         apply_events(&mut restored, &tail);
         assert_eq!(restored.status(), graph.status());
-        let claimed = restored.claim(45, 16, 20_000, 3_600_000).expect("claim b");
+        let claimed = restored
+            .claim(&claim_settings(45, 16), 20_000, u32::MAX)
+            .expect("claim b");
         assert_eq!(claimed[0].task_id, id("b"));
     }
 
@@ -937,7 +945,9 @@ mod tests {
             .expect("snapshot 1");
         // Wave 2: claim, bind, finish and publish c — node and
         // published spans rewrite on top of the first write's rows.
-        let claims = graph.claim(45, 16, 1_000, 3_600_000).expect("claim");
+        let claims = graph
+            .claim(&claim_settings(45, 16), 1_000, u32::MAX)
+            .expect("claim");
         let generation = claims[0].generation;
         commit_to(
             &db,
@@ -997,7 +1007,9 @@ mod tests {
         apply_events(&mut restored, &tail);
         assert_eq!(restored.status(), graph.status());
         assert_eq!(restored.sizes(), graph.sizes());
-        let claimed = restored.claim(45, 16, 20_000, 3_600_000).expect("claim b");
+        let claimed = restored
+            .claim(&claim_settings(45, 16), 20_000, u32::MAX)
+            .expect("claim b");
         assert_eq!(claimed[0].task_id, id("b"));
     }
 
@@ -1116,7 +1128,9 @@ mod tests {
                 },
             ),
         );
-        let claims = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        let claims = graph
+            .claim(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim");
         let generation = claims[0].generation;
         // The pass appends ONE row for the claims before posting —
         // then the isolate is evicted before the bindings land.

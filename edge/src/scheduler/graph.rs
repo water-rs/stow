@@ -1926,8 +1926,9 @@ impl Graph {
 
 /// Claims and the run lifecycle.
 impl Graph {
-    /// Claim up to `total_free` (and `macos_free` for the macOS family)
-    /// ready nodes, minting one generation per claim. `now` is unix ms;
+    /// Claim up to `bound` ready nodes within the configured capacity,
+    /// reclaiming expired leases before counting free slots. Mint one
+    /// generation per claim. `now` is unix ms;
     /// nodes whose `not_before` is in the future are skipped. Returns
     /// claims in rank order — the dispatch pass writes ONE `Claims`
     /// event for this set before posting, and ONE `Bindings` row after.
@@ -1937,26 +1938,25 @@ impl Graph {
     /// rebuilt or its target has no runner family.
     pub fn claim(
         &mut self,
-        total_free: u32,
-        macos_free: u32,
+        settings: &queue::SchedulerSettings,
         now: i64,
-        stale_ms: i64,
+        bound: u32,
     ) -> Result<Vec<Claimed>, QueueError> {
-        self.claim_scanned(total_free, macos_free, now, stale_ms, &mut 0)
+        self.claim_scanned(settings, now, bound, &mut 0)
     }
 
     /// [`Self::claim`], adding the ready entries the pass examined to
     /// `scans` — the pass's cost, which tests bound.
     fn claim_scanned(
         &mut self,
-        total_free: u32,
-        macos_free: u32,
+        settings: &queue::SchedulerSettings,
         now: i64,
-        stale_ms: i64,
+        bound: u32,
         scans: &mut u64,
     ) -> Result<Vec<Claimed>, QueueError> {
         // Stale-lease recovery first: in-flight nodes whose claim
         // outlived the lease return to pending.
+        let stale_ms = i64::from(settings.stale_dispatch_minutes) * 60_000;
         let stale: Vec<u32> = self
             .inflight
             .iter()
@@ -1977,6 +1977,9 @@ impl Graph {
         if self.freeze.is_some() {
             return Ok(Vec::new());
         }
+        let (total_free, macos_free) = self.free_slots(settings);
+        let total_free = total_free.min(bound);
+        let macos_free = macos_free.min(bound);
         // The rank is `operand × time waited` (stow#879): within one
         // operand class the oldest entry ranks highest, so the best
         // node of each class is its oldest eligible one and the claim
@@ -4062,6 +4065,7 @@ impl crate::freeze::FreezeStore for GraphFreezeStore<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::fixture::claim_settings;
     use stow_types::api::{MutationKind, SubmissionSource};
     use stow_types::identity::{
         CrateName, CrateVersion, DependencyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -4118,7 +4122,9 @@ mod tests {
     fn source_verification_survives_event_replay_and_snapshot() {
         let mut graph = Graph::default();
         graph.merge(&solo(), 0).expect("merge");
-        let claim = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        let claim = graph
+            .claim(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim");
         let task_id = claim[0].task_id.clone();
         graph.bind(&task_id, claim[0].generation, 77, 1000);
         let proof = stow_types::api::SourceFailureVerification {
@@ -4583,7 +4589,9 @@ mod tests {
         graph.merge(&chain(), 0).expect("merge");
         // Only the leaf is ready; a and b sit behind unmet edges.
         assert_eq!(ready_count(&graph), 1);
-        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        let claimed = graph
+            .claim(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].task_id, id("c"));
     }
@@ -4592,13 +4600,17 @@ mod tests {
     fn publish_flips_edges_and_releases_dependents() {
         let mut graph = Graph::default();
         graph.merge(&chain(), 0).expect("merge");
-        graph.claim(45, 16, 0, 3_600_000).expect("claim c");
+        graph
+            .claim(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim c");
         graph.run_finished(&id("c"), completion(100, true, false, None), 50_000);
         let flips = publish(&mut graph, "c");
         assert_eq!(flips, 1, "b's edge to c flips");
         // b still depends on c, so c is retained without queue state.
         assert_eq!(status_of(&graph, "c"), Some(Status::Published));
-        let claimed = graph.claim(45, 16, 60_000, 3_600_000).expect("claim b");
+        let claimed = graph
+            .claim(&claim_settings(45, 16), 60_000, u32::MAX)
+            .expect("claim b");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].task_id, id("b"));
         // The payload's subgraph rebuilds c from the retained node.
@@ -4679,7 +4691,9 @@ mod tests {
             .expect("merge d");
         assert_eq!(status_of(&graph, "c"), Some(Status::Published));
         assert_eq!(ready_count(&graph), 1, "d's only edge is met");
-        let claimed = graph.claim(45, 16, 10_000_000, 3_600_000).expect("claim d");
+        let claimed = graph
+            .claim(&claim_settings(45, 16), 10_000_000, u32::MAX)
+            .expect("claim d");
         assert_eq!(claimed[0].task_id, id("d"));
         assert_eq!(claimed[0].payload.dependency_subgraph.nodes.len(), 1);
     }
@@ -4770,7 +4784,9 @@ mod tests {
     fn completion_without_binding_parks_and_applies_on_bind() {
         let mut graph = Graph::default();
         graph.merge(&solo(), 0).expect("merge");
-        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        let claimed = graph
+            .claim(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim");
         let generation = claimed[0].generation;
         let outcome = graph.run_finished(&id("solo"), completion(4242, true, false, None), 10_000);
         assert_eq!(outcome, FinishOutcome::Parked);
@@ -4816,7 +4832,9 @@ mod tests {
     fn an_in_progress_listing_renews_the_lease() {
         let mut graph = Graph::default();
         graph.merge(&solo(), 0).expect("merge");
-        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        let claimed = graph
+            .claim(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim");
         graph.bind(&id("solo"), claimed[0].generation, 11, 1_000);
         let ix = graph.node_ix(&id("solo")).expect("node");
         graph.reconcile_runs(
@@ -4828,7 +4846,7 @@ mod tests {
             50 * 60_000,
         );
         let reclaimed = graph
-            .claim(45, 16, 70 * 60_000, 3_600_000)
+            .claim(&claim_settings(45, 16), 70 * 60_000, u32::MAX)
             .expect("claim pass");
         assert!(reclaimed.is_empty(), "the living run is not re-dispatched");
         assert_eq!(status_of(&graph, "solo"), Some(Status::Running));
@@ -4842,7 +4860,9 @@ mod tests {
     fn a_queued_listing_renews_the_lease() {
         let mut graph = Graph::default();
         graph.merge(&solo(), 0).expect("merge");
-        graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        graph
+            .claim(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim");
         let ix = graph.node_ix(&id("solo")).expect("node");
         // The claim is unbound; the listing binds it by title and
         // renews the lease in the same pass.
@@ -4856,7 +4876,7 @@ mod tests {
         );
         assert_eq!(graph.run_id_of(ix), 11);
         let reclaimed = graph
-            .claim(45, 16, 70 * 60_000, 3_600_000)
+            .claim(&claim_settings(45, 16), 70 * 60_000, u32::MAX)
             .expect("claim pass");
         assert!(reclaimed.is_empty(), "the queued run is not re-dispatched");
         assert_eq!(status_of(&graph, "solo"), Some(Status::Dispatched));
@@ -4870,11 +4890,13 @@ mod tests {
     fn an_unlisted_own_run_lets_the_lease_lapse() {
         let mut graph = Graph::default();
         graph.merge(&solo(), 0).expect("merge");
-        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        let claimed = graph
+            .claim(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim");
         graph.bind(&id("solo"), claimed[0].generation, 11, 1_000);
         graph.reconcile_runs(&[], 50 * 60_000);
         let reclaimed = graph
-            .claim(45, 16, 70 * 60_000, 3_600_000)
+            .claim(&claim_settings(45, 16), 70 * 60_000, u32::MAX)
             .expect("claim pass");
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].task_id, id("solo"));
@@ -5047,13 +5069,17 @@ mod tests {
     fn a_completion_binds_after_a_failed_dispatch() {
         let mut graph = Graph::default();
         graph.merge(&solo(), 0).expect("merge");
-        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        let claimed = graph
+            .claim(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim");
         graph.mark_dispatch_failed(&id("solo"), claimed[0].generation, "POST failed", 1_000);
         let ix = graph.node_ix(&id("solo")).expect("node");
         assert_eq!(graph.node(ix).status, Status::Pending);
         graph.edit_extra(ix, |extra| extra.not_before = 0);
         graph.refresh_ready(ix);
-        let reclaimed = graph.claim(45, 16, 2_000, 3_600_000).expect("reclaim");
+        let reclaimed = graph
+            .claim(&claim_settings(45, 16), 2_000, u32::MAX)
+            .expect("reclaim");
         assert_eq!(reclaimed.len(), 1);
         // The reclaim pass's settle never lands (an eviction, a lost
         // answer): a woken graph carries no settling set.
@@ -5091,7 +5117,9 @@ mod tests {
             .expect("request merge");
         // At +60 min: miss 100 × 60min == request 3000 × 2min; the
         // miss's earlier first_requested wins the tie.
-        let claimed = graph.claim(2, 16, 60 * 60_000, 3_600_000).expect("claim");
+        let claimed = graph
+            .claim(&claim_settings(2, 16), 60 * 60_000, u32::MAX)
+            .expect("claim");
         let ids: Vec<_> = claimed.iter().map(|claim| claim.task_id.clone()).collect();
         assert_eq!(
             ids,
@@ -5120,7 +5148,7 @@ mod tests {
 
     fn first_claim(graph: &mut Graph, now: i64) -> String {
         graph
-            .claim(1, 16, now, 3_600_000)
+            .claim(&claim_settings(45, 16), now, 1)
             .expect("claim")
             .remove(0)
             .task_id
@@ -5211,7 +5239,7 @@ mod tests {
         graph.set_floor(50);
         assert_eq!(
             graph
-                .claim(2, 16, 3_600_000, 3_600_000)
+                .claim(&claim_settings(2, 16), 3_600_000, u32::MAX)
                 .expect("claim")
                 .len(),
             1
@@ -5276,7 +5304,7 @@ mod tests {
             .expect("linux merge");
         let mut scans = 0;
         let claimed = graph
-            .claim_scanned(45, 0, 10_000, 3_600_000, &mut scans)
+            .claim_scanned(&claim_settings(45, 0), 10_000, u32::MAX, &mut scans)
             .expect("claim");
         assert_eq!(claimed.len(), 45);
         assert!(
@@ -5316,7 +5344,7 @@ mod tests {
             .expect("linux merge");
         let mut scans = 0;
         let claimed = graph
-            .claim_scanned(5, 2, 60_000, 3_600_000, &mut scans)
+            .claim_scanned(&claim_settings(5, 2), 60_000, u32::MAX, &mut scans)
             .expect("claim");
         let darwin = |claim: &Claimed| macos_ids.contains(&claim.task_id);
         assert_eq!(claimed.iter().filter(|claim| darwin(claim)).count(), 2);
@@ -5351,7 +5379,7 @@ mod tests {
             .expect("merge due");
         let mut scans = 0;
         let claimed = graph
-            .claim_scanned(30, 16, 10_000, 3_600_000, &mut scans)
+            .claim_scanned(&claim_settings(30, 16), 10_000, u32::MAX, &mut scans)
             .expect("claim");
         assert_eq!(claimed.len(), 30);
         assert!(scans <= 500 + 30 + 30, "scans {scans}");
@@ -5370,7 +5398,9 @@ mod tests {
             .expect("miss merge");
         // At +11M ms: preheat 10 × 11M = 110M outranks the miss's
         // 100 × 1M = 100M — the waited node wins eventually (stow#879).
-        let claimed = graph.claim(2, 16, 11_000_000, 3_600_000).expect("claim");
+        let claimed = graph
+            .claim(&claim_settings(2, 16), 11_000_000, u32::MAX)
+            .expect("claim");
         let ids: Vec<_> = claimed.iter().map(|claim| claim.task_id.clone()).collect();
         assert_eq!(ids, vec![id("low"), id("fresh")]);
     }
@@ -5393,7 +5423,9 @@ mod tests {
         assert_eq!(graph.state(ix).priority, queue::REQUEST_PRIORITY);
         assert_eq!(graph.state(ix).first_requested, 0);
         // Same class as the rival, but twice the wait — it leads.
-        let claimed = graph.claim(2, 16, 2_000, 3_600_000).expect("claim");
+        let claimed = graph
+            .claim(&claim_settings(2, 16), 2_000, u32::MAX)
+            .expect("claim");
         let ids: Vec<_> = claimed.iter().map(|claim| claim.task_id.clone()).collect();
         assert_eq!(ids, vec![id("shared"), id("rival")]);
     }
@@ -5412,7 +5444,9 @@ mod tests {
             .merge(&single("miss", SubmissionSource::CacheMiss), 0)
             .expect("miss merge");
         // 500 vs 100 at equal waits — the operations node leads.
-        let claimed = graph.claim(1, 16, 1_000, 3_600_000).expect("claim");
+        let claimed = graph
+            .claim(&claim_settings(1, 16), 1_000, u32::MAX)
+            .expect("claim");
         assert_eq!(claimed[0].task_id, id("ops"));
     }
 
@@ -5420,7 +5454,9 @@ mod tests {
     fn failure_retries_then_fails_and_blocks_dependents() {
         let mut graph = Graph::default();
         graph.merge(&chain(), 0).expect("merge");
-        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim c");
+        let claimed = graph
+            .claim(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim c");
         graph.bind(&id("c"), claimed[0].generation, 77, 1_000);
         for _ in 1..queue::MAX_BUILD_ATTEMPTS {
             graph.run_finished(
@@ -5432,7 +5468,9 @@ mod tests {
             assert_eq!(graph.node(ix).status, Status::Pending);
             graph.edit_extra(ix, |extra| extra.not_before = 0);
             graph.refresh_ready(ix);
-            let claimed = graph.claim(45, 16, 3_000, 3_600_000).expect("reclaim");
+            let claimed = graph
+                .claim(&claim_settings(45, 16), 3_000, u32::MAX)
+                .expect("reclaim");
             graph.bind(&id("c"), claimed[0].generation, 77, 4_000);
         }
         graph.run_finished(
@@ -5573,7 +5611,9 @@ mod tests {
         let mut graph = Graph::default();
         graph.merge(&chain(), 1_000).expect("merge");
         assert_pending_index(&graph);
-        let claimed = graph.claim(45, 16, 1_000, 3_600_000).expect("claim c");
+        let claimed = graph
+            .claim(&claim_settings(45, 16), 1_000, u32::MAX)
+            .expect("claim c");
         graph.bind(&id("c"), claimed[0].generation, 77, 1_000);
         assert_pending_index(&graph);
         for _ in 1..queue::MAX_BUILD_ATTEMPTS {
@@ -5586,7 +5626,9 @@ mod tests {
             let ix = graph.node_ix(&id("c")).expect("node");
             graph.edit_extra(ix, |extra| extra.not_before = 0);
             graph.refresh_ready(ix);
-            let claimed = graph.claim(45, 16, 3_000, 3_600_000).expect("reclaim");
+            let claimed = graph
+                .claim(&claim_settings(45, 16), 3_000, u32::MAX)
+                .expect("reclaim");
             graph.bind(&id("c"), claimed[0].generation, 77, 4_000);
         }
         graph.run_finished(
@@ -5628,7 +5670,9 @@ mod tests {
         assert_eq!(status.ready as usize, ready_count(&graph));
         assert!(status.ready > 0, "the pending rows are dispatchable");
 
-        let claimed = graph.claim(45, 16, 12_000, 3_600_000).expect("claim");
+        let claimed = graph
+            .claim(&claim_settings(45, 16), 12_000, u32::MAX)
+            .expect("claim");
         for (run, task) in (100u64..).zip(&claimed) {
             graph.bind(&task.task_id, task.generation, run, 12_000);
             graph.run_finished(&task.task_id, completion(run, true, false, None), 13_000);
@@ -5662,8 +5706,12 @@ mod tests {
     fn stale_lease_reclaims_dispatch() {
         let mut graph = Graph::default();
         graph.merge(&solo(), 0).expect("merge");
-        graph.claim(45, 16, 0, 3_600_000).expect("claim");
-        let claimed = graph.claim(45, 16, 4_000_000, 3_600_000).expect("stale");
+        graph
+            .claim(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim");
+        let claimed = graph
+            .claim(&claim_settings(45, 16), 4_000_000, u32::MAX)
+            .expect("stale");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].task_id, id("solo"));
     }
@@ -5690,7 +5738,9 @@ mod tests {
     fn snapshot_round_trip_preserves_state() {
         let mut graph = Graph::default();
         graph.merge(&chain(), 0).expect("merge");
-        graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        graph
+            .claim(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim");
         graph.run_finished(&id("c"), completion(100, true, false, None), 10_000);
         publish(&mut graph, "c");
         graph.meter.roll_to("2026-10-23");
@@ -5704,7 +5754,9 @@ mod tests {
         assert_eq!(restored.meter.rows_written, 0);
         assert_eq!(restored.meter.ops.get("test"), Some(&(1, 7, 11)));
         assert_eq!(restored.seeded_rows, Some(10_000));
-        let claimed = restored.claim(45, 16, 20_000, 3_600_000).expect("claim b");
+        let claimed = restored
+            .claim(&claim_settings(45, 16), 20_000, u32::MAX)
+            .expect("claim b");
         assert_eq!(claimed[0].task_id, id("b"));
         assert_eq!(claimed[0].payload.dependency_subgraph.nodes.len(), 1);
     }
@@ -5724,7 +5776,9 @@ mod tests {
     fn cancelled_completion_requeues_without_attempt() {
         let mut graph = Graph::default();
         graph.merge(&solo(), 0).expect("merge");
-        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        let claimed = graph
+            .claim(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim");
         graph.bind(&id("solo"), claimed[0].generation, 9, 1_000);
         let outcome = graph.run_finished(&id("solo"), completion(9, false, true, None), 2_000);
         assert_eq!(outcome, FinishOutcome::Applied);
@@ -5756,7 +5810,9 @@ mod tests {
             .expect("newer merge");
         // Same operand class: the rank reduces to time waited — the
         // older node leads regardless of downloads (stow#879).
-        let claimed = graph.claim(1, 16, 2_000, 3_600_000).expect("claim");
+        let claimed = graph
+            .claim(&claim_settings(1, 16), 2_000, u32::MAX)
+            .expect("claim");
         assert_eq!(claimed[0].task_id, id("older"));
     }
 
@@ -5829,7 +5885,12 @@ mod tests {
             },
             0,
         );
-        assert!(graph.claim(45, 16, 0, 3_600_000).expect("claim").is_empty());
+        assert!(
+            graph
+                .claim(&claim_settings(45, 16), 0, u32::MAX)
+                .expect("claim")
+                .is_empty()
+        );
         assert_eq!(
             graph.wake_plan(0, &queue::SchedulerSettings::default()),
             queue::AlarmPlan::Delete
@@ -5844,7 +5905,13 @@ mod tests {
             },
             0,
         );
-        assert_eq!(graph.claim(45, 16, 0, 3_600_000).expect("claim").len(), 1);
+        assert_eq!(
+            graph
+                .claim(&claim_settings(45, 16), 0, u32::MAX)
+                .expect("claim")
+                .len(),
+            1
+        );
     }
 
     /// A `solo` node claimed and moved to `running` by its accepted
