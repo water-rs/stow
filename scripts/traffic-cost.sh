@@ -59,6 +59,8 @@
 #                               edge lifecycle)
 #   STOW_TRAFFIC_RATE_SCALE     multiplier over the model's peak rates
 #                               (default 1.0)
+#   STOW_TRAFFIC_MAX_JOBS       override both probe and mock dispatch caps
+#   STOW_TRAFFIC_MAX_MACOS_JOBS override the mock macOS dispatch cap
 #   STOW_TRAFFIC_RUSTC          rustc the lanes request and the index
 #                               slice publishes under (default 1.85.0)
 #   STOW_TRAFFIC_EDGE_PORT      port `wrangler dev` binds (default 8788)
@@ -100,7 +102,12 @@ manifest_var() {
     [ -n "$value" ] || { echo "[traffic] ERROR: $2 not found in edge/$1" >&2; exit 1; }
     echo "$value"
 }
-DISPATCH_LIMIT="$(manifest_var Skyzen.toml STOW_MAX_CONCURRENT_JOBS)"
+DISPATCH_LIMIT="${STOW_TRAFFIC_MAX_JOBS:-$(manifest_var Skyzen.toml STOW_MAX_CONCURRENT_JOBS)}"
+MOCK_MAX_JOBS="${STOW_TRAFFIC_MAX_JOBS:-$(manifest_var Skyzen.mock.toml STOW_MAX_CONCURRENT_JOBS)}"
+MOCK_CAP_ARGS=(--var "STOW_MAX_CONCURRENT_JOBS:$MOCK_MAX_JOBS")
+if [ -n "${STOW_TRAFFIC_MAX_MACOS_JOBS:-}" ]; then
+    MOCK_CAP_ARGS+=(--var "STOW_MAX_CONCURRENT_MACOS_JOBS:$STOW_TRAFFIC_MAX_MACOS_JOBS")
+fi
 WEBHOOK_SECRET="$(manifest_var Skyzen.mock.toml STOW_GITHUB_WEBHOOK_SECRET)"
 APP_SLUG="$(manifest_var Skyzen.mock.toml GITHUB_APP_SLUG)"
 POW_SECRET="$(manifest_var Skyzen.mock.toml STOW_POW_CHALLENGE_SECRET)"
@@ -276,6 +283,7 @@ SEG_SECS=$((DURATION_SECS / SEGMENTS))
 [ "$SEG_SECS" -ge 60 ] || die "STOW_TRAFFIC_DURATION_SECS=$DURATION_SECS too small for $SEGMENTS segments"
 
 echo "[traffic] work dir: $WORK_DIR"
+echo "[traffic] dispatch caps: probe=$DISPATCH_LIMIT mock=$MOCK_MAX_JOBS macos=${STOW_TRAFFIC_MAX_MACOS_JOBS:-default}"
 
 if ! rustup target list --installed --toolchain "$RUSTUP_TOOLCHAIN" \
     | grep -qx wasm32-unknown-unknown; then
@@ -369,6 +377,7 @@ start_edge() {
     (
         cd "$REPO_ROOT/edge"
         exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
+            "${MOCK_CAP_ARGS[@]}" \
             --port "$EDGE_PORT" --inspector-port "$INSPECTOR_PORT" \
             --persist-to "$WORK_DIR/edge-state"
     ) >>"$LOG_DIR/edge.log" 2>&1 &
