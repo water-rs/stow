@@ -39,12 +39,11 @@ impl CfTransport {
 }
 
 /// The per-fetch cap every outbound CI call rides (stow#940): a
-/// `workflow_dispatch` POST now runs inside the `complete-run`
-/// webhook, which GitHub abandons at 10 s — a fetch gets 5 s, so even
-/// a bound of four sequential rounds cannot carry a request past the
-/// delivery window.
+/// `workflow_dispatch` POST runs inside the `complete-run` webhook.
+/// Both headers and body must finish within the fetch's five seconds;
+/// expiry aborts the network request and releases its outbound slot.
 #[cfg(target_arch = "wasm32")]
-const DISPATCH_FETCH_TIMEOUT_MS: u64 = 5_000;
+const DISPATCH_FETCH_TIMEOUT_MS: u32 = 5_000;
 
 #[cfg(target_arch = "wasm32")]
 impl CiTransport for CfTransport {
@@ -67,27 +66,23 @@ impl CiTransport for CfTransport {
             cf_http::bare_request(method, &request.url, &headers, request.body.as_deref())
                 .map_err(|error| DispatchError::Network(error.to_string()))?;
         let _slot = self.pool.slot().await;
-        // A `workflow_dispatch` POST rides a completion webhook's
-        // request under stow#940, whose 10 s GitHub delivery window
-        // bounds the whole pass: one fetch must finish well inside
-        // it. A timed-out fetch drops its pool slot and the claim
-        // takes the dispatch-failure backoff.
-        let fetch = CfFetch.request(&worker_request).into_send();
-        let timeout =
-            worker::Delay::from(std::time::Duration::from_millis(DISPATCH_FETCH_TIMEOUT_MS))
-                .into_send();
-        futures_util::pin_mut!(fetch);
-        futures_util::pin_mut!(timeout);
-        let response = match futures_util::future::select(fetch, timeout).await {
-            futures_util::future::Either::Left((response, _)) => response
-                .map(GuardedResponse::new)
-                .map_err(|error| DispatchError::Network(error.to_string()))?,
-            futures_util::future::Either::Right(((), _)) => {
-                return Err(DispatchError::Network(format!(
-                    "dispatch fetch exceeded {DISPATCH_FETCH_TIMEOUT_MS} ms"
-                )));
-            }
+        // The native signal stays attached through CfFetch's Request
+        // clone and response consumption. A Rust future race would only
+        // bound headers and would not abort the underlying fetch.
+        let worker_request = {
+            let init = web_sys::RequestInit::new();
+            init.set_signal(Some(&web_sys::AbortSignal::timeout_with_u32(
+                DISPATCH_FETCH_TIMEOUT_MS,
+            )));
+            web_sys::Request::new_with_request_and_init(worker_request.inner(), &init)
+                .map(worker::Request::from)
+                .map_err(|error| DispatchError::Network(worker::Error::from(error).to_string()))?
         };
+        let response = CfFetch
+            .request(&worker_request)
+            .await
+            .map(GuardedResponse::new)
+            .map_err(|error| DispatchError::Network(error.to_string()))?;
         let status = response.get_ref().status_code();
         // The contract reads only these headers; a `worker::Response`
         // exposes them by name rather than as an enumerable map.
@@ -100,16 +95,22 @@ impl CiTransport for CfTransport {
                     .map(|value| (name.to_owned(), value))
             })
             .collect();
-        let body = response
-            .into_inner()
-            .bytes()
+        // CI answers are buffered JSON. Native arrayBuffer avoids a
+        // per-chunk Wasm reader and its releaseLock rejection on abort.
+        let body = {
+            let response: web_sys::Response = response.into_inner().into();
+            response
+                .array_buffer()
+                .map_err(|error| DispatchError::Response(worker::Error::from(error).to_string()))?
+        };
+        let body = wasm_bindgen_futures::JsFuture::from(body)
             .into_send()
             .await
-            .map_err(|error| DispatchError::Response(error.to_string()))?;
+            .map_err(|error| DispatchError::Response(worker::Error::from(error).to_string()))?;
         Ok(CiResponse {
             status,
             headers,
-            body,
+            body: js_sys::Uint8Array::new(&body).to_vec(),
         })
     }
 }

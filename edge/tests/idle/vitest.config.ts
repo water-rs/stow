@@ -121,6 +121,26 @@ export default {
 				}
 				const runId = nextRunId++;
 				runs.set(runId, body.client_payload);
+				const name = body.client_payload.crate_name;
+				if (name === "timeout-headers") {
+					await new Promise((resolve) => setTimeout(resolve, 8000));
+				}
+				if (name === "timeout-body") {
+					let timer;
+					const stream = new ReadableStream({
+						start(controller) {
+							controller.enqueue(new TextEncoder().encode('{"workflow_run_id":'));
+							timer = setTimeout(() => {
+								controller.enqueue(new TextEncoder().encode(JSON.stringify(runId) + '}'));
+								controller.close();
+							}, 8000);
+						},
+						cancel() {
+							clearTimeout(timer);
+						},
+					});
+					return new Response(stream, { headers: { "content-type": "application/json" } });
+				}
 				return Response.json({
 					workflow_run_id: runId,
 					run_url: origin + "/runs/" + runId,

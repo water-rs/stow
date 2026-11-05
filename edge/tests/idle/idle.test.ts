@@ -249,6 +249,27 @@ async function expectQuiescent(
 }
 
 describe("scheduler idle proof (stow#593)", () => {
+	it.each(["timeout-headers", "timeout-body"])(
+		"dispatch aborts %s and leaves the task in retry backoff",
+		async (name) => {
+			const stub = await freshStub();
+			await reset(stub);
+			expect((await submit(stub, [enqueue(name)])).status).toBe(200);
+			await waitForStatus(stub, "dispatched");
+			await expect.poll(async () => {
+				const row = (await tasks(stub)).find((task) => task.crate_name === name)!;
+				return { status: row.status, run: row.github_run_id, attempts: row.dispatch_attempts };
+			}, { timeout: 6500, interval: 50 }).toEqual({
+				status: "pending", run: null, attempts: 1,
+			});
+			expect(await getAlarm(stub)).toBeGreaterThan(Date.now());
+			const recovery = `${name}-recovery`;
+			expect((await submit(stub, [enqueue(recovery)])).status).toBe(200);
+			expect(await waitForRun(stub, taskId(recovery))).not.toBeNull();
+		},
+		15_000,
+	);
+
 	it("empty scheduler: an armed alarm is deleted and never rescheduled", async () => {
 		const stub = await freshStub();
 		const report = await reset(stub);
