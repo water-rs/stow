@@ -482,6 +482,7 @@ LANE_ARGS=(
     --model "$REPO_ROOT/launch-model.toml"
     --queue-rows "$SMALL"
     --rustc "$RUSTC_VERSION"
+    --bundle-digest "$BUNDLE_DIGEST"
     --scheduler
     --webhook-secret "$WEBHOOK_SECRET"
     --pow-secret "$POW_SECRET"
@@ -490,7 +491,6 @@ LANE_ARGS=(
 echo "[traffic] Worker CPU per lane"
 CPU_FAILED=0
 fg admin --json traffic-cost cpu "${LANE_ARGS[@]}" \
-    --bundle-digest "$BUNDLE_DIGEST" \
     --inspector-url "$INSPECTOR_URL" \
     >"$REPORT_DIR/worker-cpu.json" 2>"$LOG_DIR/worker-cpu.log" \
     || {

@@ -805,7 +805,11 @@ pub fn build_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<V
                 rustc: args.rustc.clone(),
                 digest: args.bundle_digest.clone(),
             },
-            expected: ok_or_404,
+            expected: if args.bundle_digest.is_some() {
+                ok2xx
+            } else {
+                ok_or_404
+            },
         },
         Lane {
             name: "status-read",
@@ -905,14 +909,8 @@ mod tests {
 
     use super::{CallbackLane, LaneArgs, build_lanes, workflow_run_body};
 
-    /// The full lane set and the Worker CPU budget table name the same
-    /// lanes: a lane without a budget would be measured and never gated,
-    /// a budget without a lane would gate nothing.
-    #[test]
-    fn every_lane_has_a_cpu_budget_and_every_budget_a_lane() {
-        let model =
-            LaunchModel::from_toml(include_str!("../../../launch-model.toml")).expect("model");
-        let args = LaneArgs {
+    fn lane_args() -> LaneArgs {
+        LaneArgs {
             model: "launch-model.toml".into(),
             scheduler: true,
             webhook_secret: Some("secret".to_owned()),
@@ -922,7 +920,31 @@ mod tests {
             pow_secret: Some("secret".to_owned()),
             pow_min_bits: 12,
             bundle_digest: None,
-        };
+        }
+    }
+
+    #[test]
+    fn stored_bundle_lane_rejects_missing_fixture() {
+        let model =
+            LaunchModel::from_toml(include_str!("../../../launch-model.toml")).expect("model");
+        let mut args = lane_args();
+        args.lanes = vec!["bundle-fetch".to_owned()];
+        let lanes = build_lanes(&args, &model, 1.0).expect("miss lane");
+        assert!((lanes[0].expected)(404));
+        args.bundle_digest = Some(format!("sha256:{}", "a".repeat(64)));
+        let lanes = build_lanes(&args, &model, 1.0).expect("stored bundle lane");
+        assert!((lanes[0].expected)(200));
+        assert!(!(lanes[0].expected)(404));
+    }
+
+    /// The full lane set and the Worker CPU budget table name the same
+    /// lanes: a lane without a budget would be measured and never gated,
+    /// a budget without a lane would gate nothing.
+    #[test]
+    fn every_lane_has_a_cpu_budget_and_every_budget_a_lane() {
+        let model =
+            LaunchModel::from_toml(include_str!("../../../launch-model.toml")).expect("model");
+        let args = lane_args();
         let mut lanes: Vec<&str> = build_lanes(&args, &model, 1.0)
             .expect("lanes")
             .iter()
