@@ -183,24 +183,25 @@ impl ResolvePool {
         let (tx, rx) = mpsc::channel::<(usize, Result<R, String>)>();
         let work = &work;
         std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
             for resolver in resolvers {
                 let tx = tx.clone();
                 let next = &next;
                 let runtime = &self.runtime;
-                scope.spawn(move || {
+                handles.push(scope.spawn(move || {
                     loop {
                         let index = next.fetch_add(1, Ordering::Relaxed);
                         if index >= items.len() {
                             break;
                         }
                         // A panic is a bug, not an item failure:
-                        // `thread::scope` re-raises it at the join.
+                        // The explicit join preserves its original payload.
                         let result = work(resolver, runtime, &items[index]);
                         if tx.send((index, result)).is_err() {
                             break;
                         }
                     }
-                });
+                }));
             }
             drop(tx);
             // `rx` ends when every worker's sender dropped — that is the
@@ -208,6 +209,7 @@ impl ResolvePool {
             for (index, result) in rx {
                 on_item(index, &items[index], result);
             }
+            join_workers(handles);
         });
         Ok(())
     }
@@ -262,4 +264,40 @@ pub fn resolve_crate(
             downloads,
         ))
         .map_err(|error| format!("resolve {crate_name} {version}: {error:#}"))
+}
+
+/// Join every worker before propagating the first original panic.
+fn join_workers(handles: Vec<std::thread::ScopedJoinHandle<'_, ()>>) {
+    let mut failure = None;
+    for handle in handles {
+        if let Err(payload) = handle.join()
+            && failure.is_none()
+        {
+            failure = Some(payload);
+        }
+    }
+    if let Some(payload) = failure {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn worker_panic_payload_survives_scope() {
+        let completed = std::sync::atomic::AtomicBool::new(false);
+        let failure = std::panic::catch_unwind(|| {
+            std::thread::scope(|scope| {
+                let handles = vec![
+                    scope.spawn(|| std::panic::panic_any(73_u32)),
+                    scope.spawn(|| completed.store(true, std::sync::atomic::Ordering::Relaxed)),
+                    scope.spawn(|| std::panic::panic_any(91_u32)),
+                ];
+                super::join_workers(handles);
+            });
+        })
+        .expect_err("worker panic must remain fatal");
+        assert_eq!(failure.downcast_ref::<u32>(), Some(&73));
+        assert!(completed.load(std::sync::atomic::Ordering::Relaxed));
+    }
 }
