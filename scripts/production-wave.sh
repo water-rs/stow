@@ -136,6 +136,7 @@ require_command rustc
 require_command rustup
 require_command timeout
 require_command yq
+require_command python3
 
 # The production wave is the one preheat-admin.yml runs, so its defaults
 # come from that file rather than a copy here. preheat-cron.yml
@@ -212,3 +213,9 @@ done
     | tee "$LOG_DIR/production-wave.log" \
     || die "the production wave count failed — see $LANES_DIR/*/stderr.log"
 log "production wave: $WORK_DIR/production-wave.json"
+
+# Both lanes and their workers have exited. Free extracted sources and
+# checkouts, then let native tar save repeated immutable downloads as
+# hardlinks instead of packing a body for every resolver worker.
+python3 "$REPO_ROOT/scripts/compact-resolver-cache.py" \
+    "$RESOLVE_ROOT" "$WORK_DIR/resolver-cache.json"
