@@ -8,8 +8,8 @@
 //! the other:
 //!
 //! ```text
-//! monthly = releases/month × (wave cost per node × production nodes)
-//!         + days/month    × (resubmit cost per node × production nodes)
+//! monthly = releases/month × (wave cost per node × production nodes + wave trigger)
+//!         + days/month    × (resubmit cost per node × production nodes + daily trigger)
 //! ```
 //!
 //! The per-node costs are the report's measured phase totals over the
@@ -20,16 +20,20 @@
 //! `build-crate.yml` run — so the measured per-node cost already
 //! carries the completion its node pays.
 //!
-//! Only the scheduler Durable Object is measured: its billed calls and
-//! rows. Every other product dimension is reported as not measured and
-//! never priced at zero.
+//! Scheduler calls and rows are measured. Worker requests follow the
+//! production delivery contract, including workflows the local mock
+//! does not deliver. Trigger costs are fixed per wave, not per node.
+//! CPU and Durable Object duration remain unmeasured.
 
+use stow_types::forwards::RunForwards;
 use stow_types::launch_model::LaunchModel;
-use stow_types::preheat_cost::{PhaseCost, PreheatCostReport, ProductionWave};
+use stow_types::preheat_cost::{EventKind, PhaseCost, PreheatCostReport, ProductionWave};
 
 /// A phase's measured cost per node of the wave that measured it.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct PerNode {
+    /// Worker requests, including each build and index run's deliveries.
+    pub worker_requests: f64,
     /// Durable Object calls the phase was billed.
     pub requests: f64,
     /// Durable Object `rowsRead`.
@@ -44,19 +48,51 @@ impl PerNode {
         clippy::cast_precision_loss,
         reason = "measured counters fit f64 exactly past any wave"
     )]
-    fn of(phase: &PhaseCost, nodes: u64) -> Self {
+    fn of(phase: &PhaseCost, nodes: u64) -> Result<Self, String> {
+        if !phase.other_ops.is_empty() {
+            return Err(format!(
+                "preheat Worker request count has unsupported operations: {:?}",
+                phase.other_ops
+            ));
+        }
+        let deliveries = f64::from(RunForwards::DELIVERIES);
+        let worker_requests: f64 = phase
+            .kinds
+            .iter()
+            .map(|cost| {
+                let requests = match cost.kind {
+                    EventKind::Submit => 1.0,
+                    EventKind::Completion => deliveries,
+                    EventKind::SliceReport => 1.0 + deliveries,
+                    // Alarms invoke the object directly. An external
+                    // in_progress delivery is already in its completed
+                    // build run's lifecycle, not another lifecycle.
+                    EventKind::Dispatch | EventKind::ExternalRunUpdate => 0.0,
+                };
+                cost.events as f64 * requests
+            })
+            .sum();
         let nodes = nodes as f64;
-        Self {
+        Ok(Self {
+            worker_requests: worker_requests / nodes,
             requests: phase.requests() as f64 / nodes,
             rows_read: phase.rows_read as f64 / nodes,
             rows_written: phase.rows_written as f64 / nodes,
-        }
+        })
     }
 }
 
 /// What preheat adds to a month.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct PreheatMonthly {
+    /// Scheduler dispatch call made by the new-release webhook.
+    pub wave_trigger_do_requests: f64,
+    /// Scheduler dispatch call made by the daily scheduled tick.
+    pub resubmit_trigger_do_requests: f64,
+    /// New-release webhook plus the preheat-admin run's deliveries.
+    pub wave_trigger_worker_requests: f64,
+    /// Scheduled tick plus preheat-cron and preheat-admin deliveries.
+    pub resubmit_trigger_worker_requests: f64,
     /// Nodes the reduced wave submitted — the denominator of the
     /// per-node costs.
     pub measured_nodes: u64,
@@ -83,7 +119,8 @@ impl PreheatMonthly {
     ///
     /// # Errors
     /// The report measured no nodes, or the production lanes planned none
-    /// — either leaves nothing to scale.
+    /// — either leaves nothing to scale — or a phase contains an
+    /// operation without a production Worker-request mapping.
     pub fn new(
         model: &LaunchModel,
         report: &PreheatCostReport,
@@ -98,12 +135,17 @@ impl PreheatMonthly {
             return Err("production wave planned 0 nodes".to_owned());
         }
         Ok(Self {
+            wave_trigger_do_requests: 1.0,
+            resubmit_trigger_do_requests: 1.0,
+            wave_trigger_worker_requests: 1.0 + f64::from(RunForwards::DELIVERIES),
+            resubmit_trigger_worker_requests: 2.0_f64
+                .mul_add(f64::from(RunForwards::DELIVERIES), 1.0),
             measured_nodes: report.nodes,
             production_nodes: production.nodes,
             releases_per_month: model.monthly_stable_releases(),
             resubmits_per_month: model.monthly_resubmits(),
-            wave: PerNode::of(&report.wave, report.nodes),
-            resubmit: PerNode::of(&report.resubmit, report.nodes),
+            wave: PerNode::of(&report.wave, report.nodes)?,
+            resubmit: PerNode::of(&report.resubmit, report.nodes)?,
             wave_tasks: report.wave.tasks,
             resubmit_tasks: report.resubmit.tasks,
         })
@@ -116,16 +158,26 @@ impl PreheatMonthly {
         reason = "node counts fit f64 exactly past any wave"
     )]
     pub fn monthly(&self, product: &str, dimension: &str) -> Option<f64> {
-        let pick: fn(&PerNode) -> f64 = match (product, dimension) {
-            ("durable_objects", "requests") => |cost| cost.requests,
-            ("durable_objects", "rows_read") => |cost| cost.rows_read,
-            ("durable_objects", "rows_written") => |cost| cost.rows_written,
-            _ => return None,
-        };
+        let (pick, wave_fixed, resubmit_fixed): (fn(&PerNode) -> f64, f64, f64) =
+            match (product, dimension) {
+                ("workers", "requests") => (
+                    |cost| cost.worker_requests,
+                    self.wave_trigger_worker_requests,
+                    self.resubmit_trigger_worker_requests,
+                ),
+                ("durable_objects", "requests") => (
+                    |cost| cost.requests,
+                    self.wave_trigger_do_requests,
+                    self.resubmit_trigger_do_requests,
+                ),
+                ("durable_objects", "rows_read") => (|cost| cost.rows_read, 0.0, 0.0),
+                ("durable_objects", "rows_written") => (|cost| cost.rows_written, 0.0, 0.0),
+                _ => return None,
+            };
         let nodes = self.production_nodes as f64;
         Some(self.resubmits_per_month.mul_add(
-            pick(&self.resubmit) * nodes,
-            self.releases_per_month * (pick(&self.wave) * nodes),
+            pick(&self.resubmit).mul_add(nodes, resubmit_fixed),
+            self.releases_per_month * pick(&self.wave).mul_add(nodes, wave_fixed),
         ))
     }
 }
@@ -137,7 +189,7 @@ pub fn not_measured(product: &str, dimension: &str) -> &'static str {
         ("durable_objects", "duration_gb_s") => {
             "the report carries the harness's phase wall, not Durable Object duration"
         }
-        _ => "the report prices the scheduler Durable Object only",
+        _ => "the report counts requests and scheduler rows, not preheat Worker CPU",
     }
 }
 
@@ -228,7 +280,7 @@ mod tests {
         let requests = preheat
             .monthly("durable_objects", "requests")
             .expect("measured");
-        let expected = (model.monthly_stable_releases() + 30.0) * 2.0 * 5_000.0;
+        let expected = (model.monthly_stable_releases() + 30.0) * 10_001.0;
         assert!((requests - expected).abs() < 1e-6, "{requests}");
     }
 
@@ -241,15 +293,87 @@ mod tests {
         assert!((large.unwrap() / small.unwrap() - 10.0).abs() < 1e-9);
     }
 
+    #[test]
+    fn worker_requests_follow_production_lifecycles() {
+        use stow_types::preheat_cost::{EventKind, KindCost};
+
+        let mut report = test_report(10);
+        report.wave.kinds = [
+            (EventKind::Submit, 2),
+            (EventKind::Dispatch, 500),
+            (EventKind::Completion, 10),
+            (EventKind::SliceReport, 3),
+            (EventKind::ExternalRunUpdate, 4),
+        ]
+        .into_iter()
+        .map(|(kind, events)| KindCost {
+            kind,
+            events,
+            rows_read: 0,
+            rows_written: 0,
+        })
+        .collect();
+        report.resubmit.kinds.clear();
+        let preheat =
+            PreheatMonthly::new(&model(), &report, &test_production(1_000)).expect("scale");
+        // Two submits, ten complete build lifecycles, three report +
+        // index-run lifecycles. Neither alarms nor in_progress adds
+        // another Worker lifecycle.
+        assert!((preheat.wave.worker_requests - 4.4).abs() < 1e-12);
+        assert_eq!(preheat.resubmit.worker_requests, 0.0);
+        let expected = preheat
+            .resubmits_per_month
+            .mul_add(7.0, preheat.releases_per_month * 4_404.0);
+        let requests = preheat.monthly("workers", "requests").expect("counted");
+        assert!((requests - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trigger_requests_do_not_scale_with_nodes() {
+        let mut report = test_report(10);
+        report.wave.kinds.clear();
+        report.resubmit.kinds.clear();
+        let small = PreheatMonthly::new(&model(), &report, &test_production(10)).expect("small");
+        let large =
+            PreheatMonthly::new(&model(), &report, &test_production(10_000)).expect("large");
+        assert_eq!(
+            small.monthly("workers", "requests"),
+            large.monthly("workers", "requests")
+        );
+        assert!(small.monthly("workers", "requests").unwrap() > 0.0);
+        let scheduler_requests = small.monthly("durable_objects", "requests");
+        assert_eq!(
+            scheduler_requests,
+            large.monthly("durable_objects", "requests")
+        );
+        assert_eq!(
+            scheduler_requests,
+            Some(small.releases_per_month + small.resubmits_per_month)
+        );
+    }
+
+    #[test]
+    fn unknown_phase_operations_refuse_projection() {
+        let mut report = test_report(10);
+        report
+            .resubmit
+            .other_ops
+            .push(stow_types::api::SchedulerLedgerOp {
+                op: "POST /unknown".to_owned(),
+                events: 1,
+                rows_read: 0,
+                rows_written: 0,
+            });
+        let error = PreheatMonthly::new(&model(), &report, &test_production(10))
+            .expect_err("unknown operation");
+        assert!(error.contains("POST /unknown"), "{error}");
+    }
+
     /// A dimension the report does not measure is absent, never zero.
     #[test]
     fn unmeasured_products_have_no_preheat_usage() {
         let preheat = monthly(50, 50);
-        for (product, dimension) in [
-            ("durable_objects", "duration_gb_s"),
-            ("workers", "requests"),
-            ("workers", "cpu_ms"),
-        ] {
+        for (product, dimension) in [("durable_objects", "duration_gb_s"), ("workers", "cpu_ms")] {
             assert_eq!(preheat.monthly(product, dimension), None);
             assert_ne!(not_measured(product, dimension), "");
         }
