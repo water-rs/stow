@@ -66,6 +66,8 @@ pub(super) fn fixture_cpu(scale: impl Fn(&str) -> f64) -> WorkerCpuReport {
         sampling_interval_us: 100,
         idle_window_ms: 3000,
         idle_cpu_ms: 0.0,
+        profiles: Vec::new(),
+        scripts: Vec::new(),
         reference: ReferenceCpu {
             rounds_before: vec![FIXTURE_REFERENCE_CPU_MS],
             rounds_after: vec![FIXTURE_REFERENCE_CPU_MS],
