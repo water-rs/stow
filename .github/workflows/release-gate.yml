@@ -322,6 +322,8 @@ jobs:
           restore-keys: |
             production-wave-cargo-${{ runner.os }}-${{ steps.rustc-version.outputs.version }}-
             production-wave-cargo-${{ runner.os }}-
+      - name: Check resolver cache compaction
+        run: python3 -m unittest discover -s scripts -p test_compact_resolver_cache.py -v
       - run: scripts/production-wave.sh
         env:
           STOW_PRODUCTION_WAVE_WORK_DIR: ${{ runner.temp }}/stow-production-wave
@@ -335,7 +337,9 @@ jobs:
         if: always()
         with:
           name: production-wave
-          path: ${{ runner.temp }}/stow-production-wave/production-wave.json
+          path: |
+            ${{ runner.temp }}/stow-production-wave/production-wave.json
+            ${{ runner.temp }}/stow-production-wave/resolver-cache.json
           if-no-files-found: ignore
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure() || cancelled()
