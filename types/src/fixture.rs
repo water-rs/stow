@@ -56,34 +56,11 @@ impl FixtureShape {
     /// throughput, which the scale check must not let grow with the
     /// stored bulk.
     pub const LAST_24H_ROWS: u32 = 3_000;
-    /// The pending rows the fixture plants as dispatch-eligible — a
-    /// fixed window just above the human lane, each with its edges met,
-    /// so the dispatch claim has claimable rows to pick at any fixture
-    /// size. Held constant because the claimable population itself is a
-    /// fixture input: an eligible set that grows with the queue would
-    /// make the claimed set's dependency closure — and the dependents a
-    /// purge or a dep expansion walks — a function of stored bulk
-    /// instead of the claim's own bound (stow#588).
-    ///
-    /// Sized so one dispatch pass cannot drain it and so the pass can
-    /// reach its own bound: the claimable population is the window
-    /// minus its parked `n % 20 = 1` rows — the human pins are parked
-    /// behind `not_before` and no longer count — which must (a) exceed
-    /// the most tasks a pass can claim — one per free slot, so the
-    /// slots the in-flight rows leave free — and (b) feed that bound,
-    /// not just exceed it. The floored pass admits only rows whose
-    /// operand (its priority, stow#879) clears the floor — the
-    /// window's stored demand is what lifts its rows past it — so the
-    /// window must hold more than one full pass of claimable rows.
-    /// At 640 the family spread gives the window about 142 Windows
-    /// rows, of which the `n % 20 = 1` park leaves ~135 claimable —
-    /// every one ahead of every bulk Windows row on the window's
-    /// stored demand — so a pass fills from the window alone at any
-    /// size. A window a pass can empty would let the claim reach rows
-    /// an earlier drive left claimable, and the walk would then move
-    /// with the drives' order instead of the fixture's shape. The
-    /// edge's `planted_window_exceeds_one_full_pass` test holds the
-    /// bound against the scheduler's defaults.
+    /// Minimum dispatch-eligible window above the human lane. The edge
+    /// expands this window to retain two passes for the configured
+    /// runner capacity, excluding blocked rows and respecting the target
+    /// distribution. Capacity stays fixed across queue sizes, so the
+    /// cost comparison changes stored bulk alone.
     pub const DISPATCH_ELIGIBLE_ROWS: u32 = 640;
 
     /// Rows `1..=pending_end` are `pending` — 60% of the queue.

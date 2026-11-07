@@ -47,6 +47,8 @@ const ERROR_RATE_BOUND: f64 = 0.01;
 struct LaneStats {
     /// Requests the lane fired.
     requests: u64,
+    /// Minimum whole requests required by the configured rate and duration.
+    required_requests: u64,
     /// The rate it actually drove.
     effective_eps: f64,
     /// Median latency in milliseconds.
@@ -83,8 +85,9 @@ struct LoadReport {
 }
 
 /// Fire `fire` every `interval` until `duration` elapses — the pacing
-/// loop every lane runs. Beats are anchored to each event's start (a
-/// response slower than the interval waits nothing), but the tail
+/// loop every lane runs. Beats are anchored to the run's start, so a
+/// delayed response does not shift every later beat. A response slower
+/// than the interval waits nothing, and the tail
 /// sleep wakes AT the deadline rather than running on to the next
 /// beat: under the launch model's slowest lanes the rate floor
 /// (0.005eps) makes the interval 200s, so a lane that fired at 0/200/400
@@ -96,17 +99,18 @@ struct LoadReport {
 /// error-share gate. The clock is `tokio::time`'s so the boundary
 /// cases run under a paused clock.
 async fn run_paced(interval: Duration, duration: Duration, mut fire: impl AsyncFnMut(u64)) {
-    let deadline = tokio::time::Instant::now() + duration;
+    let mut next = tokio::time::Instant::now();
+    let deadline = next + duration;
     let mut counter = 0u64;
     loop {
-        let fired = tokio::time::Instant::now();
         fire(counter).await;
         counter += 1;
         let now = tokio::time::Instant::now();
         if now >= deadline {
             break;
         }
-        let wake = (fired + interval).min(deadline);
+        next += interval;
+        let wake = next.min(deadline);
         if now < wake {
             tokio::time::sleep_until(wake).await;
         }
@@ -114,6 +118,17 @@ async fn run_paced(interval: Duration, duration: Duration, mut fire: impl AsyncF
             break;
         }
     }
+}
+
+/// Whole requests due during the measurement window. Rounding down
+/// permits only the fractional request at the boundary, not a rate deficit.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "positive finite lane rates and bounded measurement duration"
+)]
+fn required_requests(eps: f64, duration: Duration) -> u64 {
+    (eps * duration.as_secs_f64()).floor() as u64
 }
 
 /// Run one lane to the deadline, pacing at `eps`.
@@ -125,7 +140,10 @@ async fn run_paced(interval: Duration, duration: Duration, mut fire: impl AsyncF
 )]
 async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> Result<LaneStats, String> {
     let mut client = zenwave::client();
-    let mut stats = LaneStats::default();
+    let mut stats = LaneStats {
+        required_requests: required_requests(lane.eps, duration),
+        ..LaneStats::default()
+    };
     // A lane the harness cannot make fireable stops firing and fails the
     // pass: an event fired anyway would be a different path than the one
     // the lane prices.
@@ -223,6 +241,12 @@ pub async fn run(edge: &Edge, args: &PeakArgs, output: Output) -> stow_types::er
     let mut lanes_map = BTreeMap::new();
     let mut breaches = Vec::new();
     for (lane, stats) in lanes.iter().zip(results) {
+        if stats.requests < stats.required_requests {
+            breaches.push(format!(
+                "{}: sent {} requests, below {} required at {:.6} eps",
+                lane.name, stats.requests, stats.required_requests, lane.eps
+            ));
+        }
         let total = stats.requests.max(1) as f64;
         let error_share = (stats.transport_errors + stats.server_errors) as f64 / total;
         if error_share > ERROR_RATE_BOUND {
@@ -325,7 +349,7 @@ fn render_report(report: &LoadReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Duration, run_paced};
+    use super::{Duration, required_requests, run_paced};
     use tokio::time::Instant;
 
     /// Run `run_paced` under the paused clock and return every event's
@@ -346,6 +370,13 @@ mod tests {
         })
         .await;
         (seen, Instant::now() - start)
+    }
+
+    #[test]
+    fn rate_requirement_rounds_only_the_partial_request() {
+        assert_eq!(required_requests(0.005, Duration::from_secs(450)), 2);
+        assert_eq!(required_requests(9.0, Duration::from_secs(450)), 4050);
+        assert_eq!(required_requests(0.005, Duration::from_secs(45)), 0);
     }
 
     /// The defect this fixes: a 0.005eps lane (200s interval) in a 450s
@@ -400,8 +431,27 @@ mod tests {
         assert_eq!(elapsed, Duration::from_secs(30));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn delayed_event_does_not_shift_later_beats() {
+        let start = Instant::now();
+        let mut fires = Vec::new();
+        run_paced(
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            async |counter| {
+                fires.push(Instant::now() - start);
+                if counter == 0 {
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                }
+            },
+        )
+        .await;
+        assert_eq!(fires, [0, 1200, 2000, 3000].map(Duration::from_millis));
+        assert_eq!(Instant::now() - start, Duration::from_secs(4));
+    }
+
     /// An event slower than the interval waits nothing before the next
-    /// fire — pacing anchors to the fire's start — and an in-flight
+    /// fire, and an in-flight
     /// event at the deadline completes instead of being cut (cancelling
     /// would report a fake transport error).
     #[tokio::test(start_paused = true)]
@@ -412,6 +462,7 @@ mod tests {
             Duration::from_millis(1500),
         )
         .await;
+        assert!((fires.len() as u64) < required_requests(1.0, Duration::from_secs(4)));
         assert_eq!(
             fires,
             [0, 1500, 3000].map(Duration::from_millis),

@@ -478,6 +478,9 @@ struct ProfileNode {
 #[serde(rename_all = "camelCase")]
 struct CallFrame {
     function_name: String,
+    url: String,
+    line_number: i64,
+    column_number: i64,
 }
 
 /// CPU milliseconds a profile holds: its non-`(idle)` samples times the
@@ -504,6 +507,7 @@ fn profile_cpu_ms(profile: &CpuProfile) -> f64 {
 /// Profile whatever `work` drives and return the profile's CPU ms.
 async fn profiled(
     inspector: &Inspector,
+    label: &str,
     work: impl AsyncFnOnce() -> stow_types::error::Result<()>,
 ) -> stow_types::error::Result<f64> {
     inspector
@@ -521,6 +525,39 @@ async fn profiled(
             .ok_or_else(|| stow_error!("Profiler.stop returned no profile"))?,
     )
     .map_err(|error| stow_error!("decode the CPU profile: {error}"))?;
+    let names: std::collections::BTreeMap<_, _> = profile
+        .nodes
+        .iter()
+        .map(|node| {
+            let frame = &node.call_frame;
+            let name = if frame.function_name.is_empty() {
+                format!(
+                    "{}:{}:{}",
+                    frame.url, frame.line_number, frame.column_number
+                )
+            } else {
+                frame.function_name.clone()
+            };
+            (node.id, name)
+        })
+        .collect();
+    let mut counts = std::collections::BTreeMap::<&str, u64>::new();
+    for sample in &profile.samples {
+        let name = names
+            .get(sample)
+            .ok_or_else(|| stow_error!("CPU sample names absent profile node {sample}"))?;
+        if *name != "(idle)" {
+            *counts.entry(name.as_str()).or_default() += 1;
+        }
+    }
+    let mut hotspots: Vec<_> = counts.into_iter().collect();
+    hotspots.sort_unstable_by_key(|(_, samples)| std::cmp::Reverse(*samples));
+    hotspots.truncate(10);
+    tracing::info!(
+        label,
+        ?hotspots,
+        "Worker CPU profile hotspots (function, samples)"
+    );
     Ok(profile_cpu_ms(&profile))
 }
 
@@ -594,7 +631,7 @@ async fn measure_lane(
     let mut rounds_cpu_ms = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
         ready(lane, edge, args.events_per_round).await?;
-        let cpu_ms = profiled(inspector, async || {
+        let cpu_ms = profiled(inspector, lane.name, async || {
             fire_events(lane, edge, &mut client, &mut counter, args.events_per_round).await
         })
         .await?;
@@ -613,7 +650,12 @@ async fn measure_reference(inspector: &Inspector) -> stow_types::error::Result<V
     inspector.run_reference().await?;
     let mut rounds_ms = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
-        rounds_ms.push(profiled(inspector, async || inspector.run_reference().await).await?);
+        rounds_ms.push(
+            profiled(inspector, "reference", async || {
+                inspector.run_reference().await
+            })
+            .await?,
+        );
     }
     Ok(rounds_ms)
 }
@@ -644,7 +686,7 @@ pub async fn run(edge: &Edge, args: &CpuArgs, output: Output) -> stow_types::err
         )
         .await?;
 
-    let idle_cpu_ms = profiled(&inspector, async || {
+    let idle_cpu_ms = profiled(&inspector, "idle", async || {
         tokio::time::sleep(IDLE_WINDOW).await;
         Ok(())
     })
@@ -801,10 +843,10 @@ mod tests {
     fn idle_samples_do_not_count() {
         let profile: CpuProfile = serde_json::from_value(serde_json::json!({
             "nodes": [
-                {"id": 1, "callFrame": {"functionName": "(root)"}},
-                {"id": 2, "callFrame": {"functionName": "(idle)"}},
-                {"id": 3, "callFrame": {"functionName": "fetch"}},
-                {"id": 4, "callFrame": {"functionName": "(garbage collector)"}},
+                {"id": 1, "callFrame": {"functionName": "(root)", "url": "", "lineNumber": -1, "columnNumber": -1}},
+                {"id": 2, "callFrame": {"functionName": "(idle)", "url": "", "lineNumber": -1, "columnNumber": -1}},
+                {"id": 3, "callFrame": {"functionName": "fetch", "url": "", "lineNumber": -1, "columnNumber": -1}},
+                {"id": 4, "callFrame": {"functionName": "(garbage collector)", "url": "", "lineNumber": -1, "columnNumber": -1}},
             ],
             "samples": [2, 3, 3, 2, 4, 3],
             "timeDeltas": [100, 100, 9000, 100, 100, 100],

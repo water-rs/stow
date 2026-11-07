@@ -30,7 +30,8 @@ use std::sync::{Arc, Mutex};
 use skyzen_services::durable::{Alarm, DurableDb};
 use stow_types::api::{
     CI_TARGET_TRIPLES, DispatchBinding, DispatchClaim, MutationKind, PublishedSlice, QueueSelector,
-    QueueTaskStatus, SchedulerEvent, SubmissionSource, SubmissionTree, SubmitTaskIdEntry,
+    QueueTaskStatus, RunnerFamily, SchedulerEvent, SubmissionSource, SubmissionTree,
+    SubmitTaskIdEntry,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -756,6 +757,16 @@ async fn admit_request_drive(
 }
 
 // ===== The dispatch passes =====
+
+fn occupied_slots(ctx: &DriveContext) -> (u32, u32) {
+    ctx.loaded().with(|graph| {
+        let (total, macos) = graph.inflight();
+        (
+            total + graph.external_total(),
+            macos + graph.external_family(RunnerFamily::MacOs),
+        )
+    })
+}
 
 /// One dispatch pass exactly as `run_alarm` runs it, minus the metering
 /// tail. On workerd the real `dispatch_pass` (stale recovery, the claim,
@@ -2480,7 +2491,17 @@ pub const DRIVES: &[Drive] = &[
         setup: None,
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
+                let (occupied_before, macos_before) = occupied_slots(ctx);
                 let task_ids = pass(db, settings, ctx).await?;
+                let (occupied_after, macos_after) = occupied_slots(ctx);
+                tracing::info!(
+                    occupied_before,
+                    macos_before,
+                    occupied_after,
+                    macos_after,
+                    claimed = task_ids.len(),
+                    "budget dispatch occupancy"
+                );
                 ctx.record_claimed(task_ids);
                 let _plan = routes::wake_plan(ctx.loaded(), settings, now_ms());
                 Ok(())
@@ -2554,7 +2575,7 @@ pub const DRIVES: &[Drive] = &[
         }),
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
-                let (inflight, macos_inflight) = ctx.loaded().with(|graph| graph.inflight());
+                let (inflight, macos_inflight) = occupied_slots(ctx);
                 routes::commit_as(
                     ctx.loaded(),
                     db,
@@ -2771,7 +2792,7 @@ pub const DRIVES: &[Drive] = &[
         }),
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
-                let (inflight, _) = ctx.loaded().with(|graph| graph.inflight());
+                let (inflight, _) = occupied_slots(ctx);
                 let saturated = SchedulerSettings {
                     dispatch: queue::Dispatch::from_max_concurrent_jobs(inflight),
                     ..*settings

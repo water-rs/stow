@@ -59,6 +59,8 @@
 #                               edge lifecycle)
 #   STOW_TRAFFIC_RATE_SCALE     multiplier over the model's peak rates
 #                               (default 1.0)
+#   STOW_TRAFFIC_MAX_JOBS       override both probe and mock dispatch caps
+#   STOW_TRAFFIC_MAX_MACOS_JOBS override the mock macOS dispatch cap
 #   STOW_TRAFFIC_RUSTC          rustc the lanes request and the index
 #                               slice publishes under (default 1.85.0)
 #   STOW_TRAFFIC_EDGE_PORT      port `wrangler dev` binds (default 8788)
@@ -100,7 +102,12 @@ manifest_var() {
     [ -n "$value" ] || { echo "[traffic] ERROR: $2 not found in edge/$1" >&2; exit 1; }
     echo "$value"
 }
-DISPATCH_LIMIT="$(manifest_var Skyzen.toml STOW_MAX_CONCURRENT_JOBS)"
+DISPATCH_LIMIT="${STOW_TRAFFIC_MAX_JOBS:-$(manifest_var Skyzen.toml STOW_MAX_CONCURRENT_JOBS)}"
+MOCK_MAX_JOBS="${STOW_TRAFFIC_MAX_JOBS:-$(manifest_var Skyzen.mock.toml STOW_MAX_CONCURRENT_JOBS)}"
+MOCK_CAP_ARGS=(--var "STOW_MAX_CONCURRENT_JOBS:$MOCK_MAX_JOBS")
+if [ -n "${STOW_TRAFFIC_MAX_MACOS_JOBS:-}" ]; then
+    MOCK_CAP_ARGS+=(--var "STOW_MAX_CONCURRENT_MACOS_JOBS:$STOW_TRAFFIC_MAX_MACOS_JOBS")
+fi
 WEBHOOK_SECRET="$(manifest_var Skyzen.mock.toml STOW_GITHUB_WEBHOOK_SECRET)"
 APP_SLUG="$(manifest_var Skyzen.mock.toml GITHUB_APP_SLUG)"
 POW_SECRET="$(manifest_var Skyzen.mock.toml STOW_POW_CHALLENGE_SECRET)"
@@ -276,6 +283,7 @@ SEG_SECS=$((DURATION_SECS / SEGMENTS))
 [ "$SEG_SECS" -ge 60 ] || die "STOW_TRAFFIC_DURATION_SECS=$DURATION_SECS too small for $SEGMENTS segments"
 
 echo "[traffic] work dir: $WORK_DIR"
+echo "[traffic] dispatch caps: probe=$DISPATCH_LIMIT mock=$MOCK_MAX_JOBS macos=${STOW_TRAFFIC_MAX_MACOS_JOBS:-default}"
 
 if ! rustup target list --installed --toolchain "$RUSTUP_TOOLCHAIN" \
     | grep -qx wasm32-unknown-unknown; then
@@ -348,6 +356,9 @@ fg in_dir "$REPO_ROOT/edge" \
     >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
 rm -f "$MOCK_MANIFEST"
+# Preserve the generated source locations named by the V8 CPU profile.
+cp "$REPO_ROOT/edge/stable-worker.js" "$LOG_DIR/stable-worker.js"
+cp "$REPO_ROOT/edge/stable-worker_bg.js" "$LOG_DIR/stable-worker_bg.js"
 # Wrangler writes its own ISO-timestamped log to WRANGLER_LOG_PATH.
 mkdir -p "$LOG_DIR/wrangler"
 export WRANGLER_LOG_PATH="$LOG_DIR/wrangler"
@@ -369,6 +380,7 @@ start_edge() {
     (
         cd "$REPO_ROOT/edge"
         exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
+            "${MOCK_CAP_ARGS[@]}" \
             --port "$EDGE_PORT" --inspector-port "$INSPECTOR_PORT" \
             --persist-to "$WORK_DIR/edge-state"
     ) >>"$LOG_DIR/edge.log" 2>&1 &
@@ -470,18 +482,27 @@ LANE_ARGS=(
     --model "$REPO_ROOT/launch-model.toml"
     --queue-rows "$SMALL"
     --rustc "$RUSTC_VERSION"
+    --bundle-digest "$BUNDLE_DIGEST"
     --scheduler
     --webhook-secret "$WEBHOOK_SECRET"
     --pow-secret "$POW_SECRET"
 )
 
 echo "[traffic] Worker CPU per lane"
+CPU_FAILED=0
 fg admin --json traffic-cost cpu "${LANE_ARGS[@]}" \
-    --bundle-digest "$BUNDLE_DIGEST" \
     --inspector-url "$INSPECTOR_URL" \
     >"$REPORT_DIR/worker-cpu.json" 2>"$LOG_DIR/worker-cpu.log" \
-    || { cat "$LOG_DIR/worker-cpu.log" >&2; \
-         die "Worker CPU pass failed — see $REPORT_DIR/worker-cpu.json"; }
+    || {
+        cat "$LOG_DIR/worker-cpu.log" >&2
+        # A completed measurement can breach its budget without making
+        # the independent peak and post-load measurements unusable.
+        # Inspector, reference and transport errors produce no report.
+        jq -e 'any(.rows[]; .over_budget)' "$REPORT_DIR/worker-cpu.json" >/dev/null \
+            || die "Worker CPU measurement failed — see $LOG_DIR/worker-cpu.log"
+        CPU_FAILED=1
+        echo "[traffic] Worker CPU budget failed; collecting peak and post-load evidence before failing" >&2
+    }
 jq -r '"Worker CPU per event (idle window \(.idle_window_ms) ms collected \(.idle_cpu_ms) ms):",
        "  reference workload \(.reference.cpu_ms * 100 | round / 100) ms (before \(.reference.rounds_before | map(. * 100 | round / 100)), after \(.reference.rounds_after | map(. * 100 | round / 100)))",
        (.rows[] | "  \(.lane | . + " " * (20 - length)) \(.cpu_ms * 100 | round / 100) ms = \(.relative_cpu * 10000 | round / 10000) × reference (budget \(.budget_relative_cpu)) rounds \(.rounds_cpu_ms | map(. * 100 | round / 100))")' \
@@ -520,5 +541,8 @@ fg admin traffic-cost verdict \
     --after "$REPORT_DIR/budget-after.json" \
     --model "$REPO_ROOT/launch-model.toml" \
     || die "traffic cost over its bounds — see the verdict above"
+
+[ "$CPU_FAILED" -eq 0 ] \
+    || die "Worker CPU budget failed — see $REPORT_DIR/worker-cpu.json; peak and post-load reports collected"
 
 echo "[traffic] OK — within every budget and bound; reports for the projection: $REPORT_DIR"

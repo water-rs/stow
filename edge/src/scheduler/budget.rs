@@ -179,7 +179,7 @@ pub async fn run(
     let shape = FixtureShape { queue_rows };
     // Every run starts from the canonical graph: reseeding restores
     // what earlier runs, passes and the callback lane moved.
-    fixture::seed(db, graph, shape, super::object::now_ms()).await?;
+    fixture::seed(db, graph, shape, &settings, super::object::now_ms()).await?;
     let ctx = drives::DriveContext::worker(env, graph.clone(), alarm);
     // Seed the cached installation token once, outside any measured
     // window: the probe dispatches to the local-CI endpoint, so no real

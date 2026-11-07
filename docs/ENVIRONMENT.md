@@ -281,6 +281,8 @@ oidc-token`.
 | `STOW_TRAFFIC_DURATION_SECS` | `1800` | Seconds of peak-rate drive. |
 | `STOW_TRAFFIC_SEGMENTS` | `4` | Segments the drive runs in; the edge restarts between them to bound `wrangler dev`'s per-request memory retention. |
 | `STOW_TRAFFIC_RATE_SCALE` | `1.0` | Multiplier over the launch model's peak rates. |
+| `STOW_TRAFFIC_MAX_JOBS` | Manifest defaults | Overrides both the budget probe's dispatch limit and the running mock scheduler's total dispatch cap. Unset preserves the production manifest's probe limit and the mock manifest's runtime limit. |
+| `STOW_TRAFFIC_MAX_MACOS_JOBS` | Scheduler default | Overrides the running mock scheduler's macOS dispatch cap. |
 | `STOW_TRAFFIC_RUSTC` | `1.85.0` | rustc version the lanes request and the index slice is published under. |
 | `STOW_TRAFFIC_EDGE_PORT` | `8788` | Port `wrangler dev` binds the edge on. |
 | `STOW_TRAFFIC_INSPECTOR_PORT` | `9230` | Port the workerd inspector binds — the CPU pass samples it through DevTools. |

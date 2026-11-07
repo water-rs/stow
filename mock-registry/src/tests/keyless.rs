@@ -532,29 +532,43 @@ async fn a_keyless_signature_verifies_with_the_readers_verifier() {
     assert_eq!(chain, stack.sigstore.with(|state| state.ca.pem()));
 }
 
-/// Count a complete node publication, including its signed records, on
-/// a registry that requires the upload-session PUT for every new blob.
+/// Count full publications across artifact multiplicity and blob upload modes.
 #[tokio::test]
 async fn complete_publication_counts_artifacts_records_and_signatures() {
+    for session_put in [false, true] {
+        for artifact_count in 1..=3 {
+            publication_write_cost(session_put, artifact_count).await;
+        }
+    }
+}
+
+async fn publication_write_cost(session_put: bool, artifact_count: usize) {
     let stack = Stack::new().await;
-    stack.probe.refuse_single_post();
+    if session_put {
+        stack.probe.refuse_single_post();
+    }
     let session = stack.session(&unbounded());
     let signer = stack.signer();
     let rustc = stow_types::identity::WireRustcVersion::parse("1.85.0").expect("rustc");
     for index in 0..2 {
-        let plan = plan(&stack.root, index);
+        let plans = (0..artifact_count)
+            .map(|offset| plan(&stack.root, index * artifact_count + offset))
+            .collect::<Vec<_>>();
         let sign = |reference: String, digest: String| {
             let (signer, session) = (&signer, &session);
             async move { signer.sign(session, &reference, &digest).await }
         };
         let before = stack.writes();
-        let outcome = stow_oci::push_artifacts_with(&session, std::slice::from_ref(&plan), sign)
+        let outcome = stow_oci::push_artifacts_with(&session, &plans, sign)
             .await
             .expect("artifacts");
         let artifacts = stow_types::upload_plan::build_artifact_records(
-            std::slice::from_ref(&plan),
+            &plans,
             &outcome.published_by_reference,
-            &BTreeMap::from([(plan.oci_reference.clone(), None)]),
+            &plans
+                .iter()
+                .map(|plan| (plan.oci_reference.clone(), None))
+                .collect(),
         )
         .expect("artifact records");
         let records = stow_types::records::BuildRecords {
@@ -574,17 +588,24 @@ async fn complete_publication_counts_artifacts_records_and_signatures() {
         )
         .await
         .expect("signed records");
+        let (per_artifact, cold_records, warm_records) =
+            if session_put { (15, 11, 9) } else { (9, 7, 6) };
         assert_eq!(
             stack.writes() - before,
-            if index == 0 { 26 } else { 24 },
-            "the empty records config is shared after the first publication"
+            per_artifact * artifact_count
+                + if index == 0 {
+                    cold_records
+                } else {
+                    warm_records
+                },
+            "session_put={session_put} artifacts={artifact_count} publication={index}"
         );
     }
     assert_eq!(stack.sigstore.certificates(), 1);
     assert_eq!(
         stack.sigstore.entries(),
-        4,
-        "artifact and records signed once per node"
+        2 * (artifact_count + 1),
+        "each artifact and each node record is signed once"
     );
 }
 

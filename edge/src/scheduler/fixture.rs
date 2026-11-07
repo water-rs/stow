@@ -21,7 +21,8 @@
 //!   — each claimed and bound to its own run in the log tail, the way
 //!   a dispatch pass leaves them;
 //! * the claimable pending span is the planted window of
-//!   [`FixtureShape::DISPATCH_ELIGIBLE_ROWS`] rows above the human pins,
+//!   at least [`FixtureShape::DISPATCH_ELIGIBLE_ROWS`] rows above the human pins,
+//!   expanded for the configured dispatch capacity,
 //!   each edge met against a 64-leaf pool of published nodes and each
 //!   carrying [`WINDOW_DEMAND`] so its Windows rows price above every
 //!   bulk row; every other pending row gates on an unmet dependency;
@@ -227,14 +228,44 @@ fn spread(n: u32, multiplier: u64, modulus: u32) -> u32 {
     u32::try_from(u64::from(n) * multiplier % u64::from(modulus)).expect("below the modulus")
 }
 
+/// Keep two dispatch passes available in each independently capped pool.
+/// The window depends on capacity, never on the stored queue size.
+fn dispatch_window(settings: &super::queue::SchedulerSettings) -> u32 {
+    let total = match settings.dispatch {
+        super::queue::Dispatch::Limited(limit) => limit.get(),
+        super::queue::Dispatch::Paused => 0,
+    };
+    let mut non_macos = 0u64;
+    let mut macos = 0u64;
+    let mut rows = 0;
+    while rows < FixtureShape::DISPATCH_ELIGIBLE_ROWS
+        || non_macos < 2 * u64::from(total)
+        || macos < 2 * u64::from(settings.max_concurrent_macos_jobs.min(total))
+    {
+        rows += 1;
+        let n = FixtureShape::HUMAN_LANE_ROWS + rows;
+        if n % 20 == 1 {
+            continue;
+        }
+        if stow_types::api::runner_family(target_of(n))
+            == Some(stow_types::api::RunnerFamily::MacOs)
+        {
+            macos += 1;
+        } else {
+            non_macos += 1;
+        }
+    }
+    rows
+}
+
 /// The dependency ids of pending node `n`, every one a node already in
 /// the graph by the time `n`'s tree merges (rows above `pending_end`
 /// are built first, and pending deps point at lower `n`).
-fn pending_deps(shape: FixtureShape, n: u32) -> Vec<u32> {
+fn pending_deps(shape: FixtureShape, eligible_rows: u32, n: u32) -> Vec<u32> {
     let rows = shape.queue_rows;
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
-    let eligible_end = human_end + FixtureShape::DISPATCH_ELIGIBLE_ROWS;
+    let eligible_end = human_end + eligible_rows;
     // The pool starts at `completed_row(2)`, clear of the purge
     // drive's `completed_row(0)`/`completed_row(1)`; the `n % 64` pool
     // spreads the window's edges over 64 published leaves so no leaf
@@ -440,7 +471,12 @@ fn build_failed(graph: &mut Graph, shape: FixtureShape, now: i64) -> Result<(), 
 
 /// Pending rows, ascending, split at the human pins so each tree has
 /// one source, then the window's stored demand.
-fn build_pending(graph: &mut Graph, shape: FixtureShape, now: i64) -> Result<(), QueueError> {
+fn build_pending(
+    graph: &mut Graph,
+    shape: FixtureShape,
+    eligible_rows: u32,
+    now: i64,
+) -> Result<(), QueueError> {
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
     let segments = [
@@ -455,11 +491,11 @@ fn build_pending(graph: &mut Graph, shape: FixtureShape, now: i64) -> Result<(),
     for (start, end, source) in segments {
         for (lo, hi) in runs(start, end) {
             merge_run(graph, (lo, hi), source, first_at(shape, now, lo), |n| {
-                pending_deps(shape, n)
+                pending_deps(shape, eligible_rows, n)
             })?;
         }
     }
-    let eligible_end = human_end + FixtureShape::DISPATCH_ELIGIBLE_ROWS;
+    let eligible_end = human_end + eligible_rows;
     let window: Vec<(String, i64)> = (human_end + 1..=eligible_end)
         .map(|n| (fixture_task_id(u64::from(n)), WINDOW_DEMAND))
         .collect();
@@ -473,7 +509,11 @@ fn build_pending(graph: &mut Graph, shape: FixtureShape, now: i64) -> Result<(),
 ///
 /// # Errors
 /// `QueueError::Invariant` when a fixture tree fails to merge.
-pub fn build(shape: FixtureShape, now: i64) -> Result<Graph, QueueError> {
+pub fn build(
+    shape: FixtureShape,
+    settings: &super::queue::SchedulerSettings,
+    now: i64,
+) -> Result<Graph, QueueError> {
     let mut graph = Graph::default();
     let mut generations = Generations(0);
     build_completed(&mut graph, shape, now, &mut generations)?;
@@ -488,7 +528,7 @@ pub fn build(shape: FixtureShape, now: i64) -> Result<Graph, QueueError> {
         &builder.into_tree(SubmissionSource::CacheMiss),
         now - 35 * MINUTE_MS,
     )?;
-    build_pending(&mut graph, shape, now)?;
+    build_pending(&mut graph, shape, dispatch_window(settings), now)?;
     seed_requests(&mut graph, shape);
     // The pins above charged the human lane's day; the fixture starts
     // the day unspent, as the SQL fixture's direct rows did.
@@ -717,6 +757,7 @@ pub async fn seed(
     db: &DurableDb,
     cell: &GraphCell,
     shape: FixtureShape,
+    settings: &super::queue::SchedulerSettings,
     now: i64,
 ) -> Result<SchedulerSeedReport, QueueError> {
     wipe(db).await?;
@@ -724,7 +765,7 @@ pub async fn seed(
     // would hold two graphs at once.
     cell.clear();
     tracing::info!(rows = shape.queue_rows, "fixture seed: store wiped");
-    let mut graph = build(shape, now)?;
+    let mut graph = build(shape, settings, now)?;
     tracing::info!(nodes = graph.sizes().0, "fixture seed: graph built");
     graph.seeded_rows = Some(shape.queue_rows);
     store::write_snapshot(db, &mut graph, cell, now).await?;
