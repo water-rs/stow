@@ -1067,6 +1067,7 @@ fn render_preheat(preheat: &PreheatMonthly) -> String {
     );
     let mut table = Table::new(&[
         "per node",
+        "Worker requests",
         "DO requests",
         "rows read",
         "rows written",
@@ -1078,6 +1079,7 @@ fn render_preheat(preheat: &PreheatMonthly) -> String {
     ] {
         table.push([
             label.to_owned(),
+            format!("{:.2}", cost.worker_requests),
             format!("{:.2}", cost.requests),
             format!("{:.2}", cost.rows_read),
             format!("{:.2}", cost.rows_written),
@@ -1085,6 +1087,16 @@ fn render_preheat(preheat: &PreheatMonthly) -> String {
         ]);
     }
     let _ = writeln!(out, "{}", table.render());
+    let _ = writeln!(
+        out,
+        "fixed Worker requests: {:.0}/wave, {:.0}/daily resubmit (trigger + workflow deliveries)",
+        preheat.wave_trigger_worker_requests, preheat.resubmit_trigger_worker_requests,
+    );
+    let _ = writeln!(
+        out,
+        "fixed DO requests: {:.0}/wave, {:.0}/daily resubmit (scheduler dispatch)",
+        preheat.wave_trigger_do_requests, preheat.resubmit_trigger_do_requests,
+    );
     out
 }
 
@@ -1285,6 +1297,10 @@ mod tests {
     /// production node: the monthly preheat is `wave + resubmit`.
     fn preheat_of(wave: PerNode, resubmit: PerNode) -> PreheatMonthly {
         PreheatMonthly {
+            wave_trigger_do_requests: 0.0,
+            resubmit_trigger_do_requests: 0.0,
+            wave_trigger_worker_requests: 0.0,
+            resubmit_trigger_worker_requests: 0.0,
             measured_nodes: 10,
             production_nodes: 10,
             releases_per_month: 1.0,
@@ -1371,7 +1387,8 @@ mod tests {
 
     /// Preheat is added to the products the Preheat cost report
     /// measures and to no other: the total is traffic plus preheat on a
-    /// Durable Object line, and a Worker line carries no preheat at all.
+    /// Durable Object line. Worker requests are also counted, while
+    /// Worker CPU remains unmeasured.
     #[test]
     fn preheat_adds_to_the_measured_products_only() {
         let report = fixture_report(100_000, |_| 0.5);
@@ -1395,8 +1412,41 @@ mod tests {
         assert!((after.total() - (after.traffic + 15_000.0)).abs() < 1e-6);
 
         let workers = usage(&with, "workers", "requests");
-        assert_eq!(workers.preheat, None);
+        assert_eq!(workers.preheat, Some(0.0));
         assert!((workers.total() - workers.traffic).abs() < f64::EPSILON);
+        assert_eq!(usage(&with, "workers", "cpu_ms").preheat, None);
+    }
+
+    #[test]
+    fn preheat_worker_requests_can_cross_the_combined_bound() {
+        let report = fixture_report(100_000, |_| 0.5);
+        let cpu = fixture_cpu(|_| 0.5);
+        let base = evaluate(&model(), &report, &cpu, &no_preheat()).expect("evaluate");
+        assert!(base.breaches.is_empty());
+        let line = usage(&base, "workers", "requests");
+        let headroom = line
+            .allowance
+            .mul_add(super::ALLOWANCE_FRACTION, -line.traffic);
+        assert!(headroom > 0.0);
+        let wave = PerNode {
+            worker_requests: headroom / 10.0 + 1.0,
+            ..PerNode::default()
+        };
+        let with = evaluate(
+            &model(),
+            &report,
+            &cpu,
+            &preheat_of(wave, PerNode::default()),
+        )
+        .expect("evaluate");
+        let breach = with
+            .breaches
+            .iter()
+            .find(|breach| breach.product == "workers" && breach.dimension == "requests")
+            .expect("combined request breach");
+        assert!(breach.traffic < breach.bound);
+        assert!(breach.projected > breach.bound);
+        assert!(breach.preheat > headroom);
     }
 
     /// Traffic alone is inside the bound; the same traffic plus a
