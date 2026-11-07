@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/water-rs/stow/compare/stow-cli-v0.14.0...stow-cli-v0.15.0) - 2026-11-07
+
+### Fixed
+
+- finish stale drain cleanup outside the network timeout ([#1253](https://github.com/water-rs/stow/pull/1253))
+- publish explicit build-script shapes for native nodes ([#1228](https://github.com/water-rs/stow/pull/1228))
+
 ## [0.14.0](https://github.com/water-rs/stow/compare/stow-cli-v0.13.1...stow-cli-v0.14.0) - 2026-11-01
 
 ### Added
