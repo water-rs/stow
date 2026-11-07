@@ -162,6 +162,81 @@ pub struct WorkerCpuReport {
     pub reference: ReferenceCpu,
     /// Per-lane measurements, in lane order.
     pub rows: Vec<WorkerCpuRow>,
+    /// Raw V8 profiles, retaining call trees and script identities.
+    pub profiles: Vec<CapturedProfile>,
+    /// Exact runtime JavaScript, fetched only after measurement finishes.
+    pub scripts: Vec<ScriptSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapturedProfile {
+    label: String,
+    profile: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptSource {
+    script_id: String,
+    url: String,
+    source: String,
+}
+
+#[derive(Default)]
+struct ProfileArtifacts {
+    profiles: Vec<CapturedProfile>,
+    scripts: std::collections::BTreeMap<String, String>,
+}
+
+impl ProfileArtifacts {
+    fn capture(&mut self, label: &str, raw: serde_json::Value, profile: &CpuProfile) {
+        for node in &profile.nodes {
+            let frame = &node.call_frame;
+            // Runtime script URLs need not have a file extension. Wasm
+            // frames use wasm:// URLs; native frames have no URL.
+            if !frame.url.is_empty() && !frame.url.starts_with("wasm://") {
+                self.scripts
+                    .insert(frame.script_id.clone(), frame.url.clone());
+            }
+        }
+        self.profiles.push(CapturedProfile {
+            label: label.to_owned(),
+            profile: raw,
+        });
+    }
+
+    async fn sources(&self, inspector: &Inspector) -> stow_types::error::Result<Vec<ScriptSource>> {
+        inspector
+            .call("Debugger.enable", serde_json::Value::Null)
+            .await?;
+        let mut sources = Vec::with_capacity(self.scripts.len());
+        // One owner reads this protocol socket; its request/reply exchanges
+        // serialize under a concurrency bound of one.
+        for (script_id, url) in &self.scripts {
+            let result = inspector
+                .call(
+                    "Debugger.getScriptSource",
+                    serde_json::json!({ "scriptId": script_id }),
+                )
+                .await?;
+            let source = result
+                .get("scriptSource")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    stow_error!(
+                        "Debugger.getScriptSource returned no JavaScript for {url} ({script_id})"
+                    )
+                })?;
+            sources.push(ScriptSource {
+                script_id: script_id.clone(),
+                url: url.clone(),
+                source: source.to_owned(),
+            });
+        }
+        inspector
+            .call("Debugger.disable", serde_json::Value::Null)
+            .await?;
+        Ok(sources)
+    }
 }
 
 impl WorkerCpuReport {
@@ -477,6 +552,7 @@ struct ProfileNode {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CallFrame {
+    script_id: String,
     function_name: String,
     url: String,
     line_number: i64,
@@ -507,6 +583,7 @@ fn profile_cpu_ms(profile: &CpuProfile) -> f64 {
 /// Profile whatever `work` drives and return the profile's CPU ms.
 async fn profiled(
     inspector: &Inspector,
+    artifacts: &mut ProfileArtifacts,
     label: &str,
     work: impl AsyncFnOnce() -> stow_types::error::Result<()>,
 ) -> stow_types::error::Result<f64> {
@@ -514,17 +591,16 @@ async fn profiled(
         .call("Profiler.start", serde_json::Value::Null)
         .await?;
     let worked = work().await;
-    let stopped = inspector
+    let mut stopped = inspector
         .call("Profiler.stop", serde_json::Value::Null)
         .await?;
     worked?;
-    let profile: CpuProfile = serde_json::from_value(
-        stopped
-            .get("profile")
-            .cloned()
-            .ok_or_else(|| stow_error!("Profiler.stop returned no profile"))?,
-    )
-    .map_err(|error| stow_error!("decode the CPU profile: {error}"))?;
+    let raw = stopped
+        .get_mut("profile")
+        .map(serde_json::Value::take)
+        .ok_or_else(|| stow_error!("Profiler.stop returned no profile"))?;
+    let profile = CpuProfile::deserialize(&raw)
+        .map_err(|error| stow_error!("decode the CPU profile: {error}"))?;
     let names: std::collections::BTreeMap<_, _> = profile
         .nodes
         .iter()
@@ -558,6 +634,7 @@ async fn profiled(
         ?hotspots,
         "Worker CPU profile hotspots (function, samples)"
     );
+    artifacts.capture(label, raw, &profile);
     Ok(profile_cpu_ms(&profile))
 }
 
@@ -613,6 +690,7 @@ async fn measure_lane(
     lane: &Lane,
     edge: &Edge,
     inspector: &Inspector,
+    artifacts: &mut ProfileArtifacts,
     args: &CpuArgs,
 ) -> stow_types::error::Result<LaneCpu> {
     let budget = WORKER_CPU_BUDGETS
@@ -631,7 +709,7 @@ async fn measure_lane(
     let mut rounds_cpu_ms = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
         ready(lane, edge, args.events_per_round).await?;
-        let cpu_ms = profiled(inspector, lane.name, async || {
+        let cpu_ms = profiled(inspector, artifacts, lane.name, async || {
             fire_events(lane, edge, &mut client, &mut counter, args.events_per_round).await
         })
         .await?;
@@ -646,12 +724,15 @@ async fn measure_lane(
 
 /// Profile the reference workload: one unprofiled run to warm the JIT,
 /// then [`ROUNDS`] profiled rounds.
-async fn measure_reference(inspector: &Inspector) -> stow_types::error::Result<Vec<f64>> {
+async fn measure_reference(
+    inspector: &Inspector,
+    artifacts: &mut ProfileArtifacts,
+) -> stow_types::error::Result<Vec<f64>> {
     inspector.run_reference().await?;
     let mut rounds_ms = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
         rounds_ms.push(
-            profiled(inspector, "reference", async || {
+            profiled(inspector, artifacts, "reference", async || {
                 inspector.run_reference().await
             })
             .await?,
@@ -686,7 +767,8 @@ pub async fn run(edge: &Edge, args: &CpuArgs, output: Output) -> stow_types::err
         )
         .await?;
 
-    let idle_cpu_ms = profiled(&inspector, "idle", async || {
+    let mut artifacts = ProfileArtifacts::default();
+    let idle_cpu_ms = profiled(&inspector, &mut artifacts, "idle", async || {
         tokio::time::sleep(IDLE_WINDOW).await;
         Ok(())
     })
@@ -700,12 +782,13 @@ pub async fn run(edge: &Edge, args: &CpuArgs, output: Output) -> stow_types::err
         ));
     }
 
-    let rounds_before = measure_reference(&inspector).await?;
+    let rounds_before = measure_reference(&inspector, &mut artifacts).await?;
     let mut measured = Vec::with_capacity(lanes.len());
     for lane in &lanes {
-        measured.push(measure_lane(lane, edge, &inspector, args).await?);
+        measured.push(measure_lane(lane, edge, &inspector, &mut artifacts, args).await?);
     }
-    let rounds_after = measure_reference(&inspector).await?;
+    let rounds_after = measure_reference(&inspector, &mut artifacts).await?;
+    let scripts = artifacts.sources(&inspector).await?;
     let reference = reference_cpu(rounds_before, rounds_after)?;
     let rows = measured
         .into_iter()
@@ -717,6 +800,8 @@ pub async fn run(edge: &Edge, args: &CpuArgs, output: Output) -> stow_types::err
         idle_cpu_ms,
         reference,
         rows,
+        profiles: artifacts.profiles,
+        scripts,
     };
     emit(output, &report, render_report)?;
     let over = report.breaches().count();
@@ -789,12 +874,35 @@ mod tests {
     use stow_types::do_budgets::WORKER_CPU_BUDGETS;
 
     use super::{
-        CpuProfile, LaneCpu, REFERENCE_DRIFT_LIMIT, edge_context, profile_cpu_ms, reference_cpu,
-        track_context,
+        CpuProfile, LaneCpu, ProfileArtifacts, REFERENCE_DRIFT_LIMIT, edge_context, profile_cpu_ms,
+        reference_cpu, track_context,
     };
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn artifacts_preserve_anonymous_locations_and_call_tree() {
+        let raw = serde_json::json!({
+            "nodes": [
+                {"id": 1, "children": [2], "callFrame": {"scriptId": "0", "functionName": "(root)", "url": "", "lineNumber": -1, "columnNumber": -1}},
+                {"id": 2, "callFrame": {"scriptId": "42", "functionName": "", "url": "stable-worker.js", "lineNumber": 1124, "columnNumber": 73}},
+                {"id": 3, "callFrame": {"scriptId": "43", "functionName": "rust_function", "url": "wasm://wasm/1234", "lineNumber": 0, "columnNumber": 0}},
+                {"id": 4, "callFrame": {"scriptId": "44", "functionName": "handler", "url": "worker-module", "lineNumber": 1, "columnNumber": 0}}
+            ],
+            "samples": [2, 2],
+            "timeDeltas": [100, 100]
+        });
+        let profile: CpuProfile = serde_json::from_value(raw.clone()).expect("profile");
+        let mut artifacts = ProfileArtifacts::default();
+        artifacts.capture("enqueue-redeem", raw.clone(), &profile);
+        assert_eq!(artifacts.profiles[0].profile, raw);
+        assert_eq!(artifacts.profiles[0].label, "enqueue-redeem");
+        assert_eq!(artifacts.scripts.len(), 2);
+        assert_eq!(artifacts.scripts["42"], "stable-worker.js");
+        assert_eq!(artifacts.scripts["44"], "worker-module");
+        assert_eq!(profile_cpu_ms(&profile), 0.2);
     }
 
     /// The reference is the smallest round of either set, and a lane is
@@ -843,10 +951,10 @@ mod tests {
     fn idle_samples_do_not_count() {
         let profile: CpuProfile = serde_json::from_value(serde_json::json!({
             "nodes": [
-                {"id": 1, "callFrame": {"functionName": "(root)", "url": "", "lineNumber": -1, "columnNumber": -1}},
-                {"id": 2, "callFrame": {"functionName": "(idle)", "url": "", "lineNumber": -1, "columnNumber": -1}},
-                {"id": 3, "callFrame": {"functionName": "fetch", "url": "", "lineNumber": -1, "columnNumber": -1}},
-                {"id": 4, "callFrame": {"functionName": "(garbage collector)", "url": "", "lineNumber": -1, "columnNumber": -1}},
+                {"id": 1, "callFrame": {"scriptId": "0", "functionName": "(root)", "url": "", "lineNumber": -1, "columnNumber": -1}},
+                {"id": 2, "callFrame": {"scriptId": "0", "functionName": "(idle)", "url": "", "lineNumber": -1, "columnNumber": -1}},
+                {"id": 3, "callFrame": {"scriptId": "0", "functionName": "fetch", "url": "", "lineNumber": -1, "columnNumber": -1}},
+                {"id": 4, "callFrame": {"scriptId": "0", "functionName": "(garbage collector)", "url": "", "lineNumber": -1, "columnNumber": -1}},
             ],
             "samples": [2, 3, 3, 2, 4, 3],
             "timeDeltas": [100, 100, 9000, 100, 100, 100],
