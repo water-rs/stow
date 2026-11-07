@@ -246,11 +246,10 @@ pub async fn publish_index(
         )])),
     );
     session
-        .push_blob(&layer.sha256_digest(), &layer.data)
-        .await
-        .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?;
-    session
-        .push_blob(&sha256_digest(&config.data), &config.data)
+        .push_blob_pair(
+            (&layer.sha256_digest(), &layer.data),
+            (&sha256_digest(&config.data), &config.data),
+        )
         .await
         .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?;
     let manifest_bytes = canonical_manifest_bytes(&manifest)?;
@@ -442,11 +441,10 @@ pub async fn publish_folded(
     }
 
     session
-        .push_blob(&layer.sha256_digest(), &layer.data)
-        .await
-        .map_err(|error| stow_types::stow_error!("push folded artifact {reference}: {error}"))?;
-    session
-        .push_blob(&sha256_digest(&config.data), &config.data)
+        .push_blob_pair(
+            (&layer.sha256_digest(), &layer.data),
+            (&sha256_digest(&config.data), &config.data),
+        )
         .await
         .map_err(|error| stow_types::stow_error!("push folded artifact {reference}: {error}"))?;
     let manifest_digest =

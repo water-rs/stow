@@ -878,17 +878,12 @@ async fn push_signature_layer(
     });
     let (manifest, config) = signature_manifest(layers)?;
     session
-        .push_blob(&payload_digest, &layer.payload)
+        .push_blob_pair(
+            (&payload_digest, &layer.payload),
+            (&sha256_digest(&config), &config),
+        )
         .await
-        .map_err(|error| {
-            stow_types::stow_error!("push the signature payload of {reference}: {error}")
-        })?;
-    session
-        .push_blob(&sha256_digest(&config), &config)
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("push the signature config of {reference}: {error}")
-        })?;
+        .map_err(|error| stow_types::stow_error!("push signature blobs {reference}: {error}"))?;
     session
         .put_manifest(&reference, &manifest)
         .await

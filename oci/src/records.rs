@@ -108,13 +108,12 @@ where
     let config_bytes = b"{}".to_vec();
 
     session
-        .push_blob(&layer.sha256_digest(), &layer.data)
+        .push_blob_pair(
+            (&layer.sha256_digest(), &layer.data),
+            (&sha256_digest(&config_bytes), &config_bytes),
+        )
         .await
-        .map_err(|error| stow_types::stow_error!("push records layer {reference}: {error}"))?;
-    session
-        .push_blob(&sha256_digest(&config_bytes), &config_bytes)
-        .await
-        .map_err(|error| stow_types::stow_error!("push records config {reference}: {error}"))?;
+        .map_err(|error| stow_types::stow_error!("push records blobs {reference}: {error}"))?;
     let mut manifest = OciImageManifest::build(
         std::slice::from_ref(&layer),
         &Config::new(config_bytes, RECORDS_CONFIG_MEDIA_TYPE.to_owned(), None),

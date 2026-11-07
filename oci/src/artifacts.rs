@@ -139,16 +139,15 @@ where
         .map_err(|error| stow_types::stow_error!("parse OCI reference {oci_reference}: {error}"))?;
     let layer = ImageLayer::new(pack.to_vec(), STOW_PACK_MEDIA_TYPE.to_owned(), None);
 
-    // Push order matches the manifest the bytes describe: the layer, then
-    // the config blob, then the manifest. A blob already stored under its
+    // The layer and config are independent; both must exist before
+    // publishing the manifest. A blob already stored under its
     // digest is skipped by `push_blob`'s HEAD — content addressing means it
     // can only be the same bytes.
     session
-        .push_blob(&layer.sha256_digest(), &layer.data)
-        .await
-        .map_err(|error| stow_types::stow_error!("push OCI artifact {oci_reference}: {error}"))?;
-    session
-        .push_blob(&sha256_digest(config_bytes), config_bytes)
+        .push_blob_pair(
+            (&layer.sha256_digest(), &layer.data),
+            (&sha256_digest(config_bytes), config_bytes),
+        )
         .await
         .map_err(|error| stow_types::stow_error!("push OCI artifact {oci_reference}: {error}"))?;
     let manifest = OciImageManifest::build(
@@ -223,13 +222,10 @@ async fn push_bundle(
         stow_types::stow_error!("parse bundle reference {bundle_reference}: {error}")
     })?;
     session
-        .push_blob(&bundle_digest, &bundle_layer.data)
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("push bundle artifact {bundle_reference}: {error}")
-        })?;
-    session
-        .push_blob(&sha256_digest(&bundle_config), &bundle_config)
+        .push_blob_pair(
+            (&bundle_digest, &bundle_layer.data),
+            (&sha256_digest(&bundle_config), &bundle_config),
+        )
         .await
         .map_err(|error| {
             stow_types::stow_error!("push bundle artifact {bundle_reference}: {error}")
