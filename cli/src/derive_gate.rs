@@ -114,17 +114,11 @@ async fn stop_derivations(gate_dir: &Path) {
     };
     // One exchange per pointer, all at once: the count is bounded by
     // the number of live drains.
-    futures_util::future::join_all(pointers.into_iter().map(|pointer| async move {
-        if tokio::time::timeout(STOP_DEADLINE, stop_derivation(&pointer))
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                pointer = %pointer.display(),
-                "a miss drain did not acknowledge a stop inside the deadline"
-            );
-        }
-    }))
+    futures_util::future::join_all(
+        pointers
+            .into_iter()
+            .map(|pointer| async move { stop_derivation(&pointer).await }),
+    )
     .await;
 }
 
@@ -176,13 +170,26 @@ async fn stop_derivation(pointer: &Path) {
     let Some(endpoint) = read_pointer(pointer).await else {
         return;
     };
+    // Bound the network exchange, not local filesystem work. A timed
+    // out spawn_blocking read or removal keeps running after its
+    // future is dropped, so cancelling it can return before a stale
+    // pointer has actually been removed.
+    let deadline = tokio::time::Instant::now() + STOP_DEADLINE;
     let Ok(Ok(mut stream)) =
         tokio::time::timeout(CONNECT_DEADLINE, supervisor::connect(&endpoint)).await
     else {
         remove_pointer(pointer).await;
         return;
     };
-    read_until_close(&mut stream).await;
+    if tokio::time::timeout_at(deadline, read_until_close(&mut stream))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            pointer = %pointer.display(),
+            "a miss drain did not acknowledge a stop inside the deadline"
+        );
+    }
 }
 
 /// The endpoint `pointer` names. A pointer that cannot be read or
@@ -524,6 +531,20 @@ mod tests {
         hold.release();
     }
 
+    #[tokio::test]
+    async fn a_malformed_pointer_is_removed_before_enter_returns() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let gate_dir = dir.path().join("gate");
+        let derive = gate_dir.join(DERIVE_DIR);
+        std::fs::create_dir_all(&derive).expect("derive dir");
+        let pointer = derive.join(std::process::id().to_string());
+        std::fs::write(&pointer, "invalid endpoint").expect("write pointer");
+
+        let hold = ForegroundHold::enter(&gate_dir).await.expect("enter");
+        assert!(!pointer.exists(), "malformed pointer cleanup finished");
+        hold.release();
+    }
+
     /// A drain that accepts and never answers cannot hold a command's
     /// start past the exchange deadline.
     #[tokio::test(start_paused = true)]
@@ -534,11 +555,8 @@ mod tests {
         std::fs::create_dir_all(&derive).expect("derive dir");
         let listener = supervisor::bind("stow-derive-").expect("bind");
         let endpoint = listener.endpoint();
-        std::fs::write(
-            derive.join(std::process::id().to_string()),
-            endpoint.encode(),
-        )
-        .expect("write pointer");
+        let pointer = derive.join(std::process::id().to_string());
+        std::fs::write(&pointer, endpoint.encode()).expect("write pointer");
         let _serving = tokio::spawn(async move {
             if let Ok(_stream) = listener.accept().await {
                 std::future::pending::<()>().await;
@@ -551,6 +569,7 @@ mod tests {
             started.elapsed() >= STOP_DEADLINE,
             "the silent listener cost the whole deadline, no more"
         );
+        assert!(pointer.exists(), "a silent live drain keeps its pointer");
         hold.release();
     }
 }
