@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/water-rs/stow/compare/stow-oci-v0.14.0...stow-oci-v0.15.0) - 2026-11-07
+
+### Other
+
+- upload independent OCI blobs concurrently ([#1243](https://github.com/water-rs/stow/pull/1243))
+- restrict index discovery to relevant tag namespaces ([#1235](https://github.com/water-rs/stow/pull/1235))
+- avoid duplicate signed-manifest writes ([#1210](https://github.com/water-rs/stow/pull/1210))
+
 ## [0.14.0](https://github.com/water-rs/stow/compare/stow-oci-v0.13.1...stow-oci-v0.14.0) - 2026-11-01
 
 ### Added

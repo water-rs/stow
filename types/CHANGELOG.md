@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/water-rs/stow/compare/stow-types-v0.14.0...stow-types-v0.15.0) - 2026-11-07
+
+### Added
+
+- report scheduler backlog by compilation target ([#1212](https://github.com/water-rs/stow/pull/1212))
+
+### Fixed
+
+- apply traffic capacity overrides to the mock scheduler ([#1215](https://github.com/water-rs/stow/pull/1215))
+
+### Other
+
+- keep routine dispatch diagnostics at debug level ([#1232](https://github.com/water-rs/stow/pull/1232))
+
 ## [0.14.0](https://github.com/water-rs/stow/compare/stow-types-v0.13.1...stow-types-v0.14.0) - 2026-11-01
 
 ### Added
