@@ -12,6 +12,7 @@
 //! runs after the drive.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use clap::Args;
@@ -37,6 +38,9 @@ pub struct PeakArgs {
     /// check, not a latency SLO.
     #[arg(long, default_value_t = 10_000.0)]
     pub p99_bound_ms: f64,
+    /// Maximum requests in flight per lane; defaults to host available parallelism.
+    #[arg(long)]
+    pub max_in_flight_per_lane: Option<NonZeroUsize>,
 }
 
 /// Lane error share the run tolerates before it fails — one percent.
@@ -45,6 +49,8 @@ const ERROR_RATE_BOUND: f64 = 0.01;
 /// Per-lane measurements over the run.
 #[derive(Debug, Default, serde::Serialize)]
 struct LaneStats {
+    /// Request slots used by this lane. Callback fixture rearming has one owner.
+    request_slots: usize,
     /// Requests the lane fired.
     requests: u64,
     /// Minimum whole requests required by the configured rate and duration.
@@ -78,16 +84,18 @@ struct LoadReport {
     duration_secs: u64,
     /// `rate_scale` the lanes ran at.
     rate_scale: f64,
+    /// The bounded number of independent request slots in each lane.
+    max_in_flight_per_lane: usize,
     /// Per-lane stats keyed by lane name.
     lanes: BTreeMap<&'static str, LaneStats>,
     /// Every breach the verdict names; empty on a pass.
     breaches: Vec<String>,
 }
 
-/// Fire `fire` every `interval` until `duration` elapses — the pacing
-/// loop every lane runs. Beats are anchored to the run's start, so a
-/// delayed response does not shift every later beat. A response slower
-/// than the interval waits nothing, and the tail
+/// Fire one request slot's share of the lane's anchored beats. Slot
+/// `first` handles counters `first`, `first + stride`, and so on; all
+/// slots share `start` and the deadline. A slow response delays only
+/// its own slot. The tail
 /// sleep wakes AT the deadline rather than running on to the next
 /// beat: under the launch model's slowest lanes the rate floor
 /// (0.005eps) makes the interval 200s, so a lane that fired at 0/200/400
@@ -98,18 +106,23 @@ struct LoadReport {
 /// cancelling it would report a fake transport error into the
 /// error-share gate. The clock is `tokio::time`'s so the boundary
 /// cases run under a paused clock.
-async fn run_paced(interval: Duration, duration: Duration, mut fire: impl AsyncFnMut(u64)) {
-    let mut next = tokio::time::Instant::now();
-    let deadline = next + duration;
-    let mut counter = 0u64;
+#[expect(clippy::cast_precision_loss, reason = "request slot counts fit f64")]
+async fn run_paced(
+    start: tokio::time::Instant,
+    interval: Duration,
+    duration: Duration,
+    first: usize,
+    stride: usize,
+    mut fire: impl AsyncFnMut(u64),
+) {
+    let deadline = start + duration;
+    let mut counter = first as u64;
+    let mut next = start + interval.mul_f64(first as f64);
     loop {
-        fire(counter).await;
-        counter += 1;
         let now = tokio::time::Instant::now();
         if now >= deadline {
             break;
         }
-        next += interval;
         let wake = next.min(deadline);
         if now < wake {
             tokio::time::sleep_until(wake).await;
@@ -117,6 +130,9 @@ async fn run_paced(interval: Duration, duration: Duration, mut fire: impl AsyncF
         if tokio::time::Instant::now() >= deadline {
             break;
         }
+        fire(counter).await;
+        counter += stride as u64;
+        next += interval.mul_f64(stride as f64);
     }
 }
 
@@ -132,18 +148,16 @@ fn required_requests(eps: f64, duration: Duration) -> u64 {
 }
 
 /// Run one lane to the deadline, pacing at `eps`.
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "request counts and percentile indices are tiny"
-)]
-async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> Result<LaneStats, String> {
+async fn run_lane_worker(
+    lane: &Lane,
+    edge: &Edge,
+    start: tokio::time::Instant,
+    duration: Duration,
+    first: usize,
+    stride: usize,
+) -> Result<LaneStats, String> {
     let mut client = zenwave::client();
-    let mut stats = LaneStats {
-        required_requests: required_requests(lane.eps, duration),
-        ..LaneStats::default()
-    };
+    let mut stats = LaneStats::default();
     // A lane the harness cannot make fireable stops firing and fails the
     // pass: an event fired anyway would be a different path than the one
     // the lane prices.
@@ -199,9 +213,57 @@ async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> Result<LaneSt
             .push(fired.elapsed().as_secs_f64() * 1000.0);
         stats.requests += 1;
     };
-    run_paced(interval, duration, fire).await;
+    run_paced(start, interval, duration, first, stride, fire).await;
     if let Some(error) = unready {
         return Err(format!("{}: {error}", lane.name));
+    }
+    Ok(stats)
+}
+
+/// Join the lane's independent request slots, then aggregate every
+/// completed response before applying the unchanged rate/latency gates.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "request counts and percentile indices are tiny"
+)]
+async fn run_lane(
+    lane: &Lane,
+    edge: &Edge,
+    start: tokio::time::Instant,
+    duration: Duration,
+    concurrency: usize,
+) -> Result<LaneStats, String> {
+    // Rearming replaces the callback fixture's entire armed-run queue;
+    // ready + take must remain under one request slot's ownership.
+    // Other lanes have no shared preparation and can overlap freely.
+    let concurrency = if matches!(lane.fire, lanes::Fire::WorkflowRun(_)) {
+        1
+    } else {
+        concurrency
+    };
+    let results = futures_util::future::join_all(
+        (0..concurrency)
+            .map(|first| run_lane_worker(lane, edge, start, duration, first, concurrency)),
+    )
+    .await;
+    let mut stats = LaneStats {
+        request_slots: concurrency,
+        required_requests: required_requests(lane.eps, duration),
+        ..LaneStats::default()
+    };
+    for result in results {
+        let worker = result?;
+        stats.requests += worker.requests;
+        stats.transport_errors += worker.transport_errors;
+        stats.server_errors += worker.server_errors;
+        stats.unexpected_statuses += worker.unexpected_statuses;
+        stats.overloaded += worker.overloaded;
+        stats.latencies_ms.extend(worker.latencies_ms);
+        for (status, count) in worker.statuses {
+            *stats.statuses.entry(status).or_default() += count;
+        }
     }
     let mut sorted = std::mem::take(&mut stats.latencies_ms);
     sorted.sort_by(f64::total_cmp);
@@ -231,12 +293,21 @@ pub async fn run(edge: &Edge, args: &PeakArgs, output: Output) -> stow_types::er
         .map_err(|error| stow_error!("{error}"))?;
 
     let duration = Duration::from_secs(args.duration_secs);
-    let results =
-        futures_util::future::join_all(lanes.iter().map(|lane| run_lane(lane, edge, duration)))
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| stow_error!("{error}"))?;
+    let concurrency = match args.max_in_flight_per_lane {
+        Some(value) => value,
+        None => std::thread::available_parallelism()
+            .map_err(|error| stow_error!("peak host parallelism: {error}"))?,
+    };
+    let start = tokio::time::Instant::now();
+    let results = futures_util::future::join_all(
+        lanes
+            .iter()
+            .map(|lane| run_lane(lane, edge, start, duration, concurrency.get())),
+    )
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|error| stow_error!("{error}"))?;
 
     let mut lanes_map = BTreeMap::new();
     let mut breaches = Vec::new();
@@ -286,6 +357,7 @@ pub async fn run(edge: &Edge, args: &PeakArgs, output: Output) -> stow_types::er
     let report = LoadReport {
         duration_secs: args.duration_secs,
         rate_scale: args.rate_scale,
+        max_in_flight_per_lane: concurrency.get(),
         lanes: lanes_map,
         breaches,
     };
@@ -307,6 +379,7 @@ fn render_report(report: &LoadReport) -> String {
     let mut out = String::new();
     let mut table = Table::new(&[
         "lane",
+        "slots",
         "reqs",
         "eff eps",
         "p50 ms",
@@ -325,6 +398,7 @@ fn render_report(report: &LoadReport) -> String {
             .join(" ");
         table.push([
             (*name).to_owned(),
+            stats.request_slots.to_string(),
             stats.requests.to_string(),
             format!("{:.3}", stats.effective_eps),
             format!("{:.0}", stats.p50_ms),
@@ -352,24 +426,122 @@ mod tests {
     use super::{Duration, required_requests, run_paced};
     use tokio::time::Instant;
 
+    #[tokio::test]
+    async fn http_requests_overlap_and_aggregate_completed_bodies() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock HTTP listener");
+        let edge = crate::Edge::for_test(format!(
+            "http://{}",
+            listener.local_addr().expect("mock address")
+        ));
+        let pair = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let router = axum::Router::new().fallback(move || {
+            let pair = pair.clone();
+            async move {
+                pair.wait().await;
+                "complete response body"
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("mock serves");
+        });
+        let lane = super::Lane {
+            name: "overlap-test",
+            eps: 2.0,
+            fire: super::lanes::Fire::PublicGet(vec!["/body".to_owned()]),
+            expected: |status| status == 200,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::run_lane(&lane, &edge, Instant::now(), Duration::from_secs(2), 2),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        let stats = result.expect("overlapping clients complete").expect("lane");
+        assert_eq!(stats.request_slots, 2);
+        assert_eq!(stats.requests, 4);
+        assert_eq!(stats.statuses.get(&200), Some(&4));
+        assert_eq!(stats.transport_errors, 0);
+        assert_eq!(stats.unexpected_statuses, 0);
+        assert_eq!(stats.latencies_ms.len(), 4);
+    }
+
     /// Run `run_paced` under the paused clock and return every event's
     /// virtual fire instant plus the virtual instant the run returned —
     /// each event spends `work` in flight before its call completes.
-    /// `run_paced` awaits `fire` sequentially, so the closure holds the
-    /// recording vec by `&mut` alone.
+    /// Each request slot owns its recording vector.
     async fn run_recording(
         interval: Duration,
         duration: Duration,
         work: Duration,
     ) -> (Vec<Duration>, Duration) {
+        run_recording_slots(interval, duration, work, 1).await
+    }
+
+    async fn run_recording_slots(
+        interval: Duration,
+        duration: Duration,
+        work: Duration,
+        concurrency: usize,
+    ) -> (Vec<Duration>, Duration) {
         let start = Instant::now();
-        let mut seen = Vec::new();
-        run_paced(interval, duration, async |_counter: u64| {
-            seen.push(Instant::now() - start);
-            tokio::time::sleep(work).await;
-        })
+        let slots = futures_util::future::join_all((0..concurrency).map(|first| async move {
+            let mut seen = Vec::new();
+            run_paced(
+                start,
+                interval,
+                duration,
+                first,
+                concurrency,
+                async |counter| {
+                    seen.push((counter, Instant::now() - start));
+                    tokio::time::sleep(work).await;
+                },
+            )
+            .await;
+            seen
+        }))
         .await;
+        let events: Vec<_> = slots.into_iter().flatten().collect();
+        let counters: std::collections::BTreeSet<_> =
+            events.iter().map(|(counter, _)| *counter).collect();
+        assert_eq!(
+            counters.len(),
+            events.len(),
+            "event identities stay distinct"
+        );
+        let mut seen: Vec<_> = events.into_iter().map(|(_, at)| at).collect();
+        seen.sort();
         (seen, Instant::now() - start)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_responses_preserve_the_requested_rate() {
+        let (fires, elapsed) = run_recording_slots(
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            Duration::from_millis(1500),
+            2,
+        )
+        .await;
+        assert_eq!(fires, [0, 1, 2, 3].map(Duration::from_secs));
+        assert_eq!(elapsed, Duration::from_millis(4500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_responses_respect_the_in_flight_bound() {
+        let (fires, elapsed) = run_recording_slots(
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            Duration::from_secs(3),
+            2,
+        )
+        .await;
+        assert_eq!(fires, [0, 1, 3].map(Duration::from_secs));
+        assert!((fires.len() as u64) < required_requests(1.0, Duration::from_secs(4)));
+        assert_eq!(elapsed, Duration::from_secs(6));
     }
 
     #[test]
@@ -436,8 +608,11 @@ mod tests {
         let start = Instant::now();
         let mut fires = Vec::new();
         run_paced(
+            start,
             Duration::from_secs(1),
             Duration::from_secs(4),
+            0,
+            1,
             async |counter| {
                 fires.push(Instant::now() - start);
                 if counter == 0 {
