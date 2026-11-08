@@ -185,10 +185,17 @@ pub struct InFlightRun {
     pub task_id: String,
 }
 
+/// Toolchains used by the fixed scheduler population.
+pub const SEEDED_RUSTC_VERSIONS: [&str; 2] = ["1.85.0", "1.86.0"];
+
 /// A seeded row's rustc — the seed SQL's `RUSTC_CASE_SQL` over `n`.
 #[must_use]
 pub const fn seeded_rustc(n: u64) -> &'static str {
-    if n % 3 < 2 { "1.85.0" } else { "1.86.0" }
+    if n % 3 < 2 {
+        SEEDED_RUSTC_VERSIONS[0]
+    } else {
+        SEEDED_RUSTC_VERSIONS[1]
+    }
 }
 
 /// How the fixture's `n % len` target spread maps onto

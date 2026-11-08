@@ -479,7 +479,13 @@ curl -sf --max-time 60 -X POST -H 'Content-Type: application/json' \
     || die "local CI refused the fixture's runs — see $LOG_DIR/local-ci.log"
 echo "[traffic] recorded $(jq '.runs | length' "$WORK_DIR/fixture-runs.json") in-flight fixture task runs and their records artifacts"
 
+INDEX_PUBLISH_TOKEN_FILE="$WORK_DIR/index-publish-token"
+(umask 077; "$BIN/stow-mock-registry" oidc-token --workflow index-publish.yml \
+    --lifetime-secs 7200 > "$INDEX_PUBLISH_TOKEN_FILE")
+
 LANE_ARGS=(
+    --index-publish-token-file "$INDEX_PUBLISH_TOKEN_FILE"
+    --index-publish-rustc "$(rustc --version | awk '{print $2}')"
     --model "$REPO_ROOT/launch-model.toml"
     --queue-rows "$SMALL"
     --rustc "$RUSTC_VERSION"
