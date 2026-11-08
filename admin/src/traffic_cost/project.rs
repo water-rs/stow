@@ -44,12 +44,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::preheat_cost::MeasuredReport;
 use clap::Args;
 use stow_types::api::SchedulerBudgetReport;
 use stow_types::do_budgets::{ALLOWANCE_FRACTION, DO_REQUEST_ALLOWANCE_FRACTION};
 use stow_types::forwards::{self, RunForwards};
 use stow_types::launch_model::{EventKind, LaunchModel};
-use stow_types::preheat_cost::{PreheatCostReport, ProductionWave};
+use stow_types::preheat_cost::ProductionWave;
 use stow_types::stow_error;
 
 use super::cpu::WorkerCpuReport;
@@ -989,6 +990,14 @@ fn evaluate(
                 .map_or("n/a", |route| route.route),
         });
     }
+    let unmeasured = preheat.unmeasured_worker_events();
+    if unmeasured > 0.0 {
+        projection.unmeasured_cpu.push(UnmeasuredCpu {
+            route: PREHEAT_ROUTE,
+            monthly_events: unmeasured,
+            reason: "covered phase CPU includes scheduler and observer work; build requested, index lifecycle deliveries and fixed trigger CPU are not captured",
+        });
+    }
     Ok(GateEvaluation {
         usage,
         top_routes,
@@ -1044,7 +1053,7 @@ fn project(
     small: &SchedulerBudgetReport,
     after: &SchedulerBudgetReport,
     cpu: &WorkerCpuReport,
-    preheat_report: &PreheatCostReport,
+    preheat_report: &MeasuredReport,
     production: &ProductionWave,
 ) -> Result<ProjectionReport, String> {
     let preheat = PreheatMonthly::new(model, preheat_report, production)?;
@@ -1071,6 +1080,7 @@ fn render_preheat(preheat: &PreheatMonthly) -> String {
     let mut table = Table::new(&[
         "per node",
         "Worker requests",
+        "covered CPU ms",
         "DO requests",
         "rows read",
         "rows written",
@@ -1083,6 +1093,7 @@ fn render_preheat(preheat: &PreheatMonthly) -> String {
         table.push([
             label.to_owned(),
             format!("{:.2}", cost.worker_requests),
+            format!("{:.2}", cost.worker_cpu_ms),
             format!("{:.2}", cost.requests),
             format!("{:.2}", cost.rows_read),
             format!("{:.2}", cost.rows_written),
@@ -1264,7 +1275,7 @@ pub async fn run(args: &ProjectArgs, output: Output) -> stow_types::error::Resul
     let small: SchedulerBudgetReport = super::read_json("budget report", &args.small).await?;
     let after: SchedulerBudgetReport = super::read_json("budget report", &args.after).await?;
     let cpu: WorkerCpuReport = super::read_json("Worker CPU report", &args.cpu).await?;
-    let preheat: PreheatCostReport = super::read_json("preheat cost report", &args.preheat).await?;
+    let preheat: MeasuredReport = super::read_json("preheat cost report", &args.preheat).await?;
     let production: ProductionWave = super::read_json("production wave", &args.production).await?;
     let model = super::read_model(&args.model).await?;
     let report = project(&model, &small, &after, &cpu, &preheat, &production)
@@ -1390,8 +1401,8 @@ mod tests {
 
     /// Preheat is added to the products the Preheat cost report
     /// measures and to no other: the total is traffic plus preheat on a
-    /// Durable Object line. Worker requests are also counted, while
-    /// Worker CPU remains unmeasured.
+    /// Durable Object line. Worker requests and covered phase CPU are
+    /// also counted.
     #[test]
     fn preheat_adds_to_the_measured_products_only() {
         let report = fixture_report(100_000, |_| 0.5);
@@ -1417,7 +1428,7 @@ mod tests {
         let workers = usage(&with, "workers", "requests");
         assert_eq!(workers.preheat, Some(0.0));
         assert!((workers.total() - workers.traffic).abs() < f64::EPSILON);
-        assert_eq!(usage(&with, "workers", "cpu_ms").preheat, None);
+        assert_eq!(usage(&with, "workers", "cpu_ms").preheat, Some(0.0));
     }
 
     #[test]
@@ -1523,7 +1534,7 @@ mod tests {
         let small = fixture_report(100_000, |_| 0.5);
         let after = fixture_report(100_000, |_| 0.5);
         let mut preheat = crate::traffic_cost::preheat::test_report(10);
-        preheat.nodes = 0;
+        preheat.report.nodes = 0;
         let production = crate::traffic_cost::preheat::test_production(10);
         let error = project(
             &model(),
@@ -1535,6 +1546,41 @@ mod tests {
         )
         .expect_err("a zero-node wave prices nothing");
         assert!(error.contains("0 nodes"), "{error}");
+    }
+
+    #[test]
+    fn measured_preheat_cpu_can_cross_the_combined_bound_and_retains_gaps() {
+        let small = fixture_report(100_000, |_| 0.5);
+        let after = fixture_report(100_000, |_| 0.5);
+        let mut preheat = crate::traffic_cost::preheat::test_report(10);
+        preheat.cpu.wave.initial.cpu_ms = super::WORKER_CPU_MS_MONTHLY * 10.0;
+        let report = project(
+            &model(),
+            &small,
+            &after,
+            &fixture_cpu(|_| 0.5),
+            &preheat,
+            &crate::traffic_cost::preheat::test_production(10),
+        )
+        .expect("project complete captures");
+        let breach = report
+            .projection
+            .breaches
+            .iter()
+            .find(|breach| breach.product == "workers" && breach.dimension == "cpu_ms")
+            .expect("preheat CPU must enter the gate");
+        assert!(breach.traffic < breach.bound);
+        assert!(breach.preheat > breach.bound);
+        assert_eq!(breach.top_route, super::PREHEAT_ROUTE);
+        let gap = report
+            .projection
+            .unmeasured_cpu
+            .iter()
+            .find(|gap| gap.route == super::PREHEAT_ROUTE)
+            .expect("absent deliveries must stay visible");
+        assert!(gap.monthly_events > 0.0);
+        assert!(gap.reason.contains("fixed trigger"));
+        assert!(super::render_projection(&report).contains("fixed trigger"));
     }
 
     #[test]
