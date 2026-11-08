@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use async_fs::read;
 use oci_client::Reference;
@@ -17,9 +16,8 @@ use stow_types::identity::WireRustcVersion;
 use stow_types::registry::{bundle_oci_reference, cache_repository, sha256_digest};
 use stow_types::upload_plan::{PlannedArtifact, PublishedArtifact};
 
-use crate::client::{RegistryError, RegistrySession, canonical_manifest_bytes};
+use crate::client::{RegistrySession, canonical_manifest_bytes};
 use crate::publisher::Publisher;
-use crate::retry::retry_with_backoff;
 use crate::sign;
 
 /// What [`push_artifacts`] did: the published coordinates of every plan.
@@ -39,7 +37,7 @@ pub struct UploadOutcome {
 ///
 /// # Errors
 ///
-/// Returns an error when a push, the signature, or a bundle pull fails;
+/// Returns an error when an artifact push, signing or bundle publication fails;
 /// the registry round-trip error names the plan's OCI reference.
 pub async fn push_artifacts(
     plans: &[PlannedArtifact],
@@ -69,7 +67,7 @@ pub async fn push_artifacts_with<S, Fut>(
 ) -> stow_types::error::Result<UploadOutcome>
 where
     S: Fn(String, String) -> Fut + Send + Sync,
-    Fut: Future<Output = stow_types::error::Result<()>> + Send,
+    Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
 {
     let mut published = BTreeMap::new();
     let mut newly_pushed = 0u32;
@@ -93,7 +91,7 @@ async fn publish_artifact<S, Fut>(
 ) -> stow_types::error::Result<PublishedArtifact>
 where
     S: Fn(String, String) -> Fut + Send + Sync,
-    Fut: Future<Output = stow_types::error::Result<()>> + Send,
+    Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
 {
     let config = artifact_config(plan);
     let config_bytes = serde_json::to_vec(&config)?;
@@ -120,8 +118,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error when a push, the signature, or the signature read-back
-/// fails.
+/// Returns an error when a push or the signature fails.
 pub async fn publish_packed<S, Fut>(
     session: &RegistrySession,
     oci_reference: &str,
@@ -132,7 +129,7 @@ pub async fn publish_packed<S, Fut>(
 ) -> stow_types::error::Result<PublishedArtifact>
 where
     S: Fn(String, String) -> Fut + Send + Sync,
-    Fut: Future<Output = stow_types::error::Result<()>> + Send,
+    Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
 {
     let reference: Reference = oci_reference
         .parse()
@@ -160,18 +157,19 @@ where
         None,
     );
     let manifest_bytes = canonical_manifest_bytes(&manifest)?;
-    let oci_digest = sign::put_signed_manifest(session, &reference, &manifest_bytes, |digest| {
+    let signed = sign::put_signed_manifest(session, &reference, &manifest_bytes, |digest| {
         sign(oci_reference.to_owned(), digest)
     })
     .await
     .map_err(|error| stow_types::stow_error!("push OCI artifact {oci_reference}: {error}"))?;
+    let oci_digest = signed.digest;
     tracing::info!(
         oci_reference = %oci_reference,
         digest = %oci_digest,
         "pushed and signed OCI artifact on GHCR"
     );
 
-    let signatures = pull_pushed_signature_materials(session, &reference, &oci_digest).await?;
+    let signatures = [signed.signing];
 
     let (bundle_digest, bundle_size) = push_bundle(
         session,
@@ -263,8 +261,7 @@ async fn push_bundle(
 /// Shared by the bundle republish path and the CLI's index verification.
 ///
 /// This is the read for a signature published earlier or by someone else:
-/// a `404` is the answer — the signature does not exist. For a signature
-/// this publish just pushed, use [`pull_pushed_signature_materials`].
+/// a `404` is the answer — the signature does not exist.
 ///
 /// # Errors
 ///
@@ -324,56 +321,6 @@ pub async fn verify_artifact_signature(
     )
 }
 
-/// How many times the read-back of a signature this publish just pushed
-/// runs before its absence is final. The registry may not show a tag the
-/// instant its push returned — run 38377192790 read the `.sig` tag 70 ms
-/// after cosign's push and got `MANIFEST_UNKNOWN` — and a tag this
-/// process pushed cannot legitimately be absent, so the bound is what
-/// separates a registry catching up from a push that never landed
-/// (stow#709).
-const PUSHED_READ_MAX_ATTEMPTS: u32 = 5;
-
-/// The first retry's delay; doubling across the attempts yields 200, 400,
-/// 800 and 1600 ms — three seconds in all.
-const PUSHED_READ_INITIAL_DELAY: Duration = Duration::from_millis(200);
-
-/// Pull every `sha256-<hex>.sig` signature layer for a manifest this
-/// publish has just signed and pushed.
-///
-/// The registry may not show a tag the instant its push returned, so the
-/// manifest pull retries a `404` within [`PUSHED_READ_MAX_ATTEMPTS`]
-/// before its absence is final. Use this only right after pushing the
-/// signature in the same publish; every other read goes through
-/// [`pull_signature_materials`], where a `404` is the answer.
-///
-/// # Errors
-///
-/// Same as [`pull_signature_materials`].
-pub async fn pull_pushed_signature_materials(
-    session: &RegistrySession,
-    reference: &Reference,
-    oci_digest: &str,
-) -> stow_types::error::Result<Vec<BundleSignatureMaterial>> {
-    let signature_reference = signature_reference(reference, oci_digest)?;
-    let (manifest_bytes, _) = retry_with_backoff(
-        "read back the pushed signature",
-        PUSHED_READ_MAX_ATTEMPTS,
-        PUSHED_READ_INITIAL_DELAY,
-        || session.pull_manifest(&signature_reference),
-        RegistryError::is_not_found,
-    )
-    .await
-    .map_err(|error| {
-        stow_types::stow_error!("pull signature manifest {signature_reference}: {error}")
-    })?;
-    Box::pin(signature_materials(
-        session,
-        &signature_reference,
-        &manifest_bytes,
-    ))
-    .await
-}
-
 /// The `sha256-<hex>.sig` reference `oci_digest`'s signature manifest
 /// sits under in `reference`'s registry and repository.
 fn signature_reference(
@@ -390,9 +337,7 @@ fn signature_reference(
 }
 
 /// The materials of the signature manifest `signature_reference` pulled —
-/// the part of the read [`pull_signature_materials`] and
-/// [`pull_pushed_signature_materials`] share once the manifest bytes are
-/// in hand.
+/// decoded after [`pull_signature_materials`] has fetched its bytes.
 async fn signature_materials(
     session: &RegistrySession,
     signature_reference: &Reference,

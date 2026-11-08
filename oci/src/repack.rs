@@ -59,7 +59,8 @@ pub async fn repack_record<S, Fut>(
 ) -> stow_types::error::Result<Option<ArtifactRecord>>
 where
     S: Fn(String, String) -> Fut + Send + Sync,
-    Fut: Future<Output = stow_types::error::Result<()>> + Send,
+    Fut: Future<Output = stow_types::error::Result<stow_types::bundle::BundleSignatureMaterial>>
+        + Send,
 {
     let oci_reference = record.oci_reference.as_str();
     let by_digest = session.digest_reference(&record.oci_digest)?;
