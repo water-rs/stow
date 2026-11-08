@@ -527,7 +527,7 @@ pub(super) async fn persist_freeze(
 /// An empty claim set appends nothing.
 ///
 /// # Errors
-/// `QueueError::Invariant` when a claimed payload cannot rebuild,
+/// `QueueError::Invariant` when a target has no runner family,
 /// `QueueError::Sql` on a failed append.
 pub(super) async fn claim_pass(
     graph: LoadedGraph<'_>,
