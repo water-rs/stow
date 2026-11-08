@@ -529,6 +529,8 @@ for ((seg = 1; seg <= SEGMENTS; seg++)); do
     echo "[traffic] segment $seg/$SEGMENTS: ${seg_secs}s"
     fg admin --json traffic-cost peak "${LANE_ARGS[@]}" \
         --duration-secs "$seg_secs" \
+        --inspector-url "$INSPECTOR_URL" \
+        --cpu-out "$REPORT_DIR/peak-seg${seg}-cpu.json" \
         --rate-scale "$RATE_SCALE" \
         >"$REPORT_DIR/peak-seg${seg}.json" 2>"$LOG_DIR/peak-seg${seg}.log" \
         || { cat "$LOG_DIR/peak-seg${seg}.log" >&2; \

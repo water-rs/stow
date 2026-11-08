@@ -41,10 +41,26 @@ pub struct PeakArgs {
     /// Maximum requests in flight per lane; defaults to host available parallelism.
     #[arg(long)]
     pub max_in_flight_per_lane: Option<NonZeroUsize>,
+    /// Inspector URL for CPU capture over the complete peak interval.
+    #[arg(long, requires = "cpu_out")]
+    pub inspector_url: Option<String>,
+    /// Where to retain CPU samples, including when the peak breaches.
+    #[arg(long, requires = "inspector_url")]
+    pub cpu_out: Option<std::path::PathBuf>,
 }
 
 /// Lane error share the run tolerates before it fails — one percent.
 const ERROR_RATE_BOUND: f64 = 0.01;
+
+/// One timed event, retained to correlate pauses across lanes.
+#[derive(Debug, serde::Serialize)]
+struct Observation {
+    counter: u64,
+    started_ms: f64,
+    preparation_ms: f64,
+    elapsed_ms: f64,
+    phases_ms: lanes::RequestTimingMs,
+}
 
 /// Per-lane measurements over the run.
 #[derive(Debug, Default, serde::Serialize)]
@@ -77,6 +93,8 @@ struct LaneStats {
     /// out of the emitted JSON.
     #[serde(skip)]
     latencies_ms: Vec<f64>,
+    /// Request phases in fire order per slot; counters identify their anchored beats.
+    observations: Vec<Observation>,
 }
 
 /// The driver's report — one entry per lane plus the verdict.
@@ -170,16 +188,19 @@ async fn run_lane_worker(
             return;
         }
         // Harness work, before the event's clock starts.
+        let preparation_started = tokio::time::Instant::now();
         if let Err(error) = lane.fire.ready(edge, 1).await {
             unready = Some(error);
             return;
         }
         let fired = tokio::time::Instant::now();
+        let preparation_ms = preparation_started.elapsed().as_secs_f64() * 1000.0;
+        let mut phases = lanes::RequestTimingMs::default();
         // A response the edge never sends cannot stall the run: the
         // deadline check happens between fires, so bound each one.
         let outcome = tokio::time::timeout(
             REQUEST_TIMEOUT,
-            lanes::fire_once(&lane.fire, edge, &mut client, counter),
+            lanes::fire_once(&lane.fire, edge, &mut client, counter, &mut phases),
         )
         .await
         .unwrap_or_else(|_| {
@@ -210,9 +231,15 @@ async fn run_lane_worker(
                 tracing::warn!(lane = lane.name, %error, "lane request build failed");
             }
         }
-        stats
-            .latencies_ms
-            .push(fired.elapsed().as_secs_f64() * 1000.0);
+        let elapsed_ms = fired.elapsed().as_secs_f64() * 1000.0;
+        stats.latencies_ms.push(elapsed_ms);
+        stats.observations.push(Observation {
+            counter,
+            started_ms: fired.duration_since(start).as_secs_f64() * 1000.0,
+            preparation_ms,
+            elapsed_ms,
+            phases_ms: phases,
+        });
         stats.requests += 1;
     };
     run_paced(start, interval, duration, first, stride, fire).await;
@@ -261,6 +288,7 @@ async fn run_lane(
         stats.unexpected_statuses += worker.unexpected_statuses;
         stats.overloaded += worker.overloaded;
         stats.latencies_ms.extend(worker.latencies_ms);
+        stats.observations.extend(worker.observations);
         for (status, count) in worker.statuses {
             *stats.statuses.entry(status).or_default() += count;
         }
@@ -335,6 +363,31 @@ fn lane_breaches(lane: &Lane, stats: &LaneStats, p99_bound_ms: f64) -> Vec<Strin
 /// `stow-admin traffic-cost peak` — fire the lanes, then emit the
 /// report and exit nonzero on a breach.
 pub async fn run(edge: &Edge, args: &PeakArgs, output: Output) -> stow_types::error::Result<()> {
+    let report = if let (Some(url), Some(path)) = (&args.inspector_url, &args.cpu_out) {
+        let (report, cpu) = super::cpu::capture_segment(url, "peak", async || {
+            let report = drive(edge, args).await?;
+            emit(output, &report, render_report)?;
+            Ok(report)
+        })
+        .await?;
+        tokio::fs::write(path, serde_json::to_vec(&cpu)?).await?;
+        report
+    } else {
+        let report = drive(edge, args).await?;
+        emit(output, &report, render_report)?;
+        report
+    };
+    if report.breaches.is_empty() {
+        Ok(())
+    } else {
+        Err(stow_error!(
+            "traffic-cost peak: {} breach(es)",
+            report.breaches.len()
+        ))
+    }
+}
+
+async fn drive(edge: &Edge, args: &PeakArgs) -> stow_types::error::Result<LoadReport> {
     let model = super::read_model(&args.lanes.model).await?;
     let lanes = lanes::build_lanes(&args.lanes, &model, args.rate_scale)
         .map_err(|error| stow_error!("{error}"))?;
@@ -366,15 +419,7 @@ pub async fn run(edge: &Edge, args: &PeakArgs, output: Output) -> stow_types::er
         lanes: lanes_map,
         breaches,
     };
-    emit(output, &report, render_report)?;
-    if report.breaches.is_empty() {
-        Ok(())
-    } else {
-        Err(stow_error!(
-            "traffic-cost peak: {} breach(es)",
-            report.breaches.len()
-        ))
-    }
+    Ok(report)
 }
 
 /// Human rendering — per-lane rate/latency/status table plus the
@@ -536,6 +581,11 @@ mod tests {
         assert_eq!(failed.requests, 1);
         assert_eq!(failed.statuses.get(&200), Some(&1));
         assert_eq!(failed.latencies_ms.len(), 1);
+        assert_eq!(failed.observations.len(), 1);
+        let observations = serde_json::to_value(&failed.observations).expect("observations");
+        assert!(observations[0]["phases_ms"]["body"].is_number());
+        assert!(observations[0]["started_ms"].is_number());
+        assert!(observations[0]["preparation_ms"].is_number());
         assert_eq!(failed.preparation_errors.len(), 1);
         assert!(failed.requests >= failed.required_requests);
         let breaches = super::lane_breaches(&callback, &failed, f64::INFINITY);

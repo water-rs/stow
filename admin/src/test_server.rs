@@ -46,6 +46,12 @@ const SENTINEL: Step = Step::Respond {
 /// What one accepted connection's requests do.
 #[derive(Debug, Clone)]
 pub enum Step {
+    /// A complete response with independently delayed headers and body.
+    Delayed {
+        header_delay: Duration,
+        body_delay: Duration,
+        body: &'static str,
+    },
     /// Read the request, then fail the connection without a response —
     /// the server-side drop the local CI poll met. The request is
     /// captured first: a replay of an unsent message would never reach
@@ -217,6 +223,10 @@ async fn run(
                         tx.try_send(CapturedRequest { head, body })
                             .expect("the request slot drains each connection");
                         match step {
+                            Step::Delayed { header_delay, body_delay, body } => {
+                                tokio::time::sleep(header_delay).await;
+                                delayed_body(body_delay, body)
+                            }
                             Step::Drop => Err(io::Error::new(
                                 io::ErrorKind::ConnectionAborted,
                                 "loopback drop",
@@ -278,7 +288,8 @@ async fn run(
                     }
                     // Every response step must serve cleanly; anything
                     // else is a server bug, not a scripted outcome.
-                    Step::Respond { .. }
+                    Step::Delayed { .. }
+                    | Step::Respond { .. }
                     | Step::RespondWith { .. }
                     | Step::RateLimited { .. } => {
                         served
@@ -301,6 +312,21 @@ async fn run(
 /// The body every served response shares — boxed so `respond` and
 /// `stall` agree on one response type.
 type ServedBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
+
+fn delayed_body(delay: Duration, body: &'static str) -> io::Result<Response<ServedBody>> {
+    use http_body_util::BodyExt as _;
+    let frames = futures_util::stream::once(async move {
+        tokio::time::sleep(delay).await;
+        Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(Bytes::from_static(
+            body.as_bytes(),
+        )))
+    });
+    Response::builder()
+        .status(200)
+        .header(http::header::CONTENT_LENGTH, body.len())
+        .body(http_body_util::StreamBody::new(frames).boxed())
+        .map_err(io::Error::other)
+}
 
 /// A typed h1 response for the scripted status, with `Retry-After`
 /// when the step carries a hint.
