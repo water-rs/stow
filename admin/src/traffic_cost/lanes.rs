@@ -139,10 +139,12 @@ pub enum Fire {
     WorkflowRun(CallbackLane),
     /// A nonempty signed-index membership report on its own workflow identity.
     IndexReport { token_file: PathBuf, rustc: String },
-    /// One signed lifecycle delivery of index-publish.yml.
-    IndexWorkflow {
+    /// One signed lifecycle delivery under the named workflow identity.
+    WorkflowDelivery {
         secret: String,
         action: &'static str,
+        workflow: &'static str,
+        title: &'static str,
     },
     /// `POST /api/v1/admissions` — one miss entry whose resolved graph
     /// rides in the body, so the lane pays the real mint path without
@@ -746,15 +748,15 @@ async fn plan(
         Fire::IndexReport { token_file, rustc } => {
             index_report_plan(base, token_file, rustc, counter).await
         }
-        Fire::IndexWorkflow { secret, action } => Ok(signed_workflow_plan(
+        Fire::WorkflowDelivery {
+            secret,
+            action,
+            workflow,
+            title,
+        } => Ok(signed_workflow_plan(
             base,
             secret,
-            workflow_delivery_body(
-                action,
-                stow_types::trusted_builder::INDEX_WORKFLOW_FILE,
-                counter + 1,
-                "Publish index",
-            ),
+            workflow_delivery_body(action, workflow, counter + 1, title),
         )),
         Fire::Admission { target, rustc } => Ok(Plan::PostJson {
             url: format!("{base}/api/v1/admissions"),
@@ -951,19 +953,41 @@ pub fn build_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<V
             },
         ]);
     }
+    lanes.extend(build_workflow_lanes(args, model, scale)?);
+    if !args.lanes.is_empty() {
+        lanes.retain(|lane| args.lanes.iter().any(|name| name == lane.name));
+        if lanes.is_empty() {
+            return Err(format!("no lane matches --lanes {}", args.lanes.join(",")));
+        }
+    }
+    Ok(lanes)
+}
+
+fn build_workflow_lanes(
+    args: &LaneArgs,
+    model: &LaunchModel,
+    scale: f64,
+) -> Result<Vec<Lane>, String> {
+    let eps = |kind: EventKind| model.peak_events_per_second(kind) * scale;
+    let mut lanes = Vec::new();
     if let Some(secret) = &args.webhook_secret {
+        lanes.push(Lane {
+            name: "build-requested",
+            eps: eps(EventKind::BuildCallback),
+            fire: Fire::WorkflowDelivery {
+                secret: secret.clone(),
+                action: "requested",
+                workflow: stow_types::trusted_builder::WORKFLOW_FILE,
+                title: "Build crate",
+            },
+            expected: ok2xx,
+        });
         lanes.push(Lane {
             name: "workflow-callback",
             eps: eps(EventKind::BuildCallback),
             fire: Fire::WorkflowRun(CallbackLane::new(secret.clone(), args.queue_rows)?),
             expected: ok2xx,
         });
-    }
-    if !args.lanes.is_empty() {
-        lanes.retain(|lane| args.lanes.iter().any(|name| name == lane.name));
-        if lanes.is_empty() {
-            return Err(format!("no lane matches --lanes {}", args.lanes.join(",")));
-        }
     }
     Ok(lanes)
 }
@@ -1000,9 +1024,11 @@ fn index_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<Vec<L
             lanes.push(Lane {
                 name,
                 eps: eps(EventKind::IndexPublish),
-                fire: Fire::IndexWorkflow {
+                fire: Fire::WorkflowDelivery {
                     secret: secret.clone(),
                     action,
+                    workflow: stow_types::trusted_builder::INDEX_WORKFLOW_FILE,
+                    title: "Publish index",
                 },
                 expected: ok2xx,
             });
@@ -1138,6 +1164,40 @@ mod tests {
                 (action == "completed").then_some("success")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn requested_build_lane_signs_the_build_workflow_delivery() {
+        let model =
+            LaunchModel::from_toml(include_str!("../../../launch-model.toml")).expect("model");
+        let mut args = lane_args();
+        args.lanes = vec!["build-requested".to_owned()];
+        let lanes = build_lanes(&args, &model, 1.0).expect("requested lane");
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(
+            lanes[0].eps,
+            model.peak_events_per_second(stow_types::launch_model::EventKind::BuildCallback)
+        );
+        let edge = crate::Edge::for_test("http://127.0.0.1:8080".to_owned());
+        let request = super::plan(&lanes[0].fire, &edge, &mut zenwave::client(), 41)
+            .await
+            .expect("request");
+        let super::Plan::PostBytes { url, headers, body } = request else {
+            panic!("expected signed webhook request");
+        };
+        assert_eq!(url, "http://127.0.0.1:8080/api/v1/github/workflow-run");
+        assert!(headers.contains(&(
+            "X-Hub-Signature-256".to_owned(),
+            super::sign_body("secret", &body),
+        )));
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("delivery");
+        assert_eq!(body["action"], "requested");
+        assert_eq!(body["workflow_run"]["id"], 42);
+        assert_eq!(
+            body["workflow_run"]["path"],
+            ".github/workflows/build-crate.yml"
+        );
+        assert_eq!(body["workflow_run"]["conclusion"], serde_json::Value::Null);
     }
 
     #[tokio::test]
