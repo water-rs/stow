@@ -62,6 +62,53 @@ class CacheCompaction(unittest.TestCase):
             self.assertTrue(restored_archives[0].samefile(restored_archives[1]))
             self.assertEqual(restored_archives[1].read_bytes(), b"same immutable crate body")
 
+    def test_restored_mutable_files_are_private_before_workers_start(self):
+        module = runpy.run_path(str(Path(__file__).with_name("compact-resolver-cache.py")))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "homes"
+            mutable = []
+            archives = []
+            for worker in ("worker-0", "worker-1", "worker-2"):
+                home = root / "01-projects" / worker
+                for relative in (
+                    "registry/index/crates-io/.cache/ex/am/example",
+                    "git/db/example/objects/pack/example.pack",
+                ):
+                    path = home / relative
+                    path.parent.mkdir(parents=True)
+                    path.write_bytes(b"identical cache data")
+                    mutable.append(path.relative_to(root))
+                archive = home / "registry/cache/crates-io/example.crate"
+                archive.parent.mkdir(parents=True)
+                archive.write_bytes(b"immutable archive")
+                archives.append(archive.relative_to(root))
+
+            report = module["compact"](root)
+            self.assertEqual(report["hardlinked_mutable_files"], len(mutable) - 1)
+            self.assertEqual(report["unique_mutable_cache_files"], 1)
+            packed = Path(temporary) / "cache.tar"
+            subprocess.run(["tar", "-cf", str(packed), "-C", str(root), "."], check=True, timeout=10)
+            restored = Path(temporary) / "restored"
+            restored.mkdir()
+            subprocess.run(["tar", "-xf", str(packed), "-C", str(restored)], check=True, timeout=10)
+            self.assertTrue((restored / mutable[0]).samefile(restored / mutable[-1]))
+            self.assertEqual(module["materialize"](restored), len(mutable) - 1)
+            self.assertEqual(module["materialize"](restored), 0)
+            self.assertEqual(len({(restored / path).stat().st_ino for path in mutable}), len(mutable))
+            for path in mutable:
+                self.assertEqual((restored / path).read_bytes(), b"identical cache data")
+            # Write through the inode rather than replacing the path:
+            # this would corrupt other workers if a hardlink remained.
+            (restored / mutable[0]).write_bytes(b"worker-local update")
+            for path in mutable[1:]:
+                self.assertEqual((restored / path).read_bytes(), b"identical cache data")
+            self.assertTrue((restored / archives[0]).samefile(restored / archives[-1]))
+
+    def test_cold_cache_needs_no_materialization(self):
+        module = runpy.run_path(str(Path(__file__).with_name("compact-resolver-cache.py")))
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertEqual(module["materialize"](Path(temporary)), 0)
+
     def test_empty_resolver_root_is_an_error(self):
         compact = runpy.run_path(str(Path(__file__).with_name("compact-resolver-cache.py")))["compact"]
         with tempfile.TemporaryDirectory() as temporary:

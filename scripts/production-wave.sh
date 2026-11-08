@@ -83,6 +83,9 @@ LANES_DIR="$WORK_DIR/lanes"
 # serialize against each other.
 RESOLVE_ROOT="${STOW_RESOLVE_CARGO_HOME:-$WORK_DIR/resolve-cargo}"
 mkdir -p "$LOG_DIR" "$LANES_DIR" "$RESOLVE_ROOT"
+# Native cache restoration preserves packed hardlinks. Mutable Cargo
+# files must be independently writable before any worker is started.
+python3 "$REPO_ROOT/scripts/compact-resolver-cache.py" materialize "$RESOLVE_ROOT"
 
 LANE_PIDS=()
 
@@ -215,7 +218,7 @@ done
 log "production wave: $WORK_DIR/production-wave.json"
 
 # Both lanes and their workers have exited. Free extracted sources and
-# checkouts, then let native tar save repeated immutable downloads as
-# hardlinks instead of packing a body for every resolver worker.
-python3 "$REPO_ROOT/scripts/compact-resolver-cache.py" \
+# checkouts, then let native tar save repeated cache bytes as hardlinks.
+# The next wave materializes private mutable files before launching work.
+python3 "$REPO_ROOT/scripts/compact-resolver-cache.py" compact \
     "$RESOLVE_ROOT" "$WORK_DIR/resolver-cache.json"
