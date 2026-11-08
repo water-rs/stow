@@ -29,6 +29,7 @@ use crate::Edge;
 use crate::render::Output;
 
 mod cpu;
+pub use cpu::{SegmentArgs, segment as profile_preheat};
 mod fixture_runs;
 mod lanes;
 mod peak;

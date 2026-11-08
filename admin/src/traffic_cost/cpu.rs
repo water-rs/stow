@@ -54,6 +54,7 @@
 //! [`REFERENCE_DRIFT_LIMIT`]: the runner's speed moved during the pass,
 //! so no single reference describes every lane.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -82,6 +83,77 @@ pub struct CpuArgs {
     /// Unprofiled events fired first, so JIT tiers and caches are warm.
     #[arg(long, default_value_t = 5)]
     pub warmup_events: u32,
+}
+
+/// One uninterrupted preheat segment, controlled by the mock harness.
+#[derive(Debug, Args)]
+pub struct SegmentArgs {
+    /// The local edge's `DevTools` inspector WebSocket URL.
+    #[arg(long)]
+    inspector_url: String,
+    /// Written only after profiling starts; the harness waits for it.
+    #[arg(long)]
+    ready: PathBuf,
+    /// The harness creates this file when measured work is finished.
+    #[arg(long)]
+    stop: PathBuf,
+    /// Maximum time waiting for the harness to finish this segment.
+    #[arg(long)]
+    deadline_secs: std::num::NonZeroU64,
+    /// Where to save the measured CPU and raw profiles.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+/// CPU for a complete uninterrupted edge segment, including DO CPU.
+#[derive(Debug, Serialize, Deserialize)]
+struct SegmentReport {
+    pub sampling_interval_us: u64,
+    pub idle_window_ms: u64,
+    pub idle_cpu_ms: f64,
+    pub reference: ReferenceCpu,
+    pub cpu_ms: f64,
+    pub profiles: Vec<CapturedProfile>,
+    pub scripts: Vec<ScriptSource>,
+}
+
+/// Capture a segment without changing the workload driven by the harness.
+pub async fn segment(args: &SegmentArgs) -> stow_types::error::Result<()> {
+    let (inspector, mut artifacts, idle_cpu_ms) = prepare_sampler(&args.inspector_url).await?;
+    let rounds_before = measure_reference(&inspector, &mut artifacts).await?;
+    let cpu_ms = profiled(&inspector, &mut artifacts, "preheat", async || {
+        tokio::fs::write(&args.ready, b"ready\n").await?;
+        tokio::time::timeout(Duration::from_secs(args.deadline_secs.get()), async {
+            loop {
+                match tokio::fs::metadata(&args.stop).await {
+                    Ok(_) => return Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(stow_error!("read {}: {error}", args.stop.display())),
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            stow_error!(
+                "preheat CPU segment exceeded {} seconds",
+                args.deadline_secs
+            )
+        })?
+    })
+    .await?;
+    let rounds_after = measure_reference(&inspector, &mut artifacts).await?;
+    let report = SegmentReport {
+        sampling_interval_us: SAMPLING_INTERVAL_US,
+        idle_window_ms: u64::try_from(IDLE_WINDOW.as_millis())?,
+        idle_cpu_ms,
+        reference: reference_cpu(rounds_before, rounds_after)?,
+        cpu_ms,
+        scripts: artifacts.sources(&inspector).await?,
+        profiles: artifacts.profiles,
+    };
+    tokio::fs::write(&args.out, serde_json::to_vec(&report)?).await?;
+    Ok(())
 }
 
 /// Profiled rounds per lane; the lane reports the smallest.
@@ -741,22 +813,15 @@ async fn measure_reference(
     Ok(rounds_ms)
 }
 
-/// `stow-admin traffic-cost cpu` — check the sampler, measure the
-/// reference and every lane, emit the report, and exit nonzero on a
-/// lane over budget.
+/// Connect and verify that idle isolate time is not counted as CPU.
 #[expect(
     clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
     reason = "the idle window is three seconds"
 )]
-pub async fn run(edge: &Edge, args: &CpuArgs, output: Output) -> stow_types::error::Result<()> {
-    if args.events_per_round == 0 {
-        return Err(stow_error!("--events-per-round must be at least 1"));
-    }
-    let model = super::read_model(&args.lanes.model).await?;
-    let lanes =
-        lanes::build_lanes(&args.lanes, &model, 1.0).map_err(|error| stow_error!("{error}"))?;
-    let inspector = Inspector::connect(&args.inspector_url).await?;
+async fn prepare_sampler(
+    url: &str,
+) -> stow_types::error::Result<(Inspector, ProfileArtifacts, f64)> {
+    let inspector = Inspector::connect(url).await?;
     inspector
         .call("Profiler.enable", serde_json::Value::Null)
         .await?;
@@ -781,6 +846,25 @@ pub async fn run(edge: &Edge, args: &CpuArgs, output: Output) -> stow_types::err
              samples measure wall time, not CPU"
         ));
     }
+
+    Ok((inspector, artifacts, idle_cpu_ms))
+}
+
+/// `stow-admin traffic-cost cpu` — check the sampler, measure the
+/// reference and every lane, emit the report, and exit nonzero on a
+/// lane over budget.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the idle window is three seconds"
+)]
+pub async fn run(edge: &Edge, args: &CpuArgs, output: Output) -> stow_types::error::Result<()> {
+    if args.events_per_round == 0 {
+        return Err(stow_error!("--events-per-round must be at least 1"));
+    }
+    let model = super::read_model(&args.lanes.model).await?;
+    let lanes =
+        lanes::build_lanes(&args.lanes, &model, 1.0).map_err(|error| stow_error!("{error}"))?;
+    let (inspector, mut artifacts, idle_cpu_ms) = prepare_sampler(&args.inspector_url).await?;
 
     let rounds_before = measure_reference(&inspector, &mut artifacts).await?;
     let mut measured = Vec::with_capacity(lanes.len());

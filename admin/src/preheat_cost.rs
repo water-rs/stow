@@ -74,6 +74,8 @@ enum CostCommand {
     /// Read the scheduler's probe ledger (budget-probe deploys only) and
     /// write it with the time it was read.
     Ledger(LedgerArgs),
+    /// Capture one uninterrupted mock edge CPU segment through `DevTools`.
+    Profile(crate::traffic_cost::SegmentArgs),
     /// Analyse a finished run's work directory and write the report;
     /// exits nonzero when any check fails.
     Report(ReportArgs),
@@ -129,6 +131,7 @@ pub async fn run(
 ) -> stow_types::error::Result<()> {
     match args.command {
         CostCommand::Ledger(args) => ledger(&args, store).await,
+        CostCommand::Profile(args) => crate::traffic_cost::profile_preheat(&args).await,
         CostCommand::Report(args) => report(&args, output).await,
         CostCommand::Production(args) => production(&args, output).await,
     }

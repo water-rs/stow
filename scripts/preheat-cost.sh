@@ -86,6 +86,7 @@ set -m
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 EDGE_PORT=8790
+INSPECTOR_PORT=9232
 # The mock manifest pins the registry and local CI to these ports
 # (GHCR_BASE_URL, STOW_LOCAL_CI_URL).
 REGISTRY_ADDR=127.0.0.1:28123
@@ -302,7 +303,7 @@ openssl ec -in "$WORK_DIR/keys/private.pem" -pubout -out "$WORK_DIR/keys/public.
 mkdir -p "$WORK_DIR/mock-registry" "$WORK_DIR/edge-state" "$WORK_DIR/local-ci" \
     "$WORK_DIR/index-export"
 
-for port in "$EDGE_PORT" "${REGISTRY_ADDR##*:}" "${LOCAL_CI_ADDR##*:}"; do
+for port in "$EDGE_PORT" "$INSPECTOR_PORT" "${REGISTRY_ADDR##*:}" "${LOCAL_CI_ADDR##*:}"; do
     if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
         die "port $port is already in use — refusing to probe a foreign service"
     fi
@@ -336,7 +337,7 @@ start_edge() {
     (
         cd "$REPO_ROOT/edge"
         exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
-            --port "$EDGE_PORT" --persist-to "$WORK_DIR/edge-state" \
+            --port "$EDGE_PORT" --inspector-port "$INSPECTOR_PORT" --persist-to "$WORK_DIR/edge-state" \
             --var "STOW_MAX_CONCURRENT_JOBS:$MAX_JOBS" \
             --var "STOW_MAX_CONCURRENT_MACOS_JOBS:$MAX_MACOS_JOBS" \
             --var "STOW_COST_BUDGET_MULTIPLIER:1.0"
@@ -351,7 +352,7 @@ start_edge() {
     fi
     log "started edge (pid $EDGE_PID), log: $LOG_DIR/edge.log"
     wait_for "edge listener" "$READY_DEADLINE" "$EDGE_PID" \
-        http_listening "$SCHEDULER_URL/status"
+        http_listening "$EDGE_URL/"
 }
 
 stop_edge() {
@@ -496,6 +497,46 @@ local_ci_counts() {
 ROUND=0
 RESTART=0
 
+# Each capture belongs to one phase and one uninterrupted edge lifetime.
+# Its ready marker is written after Profiler.start; stopping saves the
+# raw profile before the edge can exit. Every started segment is required.
+PROFILE_PID=""
+PROFILE_IDX=-1
+PROFILE_SEGMENT=0
+PROFILE_PHASE=""
+PROFILE_DIR=""
+
+start_profile() {
+    PROFILE_PHASE="$1"
+    PROFILE_SEGMENT=$((PROFILE_SEGMENT + 1))
+    PROFILE_DIR="$COST_DIR/$PROFILE_PHASE/cpu/$(printf '%03d' "$PROFILE_SEGMENT")"
+    mkdir -p "$PROFILE_DIR"
+    "$BIN/stow-admin" preheat cost profile \
+        --inspector-url "ws://127.0.0.1:$INSPECTOR_PORT/ws" \
+        --ready "$PROFILE_DIR/ready" --stop "$PROFILE_DIR/stop" \
+        --deadline-secs "$PHASE_DEADLINE" --out "$PROFILE_DIR/profile.json" \
+        >"$PROFILE_DIR/profiler.log" 2>&1 &
+    PROFILE_PID=$!
+    CHILD_PIDS+=("$PROFILE_PID")
+    CHILD_NAMES+=(cpu-profiler)
+    local indices=("${!CHILD_PIDS[@]}")
+    PROFILE_IDX=${indices[${#indices[@]}-1]}
+    wait_for "preheat CPU sampler" 30 "$PROFILE_PID" test -f "$PROFILE_DIR/ready"
+}
+
+stop_profile() {
+    touch "$PROFILE_DIR/stop"
+    local deadline=$((SECONDS + 30))
+    while kill -0 "$PROFILE_PID" 2>/dev/null; do
+        [ "$SECONDS" -lt "$deadline" ] || die "CPU sampler did not finish in 30s"
+        sleep 1
+    done
+    wait "$PROFILE_PID" || die "preheat CPU capture failed — see $PROFILE_DIR/profiler.log"
+    [ -s "$PROFILE_DIR/profile.json" ] || die "preheat CPU profile missing: $PROFILE_DIR"
+    unset "CHILD_PIDS[$PROFILE_IDX]" "CHILD_NAMES[$PROFILE_IDX]"
+    PROFILE_PID=""
+}
+
 # Restart the dev edge, bracketed by ledger reads. The probe ledger lives
 # on the scheduler graph and persists only through its snapshot, so the
 # restarted edge answers its last snapshot's ledger; the report carries
@@ -506,8 +547,10 @@ restart_edge() {
     dir="$COST_DIR/restarts/$(printf '%03d' "$RESTART")"
     mkdir -p "$dir"
     snapshot "$dir/before.json"
+    stop_profile
     stop_edge
     start_edge
+    start_profile "$PROFILE_PHASE"
     snapshot "$dir/after.json"
 }
 
@@ -610,17 +653,21 @@ publish_round bootstrap
 # --- the wave ---------------------------------------------------------------
 
 mkdir -p "$COST_DIR/wave" "$COST_DIR/resubmit"
+start_profile wave
 snapshot "$COST_DIR/wave/start.json"
 start_lanes wave
 drive_phase wave
 snapshot "$COST_DIR/wave/end.json"
+stop_profile
 
 # --- the daily resubmit -----------------------------------------------------
 
+start_profile resubmit
 snapshot "$COST_DIR/resubmit/start.json"
 start_lanes resubmit
 drive_phase resubmit
 snapshot "$COST_DIR/resubmit/end.json"
+stop_profile
 
 # --- the report -------------------------------------------------------------
 
