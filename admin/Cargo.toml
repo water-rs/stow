@@ -54,6 +54,8 @@ hex.workspace = true
 keyring-core = { version = "1.0.1", default-features = false }
 
 [dev-dependencies]
+# Reuse the locked WebSocket implementation for local DevTools transport regressions.
+async-tungstenite = { version = "0.34.1", default-features = false, features = ["handshake", "tokio-runtime"] }
 # `#[tokio::test]` + `start_paused` for the pacing loop's boundary tests.
 tokio = { version = "1", features = ["macros", "test-util"] }
 # The loopback test server speaks real h1 on maintained crates already

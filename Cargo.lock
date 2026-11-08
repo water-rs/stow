@@ -497,6 +497,7 @@ dependencies = [
  "futures-task",
  "log",
  "pin-project-lite",
+ "tokio",
  "tungstenite 0.29.0",
 ]
 
@@ -8057,6 +8058,7 @@ version = "0.14.0"
 dependencies = [
  "apple-native-keyring-store",
  "askama 0.14.0",
+ "async-tungstenite 0.34.1",
  "axum",
  "blake3",
  "bytes",
