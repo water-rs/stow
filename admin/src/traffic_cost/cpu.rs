@@ -277,9 +277,6 @@ impl ProfileArtifacts {
     }
 
     async fn sources(&self, inspector: &Inspector) -> stow_types::error::Result<Vec<ScriptSource>> {
-        inspector
-            .call("Debugger.enable", serde_json::Value::Null)
-            .await?;
         let mut sources = Vec::with_capacity(self.scripts.len());
         // One owner reads this protocol socket; its request/reply exchanges
         // serialize under a concurrency bound of one.
@@ -831,6 +828,11 @@ async fn prepare_sampler(
     url: &str,
 ) -> stow_types::error::Result<(Inspector, ProfileArtifacts, f64)> {
     let inspector = Inspector::connect(url).await?;
+    // Retain collected scripts from the start of capture. Enabling only
+    // before source retrieval is too late for a long-running segment.
+    inspector
+        .call("Debugger.enable", serde_json::Value::Null)
+        .await?;
     inspector
         .call("Profiler.enable", serde_json::Value::Null)
         .await?;
@@ -1017,6 +1019,89 @@ mod tests {
         ))
         .await
         .expect("profile transfer deadline");
+    }
+
+    #[tokio::test]
+    async fn debugger_retains_sources_from_before_the_first_profile_until_retrieval() {
+        use futures_util::StreamExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listen");
+        let address = listener.local_addr().expect("address");
+        let server = async {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut socket = async_tungstenite::tokio::accept_async(stream)
+                .await
+                .expect("handshake");
+            for method in [
+                "Runtime.disable",
+                "Runtime.enable",
+                "Debugger.enable",
+                "Profiler.enable",
+                "Profiler.setSamplingInterval",
+                "Profiler.start",
+                "Profiler.stop",
+                "Debugger.getScriptSource",
+                "Debugger.disable",
+            ] {
+                let request = socket.next().await.expect("request").expect("frame");
+                let request: serde_json::Value =
+                    serde_json::from_str(request.to_text().expect("text")).expect("command");
+                assert_eq!(request["method"], method);
+                if method == "Runtime.enable" {
+                    let event = serde_json::json!({"method": "Runtime.executionContextCreated", "params": {"context": {
+                        "id": 1, "name": "Worker", "origin": "", "uniqueId": "test-context"
+                    }}});
+                    socket
+                        .send(async_tungstenite::tungstenite::Message::Text(
+                            event.to_string().into(),
+                        ))
+                        .await
+                        .expect("context event");
+                }
+                let result = match method {
+                    "Profiler.stop" => {
+                        serde_json::json!({"profile": {"nodes": [], "samples": [], "timeDeltas": []}})
+                    }
+                    "Debugger.getScriptSource" => {
+                        assert_eq!(request["params"]["scriptId"], "3");
+                        serde_json::json!({"scriptSource": "retained source"})
+                    }
+                    _ => serde_json::json!({}),
+                };
+                let reply = serde_json::json!({"id": request["id"], "result": result});
+                socket
+                    .send(async_tungstenite::tungstenite::Message::Text(
+                        reply.to_string().into(),
+                    ))
+                    .await
+                    .expect("reply");
+            }
+        };
+        let client = async {
+            let (inspector, mut artifacts, idle_cpu) =
+                super::prepare_sampler(&format!("ws://{address}"))
+                    .await
+                    .expect("prepare sampler");
+            assert_eq!(idle_cpu, 0.0);
+            artifacts
+                .scripts
+                .insert("3".to_owned(), "worker-module".to_owned());
+            let sources = artifacts
+                .sources(&inspector)
+                .await
+                .expect("retained source");
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].source, "retained source");
+        };
+        Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async {
+                tokio::join!(server, client);
+            },
+        ))
+        .await
+        .expect("bounded inspector exchange");
     }
 
     fn close(a: f64, b: f64) -> bool {
