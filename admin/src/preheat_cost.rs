@@ -62,6 +62,16 @@ use stow_types::transient::Backoff;
 use crate::projects::{ProjectsPlan, SubmitOutcome};
 use crate::render::{self, Output, Planned, Table};
 
+pub mod cpu;
+
+/// Scheduler costs plus complete CPU captures for both measured phases.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct MeasuredReport {
+    #[serde(flatten)]
+    pub report: PreheatCostReport,
+    pub cpu: cpu::PreheatCpu,
+}
+
 /// `stow-admin preheat cost`.
 #[derive(Args)]
 pub struct CostArgs {
@@ -461,11 +471,15 @@ async fn report(args: &ReportArgs, output: Output) -> stow_types::error::Result<
         covered,
         overload_sightings: overload_sightings(&args.scan).await?,
     })?;
+    let report = MeasuredReport {
+        report,
+        cpu: cpu::read(&args.work_dir).await?,
+    };
     tokio::fs::write(&args.out, serde_json::to_vec_pretty(&report)?)
         .await
         .map_err(|error| stow_error!("write {}: {error}", args.out.display()))?;
     render::emit(output, &report, render_report)?;
-    let failed = report.failures().count();
+    let failed = report.report.failures().count();
     if failed > 0 {
         return Err(stow_error!(
             "{failed} preheat cost check(s) failed — see {}",
@@ -508,15 +522,29 @@ fn render_production(wave: &ProductionWave) -> String {
     )
 }
 
-fn render_report(report: &PreheatCostReport) -> String {
-    let mut phases = Table::new(&["phase", "rows read", "rows written", "runs", "wall s"]);
-    for (name, phase) in [("wave", &report.wave), ("resubmit", &report.resubmit)] {
+fn render_report(measured: &MeasuredReport) -> String {
+    let report = &measured.report;
+    let mut phases = Table::new(&[
+        "phase",
+        "rows read",
+        "rows written",
+        "runs",
+        "wall s",
+        "covered isolate CPU ms",
+        "segments",
+    ]);
+    for (name, phase, cpu) in [
+        ("wave", &report.wave, &measured.cpu.wave),
+        ("resubmit", &report.resubmit, &measured.cpu.resubmit),
+    ] {
         phases.push([
             name.to_owned(),
             phase.rows_read.to_string(),
             phase.rows_written.to_string(),
             phase.tasks.to_string(),
             (phase.wall_ms / 1000).to_string(),
+            format!("{:.1}", cpu.total_ms()),
+            cpu.segment_count().to_string(),
         ]);
     }
     let mut layers = Table::new(&[
