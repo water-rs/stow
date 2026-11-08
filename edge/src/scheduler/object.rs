@@ -1,7 +1,7 @@
 //! Durable Object glue: routes scheduler HTTP/alarm events into the queue
 //! state machine and GitHub dispatch.
 
-use futures_util::stream::{self, StreamExt as _};
+use futures_util::stream::{self, StreamExt as _, TryStreamExt as _};
 use js_sys::Reflect;
 use serde::{Deserialize, Serialize};
 use skyzen::durable::DurableObject;
@@ -2135,27 +2135,28 @@ async fn dispatch_claims(
     backend: &dispatch::CiInterface<dispatch::CfTransport>,
     claims: Vec<graph::Claimed>,
 ) -> Result<()> {
-    // Collected before streaming: a closure inside the stream's type
-    // borrows each claim under a higher-ranked lifetime, and the alarm
-    // future then cannot prove itself `Send`.
-    let dispatches: Vec<_> = claims
-        .iter()
-        .map(|claim| {
-            let encoded = claim.payload.encode_dispatch_task().map_err(|error| {
-                dispatch::DispatchError::Response(format!("encode task: {error}"))
-            });
-            async move {
-                match encoded {
-                    Ok(encoded) => backend.submit(&encoded).await,
-                    Err(error) => Err(error),
-                }
-            }
+    // Own each claim inside its future: no borrow of the stream's item
+    // escapes into the alarm future. Payload construction and encoding
+    // happen only when `buffered` polls an admitted outbound slot.
+    let outcomes = stream::iter(claims)
+        .map(|claim| async move {
+            let encoded = {
+                let payload = graph
+                    .with(|graph| graph.claimed_payload(&claim))
+                    .map_err(route_error)?;
+                payload.encode_dispatch_task().map_err(|error| {
+                    dispatch::DispatchError::Response(format!("encode task: {error}"))
+                })
+            };
+            let outcome = match encoded {
+                Ok(encoded) => backend.submit(&encoded).await,
+                Err(error) => Err(error),
+            };
+            Ok::<_, Error>((claim, outcome))
         })
-        .collect();
-    let outcomes = stream::iter(dispatches)
         .buffered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
-        .collect::<Vec<_>>()
-        .await;
+        .try_collect::<Vec<_>>()
+        .await?;
     // ONE `Bindings` row for every returned binding (review); POST
     // failures re-queue their claim under backoff in memory only —
     // the failure is not a persistent event: a wake replays the claim
@@ -2163,16 +2164,16 @@ async fn dispatch_claims(
     // the stale lease returns.
     let mut bindings = Vec::new();
     let mut fails: Vec<(String, u64, String)> = Vec::new();
-    for (claim, outcome) in claims.iter().zip(outcomes) {
+    for (claim, outcome) in outcomes {
         match outcome {
             Ok(run) => bindings.push(stow_types::api::DispatchBinding {
-                task_id: claim.task_id.clone(),
+                task_id: claim.task_id,
                 generation: claim.generation,
                 run_id: run.workflow_run_id.to_string(),
             }),
             Err(error) => {
                 tracing::error!(task_id = %claim.task_id, %error, "failed to dispatch build");
-                fails.push((claim.task_id.clone(), claim.generation, error.to_string()));
+                fails.push((claim.task_id, claim.generation, error.to_string()));
             }
         }
     }

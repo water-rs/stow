@@ -609,8 +609,6 @@ pub struct Claimed {
     pub generation: u64,
     /// The attempt cycle.
     pub attempt: u32,
-    /// The dispatch payload, subgraph rebuilt.
-    pub payload: BuildTaskPayload,
 }
 
 /// A tree whose shape and identity keys have been checked. The borrow
@@ -1968,8 +1966,7 @@ impl Graph {
     /// event for this set before posting, and ONE `Bindings` row after.
     ///
     /// # Errors
-    /// `QueueError::Invariant` when a claimed node's payload cannot be
-    /// rebuilt or its target has no runner family.
+    /// `QueueError::Invariant` when a target has no runner family.
     pub fn claim(
         &mut self,
         settings: &queue::SchedulerSettings,
@@ -2087,7 +2084,6 @@ impl Graph {
                 task_id: self.task_id_of(ix),
                 generation,
                 attempt: u32::from(self.state(ix).attempt),
-                payload: self.task_payload(ix)?,
             });
         }
         Ok(claimed)
@@ -2693,6 +2689,22 @@ impl Graph {
         self.edge_range(owner).any(|edge| {
             !self.edges.met(edge) && self.node(self.edges.dep(edge)).status == Status::Failed
         })
+    }
+
+    /// Rebuild a claim only when its outbound slot starts. The stable
+    /// task id survives arena compaction; the attempt belongs to the
+    /// claim even if a later event has changed the node's retry state.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` if the retained claim or its dependency
+    /// identities cannot be found or decoded.
+    pub fn claimed_payload(&self, claim: &Claimed) -> Result<BuildTaskPayload, QueueError> {
+        let ix = self.node_ix(&claim.task_id).ok_or_else(|| {
+            QueueError::Invariant(format!("claimed task {} is missing", claim.task_id))
+        })?;
+        let mut payload = self.task_payload(ix)?;
+        payload.attempt = claim.attempt;
+        Ok(payload)
     }
 
     /// Rebuild a claimed node's `BuildTaskPayload` — identity fields
@@ -4827,9 +4839,21 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].task_id, id("b"));
         // The payload's subgraph rebuilds c from the retained node.
-        assert_eq!(claimed[0].payload.dependency_subgraph.nodes.len(), 1);
         assert_eq!(
-            claimed[0].payload.dependency_subgraph.nodes[0]
+            graph
+                .claimed_payload(&claimed[0])
+                .expect("payload")
+                .dependency_subgraph
+                .nodes
+                .len(),
+            1
+        );
+        assert_eq!(
+            graph
+                .claimed_payload(&claimed[0])
+                .expect("payload")
+                .dependency_subgraph
+                .nodes[0]
                 .crate_name
                 .as_str(),
             "c"
@@ -4908,7 +4932,43 @@ mod tests {
             .claim(&claim_settings(45, 16), 10_000_000, u32::MAX)
             .expect("claim d");
         assert_eq!(claimed[0].task_id, id("d"));
-        assert_eq!(claimed[0].payload.dependency_subgraph.nodes.len(), 1);
+        assert_eq!(
+            graph
+                .claimed_payload(&claimed[0])
+                .expect("payload")
+                .dependency_subgraph
+                .nodes
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn deferred_claim_payload_survives_compaction_and_keeps_its_attempt() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge disposable node");
+        graph.merge(&chain(), 0).expect("merge chain");
+        publish(&mut graph, "solo");
+        publish(&mut graph, "c");
+        let claims = graph
+            .claim(&claim_settings(45, 16), 60_000, u32::MAX)
+            .expect("claim b");
+        let [claim] = claims.as_slice() else {
+            panic!("expected b only");
+        };
+        assert_eq!(claim.task_id, id("b"));
+        let before = graph.claimed_payload(claim).expect("before compaction");
+        let old_ix = graph.node_ix(&claim.task_id).expect("original index");
+        graph.compact();
+        let new_ix = graph.node_ix(&claim.task_id).expect("compacted index");
+        assert_ne!(old_ix, new_ix, "the task moved in the arena");
+        graph.state_mut(new_ix).attempt += 1;
+        let after = graph.claimed_payload(claim).expect("after compaction");
+        assert_eq!(after.attempt, claim.attempt);
+        assert_eq!(
+            before.encode_dispatch_task().expect("encode before"),
+            after.encode_dispatch_task().expect("encode after")
+        );
     }
 
     #[test]
@@ -6016,7 +6076,15 @@ mod tests {
             .claim(&claim_settings(45, 16), 20_000, u32::MAX)
             .expect("claim b");
         assert_eq!(claimed[0].task_id, id("b"));
-        assert_eq!(claimed[0].payload.dependency_subgraph.nodes.len(), 1);
+        assert_eq!(
+            restored
+                .claimed_payload(&claimed[0])
+                .expect("payload")
+                .dependency_subgraph
+                .nodes
+                .len(),
+            1
+        );
     }
 
     #[test]
