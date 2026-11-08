@@ -92,8 +92,8 @@ class CacheCompaction(unittest.TestCase):
             restored.mkdir()
             subprocess.run(["tar", "-xf", str(packed), "-C", str(restored)], check=True, timeout=10)
             self.assertTrue((restored / mutable[0]).samefile(restored / mutable[-1]))
-            self.assertEqual(module["materialize"](restored), len(mutable) - 1)
-            self.assertEqual(module["materialize"](restored), 0)
+            self.assertEqual(module["materialize"](restored)["detached_files"], len(mutable) - 1)
+            self.assertEqual(module["materialize"](restored)["detached_files"], 0)
             self.assertEqual(len({(restored / path).stat().st_ino for path in mutable}), len(mutable))
             for path in mutable:
                 self.assertEqual((restored / path).read_bytes(), b"identical cache data")
@@ -104,10 +104,71 @@ class CacheCompaction(unittest.TestCase):
                 self.assertEqual((restored / path).read_bytes(), b"identical cache data")
             self.assertTrue((restored / archives[0]).samefile(restored / archives[-1]))
 
+    def test_git_objects_remain_shared_across_fetch_and_repack(self):
+        module = runpy.run_path(str(Path(__file__).with_name("compact-resolver-cache.py")))
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            source = temporary / "source"
+            source.mkdir()
+
+            def git(directory, *args):
+                return subprocess.run(["git", "-C", str(directory), *args],
+                                      check=True, capture_output=True, text=True, timeout=10).stdout.strip()
+
+            git(source, "init", "--quiet", "--initial-branch=dev")
+            (source / "source.rs").write_text("pub fn first() {}")
+            original = git(source, "hash-object", "-w", "source.rs")
+            git(source, "update-ref", "refs/cache/state", original)
+            git(source, "repack", "-adq")
+            root = temporary / "homes"
+            databases = [root / "01-projects" / worker / "git/db/example"
+                         for worker in ("worker-0", "worker-1")]
+            for database in databases:
+                database.parent.mkdir(parents=True)
+                git(source, "clone", "--quiet", "--mirror", "--no-hardlinks", str(source), str(database))
+            module["compact"](root)
+            packed = temporary / "cache.tar"
+            subprocess.run(["tar", "-cf", str(packed), "-C", str(root), "."], check=True, timeout=10)
+            restored = temporary / "restored"
+            restored.mkdir()
+            subprocess.run(["tar", "-xf", str(packed), "-C", str(restored)], check=True, timeout=10)
+            databases = [restored / database.relative_to(root) for database in databases]
+            report = module["materialize"](restored)
+            self.assertGreater(report["shared_git_object_files"], 0)
+            self.assertGreater(report["shared_git_object_bytes"], 0)
+            packs = [next(database.glob("objects/pack/*.pack")) for database in databases]
+            self.assertTrue(packs[0].samefile(packs[1]))
+            self.assertFalse((databases[0] / "config").samefile(databases[1] / "config"))
+            self.assertFalse((databases[0] / "packed-refs").samefile(databases[1] / "packed-refs"))
+            (source / "source.rs").write_text("pub fn second() {}")
+            latest = git(source, "hash-object", "-w", "source.rs")
+            git(source, "update-ref", "refs/cache/state", latest)
+            git(databases[0], "fetch", "--quiet", "origin", "refs/cache/state:refs/cache/state")
+            git(databases[0], "repack", "-adq")
+            self.assertEqual(git(databases[0], "rev-parse", "refs/cache/state"), latest)
+            self.assertEqual(git(databases[1], "rev-parse", "refs/cache/state"), original)
+            self.assertEqual(git(databases[1], "show", "refs/cache/state"), "pub fn first() {}")
+            for database in databases:
+                git(database, "fsck", "--strict")
+
+    def test_only_final_content_addressed_git_objects_are_shared(self):
+        classify = runpy.run_path(str(Path(__file__).with_name("compact-resolver-cache.py")))["immutable_git_object"]
+        home = Path("home")
+        for relative in ("objects/ab/" + "c" * 38,
+                         "objects/pack/pack-" + "a" * 40 + ".pack",
+                         "objects/pack/pack-" + "a" * 64 + ".idx",
+                         "objects/pack/pack-" + "a" * 40 + ".rev"):
+            self.assertTrue(classify(home, home / "git/db/repo" / relative), relative)
+        for relative in ("config", "refs/heads/dev", "objects/info/packs",
+                         "objects/pack/pack_git2_partial", "objects/pack/multi-pack-index",
+                         "objects/pack/pack-" + "a" * 40 + ".keep"):
+            self.assertFalse(classify(home, home / "git/db/repo" / relative), relative)
+        self.assertFalse(classify(home, home / "registry/index/objects/ab" / ("c" * 38)))
+
     def test_cold_cache_needs_no_materialization(self):
         module = runpy.run_path(str(Path(__file__).with_name("compact-resolver-cache.py")))
         with tempfile.TemporaryDirectory() as temporary:
-            self.assertEqual(module["materialize"](Path(temporary)), 0)
+            self.assertEqual(module["materialize"](Path(temporary))["detached_files"], 0)
 
     def test_empty_resolver_root_is_an_error(self):
         compact = runpy.run_path(str(Path(__file__).with_name("compact-resolver-cache.py")))["compact"]
