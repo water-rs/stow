@@ -107,21 +107,19 @@ pub struct SegmentArgs {
 
 /// CPU for a complete uninterrupted edge segment, including DO CPU.
 #[derive(Debug, Serialize, Deserialize)]
-struct SegmentReport {
-    pub sampling_interval_us: u64,
-    pub idle_window_ms: u64,
-    pub idle_cpu_ms: f64,
-    pub reference: ReferenceCpu,
-    pub cpu_ms: f64,
-    pub profiles: Vec<CapturedProfile>,
-    pub scripts: Vec<ScriptSource>,
+pub(super) struct SegmentReport {
+    sampling_interval_us: u64,
+    idle_window_ms: u64,
+    idle_cpu_ms: f64,
+    reference: ReferenceCpu,
+    cpu_ms: f64,
+    profiles: Vec<CapturedProfile>,
+    scripts: Vec<ScriptSource>,
 }
 
 /// Capture a segment without changing the workload driven by the harness.
 pub async fn segment(args: &SegmentArgs) -> stow_types::error::Result<()> {
-    let (inspector, mut artifacts, idle_cpu_ms) = prepare_sampler(&args.inspector_url).await?;
-    let rounds_before = measure_reference(&inspector, &mut artifacts).await?;
-    let cpu_ms = profiled(&inspector, &mut artifacts, "preheat", async || {
+    let ((), report) = capture_segment(&args.inspector_url, "preheat", async || {
         tokio::fs::write(&args.ready, b"ready\n").await?;
         tokio::time::timeout(Duration::from_secs(args.deadline_secs.get()), async {
             loop {
@@ -142,6 +140,19 @@ pub async fn segment(args: &SegmentArgs) -> stow_types::error::Result<()> {
         })?
     })
     .await?;
+    tokio::fs::write(&args.out, serde_json::to_vec(&report)?).await?;
+    Ok(())
+}
+
+/// Sample one uninterrupted workload with the same idle and reference checks.
+pub(super) async fn capture_segment<R>(
+    inspector_url: &str,
+    label: &str,
+    work: impl AsyncFnOnce() -> stow_types::error::Result<R>,
+) -> stow_types::error::Result<(R, SegmentReport)> {
+    let (inspector, mut artifacts, idle_cpu_ms) = prepare_sampler(inspector_url).await?;
+    let rounds_before = measure_reference(&inspector, &mut artifacts).await?;
+    let (result, cpu_ms) = profiled(&inspector, &mut artifacts, label, work).await?;
     let rounds_after = measure_reference(&inspector, &mut artifacts).await?;
     let report = SegmentReport {
         sampling_interval_us: SAMPLING_INTERVAL_US,
@@ -152,8 +163,7 @@ pub async fn segment(args: &SegmentArgs) -> stow_types::error::Result<()> {
         scripts: artifacts.sources(&inspector).await?,
         profiles: artifacts.profiles,
     };
-    tokio::fs::write(&args.out, serde_json::to_vec(&report)?).await?;
-    Ok(())
+    Ok((result, report))
 }
 
 /// Profiled rounds per lane; the lane reports the smallest.
@@ -659,12 +669,12 @@ fn profile_cpu_ms(profile: &CpuProfile) -> f64 {
 }
 
 /// Profile whatever `work` drives and return the profile's CPU ms.
-async fn profiled(
+async fn profiled<R>(
     inspector: &Inspector,
     artifacts: &mut ProfileArtifacts,
     label: &str,
-    work: impl AsyncFnOnce() -> stow_types::error::Result<()>,
-) -> stow_types::error::Result<f64> {
+    work: impl AsyncFnOnce() -> stow_types::error::Result<R>,
+) -> stow_types::error::Result<(R, f64)> {
     inspector
         .call("Profiler.start", serde_json::Value::Null)
         .await?;
@@ -672,7 +682,7 @@ async fn profiled(
     let mut stopped = inspector
         .call("Profiler.stop", serde_json::Value::Null)
         .await?;
-    worked?;
+    let result = worked?;
     let raw = stopped
         .get_mut("profile")
         .map(serde_json::Value::take)
@@ -713,7 +723,7 @@ async fn profiled(
         "Worker CPU profile hotspots (function, samples)"
     );
     artifacts.capture(label, raw, &profile);
-    Ok(profile_cpu_ms(&profile))
+    Ok((result, profile_cpu_ms(&profile)))
 }
 
 /// Fire `count` events of `lane` back to back; any response outside the
@@ -729,7 +739,13 @@ async fn fire_events(
     for _ in 0..count {
         let outcome = tokio::time::timeout(
             REQUEST_TIMEOUT,
-            lanes::fire_once(&lane.fire, edge, client, *counter),
+            lanes::fire_once(
+                &lane.fire,
+                edge,
+                client,
+                *counter,
+                &mut lanes::RequestTimingMs::default(),
+            ),
         )
         .await
         .map_err(|_| stow_error!("{}: event exceeded {REQUEST_TIMEOUT:?}", lane.name))?
@@ -787,7 +803,7 @@ async fn measure_lane(
     let mut rounds_cpu_ms = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
         ready(lane, edge, args.events_per_round).await?;
-        let cpu_ms = profiled(inspector, artifacts, lane.name, async || {
+        let ((), cpu_ms) = profiled(inspector, artifacts, lane.name, async || {
             fire_events(lane, edge, &mut client, &mut counter, args.events_per_round).await
         })
         .await?;
@@ -813,7 +829,8 @@ async fn measure_reference(
             profiled(inspector, artifacts, "reference", async || {
                 inspector.run_reference().await
             })
-            .await?,
+            .await?
+            .1,
         );
     }
     Ok(rounds_ms)
@@ -844,7 +861,7 @@ async fn prepare_sampler(
         .await?;
 
     let mut artifacts = ProfileArtifacts::default();
-    let idle_cpu_ms = profiled(&inspector, &mut artifacts, "idle", async || {
+    let ((), idle_cpu_ms) = profiled(&inspector, &mut artifacts, "idle", async || {
         tokio::time::sleep(IDLE_WINDOW).await;
         Ok(())
     })

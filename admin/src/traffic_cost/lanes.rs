@@ -779,14 +779,29 @@ async fn plan(
     }
 }
 
-/// Fire one lane event; returns the response outcome.
+/// Completed request phases. A missing phase was not reached or was interrupted.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct RequestTimingMs {
+    /// Includes pointer HTTP fetches and credential acquisition when the lane needs them.
+    pub planning: Option<f64>,
+    /// Through response headers on success; HTTP errors can include their collected body.
+    pub response: Option<f64>,
+    /// Complete success-body consumption and overload scan.
+    pub body: Option<f64>,
+}
+
+/// Fire one lane event and retain each completed request phase.
 pub async fn fire_once(
     fire: &Fire,
     edge: &Edge,
     client: &mut zenwave::DefaultClient,
     counter: u64,
+    timing: &mut RequestTimingMs,
 ) -> Result<Outcome, String> {
-    let request = match plan(fire, edge, client, counter).await? {
+    let started = tokio::time::Instant::now();
+    let planned = plan(fire, edge, client, counter).await;
+    timing.planning = Some(started.elapsed().as_secs_f64() * 1000.0);
+    let request = match planned? {
         Plan::Done(outcome) => return Ok(outcome),
         Plan::Get { url, bearer } => {
             let request = client.get(url).map_err(|error| error.to_string())?;
@@ -823,7 +838,10 @@ pub async fn fire_once(
     // marker. zenwave lifts non-2xx statuses into `Error::Http` — they
     // are lane responses all the same (a 404 is the designed miss), so
     // they rejoin the status path while transport failures stay `Err`.
-    match request.await {
+    let started = tokio::time::Instant::now();
+    let response = request.await;
+    timing.response = Some(started.elapsed().as_secs_f64() * 1000.0);
+    match response {
         Err(error) => match error {
             zenwave::Error::Http {
                 status, response, ..
@@ -843,14 +861,18 @@ pub async fn fire_once(
             error => Ok(Outcome::Transport(error.to_string())),
         },
         Ok(response) => {
+            let started = tokio::time::Instant::now();
             let status = response.status().as_u16();
-            let body = match response.into_body().into_bytes().await {
+            let body = response.into_body().into_bytes().await;
+            timing.body = Some(started.elapsed().as_secs_f64() * 1000.0);
+            let body = match body {
                 Ok(body) => body,
                 Err(error) => return Ok(Outcome::Transport(error.to_string())),
             };
             let scan = &body[..body.len().min(8 * 1024)];
             let text = String::from_utf8_lossy(scan).to_lowercase();
             let overloaded = matches!(status, 429 | 503) || text.contains("overload");
+            timing.body = Some(started.elapsed().as_secs_f64() * 1000.0);
             Ok(Outcome::Response { status, overloaded })
         }
     }
@@ -1167,6 +1189,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_timing_separates_delayed_headers_and_complete_body() {
+        use std::time::Duration;
+        for (header_delay, body_delay) in [
+            (Duration::from_millis(150), Duration::ZERO),
+            (Duration::ZERO, Duration::from_millis(150)),
+        ] {
+            let server =
+                crate::test_server::Loopback::start(vec![crate::test_server::Step::Delayed {
+                    header_delay,
+                    body_delay,
+                    body: "complete response",
+                }])
+                .await;
+            let edge = crate::Edge::for_test(server.url.clone());
+            let fire = super::Fire::PublicGet(vec!["/timing".to_owned()]);
+            let mut timing = super::RequestTimingMs::default();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(3),
+                super::fire_once(&fire, &edge, &mut zenwave::client(), 0, &mut timing),
+            )
+            .await
+            .expect("bounded response")
+            .expect("planned request");
+            assert!(matches!(
+                outcome,
+                super::Outcome::Response { status: 200, .. }
+            ));
+            let response = timing.response.expect("response phase");
+            let body = timing.body.expect("complete body phase");
+            if header_delay.is_zero() {
+                assert!(body >= 140.0, "{timing:?}");
+                assert!(body > response, "{timing:?}");
+            } else {
+                assert!(response >= 140.0, "{timing:?}");
+                assert!(response > body, "{timing:?}");
+            }
+            assert_eq!(server.join().await.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_body_keeps_completed_phases_and_leaves_body_unfinished() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Stall {
+            status: 200,
+            body: "partial",
+            content_length: 64,
+        }])
+        .await;
+        let edge = crate::Edge::for_test(server.url.clone());
+        let fire = super::Fire::PublicGet(vec!["/timing".to_owned()]);
+        let mut timing = super::RequestTimingMs::default();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            super::fire_once(&fire, &edge, &mut zenwave::client(), 0, &mut timing),
+        )
+        .await;
+        assert!(result.is_err(), "the body remains incomplete");
+        assert!(timing.planning.is_some(), "{timing:?}");
+        assert!(timing.response.is_some(), "{timing:?}");
+        assert!(timing.body.is_none(), "{timing:?}");
+        assert_eq!(server.join().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn requested_build_lane_signs_the_build_workflow_delivery() {
         let model =
             LaunchModel::from_toml(include_str!("../../../launch-model.toml")).expect("model");
@@ -1213,7 +1299,13 @@ mod tests {
         let mut client = zenwave::client();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            super::fire_once(&fire, &edge, &mut client, 0),
+            super::fire_once(
+                &fire,
+                &edge,
+                &mut client,
+                0,
+                &mut super::RequestTimingMs::default(),
+            ),
         )
         .await
         .expect("body read completes within the bound")
