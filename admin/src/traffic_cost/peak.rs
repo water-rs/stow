@@ -51,6 +51,8 @@ const ERROR_RATE_BOUND: f64 = 0.01;
 struct LaneStats {
     /// Request slots used by this lane. Callback fixture rearming has one owner.
     request_slots: usize,
+    /// Errors that stopped preparation of this lane.
+    preparation_errors: Vec<String>,
     /// Requests the lane fired.
     requests: u64,
     /// Minimum whole requests required by the configured rate and duration.
@@ -155,7 +157,7 @@ async fn run_lane_worker(
     duration: Duration,
     first: usize,
     stride: usize,
-) -> Result<LaneStats, String> {
+) -> LaneStats {
     let mut client = zenwave::client();
     let mut stats = LaneStats::default();
     // A lane the harness cannot make fireable stops firing and fails the
@@ -214,10 +216,8 @@ async fn run_lane_worker(
         stats.requests += 1;
     };
     run_paced(start, interval, duration, first, stride, fire).await;
-    if let Some(error) = unready {
-        return Err(format!("{}: {error}", lane.name));
-    }
-    Ok(stats)
+    stats.preparation_errors.extend(unready);
+    stats
 }
 
 /// Join the lane's independent request slots, then aggregate every
@@ -234,7 +234,7 @@ async fn run_lane(
     start: tokio::time::Instant,
     duration: Duration,
     concurrency: usize,
-) -> Result<LaneStats, String> {
+) -> LaneStats {
     // Rearming replaces the callback fixture's entire armed-run queue;
     // ready + take must remain under one request slot's ownership.
     // Other lanes have no shared preparation and can overlap freely.
@@ -253,8 +253,8 @@ async fn run_lane(
         required_requests: required_requests(lane.eps, duration),
         ..LaneStats::default()
     };
-    for result in results {
-        let worker = result?;
+    for worker in results {
+        stats.preparation_errors.extend(worker.preparation_errors);
         stats.requests += worker.requests;
         stats.transport_errors += worker.transport_errors;
         stats.server_errors += worker.server_errors;
@@ -278,15 +278,62 @@ async fn run_lane(
     stats.p99_ms = percentile(0.99);
     stats.latencies_ms = sorted;
     stats.effective_eps = stats.requests as f64 / duration.as_secs_f64();
-    Ok(stats)
+    stats
+}
+
+/// Apply every lane gate even when preparation stopped before the deadline.
+#[expect(clippy::cast_precision_loss, reason = "request counts fit f64")]
+fn lane_breaches(lane: &Lane, stats: &LaneStats, p99_bound_ms: f64) -> Vec<String> {
+    let mut breaches: Vec<_> = stats
+        .preparation_errors
+        .iter()
+        .map(|error| format!("{}: preparation failed: {error}", lane.name))
+        .collect();
+    if stats.requests < stats.required_requests {
+        breaches.push(format!(
+            "{}: sent {} requests, below {} required at {:.6} eps",
+            lane.name, stats.requests, stats.required_requests, lane.eps
+        ));
+    }
+    let total = stats.requests.max(1) as f64;
+    let error_share = (stats.transport_errors + stats.server_errors) as f64 / total;
+    if error_share > ERROR_RATE_BOUND {
+        breaches.push(format!(
+            "{}: error share {:.1}% over {:.0}%",
+            lane.name,
+            error_share * 100.0,
+            ERROR_RATE_BOUND * 100.0
+        ));
+    }
+    if stats.unexpected_statuses > 0 {
+        breaches.push(format!(
+            "{}: {} unexpected statuses",
+            lane.name, stats.unexpected_statuses
+        ));
+    }
+    if stats.server_errors > 0 {
+        breaches.push(format!(
+            "{}: {} 5xx response(s) from the stack under load",
+            lane.name, stats.server_errors
+        ));
+    }
+    if stats.overloaded > 0 {
+        breaches.push(format!(
+            "{}: {} overload signal(s) — the DO serialization bound",
+            lane.name, stats.overloaded
+        ));
+    }
+    if stats.p99_ms > p99_bound_ms {
+        breaches.push(format!(
+            "{}: p99 {:.0}ms over the {:.0}ms bound",
+            lane.name, stats.p99_ms, p99_bound_ms
+        ));
+    }
+    breaches
 }
 
 /// `stow-admin traffic-cost peak` — fire the lanes, then emit the
 /// report and exit nonzero on a breach.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "request counts are tiny next to f64's mantissa"
-)]
 pub async fn run(edge: &Edge, args: &PeakArgs, output: Output) -> stow_types::error::Result<()> {
     let model = super::read_model(&args.lanes.model).await?;
     let lanes = lanes::build_lanes(&args.lanes, &model, args.rate_scale)
@@ -304,54 +351,12 @@ pub async fn run(edge: &Edge, args: &PeakArgs, output: Output) -> stow_types::er
             .iter()
             .map(|lane| run_lane(lane, edge, start, duration, concurrency.get())),
     )
-    .await
-    .into_iter()
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|error| stow_error!("{error}"))?;
+    .await;
 
     let mut lanes_map = BTreeMap::new();
     let mut breaches = Vec::new();
     for (lane, stats) in lanes.iter().zip(results) {
-        if stats.requests < stats.required_requests {
-            breaches.push(format!(
-                "{}: sent {} requests, below {} required at {:.6} eps",
-                lane.name, stats.requests, stats.required_requests, lane.eps
-            ));
-        }
-        let total = stats.requests.max(1) as f64;
-        let error_share = (stats.transport_errors + stats.server_errors) as f64 / total;
-        if error_share > ERROR_RATE_BOUND {
-            breaches.push(format!(
-                "{}: error share {:.1}% over {:.0}%",
-                lane.name,
-                error_share * 100.0,
-                ERROR_RATE_BOUND * 100.0
-            ));
-        }
-        if stats.unexpected_statuses > 0 {
-            breaches.push(format!(
-                "{}: {} unexpected statuses",
-                lane.name, stats.unexpected_statuses
-            ));
-        }
-        if stats.server_errors > 0 {
-            breaches.push(format!(
-                "{}: {} 5xx response(s) from the stack under load",
-                lane.name, stats.server_errors
-            ));
-        }
-        if stats.overloaded > 0 {
-            breaches.push(format!(
-                "{}: {} overload signal(s) — the DO serialization bound",
-                lane.name, stats.overloaded
-            ));
-        }
-        if stats.p99_ms > args.p99_bound_ms {
-            breaches.push(format!(
-                "{}: p99 {:.0}ms over the {:.0}ms bound",
-                lane.name, stats.p99_ms, args.p99_bound_ms
-            ));
-        }
+        breaches.extend(lane_breaches(lane, &stats, args.p99_bound_ms));
         lanes_map.insert(lane.name, stats);
     }
     let report = LoadReport {
@@ -459,13 +464,96 @@ mod tests {
         .await;
         server.abort();
         let _ = server.await;
-        let stats = result.expect("overlapping clients complete").expect("lane");
+        let stats = result.expect("overlapping clients complete");
         assert_eq!(stats.request_slots, 2);
         assert_eq!(stats.requests, 4);
         assert_eq!(stats.statuses.get(&200), Some(&4));
         assert_eq!(stats.transport_errors, 0);
         assert_eq!(stats.unexpected_statuses, 0);
         assert_eq!(stats.latencies_ms.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn preparation_failure_preserves_completed_requests_and_other_lanes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let edge = crate::Edge::for_test(format!(
+            "http://{}",
+            listener.local_addr().expect("address")
+        ));
+        let rearmed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/admin/scheduler/budget/rearm",
+                axum::routing::post(move || {
+                    let rearmed = rearmed.clone();
+                    async move {
+                        if rearmed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({"armed": [0]})),
+                            )
+                        } else {
+                            (
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                axum::Json(serde_json::json!({"error": "rearm failed"})),
+                            )
+                        }
+                    }
+                }),
+            )
+            .fallback(|| async { "complete body" });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve");
+        });
+        let callback = super::Lane {
+            name: "callback",
+            eps: 10.0,
+            fire: super::lanes::Fire::WorkflowRun(
+                super::lanes::CallbackLane::new("secret".to_owned(), 100_000).expect("callback"),
+            ),
+            expected: |status| status == 200,
+        };
+        let healthy = super::Lane {
+            name: "healthy",
+            eps: 10.0,
+            fire: super::lanes::Fire::PublicGet(vec!["/body".to_owned()]),
+            expected: |status| status == 200,
+        };
+        let start = Instant::now();
+        let duration = Duration::from_millis(150);
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            futures_util::join!(
+                super::run_lane(&callback, &edge, start, duration, 1),
+                super::run_lane(&healthy, &edge, start, duration, 1),
+            )
+        })
+        .await;
+        server.abort();
+        let _ = server.await;
+        let (failed, passed) = result.expect("bounded lanes");
+        assert_eq!(failed.requests, 1);
+        assert_eq!(failed.statuses.get(&200), Some(&1));
+        assert_eq!(failed.latencies_ms.len(), 1);
+        assert_eq!(failed.preparation_errors.len(), 1);
+        assert!(failed.requests >= failed.required_requests);
+        let breaches = super::lane_breaches(&callback, &failed, f64::INFINITY);
+        assert_eq!(breaches.len(), 1);
+        assert!(breaches[0].contains("preparation failed"));
+        assert!(breaches[0].contains("503"));
+        assert!(passed.requests >= passed.required_requests);
+        assert_eq!(passed.statuses.get(&200), Some(&passed.requests));
+        assert_eq!(
+            super::lane_breaches(&healthy, &passed, f64::INFINITY),
+            Vec::<String>::new()
+        );
+        let json = serde_json::to_value(&failed).expect("report stats");
+        assert_eq!(json["requests"], 1);
+        assert_eq!(
+            json["preparation_errors"].as_array().expect("errors").len(),
+            1
+        );
     }
 
     /// Run `run_paced` under the paused clock and return every event's

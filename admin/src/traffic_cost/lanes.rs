@@ -169,7 +169,7 @@ impl CallbackLane {
     ///
     /// # Errors
     /// `queue_rows` does not fit the fixture's `u32` row space.
-    fn new(secret: String, queue_rows: u64) -> Result<Self, String> {
+    pub(super) fn new(secret: String, queue_rows: u64) -> Result<Self, String> {
         Ok(Self {
             secret,
             queue_rows: u32::try_from(queue_rows).map_err(|_| {
