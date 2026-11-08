@@ -843,7 +843,8 @@ async fn replay_tail(
 /// Bind the in-flight window to its runs again after the lanes
 /// resolved some: the completed rows reopen, a snapshot makes that the
 /// store's state (a wake replays exactly this graph), and the seed's
-/// claims and bindings replay on top. The graph is not rebuilt.
+/// claims and bindings replay on top. With no completed rows, the log
+/// already describes the graph and no snapshot is needed.
 ///
 /// # Errors
 /// `QueueError` on a failed snapshot or log append.
@@ -853,12 +854,16 @@ pub async fn rearm(
     shape: FixtureShape,
     now: i64,
 ) -> Result<(), QueueError> {
-    cell.with(|graph| {
+    let reopened = cell.with(|graph| {
+        let mut reopened = false;
         for k in 0..FixtureShape::IN_FLIGHT_ROWS {
-            graph.reopen_completed(&shape.in_flight_run(k).task_id);
+            reopened |= graph.reopen_completed(&shape.in_flight_run(k).task_id);
         }
+        reopened
     });
-    routes::snapshot(cell, db, now).await?;
+    if reopened {
+        routes::snapshot(cell, db, now).await?;
+    }
     for (at, event) in tail(shape, now).into_iter().take(IN_FLIGHT_EVENTS) {
         routes::commit(cell, db, std::slice::from_ref(&event), at).await?;
     }
