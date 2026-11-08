@@ -72,12 +72,18 @@ async fn append(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
     actor: Option<&str>,
-    events: &[SchedulerEvent],
+    events: impl IntoIterator<Item: std::borrow::Borrow<SchedulerEvent>>,
     now: i64,
 ) -> Result<(), QueueError> {
     let appended = store::append_events(db, actor, events, now).await?;
     graph.with(|graph| graph.log_appended(appended.bytes, appended.seq));
     Ok(())
+}
+
+fn changing_submission<'a>(
+    (tree, changes): (&'a SubmissionTree, &bool),
+) -> Option<store::SubmissionParts<'a>> {
+    changes.then(|| store::submission_events(tree))
 }
 
 /// Append the `Submit` parts of every tree that changes the graph in
@@ -106,13 +112,12 @@ pub(super) async fn commit_trees(
             .map(|tree| graph.merge_changes(tree))
             .collect::<Vec<_>>()
     });
-    let events: Vec<_> = trees
+    let events = trees
         .iter()
         .zip(&changing)
-        .filter(|&(_, &changes)| changes)
-        .flat_map(|(tree, _)| store::submission_events(tree))
-        .collect();
-    append(graph, db, actor, &events, now).await?;
+        .filter_map(changing_submission)
+        .flatten();
+    append(graph, db, actor, events, now).await?;
     graph.with(|graph| {
         validated
             .iter()

@@ -172,36 +172,48 @@ pub fn decode_event(text: &str) -> Result<SchedulerEvent, QueueError> {
         .map_err(|error| QueueError::Invariant(format!("event decode: {error}")))
 }
 
-/// Split a submission tree into its `Submit` log events — `parts`
-/// chunks sized so no serialized row nears the row bound.
+/// Produce one owned `Submit` part at a time, keeping temporary nodes
+/// bounded by the row limit instead of the whole submission batch.
 #[must_use]
-pub fn submission_events(tree: &SubmissionTree) -> Vec<SchedulerEvent> {
-    let parts =
-        u32::try_from(tree.nodes.len().div_ceil(SUBMIT_PART_NODES).max(1)).unwrap_or(u32::MAX);
-    if parts == 1 {
-        return vec![SchedulerEvent::Submit {
-            source: tree.source,
-            part: 0,
-            parts,
-            roots: tree.roots.clone(),
-            nodes: tree.nodes.clone(),
-        }];
+pub fn submission_events(tree: &SubmissionTree) -> SubmissionParts<'_> {
+    SubmissionParts {
+        tree,
+        part: 0,
+        parts: u32::try_from(tree.nodes.len().div_ceil(SUBMIT_PART_NODES).max(1))
+            .expect("submission part count fits u32"),
     }
-    tree.nodes
-        .chunks(SUBMIT_PART_NODES)
-        .enumerate()
-        .map(|(part, nodes)| SchedulerEvent::Submit {
-            source: tree.source,
-            part: u32::try_from(part).expect("submit part fits u32"),
-            parts,
+}
+
+/// One log row is constructed only when its consumer requests it.
+pub struct SubmissionParts<'a> {
+    tree: &'a SubmissionTree,
+    part: u32,
+    parts: u32,
+}
+
+impl Iterator for SubmissionParts<'_> {
+    type Item = SchedulerEvent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.part == self.parts {
+            return None;
+        }
+        let part = self.part;
+        self.part += 1;
+        let start = usize::try_from(part).expect("part fits usize") * SUBMIT_PART_NODES;
+        let end = (start + SUBMIT_PART_NODES).min(self.tree.nodes.len());
+        Some(SchedulerEvent::Submit {
+            source: self.tree.source,
+            part,
+            parts: self.parts,
             roots: if part == 0 {
-                tree.roots.clone()
+                self.tree.roots.clone()
             } else {
                 Vec::new()
             },
-            nodes: nodes.to_vec(),
+            nodes: self.tree.nodes[start..end].to_vec(),
         })
-        .collect()
+    }
 }
 
 /// Append events in submission order, stamped `at`; returns the last
@@ -221,11 +233,12 @@ pub fn submission_events(tree: &SubmissionTree) -> Vec<SchedulerEvent> {
 pub async fn append_events(
     db: &DurableDb,
     actor: Option<&str>,
-    events: &[SchedulerEvent],
+    events: impl IntoIterator<Item: std::borrow::Borrow<SchedulerEvent>>,
     at: i64,
 ) -> Result<Appended, QueueError> {
     let mut appended = Appended { seq: 0, bytes: 0 };
-    for (index, event) in events.iter().enumerate() {
+    for (index, event) in events.into_iter().enumerate() {
+        let event = std::borrow::Borrow::borrow(&event);
         let text = match actor {
             Some(actor) if index == 0 => encode_attributed(actor, event)?,
             _ => encode_event(event)?,
@@ -817,6 +830,39 @@ mod tests {
         test_db::memory_db().await.expect("db")
     }
 
+    #[tokio::test]
+    async fn append_failure_does_not_construct_later_submission_parts() {
+        let db = test_db::memory_db_raw().await.expect("uninitialized db");
+        let tree = SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![0],
+            nodes: vec![node("part"); SUBMIT_PART_NODES * 2 + 1],
+        };
+        let constructed = std::cell::Cell::new(0);
+        let events = submission_events(&tree).inspect(|_| constructed.set(constructed.get() + 1));
+        let error = append_events(&db, None, events, 0)
+            .await
+            .expect_err("missing event log");
+        assert!(matches!(error, QueueError::Sql(_)));
+        assert_eq!(constructed.get(), 1, "later parts were never requested");
+    }
+
+    #[test]
+    fn empty_submission_keeps_one_decodable_event() {
+        let tree = SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: Vec::new(),
+            nodes: Vec::new(),
+        };
+        let events: Vec<_> = submission_events(&tree).collect();
+        assert_eq!(events.len(), 1);
+        let decoded = decode_event(&encode_event(&events[0]).expect("encode")).expect("decode");
+        assert!(
+            matches!(decoded, SchedulerEvent::Submit { part: 0, parts: 1, roots, nodes, .. }
+            if roots.is_empty() && nodes.is_empty())
+        );
+    }
+
     /// Append `events` and apply them — the store-and-graph pair a
     /// route's commit leaves.
     async fn commit_to(db: &DurableDb, graph: &mut Graph, events: &[SchedulerEvent], at: i64) {
@@ -1116,7 +1162,7 @@ mod tests {
             roots: vec![0],
             nodes: vec![node("solo")],
         };
-        let events = submission_events(&tree);
+        let events: Vec<_> = submission_events(&tree).collect();
         append_events(&db, None, &events, 0).await.expect("submit");
         apply_events(
             &mut graph,
@@ -1191,7 +1237,7 @@ mod tests {
             roots: vec![0],
             nodes: vec![node("solo")],
         };
-        append_events(&db, None, &submission_events(&tree), 0)
+        append_events(&db, None, submission_events(&tree), 0)
             .await
             .expect("submit");
         // completed arrives before its binding in the log — parked on
@@ -1241,7 +1287,7 @@ mod tests {
             roots: vec![0],
             nodes,
         };
-        let events = submission_events(&tree);
+        let events: Vec<_> = submission_events(&tree).collect();
         assert_eq!(events.len(), 2);
         // Only the first part landed before the eviction.
         append_events(&db, None, &events[..1], 0)
@@ -1260,7 +1306,7 @@ mod tests {
             roots: vec![0],
             nodes: vec![node("one"), node("two")],
         };
-        let last = append_events(&db, None, &submission_events(&tree), 5_000)
+        let last = append_events(&db, None, submission_events(&tree), 5_000)
             .await
             .expect("submit");
         assert_eq!(last.seq, 1, "one Submit part, one appended row");
@@ -1446,7 +1492,7 @@ mod tests {
 
         // A request: its appends and read settle like the guard's.
         let (metered, meter) = Meter::wrap(db.clone(), &cell);
-        let events = submission_events(&tree);
+        let events: Vec<_> = submission_events(&tree).collect();
         let appended = append_events(&metered, None, &events, NOW_MS)
             .await
             .expect("submit");
@@ -1570,7 +1616,7 @@ mod tests {
             nodes: vec![node("one")],
         };
         let (metered, meter) = Meter::wrap(db.clone(), &cell);
-        let events = submission_events(&tree);
+        let events: Vec<_> = submission_events(&tree).collect();
         let appended = append_events(&metered, None, &events, NOW_MS)
             .await
             .expect("submit");
@@ -1707,7 +1753,7 @@ mod tests {
     /// events — the unit `StoreReset` row included.
     #[tokio::test]
     async fn an_attributed_append_names_the_actor_on_the_first_row_at_no_extra_rows() {
-        let mut batch = submission_events(&chain());
+        let mut batch: Vec<_> = submission_events(&chain()).collect();
         batch.push(SchedulerEvent::Mutate {
             op: MutationKind::Cancel,
             task_ids: vec![id("a")],
