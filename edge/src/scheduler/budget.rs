@@ -198,7 +198,13 @@ pub async fn run(
     let mut rows = Vec::with_capacity(drives::DRIVES.len());
     let mut over_budget = false;
     for drive in drives::DRIVES {
+        graph.loaded().expect("probe graph loaded").with(|graph| {
+            fixture::trace_population(graph, drive.name);
+        });
         let row = run_drive(drive, db, &metered, shape, &settings, &ctx, &log).await?;
+        graph.loaded().expect("probe graph loaded").with(|graph| {
+            fixture::trace_population(graph, "drive completed");
+        });
         over_budget |= row.over_budget;
         rows.push(row);
     }
