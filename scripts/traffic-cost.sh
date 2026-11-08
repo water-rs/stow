@@ -453,6 +453,10 @@ budget_pass() {
 
 # The large fixture first, so the CPU pass and the peak drive run on the
 # small one the last reseed leaves.
+# One million fixture rows start with 600k pending nodes, covering the
+# 572,283 pending tasks observed in incident #1233. Keep both existing
+# scale-comparison cases and their budgets unchanged.
+budget_pass "population" --queue-rows 1000000
 budget_pass "large" --queue-rows "$LARGE"
 budget_pass "small" --queue-rows "$SMALL"
 

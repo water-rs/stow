@@ -517,6 +517,8 @@ pub fn build(
     let mut graph = Graph::default();
     let mut generations = Generations(0);
     build_completed(&mut graph, shape, now, &mut generations)?;
+    #[cfg(target_arch = "wasm32")]
+    trace_population(&graph, "completed population built");
     build_failed(&mut graph, shape, now)?;
     // The in-flight window's nodes (claimed in the tail).
     let mut builder = TreeBuilder::new();
@@ -529,6 +531,8 @@ pub fn build(
         now - 35 * MINUTE_MS,
     )?;
     build_pending(&mut graph, shape, dispatch_window(settings), now)?;
+    #[cfg(target_arch = "wasm32")]
+    trace_population(&graph, "pending population built");
     seed_requests(&mut graph, shape);
     // The pins above charged the human lane's day; the fixture starts
     // the day unspent, as the SQL fixture's direct rows did.
@@ -572,6 +576,39 @@ fn slice_reports(graph: &Graph, lo: u32, hi: u32) -> Vec<SchedulerEvent> {
             }
         })
         .collect()
+}
+
+/// Population and retained Wasm pages at probe phase boundaries. Linear
+/// memory includes allocator slack; it is not the isolate's JS heap or
+/// Cloudflare's billed memory. No platform memory claim derives from it.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn trace_population(graph: &Graph, phase: &str) {
+    use wasm_bindgen::JsCast as _;
+
+    let memory = wasm_bindgen::memory()
+        .dyn_into::<js_sys::WebAssembly::Memory>()
+        .expect("the module exports WebAssembly.Memory");
+    let buffer = memory
+        .buffer()
+        .dyn_into::<js_sys::ArrayBuffer>()
+        .expect("the module uses unshared linear memory");
+    let (nodes, edges, published) = graph.sizes();
+    let status = graph.status();
+    let state_nodes = u64::from(status.pending)
+        + u64::from(status.dispatched)
+        + u64::from(status.running)
+        + u64::from(status.completed)
+        + u64::from(status.failed);
+    tracing::info!(
+        phase,
+        nodes,
+        edges,
+        published,
+        pending = status.pending,
+        state_nodes,
+        wasm_linear_bytes = buffer.byte_length(),
+        "scheduler probe population"
+    );
 }
 
 /// The two request records: an `enqueued` one whose stored roots name a
@@ -767,9 +804,13 @@ pub async fn seed(
     tracing::info!(rows = shape.queue_rows, "fixture seed: store wiped");
     let mut graph = build(shape, settings, now)?;
     tracing::info!(nodes = graph.sizes().0, "fixture seed: graph built");
+    #[cfg(target_arch = "wasm32")]
+    trace_population(&graph, "seed built");
     graph.seeded_rows = Some(shape.queue_rows);
     store::write_snapshot(db, &mut graph, cell, now).await?;
     tracing::info!("fixture seed: snapshot written");
+    #[cfg(target_arch = "wasm32")]
+    trace_population(&graph, "seed snapshot written");
     let cell = cell.install(graph);
     replay_tail(cell, db, shape, now).await?;
     let (nodes, edges, published) = cell.with(|graph| graph.sizes());
