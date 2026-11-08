@@ -409,6 +409,21 @@ struct Session {
 }
 
 impl Session {
+    async fn connect(url: &str) -> stow_types::error::Result<Self> {
+        // DevTools returns a complete profile in one frame. Capture duration,
+        // rather than a generic WebSocket payload limit, bounds this local data.
+        let config = websocket::WebSocketConfig::default()
+            .with_max_frame_size(None)
+            .with_max_message_size(None);
+        let socket = websocket::connect_with(url, &zenwave::Transport::system(), config)
+            .await
+            .map_err(|error| stow_error!("connect to the inspector at {url}: {error}"))?;
+        Ok(Self {
+            socket,
+            next_id: AtomicU64::new(1),
+        })
+    }
+
     /// Send one command and return its `result`, skipping the protocol
     /// events that arrive in between.
     async fn call(
@@ -487,13 +502,7 @@ impl Inspector {
     /// `Runtime.enable` that follows report every live context again,
     /// whoever connected before.
     async fn connect(url: &str) -> stow_types::error::Result<Self> {
-        let socket = websocket::connect(url)
-            .await
-            .map_err(|error| stow_error!("connect to the inspector at {url}: {error}"))?;
-        let session = Session {
-            socket,
-            next_id: AtomicU64::new(1),
-        };
+        let session = Session::connect(url).await?;
         session
             .call("Runtime.disable", serde_json::Value::Null)
             .await?;
@@ -961,6 +970,54 @@ mod tests {
         CpuProfile, LaneCpu, ProfileArtifacts, REFERENCE_DRIFT_LIMIT, edge_context, profile_cpu_ms,
         reference_cpu, track_context,
     };
+
+    #[tokio::test]
+    async fn inspector_receives_a_profile_frame_larger_than_the_default_limit() {
+        use futures_util::StreamExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listen");
+        let address = listener.local_addr().expect("address");
+        let payload_len = (16 << 20) + 1;
+        let server = async {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut socket = async_tungstenite::tokio::accept_async(stream)
+                .await
+                .expect("handshake");
+            let request = socket.next().await.expect("request").expect("frame");
+            let request: serde_json::Value =
+                serde_json::from_str(request.to_text().expect("text")).expect("command");
+            assert_eq!(request["method"], "Profiler.stop");
+            let response = serde_json::json!({"id": request["id"], "result": {"profile": "x".repeat(payload_len)}});
+            socket
+                .send(async_tungstenite::tungstenite::Message::Text(
+                    response.to_string().into(),
+                ))
+                .await
+                .expect("send profile");
+        };
+        let client = async {
+            let session = super::Session::connect(&format!("ws://{address}"))
+                .await
+                .expect("connect");
+            let result = session
+                .call("Profiler.stop", serde_json::Value::Null)
+                .await
+                .expect("complete profile");
+            let profile = result["profile"].as_str().expect("profile");
+            assert_eq!(profile.len(), payload_len);
+            assert_eq!(profile.as_bytes()[payload_len - 1], b'x');
+        };
+        Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async {
+                tokio::join!(server, client);
+            },
+        ))
+        .await
+        .expect("profile transfer deadline");
+    }
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
