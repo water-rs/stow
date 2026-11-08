@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import shutil
 import stat
@@ -79,23 +80,48 @@ def hardlink_identical(files) -> tuple[int, int, int]:
     return count, len(unique), linked
 
 
-def materialize(root: Path) -> int:
-    """Detach restored mutable files before any resolver worker starts."""
+def immutable_git_object(home: Path, path: Path) -> bool:
+    """Final content-addressed objects, shared by Git's native local clone too."""
+    if not path.is_relative_to(home / "git/db"):
+        return False
+    parts = path.relative_to(home / "git/db").parts
+    if len(parts) != 4 or parts[1] != "objects":
+        return False
+    if parts[2] == "pack":
+        return re.fullmatch(r"pack-(?:[0-9a-f]{40}|[0-9a-f]{64})\.(?:pack|idx|rev)", parts[3]) is not None
+    return (re.fullmatch(r"[0-9a-f]{2}", parts[2]) is not None
+            and re.fullmatch(r"(?:[0-9a-f]{38}|[0-9a-f]{62})", parts[3]) is not None)
+
+
+def materialize(root: Path) -> dict:
+    """Detach mutable state while preserving shared content-addressed objects."""
     detached = 0
-    for path in mutable_files(resolver_homes(root)):
-        metadata = path.lstat()
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError(f"cache entry is not a regular file: {path}")
-        if metadata.st_nlink == 1:
-            continue
-        # Copy before replacing the alias: failure leaves the cached
-        # data intact, and no mutable inode is shared when this returns.
-        with tempfile.TemporaryDirectory(prefix=".stow-copy-", dir=path.parent) as scratch:
-            replacement = Path(scratch) / "entry"
-            shutil.copy2(path, replacement)
-            replacement.replace(path)
-        detached += 1
-    return detached
+    shared_files = 0
+    shared_bytes = 0
+    shared_inodes = set()
+    for home in resolver_homes(root):
+        for path in mutable_files([home]):
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"cache entry is not a regular file: {path}")
+            if metadata.st_nlink == 1:
+                continue
+            if immutable_git_object(home, path):
+                shared_files += 1
+                inode = (metadata.st_dev, metadata.st_ino)
+                if inode not in shared_inodes:
+                    shared_inodes.add(inode)
+                    shared_bytes += metadata.st_size
+                continue
+            # Copy before replacing the alias: failure leaves cached data intact.
+            with tempfile.TemporaryDirectory(prefix=".stow-copy-", dir=path.parent) as scratch:
+                replacement = Path(scratch) / "entry"
+                shutil.copy2(path, replacement)
+                replacement.replace(path)
+            detached += 1
+    return {"detached_files": detached,
+            "shared_git_object_files": shared_files,
+            "shared_git_object_bytes": shared_bytes}
 
 
 def compact(root: Path) -> dict:
@@ -144,7 +170,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
     if args.command == "materialize":
-        logger.info("resolver cache materialization: %s files detached", materialize(args.root))
+        logger.info("resolver cache materialization: %s", materialize(args.root))
     else:
         report = compact(args.root)
         args.report.write_text(json.dumps(report, indent=2) + "\n")
