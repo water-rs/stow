@@ -23,17 +23,24 @@
 //! Scheduler calls and rows are measured. Worker requests follow the
 //! production delivery contract, including workflows the local mock
 //! does not deliver. Trigger costs are fixed per wave, not per node.
-//! CPU and Durable Object duration remain unmeasured.
+//! Covered phase CPU includes scheduler and observer CPU. Workflow
+//! deliveries absent from the mock and fixed trigger CPU remain
+//! unmeasured, as does Durable Object duration.
 
+use crate::preheat_cost::MeasuredReport;
 use stow_types::forwards::RunForwards;
 use stow_types::launch_model::LaunchModel;
-use stow_types::preheat_cost::{EventKind, PhaseCost, PreheatCostReport, ProductionWave};
+use stow_types::preheat_cost::{EventKind, PhaseCost, ProductionWave};
 
 /// A phase's measured cost per node of the wave that measured it.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct PerNode {
     /// Worker requests, including each build and index run's deliveries.
     pub worker_requests: f64,
+    /// Covered isolate CPU, including scheduler and observer work.
+    pub worker_cpu_ms: f64,
+    /// Production deliveries absent from the captured mock phase.
+    pub unmeasured_worker_events: f64,
     /// Durable Object calls the phase was billed.
     pub requests: f64,
     /// Durable Object `rowsRead`.
@@ -48,7 +55,7 @@ impl PerNode {
         clippy::cast_precision_loss,
         reason = "measured counters fit f64 exactly past any wave"
     )]
-    fn of(phase: &PhaseCost, nodes: u64) -> Result<Self, String> {
+    fn of(phase: &PhaseCost, nodes: u64, cpu_ms: f64) -> Result<Self, String> {
         if !phase.other_ops.is_empty() {
             return Err(format!(
                 "preheat Worker request count has unsupported operations: {:?}",
@@ -73,8 +80,22 @@ impl PerNode {
             })
             .sum();
         let nodes = nodes as f64;
+        let unmeasured_worker_events: f64 = phase
+            .kinds
+            .iter()
+            .map(|cost| {
+                let missing = match cost.kind {
+                    EventKind::Completion => 1.0, // requested; started and completed are captured
+                    EventKind::SliceReport => deliveries, // mock publishes directly
+                    EventKind::Submit | EventKind::Dispatch | EventKind::ExternalRunUpdate => 0.0,
+                };
+                cost.events as f64 * missing
+            })
+            .sum();
         Ok(Self {
             worker_requests: worker_requests / nodes,
+            worker_cpu_ms: cpu_ms / nodes,
+            unmeasured_worker_events: unmeasured_worker_events / nodes,
             requests: phase.requests() as f64 / nodes,
             rows_read: phase.rows_read as f64 / nodes,
             rows_written: phase.rows_written as f64 / nodes,
@@ -123,9 +144,10 @@ impl PreheatMonthly {
     /// operation without a production Worker-request mapping.
     pub fn new(
         model: &LaunchModel,
-        report: &PreheatCostReport,
+        measured: &MeasuredReport,
         production: &ProductionWave,
     ) -> Result<Self, String> {
+        let report = &measured.report;
         if report.nodes == 0 {
             return Err(
                 "preheat cost report measured 0 nodes — no per-node cost to scale".to_owned(),
@@ -144,8 +166,12 @@ impl PreheatMonthly {
             production_nodes: production.nodes,
             releases_per_month: model.monthly_stable_releases(),
             resubmits_per_month: model.monthly_resubmits(),
-            wave: PerNode::of(&report.wave, report.nodes)?,
-            resubmit: PerNode::of(&report.resubmit, report.nodes)?,
+            wave: PerNode::of(&report.wave, report.nodes, measured.cpu.wave.total_ms())?,
+            resubmit: PerNode::of(
+                &report.resubmit,
+                report.nodes,
+                measured.cpu.resubmit.total_ms(),
+            )?,
             wave_tasks: report.wave.tasks,
             resubmit_tasks: report.resubmit.tasks,
         })
@@ -165,6 +191,7 @@ impl PreheatMonthly {
                     self.wave_trigger_worker_requests,
                     self.resubmit_trigger_worker_requests,
                 ),
+                ("workers", "cpu_ms") => (|cost| cost.worker_cpu_ms, 0.0, 0.0),
                 ("durable_objects", "requests") => (
                     |cost| cost.requests,
                     self.wave_trigger_do_requests,
@@ -180,6 +207,26 @@ impl PreheatMonthly {
             self.releases_per_month * pick(&self.wave).mul_add(nodes, wave_fixed),
         ))
     }
+
+    /// Events whose CPU is absent from the captured phases. Fixed
+    /// triggers do not scale with the production node count.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "node counts fit f64 exactly past any wave"
+    )]
+    pub fn unmeasured_worker_events(&self) -> f64 {
+        let nodes = self.production_nodes as f64;
+        self.resubmits_per_month.mul_add(
+            self.resubmit
+                .unmeasured_worker_events
+                .mul_add(nodes, self.resubmit_trigger_worker_requests),
+            self.releases_per_month
+                * self
+                    .wave
+                    .unmeasured_worker_events
+                    .mul_add(nodes, self.wave_trigger_worker_requests),
+        )
+    }
 }
 
 /// Why the Preheat cost report carries no preheat usage for a product
@@ -189,7 +236,7 @@ pub fn not_measured(product: &str, dimension: &str) -> &'static str {
         ("durable_objects", "duration_gb_s") => {
             "the report carries the harness's phase wall, not Durable Object duration"
         }
-        _ => "the report counts requests and scheduler rows, not preheat Worker CPU",
+        _ => "the preheat report does not measure this dimension",
     }
 }
 
@@ -207,10 +254,10 @@ pub(super) const fn test_production(nodes: u64) -> ProductionWave {
 /// 100 calls, 1000 rows read and 500 rows written per phase, over 100
 /// `build-crate.yml` runs — one per task.
 #[cfg(test)]
-pub(super) fn test_report(nodes: u64) -> PreheatCostReport {
+pub(super) fn test_report(nodes: u64) -> MeasuredReport {
     use std::collections::BTreeMap;
 
-    use stow_types::preheat_cost::{EventKind, KindCost};
+    use stow_types::preheat_cost::{EventKind, KindCost, PreheatCostReport};
 
     let phase = PhaseCost {
         kinds: vec![KindCost {
@@ -225,15 +272,18 @@ pub(super) fn test_report(nodes: u64) -> PreheatCostReport {
         tasks: 100,
         wall_ms: 0,
     };
-    PreheatCostReport {
-        rustc_version: "1.99.1".to_owned(),
-        nodes,
-        nodes_per_target: BTreeMap::new(),
-        wave: phase.clone(),
-        resubmit: phase,
-        layers: Vec::new(),
-        lanes: Vec::new(),
-        checks: Vec::new(),
+    MeasuredReport {
+        report: PreheatCostReport {
+            rustc_version: "1.99.1".to_owned(),
+            nodes,
+            nodes_per_target: BTreeMap::new(),
+            wave: phase.clone(),
+            resubmit: phase,
+            layers: Vec::new(),
+            lanes: Vec::new(),
+            checks: Vec::new(),
+        },
+        cpu: crate::preheat_cost::cpu::test_cpu(100.0, 20.0),
     }
 }
 
@@ -256,6 +306,31 @@ mod tests {
         assert!((preheat.resubmit.rows_written - 10.0).abs() < 1e-12);
         assert_eq!(preheat.wave_tasks, 100);
         assert_eq!(preheat.resubmit_tasks, 100);
+        assert_eq!(preheat.wave.worker_cpu_ms, 2.0);
+        assert_eq!(preheat.resubmit.worker_cpu_ms, 0.4);
+    }
+
+    #[test]
+    fn covered_cpu_scales_wave_and_resubmit_with_their_own_cadence() {
+        let preheat = monthly(50, 5_000);
+        let expected = preheat
+            .releases_per_month
+            .mul_add(10_000.0, preheat.resubmits_per_month * 2_000.0);
+        let actual = preheat.monthly("workers", "cpu_ms").expect("covered CPU");
+        assert!((actual - expected).abs() < 1e-6, "{actual}");
+        let missing = preheat
+            .releases_per_month
+            .mul_add(10_004.0, preheat.resubmits_per_month * 10_007.0);
+        assert!((preheat.unmeasured_worker_events() - missing).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_cost_report_without_cpu_cannot_be_read_as_measured() {
+        let mut value = serde_json::to_value(test_report(50)).expect("report JSON");
+        value.as_object_mut().expect("object").remove("cpu");
+        let error = serde_json::from_value::<crate::preheat_cost::MeasuredReport>(value)
+            .expect_err("CPU is mandatory");
+        assert!(error.to_string().contains("cpu"), "{error}");
     }
 
     /// The monthly usage is releases × wave + days × resubmit, each at
@@ -298,7 +373,7 @@ mod tests {
         use stow_types::preheat_cost::{EventKind, KindCost};
 
         let mut report = test_report(10);
-        report.wave.kinds = [
+        report.report.wave.kinds = [
             (EventKind::Submit, 2),
             (EventKind::Dispatch, 500),
             (EventKind::Completion, 10),
@@ -313,7 +388,7 @@ mod tests {
             rows_written: 0,
         })
         .collect();
-        report.resubmit.kinds.clear();
+        report.report.resubmit.kinds.clear();
         let preheat =
             PreheatMonthly::new(&model(), &report, &test_production(1_000)).expect("scale");
         // Two submits, ten complete build lifecycles, three report +
@@ -331,8 +406,8 @@ mod tests {
     #[test]
     fn trigger_requests_do_not_scale_with_nodes() {
         let mut report = test_report(10);
-        report.wave.kinds.clear();
-        report.resubmit.kinds.clear();
+        report.report.wave.kinds.clear();
+        report.report.resubmit.kinds.clear();
         let small = PreheatMonthly::new(&model(), &report, &test_production(10)).expect("small");
         let large =
             PreheatMonthly::new(&model(), &report, &test_production(10_000)).expect("large");
@@ -356,6 +431,7 @@ mod tests {
     fn unknown_phase_operations_refuse_projection() {
         let mut report = test_report(10);
         report
+            .report
             .resubmit
             .other_ops
             .push(stow_types::api::SchedulerLedgerOp {
@@ -369,14 +445,12 @@ mod tests {
         assert!(error.contains("POST /unknown"), "{error}");
     }
 
-    /// A dimension the report does not measure is absent, never zero.
+    /// DO active duration remains absent, never phase wall time.
     #[test]
     fn unmeasured_products_have_no_preheat_usage() {
         let preheat = monthly(50, 50);
-        for (product, dimension) in [("durable_objects", "duration_gb_s"), ("workers", "cpu_ms")] {
-            assert_eq!(preheat.monthly(product, dimension), None);
-            assert_ne!(not_measured(product, dimension), "");
-        }
+        assert_eq!(preheat.monthly("durable_objects", "duration_gb_s"), None);
+        assert_ne!(not_measured("durable_objects", "duration_gb_s"), "");
     }
 
     #[test]
