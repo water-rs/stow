@@ -3882,6 +3882,11 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         covered_units,
         ..
     } = *plan;
+    let (setup, registry_sources) = futures_util::try_join!(
+        prepare_cargo_run(plan),
+        crate::RegistrySources::from_lockfile(&project.workspace_root)
+            .instrument(tracing::debug_span!("stow.precargo.registry_sources")),
+    )?;
     let CargoRunSetup {
         scratch,
         wrappers,
@@ -3890,7 +3895,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         serve_map_ready,
         serve_map_path,
         serve_waiters,
-    } = prepare_cargo_run(plan).await?;
+    } = setup;
 
     // Every rustc invocation this cargo run spawns is a facade that asks
     // this process what to do, so the whole build shares one transport —
@@ -3918,9 +3923,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
             serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
             policy_ready: std::sync::Arc::clone(&policy_ready),
             in_flight: in_flight.clone(),
-            registry_sources: std::sync::OnceLock::from(
-                crate::RegistrySources::from_lockfile(&project.workspace_root).await?,
-            ),
+            registry_sources: std::sync::OnceLock::from(registry_sources),
         },
         config.cloned(),
         env_base,
