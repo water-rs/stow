@@ -10,9 +10,6 @@ use stow_types::transient::Backoff;
 use crate::github;
 use crate::render::{self, Output, Table};
 
-/// GitHub's per-repository Actions cache quota.
-const QUOTA_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-
 #[derive(Args)]
 pub struct CacheArgs {
     #[command(subcommand)]
@@ -21,7 +18,7 @@ pub struct CacheArgs {
 
 #[derive(Subcommand)]
 pub enum CacheCommand {
-    /// Cache usage vs the repository's 10 GiB quota.
+    /// Cache usage vs the repository's configured capacity.
     Stats,
     /// Delete every cache entry whose key starts with `--prefix`.
     Clear(ClearArgs),
@@ -47,6 +44,12 @@ struct CacheUsage {
     full_name: String,
     active_caches_count: u64,
     active_caches_size_in_bytes: u64,
+}
+
+/// `GET …/actions/cache/storage-limit`.
+#[derive(Debug, serde::Deserialize)]
+struct CacheStorageLimit {
+    max_cache_size_gb: u64,
 }
 
 /// The `cache stats` payload — usage plus the quota math.
@@ -97,12 +100,15 @@ pub async fn run(token: &str, args: CacheArgs, output: Output) -> stow_types::er
 }
 
 async fn stats(token: &str, output: Output) -> stow_types::error::Result<()> {
-    let usage: CacheUsage = github::get(token, "actions/cache/usage", Backoff::new()).await?;
+    let (usage, limit): (CacheUsage, CacheStorageLimit) = futures_util::try_join!(
+        github::get(token, "actions/cache/usage", Backoff::new()),
+        github::get(token, "actions/cache/storage-limit", Backoff::new()),
+    )?;
     let stats = CacheStats {
         repo: usage.full_name,
         active_caches: usage.active_caches_count,
         used_bytes: usage.active_caches_size_in_bytes,
-        quota_bytes: QUOTA_BYTES,
+        quota_bytes: limit.max_cache_size_gb * 1024 * 1024 * 1024,
     };
     render::emit(output, &stats, |stats| {
         #[allow(clippy::cast_precision_loss)]
