@@ -532,6 +532,39 @@ async fn a_keyless_signature_verifies_with_the_readers_verifier() {
     assert_eq!(chain, stack.sigstore.with(|state| state.ca.pem()));
 }
 
+/// The in-memory material is the signature published to the registry,
+/// including its certificate and Rekor proof, and passes the reader's verifier.
+#[tokio::test]
+async fn signing_returns_the_verified_published_material() {
+    let stack = Stack::new().await;
+    let session = stack.session(&unbounded());
+    let reference = session.reference("material").expect("reference");
+    let digest = stow_types::registry::sha256_digest(b"manifest");
+    let material = stack
+        .signer()
+        .sign(&session, &reference.to_string(), &digest)
+        .await
+        .expect("sign");
+    let stored = stow_oci::pull_signature_materials(&session, &reference, &digest)
+        .await
+        .expect("stored signature");
+    assert_eq!(stored.len(), 1);
+    let stored = &stored[0];
+    assert_eq!(material.payload_path, stored.payload_path);
+    assert_eq!(material.payload_bytes, stored.payload_bytes);
+    assert_eq!(material.signature, stored.signature);
+    assert_eq!(material.certificate_pem, stored.certificate_pem);
+    assert_eq!(material.rekor_bundle_json, stored.rekor_bundle_json);
+    stow_oci::verify::verify_materials(
+        &stow_oci::verify::Trust::GithubCi(stack.sigstore.trust()),
+        &reference.to_string(),
+        &digest,
+        &[material],
+        CERTIFICATE_IDENTITY,
+    )
+    .expect("returned material verifies");
+}
+
 /// Count full publications across artifact multiplicity and blob upload modes.
 #[tokio::test]
 async fn complete_publication_counts_artifacts_records_and_signatures() {
@@ -695,7 +728,12 @@ async fn a_sweep_stays_under_the_write_budget() {
 
     assert_eq!(stack.probe.throttled_writes(), 0, "no write was refused");
     let arrivals = stack.probe.write_arrivals();
-    assert_eq!(arrivals.len(), 24 * 9);
+    assert_eq!(
+        arrivals.len(),
+        24 * 9,
+        "requests: {:?}",
+        stack.probe.request_log()
+    );
     let peak = peak(&arrivals, Duration::from_secs(1));
     assert!(peak <= 101, "{peak} writes in one second, over the budget");
     assert_eq!(stack.sigstore.certificates(), 1);

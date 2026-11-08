@@ -259,7 +259,8 @@ pub async fn publish_index(
             async move { publisher.signer().sign(session, reference, &digest).await }
         })
         .await
-        .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?;
+        .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?
+        .digest;
     tracing::info!(
         %reference,
         digest = %manifest_digest,
@@ -453,7 +454,8 @@ pub async fn publish_folded(
             async move { publisher.signer().sign(session, reference, &digest).await }
         })
         .await
-        .map_err(|error| stow_types::stow_error!("push folded artifact {reference}: {error}"))?;
+        .map_err(|error| stow_types::stow_error!("push folded artifact {reference}: {error}"))?
+        .digest;
     tracing::info!(
         %reference,
         digest = %manifest_digest,
