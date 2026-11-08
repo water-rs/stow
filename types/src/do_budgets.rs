@@ -665,6 +665,9 @@ impl WorkerCpuBudget {
 /// code growth, while a change that doubles a lane's CPU fails. Each
 /// row's comment names the run and the measured value it came from.
 ///
+/// Newly covered lanes initially share the bound of the existing route class
+/// named in their comment; their own calibration requires the first measurement.
+///
 /// A budget is also bounded by the allowance, not only by the
 /// measurement: `stow-admin traffic-cost project` prices every route
 /// at its full budget — in the run's milliseconds, the budget times that
@@ -673,6 +676,28 @@ impl WorkerCpuBudget {
 /// (`cpu_ms_at_budget`), and prints each route's share of the allowance
 /// at its measured figure and at its budget.
 pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
+    // Initial bounds from status-read, trusted-submit and workflow-callback,
+    // respectively; these are route-class bounds, not measurements of new lanes.
+    WorkerCpuBudget {
+        lane: "health-probe",
+        relative_cpu: 0.15,
+    },
+    WorkerCpuBudget {
+        lane: "index-report",
+        relative_cpu: 0.25,
+    },
+    WorkerCpuBudget {
+        lane: "index-requested",
+        relative_cpu: 0.35,
+    },
+    WorkerCpuBudget {
+        lane: "index-in-progress",
+        relative_cpu: 0.35,
+    },
+    WorkerCpuBudget {
+        lane: "index-completed",
+        relative_cpu: 0.35,
+    },
     WorkerCpuBudget {
         // Run 40631853262: 0.027 (0.6 ms of a 22.2 ms reference).
         lane: "site",

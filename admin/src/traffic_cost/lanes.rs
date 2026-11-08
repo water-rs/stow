@@ -29,7 +29,8 @@ use sha2::Sha256;
 use stow_types::admission::{DEFAULT_POW_MIN_BITS, difficulty, issue_challenge};
 use stow_types::api::{
     AdmissionRequest, DependencyGraphEntry, EnqueueRequest, EnqueueSource, EnqueueTicket,
-    QueueSelector, ResolvedDependencyGraphEntry, SchedulerRearmReport, SchedulerRearmRequest,
+    PublishedRunReport, PublishedSlice, PublishedSliceRow, QueueSelector,
+    ResolvedDependencyGraphEntry, SchedulerRearmReport, SchedulerRearmRequest,
 };
 use stow_types::fixture::{
     FixtureShape, InFlightRun, REQUEST_FIXTURE_ENQUEUED, REQUEST_FIXTURE_FAILED, fixture_task_id,
@@ -89,6 +90,12 @@ pub struct LaneArgs {
     /// CLI byte-path fetch pays.
     #[arg(long)]
     pub bundle_digest: Option<String>,
+    /// File containing the mock issuer token for index-publish.yml.
+    #[arg(long, requires = "index_publish_rustc")]
+    pub index_publish_token_file: Option<PathBuf>,
+    /// Actual toolchain for the index-report slice; must differ from seeded toolchains.
+    #[arg(long, requires = "index_publish_token_file")]
+    pub index_publish_rustc: Option<String>,
 }
 
 /// A response that takes this long under the mock stack is a stall,
@@ -130,6 +137,13 @@ pub enum Fire {
     /// seeded in-flight task's `build-crate.yml` run `completed` — each
     /// event the first delivery for an armed run.
     WorkflowRun(CallbackLane),
+    /// A nonempty signed-index membership report on its own workflow identity.
+    IndexReport { token_file: PathBuf, rustc: String },
+    /// One signed lifecycle delivery of index-publish.yml.
+    IndexWorkflow {
+        secret: String,
+        action: &'static str,
+    },
     /// `POST /api/v1/admissions` — one miss entry whose resolved graph
     /// rides in the body, so the lane pays the real mint path without
     /// a crates.io hop.
@@ -340,19 +354,27 @@ fn sign_body(secret: &str, body: &[u8]) -> String {
 /// task's records artifact under `records-<rustc>-<task_id>-<id>-1`, both
 /// of which `traffic-cost.sh` publishes before the lanes start.
 fn workflow_run_body(task: &InFlightRun) -> String {
-    let run_id = task.run_id;
+    workflow_delivery_body(
+        "completed",
+        stow_types::trusted_builder::WORKFLOW_FILE,
+        task.run_id,
+        &run_title(task.rustc_version, &task.task_id),
+    )
+}
+
+fn workflow_delivery_body(action: &str, workflow: &str, run_id: u64, title: &str) -> String {
     serde_json::json!({
-        "action": "completed",
+        "action": action,
         "repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
         "workflow_run": {
-            "display_title": run_title(task.rustc_version, &task.task_id),
+            "display_title": title,
             "event": "workflow_dispatch",
             "head_branch": stow_types::trusted_builder::BRANCH,
             "path": format!(
                 ".github/workflows/{}",
-                stow_types::trusted_builder::WORKFLOW_FILE
+                workflow
             ),
-            "conclusion": "success",
+            "conclusion": (action == "completed").then_some("success"),
             "id": run_id,
             "run_attempt": 1,
             "html_url": run_url(&run_id.to_string()),
@@ -369,6 +391,62 @@ fn workflow_run_body(task: &InFlightRun) -> String {
         },
     })
     .to_string()
+}
+
+/// A full, nonempty wasm slice isolated from the Linux fixture and byte-path slice.
+fn index_report(rustc: &str, counter: u64) -> Result<PublishedRunReport, String> {
+    use stow_types::public_cache::{UnitInvocation, required_unit_shapes};
+
+    let mut task = submit_task(rustc, counter)?;
+    task.target = "wasm32-unknown-unknown"
+        .parse::<TargetTriple>()
+        .map_err(|error| error.to_string())?;
+    let dependency_identity = task
+        .dependency_identity()
+        .map_err(|error| error.to_string())?;
+    let added = required_unit_shapes(false, UnitInvocation::Target, task.explicit_spelling)
+        .into_iter()
+        .map(|unit_shape| PublishedSliceRow {
+            crate_name: task.crate_name.clone(),
+            version: task.version.clone(),
+            features_json: task.features_json.clone(),
+            node_profile: task.profile,
+            unit_shape,
+            dependency_identity: dependency_identity.clone(),
+        })
+        .collect();
+    let generation = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(PublishedRunReport {
+        slices: vec![PublishedSlice {
+            target: task.target,
+            rustc_version: task.rustc_version,
+            base_generation: None,
+            generation,
+            part: 0,
+            parts: 1,
+            added,
+            retired: Vec::new(),
+        }],
+    })
+}
+
+fn signed_workflow_plan(base: &str, secret: &str, body: String) -> Plan {
+    let signature = sign_body(secret, body.as_bytes());
+    Plan::PostBytes {
+        url: format!("{base}/api/v1/github/workflow-run"),
+        headers: vec![
+            ("X-GitHub-Event".to_owned(), "workflow_run".to_owned()),
+            ("X-Hub-Signature-256".to_owned(), signature),
+            ("Content-Type".to_owned(), "application/json".to_owned()),
+        ],
+        body: body.into_bytes(),
+    }
 }
 
 /// A lane event resolved into an HTTP request — `fire_once` turns the
@@ -568,6 +646,26 @@ fn mint_ticket(
     })
 }
 
+async fn index_report_plan(
+    base: &str,
+    token_file: &std::path::Path,
+    rustc: &str,
+    counter: u64,
+) -> Result<Plan, String> {
+    Ok(Plan::PostJson {
+        url: format!("{base}/api/v1/admin/index/published"),
+        bearer: Some(
+            tokio::fs::read_to_string(token_file)
+                .await
+                .map_err(|error| error.to_string())?
+                .trim()
+                .to_owned(),
+        ),
+        body: serde_json::to_value(index_report(rustc, counter)?)
+            .map_err(|error| error.to_string())?,
+    })
+}
+
 /// Resolve one lane event into its request — the index pull's pointer
 /// hop and the bearer fetches happen here.
 async fn plan(
@@ -643,17 +741,21 @@ async fn plan(
             // An armed run, so the delivery is production's first
             // delivery: the record write and the alarm arm.
             let body = workflow_run_body(&lane.take()?);
-            let signature = sign_body(&lane.secret, body.as_bytes());
-            Ok(Plan::PostBytes {
-                url: format!("{base}/api/v1/github/workflow-run"),
-                headers: vec![
-                    ("X-GitHub-Event".to_owned(), "workflow_run".to_owned()),
-                    ("X-Hub-Signature-256".to_owned(), signature),
-                    ("Content-Type".to_owned(), "application/json".to_owned()),
-                ],
-                body: body.into_bytes(),
-            })
+            Ok(signed_workflow_plan(base, &lane.secret, body))
         }
+        Fire::IndexReport { token_file, rustc } => {
+            index_report_plan(base, token_file, rustc, counter).await
+        }
+        Fire::IndexWorkflow { secret, action } => Ok(signed_workflow_plan(
+            base,
+            secret,
+            workflow_delivery_body(
+                action,
+                stow_types::trusted_builder::INDEX_WORKFLOW_FILE,
+                counter + 1,
+                "Publish index",
+            ),
+        )),
         Fire::Admission { target, rustc } => Ok(Plan::PostJson {
             url: format!("{base}/api/v1/admissions"),
             bearer: None,
@@ -816,6 +918,13 @@ pub fn build_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<V
             expected: ok2xx,
         },
     ];
+    lanes.push(Lane {
+        name: "health-probe",
+        eps: eps(EventKind::HealthProbe),
+        fire: Fire::PublicGet(vec!["/api/v1/scheduler/health".to_owned()]),
+        expected: ok2xx,
+    });
+    lanes.extend(index_lanes(args, model, scale)?);
     if args.scheduler {
         lanes.extend(scheduler_lanes(args, model, scale));
     }
@@ -854,6 +963,49 @@ pub fn build_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<V
         lanes.retain(|lane| args.lanes.iter().any(|name| name == lane.name));
         if lanes.is_empty() {
             return Err(format!("no lane matches --lanes {}", args.lanes.join(",")));
+        }
+    }
+    Ok(lanes)
+}
+
+fn index_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<Vec<Lane>, String> {
+    let eps = |kind: EventKind| model.peak_events_per_second(kind) * scale;
+    let mut lanes = Vec::new();
+    if let Some(token_file) = &args.index_publish_token_file {
+        let rustc = args
+            .index_publish_rustc
+            .as_ref()
+            .ok_or("index report requires --index-publish-rustc")?;
+        if stow_types::fixture::SEEDED_RUSTC_VERSIONS.contains(&rustc.as_str()) {
+            return Err(format!(
+                "index-report rustc {rustc} overlaps the seeded population"
+            ));
+        }
+        lanes.push(Lane {
+            name: "index-report",
+            eps: eps(EventKind::IndexPublish),
+            fire: Fire::IndexReport {
+                token_file: token_file.clone(),
+                rustc: rustc.clone(),
+            },
+            expected: ok2xx,
+        });
+    }
+    if let Some(secret) = &args.webhook_secret {
+        for (name, action) in [
+            ("index-requested", "requested"),
+            ("index-in-progress", "in_progress"),
+            ("index-completed", "completed"),
+        ] {
+            lanes.push(Lane {
+                name,
+                eps: eps(EventKind::IndexPublish),
+                fire: Fire::IndexWorkflow {
+                    secret: secret.clone(),
+                    action,
+                },
+                expected: ok2xx,
+            });
         }
     }
     Ok(lanes)
@@ -918,6 +1070,73 @@ mod tests {
             pow_secret: Some("secret".to_owned()),
             pow_min_bits: 12,
             bundle_digest: None,
+            index_publish_token_file: Some("index-publish-token".into()),
+            index_publish_rustc: Some("1.99.1".to_owned()),
+        }
+    }
+
+    #[test]
+    fn index_reports_replace_nonempty_membership_on_their_own_slice() {
+        let first = super::index_report("1.99.1", 0).expect("report");
+        let next = super::index_report("1.99.1", 1).expect("report");
+        let row = &first.slices[0];
+        assert_eq!(row.target.as_str(), "wasm32-unknown-unknown");
+        assert_eq!(row.rustc_version.as_str(), "1.99.1");
+        assert!(row.base_generation.is_none());
+        assert_eq!((row.part, row.parts), (0, 1));
+        assert_ne!(row.added, []);
+        assert_eq!(row.retired, []);
+        assert_ne!(row.added, next.slices[0].added);
+        assert!(next.slices[0].generation > row.generation);
+        let shapes = stow_types::public_cache::required_unit_shapes(
+            false,
+            stow_types::public_cache::UnitInvocation::Target,
+            stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+        );
+        assert_eq!(
+            row.added
+                .iter()
+                .map(|row| row.unit_shape)
+                .collect::<Vec<_>>(),
+            shapes
+        );
+    }
+
+    #[test]
+    fn index_report_cannot_replace_a_seeded_slice() {
+        let model =
+            LaunchModel::from_toml(include_str!("../../../launch-model.toml")).expect("model");
+        for rustc in stow_types::fixture::SEEDED_RUSTC_VERSIONS {
+            let mut args = lane_args();
+            args.index_publish_rustc = Some(rustc.to_owned());
+            assert!(
+                build_lanes(&args, &model, 1.0)
+                    .err()
+                    .expect("overlap")
+                    .contains("overlaps")
+            );
+        }
+    }
+
+    #[test]
+    fn index_lifecycle_deliveries_use_index_workflow_identity() {
+        for action in ["requested", "in_progress", "completed"] {
+            let body =
+                super::workflow_delivery_body(action, "index-publish.yml", 42, "Publish index");
+            let body: serde_json::Value = serde_json::from_str(&body).expect("delivery");
+            assert_eq!(body["action"], action);
+            assert_eq!(
+                body["workflow_run"]["path"],
+                ".github/workflows/index-publish.yml"
+            );
+            assert_eq!(
+                body["workflow_run"]["head_branch"],
+                stow_types::trusted_builder::BRANCH
+            );
+            assert_eq!(
+                body["workflow_run"]["conclusion"].as_str(),
+                (action == "completed").then_some("success")
+            );
         }
     }
 
