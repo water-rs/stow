@@ -691,6 +691,10 @@ pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
         relative_cpu: 0.35,
     },
     WorkerCpuBudget {
+        lane: "build-requested",
+        relative_cpu: 0.35,
+    },
+    WorkerCpuBudget {
         lane: "index-in-progress",
         relative_cpu: 0.35,
     },

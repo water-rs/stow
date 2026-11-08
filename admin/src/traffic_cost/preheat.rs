@@ -23,14 +23,48 @@
 //! Scheduler calls and rows are measured. Worker requests follow the
 //! production delivery contract, including workflows the local mock
 //! does not deliver. Trigger costs are fixed per wave, not per node.
-//! Covered phase CPU includes scheduler and observer CPU. Workflow
-//! deliveries absent from the mock and fixed trigger CPU remain
-//! unmeasured, as does Durable Object duration.
+//! Covered phase CPU includes scheduler and observer CPU. Missing build
+//! and index lifecycle deliveries use their separately measured lanes.
+//! Fixed trigger CPU and Durable Object duration remain unmeasured.
 
 use crate::preheat_cost::MeasuredReport;
 use stow_types::forwards::RunForwards;
 use stow_types::launch_model::LaunchModel;
 use stow_types::preheat_cost::{EventKind, PhaseCost, ProductionWave};
+
+use super::cpu::WorkerCpuReport;
+
+/// CPU of the lifecycle deliveries absent from the captured mock phase.
+#[derive(Debug)]
+struct LifecycleCpu {
+    measured_ms: f64,
+    budget_ms: f64,
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "phase event counts fit f64 exactly"
+)]
+fn lifecycle_cpu(phase: &PhaseCost, cpu: &WorkerCpuReport) -> Result<LifecycleCpu, String> {
+    let mut result = LifecycleCpu {
+        measured_ms: 0.0,
+        budget_ms: 0.0,
+    };
+    for cost in &phase.kinds {
+        let lanes: &[&str] = match cost.kind {
+            EventKind::Completion => &["build-requested"],
+            EventKind::SliceReport => &["index-requested", "index-in-progress", "index-completed"],
+            EventKind::Submit | EventKind::Dispatch | EventKind::ExternalRunUpdate => &[],
+        };
+        for lane in lanes {
+            result.measured_ms =
+                (cost.events as f64).mul_add(cpu.lane_cpu_ms(lane)?, result.measured_ms);
+            result.budget_ms =
+                (cost.events as f64).mul_add(cpu.lane_budget_ms(lane)?, result.budget_ms);
+        }
+    }
+    Ok(result)
+}
 
 /// A phase's measured cost per node of the wave that measured it.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
@@ -39,8 +73,8 @@ pub struct PerNode {
     pub worker_requests: f64,
     /// Covered isolate CPU, including scheduler and observer work.
     pub worker_cpu_ms: f64,
-    /// Production deliveries absent from the captured mock phase.
-    pub unmeasured_worker_events: f64,
+    /// Captured phase CPU plus missing lifecycle CPU at lane budgets.
+    pub worker_cpu_ms_at_lifecycle_budget: f64,
     /// Durable Object calls the phase was billed.
     pub requests: f64,
     /// Durable Object `rowsRead`.
@@ -55,7 +89,12 @@ impl PerNode {
         clippy::cast_precision_loss,
         reason = "measured counters fit f64 exactly past any wave"
     )]
-    fn of(phase: &PhaseCost, nodes: u64, cpu_ms: f64) -> Result<Self, String> {
+    fn of(
+        phase: &PhaseCost,
+        nodes: u64,
+        cpu_ms: f64,
+        cpu: &WorkerCpuReport,
+    ) -> Result<Self, String> {
         if !phase.other_ops.is_empty() {
             return Err(format!(
                 "preheat Worker request count has unsupported operations: {:?}",
@@ -80,22 +119,11 @@ impl PerNode {
             })
             .sum();
         let nodes = nodes as f64;
-        let unmeasured_worker_events: f64 = phase
-            .kinds
-            .iter()
-            .map(|cost| {
-                let missing = match cost.kind {
-                    EventKind::Completion => 1.0, // requested; started and completed are captured
-                    EventKind::SliceReport => deliveries, // mock publishes directly
-                    EventKind::Submit | EventKind::Dispatch | EventKind::ExternalRunUpdate => 0.0,
-                };
-                cost.events as f64 * missing
-            })
-            .sum();
+        let lifecycle = lifecycle_cpu(phase, cpu)?;
         Ok(Self {
             worker_requests: worker_requests / nodes,
-            worker_cpu_ms: cpu_ms / nodes,
-            unmeasured_worker_events: unmeasured_worker_events / nodes,
+            worker_cpu_ms: (cpu_ms + lifecycle.measured_ms) / nodes,
+            worker_cpu_ms_at_lifecycle_budget: (cpu_ms + lifecycle.budget_ms) / nodes,
             requests: phase.requests() as f64 / nodes,
             rows_read: phase.rows_read as f64 / nodes,
             rows_written: phase.rows_written as f64 / nodes,
@@ -146,6 +174,7 @@ impl PreheatMonthly {
         model: &LaunchModel,
         measured: &MeasuredReport,
         production: &ProductionWave,
+        cpu: &WorkerCpuReport,
     ) -> Result<Self, String> {
         let report = &measured.report;
         if report.nodes == 0 {
@@ -166,11 +195,17 @@ impl PreheatMonthly {
             production_nodes: production.nodes,
             releases_per_month: model.monthly_stable_releases(),
             resubmits_per_month: model.monthly_resubmits(),
-            wave: PerNode::of(&report.wave, report.nodes, measured.cpu.wave.total_ms())?,
+            wave: PerNode::of(
+                &report.wave,
+                report.nodes,
+                measured.cpu.wave.total_ms(),
+                cpu,
+            )?,
             resubmit: PerNode::of(
                 &report.resubmit,
                 report.nodes,
                 measured.cpu.resubmit.total_ms(),
+                cpu,
             )?,
             wave_tasks: report.wave.tasks,
             resubmit_tasks: report.resubmit.tasks,
@@ -192,6 +227,9 @@ impl PreheatMonthly {
                     self.resubmit_trigger_worker_requests,
                 ),
                 ("workers", "cpu_ms") => (|cost| cost.worker_cpu_ms, 0.0, 0.0),
+                ("workers", "cpu_ms_at_lifecycle_budget") => {
+                    (|cost| cost.worker_cpu_ms_at_lifecycle_budget, 0.0, 0.0)
+                }
                 ("durable_objects", "requests") => (
                     |cost| cost.requests,
                     self.wave_trigger_do_requests,
@@ -208,23 +246,12 @@ impl PreheatMonthly {
         ))
     }
 
-    /// Events whose CPU is absent from the captured phases. Fixed
-    /// triggers do not scale with the production node count.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "node counts fit f64 exactly past any wave"
-    )]
+    /// Fixed trigger events whose CPU is not measured. These do not
+    /// scale with the production node count.
     pub fn unmeasured_worker_events(&self) -> f64 {
-        let nodes = self.production_nodes as f64;
         self.resubmits_per_month.mul_add(
-            self.resubmit
-                .unmeasured_worker_events
-                .mul_add(nodes, self.resubmit_trigger_worker_requests),
-            self.releases_per_month
-                * self
-                    .wave
-                    .unmeasured_worker_events
-                    .mul_add(nodes, self.wave_trigger_worker_requests),
+            self.resubmit_trigger_worker_requests,
+            self.releases_per_month * self.wave_trigger_worker_requests,
         )
     }
 }
@@ -290,11 +317,82 @@ pub(super) fn test_report(nodes: u64) -> MeasuredReport {
 #[cfg(test)]
 mod tests {
     use super::{PreheatMonthly, not_measured, test_production, test_report};
-    use crate::traffic_cost::test_support::model;
+    use crate::traffic_cost::test_support::{fixture_cpu, model};
 
     fn monthly(nodes: u64, production: u64) -> PreheatMonthly {
-        PreheatMonthly::new(&model(), &test_report(nodes), &test_production(production))
-            .expect("scale")
+        PreheatMonthly::new(
+            &model(),
+            &test_report(nodes),
+            &test_production(production),
+            &fixture_cpu(|_| 0.0),
+        )
+        .expect("scale")
+    }
+
+    #[test]
+    fn missing_lifecycle_cpu_prices_only_deliveries_absent_from_the_phase() {
+        use stow_types::preheat_cost::{EventKind, KindCost};
+
+        let mut report = test_report(10);
+        report.report.wave.kinds = [
+            (EventKind::Completion, 10),
+            (EventKind::SliceReport, 3),
+            (EventKind::Submit, 7),
+            (EventKind::ExternalRunUpdate, 4),
+            (EventKind::Dispatch, 5),
+        ]
+        .into_iter()
+        .map(|(kind, events)| KindCost {
+            kind,
+            events,
+            rows_read: 0,
+            rows_written: 0,
+        })
+        .collect();
+        let mut cpu = crate::traffic_cost::test_support::fixture_cpu(|_| 0.0);
+        for row in &mut cpu.rows {
+            row.cpu_ms = match row.lane.as_str() {
+                "build-requested" => 2.0,
+                "index-requested" => 3.0,
+                "index-in-progress" => 5.0,
+                "index-completed" => 7.0,
+                _ => 1_000.0,
+            };
+            row.budget_ms = row.cpu_ms * 2.0;
+        }
+        let extra = super::lifecycle_cpu(&report.report.wave, &cpu).expect("lifecycle cost");
+        assert_eq!(extra.measured_ms, 65.0);
+        assert_eq!(extra.budget_ms, 130.0);
+        let preheat = PreheatMonthly::new(&model(), &report, &test_production(1_000), &cpu)
+            .expect("priced phases");
+        assert_eq!(preheat.wave.worker_cpu_ms, 16.5);
+        assert_eq!(preheat.resubmit.worker_cpu_ms, 22.0);
+        let expected = preheat
+            .releases_per_month
+            .mul_add(16_500.0, preheat.resubmits_per_month * 22_000.0);
+        assert!((preheat.monthly("workers", "cpu_ms").expect("CPU") - expected).abs() < 1e-6);
+        let expected_budget = preheat
+            .releases_per_month
+            .mul_add(23_000.0, preheat.resubmits_per_month * 42_000.0);
+        assert!(
+            (preheat
+                .monthly("workers", "cpu_ms_at_lifecycle_budget")
+                .expect("budget")
+                - expected_budget)
+                .abs()
+                < 1e-6
+        );
+        cpu.rows.retain(|row| row.lane != "index-completed");
+        assert!(
+            super::lifecycle_cpu(&report.report.wave, &cpu)
+                .expect_err("missing price")
+                .contains("index-completed")
+        );
+        assert!(
+            PreheatMonthly::new(&model(), &report, &test_production(1_000), &cpu)
+                .expect_err("projection needs all lifecycle prices")
+                .contains("index-completed")
+        );
     }
 
     /// Per-node cost is the phase total over the measured wave's nodes.
@@ -320,7 +418,7 @@ mod tests {
         assert!((actual - expected).abs() < 1e-6, "{actual}");
         let missing = preheat
             .releases_per_month
-            .mul_add(10_004.0, preheat.resubmits_per_month * 10_007.0);
+            .mul_add(4.0, preheat.resubmits_per_month * 7.0);
         assert!((preheat.unmeasured_worker_events() - missing).abs() < 1e-6);
     }
 
@@ -389,8 +487,13 @@ mod tests {
         })
         .collect();
         report.report.resubmit.kinds.clear();
-        let preheat =
-            PreheatMonthly::new(&model(), &report, &test_production(1_000)).expect("scale");
+        let preheat = PreheatMonthly::new(
+            &model(),
+            &report,
+            &test_production(1_000),
+            &fixture_cpu(|_| 0.0),
+        )
+        .expect("scale");
         // Two submits, ten complete build lifecycles, three report +
         // index-run lifecycles. Neither alarms nor in_progress adds
         // another Worker lifecycle.
@@ -408,9 +511,20 @@ mod tests {
         let mut report = test_report(10);
         report.report.wave.kinds.clear();
         report.report.resubmit.kinds.clear();
-        let small = PreheatMonthly::new(&model(), &report, &test_production(10)).expect("small");
-        let large =
-            PreheatMonthly::new(&model(), &report, &test_production(10_000)).expect("large");
+        let small = PreheatMonthly::new(
+            &model(),
+            &report,
+            &test_production(10),
+            &fixture_cpu(|_| 0.0),
+        )
+        .expect("small");
+        let large = PreheatMonthly::new(
+            &model(),
+            &report,
+            &test_production(10_000),
+            &fixture_cpu(|_| 0.0),
+        )
+        .expect("large");
         assert_eq!(
             small.monthly("workers", "requests"),
             large.monthly("workers", "requests")
@@ -440,8 +554,13 @@ mod tests {
                 rows_read: 0,
                 rows_written: 0,
             });
-        let error = PreheatMonthly::new(&model(), &report, &test_production(10))
-            .expect_err("unknown operation");
+        let error = PreheatMonthly::new(
+            &model(),
+            &report,
+            &test_production(10),
+            &fixture_cpu(|_| 0.0),
+        )
+        .expect_err("unknown operation");
         assert!(error.contains("POST /unknown"), "{error}");
     }
 
@@ -455,11 +574,21 @@ mod tests {
 
     #[test]
     fn nothing_to_scale_is_refused() {
-        let unmeasured = PreheatMonthly::new(&model(), &test_report(0), &test_production(10))
-            .expect_err("0 nodes");
+        let unmeasured = PreheatMonthly::new(
+            &model(),
+            &test_report(0),
+            &test_production(10),
+            &fixture_cpu(|_| 0.0),
+        )
+        .expect_err("0 nodes");
         assert!(unmeasured.contains("0 nodes"), "{unmeasured}");
-        let unplanned = PreheatMonthly::new(&model(), &test_report(10), &test_production(0))
-            .expect_err("0 plan");
+        let unplanned = PreheatMonthly::new(
+            &model(),
+            &test_report(10),
+            &test_production(0),
+            &fixture_cpu(|_| 0.0),
+        )
+        .expect_err("0 plan");
         assert!(unplanned.contains("0 nodes"), "{unplanned}");
     }
 }
