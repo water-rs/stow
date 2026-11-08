@@ -692,8 +692,8 @@ pub struct GateEvaluation {
     pub diagnostics: Vec<UsageLine>,
     /// Every measured Worker route's projected monthly CPU.
     pub cpu_routes: Vec<RouteCpu>,
-    /// Projected monthly Worker CPU were every route to spend its whole
-    /// budget — gated against the same bound as the measured line.
+    /// Traffic and missing lifecycle CPU at lane budgets, plus captured
+    /// preheat phase CPU; gated against the measured line's bound.
     pub worker_cpu_ms_at_budget: f64,
     /// Worker routes whose CPU the projection does not carry.
     pub unmeasured_cpu: Vec<UnmeasuredCpu>,
@@ -975,19 +975,27 @@ fn evaluate(
     // so a budget raised past what the allowance carries fails here
     // whatever the run measured.
     let cpu_bound = WORKER_CPU_MS_MONTHLY * ALLOWANCE_FRACTION;
-    if projection.worker_cpu_ms_at_budget > cpu_bound {
+    let preheat_cpu_at_budget = preheat
+        .monthly("workers", "cpu_ms_at_lifecycle_budget")
+        .expect("preheat carries captured CPU and lifecycle budgets");
+    let cpu_at_budget = projection.worker_cpu_ms_at_budget + preheat_cpu_at_budget;
+    if cpu_at_budget > cpu_bound {
         breaches.push(Breach {
             product: "workers",
             dimension: "cpu_ms_at_budget",
-            projected: projection.worker_cpu_ms_at_budget,
+            projected: cpu_at_budget,
             traffic: projection.worker_cpu_ms_at_budget,
-            preheat: 0.0,
+            preheat: preheat_cpu_at_budget,
             bound: cpu_bound,
-            top_route: projection
-                .cpu_routes
-                .iter()
-                .max_by(|a, b| a.share_at_budget.total_cmp(&b.share_at_budget))
-                .map_or("n/a", |route| route.route),
+            top_route: if preheat_cpu_at_budget > projection.worker_cpu_ms_at_budget {
+                PREHEAT_ROUTE
+            } else {
+                projection
+                    .cpu_routes
+                    .iter()
+                    .max_by(|a, b| a.share_at_budget.total_cmp(&b.share_at_budget))
+                    .map_or("n/a", |route| route.route)
+            },
         });
     }
     let unmeasured = preheat.unmeasured_worker_events();
@@ -995,7 +1003,7 @@ fn evaluate(
         projection.unmeasured_cpu.push(UnmeasuredCpu {
             route: PREHEAT_ROUTE,
             monthly_events: unmeasured,
-            reason: "covered phase CPU includes scheduler and observer work; build requested, index lifecycle deliveries and fixed trigger CPU are not captured",
+            reason: "covered phase CPU includes scheduler and observer work; missing build and index deliveries use measured lanes; fixed trigger CPU is not captured",
         });
     }
     Ok(GateEvaluation {
@@ -1003,7 +1011,7 @@ fn evaluate(
         top_routes,
         diagnostics,
         cpu_routes: projection.cpu_routes,
-        worker_cpu_ms_at_budget: projection.worker_cpu_ms_at_budget,
+        worker_cpu_ms_at_budget: cpu_at_budget,
         unmeasured_cpu: projection.unmeasured_cpu,
         breaches,
     })
@@ -1056,7 +1064,7 @@ fn project(
     preheat_report: &MeasuredReport,
     production: &ProductionWave,
 ) -> Result<ProjectionReport, String> {
-    let preheat = PreheatMonthly::new(model, preheat_report, production)?;
+    let preheat = PreheatMonthly::new(model, preheat_report, production, cpu)?;
     Ok(ProjectionReport {
         projection: evaluate(model, small, cpu, &preheat)?,
         projection_after_load: evaluate(model, after, cpu, &preheat)?,
@@ -1081,6 +1089,7 @@ fn render_preheat(preheat: &PreheatMonthly) -> String {
         "per node",
         "Worker requests",
         "covered CPU ms",
+        "CPU ms at lifecycle budget",
         "DO requests",
         "rows read",
         "rows written",
@@ -1094,6 +1103,7 @@ fn render_preheat(preheat: &PreheatMonthly) -> String {
             label.to_owned(),
             format!("{:.2}", cost.worker_requests),
             format!("{:.2}", cost.worker_cpu_ms),
+            format!("{:.2}", cost.worker_cpu_ms_at_lifecycle_budget),
             format!("{:.2}", cost.requests),
             format!("{:.2}", cost.rows_read),
             format!("{:.2}", cost.rows_written),
@@ -1220,7 +1230,7 @@ fn render_evaluation(title: &str, evaluation: &GateEvaluation) -> String {
     let _ = writeln!(out, "\n{}", cpu.render());
     let _ = writeln!(
         out,
-        "Worker CPU at budget: {:.3e} ms/mo, {:.1}% of the allowance (bound {:.0}%)",
+        "Worker CPU at lane budgets + captured preheat CPU: {:.3e} ms/mo, {:.1}% of the allowance (bound {:.0}%)",
         evaluation.worker_cpu_ms_at_budget,
         100.0 * evaluation.worker_cpu_ms_at_budget / WORKER_CPU_MS_MONTHLY,
         100.0 * ALLOWANCE_FRACTION
@@ -1382,7 +1392,10 @@ mod tests {
         assert!(rendered.contains("monthly projection: PASS"), "{rendered}");
         assert!(rendered.contains("preheat/mo"), "{rendered}");
         assert!(rendered.contains("Worker CPU per route"), "{rendered}");
-        assert!(rendered.contains("Worker CPU at budget"), "{rendered}");
+        assert!(
+            rendered.contains("Worker CPU at lane budgets + captured preheat CPU"),
+            "{rendered}"
+        );
     }
 
     /// `project` over a hand-built preheat share instead of a report.
@@ -1581,6 +1594,42 @@ mod tests {
         assert!(gap.monthly_events > 0.0);
         assert!(gap.reason.contains("fixed trigger"));
         assert!(super::render_projection(&report).contains("fixed trigger"));
+    }
+
+    #[test]
+    fn missing_preheat_lifecycle_budget_enters_the_combined_bound() {
+        let budget = fixture_report(100_000, |_| 0.5);
+        let mut cpu = fixture_cpu(|_| 0.0);
+        cpu.rows
+            .iter_mut()
+            .find(|row| row.lane == "build-requested")
+            .expect("requested budget")
+            .budget_ms = super::WORKER_CPU_MS_MONTHLY;
+        let report = project(
+            &model(),
+            &budget,
+            &budget,
+            &cpu,
+            &crate::traffic_cost::preheat::test_report(10),
+            &crate::traffic_cost::preheat::test_production(10),
+        )
+        .expect("priced lifecycles");
+        let breach = report
+            .projection
+            .breaches
+            .iter()
+            .find(|breach| breach.dimension == "cpu_ms_at_budget")
+            .expect("preheat lifecycle budgets must be included");
+        assert!(breach.traffic < breach.bound);
+        assert!(breach.preheat > breach.bound);
+        assert_eq!(breach.top_route, super::PREHEAT_ROUTE);
+        assert!(
+            !report
+                .projection
+                .breaches
+                .iter()
+                .any(|breach| breach.dimension == "cpu_ms")
+        );
     }
 
     #[test]

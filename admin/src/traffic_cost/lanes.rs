@@ -953,6 +953,23 @@ pub fn build_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<V
             },
         ]);
     }
+    lanes.extend(build_workflow_lanes(args, model, scale)?);
+    if !args.lanes.is_empty() {
+        lanes.retain(|lane| args.lanes.iter().any(|name| name == lane.name));
+        if lanes.is_empty() {
+            return Err(format!("no lane matches --lanes {}", args.lanes.join(",")));
+        }
+    }
+    Ok(lanes)
+}
+
+fn build_workflow_lanes(
+    args: &LaneArgs,
+    model: &LaunchModel,
+    scale: f64,
+) -> Result<Vec<Lane>, String> {
+    let eps = |kind: EventKind| model.peak_events_per_second(kind) * scale;
+    let mut lanes = Vec::new();
     if let Some(secret) = &args.webhook_secret {
         lanes.push(Lane {
             name: "build-requested",
@@ -971,12 +988,6 @@ pub fn build_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<V
             fire: Fire::WorkflowRun(CallbackLane::new(secret.clone(), args.queue_rows)?),
             expected: ok2xx,
         });
-    }
-    if !args.lanes.is_empty() {
-        lanes.retain(|lane| args.lanes.iter().any(|name| name == lane.name));
-        if lanes.is_empty() {
-            return Err(format!("no lane matches --lanes {}", args.lanes.join(",")));
-        }
     }
     Ok(lanes)
 }
