@@ -3094,6 +3094,9 @@ impl Graph {
             published_capacity = self.published.capacity(),
             pending_age_entries = self.pending_ages.len(),
             extra_entries = self.extras.len(),
+            extra_capacity = self.extras.capacity(),
+            extra_entry_bytes = size_of::<(u32, Extra)>(),
+            extra_storage_bytes = self.extras.capacity() * size_of::<(u32, Extra)>(),
             "budget graph occupancy"
         );
     }
