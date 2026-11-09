@@ -121,5 +121,5 @@ impl CiTransport for CfTransport {
 
 #[cfg(any(test, target_arch = "wasm32"))]
 mod window;
-#[cfg(any(test, target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 pub(super) use window::{dispatch_claims, retain_ci_limit};
