@@ -2145,6 +2145,7 @@ impl Graph {
         if let Some(parked) = parked
             && parked.run_id == run_id
         {
+            let parked = *parked;
             self.finish_run_inner(
                 ix,
                 parked.success,
@@ -2310,13 +2311,13 @@ impl Graph {
                 // settle — the binding lands in this isolate, so the
                 // completion waits on it.
                 self.edit_extra(ix, |extra| {
-                    extra.parked = Some(RunCompletion {
+                    extra.parked = Some(Box::new(RunCompletion {
                         run_id,
                         success,
                         cancelled,
                         source_failure,
                         error,
-                    });
+                    }));
                 });
                 return FinishOutcome::Parked;
             }

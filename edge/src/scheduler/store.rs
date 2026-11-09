@@ -1274,6 +1274,81 @@ mod tests {
         assert_eq!(restored.status().completed, 1);
     }
 
+    #[tokio::test]
+    async fn parked_completion_survives_snapshot_before_binding() {
+        use crate::scheduler::graph::{FinishOutcome, RunCompletion};
+
+        for success in [true, false] {
+            let db = store().await;
+            let mut graph = Graph::default();
+            let tree = SubmissionTree {
+                source: SubmissionSource::CacheMiss,
+                roots: vec![0],
+                nodes: vec![node("solo")],
+            };
+            let events: Vec<_> = submission_events(&tree).collect();
+            commit_to(&db, &mut graph, &events, 0).await;
+            let claims = graph
+                .claim(&claim_settings(45, 16), 0, u32::MAX)
+                .expect("claim");
+            let generation = claims[0].generation;
+            append_events(
+                &db,
+                None,
+                &[SchedulerEvent::Claims {
+                    claims: vec![DispatchClaim {
+                        task_id: id("solo"),
+                        generation,
+                        attempt: 1,
+                    }],
+                }],
+                1,
+            )
+            .await
+            .expect("claims");
+            let proof = (!success).then_some(stow_types::api::SourceFailureVerification {
+                run_id: 909,
+                run_attempt: 1,
+                job_id: 910,
+            });
+            let error = (!success).then(|| "verified source failure".to_owned());
+            let completion = SchedulerEvent::RunFinished {
+                source_failure: proof.clone(),
+                run_id: "909".into(),
+                task_id: id("solo"),
+                success,
+                cancelled: false,
+                error: error.clone(),
+            };
+            append_events(&db, None, &[completion], 2)
+                .await
+                .expect("completion");
+            assert_eq!(
+                graph.run_finished(
+                    &id("solo"),
+                    RunCompletion {
+                        run_id: 909,
+                        success,
+                        cancelled: false,
+                        source_failure: proof,
+                        error,
+                    },
+                    2,
+                ),
+                FinishOutcome::Parked,
+            );
+            write_snapshot(&db, &mut graph, &GraphCell::default(), 3)
+                .await
+                .expect("snapshot with parked completion");
+            drop(graph);
+            let (mut restored, tail) = load(&db).await.expect("wake");
+            assert!(tail.is_empty(), "completion is in the snapshot");
+            assert!(restored.bind(&id("solo"), generation, 909, 4));
+            assert_eq!(restored.status().completed, u32::from(success));
+            assert_eq!(restored.status().failed, u32::from(!success));
+        }
+    }
+
     /// A submit whose tail was cut mid-parts never reached its ack, so a
     /// wake drops it rather than merging a truncated tree.
     #[tokio::test]
