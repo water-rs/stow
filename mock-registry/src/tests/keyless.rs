@@ -802,8 +802,13 @@ async fn independent_publishers_recover_without_re_signing() {
         let stack = &stack;
         async move {
             let budget = stow_oci::WriteBudget::per_minute(NonZeroU32::new(1500).expect("rate"));
-            let session = stack.session(&budget);
-            let signer = stack.signer();
+            let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
+            let session = push_session(&stack.listen, &http, &budget);
+            let signer = stow_oci::KeylessSigner::new(
+                http,
+                stack.sigstore.trust(),
+                stack.sigstore.services(),
+            );
             let sign = |reference: String, digest: String| {
                 let (session, signer) = (&session, &signer);
                 async move { signer.sign(session, &reference, &digest).await }
