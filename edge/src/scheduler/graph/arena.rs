@@ -2,7 +2,7 @@
 
 use std::ops::{Deref, DerefMut};
 
-use orx_split_vec::{Collection, Linear, PinnedVec, PseudoDefault, SplitVec};
+use orx_split_vec::{Linear, PinnedVec, PseudoDefault, SplitVec};
 
 /// Indexed records whose growth never relocates the preceding fragments.
 #[derive(Debug)]

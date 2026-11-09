@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use orx_split_vec::{Collection, PinnedVec};
+use orx_split_vec::PinnedVec;
 
 use super::arena::Arena;
 use crate::errors::QueueError;
@@ -262,10 +262,10 @@ mod tests {
         let mut spans = Vec::new();
         let starts = |edges: &Edges| {
             (
-                &edges.dep[0] as *const u32,
-                &edges.flags[0] as *const u8,
-                &edges.offsets[0] as *const u32,
-                &edges.owners[0] as *const u32,
+                &raw const edges.dep[0],
+                &raw const edges.flags[0],
+                &raw const edges.offsets[0],
+                &raw const edges.owners[0],
             )
         };
         append(&mut edges, &mut spans, 0, 256);
