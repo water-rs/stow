@@ -122,6 +122,8 @@ pub struct LocalServerState {
     /// The bound listen address, filled by `serve` — the `html_url` a
     /// mock run reports.
     pub listen: SocketAddr,
+    /// Mock network latency for the CI control plane, excluding observer reads.
+    response_latency: Duration,
 }
 
 impl std::fmt::Debug for LocalServerState {
@@ -164,7 +166,14 @@ impl LocalServerState {
                     .get(),
             )),
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            response_latency: Duration::ZERO,
         }
+    }
+
+    /// Add latency to CI responses for external-wait duration scenarios.
+    pub fn with_response_latency(mut self, latency: Duration) -> Self {
+        self.response_latency = latency;
+        self
     }
 
     /// The `triggering_actor.login` a run dispatched through this
@@ -742,6 +751,7 @@ pub async fn serve(
 }
 
 fn build_router(state: LocalServerState) -> Router {
+    let latency = ResponseLatency(state.response_latency);
     Route::new((
         "/dispatch".post(dispatch),
         "/seeded-runs".post(seed_runs),
@@ -756,8 +766,34 @@ fn build_router(state: LocalServerState) -> Router {
         "/repos/{owner}/{repo}/actions/runs/{id}/attempts/{attempt}/jobs".at(get_attempt_jobs),
         "/repos/{owner}/{repo}/actions/runs/{id}/cancel".post(cancel_run),
     ))
+    .layer(latency)
     .with(State(state))
     .build()
+}
+
+/// Delay the response, after the operation was accepted, like a slow
+/// control-plane connection. A timed-out dispatch can still have landed.
+#[derive(Clone)]
+struct ResponseLatency(Duration);
+
+impl ResponseLatency {
+    async fn wait(&self, path: &str) {
+        if !self.0.is_zero() && (path == "/dispatch" || path.starts_with("/repos/")) {
+            sleep(self.0).await;
+        }
+    }
+}
+
+impl skyzen::middleware::Middleware for ResponseLatency {
+    async fn handle(
+        &self,
+        request: &mut skyzen::Request,
+        next: skyzen::middleware::Next<'_>,
+    ) -> skyzen::Result<Response> {
+        let response = next.run(request).await;
+        self.wait(request.uri().path()).await;
+        response
+    }
 }
 
 /// `GET /tasks` — the run list the mock e2e polls, answering the same
@@ -2168,6 +2204,7 @@ async fn post_workflow_run(
 
 #[cfg(test)]
 mod tests {
+    use futures_util::FutureExt as _;
     use skyzen::StatusCode;
     use stow_types::api::BuildTaskPayload;
     use stow_types::local_ci::{
@@ -2180,6 +2217,30 @@ mod tests {
         TaskRun, WorkflowRunReport, attempt_jobs_page, build_job_name, cancel_response,
         dispatch_response, drive_stages, publish_job_name, run_response,
     };
+
+    #[tokio::test]
+    async fn response_latency_waits_only_for_ci_control_plane_paths() {
+        let latency = super::ResponseLatency(std::time::Duration::from_secs(1));
+        for path in [
+            "/dispatch",
+            "/repos/o/r/actions/workflows/build-crate.yml/runs",
+            "/repos/o/r/actions/runs/1",
+            "/repos/o/r/actions/runs/1/attempts/1/jobs",
+            "/repos/o/r/actions/runs/1/cancel",
+        ] {
+            assert!(latency.wait(path).now_or_never().is_none(), "{path}");
+            assert!(
+                super::ResponseLatency(std::time::Duration::ZERO)
+                    .wait(path)
+                    .now_or_never()
+                    .is_some(),
+                "zero latency: {path}"
+            );
+        }
+        for path in ["/tasks", "/periodic", "/seeded-runs"] {
+            assert!(latency.wait(path).now_or_never().is_some(), "{path}");
+        }
+    }
 
     fn state() -> LocalServerState {
         LocalServerState::new(

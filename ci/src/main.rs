@@ -113,6 +113,9 @@ enum Stage {
         /// Socket address to listen on.
         #[arg(long)]
         listen: std::net::SocketAddr,
+        /// Delay mock CI control-plane responses without delaying observer reads.
+        #[arg(long, default_value_t = 0)]
+        response_latency_ms: u64,
     },
 }
 
@@ -147,7 +150,10 @@ fn main() -> stow_types::error::Result<()> {
             concurrency,
         } => tokio_runtime()?.block_on(repack_stage(&rustc_version, concurrency.get())),
         Stage::RecordsExist => tokio_runtime()?.block_on(records_exist_stage()),
-        Stage::Serve { listen } => tokio_runtime()?.block_on(serve_stage(listen)),
+        Stage::Serve {
+            listen,
+            response_latency_ms,
+        } => tokio_runtime()?.block_on(serve_stage(listen, response_latency_ms)),
     }
 }
 
@@ -552,14 +558,18 @@ fn measure_glibc_floors(
     Ok(floors)
 }
 
-async fn serve_stage(listen: std::net::SocketAddr) -> stow_types::error::Result<()> {
+async fn serve_stage(
+    listen: std::net::SocketAddr,
+    response_latency_ms: u64,
+) -> stow_types::error::Result<()> {
     let state = local_server::LocalServerState::new(
         env_required(STOW_EDGE_URL_ENV)?,
         env_required(STOW_GITHUB_WEBHOOK_SECRET_ENV)?,
         env_required(STOW_MOCK_PRIVATE_KEY_PATH_ENV)?,
         env_required(STOW_MOCK_REGISTRY_ROOT_ENV)?,
         env_required(GITHUB_APP_SLUG_ENV)?,
-    );
+    )
+    .with_response_latency(std::time::Duration::from_millis(response_latency_ms));
     local_server::serve(listen, state).await
 }
 
