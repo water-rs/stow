@@ -25,7 +25,7 @@
 //! does not deliver. Trigger costs are fixed per wave, not per node.
 //! Covered phase CPU includes scheduler and observer CPU. Missing build
 //! and index lifecycle deliveries use their separately measured lanes.
-//! Fixed trigger CPU and Durable Object duration remain unmeasured.
+//! Fixed trigger CPU uses its own entrypoint lanes; DO duration remains unmeasured.
 
 use crate::preheat_cost::MeasuredReport;
 use stow_types::forwards::RunForwards;
@@ -34,19 +34,19 @@ use stow_types::preheat_cost::{EventKind, PhaseCost, ProductionWave};
 
 use super::cpu::WorkerCpuReport;
 
-/// CPU of the lifecycle deliveries absent from the captured mock phase.
-#[derive(Debug)]
-struct LifecycleCpu {
-    measured_ms: f64,
-    budget_ms: f64,
+/// Measured CPU and its route budget for a group of fixed events.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct CpuCost {
+    pub measured_ms: f64,
+    pub budget_ms: f64,
 }
 
 #[expect(
     clippy::cast_precision_loss,
     reason = "phase event counts fit f64 exactly"
 )]
-fn lifecycle_cpu(phase: &PhaseCost, cpu: &WorkerCpuReport) -> Result<LifecycleCpu, String> {
-    let mut result = LifecycleCpu {
+fn lifecycle_cpu(phase: &PhaseCost, cpu: &WorkerCpuReport) -> Result<CpuCost, String> {
+    let mut result = CpuCost {
         measured_ms: 0.0,
         budget_ms: 0.0,
     };
@@ -64,6 +64,24 @@ fn lifecycle_cpu(phase: &PhaseCost, cpu: &WorkerCpuReport) -> Result<LifecycleCp
         }
     }
     Ok(result)
+}
+
+fn trigger_cpu(
+    cpu: &WorkerCpuReport,
+    trigger: &str,
+    workflows: &[&[&str]],
+) -> Result<CpuCost, String> {
+    let mut cost = CpuCost {
+        measured_ms: cpu.lane_cpu_ms(trigger)?,
+        budget_ms: cpu.lane_budget_ms(trigger)?,
+    };
+    for lanes in workflows {
+        for lane in *lanes {
+            cost.measured_ms += cpu.lane_cpu_ms(lane)?;
+            cost.budget_ms += cpu.lane_budget_ms(lane)?;
+        }
+    }
+    Ok(cost)
 }
 
 /// A phase's measured cost per node of the wave that measured it.
@@ -142,6 +160,10 @@ pub struct PreheatMonthly {
     pub wave_trigger_worker_requests: f64,
     /// Scheduled tick plus preheat-cron and preheat-admin deliveries.
     pub resubmit_trigger_worker_requests: f64,
+    /// Measured fixed release entrypoint and workflow CPU, before node scaling.
+    pub wave_trigger_cpu: CpuCost,
+    /// Measured daily tick and two workflow lifecycles, before node scaling.
+    pub resubmit_trigger_cpu: CpuCost,
     /// Nodes the reduced wave submitted — the denominator of the
     /// per-node costs.
     pub measured_nodes: u64,
@@ -191,6 +213,31 @@ impl PreheatMonthly {
             wave_trigger_worker_requests: 1.0 + f64::from(RunForwards::DELIVERIES),
             resubmit_trigger_worker_requests: 2.0_f64
                 .mul_add(f64::from(RunForwards::DELIVERIES), 1.0),
+            wave_trigger_cpu: trigger_cpu(
+                cpu,
+                "preheat-release",
+                &[&[
+                    "preheat-requested",
+                    "preheat-in-progress",
+                    "preheat-completed",
+                ]],
+            )?,
+            resubmit_trigger_cpu: trigger_cpu(
+                cpu,
+                "preheat-scheduled",
+                &[
+                    &[
+                        "preheat-requested",
+                        "preheat-in-progress",
+                        "preheat-completed",
+                    ],
+                    &[
+                        "preheat-cron-requested",
+                        "preheat-cron-in-progress",
+                        "preheat-cron-completed",
+                    ],
+                ],
+            )?,
             measured_nodes: report.nodes,
             production_nodes: production.nodes,
             releases_per_month: model.monthly_stable_releases(),
@@ -226,10 +273,16 @@ impl PreheatMonthly {
                     self.wave_trigger_worker_requests,
                     self.resubmit_trigger_worker_requests,
                 ),
-                ("workers", "cpu_ms") => (|cost| cost.worker_cpu_ms, 0.0, 0.0),
-                ("workers", "cpu_ms_at_lifecycle_budget") => {
-                    (|cost| cost.worker_cpu_ms_at_lifecycle_budget, 0.0, 0.0)
-                }
+                ("workers", "cpu_ms") => (
+                    |cost| cost.worker_cpu_ms,
+                    self.wave_trigger_cpu.measured_ms,
+                    self.resubmit_trigger_cpu.measured_ms,
+                ),
+                ("workers", "cpu_ms_at_lifecycle_budget") => (
+                    |cost| cost.worker_cpu_ms_at_lifecycle_budget,
+                    self.wave_trigger_cpu.budget_ms,
+                    self.resubmit_trigger_cpu.budget_ms,
+                ),
                 ("durable_objects", "requests") => (
                     |cost| cost.requests,
                     self.wave_trigger_do_requests,
@@ -244,15 +297,6 @@ impl PreheatMonthly {
             pick(&self.resubmit).mul_add(nodes, resubmit_fixed),
             self.releases_per_month * pick(&self.wave).mul_add(nodes, wave_fixed),
         ))
-    }
-
-    /// Fixed trigger events whose CPU is not measured. These do not
-    /// scale with the production node count.
-    pub fn unmeasured_worker_events(&self) -> f64 {
-        self.resubmits_per_month.mul_add(
-            self.resubmit_trigger_worker_requests,
-            self.releases_per_month * self.wave_trigger_worker_requests,
-        )
     }
 }
 
@@ -368,13 +412,15 @@ mod tests {
             .expect("priced phases");
         assert_eq!(preheat.wave.worker_cpu_ms, 16.5);
         assert_eq!(preheat.resubmit.worker_cpu_ms, 22.0);
-        let expected = preheat
-            .releases_per_month
-            .mul_add(16_500.0, preheat.resubmits_per_month * 22_000.0);
+        let expected = preheat.releases_per_month.mul_add(
+            16_500.0 + preheat.wave_trigger_cpu.measured_ms,
+            preheat.resubmits_per_month * (22_000.0 + preheat.resubmit_trigger_cpu.measured_ms),
+        );
         assert!((preheat.monthly("workers", "cpu_ms").expect("CPU") - expected).abs() < 1e-6);
-        let expected_budget = preheat
-            .releases_per_month
-            .mul_add(23_000.0, preheat.resubmits_per_month * 42_000.0);
+        let expected_budget = preheat.releases_per_month.mul_add(
+            23_000.0 + preheat.wave_trigger_cpu.budget_ms,
+            preheat.resubmits_per_month * (42_000.0 + preheat.resubmit_trigger_cpu.budget_ms),
+        );
         assert!(
             (preheat
                 .monthly("workers", "cpu_ms_at_lifecycle_budget")
@@ -417,10 +463,58 @@ mod tests {
             .mul_add(10_000.0, preheat.resubmits_per_month * 2_000.0);
         let actual = preheat.monthly("workers", "cpu_ms").expect("covered CPU");
         assert!((actual - expected).abs() < 1e-6, "{actual}");
-        let missing = preheat
-            .releases_per_month
-            .mul_add(4.0, preheat.resubmits_per_month * 7.0);
-        assert!((preheat.unmeasured_worker_events() - missing).abs() < 1e-6);
+        assert_eq!(preheat.wave_trigger_cpu.measured_ms, 0.0);
+        assert_eq!(preheat.resubmit_trigger_cpu.measured_ms, 0.0);
+    }
+
+    #[test]
+    fn fixed_trigger_cpu_uses_cadence_without_node_scaling() {
+        let mut cpu = fixture_cpu(|_| 0.0);
+        for row in &mut cpu.rows {
+            row.cpu_ms = match row.lane.as_str() {
+                "preheat-release" => 2.0,
+                "preheat-scheduled" => 3.0,
+                "preheat-requested" | "preheat-in-progress" | "preheat-completed" => 5.0,
+                "preheat-cron-requested"
+                | "preheat-cron-in-progress"
+                | "preheat-cron-completed" => 7.0,
+                _ => 0.0,
+            };
+            row.budget_ms = row.cpu_ms * 2.0;
+        }
+        for nodes in [10, 10_000] {
+            let preheat =
+                PreheatMonthly::new(&model(), &test_report(10), &test_production(nodes), &cpu)
+                    .expect("fixed trigger prices");
+            assert_eq!(preheat.wave_trigger_cpu.measured_ms, 17.0);
+            assert_eq!(preheat.resubmit_trigger_cpu.measured_ms, 39.0);
+            let phase = preheat.releases_per_month.mul_add(
+                preheat.wave.worker_cpu_ms
+                    * f64::from(u32::try_from(nodes).expect("test node count")),
+                preheat.resubmits_per_month
+                    * preheat.resubmit.worker_cpu_ms
+                    * f64::from(u32::try_from(nodes).expect("test node count")),
+            );
+            let fixed = preheat
+                .releases_per_month
+                .mul_add(17.0, preheat.resubmits_per_month * 39.0);
+            let actual = preheat.monthly("workers", "cpu_ms").expect("CPU");
+            assert!((actual - phase - fixed).abs() < 1e-6);
+        }
+        let mut incomplete = cpu;
+        incomplete
+            .rows
+            .retain(|row| row.lane != "preheat-cron-completed");
+        assert!(
+            PreheatMonthly::new(
+                &model(),
+                &test_report(10),
+                &test_production(10),
+                &incomplete
+            )
+            .expect_err("fixed lanes are required")
+            .contains("preheat-cron-completed")
+        );
     }
 
     #[test]

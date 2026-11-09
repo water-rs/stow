@@ -79,6 +79,7 @@ const miniflare = new Miniflare(convertV4MiniflareOptions({
 	host: "127.0.0.1",
 	port: Number(values.port),
 	inspectorPort: Number(values["inspector-port"]),
+	unsafeTriggerHandlers: true,
 	resourcePersistencePath: path.resolve(values["persist-to"]),
 	workers: [
 		{ ...runtimeOptions, name: config.name, modules, modulesRoot, bindings,
