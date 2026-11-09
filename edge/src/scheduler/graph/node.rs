@@ -1,6 +1,6 @@
 //! The graph's fixed-size records (stow#878). A node is one 68-byte
 //! record in an arena; the fields only an unpublished node needs ride
-//! a 40-byte [`State`] slab entry that is freed when the node
+//! a 32-byte [`State`] slab entry that is freed when the node
 //! publishes, and the rare ones (a bound run, a backoff, an error)
 //! ride [`Extra`] side-table entries.
 
