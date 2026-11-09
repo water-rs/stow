@@ -168,7 +168,7 @@ struct Signal {
 //   25G rows read/mo, 50M rows written/mo (SQLite storage billing).
 //   `activeTime` and `cpuTime` are collected as diagnostics.
 //   <https://developers.cloudflare.com/durable-objects/platform/pricing/>
-use stow_types::do_budgets::ALLOWANCE_FRACTION;
+use stow_types::do_budgets::{ALLOWANCE_FRACTION, DO_REQUEST_ALLOWANCE_FRACTION};
 pub use stow_types::do_budgets::{DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY};
 pub const DO_REQUESTS_MONTHLY: f64 = 1e6;
 pub const DO_DURATION_GB_S_MONTHLY: f64 = 400e3;
@@ -187,7 +187,7 @@ const QUARTER_HOUR: u64 = 900;
 /// threshold and trip/alert effect in one place.
 const SIGNALS: &[Signal] = &[
     // ── Cloudflare usage, billed dimensions: the month to date against the
-    // 80% line of the monthly allowance — breach trips ──
+    // dimension's configured line of the monthly allowance — breach trips ──
     Signal {
         id: "cf.do.rows_read",
         label: "DO rows read this month vs 80% of the 25G/mo allowance",
@@ -217,10 +217,10 @@ const SIGNALS: &[Signal] = &[
     },
     Signal {
         id: "cf.do.requests",
-        label: "DO requests this month vs 80% of the 1M/mo allowance",
+        label: "DO requests this month vs 90% of the 1M/mo allowance",
         window: Window::MonthToDate,
         min_sample: 0,
-        threshold: DO_REQUESTS_MONTHLY * ALLOWANCE_FRACTION,
+        threshold: DO_REQUESTS_MONTHLY * DO_REQUEST_ALLOWANCE_FRACTION,
         unit: "requests",
         effect: Effect::Trip(MaintenanceScope::Lanes),
     },
@@ -1993,15 +1993,17 @@ impl From<AccountGroups> for CfSnapshot {
 
 /// The month-to-date trip reading of one billed dimension.
 fn month_reading(id: &str, allowance: f64, total: f64) -> Reading {
-    let line = allowance * ALLOWANCE_FRACTION;
+    let signal = signal(id);
+    let line = signal.threshold;
     Reading {
-        signal: signal(id),
+        signal,
         sample: 1,
         value: total,
         threshold: None,
         evidence: vec![format!(
-            "{:.1}% of the 80% line this UTC month ({:.1}% of the allowance)",
+            "{:.1}% of the {:.0}% line this UTC month ({:.1}% of the allowance)",
             total / line * 100.0,
+            line / allowance * 100.0,
             total / allowance * 100.0
         )],
     }
@@ -3878,7 +3880,6 @@ mod tests {
             ("cf.do.rows_read", DO_ROWS_READ_MONTHLY),
             ("cf.do.rows_written", DO_ROWS_WRITTEN_MONTHLY),
             ("cf.do.duration_gb_s", DO_DURATION_GB_S_MONTHLY),
-            ("cf.do.requests", DO_REQUESTS_MONTHLY),
             ("cf.worker.requests", WORKER_REQUESTS_MONTHLY),
             ("cf.worker.cpu_ms", WORKER_CPU_MS_MONTHLY),
         ] {
@@ -3888,6 +3889,15 @@ mod tests {
             let over = decide(&[reading(id, 1, line)], &[]);
             assert_eq!(over.tripped.len(), 1, "{id} at the line");
         }
+    }
+
+    #[test]
+    fn do_requests_use_the_ninety_percent_monthly_line() {
+        let under = month_reading("cf.do.requests", DO_REQUESTS_MONTHLY, 850_000.0);
+        assert!(!decide(std::slice::from_ref(&under), &[]).incident);
+        assert!(under.evidence[0].contains("90% line"));
+        let at = month_reading("cf.do.requests", DO_REQUESTS_MONTHLY, 900_000.0);
+        assert_eq!(decide(&[at], &[]).tripped.len(), 1);
     }
 
     /// The DO duration guard can fire: a month of one 128 MB object
