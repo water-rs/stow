@@ -179,6 +179,11 @@ cleanup() {
     for ((i = ${#CHILD_PIDS[@]} - 1; i >= 0; i--)); do
         stop_tree "${CHILD_PIDS[$i]}"
     done
+    # Keep population and Wasm-memory boundaries with successful reports too.
+    # All writers have stopped, so the retained log includes the final sample.
+    if [ -f "$LOG_DIR/edge.log" ]; then
+        cp "$LOG_DIR/edge.log" "$REPORT_DIR/edge.log" || status=1
+    fi
     if [ "$status" -ne 0 ]; then
         local dump="$WORK_DIR/cleanup-dump.txt" log
         echo "[traffic] FAILED (exit $status) — log tails:" >"$dump"
