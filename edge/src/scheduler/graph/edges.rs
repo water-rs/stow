@@ -128,26 +128,29 @@ impl Edges {
         nodes: usize,
         spans: impl Iterator<Item = (u32, usize, usize)> + Clone,
     ) {
-        let mut offsets = vec![0u32; nodes + 1];
+        self.offsets.clear();
+        self.offsets.resize(nodes + 1, 0);
         for (_, start, len) in spans.clone() {
             for &dep in &self.dep[start..start + len] {
-                offsets[dep as usize + 1] += 1;
+                self.offsets[dep as usize + 1] += 1;
             }
         }
-        for at in 1..offsets.len() {
-            offsets[at] += offsets[at - 1];
+        for at in 1..self.offsets.len() {
+            self.offsets[at] += self.offsets[at - 1];
         }
-        let mut cursor = offsets.clone();
-        let mut owners = vec![0u32; offsets[nodes] as usize];
+        self.owners.clear();
+        self.owners.resize(self.offsets[nodes] as usize, 0);
         for (owner, start, len) in spans {
             for &dep in &self.dep[start..start + len] {
-                let slot = &mut cursor[dep as usize];
-                owners[*slot as usize] = owner;
+                let slot = &mut self.offsets[dep as usize];
+                self.owners[*slot as usize] = owner;
                 *slot += 1;
             }
         }
-        self.offsets = offsets;
-        self.owners = owners;
+        // Filling advances each start to its end. The preceding end is
+        // the next start, so one shift restores the CSR without a cursor copy.
+        self.offsets.copy_within(0..nodes, 1);
+        self.offsets[0] = 0;
         self.overlay.clear();
     }
 
@@ -183,5 +186,54 @@ impl Edges {
             + self.offsets.capacity() * size_of::<u32>()
             + self.owners.capacity() * size_of::<u32>()
             + self.overlay.len() * 2 * size_of::<(u32, u32)>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Edges;
+
+    fn assert_reverse(edges: &Edges, nodes: usize, spans: &[(u32, usize, usize)]) {
+        for dep in 0..u32::try_from(nodes).expect("test nodes fit") {
+            let expected: Vec<_> = spans
+                .iter()
+                .flat_map(|&(owner, start, len)| {
+                    edges.dep[start..start + len]
+                        .iter()
+                        .filter(move |&&held| held == dep)
+                        .map(move |_| owner)
+                })
+                .collect();
+            assert_eq!(edges.owners_of(dep), expected, "dependency {dep}");
+        }
+    }
+
+    #[test]
+    fn repeated_reverse_rebuilds_preserve_forward_adjacency() {
+        let mut edges = Edges::default();
+        let mut spans = Vec::new();
+        for (owner, deps) in [vec![1, 3, 3], vec![], vec![0, 3], vec![], vec![2], vec![]]
+            .into_iter()
+            .enumerate()
+        {
+            let start = edges.len();
+            for &dep in &deps {
+                edges
+                    .push(u32::try_from(owner).expect("test owner"), dep, 1, false)
+                    .expect("edge");
+            }
+            spans.push((u32::try_from(owner).expect("test owner"), start, deps.len()));
+        }
+        for nodes in [6, 9, 6, 6] {
+            edges.rebuild_reverse(nodes, spans.iter().copied());
+            assert_reverse(&edges, nodes, &spans);
+        }
+        let start = edges.len();
+        edges.push(5, 1, 1, false).expect("new edge");
+        spans[5] = (5, start, 1);
+        edges.rebuild_reverse(6, spans.iter().copied());
+        assert_reverse(&edges, 6, &spans);
+        edges.rebuild_reverse(0, std::iter::empty());
+        assert!(edges.owners_of(0).is_empty());
     }
 }
