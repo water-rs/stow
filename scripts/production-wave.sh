@@ -216,9 +216,3 @@ done
     | tee "$LOG_DIR/production-wave.log" \
     || die "the production wave count failed — see $LANES_DIR/*/stderr.log"
 log "production wave: $WORK_DIR/production-wave.json"
-
-# Both lanes and their workers have exited. Free extracted sources and
-# checkouts, then let native tar save repeated cache bytes as hardlinks.
-# The next wave materializes private mutable files before launching work.
-python3 "$REPO_ROOT/scripts/compact-resolver-cache.py" compact \
-    "$RESOLVE_ROOT" "$WORK_DIR/resolver-cache.json"
