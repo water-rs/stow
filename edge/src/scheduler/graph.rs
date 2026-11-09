@@ -446,6 +446,9 @@ pub struct Graph {
     /// The node arena. Indexes are stable between compactions and
     /// compactions keep creation order.
     nodes: Vec<Node>,
+    /// Derived queue-state candidates; published and free nodes have no entry.
+    /// Rebuilt with the identity indexes after loading or renumbering nodes.
+    by_status: [fixedbitset::FixedBitSet; Status::COUNT],
     /// Queue state of the nodes that have not published.
     states: Vec<State>,
     /// Vacant `states` slots, reused before the slab grows.
@@ -893,6 +896,10 @@ impl Graph {
         }
         self.index_pending(ix, false);
         self.nodes[ix as usize].status = to;
+        if from.has_state() {
+            self.by_status[from.index()].set(ix as usize, false);
+        }
+        self.index_status(ix, to);
         self.index_pending(ix, true);
         self.counts[from.index()] -= 1;
         self.counts[to.index()] += 1;
@@ -904,6 +911,14 @@ impl Graph {
         }
         if to.in_flight() {
             self.inflight.insert(ix);
+        }
+    }
+
+    fn index_status(&mut self, ix: u32, status: Status) {
+        if status.has_state() {
+            let entries = &mut self.by_status[status.index()];
+            entries.grow(self.nodes.len());
+            entries.insert(ix as usize);
         }
     }
 
@@ -1118,6 +1133,7 @@ impl Graph {
             flags: new.flags,
         });
         self.counts[status.index()] += 1;
+        self.index_status(ix, status);
         self.targets[usize::from(target)].counts[status.index()] += 1;
         self.index_pending(ix, true);
         let nodes = &self.nodes;
@@ -1262,6 +1278,10 @@ impl Graph {
     /// Rebuild the id and identity tables and the reverse edges over
     /// the current arena.
     fn rebuild_indexes_over_nodes(&mut self) {
+        self.by_status = Default::default();
+        for ix in 0..u32::try_from(self.nodes.len()).expect("node indexes fit u32") {
+            self.index_status(ix, self.node(ix).status);
+        }
         let nodes = &self.nodes;
         let mut ids = IxTable::with_entries(nodes.len());
         let mut idents = IxTable::with_entries(nodes.len());
@@ -3736,21 +3756,40 @@ impl Graph {
         let cutoff = selector
             .older_than_secs
             .map(|secs| now.saturating_sub(i64::try_from(secs).unwrap_or(i64::MAX) * 1000));
-        Ok(
-            (0..u32::try_from(self.nodes.len()).expect("node indexes fit u32"))
-                .filter(|&ix| {
-                    let node = self.node(ix);
-                    node.status.has_state()
-                        && selector
-                            .status
-                            .is_none_or(|status| Self::wire_status(node) == status)
-                        && target.is_none_or(|t| t == Some(node.target))
-                        && rustc.is_none_or(|r| r == Some(node.rustc))
-                        && crate_name.is_none_or(|c| c == Some(node.crate_name))
-                        && cutoff.is_none_or(|cutoff| self.state(ix).updated <= cutoff)
-                })
-                .collect(),
-        )
+        let status = selector.status.map(|status| {
+            use stow_types::api::QueueTaskStatus as S;
+            match status {
+                S::Pending | S::Blocked => Status::Pending,
+                S::Dispatched => Status::Dispatched,
+                S::Running => Status::Running,
+                S::Completed => Status::Completed,
+                S::Failed => Status::Failed,
+            }
+        });
+        let candidates = status
+            .into_iter()
+            .flat_map(|status| self.by_status[status.index()].ones())
+            .chain(
+                0..if status.is_none() {
+                    self.nodes.len()
+                } else {
+                    0
+                },
+            )
+            .map(|ix| u32::try_from(ix).expect("node indexes fit u32"));
+        Ok(candidates
+            .filter(|&ix| {
+                let node = self.node(ix);
+                node.status.has_state()
+                    && selector
+                        .status
+                        .is_none_or(|status| Self::wire_status(node) == status)
+                    && target.is_none_or(|t| t == Some(node.target))
+                    && rustc.is_none_or(|r| r == Some(node.rustc))
+                    && crate_name.is_none_or(|c| c == Some(node.crate_name))
+                    && cutoff.is_none_or(|cutoff| self.state(ix).updated <= cutoff)
+            })
+            .collect())
     }
 
     /// The task ids a mutation selector resolves to — `purge` demands
@@ -4728,6 +4767,55 @@ mod tests {
     /// The pending index recomputed by walking the arena — what
     /// `index_pending` keeps through every transition must equal it.
     fn assert_pending_index(graph: &Graph) {
+        use stow_types::api::{QueueSelector, QueueTaskStatus as S};
+
+        for status in 0..Status::COUNT {
+            let expected: Vec<_> = graph
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.status.has_state() && node.status.index() == status)
+                .map(|(ix, _)| ix)
+                .collect();
+            assert_eq!(
+                graph.by_status[status].ones().collect::<Vec<_>>(),
+                expected,
+                "status index {status}"
+            );
+        }
+        for status in [
+            S::Pending,
+            S::Blocked,
+            S::Dispatched,
+            S::Running,
+            S::Completed,
+            S::Failed,
+        ] {
+            for older_than_secs in [None, Some(1)] {
+                let selector = QueueSelector {
+                    status: Some(status),
+                    older_than_secs,
+                    ..QueueSelector::default()
+                };
+                let expected: Vec<_> = (0u32..)
+                    .zip(&graph.nodes)
+                    .filter(|&(ix, node)| {
+                        node.status.has_state()
+                            && Graph::wire_status(node) == status
+                            && older_than_secs.is_none_or(|secs| {
+                                graph.state(ix).updated
+                                    <= 1_000_000
+                                        - i64::try_from(secs).expect("test age fits") * 1000
+                            })
+                    })
+                    .map(|(ix, _)| ix)
+                    .collect();
+                assert_eq!(
+                    graph.select(&selector, 1_000_000).expect("select"),
+                    expected
+                );
+            }
+        }
         let mut target_counts = vec![[0u32; Status::COUNT]; graph.targets.len()];
         let mut target_blocked = vec![0u32; graph.targets.len()];
         let mut inflight = (0u32, 0u32);
