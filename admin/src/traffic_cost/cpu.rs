@@ -957,7 +957,7 @@ async fn measure_reference(
     for _ in 0..ROUNDS {
         rounds.push(
             resolve_reference_round(async || {
-                let (_, cpu_ms) =
+                let ((), cpu_ms) =
                     profiled(reference.inspector, artifacts, "reference", async || {
                         reference.run().await
                     })
@@ -975,7 +975,7 @@ async fn resolve_reference_round(
 ) -> stow_types::error::Result<ReferenceRound> {
     let mut invocations = 0_u32;
     let mut sampled_cpu_ms = 0.0;
-    while sampled_cpu_ms < MIN_REFERENCE_CPU_MS {
+    loop {
         let cpu_ms = sample().await?;
         if cpu_ms <= 0.0 {
             return Err(stow_error!(
@@ -986,6 +986,9 @@ async fn resolve_reference_round(
             .checked_add(1)
             .ok_or_else(|| stow_error!("reference invocation count overflow"))?;
         sampled_cpu_ms += cpu_ms;
+        if sampled_cpu_ms >= MIN_REFERENCE_CPU_MS {
+            break;
+        }
     }
     Ok(ReferenceRound {
         invocations: std::num::NonZeroU32::new(invocations)
