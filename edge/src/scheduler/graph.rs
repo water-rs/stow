@@ -1283,14 +1283,14 @@ impl Graph {
             self.index_status(ix, self.node(ix).status);
         }
         let nodes = &self.nodes;
-        let mut ids = IxTable::with_entries(nodes.len());
-        let mut idents = IxTable::with_entries(nodes.len());
+        self.ids.clear_for(nodes.len());
+        self.idents.clear_for(nodes.len());
         for (at, node) in nodes.iter().enumerate() {
             let ix = u32::try_from(at).expect("node indexes fit u32");
-            ids.insert(u64::from(node.id_tag), ix, |held| {
+            self.ids.insert(u64::from(node.id_tag), ix, |held| {
                 u64::from(nodes[held as usize].id_tag)
             });
-            idents.insert(
+            self.idents.insert(
                 ident_hash(
                     node.crate_name,
                     node.version,
@@ -1311,8 +1311,6 @@ impl Graph {
                 },
             );
         }
-        self.ids = ids;
-        self.idents = idents;
         self.edges.rebuild_reverse(
             nodes.len(),
             nodes.iter().enumerate().map(|(at, node)| {
