@@ -2,7 +2,7 @@
 
 use std::ops::{Deref, DerefMut};
 
-use orx_split_vec::{Linear, PseudoDefault, SplitVec};
+use orx_split_vec::{Linear, PinnedVec, PseudoDefault, SplitVec};
 
 /// Indexed records whose growth never relocates the preceding fragments.
 #[derive(Debug)]
@@ -11,6 +11,15 @@ pub(super) struct Arena<T>(SplitVec<T, Linear>);
 impl<T> Default for Arena<T> {
     fn default() -> Self {
         Self(SplitVec::with_growth(Linear::pseudo_default()))
+    }
+}
+
+impl<T: Clone> Arena<T> {
+    /// Retain initialized records and append only the missing tail.
+    pub(super) fn resize(&mut self, len: usize, value: T) {
+        self.0.truncate(len);
+        self.0
+            .extend(std::iter::repeat_n(value, len - self.0.len()));
     }
 }
 

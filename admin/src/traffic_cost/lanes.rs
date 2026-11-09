@@ -63,6 +63,12 @@ pub struct LaneArgs {
     /// (`mock-github-webhook-secret`).
     #[arg(long)]
     pub webhook_secret: Option<String>,
+    /// Mock newreleases signing secret; enables fixed preheat CPU lanes.
+    #[arg(long, requires = "preheat_cron")]
+    pub newreleases_secret: Option<String>,
+    /// Native Miniflare scheduled event's configured daily preheat cron.
+    #[arg(long, requires = "newreleases_secret")]
+    pub preheat_cron: Option<String>,
     /// Queue rows the seeded fixture holds — picks the task ids the
     /// mutation and callback lanes name.
     #[arg(long, default_value_t = 100_000)]
@@ -96,6 +102,9 @@ pub struct LaneArgs {
     /// Actual toolchain for the index-report slice; must differ from seeded toolchains.
     #[arg(long, requires = "index_publish_token_file")]
     pub index_publish_rustc: Option<String>,
+    /// Mock resolve-request.yml OIDC token for the complete human lifecycle lane.
+    #[arg(long, requires_all = ["webhook_secret", "index_publish_rustc"])]
+    pub resolve_token_file: Option<PathBuf>,
 }
 
 /// A response that takes this long under the mock stack is a stall,
@@ -109,6 +118,8 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// What one lane event is.
 #[derive(Debug)]
 pub enum Fire {
+    /// Admission, resolve workflow deliveries and nonempty outcome reporting.
+    HumanLifecycle(super::human::HumanLane),
     /// Round-robin `GET`s over public paths.
     PublicGet(Vec<String>),
     /// `GET /api/v1/index/{target}/{rustc}` then the digest-addressed
@@ -139,6 +150,8 @@ pub enum Fire {
     WorkflowRun(CallbackLane),
     /// A nonempty signed-index membership report on its own workflow identity.
     IndexReport { token_file: PathBuf, rustc: String },
+    /// A signed stable Rust release notification.
+    PreheatRelease { secret: String, rustc: String },
     /// One signed lifecycle delivery under the named workflow identity.
     WorkflowDelivery {
         secret: String,
@@ -272,6 +285,13 @@ impl Fire {
     pub async fn ready(&self, edge: &Edge, needed: usize) -> Result<(), String> {
         match self {
             Self::WorkflowRun(lane) => lane.ready(edge, needed).await,
+            Self::HumanLifecycle(lane) => {
+                tokio::time::timeout(REQUEST_TIMEOUT, lane.ready(edge, needed))
+                    .await
+                    .map_err(|_| {
+                        "human lifecycle preparation exceeded its request deadline".to_owned()
+                    })?
+            }
             _ => Ok(()),
         }
     }
@@ -338,7 +358,7 @@ const SUBMIT_POOL: &[(&str, &str)] = &[
 
 /// `POST /api/v1/github/workflow_run`'s `sha256=<hex>` HMAC-SHA256 over
 /// the raw body.
-fn sign_body(secret: &str, body: &[u8]) -> String {
+pub(super) fn sign_body(secret: &str, body: &[u8]) -> String {
     let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts any key length");
     mac.update(body);
@@ -364,7 +384,12 @@ fn workflow_run_body(task: &InFlightRun) -> String {
     )
 }
 
-fn workflow_delivery_body(action: &str, workflow: &str, run_id: u64, title: &str) -> String {
+pub(super) fn workflow_delivery_body(
+    action: &str,
+    workflow: &str,
+    run_id: u64,
+    title: &str,
+) -> String {
     serde_json::json!({
         "action": action,
         "repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
@@ -668,6 +693,40 @@ async fn index_report_plan(
     })
 }
 
+fn public_get_plan(base: &str, paths: &[String], counter: u64) -> Plan {
+    let index = usize::try_from(counter).unwrap_or_default() % paths.len();
+    Plan::Get {
+        url: format!("{base}{}", paths[index]),
+        bearer: None,
+    }
+}
+
+fn preheat_release_plan(base: &str, secret: &str, rustc: &str) -> Result<Plan, String> {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "provider": "github", "project": "rust-lang/rust", "version": rustc,
+        "is_prerelease": false,
+    }))
+    .map_err(|error| error.to_string())?;
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|error| error.to_string())?;
+    mac.update(timestamp.as_bytes());
+    mac.update(b".");
+    mac.update(&body);
+    Ok(Plan::PostBytes {
+        url: format!("{base}/api/v1/newreleases/release"),
+        headers: vec![
+            ("X-Newreleases-Timestamp".to_owned(), timestamp),
+            (
+                "X-Newreleases-Signature".to_owned(),
+                hex::encode(mac.finalize().into_bytes()),
+            ),
+            ("Content-Type".to_owned(), "application/json".to_owned()),
+        ],
+        body,
+    })
+}
+
 /// Resolve one lane event into its request — the index pull's pointer
 /// hop and the bearer fetches happen here.
 async fn plan(
@@ -679,13 +738,8 @@ async fn plan(
     let base = edge.base();
     let bearer = || async { edge.bearer().await.map_err(|error| error.to_string()) };
     match fire {
-        Fire::PublicGet(paths) => {
-            let index = usize::try_from(counter).unwrap_or_default() % paths.len();
-            Ok(Plan::Get {
-                url: format!("{base}{}", paths[index]),
-                bearer: None,
-            })
-        }
+        Fire::HumanLifecycle(_) => Err("human lifecycle has no single-request plan".to_owned()),
+        Fire::PublicGet(paths) => Ok(public_get_plan(base, paths, counter)),
         Fire::IndexPull { target, rustc } => plan_index_pull(base, target, rustc, client).await,
         Fire::BundleFetch { rustc, digest } => {
             let digest = digest.clone().unwrap_or_else(|| {
@@ -748,6 +802,7 @@ async fn plan(
         Fire::IndexReport { token_file, rustc } => {
             index_report_plan(base, token_file, rustc, counter).await
         }
+        Fire::PreheatRelease { secret, rustc } => preheat_release_plan(base, secret, rustc),
         Fire::WorkflowDelivery {
             secret,
             action,
@@ -798,6 +853,9 @@ pub async fn fire_once(
     counter: u64,
     timing: &mut RequestTimingMs,
 ) -> Result<Outcome, String> {
+    if let Fire::HumanLifecycle(lane) = fire {
+        return lane.fire(edge, client).await;
+    }
     let started = tokio::time::Instant::now();
     let planned = plan(fire, edge, client, counter).await;
     timing.planning = Some(started.elapsed().as_secs_f64() * 1000.0);
@@ -958,6 +1016,7 @@ pub fn build_lanes(
         expected: ok2xx,
     });
     lanes.extend(index_lanes(args, model, scale)?);
+    lanes.extend(human_lanes(args, model, scale)?);
     if args.scheduler {
         lanes.extend(scheduler_lanes(args, model, scale));
     }
@@ -984,6 +1043,7 @@ pub fn build_lanes(
             },
         ]);
     }
+    lanes.extend(preheat_lanes(args, model, scale)?);
     lanes.extend(build_workflow_lanes(
         args,
         model,
@@ -997,6 +1057,96 @@ pub fn build_lanes(
         }
     }
     Ok(lanes)
+}
+
+fn preheat_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<Vec<Lane>, String> {
+    let Some(secret) = &args.newreleases_secret else {
+        return Ok(Vec::new());
+    };
+    let mut lanes = Vec::new();
+    let cron = args
+        .preheat_cron
+        .as_ref()
+        .ok_or("preheat CPU needs --preheat-cron")?;
+    lanes.push(Lane {
+        name: "preheat-release",
+        eps: model.monthly_stable_releases() / (f64::from(model.scale.days_per_month) * 86_400.0)
+            * scale,
+        fire: Fire::PreheatRelease {
+            secret: secret.clone(),
+            rustc: args.rustc.clone(),
+        },
+        expected: ok2xx,
+    });
+    let query = serde_html_form::to_string([("cron", cron)]).map_err(|error| error.to_string())?;
+    lanes.push(Lane {
+        name: "preheat-scheduled",
+        eps: model.monthly_resubmits() / (f64::from(model.scale.days_per_month) * 86_400.0) * scale,
+        fire: Fire::PublicGet(vec![format!("/cdn-cgi/local/scheduled?{query}")]),
+        expected: ok2xx,
+    });
+    let webhook = args
+        .webhook_secret
+        .as_ref()
+        .ok_or("preheat CPU needs --webhook-secret")?;
+    for (name, action) in [
+        ("preheat-requested", "requested"),
+        ("preheat-in-progress", "in_progress"),
+        ("preheat-completed", "completed"),
+    ] {
+        lanes.push(Lane {
+            name,
+            eps: (model.monthly_stable_releases() + model.monthly_resubmits())
+                / (f64::from(model.scale.days_per_month) * 86_400.0)
+                * scale,
+            fire: Fire::WorkflowDelivery {
+                secret: webhook.clone(),
+                action,
+                workflow: stow_types::trusted_builder::PREHEAT_WORKFLOW_FILE,
+                title: "Preheat",
+            },
+            expected: ok2xx,
+        });
+    }
+    for (name, action) in [
+        ("preheat-cron-requested", "requested"),
+        ("preheat-cron-in-progress", "in_progress"),
+        ("preheat-cron-completed", "completed"),
+    ] {
+        lanes.push(Lane {
+            name,
+            eps: model.monthly_resubmits() / (f64::from(model.scale.days_per_month) * 86_400.0)
+                * scale,
+            fire: Fire::WorkflowDelivery {
+                secret: webhook.clone(),
+                action,
+                workflow: "preheat-cron.yml",
+                title: "Preheat cron",
+            },
+            expected: ok2xx,
+        });
+    }
+    Ok(lanes)
+}
+
+fn human_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<Vec<Lane>, String> {
+    let Some(token_file) = &args.resolve_token_file else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![Lane {
+        name: "human-lifecycle",
+        eps: model.peak_events_per_second(EventKind::HumanRequest) * scale,
+        fire: Fire::HumanLifecycle(super::human::HumanLane::new(
+            args.webhook_secret
+                .clone()
+                .ok_or("human lifecycle needs --webhook-secret")?,
+            token_file.clone(),
+            args.index_publish_rustc
+                .as_deref()
+                .ok_or("human lifecycle needs --index-publish-rustc")?,
+        )?),
+        expected: ok2xx,
+    }])
 }
 
 fn build_workflow_lanes(
@@ -1128,6 +1278,8 @@ mod tests {
             model: "launch-model.toml".into(),
             scheduler: true,
             webhook_secret: Some("secret".to_owned()),
+            newreleases_secret: Some("newreleases-secret".to_owned()),
+            preheat_cron: Some("17 0 * * *".to_owned()),
             queue_rows: 100_000,
             rustc: "1.85.0".to_owned(),
             lanes: Vec::new(),
@@ -1136,6 +1288,7 @@ mod tests {
             bundle_digest: None,
             index_publish_token_file: Some("index-publish-token".into()),
             index_publish_rustc: Some("1.99.1".to_owned()),
+            resolve_token_file: Some("resolve-token".into()),
         }
     }
 
@@ -1319,6 +1472,100 @@ mod tests {
                 .err()
                 .expect("invalid callback rate");
             assert!(error.contains("finite and positive"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn preheat_lanes_sign_real_entrypoints_and_keep_workflow_identities() {
+        use hmac::{KeyInit as _, Mac as _};
+        let model =
+            LaunchModel::from_toml(include_str!("../../../launch-model.toml")).expect("model");
+        let args = lane_args();
+        let lanes = build_lanes(&args, &model, 1.0, None).expect("lanes");
+        let edge = crate::Edge::for_test("http://127.0.0.1:8080".to_owned());
+        let release = lanes
+            .iter()
+            .find(|lane| lane.name == "preheat-release")
+            .expect("release");
+        let super::Plan::PostBytes { url, headers, body } =
+            super::plan(&release.fire, &edge, &mut zenwave::client(), 0)
+                .await
+                .expect("release request")
+        else {
+            panic!("signed release")
+        };
+        assert_eq!(url, "http://127.0.0.1:8080/api/v1/newreleases/release");
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .expect("header")
+                .1
+                .as_str()
+        };
+        let mut mac =
+            super::Hmac::<super::Sha256>::new_from_slice(b"newreleases-secret").expect("key");
+        mac.update(header("X-Newreleases-Timestamp").as_bytes());
+        mac.update(b".");
+        mac.update(&body);
+        mac.verify_slice(&hex::decode(header("X-Newreleases-Signature")).expect("hex signature"))
+            .expect("valid signature");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("release");
+        assert_eq!(payload["provider"], "github");
+        assert_eq!(payload["project"], "rust-lang/rust");
+        assert_eq!(payload["version"], args.rustc);
+        let scheduled = lanes
+            .iter()
+            .find(|lane| lane.name == "preheat-scheduled")
+            .expect("scheduled");
+        let super::Plan::Get { url, .. } =
+            super::plan(&scheduled.fire, &edge, &mut zenwave::client(), 0)
+                .await
+                .expect("scheduled request")
+        else {
+            panic!("native scheduled endpoint")
+        };
+        let query = serde_html_form::to_string([("cron", "17 0 * * *")]).expect("query");
+        assert_eq!(
+            url,
+            format!("http://127.0.0.1:8080/cdn-cgi/local/scheduled?{query}")
+        );
+        for (name, workflow, cadence) in [
+            (
+                "preheat-requested",
+                "preheat-admin.yml",
+                model.monthly_stable_releases() + model.monthly_resubmits(),
+            ),
+            (
+                "preheat-cron-requested",
+                "preheat-cron.yml",
+                model.monthly_resubmits(),
+            ),
+        ] {
+            let lane = lanes
+                .iter()
+                .find(|lane| lane.name == name)
+                .expect("workflow lane");
+            assert_eq!(
+                lane.eps,
+                cadence / (f64::from(model.scale.days_per_month) * 86_400.0)
+            );
+            let super::Plan::PostBytes { headers, body, .. } =
+                super::plan(&lane.fire, &edge, &mut zenwave::client(), 0)
+                    .await
+                    .expect("workflow request")
+            else {
+                panic!("signed workflow")
+            };
+            assert!(headers.contains(&(
+                "X-Hub-Signature-256".to_owned(),
+                super::sign_body("secret", &body)
+            )));
+            let payload: serde_json::Value = serde_json::from_slice(&body).expect("workflow");
+            assert_eq!(
+                payload["workflow_run"]["path"],
+                format!(".github/workflows/{workflow}")
+            );
         }
     }
 

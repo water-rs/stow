@@ -676,6 +676,40 @@ impl WorkerCpuBudget {
 /// (`cpu_ms_at_budget`), and prints each route's share of the allowance
 /// at its measured figure and at its budget.
 pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
+    // Fixed preheat entrypoints compose the existing dispatch and signed
+    // webhook route-class bounds; these are bounds, not measurements.
+    WorkerCpuBudget {
+        lane: "preheat-release",
+        relative_cpu: 0.60,
+    },
+    WorkerCpuBudget {
+        lane: "preheat-scheduled",
+        relative_cpu: 0.25,
+    },
+    WorkerCpuBudget {
+        lane: "preheat-requested",
+        relative_cpu: 0.35,
+    },
+    WorkerCpuBudget {
+        lane: "preheat-in-progress",
+        relative_cpu: 0.35,
+    },
+    WorkerCpuBudget {
+        lane: "preheat-completed",
+        relative_cpu: 0.35,
+    },
+    WorkerCpuBudget {
+        lane: "preheat-cron-requested",
+        relative_cpu: 0.35,
+    },
+    WorkerCpuBudget {
+        lane: "preheat-cron-in-progress",
+        relative_cpu: 0.35,
+    },
+    WorkerCpuBudget {
+        lane: "preheat-cron-completed",
+        relative_cpu: 0.35,
+    },
     // Initial bounds from status-read, trusted-submit and workflow-callback,
     // respectively; these are route-class bounds, not measurements of new lanes.
     WorkerCpuBudget {
@@ -758,6 +792,12 @@ pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
         // Run 40631853262: 0.118 (2.625 ms of 22.2 ms).
         lane: "trusted-submit",
         relative_cpu: 0.25,
+    },
+    WorkerCpuBudget {
+        // One whole lifecycle: two scheduler mutations and three signed
+        // deliveries, composed from their existing per-request bounds.
+        lane: "human-lifecycle",
+        relative_cpu: 2.0 * 0.25 + 3.0 * 0.35,
     },
     WorkerCpuBudget {
         // Run 40631853262: 0.038 (0.85 ms of 22.2 ms).
