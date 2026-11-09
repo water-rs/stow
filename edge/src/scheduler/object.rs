@@ -1860,6 +1860,7 @@ async fn run_alarm(
     db: DurableDb,
     alarm: Alarm,
 ) -> Result<&'static str> {
+    let _invocation = budget_probe_enabled(&env).then(|| graph.probe_invocation());
     let multiplier = cost_budget_multiplier(&env)?;
     let (metered, meter) = Meter::wrap(db.clone(), &graph);
     let meter = if budget_probe_enabled(&env) {

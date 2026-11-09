@@ -350,11 +350,22 @@ pub fn ledger_op(method: &str, path: &str) -> String {
     format!("{method} {route}")
 }
 
+#[cfg(target_arch = "wasm32")]
+fn ledger_now_ms() -> i64 {
+    super::object::now_ms()
+}
+#[cfg(not(target_arch = "wasm32"))]
+const fn ledger_now_ms() -> i64 {
+    0
+}
+
 /// Every op the day meter booked since the last reset — the
 /// `GET /budget/ledger` answer. Bounded by the number of distinct
 /// operations the object serves, never by the queue.
 pub fn ledger(graph: LoadedGraph<'_>) -> stow_types::api::SchedulerLedger {
+    let active_ms = graph.cell().probe_active_ms(ledger_now_ms());
     graph.with(|graph| stow_types::api::SchedulerLedger {
+        active_ms,
         woken_at_ms: graph.woken_at_ms,
         ops: graph
             .meter
@@ -409,10 +420,11 @@ impl skyzen::middleware::Middleware for MeterGuard {
             .extensions()
             .get::<skyzen::runtime::wasm::WasmEnv>()
             .cloned();
-        let meter = if env
+        let probe = env
             .as_ref()
-            .is_some_and(super::object::budget_probe_enabled)
-        {
+            .is_some_and(super::object::budget_probe_enabled);
+        let _invocation = probe.then(|| self.graph.probe_invocation());
+        let meter = if probe {
             meter.with_ledger_op(ledger_op(request.method().as_str(), request.uri().path()))
         } else {
             meter
