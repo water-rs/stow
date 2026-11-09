@@ -559,19 +559,14 @@ type StagedItem = (
 /// One keyed span's materialized entries — collected sorted at the
 /// encoder's creation, bounded by the bucket's own size (the graph is
 /// never copied whole).
-enum SpanItem {
-    Published(IdKey, Published),
-    Requests(String, RequestRecord),
-    Feed(String, usize, Vec<stow_types::api::SchedulerDemandEntry>),
-    Batches(String, (String, i64)),
-    Staged(
-        SliceId,
-        i64,
-        u32,
-        u32,
-        Vec<stow_types::api::PublishedSliceRow>,
-    ),
-    Outcomes(AttemptOutcome),
+#[derive(Default)]
+struct SpanItems {
+    published: Vec<(IdKey, Published)>,
+    requests: Vec<(String, RequestRecord)>,
+    feed: Vec<(String, usize, Vec<stow_types::api::SchedulerDemandEntry>)>,
+    batches: Vec<(String, (String, i64))>,
+    staged: Vec<StagedItem>,
+    outcomes: Vec<AttemptOutcome>,
 }
 
 /// The rows of one dirty span, emitted one at a time so peak memory is
@@ -582,7 +577,7 @@ pub struct SpanEncoder {
     /// indexed kinds, a position in `items` for the keyed kinds.
     at: u32,
     /// The keyed kinds' entries, sorted for a stable encoding.
-    items: Vec<SpanItem>,
+    items: SpanItems,
 }
 
 impl SpanEncoder {
@@ -635,39 +630,19 @@ impl SpanEncoder {
                 })?
             }
             ChunkKind::Published => {
-                writer.fill_raw(self.items[at..].iter(), |buf, item| match item {
-                    SpanItem::Published(key, entry) => {
-                        buf.extend_from_slice(key);
-                        buf.push(entry.mask);
-                        buf.push(entry.slice.0);
-                        buf.push(entry.slice.1);
-                        Ok(())
-                    }
-                    _ => unreachable!("a published span holds published items"),
+                writer.fill_raw(self.items.published[at..].iter(), |buf, (key, entry)| {
+                    buf.extend_from_slice(key);
+                    buf.push(entry.mask);
+                    buf.push(entry.slice.0);
+                    buf.push(entry.slice.1);
+                    Ok(())
                 })?
             }
-            ChunkKind::Requests => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Requests(id, record) => (id, record),
-                _ => unreachable!("a requests span holds request items"),
-            }))?,
-            ChunkKind::Feed => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Feed(hour, page, entries) => (hour, page, entries),
-                _ => unreachable!("a feed span holds feed items"),
-            }))?,
-            ChunkKind::Batches => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Batches(id, batch) => (id, batch),
-                _ => unreachable!("a batches span holds batch items"),
-            }))?,
-            ChunkKind::Staged => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Staged(slice, generation, parts, part, rows) => {
-                    (slice, generation, parts, part, rows)
-                }
-                _ => unreachable!("a staged span holds staged items"),
-            }))?,
-            ChunkKind::Outcomes => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Outcomes(outcome) => outcome,
-                _ => unreachable!("an outcomes span holds outcome items"),
-            }))?,
+            ChunkKind::Requests => writer.fill(self.items.requests[at..].iter())?,
+            ChunkKind::Feed => writer.fill(self.items.feed[at..].iter())?,
+            ChunkKind::Batches => writer.fill(self.items.batches[at..].iter())?,
+            ChunkKind::Staged => writer.fill(self.items.staged[at..].iter())?,
+            ChunkKind::Outcomes => writer.fill(self.items.outcomes[at..].iter())?,
         };
         if taken == 0 {
             return Ok(None);
@@ -819,69 +794,71 @@ impl Graph {
     /// indexed kinds read the arena by index at each `next_row`.
     pub fn snapshot_encoder(&self, span: ChunkSpan) -> SpanEncoder {
         let bucket = span.range;
-        let items = match span.kind {
+        let mut materialized = SpanItems::default();
+        match span.kind {
             ChunkKind::Published => {
                 let mut items: Vec<_> = self
                     .published
                     .iter()
                     .filter(|(key, _)| published_bucket(key) == bucket)
-                    .map(|(&key, &entry)| SpanItem::Published(key, entry))
+                    .map(|(&key, &entry)| (key, entry))
                     .collect();
-                items.sort_by_key(|item| match item {
-                    SpanItem::Published(key, _) => *key,
-                    _ => unreachable!("a published span holds published items"),
-                });
-                items
+                items.sort_by_key(|(key, _)| *key);
+                materialized.published = items;
             }
-            ChunkKind::Requests => self
-                .requests
-                .iter()
-                .filter(|(id, _)| keyed_bucket(id, REQUESTS_BUCKETS) == bucket)
-                .map(|(id, record)| SpanItem::Requests(id.clone(), record.clone()))
-                .collect(),
-            ChunkKind::Feed => self
-                .feed_sessions
-                .iter()
-                .filter(|(hour, _)| keyed_bucket(hour, FEED_BUCKETS) == bucket)
-                .flat_map(|(hour, session)| {
-                    session
-                        .staged
-                        .iter()
-                        .enumerate()
-                        .map(move |(page, entries)| {
-                            SpanItem::Feed(hour.clone(), page, entries.clone())
-                        })
-                })
-                .collect(),
-            ChunkKind::Batches => self
-                .demand_batches
-                .iter()
-                .filter(|(id, _)| keyed_bucket(id, BATCHES_BUCKETS) == bucket)
-                .map(|(id, batch)| SpanItem::Batches(id.clone(), batch.clone()))
-                .collect(),
-            ChunkKind::Staged => self
-                .staged_slices
-                .iter()
-                .filter(|(slice, _)| staged_bucket(**slice) == bucket)
-                .flat_map(|(&slice, staged)| {
-                    staged.rows.iter().enumerate().map(move |(part, rows)| {
-                        SpanItem::Staged(
-                            slice,
-                            staged.generation,
-                            staged.parts,
-                            u32::try_from(part).expect("part fits u32"),
-                            rows.clone(),
-                        )
+            ChunkKind::Requests => {
+                materialized.requests = self
+                    .requests
+                    .iter()
+                    .filter(|(id, _)| keyed_bucket(id, REQUESTS_BUCKETS) == bucket)
+                    .map(|(id, record)| (id.clone(), record.clone()))
+                    .collect();
+            }
+            ChunkKind::Feed => {
+                materialized.feed = self
+                    .feed_sessions
+                    .iter()
+                    .filter(|(hour, _)| keyed_bucket(hour, FEED_BUCKETS) == bucket)
+                    .flat_map(|(hour, session)| {
+                        session
+                            .staged
+                            .iter()
+                            .enumerate()
+                            .map(move |(page, entries)| (hour.clone(), page, entries.clone()))
                     })
-                })
-                .collect(),
-            ChunkKind::Outcomes => self
-                .attempt_outcomes
-                .iter()
-                .map(|outcome| SpanItem::Outcomes(outcome.clone()))
-                .collect(),
-            _ => Vec::new(),
-        };
+                    .collect();
+            }
+            ChunkKind::Batches => {
+                materialized.batches = self
+                    .demand_batches
+                    .iter()
+                    .filter(|(id, _)| keyed_bucket(id, BATCHES_BUCKETS) == bucket)
+                    .map(|(id, batch)| (id.clone(), batch.clone()))
+                    .collect();
+            }
+            ChunkKind::Staged => {
+                materialized.staged = self
+                    .staged_slices
+                    .iter()
+                    .filter(|(slice, _)| staged_bucket(**slice) == bucket)
+                    .flat_map(|(&slice, staged)| {
+                        staged.rows.iter().enumerate().map(move |(part, rows)| {
+                            (
+                                slice,
+                                staged.generation,
+                                staged.parts,
+                                u32::try_from(part).expect("part fits u32"),
+                                rows.clone(),
+                            )
+                        })
+                    })
+                    .collect();
+            }
+            ChunkKind::Outcomes => {
+                materialized.outcomes = self.attempt_outcomes.iter().cloned().collect();
+            }
+            _ => {}
+        }
         // The indexed kinds start at their range's first index.
         let at = match span.kind {
             ChunkKind::Intern => span.range * INTERN_RANGE,
@@ -889,7 +866,11 @@ impl Graph {
             ChunkKind::Edges => span.range * EDGES_RANGE,
             _ => 0,
         };
-        SpanEncoder { span, at, items }
+        SpanEncoder {
+            span,
+            at,
+            items: materialized,
+        }
     }
 
     /// The store holds every dirty range: clear the marks and lift the
