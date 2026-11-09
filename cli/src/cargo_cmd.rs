@@ -5044,19 +5044,17 @@ impl CoverageSnapshot {
                 divergence: None,
             };
         };
+        let (counters, divergence) = futures_util::join!(
+            stats::read_counters(config)
+                .instrument(tracing::debug_span!("stow.precargo.stats_summary")),
+            stats::read_profile_divergence(config)
+                .instrument(tracing::debug_span!("stow.precargo.stats_divergence")),
+        );
+        let counters = counters.unwrap_or_default();
         Self {
-            stats: stats::read_summary(config)
-                .instrument(tracing::debug_span!("stow.precargo.stats_summary"))
-                .await
-                .unwrap_or_default(),
-            errors: stats::read_error_counts(config)
-                .instrument(tracing::debug_span!("stow.precargo.stats_errors"))
-                .await
-                .unwrap_or_default(),
-            divergence: stats::read_profile_divergence(config)
-                .instrument(tracing::debug_span!("stow.precargo.stats_divergence"))
-                .await
-                .unwrap_or_default(),
+            stats: counters.summary,
+            errors: counters.errors,
+            divergence: divergence.unwrap_or_default(),
         }
     }
 }
@@ -5071,10 +5069,10 @@ async fn report_cache_coverage(
     before: CoverageSnapshot,
     covered_units: usize,
 ) {
-    let Ok(after) = stats::read_summary(config).await else {
+    let Ok(after) = stats::read_counters(config).await else {
         return;
     };
-    let delta = after.since(before.stats);
+    let delta = after.summary.since(before.stats);
     if delta.rust_lookups() == 0 && delta.rust_local_dependency_builds == 0 && covered_units == 0 {
         return;
     }
@@ -5083,10 +5081,7 @@ async fn report_cache_coverage(
     // crate was compiled anyway. The wrapper explains each one, but not at
     // default verbosity, so the count alone leaves nothing to act on.
     let errored_crates = if delta.rust_errors > 0 {
-        stats::read_error_counts(config)
-            .await
-            .map(|after| stats::newly_errored(&before.errors, &after))
-            .unwrap_or_default()
+        stats::newly_errored(&before.errors, &after.errors)
     } else {
         Vec::new()
     };
