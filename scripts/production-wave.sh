@@ -95,6 +95,9 @@ disk_usage() {
     status=0
     timeout --kill-after=5 30 du -x -B1 --max-depth=4 "$RESOLVE_ROOT" || status=$?
     echo "[production-wave] resolver directory scan exited $status"
+    status=0
+    timeout --kill-after=5 30 du -x -B1 --max-depth=1 "${TMPDIR:-/tmp}" || status=$?
+    echo "[production-wave] source scratch scan exited $status"
 }
 
 LANE_PIDS=()
