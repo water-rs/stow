@@ -51,6 +51,7 @@ serde-wasm-bindgen = "0.6"
 utoipa.workspace = true
 futures-util = "0.3"
 fixedbitset = { version = "0.5.9", default-features = false }
+orx-split-vec = { version = "4.1.1", default-features = false }
 # A maintained semaphore for the outbound and ambient-VFS permits —
 # event-listener only ever wakes tasks that returned `Pending`, which a
 # hand-rolled waker queue cannot promise on the single-threaded
