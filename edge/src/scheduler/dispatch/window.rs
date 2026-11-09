@@ -139,6 +139,8 @@ fn wire_claim(claim: graph::Claimed) -> stow_types::api::DispatchClaim {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use std::future::Future as _;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use stow_types::ci::{CiRequest, CiResponse};
@@ -147,7 +149,7 @@ mod tests {
     use crate::scheduler::{drives::HOST_NOW_MS, fixture, store, test_db};
 
     struct Limited {
-        sent: AtomicUsize,
+        sent: Arc<AtomicUsize>,
         answered: AtomicBool,
         primary: bool,
     }
@@ -216,17 +218,34 @@ mod tests {
             .expect("claims");
         assert_eq!(claims.len(), 12);
         let ids: Vec<_> = claims.iter().map(|claim| claim.task_id.clone()).collect();
+        let sent = Arc::new(AtomicUsize::new(0));
         let backend = CiInterface::local_ci(
             "http://ci.test",
             Limited {
-                sent: AtomicUsize::new(0),
+                sent: Arc::clone(&sent),
                 answered: AtomicBool::new(false),
                 primary,
             },
         );
-        dispatch_claims(graph, &db, &backend, claims, || HOST_NOW_MS)
-            .await
-            .expect("dispatch");
+        let mut dispatch = Box::pin(dispatch_claims(graph, &db, &backend, claims, || {
+            HOST_NOW_MS
+        }));
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(dispatch.as_mut().poll(cx))).await;
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            4,
+            "the first round starts concurrently"
+        );
+        match first {
+            std::task::Poll::Ready(result) => result.expect("dispatch"),
+            std::task::Poll::Pending => dispatch.await.expect("dispatch"),
+        }
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            4,
+            "no admission after the refusal"
+        );
         let until = HOST_NOW_MS + if primary { 62_000 } else { 60_000 };
         assert!(graph.with(|graph| graph.ci_waiting(until - 1)));
         let recovered_owner = graph::GraphCell::default();
