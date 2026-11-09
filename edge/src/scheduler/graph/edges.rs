@@ -1,5 +1,5 @@
 //! Dependency edges as flat `u32` arrays (stow#878): the forward
-//! edges of every node sit contiguous in the node's own span, and the
+//! edges of every node occupy one indexed span, and the
 //! reverse index — dependents of a node, for the publish flip and the
 //! failure block — is a CSR (offsets plus owners) rebuilt in one
 //! counting sort, with the edges added since the last rebuild kept in
@@ -9,6 +9,9 @@
 
 use std::collections::BTreeSet;
 
+use orx_split_vec::{Collection, PinnedVec};
+
+use super::arena::Arena;
 use crate::errors::QueueError;
 
 /// Bit of an edge's byte that records the edge is met.
@@ -21,28 +24,22 @@ const REBUILD_FLOOR: usize = 8_192;
 #[derive(Debug, Default)]
 pub(super) struct Edges {
     /// Dep node of each edge.
-    dep: Vec<u32>,
+    dep: Arena<u32>,
     /// The 4-bit mask of unit shapes the edge requires, with
     /// [`MET`] set once the dep's published shapes cover it.
-    flags: Vec<u8>,
+    flags: Arena<u8>,
     /// `offsets[d]..offsets[d + 1]` is dep `d`'s span of `owners`;
     /// nodes past the end have no CSR entries.
-    offsets: Vec<u32>,
+    offsets: Arena<u32>,
     /// Owners of the edges onto each dep, grouped by dep.
-    owners: Vec<u32>,
+    owners: Arena<u32>,
     /// `(dep, owner)` of every edge pushed since the last rebuild.
     overlay: BTreeSet<(u32, u32)>,
 }
 
 impl Edges {
-    pub(super) const fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.dep.len()
-    }
-
-    /// Size the forward arrays for `edges` edges.
-    pub(super) fn reserve_exact(&mut self, edges: usize) {
-        self.dep.reserve_exact(edges);
-        self.flags.reserve_exact(edges);
     }
 
     /// Append one edge, `owner` onto `dep`; returns its index.
@@ -101,10 +98,11 @@ impl Edges {
     pub(super) fn owners_of(&self, dep: u32) -> Vec<u32> {
         let d = dep as usize;
         let base = match (self.offsets.get(d), self.offsets.get(d + 1)) {
-            (Some(&from), Some(&to)) => &self.owners[from as usize..to as usize],
-            _ => &[],
+            (Some(&from), Some(&to)) => from as usize..to as usize,
+            _ => 0..0,
         };
-        base.iter()
+        self.owners
+            .iter_over(base)
             .copied()
             .chain(
                 self.overlay
@@ -128,20 +126,21 @@ impl Edges {
         nodes: usize,
         spans: impl Iterator<Item = (u32, usize, usize)> + Clone,
     ) {
-        self.offsets.clear();
         self.offsets.resize(nodes + 1, 0);
+        for offset in &mut self.offsets {
+            *offset = 0;
+        }
         for (_, start, len) in spans.clone() {
-            for &dep in &self.dep[start..start + len] {
+            for &dep in self.dep.iter_over(start..start + len) {
                 self.offsets[dep as usize + 1] += 1;
             }
         }
         for at in 1..self.offsets.len() {
             self.offsets[at] += self.offsets[at - 1];
         }
-        self.owners.clear();
         self.owners.resize(self.offsets[nodes] as usize, 0);
         for (owner, start, len) in spans {
-            for &dep in &self.dep[start..start + len] {
+            for &dep in self.dep.iter_over(start..start + len) {
                 let slot = &mut self.offsets[dep as usize];
                 self.owners[*slot as usize] = owner;
                 *slot += 1;
@@ -149,7 +148,9 @@ impl Edges {
         }
         // Filling advances each start to its end. The preceding end is
         // the next start, so one shift restores the CSR without a cursor copy.
-        self.offsets.copy_within(0..nodes, 1);
+        for at in (0..nodes).rev() {
+            self.offsets[at + 1] = self.offsets[at];
+        }
         self.offsets[0] = 0;
         self.overlay.clear();
     }
@@ -162,8 +163,10 @@ impl Edges {
         let mut end = 0;
         for (from, len) in spans {
             assert!(from >= end, "edge spans are ascending and disjoint");
-            self.dep.copy_within(from..from + len, end);
-            self.flags.copy_within(from..from + len, end);
+            for at in 0..len {
+                self.dep[end + at] = self.dep[from + at];
+                self.flags[end + at] = self.flags[from + at];
+            }
             end += len;
         }
         self.dep.truncate(end);
@@ -171,26 +174,28 @@ impl Edges {
         for dep in &mut self.dep {
             *dep = remap[*dep as usize];
         }
-        self.dep.shrink_to_fit();
-        self.flags.shrink_to_fit();
-        self.offsets = Vec::new();
-        self.owners = Vec::new();
         self.overlay.clear();
+    }
+
+    /// Allocated element storage, excluding fragment descriptors and the overlay.
+    pub(super) fn array_bytes(&self) -> usize {
+        self.dep.capacity() * size_of::<u32>()
+            + self.flags.capacity()
+            + self.offsets.capacity() * size_of::<u32>()
+            + self.owners.capacity() * size_of::<u32>()
     }
 
     /// Heap bytes the arrays hold.
     #[cfg(test)]
     pub(super) fn heap_bytes(&self) -> usize {
-        self.dep.capacity() * size_of::<u32>()
-            + self.flags.capacity()
-            + self.offsets.capacity() * size_of::<u32>()
-            + self.owners.capacity() * size_of::<u32>()
-            + self.overlay.len() * 2 * size_of::<(u32, u32)>()
+        self.array_bytes() + self.overlay.len() * 2 * size_of::<(u32, u32)>()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use orx_split_vec::{Collection, PinnedVec};
+
     use super::Edges;
 
     fn assert_reverse(edges: &Edges, nodes: usize, spans: &[(u32, usize, usize)]) {
@@ -198,8 +203,9 @@ mod tests {
             let expected: Vec<_> = spans
                 .iter()
                 .flat_map(|&(owner, start, len)| {
-                    edges.dep[start..start + len]
-                        .iter()
+                    edges
+                        .dep
+                        .iter_over(start..start + len)
                         .filter(move |&&held| held == dep)
                         .map(move |_| owner)
                 })
@@ -235,5 +241,84 @@ mod tests {
         assert_reverse(&edges, 6, &spans);
         edges.rebuild_reverse(0, std::iter::empty());
         assert_eq!(edges.owners_of(0), [0u32; 0]);
+    }
+
+    #[test]
+    fn fragmented_edges_preserve_growth_compaction_and_reload() {
+        fn append(edges: &mut Edges, spans: &mut Vec<(u32, usize, usize)>, from: u32, to: u32) {
+            for owner in from..to {
+                let start = edges.len();
+                for (dep, required) in [(owner, 1), ((owner + 1) % to, 2), (owner, 4)] {
+                    edges
+                        .push(owner, dep, required, owner % 2 == 0)
+                        .expect("edge");
+                }
+                spans.push((owner, start, 3));
+            }
+        }
+
+        const NODES: u32 = 1031;
+        let mut edges = Edges::default();
+        let mut spans = Vec::new();
+        let starts = |edges: &Edges| {
+            (
+                &edges.dep[0] as *const u32,
+                &edges.flags[0] as *const u8,
+                &edges.offsets[0] as *const u32,
+                &edges.owners[0] as *const u32,
+            )
+        };
+        append(&mut edges, &mut spans, 0, 256);
+        edges.rebuild_reverse(256, spans.iter().copied());
+        let before = starts(&edges);
+        append(&mut edges, &mut spans, 256, NODES);
+        edges.rebuild_reverse(NODES as usize, spans.iter().copied());
+        assert_eq!(
+            starts(&edges),
+            before,
+            "growth retains each preceding fragment"
+        );
+        assert_reverse(&edges, NODES as usize, &spans);
+
+        let remap: Vec<_> = (0..NODES).rev().collect();
+        let kept: Vec<_> = spans
+            .iter()
+            .copied()
+            .filter(|(owner, _, _)| owner % 2 == 0)
+            .collect();
+        let expected: Vec<_> = kept
+            .iter()
+            .flat_map(|&(_, from, len)| {
+                (from..from + len).map(|at| (remap[edges.dep(at) as usize], edges.raw_flags(at)))
+            })
+            .collect();
+        edges.compact(kept.iter().map(|&(_, from, len)| (from, len)), &remap);
+        assert_eq!(
+            (0..edges.len())
+                .map(|at| (edges.dep(at), edges.raw_flags(at)))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let mut start = 0;
+        let kept: Vec<_> = kept
+            .into_iter()
+            .map(|(owner, _, len)| {
+                let span = (remap[owner as usize], start, len);
+                start += len;
+                span
+            })
+            .collect();
+        edges.rebuild_reverse(NODES as usize, kept.iter().copied());
+        assert_reverse(&edges, NODES as usize, &kept);
+
+        let mut loaded = Edges::default();
+        for (dep, flags) in expected {
+            loaded.load(dep, flags);
+        }
+        loaded.rebuild_reverse(NODES as usize, kept.iter().copied());
+        assert_reverse(&loaded, NODES as usize, &kept);
+        for at in 0..edges.len() {
+            assert_eq!(loaded.raw_flags(at), edges.raw_flags(at));
+        }
     }
 }
