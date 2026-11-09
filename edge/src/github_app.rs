@@ -10,8 +10,8 @@
 //! credential is ever written to storage.
 //!
 //! PEM decoding and JWT header/claims encoding are pure functions
-//! unit-tested on the host; `WebCrypto` signing and the token-exchange POST
-//! are `wasm32`-only like the rest of the Cloudflare-bound modules. The
+//! unit-tested on the host; `WebCrypto` signing and the bounded transport
+//! are `wasm32`-only. Token exchange shares the scheduler CI transport. The
 //! token and the JWT are credentials — they are never logged and never
 //! appear in `Debug` output.
 
@@ -248,54 +248,45 @@ pub async fn mint_installation_token(
     let signing_input = jwt_signing_input(&config.app_id, now_unix)?;
     let signature = sign_rs256(&pkcs8_der, signing_input.as_bytes()).await?;
     let jwt = encode_jwt(&signing_input, &signature);
-    exchange_installation_token(&config.installation_id, &jwt).await
+    let transport =
+        crate::scheduler::dispatch::CfTransport::new(crate::fetch_guard::OutboundPool::new());
+    exchange_installation_token(&transport, &config.installation_id, &jwt).await
 }
 
-/// `POST /app/installations/{id}/access_tokens` with the JWT; a non-2xx
-/// response is an error carrying status and body.
-#[cfg(target_arch = "wasm32")]
+/// `POST /app/installations/{id}/access_tokens` through the same bounded
+/// transport as dispatch, including complete response-body consumption.
+#[cfg(any(test, target_arch = "wasm32"))]
 async fn exchange_installation_token(
+    transport: &impl stow_types::ci::CiTransport,
     installation_id: &str,
     jwt: &str,
 ) -> Result<InstallationToken, GitHubAppError> {
-    use skyzen_cloudflare::worker::send::{IntoSendFuture as _, SendWrapper};
-
-    let url = format!("https://api.github.com/app/installations/{installation_id}/access_tokens");
-    let bearer = format!("Bearer {jwt}");
-    let request = SendWrapper::new(
-        crate::cf_http::bare_request(
-            skyzen_cloudflare::worker::Method::Post,
-            &url,
-            &[
-                ("Authorization", &bearer),
-                ("Accept", "application/vnd.github+json"),
-                ("X-GitHub-Api-Version", "2022-11-28"),
-                ("User-Agent", "stow-scheduler"),
+    let response = transport
+        .send(stow_types::ci::CiRequest {
+            method: "POST",
+            url: format!(
+                "https://api.github.com/app/installations/{installation_id}/access_tokens"
+            ),
+            headers: vec![
+                ("Authorization".to_owned(), format!("Bearer {jwt}")),
+                (
+                    "Accept".to_owned(),
+                    "application/vnd.github+json".to_owned(),
+                ),
+                ("X-GitHub-Api-Version".to_owned(), "2022-11-28".to_owned()),
+                ("User-Agent".to_owned(), "stow-scheduler".to_owned()),
             ],
-            None,
-        )
-        .map_err(|error| GitHubAppError::Exchange(format!("build request: {error}")))?,
-    );
-
-    let mut response = SendWrapper::new(
-        skyzen_cloudflare::CfFetch
-            .request(&request)
-            .await
-            .map_err(|error| GitHubAppError::Exchange(error.to_string()))?,
-    );
-    let status = response.status_code();
-    if !(200..300).contains(&status) {
-        let body = response
-            .text()
-            .into_send()
-            .await
-            .unwrap_or_else(|_| "<unreadable body>".to_owned());
-        return Err(GitHubAppError::ExchangeStatus { status, body });
-    }
-    let parsed: AccessTokenResponse = response
-        .json()
-        .into_send()
+            body: None,
+        })
         .await
+        .map_err(|error| GitHubAppError::Exchange(error.to_string()))?;
+    if !(200..300).contains(&response.status) {
+        return Err(GitHubAppError::ExchangeStatus {
+            status: response.status,
+            body: String::from_utf8_lossy(&response.body).into_owned(),
+        });
+    }
+    let parsed: AccessTokenResponse = serde_json::from_slice(&response.body)
         .map_err(|error| GitHubAppError::Exchange(format!("decode response: {error}")))?;
     Ok(InstallationToken {
         token: parsed.token,
@@ -365,7 +356,7 @@ async fn sign_rs256(pkcs8_der: &[u8], data: &[u8]) -> Result<Vec<u8>, GitHubAppE
 
 /// GitHub's `access_tokens` response body. No `Debug`: `token` is a
 /// credential and must not be printable by accident.
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(test, target_arch = "wasm32"))]
 #[derive(serde::Deserialize)]
 struct AccessTokenResponse {
     token: String,
@@ -377,6 +368,104 @@ mod tests {
     use base64::Engine as _;
 
     use super::{encode_jwt, jwt_signing_input, pkcs8_der_from_pem};
+
+    struct ExchangeTransport {
+        requests: std::sync::Mutex<Vec<stow_types::ci::CiRequest>>,
+        response: std::sync::Mutex<
+            Option<Result<stow_types::ci::CiResponse, stow_types::ci::DispatchError>>,
+        >,
+    }
+
+    impl stow_types::ci::CiTransport for ExchangeTransport {
+        async fn send(
+            &self,
+            request: stow_types::ci::CiRequest,
+        ) -> Result<stow_types::ci::CiResponse, stow_types::ci::DispatchError> {
+            self.requests.lock().unwrap().push(request);
+            self.response.lock().unwrap().take().expect("one exchange")
+        }
+    }
+
+    fn exchange_transport(
+        response: Result<stow_types::ci::CiResponse, stow_types::ci::DispatchError>,
+    ) -> ExchangeTransport {
+        ExchangeTransport {
+            requests: std::sync::Mutex::new(Vec::new()),
+            response: std::sync::Mutex::new(Some(response)),
+        }
+    }
+
+    fn exchange_response(status: u16, body: Vec<u8>) -> stow_types::ci::CiResponse {
+        stow_types::ci::CiResponse {
+            status,
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    #[tokio::test]
+    async fn installation_exchange_uses_the_ci_transport_and_decodes_complete_bytes() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "token": "test-installation-token", "expires_at": "2026-11-09T10:00:00Z"
+        }))
+        .unwrap();
+        let transport = exchange_transport(Ok(exchange_response(201, body)));
+        let token = super::exchange_installation_token(&transport, "123", "test-jwt")
+            .await
+            .expect("exchange");
+        assert_eq!(token.token, "test-installation-token");
+        assert_eq!(token.expires_at, "2026-11-09T10:00:00Z");
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.url,
+            "https://api.github.com/app/installations/123/access_tokens"
+        );
+        assert!(request.body.is_none());
+        assert_eq!(
+            request.headers,
+            vec![
+                ("Authorization".to_owned(), "Bearer test-jwt".to_owned()),
+                (
+                    "Accept".to_owned(),
+                    "application/vnd.github+json".to_owned()
+                ),
+                ("X-GitHub-Api-Version".to_owned(), "2022-11-28".to_owned()),
+                ("User-Agent".to_owned(), "stow-scheduler".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn installation_exchange_preserves_api_refusals_and_decode_failures() {
+        let transport = exchange_transport(Ok(exchange_response(403, b"denied".to_vec())));
+        assert!(matches!(
+            super::exchange_installation_token(&transport, "123", "test-jwt").await,
+            Err(super::GitHubAppError::ExchangeStatus { status: 403, body }) if body == "denied"
+        ));
+        let transport = exchange_transport(Ok(exchange_response(201, b"invalid json".to_vec())));
+        assert!(matches!(
+            super::exchange_installation_token(&transport, "123", "test-jwt").await,
+            Err(super::GitHubAppError::Exchange(message)) if message.contains("decode response")
+        ));
+    }
+
+    #[tokio::test]
+    async fn installation_exchange_propagates_header_and_body_transport_failures() {
+        for error in [
+            stow_types::ci::DispatchError::Network("headers aborted".to_owned()),
+            stow_types::ci::DispatchError::Response("body aborted".to_owned()),
+        ] {
+            let expected = error.to_string();
+            let transport = exchange_transport(Err(error));
+            assert!(matches!(
+                super::exchange_installation_token(&transport, "123", "test-jwt").await,
+                Err(super::GitHubAppError::Exchange(message)) if message == expected
+            ));
+        }
+    }
 
     /// Test-only RSA-2048 keys under `edge/tests/fixtures/` — see that
     /// directory's README. `RSA PRIVATE KEY` (PKCS#1) is what GitHub
