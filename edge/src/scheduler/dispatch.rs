@@ -20,6 +20,7 @@ use crate::fetch_guard::{FetchedResponse, GuardedResponse};
 #[cfg(target_arch = "wasm32")]
 use stow_types::ci::{CiRequest, CiResponse, CiTransport};
 
+#[cfg(target_arch = "wasm32")]
 pub use stow_types::ci::{CiInterface, DispatchError};
 
 /// `CfFetch` under the pool's outbound bound — the transport the

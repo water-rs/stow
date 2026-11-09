@@ -9,7 +9,10 @@ use crate::errors::QueueError;
 use crate::scheduler::{graph, queue, routes};
 
 /// Persist the API recovery fence before any subsequent request may start.
-pub(crate) async fn retain_ci_limit(
+///
+/// # Errors
+/// Returns the storage error if the recovery event cannot be appended.
+pub async fn retain_ci_limit(
     graph: graph::LoadedGraph<'_>,
     db: &DurableDb,
     error: &DispatchError,
@@ -61,7 +64,11 @@ async fn submit_claim<T: CiTransport>(
 /// At most four requests are active. Observe each completion immediately so
 /// a rate-limit refusal prevents any further admission, then drain the active
 /// requests and apply their results in claim order.
-pub(crate) async fn dispatch_claims<T: CiTransport>(
+///
+/// # Errors
+/// Returns a payload invariant or storage error; accepted unbound runs remain
+/// recoverable through the persisted claims and normal run reconciliation.
+pub async fn dispatch_claims<T: CiTransport>(
     graph: graph::LoadedGraph<'_>,
     db: &DurableDb,
     backend: &CiInterface<T>,
