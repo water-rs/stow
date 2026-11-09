@@ -357,7 +357,7 @@ sed -e "s/127\.0\.0\.1:28123/127.0.0.1:${REGISTRY_ADDR##*:}/g" \
     -e "s/127\.0\.0\.1:28124/127.0.0.1:${LOCAL_CI_ADDR##*:}/g" \
     "$REPO_ROOT/edge/Skyzen.mock.toml" >"$MOCK_MANIFEST"
 fg in_dir "$REPO_ROOT/edge" \
-    skyzen build --provider cloudflare --manifest "$(basename "$MOCK_MANIFEST")" \
+    skyzen build --release --provider cloudflare --manifest "$(basename "$MOCK_MANIFEST")" \
     >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
 rm -f "$MOCK_MANIFEST"
