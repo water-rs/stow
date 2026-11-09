@@ -234,6 +234,6 @@ mod tests {
         edges.rebuild_reverse(6, spans.iter().copied());
         assert_reverse(&edges, 6, &spans);
         edges.rebuild_reverse(0, std::iter::empty());
-        assert!(edges.owners_of(0).is_empty());
+        assert_eq!(edges.owners_of(0), [0u32; 0]);
     }
 }
