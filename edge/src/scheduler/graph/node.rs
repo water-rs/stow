@@ -216,7 +216,7 @@ pub(super) struct Node {
     pub(super) flags: Flags,
 }
 
-/// The queue state of an unpublished node. 40 bytes.
+/// The queue state of an unpublished node. 32 bytes.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct State {
     pub(super) first_requested: i64,
@@ -224,7 +224,6 @@ pub(super) struct State {
     /// `updated_at` and the purge age floor.
     pub(super) updated: i64,
     pub(super) priority: PriorityId,
-    pub(super) demand: i64,
     pub(super) downloads: u64,
     pub(super) attempt: u8,
     pub(super) dispatch_attempts: u16,

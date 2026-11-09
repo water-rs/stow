@@ -415,6 +415,7 @@ fn write_node(
     node: &Node,
     state: Option<(&State, i64)>,
     extra: Option<&Extra>,
+    demand: i64,
 ) -> Result<(), QueueError> {
     buf.extend_from_slice(&node.digest);
     buf.extend_from_slice(&node.crate_name.to_le_bytes());
@@ -430,7 +431,7 @@ fn write_node(
         buf.extend_from_slice(&state.first_requested.to_le_bytes());
         buf.extend_from_slice(&state.updated.to_le_bytes());
         buf.extend_from_slice(&priority.to_le_bytes());
-        buf.extend_from_slice(&state.demand.to_le_bytes());
+        buf.extend_from_slice(&demand.to_le_bytes());
         buf.extend_from_slice(&state.downloads.to_le_bytes());
         buf.push(state.attempt);
         buf.extend_from_slice(&state.dispatch_attempts.to_le_bytes());
@@ -615,14 +616,13 @@ impl SpanEncoder {
                     let node = &graph.nodes[ix];
                     let state =
                         (node.state != NO_STATE).then(|| &graph.states[node.state as usize]);
-                    let extra = graph
-                        .extras
-                        .get(&u32::try_from(ix).expect("node indexes fit u32"));
+                    let extra = graph.extras.get(&node.state);
                     write_node(
                         buf,
                         node,
                         state.map(|state| (state, graph.priorities.at(state.priority))),
                         extra,
+                        graph.demand.get(node.state),
                     )
                 })?
             }
@@ -1101,12 +1101,15 @@ impl SnapshotLoader {
         let rustc = bytes.u8()?;
         let status = Status::from_byte(bytes.u8()?)?;
         let flags = Flags(bytes.u8()?);
-        let state = if status.has_state() {
+        let (state, demand) = if status.has_state() {
+            let first_requested = bytes.i64()?;
+            let updated = bytes.i64()?;
+            let priority = bytes.i64()?;
+            let demand = bytes.i64()?;
             let state = State {
-                first_requested: bytes.i64()?,
-                updated: bytes.i64()?,
-                priority: graph.priorities.intern(bytes.i64()?),
-                demand: bytes.i64()?,
+                first_requested,
+                updated,
+                priority: graph.priorities.intern(priority),
                 downloads: bytes.u64()?,
                 attempt: bytes.u8()?,
                 dispatch_attempts: bytes.u16()?,
@@ -1114,9 +1117,9 @@ impl SnapshotLoader {
             let at = u32::try_from(graph.states.len())
                 .map_err(|_| QueueError::Invariant("snapshot state slab overflows u32".into()))?;
             graph.states.push(state);
-            at
+            (at, demand)
         } else {
-            NO_STATE
+            (NO_STATE, 0)
         };
         let node = Node {
             digest,
@@ -1134,16 +1137,15 @@ impl SnapshotLoader {
             status,
             flags,
         };
-        let ix = u32::try_from(graph.nodes.len())
-            .map_err(|_| QueueError::Invariant("node count overflows u32".into()))?;
         graph.nodes.push(node);
+        graph.demand.set(state, demand);
         match bytes.u8()? {
             0 => Ok(()),
             1 => {
                 let len = bytes.u32()? as usize;
                 let extra: Extra =
                     rmp_serde::from_slice(bytes.bytes(len)?).map_err(encode_error)?;
-                graph.extras.insert(ix, extra);
+                graph.extras.insert(state, extra);
                 Ok(())
             }
             flag => Err(QueueError::Invariant(format!(
