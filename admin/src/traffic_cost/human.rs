@@ -57,15 +57,17 @@ impl HumanLane {
             return Ok(());
         }
         let mut client = zenwave::client();
-        let versions: CrateVersionsResponse = client
+        let bytes = client
             .get(format!("{}/api/v1/crates/serde/versions", edge.base()))
             .map_err(|error| error.to_string())?
             .await
             .map_err(|error| error.to_string())?
             .into_body()
-            .json()
+            .into_bytes()
             .await
             .map_err(|error| error.to_string())?;
+        let versions: CrateVersionsResponse =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
         let mut fresh = Vec::new();
         for version in versions.versions {
             let semver =
@@ -237,15 +239,16 @@ async fn post<T: DeserializeOwned>(
             .map_err(|error| error.to_string())?,
         None => request,
     };
-    request
+    let bytes = request
         .json_body(body)
         .map_err(|error| error.to_string())?
         .await
         .map_err(|error| error.to_string())?
         .into_body()
-        .json()
+        .into_bytes()
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
 fn outcome(
