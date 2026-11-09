@@ -63,7 +63,7 @@ impl CiTransport for CfTransport {
         // clone and response consumption. A Rust future race would only
         // bound headers and would not abort the underlying fetch.
         let worker_request =
-            cf_http::with_abort_signal(worker_request, &cf_http::control_deadline())
+            cf_http::with_abort_signal(&worker_request, &cf_http::control_deadline())
                 .map_err(|error| DispatchError::Network(error.to_string()))?;
         let response = CfFetch
             .request(&worker_request)

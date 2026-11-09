@@ -7,17 +7,17 @@ pub use skyzen_cloudflare::bare_request;
 
 /// CI control requests and records verification must leave room inside
 /// GitHub's webhook delivery deadline for the scheduler's own work.
-pub(crate) type RequestSignal = skyzen_cloudflare::worker::send::SendWrapper<web_sys::AbortSignal>;
+pub type RequestSignal = skyzen_cloudflare::worker::send::SendWrapper<web_sys::AbortSignal>;
 
 /// The same signal can bound an authenticated request and its retry.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn control_deadline() -> RequestSignal {
+pub fn control_deadline() -> RequestSignal {
     skyzen_cloudflare::worker::send::SendWrapper::new(web_sys::AbortSignal::timeout_with_u32(5_000))
 }
 
 /// Attach a native cancellation signal through response consumption.
-pub(crate) fn with_abort_signal(
-    request: skyzen_cloudflare::worker::Request,
+pub fn with_abort_signal(
+    request: &skyzen_cloudflare::worker::Request,
     signal: &web_sys::AbortSignal,
 ) -> Result<skyzen_cloudflare::worker::Request, skyzen_cloudflare::worker::Error> {
     let init = web_sys::RequestInit::new();

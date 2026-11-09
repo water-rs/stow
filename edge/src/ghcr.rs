@@ -211,7 +211,7 @@ async fn send(
     let _slot = pool.slot().await;
     let request = build_request(url, token, accept)?;
     let request = match signal {
-        Some(signal) => cf_http::with_abort_signal(request, signal)
+        Some(signal) => cf_http::with_abort_signal(&request, signal)
             .map_err(|error| FetchError::InvalidRequest(error.to_string()))?,
         None => request,
     };
