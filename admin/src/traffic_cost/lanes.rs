@@ -96,6 +96,9 @@ pub struct LaneArgs {
     /// Actual toolchain for the index-report slice; must differ from seeded toolchains.
     #[arg(long, requires = "index_publish_token_file")]
     pub index_publish_rustc: Option<String>,
+    /// Mock resolve-request.yml OIDC token for the complete human lifecycle lane.
+    #[arg(long, requires_all = ["webhook_secret", "index_publish_rustc"])]
+    pub resolve_token_file: Option<PathBuf>,
 }
 
 /// A response that takes this long under the mock stack is a stall,
@@ -109,6 +112,8 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// What one lane event is.
 #[derive(Debug)]
 pub enum Fire {
+    /// Admission, resolve workflow deliveries and nonempty outcome reporting.
+    HumanLifecycle(super::human::HumanLane),
     /// Round-robin `GET`s over public paths.
     PublicGet(Vec<String>),
     /// `GET /api/v1/index/{target}/{rustc}` then the digest-addressed
@@ -272,6 +277,13 @@ impl Fire {
     pub async fn ready(&self, edge: &Edge, needed: usize) -> Result<(), String> {
         match self {
             Self::WorkflowRun(lane) => lane.ready(edge, needed).await,
+            Self::HumanLifecycle(lane) => {
+                tokio::time::timeout(REQUEST_TIMEOUT, lane.ready(edge, needed))
+                    .await
+                    .map_err(|_| {
+                        "human lifecycle preparation exceeded its request deadline".to_owned()
+                    })?
+            }
             _ => Ok(()),
         }
     }
@@ -338,7 +350,7 @@ const SUBMIT_POOL: &[(&str, &str)] = &[
 
 /// `POST /api/v1/github/workflow_run`'s `sha256=<hex>` HMAC-SHA256 over
 /// the raw body.
-fn sign_body(secret: &str, body: &[u8]) -> String {
+pub(super) fn sign_body(secret: &str, body: &[u8]) -> String {
     let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts any key length");
     mac.update(body);
@@ -364,7 +376,12 @@ fn workflow_run_body(task: &InFlightRun) -> String {
     )
 }
 
-fn workflow_delivery_body(action: &str, workflow: &str, run_id: u64, title: &str) -> String {
+pub(super) fn workflow_delivery_body(
+    action: &str,
+    workflow: &str,
+    run_id: u64,
+    title: &str,
+) -> String {
     serde_json::json!({
         "action": action,
         "repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
@@ -679,6 +696,7 @@ async fn plan(
     let base = edge.base();
     let bearer = || async { edge.bearer().await.map_err(|error| error.to_string()) };
     match fire {
+        Fire::HumanLifecycle(_) => Err("human lifecycle has no single-request plan".to_owned()),
         Fire::PublicGet(paths) => {
             let index = usize::try_from(counter).unwrap_or_default() % paths.len();
             Ok(Plan::Get {
@@ -798,6 +816,9 @@ pub async fn fire_once(
     counter: u64,
     timing: &mut RequestTimingMs,
 ) -> Result<Outcome, String> {
+    if let Fire::HumanLifecycle(lane) = fire {
+        return lane.fire(edge, client).await;
+    }
     let started = tokio::time::Instant::now();
     let planned = plan(fire, edge, client, counter).await;
     timing.planning = Some(started.elapsed().as_secs_f64() * 1000.0);
@@ -958,6 +979,22 @@ pub fn build_lanes(
         expected: ok2xx,
     });
     lanes.extend(index_lanes(args, model, scale)?);
+    if let Some(token_file) = &args.resolve_token_file {
+        lanes.push(Lane {
+            name: "human-lifecycle",
+            eps: eps(EventKind::HumanRequest),
+            fire: Fire::HumanLifecycle(super::human::HumanLane::new(
+                args.webhook_secret
+                    .clone()
+                    .ok_or("human lifecycle needs --webhook-secret")?,
+                token_file.clone(),
+                args.index_publish_rustc
+                    .as_deref()
+                    .ok_or("human lifecycle needs --index-publish-rustc")?,
+            )?),
+            expected: ok2xx,
+        });
+    }
     if args.scheduler {
         lanes.extend(scheduler_lanes(args, model, scale));
     }
@@ -1136,6 +1173,7 @@ mod tests {
             bundle_digest: None,
             index_publish_token_file: Some("index-publish-token".into()),
             index_publish_rustc: Some("1.99.1".to_owned()),
+            resolve_token_file: Some("resolve-token".into()),
         }
     }
 

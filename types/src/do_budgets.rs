@@ -760,6 +760,12 @@ pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
         relative_cpu: 0.25,
     },
     WorkerCpuBudget {
+        // One whole lifecycle: two authenticated mutations and three signed
+        // deliveries, composed from their existing per-request bounds.
+        lane: "human-lifecycle",
+        relative_cpu: 2.0 * 0.25 + 3.0 * 0.35,
+    },
+    WorkerCpuBudget {
         // Run 40631853262: 0.038 (0.85 ms of 22.2 ms).
         lane: "admission",
         relative_cpu: 0.10,

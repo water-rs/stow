@@ -34,6 +34,7 @@ pub use cpu::ReferenceCpu;
 pub use cpu::ReferenceRound;
 pub use cpu::{SegmentArgs, segment as profile_preheat};
 mod fixture_runs;
+mod human;
 mod lanes;
 mod peak;
 mod preheat;

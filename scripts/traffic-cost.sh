@@ -492,8 +492,12 @@ echo "[traffic] recorded $(jq '.runs | length' "$WORK_DIR/fixture-runs.json") in
 INDEX_PUBLISH_TOKEN_FILE="$WORK_DIR/index-publish-token"
 (umask 077; "$BIN/stow-mock-registry" oidc-token --workflow index-publish.yml \
     --lifetime-secs 7200 > "$INDEX_PUBLISH_TOKEN_FILE")
+RESOLVE_TOKEN_FILE="$WORK_DIR/resolve-token"
+(umask 077; "$BIN/stow-mock-registry" oidc-token --workflow resolve-request.yml \
+    --lifetime-secs 7200 > "$RESOLVE_TOKEN_FILE")
 
 LANE_ARGS=(
+    --resolve-token-file "$RESOLVE_TOKEN_FILE"
     --index-publish-token-file "$INDEX_PUBLISH_TOKEN_FILE"
     --index-publish-rustc "$(rustc --version | awk '{print $2}')"
     --model "$REPO_ROOT/launch-model.toml"

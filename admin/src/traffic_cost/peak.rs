@@ -268,10 +268,12 @@ async fn run_lane(
     duration: Duration,
     concurrency: usize,
 ) -> LaneStats {
-    // Rearming replaces the callback fixture's entire armed-run queue;
-    // ready + take must remain under one request slot's ownership.
-    // Other lanes have no shared preparation and can overlap freely.
-    let concurrency = if matches!(lane.fire, lanes::Fire::WorkflowRun(_)) {
+    // Prepared identities and callback rearming each have one owner;
+    // ready + take must stay in the same request slot. Other lanes overlap.
+    let concurrency = if matches!(
+        lane.fire,
+        lanes::Fire::WorkflowRun(_) | lanes::Fire::HumanLifecycle(_)
+    ) {
         1
     } else {
         concurrency
