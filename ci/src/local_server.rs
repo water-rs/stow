@@ -30,6 +30,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_net::TcpListener;
 use executor_core::tokio::TokioGlobal;
@@ -1525,6 +1526,19 @@ struct TaskRun {
     exe: PathBuf,
 }
 
+impl TaskRun {
+    fn log_stage(&self, stage: &str, started: Instant, succeeded: bool) {
+        tracing::info!(
+            task_id = %self.task.task_id,
+            run_id = self.workflow_run_id,
+            stage,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            succeeded,
+            "local CI stage timing"
+        );
+    }
+}
+
 /// Filesystem layout of the task's working directory: the workspace the
 /// build stage unpacks into, the output directory it writes to, and the
 /// files the two stages exchange.
@@ -1654,7 +1668,10 @@ async fn drive_stages(run: &TaskRun) -> Result<(), String> {
     };
 
     let publish_job = state.begin_job(workflow_run_id, publish_job_name(), PUBLISH_JOB_STEPS);
-    match publish_stage(run, &layout).await {
+    let started = Instant::now();
+    let publication = publish_stage(run, &layout).await;
+    run.log_stage("publish", started, publication.is_ok());
+    match publication {
         Ok(()) => {
             state.finish_job(workflow_run_id, publish_job, "success", &["success"]);
             state.set_task(workflow_run_id, "completed", Some("success"), None);
@@ -1675,16 +1692,25 @@ async fn build_stage(run: &TaskRun) -> stow_types::error::Result<TaskLayout> {
     if run.stub {
         return Ok(layout);
     }
+    let waiting = Instant::now();
     let _runner = run
         .state
         .runners
         .acquire()
         .await
         .expect("the runner pool is never closed");
+    run.log_stage("build-runner-wait", waiting, true);
     run.state.mark_built(run.workflow_run_id);
     // The child is the untrusted build stage: it gets the event file and
     // nothing else, exactly as the production build job does.
-    let status = run_build_stage(run, &layout).await?;
+    let started = Instant::now();
+    let result = run_build_stage(run, &layout).await;
+    run.log_stage(
+        "build",
+        started,
+        result.as_ref().is_ok_and(std::process::ExitStatus::success),
+    );
+    let status = result?;
     if !status.success() {
         return Err(stow_types::stow_error!(
             "stow-build exited with status {status}: {}",
@@ -1708,9 +1734,12 @@ async fn verify_failure_stage(run: &TaskRun) -> stow_types::error::Result<()> {
         stow_types::build_failure::VERIFICATION_JOB_NAME.to_owned(),
         &["Replay without cached artifacts"],
     );
+    let waiting = Instant::now();
     let replay = async {
         let _runner = run.state.runners.acquire().await.expect("runner pool open");
-        untrusted_command(run)
+        run.log_stage("failure-replay-runner-wait", waiting, true);
+        let started = Instant::now();
+        let result = untrusted_command(run)
             .arg("verify-failure")
             .arg("--input-dir")
             .arg(&layout.output_dir)
@@ -1722,7 +1751,13 @@ async fn verify_failure_stage(run: &TaskRun) -> stow_types::error::Result<()> {
             )
             .stderr(std::fs::File::create(layout.root.join("replay.log"))?)
             .status()
-            .await
+            .await;
+        run.log_stage(
+            "failure-replay",
+            started,
+            result.as_ref().is_ok_and(std::process::ExitStatus::success),
+        );
+        result
     }
     .await;
     let conclusion = if replay.as_ref().is_ok_and(std::process::ExitStatus::success) {
@@ -1745,21 +1780,26 @@ async fn verify_failure_stage(run: &TaskRun) -> stow_types::error::Result<()> {
 async fn publish_stage(run: &TaskRun, layout: &TaskLayout) -> stow_types::error::Result<()> {
     let task = &run.task;
     if !run.stub {
+        let waiting = Instant::now();
         let _runner = run
             .state
             .runners
             .acquire()
             .await
             .expect("the runner pool is never closed");
+        run.log_stage("publish-runner-wait", waiting, true);
         // The task is read back from the event file, as `stow-build
         // publish` reads it, and validated exactly as it validates it:
         // the mock registry below stands in for GHCR and the signer, not for
         // the validation that gates them.
         let event = async_fs::read(&run.event_path).await?;
         let dispatched = crate::task_from_event(&event, &run.event_path)?;
-        let output = crate::validated_build_output(&dispatched, &layout.output_dir)
+        let started = Instant::now();
+        let result = crate::validated_build_output(&dispatched, &layout.output_dir)
             .await
-            .map_err(|error| error.wrap_err("publish-stage validation"))?;
+            .map_err(|error| error.wrap_err("publish-stage validation"));
+        run.log_stage("publish-validation", started, result.is_ok());
+        let output = result?;
         // `stow-build build` exits non-zero when any cargo phase failed —
         // the outcome is binary: a build that reached here ran to
         // completion and whatever it plans is the whole closure. An
