@@ -724,6 +724,7 @@ fn reclaim_sources(gctx: &GlobalContext) -> CargoResult<()> {
     let _lock = gctx.acquire_package_cache_lock(CacheLockMode::MutateExclusive)?;
     let mut tracker = gctx.global_cache_tracker()?;
     let mut gc = Gc::new(gctx, &mut tracker)?;
+    drop(tracker);
     gc.gc(
         &mut CleanContext::new(gctx),
         &GcOpts {
@@ -768,7 +769,7 @@ mod tests {
             let mut used = DeferredGlobalLastUse::new();
             // Explicit historical metadata avoids sleeping across Cargo's
             // one-second timestamp boundary.
-            let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(86_400);
+            let old = std::time::UNIX_EPOCH + std::time::Duration::from_hours(24);
             used.mark_git_checkout_used_stamp(
                 GitCheckout {
                     encoded_git_name: "project".into(),
