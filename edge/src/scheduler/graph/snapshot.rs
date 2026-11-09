@@ -995,7 +995,6 @@ impl SnapshotLoader {
                 let mask = bytes.u8()?;
                 let slice = (bytes.u8()?, bytes.u8()?);
                 graph.published.insert(key, Published { mask, slice });
-                graph.slice_members.entry(slice).or_default().insert(key);
                 Ok(())
             }),
             ChunkKind::Outcomes => decode_items(kind, payload, |outcome: AttemptOutcome| {
