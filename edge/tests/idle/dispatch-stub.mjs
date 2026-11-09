@@ -6,6 +6,7 @@ import { externalResponse } from "./external-responses.mjs";
 const periodic = [];
 let ciLimit = null;
 let dispatchAttempts = 0;
+let ciLatencyMs = 0;
 const resolves = [];
 const externalCalls = [];
 // The stems of the workflows STOW_PERIODIC_WORKFLOWS names in
@@ -85,6 +86,10 @@ export default {
 		// STOW_LOCAL_CI_URL: the /dispatch event POST and the
 		// GitHub-shaped run endpoints under /repos/{owner}/{repo}/actions.
 		if (url.port === "28124") {
+			if (url.pathname === "/__control/ci-latency" && request.method === "POST") {
+				ciLatencyMs = (await request.json()).milliseconds;
+				return new Response(null, { status: 204 });
+			}
 			if (url.pathname === "/__control/ci-limit") {
 				if (request.method === "POST") {
 					ciLimit = (await request.json()).mode;
@@ -104,6 +109,7 @@ export default {
 				if (request.method === "POST") {
 					periodic.length = 0;
 					ciLimit = null;
+					ciLatencyMs = 0;
 					dispatchAttempts = 0;
 					return new Response(null, { status: 204 });
 				}
@@ -111,6 +117,9 @@ export default {
 			}
 			if (request.method === "POST" && url.pathname === "/dispatch") {
 				dispatchAttempts++;
+				if (ciLatencyMs > 0) {
+					await new Promise((resolve) => setTimeout(resolve, ciLatencyMs));
+				}
 				if (ciLimit) {
 					const headers = ciLimit === "primary"
 						? { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 60) }

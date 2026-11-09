@@ -87,3 +87,36 @@ describe("control dispatch recovery fence", () => {
 		expect(deadlines[0].until).toBeGreaterThan(Date.now());
 	});
 });
+
+describe("scheduler activity ledger", () => {
+	beforeEach(reset);
+
+	it("counts outbound CI waiting and excludes time between invocations", async () => {
+		const stub = env.SCHEDULER.get(env.SCHEDULER.idFromName("scheduler"));
+		const active = async () => {
+			const response = await stub.fetch("https://scheduler.invalid/budget/ledger");
+			expect(response.status).toBe(200);
+			return ((await response.json()) as { active_ms: number }).active_ms;
+		};
+		const latency = 250;
+		const configured = await fetch("http://127.0.0.1:28124/__control/ci-latency", {
+			method: "POST",
+			body: JSON.stringify({ milliseconds: latency }),
+		});
+		expect(configured.status).toBe(204);
+		const before = await active();
+		const response = await stub.fetch("https://scheduler.invalid/periodic/dispatch", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ workflow: "watchdog.yml", ref: "main" }),
+		});
+		expect(response.status, await response.text()).toBe(200);
+		const after = await active();
+		expect(after - before).toBeGreaterThanOrEqual(latency);
+		await new Promise((resolve) => setTimeout(resolve, latency));
+		const idle = await active();
+		// A ledger read has its own handler cost, but the preceding idle
+		// interval must not be charged as another outbound wait.
+		expect(idle - after).toBeLessThan(latency / 2);
+	});
+});
