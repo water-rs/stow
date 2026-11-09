@@ -171,7 +171,7 @@ impl LocalServerState {
     }
 
     /// Add latency to CI responses for external-wait duration scenarios.
-    pub fn with_response_latency(mut self, latency: Duration) -> Self {
+    pub const fn with_response_latency(mut self, latency: Duration) -> Self {
         self.response_latency = latency;
         self
     }
