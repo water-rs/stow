@@ -257,12 +257,12 @@ pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<Stat
 
 /// Coverage totals and Rust error names from the same crate-statistics rows.
 #[derive(Default)]
-pub(crate) struct CrateCounters {
+pub struct CrateCounters {
     pub summary: StatsSummary,
     pub errors: BTreeMap<String, u64>,
 }
 
-pub(crate) async fn read_counters(config: &StowConfig) -> stow_types::error::Result<CrateCounters> {
+pub async fn read_counters(config: &StowConfig) -> stow_types::error::Result<CrateCounters> {
     let connection = config.state_db_pool().await?;
     let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64)>(
         "SELECT crate_name, hits, misses, errors, glibc_refusals, local_dependency_builds \
@@ -354,7 +354,7 @@ enum StatsField {
     LocalDependencyBuilds,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StatsSummary {
     pub rust_hits: u64,
     pub rust_misses: u64,
