@@ -693,6 +693,14 @@ async fn index_report_plan(
     })
 }
 
+fn public_get_plan(base: &str, paths: &[String], counter: u64) -> Plan {
+    let index = usize::try_from(counter).unwrap_or_default() % paths.len();
+    Plan::Get {
+        url: format!("{base}{}", paths[index]),
+        bearer: None,
+    }
+}
+
 fn preheat_release_plan(base: &str, secret: &str, rustc: &str) -> Result<Plan, String> {
     let body = serde_json::to_vec(&serde_json::json!({
         "provider": "github", "project": "rust-lang/rust", "version": rustc,
@@ -731,13 +739,7 @@ async fn plan(
     let bearer = || async { edge.bearer().await.map_err(|error| error.to_string()) };
     match fire {
         Fire::HumanLifecycle(_) => Err("human lifecycle has no single-request plan".to_owned()),
-        Fire::PublicGet(paths) => {
-            let index = usize::try_from(counter).unwrap_or_default() % paths.len();
-            Ok(Plan::Get {
-                url: format!("{base}{}", paths[index]),
-                bearer: None,
-            })
-        }
+        Fire::PublicGet(paths) => Ok(public_get_plan(base, paths, counter)),
         Fire::IndexPull { target, rustc } => plan_index_pull(base, target, rustc, client).await,
         Fire::BundleFetch { rustc, digest } => {
             let digest = digest.clone().unwrap_or_else(|| {
