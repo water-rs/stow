@@ -56,6 +56,7 @@ fn route_error(error: QueueError) -> Error {
             StatusCode::TOO_MANY_REQUESTS
         }
         QueueError::Sql(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        QueueError::CiRateLimited => StatusCode::SERVICE_UNAVAILABLE,
     };
     to_error(error).set_status(status)
 }
@@ -1132,12 +1133,6 @@ pub(super) async fn admit_request_pass(
     dispatched_at: i64,
 ) -> Result<stow_types::api::CrateRequestStatus> {
     refuse_if_frozen(graph)?;
-    if graph.with(|graph| graph.ci_waiting(now_ms())) {
-        return Err(
-            Error::msg("GitHub API is waiting for its rate-limit recovery deadline")
-                .set_status(StatusCode::SERVICE_UNAVAILABLE),
-        );
-    }
     let step = routes::admit_request(graph, db, settings, admission, dispatched_at, now_ms())
         .await
         .map_err(route_error)?;

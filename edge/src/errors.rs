@@ -90,6 +90,9 @@ pub enum ResolverError {
 /// Errors raised by the scheduler queue (Durable Object).
 #[derive(Debug, thiserror::Error)]
 pub enum QueueError {
+    /// GitHub's recovery deadline has not arrived; no new dispatch may start.
+    #[error("GitHub API is waiting for its rate-limit recovery deadline")]
+    CiRateLimited,
     /// Underlying durable-object SQL access failed.
     #[error("queue sql: {0}")]
     Sql(String),

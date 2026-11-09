@@ -665,7 +665,7 @@ pub(super) async fn admit_request(
     now: i64,
 ) -> Result<queue::RequestAdmissionStep, QueueError> {
     let (step, event) =
-        graph.with(|graph| queue::admit_request(graph, admission, dispatched_at, settings))?;
+        graph.with(|graph| queue::admit_request(graph, admission, dispatched_at, settings, now))?;
     if let Some(event) = event {
         commit(graph, db, &[event], now).await?;
     }
