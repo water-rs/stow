@@ -3051,6 +3051,26 @@ impl Graph {
         )
     }
 
+    /// Probe-only arena occupancy. Capacities are slots, not measured bytes;
+    /// indexes, interned strings and transient allocations are not included.
+    pub(super) fn trace_occupancy(&self, drive: &str, phase: &str, boundary: &str) {
+        tracing::info!(
+            drive,
+            phase,
+            boundary,
+            graph_loaded = true,
+            retained_nodes = self.nodes.len() - self.counts[Status::Free.index()] as usize,
+            node_slots = self.nodes.len(),
+            node_capacity = self.nodes.capacity(),
+            active_states = self.states.len() - self.free_states.len(),
+            state_slots = self.states.len(),
+            state_capacity = self.states.capacity(),
+            dependency_edges = self.edges.len(),
+            published_identities = self.published.len(),
+            "budget graph occupancy"
+        );
+    }
+
     /// The miss lane's pending depth, which `STOW_MAX_QUEUE_PENDING`
     /// gates: work other lanes queued is not the miss lane's to bound.
     pub const fn miss_pending_depth(&self) -> u32 {

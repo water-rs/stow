@@ -362,6 +362,25 @@ async fn run_drive(
     let mut measure = WindowMeasure::new(drive.name, log);
     let outcome = drives::drive_lifecycle(drive, db, metered, shape, settings, ctx, &mut |mark| {
         measure.mark(mark);
+        // Keep diagnostic work outside the measured run + durability barrier.
+        let (phase, boundary) = match mark {
+            drives::PhaseMark::Starting(drives::LifecyclePhase::Setup) => ("setup", "before"),
+            drives::PhaseMark::Finished(drives::LifecyclePhase::Setup) => ("setup", "after"),
+            drives::PhaseMark::Finished(drives::LifecyclePhase::PostSync) => ("run", "after"),
+            drives::PhaseMark::Finished(drives::LifecyclePhase::Cleanup) => ("cleanup", "after"),
+            _ => return,
+        };
+        if let Some(loaded) = ctx.graph.loaded() {
+            loaded.with(|graph| graph.trace_occupancy(drive.name, phase, boundary));
+        } else {
+            tracing::info!(
+                drive = drive.name,
+                phase,
+                boundary,
+                graph_loaded = false,
+                "budget graph occupancy"
+            );
+        }
     })
     .await;
     if let Err(error) = outcome.setup {
