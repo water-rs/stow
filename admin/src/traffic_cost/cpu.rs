@@ -88,7 +88,7 @@ pub struct CpuArgs {
 /// Observe native inspector memory counters without collecting garbage.
 #[derive(Debug, Args)]
 pub struct MemoryArgs {
-    /// The local mock edge's DevTools inspector WebSocket URL.
+    /// The local mock edge's `DevTools` inspector WebSocket URL.
     #[arg(long)]
     inspector_url: String,
 }
@@ -96,6 +96,10 @@ pub struct MemoryArgs {
 /// Native isolate counters, not a sum or a production memory-limit verdict.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[expect(
+    clippy::struct_field_names,
+    reason = "preserve the native DevTools protocol field names"
+)]
 struct HeapUsage {
     used_size: f64,
     total_size: f64,
@@ -103,7 +107,7 @@ struct HeapUsage {
     backing_storage_size: f64,
 }
 
-/// Preserve each counter independently: backing storage includes ArrayBuffers
+/// Preserve each counter independently: backing storage includes `ArrayBuffers`
 /// and external strings, while heap fields describe different allocations.
 pub async fn memory(args: &MemoryArgs, output: Output) -> stow_types::error::Result<()> {
     let session = Session::connect(&args.inspector_url).await?;
@@ -1077,9 +1081,12 @@ mod tests {
             assert_eq!(usage.backing_storage_size, 40.0);
             assert!(session.heap_usage().await.is_err());
         };
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(server, client);
-        })
+        Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async {
+                tokio::join!(server, client);
+            },
+        ))
         .await
         .expect("inspector deadline");
     }
