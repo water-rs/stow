@@ -308,9 +308,8 @@ async fn production_lanes(lanes_dir: &Path) -> stow_types::error::Result<Vec<Pro
             tasks: plan
                 .tasks
                 .iter()
-                .flat_map(|tree| &tree.nodes)
-                .map(|node| {
-                    Ok(ProductionTask {
+                .flat_map(|tree| {
+                    tree.nodes.iter().map(move |node| ProductionTask {
                         task_id: node.task_id.clone(),
                         target: node.target.as_str().to_owned(),
                         dependencies: node
@@ -320,7 +319,7 @@ async fn production_lanes(lanes_dir: &Path) -> stow_types::error::Result<Vec<Pro
                             .collect(),
                     })
                 })
-                .collect::<stow_types::error::Result<_>>()?,
+                .collect(),
             lane: name,
         });
     }
