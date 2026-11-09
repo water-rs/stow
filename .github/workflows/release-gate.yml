@@ -310,6 +310,7 @@ jobs:
       # restore-key prefixes hand every run the most recent index — the
       # repo's 10 GB Actions allowance is not spent on per-request saves.
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        id: resolver-cache
         with:
           # Cargo recreates extracted sources and Git checkouts from these
           # downloads. Saving the whole home duplicated both representations
@@ -331,6 +332,14 @@ jobs:
           # Full projects lane: 29m51s at 16 workers (run 41703355413);
           # four workers had not completed the list after 55 minutes.
           STOW_RESOLVE_CONCURRENCY: 16
+      # An exact-key hit is never saved again by actions/cache. Only pay
+      # for packing when the successful wave can create a new cache entry.
+      - name: Compact resolver cache for saving
+        if: steps.resolver-cache.outputs.cache-hit != 'true'
+        run: >-
+          python3 scripts/compact-resolver-cache.py compact
+          "$RUNNER_TEMP/stow-resolve-cargo"
+          "$RUNNER_TEMP/stow-production-wave/resolver-cache.json"
       # The count is the run's number — kept on a pass too; the monthly
       # projection job downloads it.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
