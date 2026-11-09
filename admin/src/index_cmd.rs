@@ -50,7 +50,7 @@ use zenwave::ResponseExt as _;
 /// anonymous session already honors the registry's rate limit, so this
 /// bounds in-flight work, not throughput.
 const RECORDS_PULL_CONCURRENCY: usize = 16;
-/// Previous `index`/`folded` pairs pulled in flight per export.
+/// Published slices or previous `index`/`folded` pairs pulled in flight.
 const PREV_PULL_CONCURRENCY: usize = 8;
 /// Artifact records per sync request — each request lands as one
 /// edge-side batch write, so a chunk is one round trip rather than a
@@ -1270,22 +1270,28 @@ async fn index_reconcile(edge: &Edge, args: IndexReconcileArgs) -> stow_types::e
         .into_iter()
         .map(|slice| ((slice.target, slice.rustc_version), slice.generation))
         .collect();
-    let mut indexes = Vec::new();
-    for tag in &tags {
-        let Some((target, tag_rustc)) = index_tag_parts(tag) else {
-            continue;
-        };
-        if WireRustcVersion::parse(tag_rustc).map_or(true, |tag_rustc| tag_rustc != rustc_version) {
-            continue;
+    let pulls = tags.iter().filter_map(|tag| {
+        let (target, tag_rustc) = index_tag_parts(tag)?;
+        WireRustcVersion::parse(tag_rustc)
+            .is_ok_and(|tag_rustc| tag_rustc == rustc_version)
+            .then_some((tag, target))
+    });
+    let indexes = futures_util::stream::iter(pulls.map(|(tag, target)| {
+        let ctx = &ctx;
+        let rustc_version = &rustc_version;
+        async move {
+            let target = TargetTriple::parse(target)
+                .map_err(|error| stow_error!("index tag {tag} target: {error}"))?;
+            ctx.live_index(&target, rustc_version)
+                .await?
+                .ok_or_else(|| {
+                    stow_error!("index tag {tag} listed but its manifest does not exist")
+                })
         }
-        let target = TargetTriple::parse(target)
-            .map_err(|error| stow_error!("index tag {tag} target: {error}"))?;
-        let index = ctx
-            .live_index(&target, &rustc_version)
-            .await?
-            .ok_or_else(|| stow_error!("index tag {tag} listed but its manifest does not exist"))?;
-        indexes.push(index);
-    }
+    }))
+    .buffered(PREV_PULL_CONCURRENCY)
+    .try_collect::<Vec<_>>()
+    .await?;
     let report = unreported_slices(indexes, &reported)?;
     tracing::info!(
         slices = report.slices.len(),
