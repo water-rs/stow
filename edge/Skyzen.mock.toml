@@ -1,7 +1,7 @@
 [cloudflare]
 name = "stow-edge-mock"
 main = "stable-worker.js"
-compatibility_date = "2025-02-01"
+compatibility_date = "2026-07-15"
 workers_dev = false
 
 [cloudflare.vars]

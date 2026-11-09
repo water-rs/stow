@@ -318,7 +318,7 @@ wait_for "mock registry /v2/" 60 "$SERVICE_PID" mock_registry_ready
 
 (
     cd "$REPO_ROOT/edge"
-    skyzen build --provider cloudflare --manifest Skyzen.mock.toml
+    skyzen build --release --provider cloudflare --manifest Skyzen.mock.toml
 ) >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
 
