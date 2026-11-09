@@ -40,6 +40,7 @@ mod arena;
 mod edges;
 mod index;
 mod node;
+mod published;
 mod snapshot;
 mod sparse;
 
@@ -48,6 +49,7 @@ use edges::Edges;
 use index::{Interner, IxTable, Priorities, hash_of};
 pub use node::RunCompletion;
 use node::{Extra, Flags, Lane, NO_STATE, Node, State, Status};
+use published::PublishedEntries;
 use sparse::SparseDemand;
 
 pub use snapshot::{ChunkSpan, SNAPSHOT_SPAN_ROWS, SnapshotLoader, SnapshotPlan, SpanEncoder};
@@ -468,11 +470,7 @@ pub struct Graph {
     /// Forward edges and the reverse index.
     edges: Edges,
     /// Published unit-shape mask per task id.
-    published: HashMap<IdKey, Published>,
-    /// The task ids each slice serves, derived from `published`: a full
-    /// report retires the slice's stale ids from here, so its cost is
-    /// the slice's own size rather than the whole map's.
-    slice_members: HashMap<SliceId, HashSet<IdKey>>,
+    published: PublishedEntries,
     /// The generation of the index each reported slice last applied.
     slice_generations: BTreeMap<SliceId, i64>,
     /// The incomplete multi-part full reports, one per slice: staged
@@ -1891,10 +1889,8 @@ impl Graph {
         }
         let mut flips = 0;
         let stale: Vec<IdKey> = self
-            .slice_members
-            .get(&slice)
-            .into_iter()
-            .flatten()
+            .published
+            .members(slice)
             .filter(|key| !next.contains_key(*key))
             .copied()
             .collect();
@@ -1943,12 +1939,8 @@ impl Graph {
         if mask != old {
             if mask == 0 {
                 self.published.remove(&key);
-                if let Some(members) = self.slice_members.get_mut(&slice) {
-                    members.remove(&key);
-                }
             } else {
                 self.published.insert(key, Published { mask, slice });
-                self.slice_members.entry(slice).or_default().insert(key);
             }
             self.touch_published(&key);
         }
@@ -3186,6 +3178,7 @@ impl Graph {
             edge_array_storage_bytes = self.edges.array_bytes(),
             published_identities = self.published.len(),
             published_capacity = self.published.capacity(),
+            published_storage_bytes = self.published.heap_bytes(),
             pending_age_entries = self.pending_ages.len(),
             extra_entries = self.extras.len(),
             extra_capacity = self.extras.capacity(),
@@ -3274,8 +3267,7 @@ impl Graph {
             + self.states.capacity() * size_of::<State>()
             + self.demand.heap_bytes()
             + self.edges.heap_bytes()
-            + self.published.capacity() * (size_of::<IdKey>() + size_of::<Published>())
-            + self.published.len() * size_of::<IdKey>()
+            + self.published.heap_bytes()
             + (self.ready.len() + self.ready_macos.len())
                 * (size_of::<i64>() + size_of::<BTreeSet<(i64, u32)>>())
             + self.ready_sets().map(BTreeSet::len).sum::<usize>() * (size_of::<(i64, u32)>() + 32)
