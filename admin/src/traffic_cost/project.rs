@@ -1054,7 +1054,7 @@ impl ProjectionReport {
                         )
                     }),
             );
-            failures.extend(evaluation.unmeasured_cpu.iter().map(|gap| {
+            failures.extend(evaluation.unmeasured_cpu.iter().filter(|gap| gap.monthly_events > 0.0).map(|gap| {
                 format!("{label} projection: Worker CPU for {} is unmeasured ({:.3e} events/month) — {}",
                     gap.route, gap.monthly_events, gap.reason)
             }));
