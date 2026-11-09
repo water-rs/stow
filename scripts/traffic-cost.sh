@@ -371,7 +371,7 @@ fg in_dir "$REPO_ROOT/edge/tests/idle" bun install --frozen-lockfile \
 # the existing segments and durable state across their restarts.
 EDGE_IDX=-1
 EDGE_PID=
-INSPECTOR_URL_FILE="$WORK_DIR/edge-inspector-url"
+INSPECTOR_URL_FILE="$WORK_DIR/edge-runtime-ready.json"
 
 start_edge() {
     rm -f "$INSPECTOR_URL_FILE"
@@ -380,7 +380,7 @@ start_edge() {
         exec bun tests/idle/cpu-runtime.mjs --config .skyzen/gen/wrangler.toml \
             "${MOCK_CAP_ARGS[@]}" \
             --port "$EDGE_PORT" --inspector-port "$INSPECTOR_PORT" \
-            --inspector-url-file "$INSPECTOR_URL_FILE" \
+            --ready-file "$INSPECTOR_URL_FILE" \
             --persist-to "$WORK_DIR/edge-state"
     ) >>"$LOG_DIR/edge.log" 2>&1 &
     EDGE_PID=$!
@@ -396,7 +396,7 @@ start_edge() {
         http_listening "$SCHEDULER_URL/status"
     wait_for "edge inspector target" "$READY_DEADLINE" "$EDGE_PID" \
         test -s "$INSPECTOR_URL_FILE"
-    INSPECTOR_URL="$(cat "$INSPECTOR_URL_FILE")"
+    INSPECTOR_URL="$(jq -er '.inspector' "$INSPECTOR_URL_FILE")"
 }
 
 # Resident set size of the edge process tree, logged at segment

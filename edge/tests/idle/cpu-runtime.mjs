@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { writeFile } from "node:fs/promises";
+import { rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { externalBindings, outboundModules } from "./external-data.mjs";
@@ -14,10 +14,10 @@ const { values } = parseArgs({ options: {
 	port: { type: "string" },
 	"inspector-port": { type: "string" },
 	"persist-to": { type: "string" },
-	"inspector-url-file": { type: "string" },
+	"ready-file": { type: "string" },
 	var: { type: "string", multiple: true, default: [] },
 } });
-for (const name of ["config", "port", "inspector-port", "persist-to", "inspector-url-file"]) {
+for (const name of ["config", "port", "inspector-port", "persist-to", "ready-file"]) {
 	if (!values[name]) throw new Error(`missing --${name}`);
 }
 const config = unstable_readConfig({ config: path.resolve(values.config) });
@@ -61,7 +61,7 @@ try {
 		process.once("SIGTERM", resolve);
 		process.once("SIGINT", resolve);
 	});
-	await miniflare.ready;
+	const url = String(await miniflare.ready);
 	const listing = await miniflare.getInspectorURL();
 	listing.protocol = "http:";
 	listing.pathname = "/json";
@@ -69,10 +69,11 @@ try {
 	if (!response.ok) throw new Error(`Inspector listing: HTTP ${response.status}`);
 	const targets = (await response.json()).filter((target) => target.id === `core:user:${config.name}`);
 	if (targets.length !== 1) throw new Error(`Inspector has ${targets.length} targets for ${config.name}`);
-	await writeFile(values["inspector-url-file"], targets[0].webSocketDebuggerUrl + "\n");
-	console.info("CPU runtime ready", JSON.stringify({
-		main, inspector: targets[0].webSocketDebuggerUrl,
-	}));
+	const ready = { main, url, inspector: targets[0].webSocketDebuggerUrl };
+	const temporary = values["ready-file"] + ".pending";
+	await writeFile(temporary, JSON.stringify(ready));
+	await rename(temporary, values["ready-file"]);
+	console.info("CPU runtime ready", JSON.stringify(ready));
 	await stopped;
 } finally {
 	await miniflare.dispose();
