@@ -178,13 +178,13 @@ impl ResolvePool {
                 )
             })
             .collect::<stow_types::error::Result<_>>()?;
-        let resolvers = &resolvers;
         let next = AtomicUsize::new(0);
-        let (tx, rx) = mpsc::channel::<(usize, Result<R, String>)>();
+        let (tx, rx) = mpsc::channel::<Result<(usize, Result<R, String>), String>>();
+        let mut cleanup_error = None;
         let work = &work;
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);
-            for resolver in resolvers {
+            for mut resolver in resolvers {
                 let tx = tx.clone();
                 let next = &next;
                 let runtime = &self.runtime;
@@ -196,8 +196,15 @@ impl ResolvePool {
                         }
                         // A panic is a bug, not an item failure:
                         // The explicit join preserves its original payload.
-                        let result = work(resolver, runtime, &items[index]);
-                        if tx.send((index, result)).is_err() {
+                        let result = work(&resolver, runtime, &items[index]);
+                        let message = resolver
+                            .reclaim_sources()
+                            .map(|()| (index, result))
+                            .map_err(|error| {
+                                format!("reclaim resolver sources after input {index}: {error:#}")
+                            });
+                        let failed = message.is_err();
+                        if tx.send(message).is_err() || failed {
                             break;
                         }
                     }
@@ -206,11 +213,20 @@ impl ResolvePool {
             drop(tx);
             // `rx` ends when every worker's sender dropped — that is the
             // whole run.
-            for (index, result) in rx {
-                on_item(index, &items[index], result);
+            for message in rx {
+                match message {
+                    Ok((index, result)) => on_item(index, &items[index], result),
+                    Err(error) => {
+                        cleanup_error = Some(error);
+                        break;
+                    }
+                }
             }
             join_workers(handles);
         });
+        if let Some(error) = cleanup_error {
+            return Err(stow_types::stow_error!("{error}"));
+        }
         Ok(())
     }
 }

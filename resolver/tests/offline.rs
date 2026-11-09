@@ -392,6 +392,36 @@ fn units_named<'a>(
 }
 
 #[test]
+fn source_reclamation_preserves_repeated_offline_resolution() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "dep",
+            version: "0.1.0",
+            deps: vec![],
+            target_deps: vec![],
+            features: &[],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    let manifest = project(&work.path().join("root"), &json!({"dep":"0.1"}));
+    let (_home, mut resolver) = resolver_at(&reg);
+    let targets = ["x86_64-unknown-linux-gnu".to_owned()];
+    let opts = ResolveOptions::default();
+    let before = resolver.resolve(&manifest, &opts, &targets).unwrap();
+    resolver.reclaim_sources().unwrap();
+    let after = resolver.resolve(&manifest, &opts, &targets).unwrap();
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&before).unwrap(),
+    );
+}
+
+#[test]
 fn operator_lockfile_preservation_keeps_the_resolved_dependency_context() {
     let scratch = tempfile::tempdir().unwrap();
     let reg = scratch.path().join("registry");
