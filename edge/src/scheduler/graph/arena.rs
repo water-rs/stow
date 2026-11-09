@@ -27,3 +27,21 @@ impl<T> DerefMut for Arena<T> {
         &mut self.0
     }
 }
+
+impl<'a, T> IntoIterator for &'a Arena<T> {
+    type Item = &'a T;
+    type IntoIter = <&'a SplitVec<T, Linear> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        (&self.0).into_iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a mut Arena<T> {
+    type Item = &'a mut T;
+    type IntoIter = <&'a mut SplitVec<T, Linear> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        (&mut self.0).into_iter()
+    }
+}
