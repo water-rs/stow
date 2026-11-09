@@ -7,6 +7,7 @@ const periodic = [];
 let ciLimit = null;
 let dispatchAttempts = 0;
 let ciLatencyMs = 0;
+const ciStatusRequests = [];
 const resolves = [];
 const externalCalls = [];
 // The stems of the workflows STOW_PERIODIC_WORKFLOWS names in
@@ -86,9 +87,12 @@ export default {
 		// STOW_LOCAL_CI_URL: the /dispatch event POST and the
 		// GitHub-shaped run endpoints under /repos/{owner}/{repo}/actions.
 		if (url.port === "28124") {
-			if (url.pathname === "/__control/ci-latency" && request.method === "POST") {
-				ciLatencyMs = (await request.json()).milliseconds;
-				return new Response(null, { status: 204 });
+			if (url.pathname === "/__control/ci-latency") {
+				if (request.method === "POST") {
+					ciLatencyMs = (await request.json()).milliseconds;
+					return new Response(null, { status: 204 });
+				}
+				return Response.json({ statusRequests: ciStatusRequests });
 			}
 			if (url.pathname === "/__control/ci-limit") {
 				if (request.method === "POST") {
@@ -110,10 +114,24 @@ export default {
 					periodic.length = 0;
 					ciLimit = null;
 					ciLatencyMs = 0;
+					ciStatusRequests.length = 0;
 					dispatchAttempts = 0;
 					return new Response(null, { status: 204 });
 				}
 				return Response.json(periodic);
+			}
+			if (request.method === "GET" && /^\/repos\/[^/]+\/[^/]+\/actions\/workflows\/build-crate\.yml\/runs$/.test(url.pathname)) {
+				const status = url.searchParams.get("status");
+				if (status !== "queued" && status !== "in_progress") {
+					return new Response("unexpected CI status query", { status: 500 });
+				}
+				ciStatusRequests.push(status);
+				if (ciLatencyMs > 0) {
+					await new Promise((resolve) => setTimeout(resolve, ciLatencyMs));
+				}
+				// This fixture completes every build run immediately; its
+				// queued and running lists are therefore both empty.
+				return Response.json({ workflow_runs: [] });
 			}
 			if (request.method === "POST" && url.pathname === "/dispatch") {
 				dispatchAttempts++;

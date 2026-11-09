@@ -98,6 +98,11 @@ describe("scheduler activity ledger", () => {
 			expect(response.status).toBe(200);
 			return ((await response.json()) as { active_ms: number }).active_ms;
 		};
+		// Wake/replay reconciles both GitHub run lists before the ledger
+		// can answer. Do not silently price a failed mock reconciliation.
+		await active();
+		const reconciled = await (await fetch("http://127.0.0.1:28124/__control/ci-latency")).json() as { statusRequests: string[] };
+		expect(reconciled.statusRequests.sort()).toEqual(["in_progress", "queued"]);
 		const latency = 250;
 		const configured = await fetch("http://127.0.0.1:28124/__control/ci-latency", {
 			method: "POST",
