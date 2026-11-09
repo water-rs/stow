@@ -86,15 +86,20 @@ impl CiTransport for CfTransport {
         let status = response.get_ref().status_code();
         // The contract reads only these headers; a `worker::Response`
         // exposes them by name rather than as an enumerable map.
-        let headers = ["link", "retry-after", "x-ratelimit-remaining"]
-            .into_iter()
-            .filter_map(|name| {
-                response
-                    .get_ref()
-                    .header(name)
-                    .map(|value| (name.to_owned(), value))
-            })
-            .collect();
+        let headers = [
+            "link",
+            "retry-after",
+            "x-ratelimit-remaining",
+            "x-ratelimit-reset",
+        ]
+        .into_iter()
+        .filter_map(|name| {
+            response
+                .get_ref()
+                .header(name)
+                .map(|value| (name.to_owned(), value))
+        })
+        .collect();
         // CI answers are buffered JSON. Native arrayBuffer avoids a
         // per-chunk Wasm reader and its releaseLock rejection on abort.
         let body = {

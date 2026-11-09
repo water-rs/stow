@@ -710,17 +710,18 @@ fn decode_run_details(body: &str) -> Result<DispatchedRun, DispatchError> {
 /// provably did not happen.
 fn classify_failure(response: &CiResponse) -> DispatchError {
     let status = response.status;
-    let retry_after = response
-        .header("retry-after")
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    let primary_exhausted = response
-        .header("x-ratelimit-remaining")
-        .is_some_and(|remaining| remaining.trim() == "0");
-    if status == 429 || (status == 403 && (retry_after.is_some() || primary_exhausted)) {
-        return DispatchError::RateLimited {
-            status,
-            retry_after_secs: retry_after,
-        };
+    let headers: http::HeaderMap = response
+        .headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                http::HeaderName::from_bytes(name.as_bytes()).expect("valid CI header name"),
+                http::HeaderValue::from_str(value).expect("valid CI header value"),
+            )
+        })
+        .collect();
+    if crate::transient::rate_limit(status, &headers, 0).is_some() {
+        return DispatchError::RateLimited { status, headers };
     }
     let body = String::from_utf8_lossy(&response.body);
     let body = body.chars().take(512).collect::<String>();
@@ -752,13 +753,13 @@ pub enum DispatchError {
         body: String,
     },
     /// GitHub's rate limit answered — the write did not happen, and
-    /// `retry_after_secs` is the wait it named when it named one.
+    /// Its headers retain the recovery hints for the caller's clock.
     #[error("GitHub rate limit (HTTP {status})")]
     RateLimited {
         /// HTTP status — `429`, or a `403` carrying the limit's marks.
         status: u16,
-        /// `Retry-After` seconds the answer named, when it named one.
-        retry_after_secs: Option<u64>,
+        /// The response headers, including primary and secondary limit hints.
+        headers: http::HeaderMap,
     },
     /// The dispatch POST succeeded but its run-details body did not
     /// read or decode — the run may exist unbound, so the caller
@@ -770,6 +771,20 @@ pub enum DispatchError {
     /// bearer it bears, to a host the API never named.
     #[error("out-of-origin URL refused: {0}")]
     OutOfScope(String),
+}
+
+impl DispatchError {
+    /// The server's recovery wait at the caller's epoch-second clock.
+    /// A non-limit failure returns `None`; an unstated limit stays typed.
+    #[must_use]
+    pub fn rate_limit(&self, now: i64) -> Option<crate::transient::RateLimit> {
+        match self {
+            Self::RateLimited { status, headers } => {
+                crate::transient::rate_limit(*status, headers, now)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -982,12 +997,40 @@ mod tests {
         let interface = CiInterface::github("water-rs/stow", "token", stub);
         let error = futures_lite::future::block_on(interface.submit("{}")).expect_err("refused");
         assert!(matches!(
-            error,
-            DispatchError::RateLimited {
-                status: 429,
-                retry_after_secs: Some(30)
-            }
+            &error,
+            DispatchError::RateLimited { status: 429, .. }
         ));
+        assert_eq!(
+            error.rate_limit(1_000),
+            Some(crate::transient::RateLimit::Wait {
+                wait: std::time::Duration::from_secs(30),
+                reset: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_primary_limit_retains_its_reset_for_the_callers_clock() {
+        let response = Stub::answer(
+            403,
+            &[
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset", "1100"),
+            ],
+            "{}",
+        );
+        let error = super::classify_failure(&response);
+        assert_eq!(
+            error.rate_limit(1_000),
+            Some(crate::transient::RateLimit::Wait {
+                wait: std::time::Duration::from_secs(102),
+                reset: Some(1_100),
+            })
+        );
+        assert_eq!(
+            super::classify_failure(&Stub::answer(429, &[], "{}")).rate_limit(1_000),
+            Some(crate::transient::RateLimit::Unstated)
+        );
     }
 
     /// A periodic dispatch is the workflow file on `main` with no
