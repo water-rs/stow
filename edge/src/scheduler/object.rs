@@ -819,25 +819,28 @@ pub(super) async fn complete_run_pass(
     let mut verified_report = report.clone();
     // Evidence is read from GitHub, never accepted from the serving edge.
     verified_report.source_failure = None;
-    if !report.success && !report.cancelled {
+    if !report.success && !report.cancelled && !graph.with(|graph| graph.ci_waiting(now_ms())) {
         let verification = async {
             let run_id = report
                 .github_run_id
                 .parse::<u64>()
-                .map_err(|error| to_error(error.to_string()))?;
+                .map_err(|error| dispatch::DispatchError::Response(error.to_string()))?;
             unloaded_ci_interface(graph.cell(), env)
-                .await?
+                .await
+                .map_err(|error| dispatch::DispatchError::TokenMint(error.to_string()))?
                 .source_failure_verification(stow_types::records::BuildRun {
                     run_id,
                     run_attempt: report.github_run_attempt,
                 })
                 .await
-                .map_err(|error| to_error(error.to_string()))
         }
         .await;
         match verification {
             Ok(proof) => verified_report.source_failure = proof,
             Err(error) => {
+                dispatch::retain_ci_limit(graph, db, &error, now_ms())
+                    .await
+                    .map_err(to_error)?;
                 tracing::warn!(%error, "source failure unverified; counting infrastructure failure");
             }
         }
@@ -1129,6 +1132,12 @@ pub(super) async fn admit_request_pass(
     dispatched_at: i64,
 ) -> Result<stow_types::api::CrateRequestStatus> {
     refuse_if_frozen(graph)?;
+    if graph.with(|graph| graph.ci_waiting(now_ms())) {
+        return Err(
+            Error::msg("GitHub API is waiting for its rate-limit recovery deadline")
+                .set_status(StatusCode::SERVICE_UNAVAILABLE),
+        );
+    }
     let step = routes::admit_request(graph, db, settings, admission, dispatched_at, now_ms())
         .await
         .map_err(route_error)?;
@@ -1195,6 +1204,9 @@ pub(super) async fn admit_request_pass(
         }
     };
     if let Err(error) = outcome {
+        dispatch::retain_ci_limit(graph, db, &error, now_ms())
+            .await
+            .map_err(to_error)?;
         routes::fail_request_dispatch(
             graph,
             db,
