@@ -1509,6 +1509,39 @@ fn timed_build(command: &mut Command) -> (std::process::Output, std::time::Durat
     (output, started.elapsed())
 }
 
+/// Trace only after a failed measurement, outside its timing samples. Let
+/// the process exit normally so tracing-chrome flushes complete JSON.
+fn precargo_diagnostic(dir: &Path, cargo_home: &Path, edge_url: &str) -> serde_json::Value {
+    let cache = tempfile::tempdir().expect("diagnostic cache");
+    let target = tempfile::tempdir().expect("diagnostic target");
+    let trace_dir = tempfile::tempdir().expect("diagnostic trace directory");
+    let trace_file = trace_dir.path().join("trace.json");
+    let mut command = stow_candidate(dir, cargo_home, edge_url, cache.path(), target.path());
+    command.env("STOW_TRACE_FILE", &trace_file);
+    let (output, _) = timed_build(&mut command);
+    let events: Vec<serde_json::Value> = serde_json::from_slice(
+        &std::fs::read(&trace_file).expect("read complete diagnostic trace"),
+    )
+    .expect("parse diagnostic trace");
+    let events: Vec<_> = events
+        .into_iter()
+        .filter(|event| {
+            event["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("stow.precargo."))
+        })
+        .collect();
+    assert!(
+        !events.is_empty(),
+        "diagnostic trace has no pre-Cargo events"
+    );
+    serde_json::json!({
+        "status": output.status.code(),
+        "stderr": String::from_utf8_lossy(&output.stderr),
+        "events": events,
+    })
+}
+
 /// One build's pre-cargo window: the wall clock until its first
 /// `Compiling` line — the end of the window the issue profiles — after
 /// which the build is stopped. Nothing past that line belongs to the
@@ -1631,13 +1664,19 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
             empty: &stow_empty_windows,
         },
     );
+    let diagnostic = (!window_comparison.passes()).then(|| {
+        serde_json::json!({
+            "empty": precargo_diagnostic(empty_dir.path(), cargo_home.path(), &edge_url),
+            "project": precargo_diagnostic(dir.path(), cargo_home.path(), &edge_url),
+        })
+    });
     assert!(
         window_comparison.passes(),
         "stow must never put serial work in front of cargo: \
          cargo windows {cargo_windows:?} on the project and {cargo_empty_windows:?} on the \
          empty crate, stow windows {stow_windows:?} and {stow_empty_windows:?}: beyond the \
          measured {:?} startup floor stow adds {:?}, which exceeds the measured run-to-run \
-         spread {:?}",
+         spread {:?}; unmeasured diagnostic traces: {diagnostic:?}",
         window_comparison.floor,
         window_comparison.residual,
         window_comparison.tolerance,
