@@ -91,11 +91,11 @@ pub struct ProjectArgs {
 // its dimension-specific fraction of the included allowance. The runtime
 // breaker retains the default fraction declared in `stow-types`.
 
-/// GB-s each serialized DO wall second is priced at. Cloudflare's
-/// billing rule is fixed — 128 MB of memory per Durable Object
-/// instance, so 0.125 GB-s per wall second — and 0.25 deliberately
-/// over-reads it by 2×, so the projection errs on the bill's side.
-const DO_DURATION_GB_PER_WALL_S: f64 = 0.25;
+/// Allocated memory in Cloudflare's billing units: its published example
+/// prices 1,000,000 active seconds at 128,000 GB-s. This conversion does
+/// not turn mock handler wall time into a production I/O duration bound.
+/// https://developers.cloudflare.com/durable-objects/platform/pricing/
+const DO_ALLOCATED_MEMORY_GB: f64 = 0.128;
 
 /// Tasks the enqueue drives' `submit_batch` carries — the denominator
 /// a single-task insert prices against.
@@ -806,8 +806,7 @@ fn fold_kind(
         ),
         (
             "do_duration_gb_s",
-            monthly * (kind.wall_ms / 1000.0) * DO_DURATION_GB_PER_WALL_S
-                / DO_DURATION_GB_S_MONTHLY,
+            monthly * (kind.wall_ms / 1000.0) * DO_ALLOCATED_MEMORY_GB / DO_DURATION_GB_S_MONTHLY,
         ),
         (
             "do_rows_read",
@@ -886,7 +885,7 @@ fn usage_lines(projection: &Projection, preheat: &PreheatMonthly) -> Vec<UsageLi
         line(
             "durable_objects",
             "duration_gb_s",
-            projection.do_wall_s * DO_DURATION_GB_PER_WALL_S,
+            projection.do_wall_s * DO_ALLOCATED_MEMORY_GB,
             DO_DURATION_GB_S_MONTHLY,
         ),
     ]
