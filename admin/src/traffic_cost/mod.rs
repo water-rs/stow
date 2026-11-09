@@ -49,6 +49,8 @@ pub struct TrafficCostArgs {
 
 #[derive(Debug, Subcommand)]
 enum TrafficCostCommand {
+    /// Observe the local isolate's heap and backing-storage counters.
+    Memory(cpu::MemoryArgs),
     /// Measure Worker CPU per traffic lane through the edge's `DevTools`
     /// inspector and fail on a lane over its budget.
     Cpu(cpu::CpuArgs),
@@ -73,6 +75,7 @@ pub async fn run(
     store: &(impl CredentialStoreApi + Sync),
 ) -> stow_types::error::Result<()> {
     match args.command {
+        TrafficCostCommand::Memory(args) => cpu::memory(&args, output).await,
         TrafficCostCommand::Cpu(args) => cpu::run(&Edge::connect(store)?, &args, output).await,
         TrafficCostCommand::Peak(args) => peak::run(&Edge::connect(store)?, &args, output).await,
         TrafficCostCommand::Verdict(args) => verdict::run(&args, output).await,

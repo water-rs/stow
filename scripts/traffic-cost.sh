@@ -449,6 +449,11 @@ budget_pass() {
         (.rows[] | "  \(.name | . + " " * (48 - length)) stmts=\(.statements)/\(.statement_budget) rows_read=\(.rows_read)/\(.read_budget) rows_written=\(.rows_written)/\(.write_budget) wall_ms=\(.wall_ms)\(if .over_budget then " OVER" else "" end)")
     ' "$REPORT_DIR/budget-$label.json"
     drain_builds "$label"
+    # Observe retained memory before the next pass replaces this population.
+    # These native counters do not establish transient peaks or billed memory.
+    fg admin --json traffic-cost memory --inspector-url "$INSPECTOR_URL" \
+        >"$REPORT_DIR/memory-$label.json" 2>"$LOG_DIR/memory-$label.log" \
+        || die "memory observation $label failed — see $LOG_DIR/memory-$label.log"
 }
 
 # The large fixture first, so the CPU pass and the peak drive run on the
