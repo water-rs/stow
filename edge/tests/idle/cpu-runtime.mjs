@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
-import { readdir, rename, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdir, mkdtemp, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { externalBindings, outboundModules } from "./external-data.mjs";
@@ -25,20 +26,39 @@ const { workerOptions, main, externalWorkers, define } = unstable_getMiniflareWo
 if (!config.name) throw new Error("generated Worker configuration has no name");
 if (!main) throw new Error("generated Worker configuration has no main module");
 if (Object.keys(define).length) throw new Error("CPU runtime needs a built artifact without compile-time defines");
-// The v5 adapter requires an explicit manifest. Preserve Wrangler's module
-// rules with Miniflare's own compiler and matcher over the built output.
+// Build the deployment module graph before adapting it to v5's manifest.
+// Scanning the source directory also registers unrelated tests and dependencies.
 const { modulesRules, ...runtimeOptions } = workerOptions;
-const modulesRoot = path.dirname(main);
+await mkdir(path.resolve(values["persist-to"]), { recursive: true });
+const modulesRoot = await mkdtemp(path.join(path.resolve(values["persist-to"]), "bundle-"));
+const wranglerBin = path.resolve(path.dirname(require.resolve("wrangler")), "../bin/wrangler.js");
+const build = spawn(process.execPath, [wranglerBin, "deploy", "--dry-run",
+	"--config", path.resolve(values.config), "--outdir", modulesRoot],
+	{ stdio: "inherit", detached: true, env: { ...process.env, WRANGLER_SEND_METRICS: "false" } });
+const buildDeadline = setTimeout(() => process.kill(-build.pid, "SIGKILL"), 30_000);
+try {
+	await new Promise((resolve, reject) => {
+		build.once("error", reject);
+		build.once("exit", (code, signal) => code === 0 ? resolve()
+			: reject(new Error(`Wrangler dry run failed: code ${code}, signal ${signal}`)));
+	});
+} catch (error) {
+	await rm(modulesRoot, { recursive: true, force: true });
+	throw error;
+} finally {
+	clearTimeout(buildDeadline);
+}
+const builtMain = path.join(modulesRoot, config.no_bundle ? path.basename(main) : `${path.parse(main).name}.js`);
 const rules = compileModuleRules([
 	...modulesRules,
 	{ type: "ESModule", include: ["**/*.js", "**/*.mjs"] },
 	{ type: "CommonJS", include: ["**/*.cjs"] },
 ]);
-const modules = [{ type: "ESModule", path: main }];
+const modules = [{ type: "ESModule", path: builtMain }];
 for (const file of (await readdir(modulesRoot, { recursive: true, withFileTypes: true }))
 	.filter((entry) => entry.isFile())
 	.map((entry) => path.join(entry.parentPath, entry.name)).sort()) {
-	if (file === main) continue;
+	if (file === builtMain) continue;
 	const relative = path.relative(modulesRoot, file).split(path.sep).join("/");
 	const rule = rules.find(({ include }) => testRegExps(include, relative));
 	if (rule) modules.push({ type: rule.type, path: file });
@@ -87,7 +107,7 @@ try {
 	if (!response.ok) throw new Error(`Inspector listing: HTTP ${response.status}`);
 	const targets = (await response.json()).filter((target) => target.id === `core:user:${config.name}`);
 	if (targets.length !== 1) throw new Error(`Inspector has ${targets.length} targets for ${config.name}`);
-	const ready = { main, url, inspector: targets[0].webSocketDebuggerUrl };
+	const ready = { main: builtMain, modulesRoot, modules, url, inspector: targets[0].webSocketDebuggerUrl };
 	const temporary = values["ready-file"] + ".pending";
 	await writeFile(temporary, JSON.stringify(ready));
 	await rename(temporary, values["ready-file"]);
@@ -95,4 +115,5 @@ try {
 	await stopped;
 } finally {
 	await miniflare.dispose();
+	await rm(modulesRoot, { recursive: true, force: true });
 }
