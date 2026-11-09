@@ -4776,7 +4776,8 @@ mod tests {
                             && Graph::wire_status(node) == status
                             && older_than_secs.is_none_or(|secs| {
                                 graph.state(ix).updated
-                                    <= 1_000_000 - i64::try_from(secs).expect("test age fits") * 1000
+                                    <= 1_000_000
+                                        - i64::try_from(secs).expect("test age fits") * 1000
                             })
                     })
                     .map(|(ix, _)| ix)
