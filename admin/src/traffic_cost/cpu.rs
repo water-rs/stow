@@ -160,7 +160,7 @@ pub(super) struct SegmentReport {
 
 /// Capture a segment without changing the workload driven by the harness.
 pub async fn segment(args: &SegmentArgs) -> stow_types::error::Result<()> {
-    let ((), report) = capture_segment(&args.inspector_url, "preheat", async || {
+    let ((), report) = capture_segment(&args.inspector_url, "preheat", &args.out, async || {
         tokio::fs::write(&args.ready, b"ready\n").await?;
         tokio::time::timeout(Duration::from_secs(args.deadline_secs.get()), async {
             loop {
@@ -189,12 +189,17 @@ pub async fn segment(args: &SegmentArgs) -> stow_types::error::Result<()> {
 pub(super) async fn capture_segment<R>(
     inspector_url: &str,
     label: &str,
+    out: &std::path::Path,
     work: impl AsyncFnOnce() -> stow_types::error::Result<R>,
 ) -> stow_types::error::Result<(R, SegmentReport)> {
     let (inspector, mut artifacts, idle_cpu_ms) = prepare_sampler(inspector_url).await?;
     let rounds_before = measure_reference(&inspector, &mut artifacts).await?;
-    let (result, cpu_ms) = profiled(&inspector, &mut artifacts, label, work).await?;
-    let rounds_after = measure_reference(&inspector, &mut artifacts).await?;
+    let measured = profiled(&inspector, &mut artifacts, label, work).await;
+    artifacts.save_raw(out).await?;
+    let (result, cpu_ms) = measured?;
+    let rounds_after = measure_reference(&inspector, &mut artifacts).await;
+    artifacts.save_raw(out).await?;
+    let rounds_after = rounds_after?;
     let report = SegmentReport {
         sampling_interval_us: SAMPLING_INTERVAL_US,
         idle_window_ms: u64::try_from(IDLE_WINDOW.as_millis())?,
@@ -304,13 +309,19 @@ pub struct ScriptSource {
     source: String,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize)]
 struct ProfileArtifacts {
     profiles: Vec<CapturedProfile>,
     scripts: std::collections::BTreeMap<String, String>,
 }
 
 impl ProfileArtifacts {
+    /// Diagnostic checkpoint, deliberately distinct from the validated report.
+    async fn save_raw(&self, report: &std::path::Path) -> stow_types::error::Result<()> {
+        tokio::fs::write(report.with_extension("raw.json"), serde_json::to_vec(self)?).await?;
+        Ok(())
+    }
+
     fn capture(&mut self, label: &str, raw: serde_json::Value, profile: &CpuProfile) {
         for node in &profile.nodes {
             let frame = &node.call_frame;
@@ -730,7 +741,6 @@ async fn profiled<R>(
     let mut stopped = inspector
         .call("Profiler.stop", serde_json::Value::Null)
         .await?;
-    let result = worked?;
     let raw = stopped
         .get_mut("profile")
         .map(serde_json::Value::take)
@@ -771,7 +781,7 @@ async fn profiled<R>(
         "Worker CPU profile hotspots (function, samples)"
     );
     artifacts.capture(label, raw, &profile);
-    Ok((result, profile_cpu_ms(&profile)))
+    Ok((worked?, profile_cpu_ms(&profile)))
 }
 
 /// Fire `count` events of `lane` back to back; any response outside the
@@ -1037,6 +1047,126 @@ mod tests {
         CpuProfile, LaneCpu, ProfileArtifacts, REFERENCE_DRIFT_LIMIT, edge_context, profile_cpu_ms,
         reference_cpu, track_context,
     };
+
+    async fn incomplete_source_inspector(listener: tokio::net::TcpListener, fail_work: bool) {
+        use futures_util::StreamExt as _;
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = async_tungstenite::tokio::accept_async(stream)
+            .await
+            .expect("handshake");
+        let mut stops = 0;
+        loop {
+            let frame = socket.next().await.expect("request").expect("frame");
+            let request: serde_json::Value =
+                serde_json::from_str(frame.to_text().expect("text")).expect("command");
+            let method = request["method"].as_str().expect("method");
+            if method == "Runtime.enable" {
+                socket
+                    .send(async_tungstenite::tungstenite::Message::Text(
+                        serde_json::json!({"method":"Runtime.executionContextCreated",
+                        "params":{"context":{"id":1,"name":"Worker"}}})
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .expect("context");
+            }
+            let result = match method {
+                "Runtime.evaluate" => serde_json::json!({"result":{
+                    "value":super::REFERENCE_CHECKSUM}}),
+                "Profiler.stop" => {
+                    stops += 1;
+                    if stops == 1 {
+                        serde_json::json!({"profile":{"nodes":[],"samples":[]}})
+                    } else {
+                        serde_json::json!({"profile":{"nodes":[{"id":1,"callFrame":{
+                            "scriptId":"3","functionName":"retained_work",
+                            "url":"worker.js","lineNumber":0,"columnNumber":0}}],
+                            "samples":vec![1;120]}})
+                    }
+                }
+                _ => serde_json::json!({}),
+            };
+            let reply = if method == "Debugger.getScriptSource" {
+                serde_json::json!({"id":request["id"],"error":{
+                    "code":-32000,"message":"No script for id: 3"}})
+            } else {
+                serde_json::json!({"id":request["id"],"result":result})
+            };
+            socket
+                .send(async_tungstenite::tungstenite::Message::Text(
+                    reply.to_string().into(),
+                ))
+                .await
+                .expect("reply");
+            if method == "Debugger.getScriptSource" || (fail_work && stops == 5) {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_work_or_source_attachment_keeps_raw_profiles_without_validating_them() {
+        for fail_work in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listen");
+            let address = listener.local_addr().expect("address");
+            let directory = tempfile::tempdir().expect("directory");
+            let output = directory.path().join("segment.json");
+            let server = incomplete_source_inspector(listener, fail_work);
+            let client = async {
+                let result = super::capture_segment(
+                    &format!("ws://{address}"),
+                    "peak",
+                    &output,
+                    async || {
+                        if fail_work {
+                            Err(stow_types::stow_error!("workload failed"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .await;
+                let error = result.expect_err("capture remains invalid").to_string();
+                assert!(error.contains(if fail_work {
+                    "workload failed"
+                } else {
+                    "No script"
+                }));
+                assert!(!output.exists());
+                let raw: serde_json::Value = serde_json::from_slice(
+                    &tokio::fs::read(output.with_extension("raw.json"))
+                        .await
+                        .expect("raw file"),
+                )
+                .expect("raw JSON");
+                assert_eq!(raw["scripts"]["3"], "worker.js");
+                let peak = raw["profiles"]
+                    .as_array()
+                    .expect("profiles")
+                    .iter()
+                    .find(|profile| profile["label"] == "peak")
+                    .expect("peak call tree");
+                assert_eq!(
+                    peak["profile"]["samples"]
+                        .as_array()
+                        .expect("samples")
+                        .len(),
+                    120
+                );
+            };
+            Box::pin(tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                async {
+                    tokio::join!(server, client);
+                },
+            ))
+            .await
+            .expect("capture deadline");
+        }
+    }
 
     #[tokio::test]
     async fn native_heap_observation_preserves_every_counter_and_rejects_missing_fields() {
