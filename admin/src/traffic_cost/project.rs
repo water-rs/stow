@@ -125,8 +125,6 @@ enum CpuPricing {
     /// The event is no Worker request (it runs inside the Durable
     /// Object), so the Worker bills it no CPU.
     NoWorkerRequest,
-    /// A Worker request no lane can drive yet — the reason is printed.
-    Unmeasured(&'static str),
 }
 
 /// One scheduler call an event pays: the Durable Object requests it is
@@ -284,11 +282,7 @@ const EVENT_COSTS: &[EventCost] = &[
         ],
         claims: 0.0,
         worker_requests: forwards::human_request_worker_requests(true) as f64,
-        cpu: CpuPricing::Unmeasured(
-            "POST /api/v1/requests verifies Turnstile at challenges.cloudflare.com and reads the \
-             stable channel manifest from static.rust-lang.org — no lane drives it off the \
-             network, nor the resolve run's deliveries and outcome post",
-        ),
+        cpu: CpuPricing::Lanes(&[("human-lifecycle", 1.0)]),
         subrequests: 3.0,
         r2_ops: 0.0,
     },
@@ -769,11 +763,6 @@ fn fold_cpu(
                 ));
             }
         }
-        CpuPricing::Unmeasured(reason) => projection.unmeasured_cpu.push(UnmeasuredCpu {
-            route: cost.route,
-            monthly_events: monthly,
-            reason,
-        }),
     }
     Ok(kind_cpu_ms)
 }
@@ -1415,8 +1404,10 @@ mod tests {
     fn incomplete_measurements_cannot_pass_even_when_known_usage_fits() {
         let small = fixture_report(100_000, |_| 0.5);
         let after = fixture_report(100_000, |_| 0.5);
+        let mut preheat = no_preheat();
+        preheat.wave_trigger_worker_requests = 1.0;
         let mut report =
-            project_with(&small, &after, &no_preheat(), &fixture_cpu(|_| 0.5)).expect("project");
+            project_with(&small, &after, &preheat, &fixture_cpu(|_| 0.5)).expect("project");
         assert!(report.projection.breaches.is_empty());
         let failures = report.failures();
         assert!(
@@ -1833,6 +1824,8 @@ mod tests {
             (cost.worker_requests - f64::from(human_request_worker_requests(true))).abs() < 1e-12
         );
         assert!((cost.worker_requests - 5.0).abs() < 1e-12);
+        assert!(matches!(cost.cpu, super::CpuPricing::Lanes(rows)
+            if rows == [("human-lifecycle", 1.0)]));
     }
 
     /// The per-request counts of the events whose handler is a single

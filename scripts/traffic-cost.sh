@@ -8,7 +8,7 @@
 #      rowsWritten against DO_BUDGETS, measured under workerd's billed
 #      cursor counters;
 #   2. Worker CPU per traffic lane, sampled by the isolate's V8 profiler
-#      through `wrangler dev`'s DevTools inspector and divided by a fixed
+#      through workerd's DevTools inspector and divided by a fixed
 #      reference workload profiled in the same isolate before and after
 #      the lanes, so the runner's speed cancels, against
 #      WORKER_CPU_BUDGETS (`stow-admin traffic-cost cpu`);
@@ -36,7 +36,7 @@
 #
 # Every service is local: the mock GHCR (`stow-mock-registry`, the
 # edge's GHCR_BASE_URL and the stats SQL endpoint), the edge under
-# `wrangler dev` (workerd), and `stow-build serve` under
+# the native workerd test runtime, and `stow-build serve` under
 # STOW_LOCAL_CI_STUB (the edge's STOW_LOCAL_CI_URL — the dispatch POST
 # and the signed `workflow_run` callback are real, the cargo build
 # behind them is not). Each pass's dispatches complete asynchronously
@@ -64,7 +64,7 @@
 #   STOW_TRAFFIC_MAX_MACOS_JOBS override the mock macOS dispatch cap
 #   STOW_TRAFFIC_RUSTC          rustc the lanes request and the index
 #                               slice publishes under (default 1.85.0)
-#   STOW_TRAFFIC_EDGE_PORT      port `wrangler dev` binds (default 8788)
+#   STOW_TRAFFIC_EDGE_PORT      port the test runtime binds (default 8788)
 #   STOW_TRAFFIC_INSPECTOR_PORT port the workerd inspector binds (default 9230)
 #   STOW_TRAFFIC_REGISTRY_PORT  port `stow-mock-registry serve` binds
 #                               (default 28123)
@@ -80,7 +80,7 @@ REGISTRY_ADDR="127.0.0.1:${STOW_TRAFFIC_REGISTRY_PORT:-28123}"
 LOCAL_CI_ADDR="127.0.0.1:${STOW_TRAFFIC_LOCAL_CI_PORT:-28124}"
 EDGE_URL="http://127.0.0.1:${EDGE_PORT}"
 SCHEDULER_URL="${EDGE_URL}/api/v1/scheduler"
-INSPECTOR_URL="ws://127.0.0.1:${INSPECTOR_PORT}/ws"
+INSPECTOR_URL=
 READY_DEADLINE="${STOW_E2E_READY_DEADLINE:-600}"
 SIZES="${STOW_TRAFFIC_SIZES:-100000 480000}"
 DURATION_SECS="${STOW_TRAFFIC_DURATION_SECS:-1800}"
@@ -277,7 +277,7 @@ require_command curl
 require_command jq
 require_command openssl
 require_command skyzen
-require_command wrangler
+require_command bun
 
 read -r -a size_list <<<"$SIZES"
 [ "${#size_list[@]}" -eq 2 ] || die "STOW_TRAFFIC_SIZES must name exactly two sizes"
@@ -361,29 +361,26 @@ fg in_dir "$REPO_ROOT/edge" \
     >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
 rm -f "$MOCK_MANIFEST"
-# Wrangler writes its own ISO-timestamped log to WRANGLER_LOG_PATH.
-mkdir -p "$LOG_DIR/wrangler"
-export WRANGLER_LOG_PATH="$LOG_DIR/wrangler"
+fg in_dir "$REPO_ROOT/edge/tests/idle" bun install --frozen-lockfile \
+    >"$LOG_DIR/native-runtime-install.log" 2>&1 \
+    || die "native runtime install failed — see $LOG_DIR/native-runtime-install.log"
 
-# The edge runs under `wrangler dev`, whose miniflare service graph (the
-# ProxyWorker in front of every request plus the dev-time tail and
-# live-reload plumbing) retains native memory per request — ~50-190KB on
-# these lanes, linear and never released on idle (upstream:
-# cloudflare/workers-sdk#14701; reproduced on wrangler 4.100.0 and
-# 4.145.0). The isolates' own JS heaps stay flat, so no repo code is
-# implicated; what dies is the dev process around ~1.4GB. The peak drive
-# therefore runs in SEGMENTS fixed segments and the edge restarts
-# between them, persisting Durable Object state on disk. Lane mix,
-# rate and total request volume are unchanged.
+# Run the built artifact and generated bindings through Wrangler's native
+# Miniflare configuration adapter. The outbound service supplies pinned
+# external responses and forwards only to the local CI/registry. Retain
+# the existing segments and durable state across their restarts.
 EDGE_IDX=-1
 EDGE_PID=
+INSPECTOR_URL_FILE="$WORK_DIR/edge-runtime-ready.json"
 
 start_edge() {
+    rm -f "$INSPECTOR_URL_FILE"
     (
         cd "$REPO_ROOT/edge"
-        exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
+        exec bun tests/idle/cpu-runtime.mjs --config .skyzen/gen/wrangler.toml \
             "${MOCK_CAP_ARGS[@]}" \
             --port "$EDGE_PORT" --inspector-port "$INSPECTOR_PORT" \
+            --ready-file "$INSPECTOR_URL_FILE" \
             --persist-to "$WORK_DIR/edge-state"
     ) >>"$LOG_DIR/edge.log" 2>&1 &
     EDGE_PID=$!
@@ -397,6 +394,9 @@ start_edge() {
     echo "[traffic] started edge (pid $EDGE_PID), log: $LOG_DIR/edge.log"
     wait_for "edge listener" "$READY_DEADLINE" "$EDGE_PID" \
         http_listening "$SCHEDULER_URL/status"
+    wait_for "edge inspector target" "$READY_DEADLINE" "$EDGE_PID" \
+        test -s "$INSPECTOR_URL_FILE"
+    INSPECTOR_URL="$(jq -er '.inspector' "$INSPECTOR_URL_FILE")"
 }
 
 # Resident set size of the edge process tree, logged at segment
@@ -492,8 +492,12 @@ echo "[traffic] recorded $(jq '.runs | length' "$WORK_DIR/fixture-runs.json") in
 INDEX_PUBLISH_TOKEN_FILE="$WORK_DIR/index-publish-token"
 (umask 077; "$BIN/stow-mock-registry" oidc-token --workflow index-publish.yml \
     --lifetime-secs 7200 > "$INDEX_PUBLISH_TOKEN_FILE")
+RESOLVE_TOKEN_FILE="$WORK_DIR/resolve-token"
+(umask 077; "$BIN/stow-mock-registry" oidc-token --workflow resolve-request.yml \
+    --lifetime-secs 7200 > "$RESOLVE_TOKEN_FILE")
 
 LANE_ARGS=(
+    --resolve-token-file "$RESOLVE_TOKEN_FILE"
     --index-publish-token-file "$INDEX_PUBLISH_TOKEN_FILE"
     --index-publish-rustc "$(rustc --version | awk '{print $2}')"
     --model "$REPO_ROOT/launch-model.toml"
