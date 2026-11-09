@@ -798,8 +798,10 @@ pub async fn phase_unit_graphs(
     for &phase in cargo_phases(cargo_subcommand) {
         let mut invocations = std::collections::VecDeque::from(phase_invocations(task).to_vec());
         while let Some(invocation) = invocations.pop_front() {
+            let passes_target = invocation_passes_target(task, invocation).await?;
             #[cfg_attr(not(feature = "mock-compile"), allow(unused_mut))]
-            let mut phase_args = cargo_phase_args(workspace, task, phase, invocation).await?;
+            let mut phase_args =
+                cargo_phase_args(workspace, task, phase, invocation, passes_target)?;
             #[cfg(feature = "mock-compile")]
             if let Some((_, wrapper)) = &mock_wrapper {
                 phase_args.push("--config".to_owned());
@@ -808,7 +810,6 @@ pub async fn phase_unit_graphs(
                     toml::Value::String(wrapper.to_string_lossy().into_owned())
                 ));
             }
-            let passes_target = invocation_passes_target(task, invocation).await?;
             let graph = stow_cli::resolve_exact_dependency_graph(
                 workspace.manifest_path(),
                 phase.as_str(),
@@ -1303,7 +1304,7 @@ async fn compile_task(
     // Resolve and verify the run toolchain once per task — a name whose
     // rustc reports a different release than the pinned `rustc_version`
     // is refused here, before any phase runs cargo.
-    verified_run_toolchain(task)?;
+    verified_run_toolchain(task).await?;
     let cargo_home = cargo_home()?;
     let workspace = mode.workspace(task, &cargo_home).await?;
 
@@ -1434,13 +1435,14 @@ pub fn run_toolchain(task: &BuildTaskPayload) -> String {
 /// invocation, naming the toolchain, its reported release, and the
 /// task's `rustc_version`. `RUSTUP_AUTO_INSTALL=0` keeps a missing name
 /// a refusal instead of a network install.
-pub fn verified_run_toolchain(task: &BuildTaskPayload) -> stow_types::error::Result<String> {
+pub async fn verified_run_toolchain(task: &BuildTaskPayload) -> stow_types::error::Result<String> {
     let toolchain = run_toolchain(task);
-    let output = std::process::Command::new("rustc")
+    let output = Command::new("rustc")
         .arg("-vV")
         .env("RUSTUP_TOOLCHAIN", &toolchain)
         .env("RUSTUP_AUTO_INSTALL", "0")
         .output()
+        .await
         .map_err(|error| stow_types::stow_error!("probe run toolchain {toolchain}: {error}"))?;
     if !output.status.success() {
         return Err(stow_types::stow_error!(
@@ -1618,7 +1620,8 @@ async fn run_phase(
 ) -> stow_types::error::Result<Option<crate::failure::FailureCandidate>> {
     let setup = run.setup;
     create_dir_all(target_dir).await?;
-    let mut args = cargo_phase_args(setup.workspace, task, phase, invocation).await?;
+    let passes_target = invocation_passes_target(task, invocation).await?;
+    let mut args = cargo_phase_args(setup.workspace, task, phase, invocation, passes_target)?;
     args.push("--message-format=json".to_owned());
     let lockfile =
         async_fs::read_to_string(setup.workspace.workspace_root().join("Cargo.lock")).await?;
@@ -1688,7 +1691,6 @@ async fn run_phase(
                 runner_host_triple(task)?,
             );
     }
-    let passes_target = invocation_passes_target(task, invocation).await?;
     let output = command.output().await.map_err(|error| {
         stow_types::stow_error!("run sandboxed cargo {}: {error}", phase.as_str())
     })?;
@@ -1818,11 +1820,12 @@ fn phase_invocations(task: &BuildTaskPayload) -> &'static [CargoInvocation] {
 }
 
 /// The `cargo` argv for one sandboxed phase.
-async fn cargo_phase_args(
+fn cargo_phase_args(
     workspace: &BuildWorkspace,
     task: &BuildTaskPayload,
     phase: CargoSubcommand,
     invocation: CargoInvocation,
+    passes_target: bool,
 ) -> stow_types::error::Result<Vec<String>> {
     let mut args = vec![
         phase.as_str().to_owned(),
@@ -1856,7 +1859,7 @@ async fn cargo_phase_args(
     // it produces the host units of both invocation shapes, so its
     // `Explicit` run passes `--target` even though its target is the
     // host triple.
-    if invocation_passes_target(task, invocation).await? {
+    if passes_target {
         args.push("--target".to_owned());
         args.push(task.target.as_str().to_owned());
     }
@@ -3419,7 +3422,7 @@ mod tests {
     fn a_mismatched_run_toolchain_is_refused_before_any_cargo() {
         let mut task = task_with_features(&[]);
         task.rustc_version = WireRustcVersion::parse("0.0.0").expect("mismatched version parses");
-        let error = super::verified_run_toolchain(&task)
+        let error = smol::block_on(super::verified_run_toolchain(&task))
             .expect_err("a toolchain reporting a different release must be refused");
         let message = format!("{error}");
         assert!(
@@ -3442,7 +3445,7 @@ mod tests {
     fn a_matching_run_toolchain_verifies_and_returns_its_name() {
         let mut task = task_with_features(&[]);
         task.rustc_version = active_release();
-        let toolchain = super::verified_run_toolchain(&task)
+        let toolchain = smol::block_on(super::verified_run_toolchain(&task))
             .expect("a toolchain reporting the pinned release verifies");
         assert_eq!(toolchain, super::run_toolchain(&task));
     }
