@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { rename, writeFile } from "node:fs/promises";
+import { readdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { externalBindings, outboundModules } from "./external-data.mjs";
@@ -8,7 +8,7 @@ const require = createRequire(import.meta.url);
 const { unstable_getMiniflareWorkerOptions, unstable_readConfig } = require("wrangler");
 // Use precisely the Miniflare version Wrangler's locked API targets.
 const wranglerRequire = createRequire(require.resolve("wrangler"));
-const { Miniflare, convertV4MiniflareOptions } = wranglerRequire("miniflare");
+const { Miniflare, compileModuleRules, convertV4MiniflareOptions, testRegExps } = wranglerRequire("miniflare");
 const { values } = parseArgs({ options: {
 	config: { type: "string" },
 	port: { type: "string" },
@@ -25,6 +25,20 @@ const { workerOptions, main, externalWorkers, define } = unstable_getMiniflareWo
 if (!config.name) throw new Error("generated Worker configuration has no name");
 if (!main) throw new Error("generated Worker configuration has no main module");
 if (Object.keys(define).length) throw new Error("CPU runtime needs a built artifact without compile-time defines");
+// The v5 adapter requires an explicit manifest. Preserve Wrangler's module
+// rules with Miniflare's own compiler and matcher over the built output.
+const { modulesRules, ...runtimeOptions } = workerOptions;
+const modulesRoot = path.dirname(main);
+const rules = compileModuleRules(modulesRules);
+const modules = [{ type: "ESModule", path: main }];
+for (const file of (await readdir(modulesRoot, { recursive: true, withFileTypes: true }))
+	.filter((entry) => entry.isFile())
+	.map((entry) => path.join(entry.parentPath, entry.name)).sort()) {
+	if (file === main) continue;
+	const relative = path.relative(modulesRoot, file).split(path.sep).join("/");
+	const rule = rules.find(({ include }) => testRegExps(include, relative));
+	if (rule) modules.push({ type: rule.type, path: file });
+}
 const bindings = { ...workerOptions.bindings };
 for (const entry of values.var) {
 	const colon = entry.indexOf(":");
@@ -43,7 +57,7 @@ const miniflare = new Miniflare(convertV4MiniflareOptions({
 	inspectorPort: Number(values["inspector-port"]),
 	resourcePersistencePath: path.resolve(values["persist-to"]),
 	workers: [
-		{ ...workerOptions, name: config.name, modules: true, scriptPath: main, bindings,
+		{ ...runtimeOptions, name: config.name, modules, modulesRoot, bindings,
 			outboundService: "cpu-egress", unsafeInspectorProxy: false },
 		...externalWorkers,
 		{
