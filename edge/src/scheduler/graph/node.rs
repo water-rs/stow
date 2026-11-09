@@ -259,7 +259,9 @@ pub(super) struct Extra {
     pub(super) lease_at: i64,
     pub(super) not_before: i64,
     pub(super) error: Option<Box<str>>,
-    pub(super) parked: Option<RunCompletion>,
+    /// Only a completion racing its dispatch binding owns this payload.
+    /// Keep absent payloads out of every other side-table entry.
+    pub(super) parked: Option<Box<RunCompletion>>,
 }
 
 impl Extra {
