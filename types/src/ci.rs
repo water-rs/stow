@@ -262,8 +262,8 @@ impl CiEndpoint {
 
     fn repo(&self) -> &str {
         match self {
-            CiEndpoint::GitHub { repo, .. } => repo,
-            CiEndpoint::Local { .. } => crate::trusted_builder::REPOSITORY,
+            Self::GitHub { repo, .. } => repo,
+            Self::Local { .. } => crate::trusted_builder::REPOSITORY,
         }
     }
 
@@ -273,8 +273,8 @@ impl CiEndpoint {
     /// API never named.
     fn resolve(&self, path_or_url: &str) -> Result<String, DispatchError> {
         let base = match self {
-            CiEndpoint::GitHub { .. } => "https://api.github.com",
-            CiEndpoint::Local { base } => base.as_str(),
+            Self::GitHub { .. } => "https://api.github.com",
+            Self::Local { base } => base.as_str(),
         };
         scoped_url(base, path_or_url)
     }
@@ -283,7 +283,7 @@ impl CiEndpoint {
     /// or the local server's unauthenticated POST/GET.
     fn api_request(&self, method: &'static str, url: &str, body: Option<Vec<u8>>) -> CiRequest {
         let mut headers = Vec::new();
-        if let CiEndpoint::GitHub { token, .. } = self {
+        if let Self::GitHub { token, .. } = self {
             headers.extend([
                 (
                     "Accept".to_owned(),
@@ -697,7 +697,7 @@ pub struct CiRunsPage<Row> {
     pub workflow_runs: Vec<Row>,
 }
 
-/// A caller-owned reader, optionally retaining each page's ETag and body.
+/// A caller-owned reader, optionally retaining each page's `ETag` and body.
 /// The interface supplies authenticated requests and validates next links.
 pub trait CiRunPages {
     /// The caller's complete run metadata.
@@ -1031,7 +1031,8 @@ mod tests {
         impl super::CiTransport for Overlap {
             async fn send(&self, request: CiRequest) -> Result<CiResponse, DispatchError> {
                 self.started.lock().unwrap().push(request.url);
-                if let Some(waiter) = self.waiter.lock().unwrap().take() {
+                let waiter = self.waiter.lock().unwrap().take();
+                if let Some(waiter) = waiter {
                     waiter.wake();
                 }
                 std::future::poll_fn(|cx| {
@@ -1067,6 +1068,7 @@ mod tests {
                 .iter()
                 .any(|url| url.contains("status=in_progress"))
         );
+        drop(requests);
     }
 
     #[test]
