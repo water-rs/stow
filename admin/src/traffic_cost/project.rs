@@ -1825,7 +1825,7 @@ mod tests {
         );
         assert!((cost.worker_requests - 5.0).abs() < 1e-12);
         assert!(matches!(cost.cpu, super::CpuPricing::Lanes(rows)
-            if rows == &[("human-lifecycle", 1.0)]));
+            if rows == [("human-lifecycle", 1.0)]));
     }
 
     /// The per-request counts of the events whose handler is a single

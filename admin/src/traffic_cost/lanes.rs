@@ -979,22 +979,7 @@ pub fn build_lanes(
         expected: ok2xx,
     });
     lanes.extend(index_lanes(args, model, scale)?);
-    if let Some(token_file) = &args.resolve_token_file {
-        lanes.push(Lane {
-            name: "human-lifecycle",
-            eps: eps(EventKind::HumanRequest),
-            fire: Fire::HumanLifecycle(super::human::HumanLane::new(
-                args.webhook_secret
-                    .clone()
-                    .ok_or("human lifecycle needs --webhook-secret")?,
-                token_file.clone(),
-                args.index_publish_rustc
-                    .as_deref()
-                    .ok_or("human lifecycle needs --index-publish-rustc")?,
-            )?),
-            expected: ok2xx,
-        });
-    }
+    lanes.extend(human_lanes(args, model, scale)?);
     if args.scheduler {
         lanes.extend(scheduler_lanes(args, model, scale));
     }
@@ -1034,6 +1019,26 @@ pub fn build_lanes(
         }
     }
     Ok(lanes)
+}
+
+fn human_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<Vec<Lane>, String> {
+    let Some(token_file) = &args.resolve_token_file else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![Lane {
+        name: "human-lifecycle",
+        eps: model.peak_events_per_second(EventKind::HumanRequest) * scale,
+        fire: Fire::HumanLifecycle(super::human::HumanLane::new(
+            args.webhook_secret
+                .clone()
+                .ok_or("human lifecycle needs --webhook-secret")?,
+            token_file.clone(),
+            args.index_publish_rustc
+                .as_deref()
+                .ok_or("human lifecycle needs --index-publish-rustc")?,
+        )?),
+        expected: ok2xx,
+    }])
 }
 
 fn build_workflow_lanes(

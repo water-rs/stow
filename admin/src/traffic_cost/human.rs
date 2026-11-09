@@ -230,7 +230,7 @@ async fn post<T: DeserializeOwned>(
     client: &mut zenwave::DefaultClient,
     url: &str,
     token: Option<&str>,
-    body: &impl serde::Serialize,
+    body: &(impl serde::Serialize + Sync),
 ) -> Result<T, String> {
     let request = client.post(url).map_err(|error| error.to_string())?;
     let request = match token {
@@ -328,7 +328,7 @@ mod tests {
             assert_eq!(node.features_json, FeaturesJson::default());
             assert_eq!(node.dependency_identity, leaf);
             assert!(!root.cached);
-            assert!(node.deps.is_empty());
+            assert_eq!(node.deps, [] as [u32; 0]);
         }
     }
 }
