@@ -3113,6 +3113,7 @@ impl Graph {
             task_id_index_bytes = self.ids.heap_bytes(),
             identity_index_bytes = self.idents.heap_bytes(),
             dependency_edges = self.edges.len(),
+            edge_array_storage_bytes = self.edges.array_bytes(),
             published_identities = self.published.len(),
             published_capacity = self.published.capacity(),
             pending_age_entries = self.pending_ages.len(),
