@@ -33,6 +33,7 @@ pub use cpu::ReferenceCpu;
 #[cfg(test)]
 pub use cpu::ReferenceRound;
 pub use cpu::{SegmentArgs, segment as profile_preheat};
+mod duration;
 mod fixture_runs;
 mod human;
 mod lanes;
@@ -52,6 +53,8 @@ pub struct TrafficCostArgs {
 
 #[derive(Debug, Subcommand)]
 enum TrafficCostCommand {
+    /// Bound activity under explicit hot, cold, idle-gap and restart assumptions.
+    DurationEnvelope(duration::DurationArgs),
     /// Observe the local isolate's heap and backing-storage counters.
     Memory(cpu::MemoryArgs),
     /// Measure Worker CPU per traffic lane through the edge's `DevTools`
@@ -78,6 +81,7 @@ pub async fn run(
     store: &(impl CredentialStoreApi + Sync),
 ) -> stow_types::error::Result<()> {
     match args.command {
+        TrafficCostCommand::DurationEnvelope(args) => duration::run(&args, output),
         TrafficCostCommand::Memory(args) => cpu::memory(&args, output).await,
         TrafficCostCommand::Cpu(args) => cpu::run(&Edge::connect(store)?, &args, output).await,
         TrafficCostCommand::Peak(args) => peak::run(&Edge::connect(store)?, &args, output).await,
