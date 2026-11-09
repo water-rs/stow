@@ -30,6 +30,8 @@ use crate::render::Output;
 
 mod cpu;
 pub use cpu::ReferenceCpu;
+#[cfg(test)]
+pub use cpu::ReferenceRound;
 pub use cpu::{SegmentArgs, segment as profile_preheat};
 mod fixture_runs;
 mod lanes;

@@ -247,15 +247,29 @@ const MIN_REFERENCE_CPU_MS: f64 = 10.0;
 /// them may lie, as the larger over the smaller.
 const REFERENCE_DRIFT_LIMIT: f64 = 1.25;
 
+/// A resolved reference round; CPU is summed across these invocations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceRound {
+    /// Complete checksum-verified workload invocations.
+    pub invocations: std::num::NonZeroU32,
+    /// Total sampled CPU milliseconds across the invocations.
+    pub sampled_cpu_ms: f64,
+}
+
+impl ReferenceRound {
+    fn per_invocation_ms(&self) -> f64 {
+        self.sampled_cpu_ms / f64::from(self.invocations.get())
+    }
+}
+
 /// The reference workload's measurement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReferenceCpu {
-    /// Each round's CPU milliseconds, profiled before the first lane.
-    pub rounds_before: Vec<f64>,
-    /// Each round's CPU milliseconds, profiled after the last lane.
-    pub rounds_after: Vec<f64>,
-    /// The reference's CPU milliseconds: the smallest round of either
-    /// set.
+    /// Resolved rounds profiled before the first lane.
+    pub rounds_before: Vec<ReferenceRound>,
+    /// Resolved rounds profiled after the last lane.
+    pub rounds_after: Vec<ReferenceRound>,
+    /// CPU milliseconds per invocation: the smallest normalized round.
     pub cpu_ms: f64,
 }
 
@@ -434,20 +448,27 @@ fn smallest(rounds: &[f64]) -> f64 {
 /// The reference from its rounds before and after the lanes, or why it
 /// cannot gate them.
 fn reference_cpu(
-    rounds_before: Vec<f64>,
-    rounds_after: Vec<f64>,
+    rounds_before: Vec<ReferenceRound>,
+    rounds_after: Vec<ReferenceRound>,
 ) -> stow_types::error::Result<ReferenceCpu> {
-    let before = smallest(&rounds_before);
-    let after = smallest(&rounds_after);
+    let per_invocation = |rounds: &[ReferenceRound]| {
+        rounds
+            .iter()
+            .map(ReferenceRound::per_invocation_ms)
+            .fold(f64::INFINITY, f64::min)
+    };
+    let before = per_invocation(&rounds_before);
+    let after = per_invocation(&rounds_after);
     if let Some(round) = rounds_before
         .iter()
         .chain(&rounds_after)
-        .find(|&&round| round < MIN_REFERENCE_CPU_MS)
+        .find(|round| round.sampled_cpu_ms < MIN_REFERENCE_CPU_MS)
     {
         return Err(stow_error!(
-            "a reference round collected {round:.1} ms of samples, under the \
+            "a reference round collected {:.1} ms of samples, under the \
              {MIN_REFERENCE_CPU_MS} ms one round needs to resolve — the profile did not cover \
-             the reference workload"
+             the reference workload",
+            round.sampled_cpu_ms
         ));
     }
     let drift = before.max(after) / before.min(after);
@@ -942,24 +963,55 @@ async fn measure_lane(
     })
 }
 
-/// Profile the reference workload: one unprofiled run to warm the JIT,
-/// then [`ROUNDS`] profiled rounds.
+/// Warm the retained function, then resolve each round to at least 100 samples.
+/// Repeating the same reference preserves the budget's per-invocation unit.
 async fn measure_reference(
     reference: &Reference<'_>,
     artifacts: &mut ProfileArtifacts,
-) -> stow_types::error::Result<Vec<f64>> {
+) -> stow_types::error::Result<Vec<ReferenceRound>> {
     reference.run().await?;
-    let mut rounds_ms = Vec::with_capacity(ROUNDS);
+    let mut rounds = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
-        rounds_ms.push(
-            profiled(reference.inspector, artifacts, "reference", async || {
-                reference.run().await
+        rounds.push(
+            resolve_reference_round(async || {
+                let ((), cpu_ms) =
+                    profiled(reference.inspector, artifacts, "reference", async || {
+                        reference.run().await
+                    })
+                    .await?;
+                Ok(cpu_ms)
             })
-            .await?
-            .1,
+            .await?,
         );
     }
-    Ok(rounds_ms)
+    Ok(rounds)
+}
+
+async fn resolve_reference_round(
+    mut sample: impl AsyncFnMut() -> stow_types::error::Result<f64>,
+) -> stow_types::error::Result<ReferenceRound> {
+    let mut invocations = 0_u32;
+    let mut sampled_cpu_ms = 0.0;
+    loop {
+        let cpu_ms = sample().await?;
+        if cpu_ms <= 0.0 {
+            return Err(stow_error!(
+                "a complete reference invocation collected no CPU samples"
+            ));
+        }
+        invocations = invocations
+            .checked_add(1)
+            .ok_or_else(|| stow_error!("reference invocation count overflow"))?;
+        sampled_cpu_ms += cpu_ms;
+        if sampled_cpu_ms >= MIN_REFERENCE_CPU_MS {
+            break;
+        }
+    }
+    Ok(ReferenceRound {
+        invocations: std::num::NonZeroU32::new(invocations)
+            .expect("a resolved round invoked the reference"),
+        sampled_cpu_ms,
+    })
 }
 
 /// Connect and verify that idle isolate time is not counted as CPU.
@@ -1094,8 +1146,22 @@ fn render_report(report: &WorkerCpuReport) -> String {
         out,
         "reference workload {:.2} ms (before the lanes {}; after {})",
         report.reference.cpu_ms,
-        rounds(&report.reference.rounds_before),
-        rounds(&report.reference.rounds_after)
+        rounds(
+            &report
+                .reference
+                .rounds_before
+                .iter()
+                .map(ReferenceRound::per_invocation_ms)
+                .collect::<Vec<_>>()
+        ),
+        rounds(
+            &report
+                .reference
+                .rounds_after
+                .iter()
+                .map(ReferenceRound::per_invocation_ms)
+                .collect::<Vec<_>>()
+        )
     );
     let _ = writeln!(out, "{}", table.render());
     let over: Vec<&str> = report.breaches().map(|row| row.lane.as_str()).collect();
@@ -1117,7 +1183,7 @@ mod tests {
 
     use super::{
         CpuProfile, LaneCpu, ProfileArtifacts, REFERENCE_DRIFT_LIMIT, edge_context, profile_cpu_ms,
-        reference_cpu, track_context,
+        track_context,
     };
 
     async fn incomplete_source_inspector(listener: tokio::net::TcpListener) {
@@ -1451,6 +1517,60 @@ mod tests {
         assert_eq!(artifacts.scripts["42"], "stable-worker.js");
         assert_eq!(artifacts.scripts["44"], "worker-module");
         assert_eq!(profile_cpu_ms(&profile), 0.2);
+    }
+
+    fn reference_cpu(
+        before: Vec<f64>,
+        after: Vec<f64>,
+    ) -> stow_types::error::Result<super::ReferenceCpu> {
+        let rounds = |values: Vec<f64>| {
+            values
+                .into_iter()
+                .map(|sampled_cpu_ms| super::ReferenceRound {
+                    invocations: std::num::NonZeroU32::new(1).expect("one"),
+                    sampled_cpu_ms,
+                })
+                .collect()
+        };
+        super::reference_cpu(rounds(before), rounds(after))
+    }
+
+    #[tokio::test]
+    async fn a_fast_reference_accumulates_complete_invocations_and_zero_samples_fail() {
+        let mut calls = 0;
+        let round = super::resolve_reference_round(async || {
+            calls += 1;
+            Ok(8.5)
+        })
+        .await
+        .expect("resolved round");
+        assert_eq!(calls, 2);
+        assert_eq!(round.invocations.get(), 2);
+        assert!(close(round.sampled_cpu_ms, 17.0));
+        assert!(close(round.per_invocation_ms(), 8.5));
+        assert!(
+            super::resolve_reference_round(async || Ok(0.0))
+                .await
+                .is_err()
+        );
+        assert!(
+            super::resolve_reference_round(async || Err(stow_types::stow_error!("capture failed")))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn fast_reference_rounds_preserve_the_per_invocation_budget_unit() {
+        let round = |invocations, sampled_cpu_ms| super::ReferenceRound {
+            invocations: std::num::NonZeroU32::new(invocations).expect("invocations"),
+            sampled_cpu_ms,
+        };
+        let reference =
+            super::reference_cpu(vec![round(2, 17.0), round(3, 25.5)], vec![round(4, 34.0)])
+                .expect("resolved rounds");
+        assert!(close(reference.cpu_ms, 8.5));
+        assert!(super::reference_cpu(vec![round(1, 8.5)], vec![round(2, 17.0)]).is_err());
     }
 
     /// The reference is the smallest round of either set, and a lane is

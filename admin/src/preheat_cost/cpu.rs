@@ -118,6 +118,17 @@ pub(super) async fn read(dir: &Path) -> stow_types::error::Result<PreheatCpu> {
 }
 
 #[cfg(test)]
+fn reference_rounds(values: &[f64]) -> Vec<crate::traffic_cost::ReferenceRound> {
+    values
+        .iter()
+        .map(|&sampled_cpu_ms| crate::traffic_cost::ReferenceRound {
+            invocations: std::num::NonZeroU32::new(1).expect("one"),
+            sampled_cpu_ms,
+        })
+        .collect()
+}
+
+#[cfg(test)]
 pub fn test_cpu(wave_ms: f64, resubmit_ms: f64) -> PreheatCpu {
     let phase = |segment, cpu_ms| PhaseCpu {
         initial: SegmentCpu {
@@ -127,8 +138,8 @@ pub fn test_cpu(wave_ms: f64, resubmit_ms: f64) -> PreheatCpu {
             idle_window_ms: 3_000,
             idle_cpu_ms: 0.0,
             reference: ReferenceCpu {
-                rounds_before: vec![20.0; 3],
-                rounds_after: vec![20.0; 3],
+                rounds_before: reference_rounds(&[20.0; 3]),
+                rounds_after: reference_rounds(&[20.0; 3]),
                 cpu_ms: 20.0,
             },
         },
@@ -154,8 +165,8 @@ mod tests {
             "idle_window_ms": 3000,
             "idle_cpu_ms": 0.0,
             "reference": {
-                "rounds_before": [20.0, 21.0, 22.0],
-                "rounds_after": [22.0, 21.0, 20.0],
+                "rounds_before": super::reference_rounds(&[20.0, 21.0, 22.0]),
+                "rounds_after": super::reference_rounds(&[22.0, 21.0, 20.0]),
                 "cpu_ms": 20.0,
             },
             "profiles": [{"label": "preheat", "profile": {}}],
@@ -185,7 +196,7 @@ mod tests {
         assert_eq!(cpu.resubmit.total_ms(), 7.0);
         assert_eq!(
             cpu.wave.resumed[0].reference.rounds_after,
-            vec![22.0, 21.0, 20.0]
+            super::reference_rounds(&[22.0, 21.0, 20.0])
         );
     }
 
