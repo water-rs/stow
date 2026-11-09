@@ -3404,7 +3404,9 @@ impl Graph {
                             record.run_id.clone_from(&update.run_id);
                             record.run_url.clone_from(&update.run_url);
                         }
-                        RequestRunAction::Completed if record.state != "enqueued" => {
+                        RequestRunAction::Completed
+                            if matches!(record.state.as_str(), "accepted" | "resolving") =>
+                        {
                             "failed".clone_into(&mut record.state);
                             record.error = Some(match update.conclusion.as_deref() {
                                 Some("success") => {
@@ -4309,6 +4311,94 @@ mod tests {
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.85.0";
+
+    fn request_graph(state: &str) -> Graph {
+        let mut graph = Graph::default();
+        graph.requests.insert(
+            "request".to_owned(),
+            RequestRecord {
+                admission: Box::new(stow_types::api::RequestAdmission {
+                    request_id: "request".to_owned(),
+                    crate_name: "serde".parse().expect("crate"),
+                    version: "1.0.219".parse().expect("version"),
+                    features_json: FeaturesJson::default(),
+                    rustc_version: RUSTC.parse().expect("rustc"),
+                    max_closure: 500,
+                }),
+                attempt: 1,
+                dispatched_at: 100,
+                state: state.to_owned(),
+                run_id: Some("123".to_owned()),
+                run_url: Some("https://github.com/water-rs/stow/actions/runs/123".to_owned()),
+                outcome_json: Some("[]".to_owned()),
+                error: (state == "failed").then(|| "specific resolver failure".to_owned()),
+            },
+        );
+        graph
+    }
+
+    fn request_completion(attempt: u32, conclusion: &str) -> SchedulerEvent {
+        SchedulerEvent::Request {
+            request_id: "request".to_owned(),
+            kind: stow_types::api::RequestEvent::RunUpdated {
+                update: Box::new(stow_types::api::RequestRunUpdate {
+                    attempt,
+                    action: stow_types::api::RequestRunAction::Completed,
+                    conclusion: Some(conclusion.to_owned()),
+                    run_id: Some("123".to_owned()),
+                    run_url: None,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn completed_request_deliveries_preserve_both_settled_outcomes_on_replay() {
+        for state in ["enqueued", "failed"] {
+            for conclusion in ["success", "failure", "cancelled"] {
+                let mut graph = request_graph(state);
+                let before = graph.requests["request"].clone();
+                let event = request_completion(1, conclusion);
+                graph.apply(&event, 200);
+                graph.apply(&event, 300);
+                let after = &graph.requests["request"];
+                assert_eq!(after.state, before.state);
+                assert_eq!(after.error, before.error);
+                assert_eq!(after.outcome_json, before.outcome_json);
+                assert_eq!(after.run_id, before.run_id);
+                assert_eq!(after.run_url, before.run_url);
+            }
+        }
+    }
+
+    #[test]
+    fn completed_request_without_an_outcome_still_fails_each_live_state() {
+        for state in ["accepted", "resolving"] {
+            for conclusion in ["success", "failure"] {
+                let mut graph = request_graph(state);
+                graph.apply(&request_completion(1, conclusion), 200);
+                let record = &graph.requests["request"];
+                assert_eq!(record.state, "failed");
+                let error = record.error.as_deref().expect("completion error");
+                assert!(if conclusion == "success" {
+                    error.contains("without an outcome")
+                } else {
+                    error.contains("failure")
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn superseded_request_completion_cannot_fail_a_live_attempt() {
+        for state in ["accepted", "resolving"] {
+            let mut graph = request_graph(state);
+            graph.apply(&request_completion(0, "failure"), 200);
+            let record = &graph.requests["request"];
+            assert_eq!(record.state, state);
+            assert!(record.error.is_none());
+        }
+    }
 
     fn sub(name: &str) -> SubmissionNode {
         let mut node = SubmissionNode {
