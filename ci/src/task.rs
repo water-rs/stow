@@ -798,8 +798,10 @@ pub async fn phase_unit_graphs(
     for &phase in cargo_phases(cargo_subcommand) {
         let mut invocations = std::collections::VecDeque::from(phase_invocations(task).to_vec());
         while let Some(invocation) = invocations.pop_front() {
+            let passes_target = invocation_passes_target(task, invocation).await?;
             #[cfg_attr(not(feature = "mock-compile"), allow(unused_mut))]
-            let mut phase_args = cargo_phase_args(workspace, task, phase, invocation).await?;
+            let mut phase_args =
+                cargo_phase_args(workspace, task, phase, invocation, passes_target)?;
             #[cfg(feature = "mock-compile")]
             if let Some((_, wrapper)) = &mock_wrapper {
                 phase_args.push("--config".to_owned());
@@ -808,7 +810,6 @@ pub async fn phase_unit_graphs(
                     toml::Value::String(wrapper.to_string_lossy().into_owned())
                 ));
             }
-            let passes_target = invocation_passes_target(task, invocation).await?;
             let graph = stow_cli::resolve_exact_dependency_graph(
                 workspace.manifest_path(),
                 phase.as_str(),
@@ -1618,7 +1619,8 @@ async fn run_phase(
 ) -> stow_types::error::Result<Option<crate::failure::FailureCandidate>> {
     let setup = run.setup;
     create_dir_all(target_dir).await?;
-    let mut args = cargo_phase_args(setup.workspace, task, phase, invocation).await?;
+    let passes_target = invocation_passes_target(task, invocation).await?;
+    let mut args = cargo_phase_args(setup.workspace, task, phase, invocation, passes_target)?;
     args.push("--message-format=json".to_owned());
     let lockfile =
         async_fs::read_to_string(setup.workspace.workspace_root().join("Cargo.lock")).await?;
@@ -1688,7 +1690,6 @@ async fn run_phase(
                 runner_host_triple(task)?,
             );
     }
-    let passes_target = invocation_passes_target(task, invocation).await?;
     let output = command.output().await.map_err(|error| {
         stow_types::stow_error!("run sandboxed cargo {}: {error}", phase.as_str())
     })?;
@@ -1818,11 +1819,12 @@ fn phase_invocations(task: &BuildTaskPayload) -> &'static [CargoInvocation] {
 }
 
 /// The `cargo` argv for one sandboxed phase.
-async fn cargo_phase_args(
+fn cargo_phase_args(
     workspace: &BuildWorkspace,
     task: &BuildTaskPayload,
     phase: CargoSubcommand,
     invocation: CargoInvocation,
+    passes_target: bool,
 ) -> stow_types::error::Result<Vec<String>> {
     let mut args = vec![
         phase.as_str().to_owned(),
@@ -1856,7 +1858,7 @@ async fn cargo_phase_args(
     // it produces the host units of both invocation shapes, so its
     // `Explicit` run passes `--target` even though its target is the
     // host triple.
-    if invocation_passes_target(task, invocation).await? {
+    if passes_target {
         args.push("--target".to_owned());
         args.push(task.target.as_str().to_owned());
     }
