@@ -3100,6 +3100,8 @@ impl Graph {
             state_capacity = self.states.capacity(),
             state_storage_bytes = self.states.capacity() * size_of::<State>(),
             intern_storage_bytes = self.intern.heap_bytes(),
+            ready_entries = self.ready_sets().map(BTreeSet::len).sum::<usize>(),
+            ready_classes = self.ready.len() + self.ready_macos.len(),
             priority_values = self.priorities.len(),
             priority_storage_bytes = self.priorities.heap_bytes(),
             task_id_index_bytes = self.ids.heap_bytes(),
