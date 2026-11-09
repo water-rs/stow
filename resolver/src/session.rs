@@ -723,16 +723,19 @@ fn reclaim_sources(gctx: &GlobalContext) -> CargoResult<()> {
 
     let _lock = gctx.acquire_package_cache_lock(CacheLockMode::MutateExclusive)?;
     let mut tracker = gctx.global_cache_tracker()?;
-    let mut gc = Gc::new(gctx, &mut tracker)?;
+    let result = {
+        let mut gc = Gc::new(gctx, &mut tracker)?;
+        gc.gc(
+            &mut CleanContext::new(gctx),
+            &GcOpts {
+                max_src_size: Some(0),
+                max_git_co_age: Some(std::time::Duration::ZERO),
+                ..GcOpts::default()
+            },
+        )
+    };
     drop(tracker);
-    gc.gc(
-        &mut CleanContext::new(gctx),
-        &GcOpts {
-            max_src_size: Some(0),
-            max_git_co_age: Some(std::time::Duration::ZERO),
-            ..GcOpts::default()
-        },
-    )
+    result
 }
 
 #[cfg(test)]
