@@ -193,23 +193,27 @@ pub(super) async fn capture_segment<R>(
     work: impl AsyncFnOnce() -> stow_types::error::Result<R>,
 ) -> stow_types::error::Result<(R, SegmentReport)> {
     let (inspector, mut artifacts, idle_cpu_ms) = prepare_sampler(inspector_url).await?;
-    let rounds_before = measure_reference(&inspector, &mut artifacts).await?;
-    let measured = profiled(&inspector, &mut artifacts, label, work).await;
-    artifacts.save_raw(out).await?;
-    let (result, cpu_ms) = measured?;
-    let rounds_after = measure_reference(&inspector, &mut artifacts).await;
-    artifacts.save_raw(out).await?;
-    let rounds_after = rounds_after?;
-    let report = SegmentReport {
-        sampling_interval_us: SAMPLING_INTERVAL_US,
-        idle_window_ms: u64::try_from(IDLE_WINDOW.as_millis())?,
-        idle_cpu_ms,
-        reference: reference_cpu(rounds_before, rounds_after)?,
-        cpu_ms,
-        scripts: artifacts.sources(&inspector).await?,
-        profiles: artifacts.profiles,
-    };
-    Ok((result, report))
+    inspector
+        .with_reference(async |reference| {
+            let rounds_before = measure_reference(reference, &mut artifacts).await?;
+            let measured = profiled(&inspector, &mut artifacts, label, work).await;
+            artifacts.save_raw(out).await?;
+            let (result, cpu_ms) = measured?;
+            let rounds_after = measure_reference(reference, &mut artifacts).await;
+            artifacts.save_raw(out).await?;
+            let rounds_after = rounds_after?;
+            let report = SegmentReport {
+                sampling_interval_us: SAMPLING_INTERVAL_US,
+                idle_window_ms: u64::try_from(IDLE_WINDOW.as_millis())?,
+                idle_cpu_ms,
+                reference: reference_cpu(rounds_before, rounds_after)?,
+                cpu_ms,
+                scripts: artifacts.sources(&inspector).await?,
+                profiles: artifacts.profiles,
+            };
+            Ok((result, report))
+        })
+        .await
 }
 
 /// Profiled rounds per lane; the lane reports the smallest.
@@ -593,15 +597,62 @@ impl Inspector {
         self.session.call(method, params).await
     }
 
-    /// Evaluate [`REFERENCE_WORKLOAD`] in the isolate and check it
-    /// returned [`REFERENCE_CHECKSUM`].
-    async fn run_reference(&self) -> stow_types::error::Result<()> {
+    /// Retain the same function through warm-up and sampling. The remote
+    /// object is released even when the sampling scope fails.
+    async fn with_reference<R>(
+        &self,
+        work: impl AsyncFnOnce(&Reference<'_>) -> stow_types::error::Result<R>,
+    ) -> stow_types::error::Result<R> {
         let evaluated = self
             .call(
                 "Runtime.evaluate",
                 serde_json::json!({
                     "expression": REFERENCE_WORKLOAD,
                     "contextId": self.context_id,
+                    "returnByValue": false,
+                }),
+            )
+            .await?;
+        if let Some(exception) = evaluated.get("exceptionDetails") {
+            return Err(stow_error!("the reference workload threw: {exception}"));
+        }
+        let object_id = evaluated["result"]["objectId"]
+            .as_str()
+            .filter(|_| evaluated["result"]["type"] == "function")
+            .ok_or_else(|| stow_error!("reference did not evaluate to a function: {evaluated}"))?;
+        let reference = Reference {
+            inspector: self,
+            object_id,
+        };
+        let result = work(&reference).await;
+        let released = self
+            .call(
+                "Runtime.releaseObject",
+                serde_json::json!({"objectId":object_id}),
+            )
+            .await;
+        let value = result?;
+        released?;
+        Ok(value)
+    }
+}
+
+/// A warmed function retained by the inspector for one sampling scope.
+struct Reference<'a> {
+    inspector: &'a Inspector,
+    object_id: &'a str,
+}
+
+impl Reference<'_> {
+    /// Invoke the retained workload and check its checksum.
+    async fn run(&self) -> stow_types::error::Result<()> {
+        let evaluated = self
+            .inspector
+            .call(
+                "Runtime.callFunctionOn",
+                serde_json::json!({
+                    "objectId": self.object_id,
+                    "functionDeclaration": "function() { return this(); }",
                     "returnByValue": true,
                 }),
             )
@@ -877,15 +928,15 @@ async fn measure_lane(
 /// Profile the reference workload: one unprofiled run to warm the JIT,
 /// then [`ROUNDS`] profiled rounds.
 async fn measure_reference(
-    inspector: &Inspector,
+    reference: &Reference<'_>,
     artifacts: &mut ProfileArtifacts,
 ) -> stow_types::error::Result<Vec<f64>> {
-    inspector.run_reference().await?;
+    reference.run().await?;
     let mut rounds_ms = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
         rounds_ms.push(
-            profiled(inspector, artifacts, "reference", async || {
-                inspector.run_reference().await
+            profiled(reference.inspector, artifacts, "reference", async || {
+                reference.run().await
             })
             .await?
             .1,
@@ -952,36 +1003,40 @@ pub async fn run(edge: &Edge, args: &CpuArgs, output: Output) -> stow_types::err
         .map_err(|error| stow_error!("{error}"))?;
     let (inspector, mut artifacts, idle_cpu_ms) = prepare_sampler(&args.inspector_url).await?;
 
-    let rounds_before = measure_reference(&inspector, &mut artifacts).await?;
-    let mut measured = Vec::with_capacity(lanes.len());
-    for lane in &lanes {
-        measured.push(measure_lane(lane, edge, &inspector, &mut artifacts, args).await?);
-    }
-    let rounds_after = measure_reference(&inspector, &mut artifacts).await?;
-    let scripts = artifacts.sources(&inspector).await?;
-    let reference = reference_cpu(rounds_before, rounds_after)?;
-    let rows = measured
-        .into_iter()
-        .map(|lane| lane.gate(reference.cpu_ms))
-        .collect();
-    let report = WorkerCpuReport {
-        sampling_interval_us: SAMPLING_INTERVAL_US,
-        idle_window_ms: IDLE_WINDOW.as_millis() as u64,
-        idle_cpu_ms,
-        reference,
-        rows,
-        profiles: artifacts.profiles,
-        scripts,
-    };
-    emit(output, &report, render_report)?;
-    let over = report.breaches().count();
-    if over == 0 {
-        Ok(())
-    } else {
-        Err(stow_error!(
-            "traffic-cost cpu: {over} lane(s) over their Worker CPU budget"
-        ))
-    }
+    inspector
+        .with_reference(async |reference| {
+            let rounds_before = measure_reference(reference, &mut artifacts).await?;
+            let mut measured = Vec::with_capacity(lanes.len());
+            for lane in &lanes {
+                measured.push(measure_lane(lane, edge, &inspector, &mut artifacts, args).await?);
+            }
+            let rounds_after = measure_reference(reference, &mut artifacts).await?;
+            let scripts = artifacts.sources(&inspector).await?;
+            let reference = reference_cpu(rounds_before, rounds_after)?;
+            let rows = measured
+                .into_iter()
+                .map(|lane| lane.gate(reference.cpu_ms))
+                .collect();
+            let report = WorkerCpuReport {
+                sampling_interval_us: SAMPLING_INTERVAL_US,
+                idle_window_ms: IDLE_WINDOW.as_millis() as u64,
+                idle_cpu_ms,
+                reference,
+                rows,
+                profiles: artifacts.profiles,
+                scripts,
+            };
+            emit(output, &report, render_report)?;
+            let over = report.breaches().count();
+            if over == 0 {
+                Ok(())
+            } else {
+                Err(stow_error!(
+                    "traffic-cost cpu: {over} lane(s) over their Worker CPU budget"
+                ))
+            }
+        })
+        .await
 }
 
 /// Human rendering — one row per lane against its budget.
@@ -1048,7 +1103,7 @@ mod tests {
         reference_cpu, track_context,
     };
 
-    async fn incomplete_source_inspector(listener: tokio::net::TcpListener, fail_work: bool) {
+    async fn incomplete_source_inspector(listener: tokio::net::TcpListener) {
         use futures_util::StreamExt as _;
         let (stream, _) = listener.accept().await.expect("accept");
         let mut socket = async_tungstenite::tokio::accept_async(stream)
@@ -1073,6 +1128,8 @@ mod tests {
             }
             let result = match method {
                 "Runtime.evaluate" => serde_json::json!({"result":{
+                    "type":"function", "objectId":"reference"}}),
+                "Runtime.callFunctionOn" => serde_json::json!({"result":{
                     "value":super::REFERENCE_CHECKSUM}}),
                 "Profiler.stop" => {
                     stops += 1;
@@ -1099,7 +1156,7 @@ mod tests {
                 ))
                 .await
                 .expect("reply");
-            if method == "Debugger.getScriptSource" || (fail_work && stops == 5) {
+            if method == "Runtime.releaseObject" {
                 break;
             }
         }
@@ -1114,7 +1171,7 @@ mod tests {
             let address = listener.local_addr().expect("address");
             let directory = tempfile::tempdir().expect("directory");
             let output = directory.path().join("segment.json");
-            let server = incomplete_source_inspector(listener, fail_work);
+            let server = incomplete_source_inspector(listener);
             let client = async {
                 let result = super::capture_segment(
                     &format!("ws://{address}"),
@@ -1436,6 +1493,104 @@ mod tests {
         .expect("profile");
         // Four busy samples at 100 µs — the 9 ms delta is a gap, not CPU.
         assert!((profile_cpu_ms(&profile) - 0.4).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn reference_calls_share_one_function_and_release_it_after_success_or_failure() {
+        use futures_util::StreamExt as _;
+
+        for fail_work in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listen");
+            let address = listener.local_addr().expect("address");
+            let server = async {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut socket = async_tungstenite::tokio::accept_async(stream)
+                    .await
+                    .expect("handshake");
+                let mut evaluations = 0;
+                let mut calls = 0;
+                loop {
+                    let frame = socket.next().await.expect("request").expect("frame");
+                    let request: serde_json::Value =
+                        serde_json::from_str(frame.to_text().expect("text")).expect("command");
+                    let method = request["method"].as_str().expect("method");
+                    if method == "Runtime.enable" {
+                        socket
+                            .send(async_tungstenite::tungstenite::Message::Text(
+                                serde_json::json!({"method":"Runtime.executionContextCreated",
+                            "params":{"context":{"id":7,"name":"Worker"}}})
+                                .to_string()
+                                .into(),
+                            ))
+                            .await
+                            .expect("context");
+                    }
+                    let result = match method {
+                        "Runtime.disable" | "Runtime.enable" => serde_json::json!({}),
+                        "Runtime.evaluate" => {
+                            evaluations += 1;
+                            assert_eq!(evaluations, 1);
+                            assert_eq!(request["params"]["contextId"], 7);
+                            assert_eq!(request["params"]["expression"], super::REFERENCE_WORKLOAD);
+                            assert_eq!(request["params"]["returnByValue"], false);
+                            serde_json::json!({"result":{"type":"function","objectId":"warmed"}})
+                        }
+                        "Runtime.callFunctionOn" => {
+                            calls += 1;
+                            assert_eq!(request["params"]["objectId"], "warmed");
+                            assert_eq!(request["params"]["returnByValue"], true);
+                            serde_json::json!({"result":{"value":super::REFERENCE_CHECKSUM}})
+                        }
+                        "Runtime.releaseObject" => {
+                            assert_eq!(request["params"]["objectId"], "warmed");
+                            assert_eq!((evaluations, calls), (1, 2));
+                            serde_json::json!({})
+                        }
+                        other => panic!("unexpected command {other}"),
+                    };
+                    socket
+                        .send(async_tungstenite::tungstenite::Message::Text(
+                            serde_json::json!({"id":request["id"],"result":result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .expect("reply");
+                    if method == "Runtime.releaseObject" {
+                        break;
+                    }
+                }
+            };
+            let client = async {
+                let inspector = super::Inspector::connect(&format!("ws://{address}"))
+                    .await
+                    .expect("inspector");
+                let result = inspector
+                    .with_reference(async |reference| {
+                        reference.run().await?;
+                        reference.run().await?;
+                        if fail_work {
+                            Err(stow_types::stow_error!("capture failed"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .await;
+                if fail_work {
+                    assert!(
+                        result
+                            .expect_err("failed capture")
+                            .to_string()
+                            .contains("capture failed")
+                    );
+                } else {
+                    result.expect("capture");
+                }
+            };
+            tokio::join!(server, client);
+        }
     }
 
     /// The reference evaluates in the one live worker context the
