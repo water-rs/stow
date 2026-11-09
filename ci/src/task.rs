@@ -1304,7 +1304,7 @@ async fn compile_task(
     // Resolve and verify the run toolchain once per task — a name whose
     // rustc reports a different release than the pinned `rustc_version`
     // is refused here, before any phase runs cargo.
-    verified_run_toolchain(task)?;
+    verified_run_toolchain(task).await?;
     let cargo_home = cargo_home()?;
     let workspace = mode.workspace(task, &cargo_home).await?;
 
@@ -1435,13 +1435,14 @@ pub fn run_toolchain(task: &BuildTaskPayload) -> String {
 /// invocation, naming the toolchain, its reported release, and the
 /// task's `rustc_version`. `RUSTUP_AUTO_INSTALL=0` keeps a missing name
 /// a refusal instead of a network install.
-pub fn verified_run_toolchain(task: &BuildTaskPayload) -> stow_types::error::Result<String> {
+pub async fn verified_run_toolchain(task: &BuildTaskPayload) -> stow_types::error::Result<String> {
     let toolchain = run_toolchain(task);
-    let output = std::process::Command::new("rustc")
+    let output = Command::new("rustc")
         .arg("-vV")
         .env("RUSTUP_TOOLCHAIN", &toolchain)
         .env("RUSTUP_AUTO_INSTALL", "0")
         .output()
+        .await
         .map_err(|error| stow_types::stow_error!("probe run toolchain {toolchain}: {error}"))?;
     if !output.status.success() {
         return Err(stow_types::stow_error!(
@@ -3421,7 +3422,7 @@ mod tests {
     fn a_mismatched_run_toolchain_is_refused_before_any_cargo() {
         let mut task = task_with_features(&[]);
         task.rustc_version = WireRustcVersion::parse("0.0.0").expect("mismatched version parses");
-        let error = super::verified_run_toolchain(&task)
+        let error = smol::block_on(super::verified_run_toolchain(&task))
             .expect_err("a toolchain reporting a different release must be refused");
         let message = format!("{error}");
         assert!(
@@ -3444,7 +3445,7 @@ mod tests {
     fn a_matching_run_toolchain_verifies_and_returns_its_name() {
         let mut task = task_with_features(&[]);
         task.rustc_version = active_release();
-        let toolchain = super::verified_run_toolchain(&task)
+        let toolchain = smol::block_on(super::verified_run_toolchain(&task))
             .expect("a toolchain reporting the pinned release verifies");
         assert_eq!(toolchain, super::run_toolchain(&task));
     }
