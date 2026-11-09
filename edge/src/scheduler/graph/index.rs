@@ -70,7 +70,6 @@ impl IxTable {
     }
 
     /// Heap bytes the slot array holds.
-    #[cfg(test)]
     pub(super) const fn heap_bytes(&self) -> usize {
         self.slots.len() * size_of::<u32>()
     }
@@ -176,7 +175,6 @@ impl Interner {
     }
 
     /// Heap bytes held: text, offsets and table.
-    #[cfg(test)]
     pub(super) const fn heap_bytes(&self) -> usize {
         self.text.capacity() + self.ends.capacity() * size_of::<u32>() + self.table.heap_bytes()
     }
