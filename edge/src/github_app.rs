@@ -377,12 +377,14 @@ mod tests {
     }
 
     impl stow_types::ci::CiTransport for ExchangeTransport {
-        async fn send(
+        fn send(
             &self,
             request: stow_types::ci::CiRequest,
-        ) -> Result<stow_types::ci::CiResponse, stow_types::ci::DispatchError> {
+        ) -> impl std::future::Future<
+            Output = Result<stow_types::ci::CiResponse, stow_types::ci::DispatchError>,
+        > + Send {
             self.requests.lock().unwrap().push(request);
-            self.response.lock().unwrap().take().expect("one exchange")
+            std::future::ready(self.response.lock().unwrap().take().expect("one exchange"))
         }
     }
 
@@ -415,7 +417,7 @@ mod tests {
             .expect("exchange");
         assert_eq!(token.token, "test-installation-token");
         assert_eq!(token.expires_at, "2026-11-09T10:00:00Z");
-        let requests = transport.requests.lock().unwrap();
+        let requests = transport.requests.into_inner().unwrap();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(request.method, "POST");
