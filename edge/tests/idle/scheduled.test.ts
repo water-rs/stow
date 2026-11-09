@@ -10,7 +10,7 @@
 // exception that vitest counts against the whole run, so they are covered
 // by the host tests of `edge/src/periodic.rs` instead.
 
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -78,5 +78,12 @@ describe("control dispatch recovery fence", () => {
 		expect(await call("/preheat/release", release)).toBe(503);
 		const observed = await (await fetch(control)).json() as { attempts: number };
 		expect(observed.attempts).toBe(1);
+		const deadlines = await runInDurableObject(stub, async (_instance, ctx) => {
+			return ctx.storage.sql.exec<{ until: number }>(
+				"SELECT json_extract(event, '$.until') AS until FROM event_log WHERE json_extract(event, '$.event') = 'ci_rate_limited'",
+			).toArray();
+		});
+		expect(deadlines).toHaveLength(1);
+		expect(deadlines[0].until).toBeGreaterThan(Date.now());
 	});
 });
