@@ -85,6 +85,43 @@ pub struct CpuArgs {
     pub warmup_events: u32,
 }
 
+/// Observe native inspector memory counters without collecting garbage.
+#[derive(Debug, Args)]
+pub struct MemoryArgs {
+    /// The local mock edge's DevTools inspector WebSocket URL.
+    #[arg(long)]
+    inspector_url: String,
+}
+
+/// Native isolate counters, not a sum or a production memory-limit verdict.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HeapUsage {
+    used_size: f64,
+    total_size: f64,
+    embedder_heap_used_size: f64,
+    backing_storage_size: f64,
+}
+
+/// Preserve each counter independently: backing storage includes ArrayBuffers
+/// and external strings, while heap fields describe different allocations.
+pub async fn memory(args: &MemoryArgs, output: Output) -> stow_types::error::Result<()> {
+    let session = Session::connect(&args.inspector_url).await?;
+    let usage = session.heap_usage().await?;
+    emit(output, &usage, |usage| {
+        let mut table = Table::new(&["isolate counter", "bytes"]);
+        for (name, bytes) in [
+            ("JS heap used", usage.used_size),
+            ("JS heap allocated", usage.total_size),
+            ("embedder heap used", usage.embedder_heap_used_size),
+            ("backing storage", usage.backing_storage_size),
+        ] {
+            table.push(vec![name.to_owned(), bytes.to_string()]);
+        }
+        table.render()
+    })
+}
+
 /// One uninterrupted preheat segment, controlled by the mock harness.
 #[derive(Debug, Args)]
 pub struct SegmentArgs {
@@ -416,6 +453,13 @@ struct Session {
 }
 
 impl Session {
+    async fn heap_usage(&self) -> stow_types::error::Result<HeapUsage> {
+        Ok(serde_json::from_value(
+            self.call("Runtime.getHeapUsage", serde_json::Value::Null)
+                .await?,
+        )?)
+    }
+
     async fn connect(url: &str) -> stow_types::error::Result<Self> {
         // DevTools returns a complete profile in one frame. Capture duration,
         // rather than a generic WebSocket payload limit, bounds this local data.
@@ -989,6 +1033,56 @@ mod tests {
         CpuProfile, LaneCpu, ProfileArtifacts, REFERENCE_DRIFT_LIMIT, edge_context, profile_cpu_ms,
         reference_cpu, track_context,
     };
+
+    #[tokio::test]
+    async fn native_heap_observation_preserves_every_counter_and_rejects_missing_fields() {
+        use futures_util::StreamExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listen");
+        let address = listener.local_addr().expect("address");
+        let server = async {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut socket = async_tungstenite::tokio::accept_async(stream)
+                .await
+                .expect("handshake");
+            for result in [
+                serde_json::json!({"usedSize": 10, "totalSize": 20,
+                    "embedderHeapUsedSize": 30, "backingStorageSize": 40}),
+                serde_json::json!({"usedSize": 10, "totalSize": 20}),
+            ] {
+                let frame = socket.next().await.expect("request").expect("frame");
+                let request: serde_json::Value =
+                    serde_json::from_str(frame.to_text().expect("text")).expect("command");
+                assert_eq!(request["method"], "Runtime.getHeapUsage");
+                socket
+                    .send(async_tungstenite::tungstenite::Message::Text(
+                        serde_json::json!({"id": request["id"], "result": result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .expect("reply");
+            }
+        };
+        let client = async {
+            let session = super::Session::connect(&format!("ws://{address}"))
+                .await
+                .expect("connect");
+            let usage = session.heap_usage().await.expect("native counters");
+            assert_eq!(usage.used_size, 10.0);
+            assert_eq!(usage.total_size, 20.0);
+            assert_eq!(usage.embedder_heap_used_size, 30.0);
+            assert_eq!(usage.backing_storage_size, 40.0);
+            assert!(session.heap_usage().await.is_err());
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(server, client);
+        })
+        .await
+        .expect("inspector deadline");
+    }
 
     #[tokio::test]
     async fn inspector_receives_a_profile_frame_larger_than_the_default_limit() {
