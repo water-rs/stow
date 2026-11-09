@@ -40,7 +40,7 @@ export async function jwksFetches(): Promise<number> {
 	return ((await res.json()) as { fetches: number }).fetches;
 }
 
-function b64url(bytes: ArrayBuffer | Uint8Array | string): string {
+export function b64url(bytes: ArrayBuffer | Uint8Array | string): string {
 	const data =
 		typeof bytes === "string" ? new TextEncoder().encode(bytes) : new Uint8Array(bytes);
 	return btoa(String.fromCharCode(...data))

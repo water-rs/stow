@@ -12,7 +12,7 @@
 import { exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 
-import { claims, jwksFetches, mint, newSigner, publish } from "./oidc-fixture";
+import { b64url, claims, jwksFetches, mint, newSigner, publish } from "./oidc-fixture";
 
 async function status(token: string): Promise<number> {
 	const res = await exports.default.fetch(
