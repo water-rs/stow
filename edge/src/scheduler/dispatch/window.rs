@@ -139,7 +139,6 @@ fn wire_claim(claim: graph::Claimed) -> stow_types::api::DispatchClaim {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use std::future::Future as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -227,20 +226,13 @@ mod tests {
                 primary,
             },
         );
-        let mut dispatch = Box::pin(dispatch_claims(graph, &db, &backend, claims, || {
-            HOST_NOW_MS
-        }));
-        let first =
-            std::future::poll_fn(|cx| std::task::Poll::Ready(dispatch.as_mut().poll(cx))).await;
-        assert_eq!(
-            sent.load(Ordering::SeqCst),
-            4,
-            "the first round starts concurrently"
-        );
-        match first {
-            std::task::Poll::Ready(result) => result.expect("dispatch"),
-            std::task::Poll::Pending => dispatch.await.expect("dispatch"),
-        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatch_claims(graph, &db, &backend, claims, || HOST_NOW_MS),
+        )
+        .await
+        .expect("the first round must reach all four requests concurrently")
+        .expect("dispatch");
         assert_eq!(
             sent.load(Ordering::SeqCst),
             4,
