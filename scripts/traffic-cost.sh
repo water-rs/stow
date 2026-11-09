@@ -501,7 +501,13 @@ RESOLVE_TOKEN_FILE="$WORK_DIR/resolve-token"
 (umask 077; "$BIN/stow-mock-registry" oidc-token --workflow resolve-request.yml \
     --lifetime-secs 7200 > "$RESOLVE_TOKEN_FILE")
 
+PREHEAT_CRON="$(bun -e 'console.log(Bun.TOML.parse(await Bun.file(process.argv[1]).text()).cloudflare.vars.STOW_PERIODIC_WORKFLOWS)' \
+    "$REPO_ROOT/edge/Skyzen.mock.toml" | jq -er '
+    to_entries | map(select(any(.value[]; . == "preheat-cron.yml")))
+    | if length == 1 then .[0].key else error("expected one preheat cron") end')"
 LANE_ARGS=(
+    --newreleases-secret "$(manifest_var Skyzen.mock.toml STOW_NEWRELEASES_WEBHOOK_SECRET)"
+    --preheat-cron "$PREHEAT_CRON"
     --resolve-token-file "$RESOLVE_TOKEN_FILE"
     --index-publish-token-file "$INDEX_PUBLISH_TOKEN_FILE"
     --index-publish-rustc "$(rustc --version | awk '{print $2}')"
