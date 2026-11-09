@@ -279,6 +279,7 @@ struct SnapshotHead {
     /// probe state a `store_meta` row cannot hold without a billed
     /// statement the replay cannot re-count.
     seeded_rows: Option<u32>,
+    ci_not_before: i64,
     freeze: Option<stow_types::api::DispatchFreezeRecord>,
     /// The operator's dispatch-cap setting (stow#1039) — `None` until
     /// the first `set`, when the deploy bindings apply.
@@ -885,6 +886,7 @@ impl Graph {
             next_generation: self.next_generation,
             meter_ops: self.meter.ops.clone(),
             seeded_rows: self.seeded_rows,
+            ci_not_before: self.ci_not_before,
             freeze: self.freeze.clone(),
             dispatch_cap: self.dispatch_cap.clone(),
             release_priority: self.release_priority.clone(),
@@ -1148,6 +1150,7 @@ impl SnapshotLoader {
         graph.meter.ops = head.meter_ops;
         graph.seeded_rows = head.seeded_rows;
         graph.freeze = head.freeze;
+        graph.ci_not_before = head.ci_not_before;
         graph.dispatch_cap = head.dispatch_cap;
         graph.release_priority = head.release_priority;
         graph.external_runs = head.external_runs.into_iter().collect();

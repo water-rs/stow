@@ -26,6 +26,17 @@ use skyzen_services::durable::DurableDb;
 /// splits so no row nears the platform's row bound.
 const MUTATE_PART_IDS: usize = 4096;
 
+/// Refuse a CI call while its durable recovery deadline is in the future.
+///
+/// # Errors
+/// `QueueError::CiRateLimited` until the server's recovery deadline.
+pub(super) fn require_ci_ready(graph: LoadedGraph<'_>, now: i64) -> Result<(), QueueError> {
+    if graph.with(|graph| graph.ci_waiting(now)) {
+        return Err(QueueError::CiRateLimited);
+    }
+    Ok(())
+}
+
 /// Append `events` to the log at `now`, then apply each to the graph.
 /// The append lands first: an event is acknowledged only once it is
 /// durable, and a wake replays exactly what was acknowledged. `Submit`
@@ -665,7 +676,7 @@ pub(super) async fn admit_request(
     now: i64,
 ) -> Result<queue::RequestAdmissionStep, QueueError> {
     let (step, event) =
-        graph.with(|graph| queue::admit_request(graph, admission, dispatched_at, settings))?;
+        graph.with(|graph| queue::admit_request(graph, admission, dispatched_at, settings, now))?;
     if let Some(event) = event {
         commit(graph, db, &[event], now).await?;
     }

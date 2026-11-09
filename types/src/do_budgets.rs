@@ -314,14 +314,10 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
-        // The newreleases.io forward: signature already verified at the
-        // edge, so the object only resolves its credential arm and
-        // posts one `workflow_dispatch` — `preheat_release_pass` takes
-        // no `DurableDb`, so the route bills no store row and the
-        // settle writes none either (stow#931). The 0/0/0 is a code
-        // read: the host drive's arm is a no-op, so its zero measures
-        // nothing. The old 2/4/4 row was the removed `do_meter`
-        // settle's, not this route's.
+        // The resident graph checks its recovery fence in memory;
+        // successful dispatch writes no log row. Cold recovery is
+        // measured separately by the wake drive. A limit response
+        // appends one recovery event instead of making more CI calls.
         name: "POST /preheat/release",
         statements: 0,
         rows_read: 0,
@@ -329,18 +325,9 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 500,
     },
     DriveBudget {
-        // The edge Cron Trigger's dispatch (stow#1100): like
-        // `/preheat/release`, `periodic_dispatch_pass` takes no
-        // `DurableDb` — it resolves the credential arm and posts one
-        // `workflow_dispatch`, so the route bills no store row. The
-        // 0/0/0 is a code read: the host drive's arm is a no-op. Per
-        // UTC day the trigger is 96 watchdog + 1 preheat-cron = 97
-        // scheduled invocations, each one object request, one token
-        // mint (the object is rarely resident between ticks) and one
-        // dispatch POST: 97 Worker requests, 97 object requests and
-        // at most 291 subrequests a day. Over 30 days that is 2,910 of
-        // 10M included Worker requests (0.03%) and of 1M included
-        // object requests (0.3%), far under the 80% line, and no rows.
+        // Periodic dispatch shares release preheat's in-memory fence
+        // and credential path. No successful-path SQL is added; cold
+        // recovery belongs to the separate wake drive.
         name: "POST /periodic/dispatch",
         statements: 0,
         rows_read: 0,
