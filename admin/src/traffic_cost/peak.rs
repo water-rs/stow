@@ -364,7 +364,7 @@ fn lane_breaches(lane: &Lane, stats: &LaneStats, p99_bound_ms: f64) -> Vec<Strin
 /// report and exit nonzero on a breach.
 pub async fn run(edge: &Edge, args: &PeakArgs, output: Output) -> stow_types::error::Result<()> {
     let report = if let (Some(url), Some(path)) = (&args.inspector_url, &args.cpu_out) {
-        let (report, cpu) = super::cpu::capture_segment(url, "peak", async || {
+        let (report, cpu) = super::cpu::capture_segment(url, "peak", path, async || {
             let report = drive(edge, args).await?;
             emit(output, &report, render_report)?;
             Ok(report)
