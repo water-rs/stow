@@ -1,7 +1,6 @@
 //! Durable Object glue: routes scheduler HTTP/alarm events into the queue
 //! state machine and GitHub dispatch.
 
-use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use js_sys::Reflect;
 use serde::{Deserialize, Serialize};
 use skyzen::durable::DurableObject;
@@ -93,7 +92,9 @@ async fn ensure_graph<'a>(
                 loaded.with(|graph| graph.reconcile_runs(&runs, now_ms()));
             }
             Err(error) => {
-                retain_ci_limit(loaded, db, &error).await?;
+                dispatch::retain_ci_limit(loaded, db, &error, now_ms())
+                    .await
+                    .map_err(route_error)?;
                 loaded.with(|graph| graph.reconcile_failed(now_ms()));
                 tracing::warn!(%error, "post-wake CI status reconcile failed — keeping replayed state");
             }
@@ -2084,7 +2085,9 @@ pub(super) async fn dispatch_pass(
                 graph.with(|graph| graph.reconcile_runs(&listed, now_ms()));
             }
             Err(error) => {
-                retain_ci_limit(graph, db, &error).await?;
+                dispatch::retain_ci_limit(graph, db, &error, now_ms())
+                    .await
+                    .map_err(route_error)?;
                 graph.with(|graph| graph.reconcile_failed(now_ms()));
                 tracing::warn!(%error, "CI status reconcile failed — keeping delivery-tracked external occupancy");
             }
@@ -2106,7 +2109,9 @@ pub(super) async fn dispatch_pass(
     if claims.is_empty() {
         return Ok(Vec::new());
     }
-    dispatch_claims(graph, db, &interface, claims).await?;
+    dispatch::dispatch_claims(graph, db, &interface, claims, now_ms)
+        .await
+        .map_err(route_error)?;
     Ok(task_ids)
 }
 
@@ -2131,133 +2136,6 @@ pub(super) fn now_ms() -> i64 {
     #[allow(clippy::cast_possible_truncation)]
     {
         js_sys::Date::now() as i64
-    }
-}
-
-/// Persist the API recovery fence before any subsequent request may start.
-async fn retain_ci_limit(
-    graph: graph::LoadedGraph<'_>,
-    db: &DurableDb,
-    error: &dispatch::DispatchError,
-) -> Result<bool> {
-    use stow_types::transient::RateLimit;
-    let now = now_ms();
-    let Some(limit) = error.rate_limit(now / 1_000) else {
-        return Ok(false);
-    };
-    let wait = match limit {
-        RateLimit::Wait { wait, .. } => wait,
-        RateLimit::Unstated => {
-            std::time::Duration::from_mins(u64::from(queue::dispatch_backoff_minutes(0)))
-        }
-    };
-    let until = now.saturating_add(i64::try_from(wait.as_millis()).unwrap_or(i64::MAX));
-    routes::commit(graph, db, &[SchedulerEvent::CiRateLimited { until }], now)
-        .await
-        .map_err(route_error)?;
-    Ok(true)
-}
-
-struct ClaimOutcome {
-    order: usize,
-    claim: graph::Claimed,
-    result: std::result::Result<stow_types::ci::DispatchedRun, dispatch::DispatchError>,
-}
-
-/// Construct each payload only after admitting its outbound slot.
-async fn submit_claim(
-    graph: graph::LoadedGraph<'_>,
-    backend: &dispatch::CiInterface<dispatch::CfTransport>,
-    order: usize,
-    claim: graph::Claimed,
-) -> Result<ClaimOutcome> {
-    let encoded = graph
-        .with(|graph| graph.claimed_payload(&claim))
-        .map_err(route_error)?
-        .encode_dispatch_task()
-        .map_err(|error| dispatch::DispatchError::Response(format!("encode task: {error}")));
-    let outcome = match encoded {
-        Ok(encoded) => backend.submit(&encoded).await,
-        Err(error) => Err(error),
-    };
-    Ok(ClaimOutcome {
-        order,
-        claim,
-        result: outcome,
-    })
-}
-
-/// At most four requests are active. Observe each completion immediately so
-/// a rate-limit refusal prevents any further admission, then drain the active
-/// requests and apply their results in claim order.
-async fn dispatch_claims(
-    graph: graph::LoadedGraph<'_>,
-    db: &DurableDb,
-    backend: &dispatch::CiInterface<dispatch::CfTransport>,
-    claims: Vec<graph::Claimed>,
-) -> Result<()> {
-    let mut pending = claims.into_iter().enumerate();
-    let mut active = FuturesUnordered::new();
-    for (order, claim) in pending
-        .by_ref()
-        .take(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
-    {
-        active.push(submit_claim(graph, backend, order, claim));
-    }
-    let mut outcomes = Vec::new();
-    while let Some(result) = active.next().await {
-        let outcome = result?;
-        if let Err(error) = &outcome.result {
-            retain_ci_limit(graph, db, error).await?;
-        }
-        outcomes.push(outcome);
-        if !graph.with(|graph| graph.ci_waiting(now_ms()))
-            && let Some((order, claim)) = pending.next()
-        {
-            active.push(submit_claim(graph, backend, order, claim));
-        }
-    }
-    let mut refused: Vec<_> = pending.map(|(_, claim)| wire_claim(claim)).collect();
-    outcomes.sort_unstable_by_key(|outcome| outcome.order);
-    let mut bindings = Vec::new();
-    let mut failures = Vec::new();
-    for outcome in outcomes {
-        let claim = outcome.claim;
-        match outcome.result {
-            Ok(run) => bindings.push(stow_types::api::DispatchBinding {
-                task_id: claim.task_id,
-                generation: claim.generation,
-                run_id: run.workflow_run_id.to_string(),
-            }),
-            Err(error) if error.rate_limit(now_ms() / 1_000).is_some() => {
-                refused.push(wire_claim(claim));
-            }
-            Err(error) => {
-                tracing::error!(task_id = %claim.task_id, %error, "failed to dispatch build");
-                failures.push((claim.task_id, claim.generation, error.to_string()));
-            }
-        }
-    }
-    if !refused.is_empty() {
-        routes::commit(
-            graph,
-            db,
-            &[SchedulerEvent::ClaimsRefused { claims: refused }],
-            now_ms(),
-        )
-        .await
-        .map_err(route_error)?;
-    }
-    routes::settle_dispatch(graph, db, bindings, failures, now_ms())
-        .await
-        .map_err(route_error)
-}
-
-fn wire_claim(claim: graph::Claimed) -> stow_types::api::DispatchClaim {
-    stow_types::api::DispatchClaim {
-        task_id: claim.task_id,
-        generation: claim.generation,
-        attempt: claim.attempt,
     }
 }
 

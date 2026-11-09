@@ -20,7 +20,6 @@ use crate::fetch_guard::{FetchedResponse, GuardedResponse};
 #[cfg(target_arch = "wasm32")]
 use stow_types::ci::{CiRequest, CiResponse, CiTransport};
 
-#[cfg(target_arch = "wasm32")]
 pub use stow_types::ci::{CiInterface, DispatchError};
 
 /// `CfFetch` under the pool's outbound bound — the transport the
@@ -119,3 +118,8 @@ impl CiTransport for CfTransport {
         })
     }
 }
+
+#[cfg(any(test, target_arch = "wasm32"))]
+mod window;
+#[cfg(any(test, target_arch = "wasm32"))]
+pub(super) use window::{dispatch_claims, retain_ci_limit};
