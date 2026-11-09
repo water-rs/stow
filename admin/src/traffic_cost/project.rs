@@ -119,8 +119,6 @@ enum CpuPricing {
     /// The event is no Worker request (it runs inside the Durable
     /// Object), so the Worker bills it no CPU.
     NoWorkerRequest,
-    /// A Worker request no lane can drive yet — the reason is printed.
-    Unmeasured(&'static str),
 }
 
 /// One scheduler call an event pays: the Durable Object requests it is
@@ -278,11 +276,7 @@ const EVENT_COSTS: &[EventCost] = &[
         ],
         claims: 0.0,
         worker_requests: forwards::human_request_worker_requests(true) as f64,
-        cpu: CpuPricing::Unmeasured(
-            "POST /api/v1/requests verifies Turnstile at challenges.cloudflare.com and reads the \
-             stable channel manifest from static.rust-lang.org — no lane drives it off the \
-             network, nor the resolve run's deliveries and outcome post",
-        ),
+        cpu: CpuPricing::Lanes(&[("human-lifecycle", 1.0)]),
         subrequests: 3.0,
         r2_ops: 0.0,
     },
@@ -636,17 +630,6 @@ pub struct RouteShare {
     pub share: f64,
 }
 
-/// A Worker route whose CPU no lane measures, with its volume.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct UnmeasuredCpu {
-    /// The event's route label.
-    pub route: &'static str,
-    /// Projected monthly events.
-    pub monthly_events: f64,
-    /// Why no lane drives it.
-    pub reason: &'static str,
-}
-
 /// The driver a breach names when preheat, not user traffic, is the
 /// larger part of the total.
 const PREHEAT_ROUTE: &str = "preheat (stable-release waves + daily resubmits)";
@@ -708,8 +691,6 @@ pub struct GateEvaluation {
     /// Traffic and missing lifecycle CPU at lane budgets, plus captured
     /// preheat phase CPU; gated against the measured line's bound.
     pub worker_cpu_ms_at_budget: f64,
-    /// Worker routes whose CPU the projection does not carry.
-    pub unmeasured_cpu: Vec<UnmeasuredCpu>,
     /// Empty on a pass.
     pub breaches: Vec<Breach>,
 }
@@ -739,8 +720,6 @@ struct Projection {
     cpu_routes: Vec<RouteCpu>,
     /// Projected monthly Worker CPU milliseconds at budget.
     worker_cpu_ms_at_budget: f64,
-    /// Worker routes the CPU line leaves out.
-    unmeasured_cpu: Vec<UnmeasuredCpu>,
 }
 
 /// Fold the event kind's Worker CPU price into the projection and
@@ -779,11 +758,6 @@ fn fold_cpu(
                 ));
             }
         }
-        CpuPricing::Unmeasured(reason) => projection.unmeasured_cpu.push(UnmeasuredCpu {
-            route: cost.route,
-            monthly_events: monthly,
-            reason,
-        }),
     }
     Ok(kind_cpu_ms)
 }
@@ -1006,21 +980,12 @@ fn evaluate(
             },
         });
     }
-    let unmeasured = preheat.unmeasured_worker_events();
-    if unmeasured > 0.0 {
-        projection.unmeasured_cpu.push(UnmeasuredCpu {
-            route: PREHEAT_ROUTE,
-            monthly_events: unmeasured,
-            reason: "covered phase CPU includes scheduler and observer work; missing build and index deliveries use measured lanes; fixed trigger CPU is not captured",
-        });
-    }
     Ok(GateEvaluation {
         usage,
         top_routes,
         diagnostics,
         cpu_routes: projection.cpu_routes,
         worker_cpu_ms_at_budget: cpu_at_budget,
-        unmeasured_cpu: projection.unmeasured_cpu,
         breaches,
     })
 }
@@ -1052,10 +1017,6 @@ impl ProjectionReport {
                         line.product, line.dimension,
                     )
                 })
-            }));
-            failures.extend(evaluation.unmeasured_cpu.iter().filter(|gap| gap.monthly_events > 0.0).map(|gap| {
-                format!("{label} projection: Worker CPU for {} is unmeasured ({:.3e} events/month) — {}",
-                    gap.route, gap.monthly_events, gap.reason)
             }));
             failures.extend(evaluation.breaches.iter().map(|breach| {
                 format!(
@@ -1264,17 +1225,6 @@ fn render_evaluation(title: &str, evaluation: &GateEvaluation) -> String {
         100.0 * evaluation.worker_cpu_ms_at_budget / WORKER_CPU_MS_MONTHLY,
         100.0 * ALLOWANCE_FRACTION
     );
-    if !evaluation.unmeasured_cpu.is_empty() {
-        let mut gaps = Table::new(&["Worker CPU not measured", "events/mo", "why"]);
-        for gap in &evaluation.unmeasured_cpu {
-            gaps.push([
-                gap.route.to_owned(),
-                format!("{:.3e}", gap.monthly_events),
-                gap.reason.to_owned(),
-            ]);
-        }
-        let _ = writeln!(out, "\n{}", gaps.render());
-    }
     out
 }
 
@@ -1354,6 +1304,8 @@ mod tests {
             resubmit_trigger_do_requests: 0.0,
             wave_trigger_worker_requests: 0.0,
             resubmit_trigger_worker_requests: 0.0,
+            wave_trigger_cpu: super::super::preheat::CpuCost::default(),
+            resubmit_trigger_cpu: super::super::preheat::CpuCost::default(),
             measured_nodes: 10,
             production_nodes: 10,
             releases_per_month: 1.0,
@@ -1414,8 +1366,10 @@ mod tests {
     fn incomplete_measurements_cannot_pass_even_when_known_usage_fits() {
         let small = fixture_report(100_000, |_| 0.5);
         let after = fixture_report(100_000, |_| 0.5);
+        let mut preheat = no_preheat();
+        preheat.wave_trigger_worker_requests = 1.0;
         let mut report =
-            project_with(&small, &after, &no_preheat(), &fixture_cpu(|_| 0.5)).expect("project");
+            project_with(&small, &after, &preheat, &fixture_cpu(|_| 0.5)).expect("project");
         assert!(report.projection.breaches.is_empty());
         let failures = report.failures();
         assert!(
@@ -1424,9 +1378,9 @@ mod tests {
                 .any(|failure| failure.contains("duration_gb_s incomplete"))
         );
         assert!(
-            failures
+            !failures
                 .iter()
-                .any(|failure| failure.contains("Worker CPU") && failure.contains("unmeasured"))
+                .any(|failure| failure.contains("fixed trigger"))
         );
         assert!(super::render_projection(&report).contains("monthly projection: FAIL"));
         assert!(super::render_usage(&report.projection.usage).contains("UNMEASURED"));
@@ -1464,9 +1418,6 @@ mod tests {
                 if line.preheat.is_none() {
                     line.preheat = Some(0.0);
                 }
-            }
-            for gap in &mut evaluation.unmeasured_cpu {
-                gap.monthly_events = 0.0;
             }
         }
         let rendered = super::render_projection(&report);
@@ -1690,15 +1641,6 @@ mod tests {
         assert!(breach.traffic < breach.bound);
         assert!(breach.preheat > breach.bound);
         assert_eq!(breach.top_route, super::PREHEAT_ROUTE);
-        let gap = report
-            .projection
-            .unmeasured_cpu
-            .iter()
-            .find(|gap| gap.route == super::PREHEAT_ROUTE)
-            .expect("absent deliveries must stay visible");
-        assert!(gap.monthly_events > 0.0);
-        assert!(gap.reason.contains("fixed trigger"));
-        assert!(super::render_projection(&report).contains("fixed trigger"));
     }
 
     #[test]
@@ -1873,6 +1815,8 @@ mod tests {
             (cost.worker_requests - f64::from(human_request_worker_requests(true))).abs() < 1e-12
         );
         assert!((cost.worker_requests - 5.0).abs() < 1e-12);
+        assert!(matches!(cost.cpu, super::CpuPricing::Lanes(rows)
+            if rows == [("human-lifecycle", 1.0)]));
     }
 
     /// The per-request counts of the events whose handler is a single

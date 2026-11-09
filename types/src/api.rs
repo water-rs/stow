@@ -6048,6 +6048,11 @@ pub enum SchedulerEvent {
         /// The pass's claims, in claim order.
         claims: Vec<DispatchClaim>,
     },
+    /// Claims known not to have created a run, returned without an attempt.
+    ClaimsRefused {
+        /// Unsent claims or claims explicitly refused by the CI rate limiter.
+        claims: Vec<DispatchClaim>,
+    },
     /// One dispatch pass's whole binding set — one row after the
     /// concurrent dispatch POSTs return.
     Bindings {
@@ -6130,6 +6135,11 @@ pub enum SchedulerEvent {
         hour: String,
         /// The step.
         kind: FeedEvent,
+    },
+    /// The earliest epoch-millisecond instant CI requests may resume.
+    CiRateLimited {
+        /// Absolute recovery deadline, retained across eviction.
+        until: i64,
     },
     /// An operator's dispatch-cap setting (stow#1039): replaces the
     /// `STOW_MAX_CONCURRENT_JOBS` / `STOW_MAX_CONCURRENT_MACOS_JOBS`

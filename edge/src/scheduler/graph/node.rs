@@ -1,6 +1,6 @@
 //! The graph's fixed-size records (stow#878). A node is one 68-byte
 //! record in an arena; the fields only an unpublished node needs ride
-//! a 48-byte [`State`] slab entry that is freed when the node
+//! a 32-byte [`State`] slab entry that is freed when the node
 //! publishes, and the rare ones (a bound run, a backoff, an error)
 //! ride [`Extra`] side-table entries.
 
@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use stow_types::api::SubmissionSource;
 use stow_types::node_profile::NodeProfile;
 
+use super::index::PriorityId;
 use crate::errors::QueueError;
 
 /// Queue status — the graph's lifecycle states. `Published` is a node
@@ -215,15 +216,14 @@ pub(super) struct Node {
     pub(super) flags: Flags,
 }
 
-/// The queue state of an unpublished node. 48 bytes.
+/// The queue state of an unpublished node. 32 bytes.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct State {
     pub(super) first_requested: i64,
     /// The last state transition (unix ms) — the admin listing's
     /// `updated_at` and the purge age floor.
     pub(super) updated: i64,
-    pub(super) priority: i64,
-    pub(super) demand: i64,
+    pub(super) priority: PriorityId,
     pub(super) downloads: u64,
     pub(super) attempt: u8,
     pub(super) dispatch_attempts: u16,

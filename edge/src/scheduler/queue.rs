@@ -289,6 +289,7 @@ pub fn admit_request(
     admission: &stow_types::api::RequestAdmission,
     dispatched_at: i64,
     settings: &SchedulerSettings,
+    now: i64,
 ) -> Result<
     (
         RequestAdmissionStep,
@@ -301,6 +302,9 @@ pub fn admit_request(
         && record.state != "failed"
     {
         return Ok((RequestAdmissionStep::Existing, None));
+    }
+    if graph.ci_waiting(now) {
+        return Err(QueueError::CiRateLimited);
     }
     // The probe the SQL read over `human_daily_task_budget` — a fresh
     // day resets the spend, same as `date('now')` keyed the row.
@@ -1009,6 +1013,39 @@ fn u64_to_u32(value: u64, field: &'static str) -> Result<u32, QueueError> {
 #[cfg(test)]
 mod tests {
     use super::seconds_until_utc_midnight;
+
+    #[test]
+    fn resolve_admission_waits_without_writing_and_keeps_live_dedup() {
+        use crate::scheduler::graph::Graph;
+        use stow_types::api::{RequestAdmission, SchedulerEvent};
+
+        let mut graph = Graph::default();
+        let settings = crate::scheduler::fixture::claim_settings(500, 50);
+        let admission = RequestAdmission {
+            request_id: "test-request".to_owned(),
+            crate_name: "serde".parse().unwrap(),
+            version: "1.0.229".parse().unwrap(),
+            features_json: stow_types::identity::FeaturesJson::default(),
+            rustc_version: "1.99.1".parse().unwrap(),
+            max_closure: 500,
+        };
+        graph.apply(&SchedulerEvent::CiRateLimited { until: 1000 }, 0);
+        assert!(matches!(
+            super::admit_request(&graph, &admission, 0, &settings, 999),
+            Err(crate::errors::QueueError::CiRateLimited)
+        ));
+        assert!(super::load_request(&graph, &admission.request_id).is_none());
+        let (step, event) = super::admit_request(&graph, &admission, 1, &settings, 1000).unwrap();
+        assert!(matches!(
+            step,
+            super::RequestAdmissionStep::Dispatch { attempt: 1 }
+        ));
+        graph.apply(&event.unwrap(), 1000);
+        graph.apply(&SchedulerEvent::CiRateLimited { until: 2000 }, 1000);
+        let (step, event) = super::admit_request(&graph, &admission, 1, &settings, 1001).unwrap();
+        assert!(matches!(step, super::RequestAdmissionStep::Existing));
+        assert!(event.is_none());
+    }
 
     #[test]
     fn reproduced_source_failures_stay_in_history_but_not_the_breaker() {

@@ -14,7 +14,7 @@ skyzen = { version = "0.5.0", default-features = false, features = ["json", "que
 skyzen-core = "0.2"
 skyzen-cloudflare = "0.5.0"
 skyzen-services = { version = "0.3.0", default-features = false }
-stow-types.workspace = true
+stow-types = { workspace = true, features = ["ci"] }
 stow-shim.workspace = true
 http = "1"
 anyhow = "1"
@@ -73,7 +73,7 @@ hex.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 # Synthesized `.crate` tarballs for the sparse-unpack resolve test.
 tar.workspace = true
 

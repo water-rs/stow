@@ -180,6 +180,11 @@ cleanup() {
     for pid in ${CHILD_PIDS[@]+"${CHILD_PIDS[@]}"}; do
         kill -9 -- "-$pid" 2>/dev/null || true
     done
+    # Successful runs upload COST_DIR too. Keep the settled CI log with
+    # its stage timings there, after stopping the writers.
+    if [ -f "$LOG_DIR/local-ci.log" ]; then
+        cp "$LOG_DIR/local-ci.log" "$COST_DIR/local-ci.log" || status=1
+    fi
     if [ "$status" -ne 0 ]; then
         # Collected outside LOG_DIR first: a redirect still bound to one
         # of the logs must not tail itself.

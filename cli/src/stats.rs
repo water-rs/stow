@@ -241,31 +241,6 @@ pub fn profile_divergence_line(
     ))
 }
 
-/// How many errors each Rust crate has accumulated, for the crates that
-/// have any.
-///
-/// The aggregate `errored` count says a cached artifact was resolved and
-/// then could not be used; without the names there is nothing to act on,
-/// and the wrapper's own explanation is not visible at default verbosity.
-pub async fn read_error_counts(
-    config: &StowConfig,
-) -> stow_types::error::Result<BTreeMap<String, u64>> {
-    let connection = config.state_db_pool().await?;
-    let rows = sqlx::query_as::<_, (String, i64)>(
-        "SELECT crate_name, errors FROM crate_stats WHERE errors > 0",
-    )
-    .fetch_all(&connection)
-    .await?;
-    let mut counts = BTreeMap::new();
-    for (crate_name, errors) in rows {
-        if crate_name.starts_with("cc:") {
-            continue;
-        }
-        counts.insert(crate_name, db_int(errors, "crate stats errors")?);
-    }
-    Ok(counts)
-}
-
 /// The crates whose error count grew between `before` and `after`.
 #[must_use]
 pub fn newly_errored(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> Vec<String> {
@@ -277,6 +252,17 @@ pub fn newly_errored(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u6
 }
 
 pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<StatsSummary> {
+    Ok(read_counters(config).await?.summary)
+}
+
+/// Coverage totals and Rust error names from the same crate-statistics rows.
+#[derive(Default)]
+pub struct CrateCounters {
+    pub summary: StatsSummary,
+    pub errors: BTreeMap<String, u64>,
+}
+
+pub async fn read_counters(config: &StowConfig) -> stow_types::error::Result<CrateCounters> {
     let connection = config.state_db_pool().await?;
     let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64)>(
         "SELECT crate_name, hits, misses, errors, glibc_refusals, local_dependency_builds \
@@ -286,6 +272,7 @@ pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<Stat
     .await?;
 
     let mut summary = StatsSummary::default();
+    let mut error_counts = BTreeMap::new();
     for (crate_name, hits, misses, errors, glibc_refusals, local_dependency_builds) in rows {
         let hits: u64 = db_int(hits, "crate stats hits")?;
         let misses: u64 = db_int(misses, "crate stats misses")?;
@@ -300,6 +287,9 @@ pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<Stat
             summary.cc_misses = summary.cc_misses.saturating_add(misses);
             summary.cc_errors = summary.cc_errors.saturating_add(errors);
         } else {
+            if errors > 0 {
+                error_counts.insert(crate_name, errors);
+            }
             summary.rust_hits = summary.rust_hits.saturating_add(hits);
             summary.rust_misses = summary.rust_misses.saturating_add(misses);
             summary.rust_errors = summary.rust_errors.saturating_add(errors);
@@ -310,7 +300,10 @@ pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<Stat
                 .saturating_add(local_dependency_builds);
         }
     }
-    Ok(summary)
+    Ok(CrateCounters {
+        summary,
+        errors: error_counts,
+    })
 }
 
 async fn update_stats(
@@ -361,7 +354,7 @@ enum StatsField {
     LocalDependencyBuilds,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StatsSummary {
     pub rust_hits: u64,
     pub rust_misses: u64,
@@ -515,6 +508,43 @@ mod tests {
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn coverage_totals_and_error_names_share_one_counter_read() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        let config = test_config(directory.path().to_path_buf());
+        let empty = super::read_counters(&config).await.expect("empty counters");
+        assert_eq!(empty.summary, StatsSummary::default());
+        assert_eq!(empty.errors, std::collections::BTreeMap::new());
+        let pool = config.state_db_pool().await.expect("state pool");
+        sqlx::query("INSERT INTO crate_stats (crate_name, hits, misses, errors, glibc_refusals, local_dependency_builds) VALUES ('serde', 2, 3, 4, 5, 6), ('syn', 7, 8, 0, 9, 10), ('cc:cc', 11, 12, 13, 14, 15)")
+            .execute(&pool)
+            .await
+            .expect("seed Rust and C counters");
+        let counters = super::read_counters(&config).await.expect("counters");
+        assert_eq!(
+            counters.summary,
+            StatsSummary {
+                rust_hits: 9,
+                rust_misses: 11,
+                rust_errors: 4,
+                rust_glibc_refusals: 14,
+                rust_local_dependency_builds: 16,
+                cc_hits: 11,
+                cc_misses: 12,
+                cc_errors: 13,
+            }
+        );
+        assert_eq!(
+            counters.errors,
+            std::collections::BTreeMap::from([("serde".to_owned(), 4)])
+        );
+        assert_eq!(
+            super::read_summary(&config).await.expect("summary"),
+            counters.summary
+        );
+        pool.close().await;
     }
 
     #[tokio::test]

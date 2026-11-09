@@ -780,6 +780,96 @@ async fn a_refused_write_backs_off_in_place_without_re_signing() {
     }
 }
 
+/// Each CI job owns its budget and signer. A refusal of every job's
+/// artifact manifest must recover without creating another signature.
+#[tokio::test]
+async fn independent_publishers_recover_without_re_signing() {
+    let stack = Stack::new().await;
+    let plans = (0..500)
+        .map(|index| plan(&stack.root, index))
+        .collect::<Vec<_>>();
+    for plan in &plans {
+        let reference: stow_oci::Reference = plan.oci_reference.parse().expect("reference");
+        stack.probe.rate_limit(
+            Method::PUT,
+            &format!("/manifests/{}", reference.tag().expect("artifact tag")),
+            1,
+        );
+    }
+    // All 500 jobs are polled concurrently, each with an independent
+    // 1500-write/minute budget, matching the production default.
+    futures_util::future::try_join_all(plans.iter().enumerate().map(|(index, plan)| {
+        let stack = &stack;
+        async move {
+            let budget = stow_oci::WriteBudget::per_minute(NonZeroU32::new(1500).expect("rate"));
+            let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
+            let session = push_session(&stack.listen, &http, &budget);
+            let signer = stow_oci::KeylessSigner::new(
+                http,
+                stack.sigstore.trust(),
+                stack.sigstore.services(),
+            );
+            let sign = |reference: String, digest: String| {
+                let (session, signer) = (&session, &signer);
+                async move { signer.sign(session, &reference, &digest).await }
+            };
+            let outcome =
+                stow_oci::push_artifacts_with(&session, std::slice::from_ref(plan), sign).await?;
+            let artifacts = stow_types::upload_plan::build_artifact_records(
+                std::slice::from_ref(plan),
+                &outcome.published_by_reference,
+                &[(plan.oci_reference.clone(), None)].into_iter().collect(),
+            )?;
+            let records = stow_types::records::BuildRecords {
+                artifacts,
+                local_programs: Vec::new(),
+            };
+            let published_records = stow_oci::push_records_with(
+                &session,
+                &stow_types::identity::WireRustcVersion::parse("1.85.0")?,
+                &format!("task-{index}"),
+                stow_types::records::BuildRun {
+                    run_id: index as u64 + 1,
+                    run_attempt: 1,
+                },
+                &records,
+                sign,
+            )
+            .await?;
+            let reference: stow_oci::Reference = published_records.oci_reference.parse()?;
+            stow_oci::verify_artifact_signature(
+                &session,
+                &stow_oci::verify::Trust::GithubCi(stack.sigstore.trust()),
+                &reference,
+                &published_records.oci_reference,
+                &published_records.manifest_digest,
+                CERTIFICATE_IDENTITY,
+            )
+            .await?;
+            let digest = &outcome.published_by_reference[&plan.oci_reference].oci_digest;
+            stack.verify(&session, plan, digest).await?;
+            Ok::<_, stow_types::error::Error>(())
+        }
+    }))
+    .await
+    .expect("all independent publications recover");
+    assert_eq!(stack.sigstore.certificates(), plans.len());
+    assert_eq!(stack.sigstore.entries(), plans.len() * 2);
+    let requests = stack.probe.request_log();
+    for plan in &plans {
+        let reference: stow_oci::Reference = plan.oci_reference.parse().expect("reference");
+        let path = format!("/manifests/{}", reference.tag().expect("artifact tag"));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == Method::PUT && request.path.ends_with(&path))
+                .count(),
+            2,
+            "one refusal and one successful artifact manifest write"
+        );
+    }
+}
+
 /// A Rekor answer lost on the way back is retried; the retry meets the
 /// logged entry (`409`), reads it back, and the signature has one entry.
 #[tokio::test]
