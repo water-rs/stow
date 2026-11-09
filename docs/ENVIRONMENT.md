@@ -280,6 +280,7 @@ oidc-token`.
 | `STOW_TRAFFIC_SIZES` | `100000 480000` | The two fixture sizes, small then large, the budget pass measures; a drive whose rows grow by more than 10% + 50 between them fails. The CPU pass, the peak drive and the post-load pass run on the small one. |
 | `STOW_TRAFFIC_DURATION_SECS` | `1800` | Seconds of peak-rate drive. |
 | `STOW_TRAFFIC_SEGMENTS` | `4` | Segments the drive runs in; the edge restarts between them to bound `wrangler dev`'s per-request memory retention. |
+| `STOW_TRAFFIC_BUILD_CALLBACK_EPS` | unset | Optional absolute events per second for each build workflow delivery lane in the mock peak test; other lanes retain their model rates and global multiplier. |
 | `STOW_TRAFFIC_RATE_SCALE` | `1.0` | Multiplier over the launch model's peak rates. |
 | `STOW_TRAFFIC_MAX_JOBS` | Manifest defaults | Overrides both the budget probe's dispatch limit and the running mock scheduler's total dispatch cap. Unset preserves the production manifest's probe limit and the mock manifest's runtime limit. |
 | `STOW_TRAFFIC_MAX_MACOS_JOBS` | Scheduler default | Overrides the running mock scheduler's macOS dispatch cap. |

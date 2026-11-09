@@ -892,8 +892,17 @@ fn ok_or_404(status: u16) -> bool {
 /// Build this run's lane set — the public lanes always, the trusted
 /// scheduler lanes behind `--scheduler`, the signed callback lane
 /// behind `--webhook-secret` — each at `scale` × the model's peak rate,
-/// narrowed to `--lanes` when given.
-pub fn build_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<Vec<Lane>, String> {
+/// narrowed to `--lanes` when given. An absolute build callback rate
+/// overrides only the two build workflow delivery lanes.
+pub fn build_lanes(
+    args: &LaneArgs,
+    model: &LaunchModel,
+    scale: f64,
+    build_callback_eps: Option<f64>,
+) -> Result<Vec<Lane>, String> {
+    if build_callback_eps.is_some_and(|rate| !rate.is_finite() || rate <= 0.0) {
+        return Err("build callback rate must be finite and positive".to_owned());
+    }
     let eps = |kind: EventKind| model.peak_events_per_second(kind) * scale;
 
     let mut lanes = vec![
@@ -975,7 +984,12 @@ pub fn build_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<V
             },
         ]);
     }
-    lanes.extend(build_workflow_lanes(args, model, scale)?);
+    lanes.extend(build_workflow_lanes(
+        args,
+        model,
+        scale,
+        build_callback_eps,
+    )?);
     if !args.lanes.is_empty() {
         lanes.retain(|lane| args.lanes.iter().any(|name| name == lane.name));
         if lanes.is_empty() {
@@ -989,13 +1003,15 @@ fn build_workflow_lanes(
     args: &LaneArgs,
     model: &LaunchModel,
     scale: f64,
+    build_callback_eps: Option<f64>,
 ) -> Result<Vec<Lane>, String> {
-    let eps = |kind: EventKind| model.peak_events_per_second(kind) * scale;
+    let rate = build_callback_eps
+        .unwrap_or_else(|| model.peak_events_per_second(EventKind::BuildCallback) * scale);
     let mut lanes = Vec::new();
     if let Some(secret) = &args.webhook_secret {
         lanes.push(Lane {
             name: "build-requested",
-            eps: eps(EventKind::BuildCallback),
+            eps: rate,
             fire: Fire::WorkflowDelivery {
                 secret: secret.clone(),
                 action: "requested",
@@ -1006,7 +1022,7 @@ fn build_workflow_lanes(
         });
         lanes.push(Lane {
             name: "workflow-callback",
-            eps: eps(EventKind::BuildCallback),
+            eps: rate,
             fire: Fire::WorkflowRun(CallbackLane::new(secret.clone(), args.queue_rows)?),
             expected: ok2xx,
         });
@@ -1158,7 +1174,7 @@ mod tests {
             let mut args = lane_args();
             args.index_publish_rustc = Some(rustc.to_owned());
             assert!(
-                build_lanes(&args, &model, 1.0)
+                build_lanes(&args, &model, 1.0, None)
                     .err()
                     .expect("overlap")
                     .contains("overlaps")
@@ -1252,13 +1268,67 @@ mod tests {
         assert_eq!(server.join().await.len(), 1);
     }
 
+    #[test]
+    fn build_callback_override_preserves_every_other_lane_and_global_scaling() {
+        let model =
+            LaunchModel::from_toml(include_str!("../../../launch-model.toml")).expect("model");
+        let args = lane_args();
+        let scale = 32.0;
+        let baseline = build_lanes(&args, &model, scale, None).expect("baseline");
+        let overridden = build_lanes(&args, &model, scale, Some(6.1)).expect("override");
+        assert_eq!(baseline.len(), overridden.len());
+        let mut changed = 0;
+        for (before, after) in baseline.iter().zip(&overridden) {
+            assert_eq!(before.name, after.name);
+            if matches!(after.name, "build-requested" | "workflow-callback") {
+                assert_eq!(after.eps, 6.1);
+                assert_eq!(
+                    before.eps,
+                    model
+                        .peak_events_per_second(stow_types::launch_model::EventKind::BuildCallback)
+                        * scale
+                );
+                changed += 1;
+            } else {
+                assert_eq!(before.eps, after.eps, "{}", after.name);
+            }
+        }
+        assert_eq!(changed, 2);
+        let site = overridden
+            .iter()
+            .find(|lane| lane.name == "site")
+            .expect("site");
+        let unscaled = build_lanes(&args, &model, 1.0, None).expect("unscaled");
+        assert_eq!(
+            site.eps,
+            unscaled
+                .iter()
+                .find(|lane| lane.name == "site")
+                .expect("site")
+                .eps
+                * scale
+        );
+    }
+
+    #[test]
+    fn build_callback_override_rejects_nonpositive_and_nonfinite_rates() {
+        let model =
+            LaunchModel::from_toml(include_str!("../../../launch-model.toml")).expect("model");
+        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = build_lanes(&lane_args(), &model, 1.0, Some(rate))
+                .err()
+                .expect("invalid callback rate");
+            assert!(error.contains("finite and positive"), "{error}");
+        }
+    }
+
     #[tokio::test]
     async fn requested_build_lane_signs_the_build_workflow_delivery() {
         let model =
             LaunchModel::from_toml(include_str!("../../../launch-model.toml")).expect("model");
         let mut args = lane_args();
         args.lanes = vec!["build-requested".to_owned()];
-        let lanes = build_lanes(&args, &model, 1.0).expect("requested lane");
+        let lanes = build_lanes(&args, &model, 1.0, None).expect("requested lane");
         assert_eq!(lanes.len(), 1);
         assert_eq!(
             lanes[0].eps,
@@ -1321,10 +1391,10 @@ mod tests {
             LaunchModel::from_toml(include_str!("../../../launch-model.toml")).expect("model");
         let mut args = lane_args();
         args.lanes = vec!["bundle-fetch".to_owned()];
-        let lanes = build_lanes(&args, &model, 1.0).expect("miss lane");
+        let lanes = build_lanes(&args, &model, 1.0, None).expect("miss lane");
         assert!((lanes[0].expected)(404));
         args.bundle_digest = Some(format!("sha256:{}", "a".repeat(64)));
-        let lanes = build_lanes(&args, &model, 1.0).expect("stored bundle lane");
+        let lanes = build_lanes(&args, &model, 1.0, None).expect("stored bundle lane");
         assert!((lanes[0].expected)(200));
         assert!(!(lanes[0].expected)(404));
     }
@@ -1337,7 +1407,7 @@ mod tests {
         let model =
             LaunchModel::from_toml(include_str!("../../../launch-model.toml")).expect("model");
         let args = lane_args();
-        let mut lanes: Vec<&str> = build_lanes(&args, &model, 1.0)
+        let mut lanes: Vec<&str> = build_lanes(&args, &model, 1.0, None)
             .expect("lanes")
             .iter()
             .map(|lane| lane.name)
