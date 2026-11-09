@@ -30,6 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine as _;
+use orx_split_vec::PinnedVec;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -1184,8 +1185,6 @@ impl SnapshotLoader {
         graph.outcome_hours = head.outcome_hours.into_iter().collect();
         graph.last_run_update_ms = head.last_run_update_ms;
         graph.intern.reserve_exact(head.lens.intern);
-        graph.nodes.reserve_exact(head.lens.nodes);
-        graph.states.reserve(head.lens.nodes);
         graph.edges.reserve_exact(head.lens.edges);
         graph.published.reserve(head.lens.published);
         *lens = Some(head.lens);
