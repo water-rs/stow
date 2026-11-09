@@ -826,7 +826,7 @@ pub(super) async fn complete_run_pass(
                 .github_run_id
                 .parse::<u64>()
                 .map_err(|error| dispatch::DispatchError::Response(error.to_string()))?;
-            unloaded_ci_interface(graph.cell(), env)
+            ci_interface(env, graph)
                 .await
                 .map_err(|error| dispatch::DispatchError::TokenMint(error.to_string()))?
                 .source_failure_verification(stow_types::records::BuildRun {
@@ -1714,17 +1714,17 @@ fn trip_trigger(
 /// dispatch pass uses; the workflow's own manifest check is the
 /// authority on the version, so the payload is only a hint.
 ///
-/// The route creates nothing: no event, no graph load — its cost is
-/// the delivery's own (binding reads, the token cache read, one
-/// `workflow_dispatch` POST), never a replay of stored data. A
-/// dispatch failure answers 502 so newreleases.io's backoff retry
-/// redelivers.
+/// Check the shared recovery fence before dispatch. A rate-limit
+/// response appends its recovery deadline before answering 502 so
+/// newreleases.io's retry cannot bypass the shared fence. Graph recovery
+/// precedes dispatch rather than occurring in the metering tail.
 async fn preheat_release(
     State(graph): State<graph::GraphCell>,
     env: WasmEnv,
+    db: DurableDb,
     Json(request): Json<stow_types::api::PreheatReleaseRequest>,
 ) -> Result<Json<OkResponse>> {
-    preheat_release_pass(&graph, &env, &request).await?;
+    preheat_release_pass(&graph, &env, &db, &request).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -1734,62 +1734,37 @@ async fn preheat_release(
 pub(super) async fn preheat_release_pass(
     graph: &graph::GraphCell,
     env: &WasmEnv,
+    db: &DurableDb,
     request: &stow_types::api::PreheatReleaseRequest,
 ) -> Result<()> {
-    let interface = unloaded_ci_interface(graph, env).await?;
-    interface
+    let graph = ensure_graph(env, db, graph).await?;
+    routes::require_ci_ready(graph, now_ms()).map_err(route_error)?;
+    let interface = ci_interface(env, graph).await?;
+    routes::require_ci_ready(graph, now_ms()).map_err(route_error)?;
+    if let Err(error) = interface
         .submit_preheat(request.rustc_version.as_str())
         .await
-        .map_err(|error| {
-            let error = to_error(error.to_string());
-            tracing::error!(%error, "preheat release dispatch failed");
-            error.set_status(StatusCode::BAD_GATEWAY)
-        })
-}
-
-/// The CI interface a route that reads no stored row resolves: the
-/// credential arm plus the cached installation token, minted inline on
-/// expiry. A failed mint answers 502, like a failed dispatch.
-async fn unloaded_ci_interface(
-    graph: &graph::GraphCell,
-    env: &WasmEnv,
-) -> Result<dispatch::CiInterface<dispatch::CfTransport>> {
-    let pool = crate::fetch_guard::OutboundPool::new();
-    match credential_source(env)? {
-        CredentialSource::LocalCi(url) => Ok(dispatch::CiInterface::local_ci(
-            &url,
-            dispatch::CfTransport::new(pool),
-        )),
-        CredentialSource::GitHub(config) => {
-            let token = github_app::installation_token(graph.tokens(), &config)
-                .await
-                .map_err(|error| {
-                    let error =
-                        to_error(dispatch::DispatchError::TokenMint(error.to_string()).to_string());
-                    tracing::error!(%error, "installation token mint failed");
-                    error.set_status(StatusCode::BAD_GATEWAY)
-                })?;
-            let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
-            Ok(dispatch::CiInterface::github(
-                &github_repo,
-                &token.token,
-                dispatch::CfTransport::new(pool),
-            ))
-        }
+    {
+        dispatch::retain_ci_limit(graph, db, &error, now_ms())
+            .await
+            .map_err(route_error)?;
+        tracing::error!(%error, "preheat release dispatch failed");
+        return Err(to_error(error).set_status(StatusCode::BAD_GATEWAY));
     }
+    Ok(())
 }
 
 /// `POST /periodic/dispatch` — the edge's Cron Trigger names one due
-/// periodic workflow (stow#1100). Like `/preheat/release` the route
-/// creates nothing and touches no store row: its cost is the binding
-/// reads, the token cache read and one `workflow_dispatch` POST. A
-/// dispatch failure answers 502 so the Worker's handler reports it.
+/// periodic workflow (stow#1100). Like `/preheat/release`, it checks
+/// and persists the shared API recovery fence. A dispatch failure
+/// answers 502 so the Worker's handler reports it.
 async fn periodic_dispatch(
     State(graph): State<graph::GraphCell>,
     env: WasmEnv,
+    db: DurableDb,
     Json(request): Json<stow_types::periodic::PeriodicWorkflow>,
 ) -> Result<Json<OkResponse>> {
-    periodic_dispatch_pass(&graph, &env, &request).await?;
+    periodic_dispatch_pass(&graph, &env, &db, &request).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -1799,17 +1774,21 @@ async fn periodic_dispatch(
 pub(super) async fn periodic_dispatch_pass(
     graph: &graph::GraphCell,
     env: &WasmEnv,
+    db: &DurableDb,
     request: &stow_types::periodic::PeriodicWorkflow,
 ) -> Result<()> {
-    let interface = unloaded_ci_interface(graph, env).await?;
-    interface
-        .submit_periodic(request)
-        .await
-        .map_err(|error| {
-            let error = to_error(error.to_string());
-            tracing::error!(%error, workflow = request.workflow.as_str(), dispatch_ref = request.dispatch_ref.as_str(), "periodic dispatch failed");
-            error.set_status(StatusCode::BAD_GATEWAY)
-        })
+    let graph = ensure_graph(env, db, graph).await?;
+    routes::require_ci_ready(graph, now_ms()).map_err(route_error)?;
+    let interface = ci_interface(env, graph).await?;
+    routes::require_ci_ready(graph, now_ms()).map_err(route_error)?;
+    if let Err(error) = interface.submit_periodic(request).await {
+        dispatch::retain_ci_limit(graph, db, &error, now_ms())
+            .await
+            .map_err(route_error)?;
+        tracing::error!(%error, workflow = request.workflow.as_str(), dispatch_ref = request.dispatch_ref.as_str(), "periodic dispatch failed");
+        return Err(to_error(error).set_status(StatusCode::BAD_GATEWAY));
+    }
+    Ok(())
 }
 
 /// `POST /index/published` — the index-publish path's report that a

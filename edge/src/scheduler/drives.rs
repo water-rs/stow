@@ -2027,14 +2027,12 @@ pub const DRIVES: &[Drive] = &[
         }),
     },
     Drive {
-        // The newreleases.io forward's object half (stow#880): on
-        // wasm the real `preheat_release_pass` — credential arm plus
-        // the `workflow_dispatch` POST to the local-CI dispatcher; on
-        // host the arm is a no-op `Ok(())` — no store work runs and
-        // there is nothing to measure.
+        // The release forward checks the shared recovery fence before
+        // its credential arm and workflow dispatch. The fixture is
+        // resident; the separate wake drive prices cold recovery.
         name: "POST /preheat/release",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 #[cfg(target_arch = "wasm32")]
                 {
@@ -2045,6 +2043,7 @@ pub const DRIVES: &[Drive] = &[
                     super::object::preheat_release_pass(
                         &ctx.graph,
                         env,
+                        db,
                         &stow_types::api::PreheatReleaseRequest {
                             rustc_version: "1.90.0".parse().map_err(|error| {
                                 format!("preheat release rustc version: {error}")
@@ -2056,22 +2055,19 @@ pub const DRIVES: &[Drive] = &[
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let _ = ctx;
-                    Ok(())
+                    let _ = db;
+                    routes::require_ci_ready(ctx.loaded(), HOST_NOW_MS).map_err(text)
                 }
             })
         },
         cleanup: None,
     },
     Drive {
-        // The edge Cron Trigger's per-workflow dispatch (stow#1100):
-        // on wasm the real `periodic_dispatch_pass` — credential arm
-        // plus the `workflow_dispatch` POST to the local-CI
-        // dispatcher; on host the arm is a no-op `Ok(())` — no store
-        // work runs and there is nothing to measure.
+        // Periodic dispatch uses the same recovery fence as release
+        // preheat. The separate wake drive prices cold recovery.
         name: "POST /periodic/dispatch",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 #[cfg(target_arch = "wasm32")]
                 {
@@ -2082,6 +2078,7 @@ pub const DRIVES: &[Drive] = &[
                     super::object::periodic_dispatch_pass(
                         &ctx.graph,
                         env,
+                        db,
                         &stow_types::periodic::PeriodicWorkflow {
                             workflow: "watchdog.yml"
                                 .parse()
@@ -2094,8 +2091,8 @@ pub const DRIVES: &[Drive] = &[
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let _ = ctx;
-                    Ok(())
+                    let _ = db;
+                    routes::require_ci_ready(ctx.loaded(), HOST_NOW_MS).map_err(text)
                 }
             })
         },

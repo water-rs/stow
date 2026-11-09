@@ -247,6 +247,11 @@ mod tests {
         assert!(recovered.with(|graph| graph.ci_waiting(until - 1)));
         assert!(!recovered.with(|graph| graph.ci_waiting(until)));
         for held in [graph, recovered] {
+            assert!(matches!(
+                routes::require_ci_ready(held, until - 1),
+                Err(QueueError::CiRateLimited)
+            ));
+            routes::require_ci_ready(held, until).expect("control dispatch resumes at deadline");
             let rows = held
                 .with(|graph| {
                     graph.list(
