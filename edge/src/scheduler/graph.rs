@@ -519,6 +519,8 @@ pub struct Graph {
     pending_ages: BTreeMap<i64, u32>,
     /// External `build-crate.yml` runs (stow#877): run id → family bit.
     external_runs: HashMap<u64, u8>,
+    /// The CI API recovery deadline in epoch milliseconds.
+    ci_not_before: i64,
     /// The dispatch freeze record while engaged.
     freeze: Option<stow_types::api::DispatchFreezeRecord>,
     /// The recent freeze transitions, oldest first, bounded by
@@ -2068,7 +2070,7 @@ impl Graph {
             });
             self.refresh_ready(ix);
         }
-        if self.freeze.is_some() {
+        if self.freeze.is_some() || self.ci_not_before > now {
             return Ok(Vec::new());
         }
         let (total_free, macos_free) = self.free_slots(settings);
@@ -2201,6 +2203,30 @@ impl Graph {
             );
         }
         true
+    }
+
+    /// Return a claim proven not to have created a run, without spending
+    /// its dispatch attempt. Generation and binding fences reject stale returns.
+    fn return_refused_claim(&mut self, claim: &stow_types::api::DispatchClaim, now: i64) {
+        let Some(ix) = self.node_ix(&claim.task_id) else {
+            return;
+        };
+        if !self.node(ix).status.in_flight()
+            || self.generation_of(ix) != claim.generation
+            || self.run_id_of(ix) != 0
+        {
+            return;
+        }
+        self.settling.remove(&claim.generation);
+        self.set_status(ix, Status::Pending);
+        let state = self.state_mut(ix);
+        state.updated = now;
+        state.dispatch_attempts = state
+            .dispatch_attempts
+            .checked_sub(1)
+            .expect("claimed attempt");
+        self.extras.remove(&ix);
+        self.refresh_ready(ix);
     }
 
     /// A `workflow_dispatch` failure re-queues the claim under the
@@ -3041,6 +3067,13 @@ impl Graph {
         if self.freeze.is_some() {
             return queue::AlarmPlan::Delete;
         }
+        if self.ci_not_before > now {
+            return if self.has_ready() || !self.inflight.is_empty() {
+                queue::AlarmPlan::At(self.ci_not_before)
+            } else {
+                queue::AlarmPlan::Delete
+            };
+        }
         // A due run-listing reconcile is timer work of its own: the
         // request passes that skip it — the completion's bounded pass
         // (stow#940) — leave it to the alarm.
@@ -3207,9 +3240,15 @@ impl Graph {
     /// scheduler claims nothing whatever the occupancy). An idle or
     /// paused-and-drained scheduler never asks.
     pub fn reconcile_due(&self, now: i64, settings: &queue::SchedulerSettings) -> bool {
-        now - self.reconcile_attempted_at >= Self::STATUS_RECONCILE_MS
+        self.ci_not_before <= now
+            && now - self.reconcile_attempted_at >= Self::STATUS_RECONCILE_MS
             && (!self.inflight.is_empty()
                 || (self.has_ready() && !matches!(settings.dispatch, queue::Dispatch::Paused)))
+    }
+
+    /// Whether CI requests must wait for a rate-limit recovery.
+    pub const fn ci_waiting(&self, now: i64) -> bool {
+        self.ci_not_before > now
     }
 
     /// A listing attempt that failed: the next one waits the interval
@@ -3339,6 +3378,11 @@ impl Graph {
                     }
                 }
             }
+            SchedulerEvent::ClaimsRefused { claims } => {
+                for claim in claims {
+                    self.return_refused_claim(claim, now);
+                }
+            }
             SchedulerEvent::Bindings { bindings } => {
                 for binding in bindings {
                     if let Ok(run_id) = binding.run_id.parse::<u64>() {
@@ -3384,6 +3428,9 @@ impl Graph {
                         i64::try_from(entries.len()).unwrap_or(i64::MAX),
                     ),
                 );
+            }
+            SchedulerEvent::CiRateLimited { until } => {
+                self.ci_not_before = self.ci_not_before.max(*until);
             }
             SchedulerEvent::DispatchCap { setting } => {
                 self.dispatch_cap = Some((**setting).clone());
@@ -6480,6 +6527,92 @@ mod tests {
         let restored = round_trip(&graph);
         assert_pending_index(&restored);
         assert_eq!(restored.status(), graph.status());
+    }
+
+    #[test]
+    fn ci_recovery_survives_replay_and_snapshot_and_resumes_at_the_deadline() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let settings = claim_settings(500, 50);
+        let deadline = 1_000_000;
+        graph.apply(&SchedulerEvent::CiRateLimited { until: deadline }, 100);
+        graph.apply(
+            &SchedulerEvent::CiRateLimited {
+                until: deadline - 1,
+            },
+            101,
+        );
+        let mut restored = round_trip(&graph);
+        for held in [&mut graph, &mut restored] {
+            assert!(held.ci_waiting(deadline - 1));
+            assert!(!held.reconcile_due(deadline - 1, &settings));
+            assert_eq!(
+                held.wake_plan(deadline - 1, &settings),
+                queue::AlarmPlan::At(deadline)
+            );
+            assert!(
+                held.claim(&settings, deadline - 1, u32::MAX)
+                    .expect("claim")
+                    .is_empty()
+            );
+            assert!(!held.ci_waiting(deadline));
+            assert_eq!(
+                held.wake_plan(deadline, &settings),
+                queue::AlarmPlan::At(deadline)
+            );
+            assert_eq!(
+                held.claim(&settings, deadline, u32::MAX)
+                    .expect("resume")
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn refused_claims_preserve_attempts_and_reject_stale_or_bound_returns() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let settings = claim_settings(500, 50);
+        let first = graph
+            .claim(&settings, 0, 1)
+            .expect("claim")
+            .pop()
+            .expect("one");
+        let refused = SchedulerEvent::ClaimsRefused {
+            claims: vec![stow_types::api::DispatchClaim {
+                task_id: first.task_id.clone(),
+                generation: first.generation,
+                attempt: first.attempt,
+            }],
+        };
+        graph.apply(&refused, 1);
+        let mut graph = round_trip(&graph);
+        let ix = graph.node_ix(&first.task_id).expect("node");
+        assert_eq!(graph.state(ix).dispatch_attempts, 0);
+        assert_eq!(status_of(&graph, "solo"), Some(Status::Pending));
+        let second = graph
+            .claim(&settings, 2, 1)
+            .expect("claim")
+            .pop()
+            .expect("one");
+        assert_ne!(first.generation, second.generation);
+        graph.apply(&refused, 3);
+        assert_eq!(status_of(&graph, "solo"), Some(Status::Dispatched));
+        assert_eq!(graph.state(ix).dispatch_attempts, 1);
+        graph.bind(&second.task_id, second.generation, 42, 4);
+        graph.apply(
+            &SchedulerEvent::ClaimsRefused {
+                claims: vec![stow_types::api::DispatchClaim {
+                    task_id: second.task_id,
+                    generation: second.generation,
+                    attempt: second.attempt,
+                }],
+            },
+            5,
+        );
+        assert_eq!(graph.run_id_of(ix), 42);
+        assert_eq!(graph.state(ix).dispatch_attempts, 1);
     }
 
     #[test]
