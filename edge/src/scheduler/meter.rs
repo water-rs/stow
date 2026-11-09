@@ -118,15 +118,15 @@ impl MeteringBackend {
         inner: &Arc<DurableDb>,
         pending: &Arc<Pending>,
         unsettled: &Arc<Unsettled>,
-        sql: String,
-        params: Vec<DbValue>,
+        sql: &str,
+        params: &[DbValue],
         write: bool,
     ) -> Result<DbExecResult, DurableDbError> {
         let mut source: &DurableDb = inner;
         let result = if write {
-            QuerySource::execute(&mut source, &sql, &params).await?
+            QuerySource::execute(&mut source, sql, params).await?
         } else {
-            QuerySource::query(&mut source, &sql, &params).await?
+            QuerySource::query(&mut source, sql, params).await?
         };
         pending.add(result.rows_read, result.rows_written);
         unsettled.add(result.rows_read, result.rows_written);
@@ -144,8 +144,8 @@ impl DurableDbBackend for MeteringBackend {
             &self.inner,
             &self.pending,
             &self.unsettled,
-            query.to_owned(),
-            params.to_vec(),
+            query,
+            params,
             false,
         )
     }
@@ -159,8 +159,8 @@ impl DurableDbBackend for MeteringBackend {
             &self.inner,
             &self.pending,
             &self.unsettled,
-            query.to_owned(),
-            params.to_vec(),
+            query,
+            params,
             true,
         )
     }

@@ -14,6 +14,7 @@ pub mod build_failure;
 pub mod bundle;
 pub mod bundle_schema;
 pub mod capture;
+#[cfg(feature = "ci")]
 pub mod ci;
 pub mod crate_info;
 pub mod do_budgets;

@@ -873,11 +873,13 @@ impl BuildContext {
     ///
     /// The cargo config the standalone rule reads does not load or names
     /// a source chain cargo itself would reject.
-    pub(crate) fn registry_sources(&self) -> stow_types::error::Result<&RegistrySources> {
+    pub(crate) async fn registry_sources(&self) -> stow_types::error::Result<&RegistrySources> {
         if let Some(sources) = self.registry_sources.get() {
             return Ok(sources);
         }
-        let sources = RegistrySources::from_cargo_config()?;
+        let span = tracing::Span::current();
+        let sources =
+            smol::unblock(move || span.in_scope(RegistrySources::from_cargo_config)).await?;
         Ok(self.registry_sources.get_or_init(|| sources))
     }
 }
@@ -926,24 +928,33 @@ impl RegistrySources {
     /// The lockfile is unreadable or unparseable.
     pub(crate) async fn from_lockfile(workspace_root: &Path) -> stow_types::error::Result<Self> {
         let lockfile_path = workspace_root.join("Cargo.lock");
-        let contents = match async_fs::read(&lockfile_path).await {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Self::from_cargo_config();
-            }
-            Err(error) => {
-                return Err(stow_types::stow_error!(
-                    "read lockfile {}: {error}",
-                    lockfile_path.display()
-                ));
-            }
-        };
-        let contents = String::from_utf8(contents).map_err(|error| {
-            stow_types::stow_error!("lockfile {} is not UTF-8: {error}", lockfile_path.display())
-        })?;
-        Self::parse_lockfile(&contents, &cargo_config_hosts()?).map_err(|error| {
-            stow_types::stow_error!("parse lockfile {}: {error}", lockfile_path.display())
+        let span = tracing::Span::current();
+        smol::unblock(move || {
+            span.in_scope(|| {
+                let contents = match std::fs::read(&lockfile_path) {
+                    Ok(contents) => contents,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Self::from_cargo_config();
+                    }
+                    Err(error) => {
+                        return Err(stow_types::stow_error!(
+                            "read lockfile {}: {error}",
+                            lockfile_path.display()
+                        ));
+                    }
+                };
+                let contents = String::from_utf8(contents).map_err(|error| {
+                    stow_types::stow_error!(
+                        "lockfile {} is not UTF-8: {error}",
+                        lockfile_path.display()
+                    )
+                })?;
+                Self::parse_lockfile(&contents, &cargo_config_hosts()?).map_err(|error| {
+                    stow_types::stow_error!("parse lockfile {}: {error}", lockfile_path.display())
+                })
+            })
         })
+        .await
     }
 
     /// The `(package, version)` → source map one `Cargo.lock` records,
@@ -5444,10 +5455,11 @@ async fn detect_unit_source(
 ) -> stow_types::error::Result<Result<UnitSource, UncachedReason>> {
     if let Some(slot) = stow_types::public_cache::detect_registry_package_slot(parsed)? {
         return Ok(
-            if ctx
-                .registry_sources()?
-                .is_crates_io(&slot.package, &slot.version, &slot.index_dir)
-            {
+            if ctx.registry_sources().await?.is_crates_io(
+                &slot.package,
+                &slot.version,
+                &slot.index_dir,
+            ) {
                 Ok(UnitSource::CratesIo {
                     package: slot.package,
                     version: slot.version,

@@ -676,6 +676,40 @@ impl WorkerCpuBudget {
 /// (`cpu_ms_at_budget`), and prints each route's share of the allowance
 /// at its measured figure and at its budget.
 pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
+    // Fixed preheat entrypoints compose the existing dispatch and signed
+    // webhook route-class bounds; these are bounds, not measurements.
+    WorkerCpuBudget {
+        lane: "preheat-release",
+        relative_cpu: 0.60,
+    },
+    WorkerCpuBudget {
+        lane: "preheat-scheduled",
+        relative_cpu: 0.25,
+    },
+    WorkerCpuBudget {
+        lane: "preheat-requested",
+        relative_cpu: 0.35,
+    },
+    WorkerCpuBudget {
+        lane: "preheat-in-progress",
+        relative_cpu: 0.35,
+    },
+    WorkerCpuBudget {
+        lane: "preheat-completed",
+        relative_cpu: 0.35,
+    },
+    WorkerCpuBudget {
+        lane: "preheat-cron-requested",
+        relative_cpu: 0.35,
+    },
+    WorkerCpuBudget {
+        lane: "preheat-cron-in-progress",
+        relative_cpu: 0.35,
+    },
+    WorkerCpuBudget {
+        lane: "preheat-cron-completed",
+        relative_cpu: 0.35,
+    },
     // Initial bounds from status-read, trusted-submit and workflow-callback,
     // respectively; these are route-class bounds, not measurements of new lanes.
     WorkerCpuBudget {

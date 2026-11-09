@@ -414,8 +414,9 @@ fn encode_error(error: impl std::fmt::Display) -> QueueError {
 fn write_node(
     buf: &mut Vec<u8>,
     node: &Node,
-    state: Option<&State>,
+    state: Option<(&State, i64)>,
     extra: Option<&Extra>,
+    demand: i64,
 ) -> Result<(), QueueError> {
     buf.extend_from_slice(&node.digest);
     buf.extend_from_slice(&node.crate_name.to_le_bytes());
@@ -427,11 +428,11 @@ fn write_node(
     buf.push(node.rustc);
     buf.push(node.status as u8);
     buf.push(node.flags.0);
-    if let Some(state) = state {
+    if let Some((state, priority)) = state {
         buf.extend_from_slice(&state.first_requested.to_le_bytes());
         buf.extend_from_slice(&state.updated.to_le_bytes());
-        buf.extend_from_slice(&state.priority.to_le_bytes());
-        buf.extend_from_slice(&state.demand.to_le_bytes());
+        buf.extend_from_slice(&priority.to_le_bytes());
+        buf.extend_from_slice(&demand.to_le_bytes());
         buf.extend_from_slice(&state.downloads.to_le_bytes());
         buf.push(state.attempt);
         buf.extend_from_slice(&state.dispatch_attempts.to_le_bytes());
@@ -439,14 +440,14 @@ fn write_node(
     match extra {
         None => buf.push(0),
         Some(extra) => {
-            let bytes = rmp_serde::to_vec(extra).map_err(encode_error)?;
             buf.push(1);
-            buf.extend_from_slice(
-                &u32::try_from(bytes.len())
-                    .map_err(|_| QueueError::Invariant("node extra exceeds u32".into()))?
-                    .to_le_bytes(),
-            );
-            buf.extend_from_slice(&bytes);
+            let length_at = buf.len();
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            let payload_at = buf.len();
+            rmp_serde::encode::write(&mut *buf, extra).map_err(encode_error)?;
+            let length = u32::try_from(buf.len() - payload_at)
+                .map_err(|_| QueueError::Invariant("node extra exceeds u32".into()))?;
+            buf[length_at..payload_at].copy_from_slice(&length.to_le_bytes());
         }
     }
     Ok(())
@@ -559,19 +560,14 @@ type StagedItem = (
 /// One keyed span's materialized entries — collected sorted at the
 /// encoder's creation, bounded by the bucket's own size (the graph is
 /// never copied whole).
-enum SpanItem {
-    Published(IdKey, Published),
-    Requests(String, RequestRecord),
-    Feed(String, usize, Vec<stow_types::api::SchedulerDemandEntry>),
-    Batches(String, (String, i64)),
-    Staged(
-        SliceId,
-        i64,
-        u32,
-        u32,
-        Vec<stow_types::api::PublishedSliceRow>,
-    ),
-    Outcomes(AttemptOutcome),
+#[derive(Default)]
+struct SpanItems {
+    published: Vec<(IdKey, Published)>,
+    requests: Vec<(String, RequestRecord)>,
+    feed: Vec<(String, usize, Vec<stow_types::api::SchedulerDemandEntry>)>,
+    batches: Vec<(String, (String, i64))>,
+    staged: Vec<StagedItem>,
+    outcomes: Vec<AttemptOutcome>,
 }
 
 /// The rows of one dirty span, emitted one at a time so peak memory is
@@ -582,7 +578,7 @@ pub struct SpanEncoder {
     /// indexed kinds, a position in `items` for the keyed kinds.
     at: u32,
     /// The keyed kinds' entries, sorted for a stable encoding.
-    items: Vec<SpanItem>,
+    items: SpanItems,
 }
 
 impl SpanEncoder {
@@ -616,10 +612,14 @@ impl SpanEncoder {
                     let node = &graph.nodes[ix];
                     let state =
                         (node.state != NO_STATE).then(|| &graph.states[node.state as usize]);
-                    let extra = graph
-                        .extras
-                        .get(&u32::try_from(ix).expect("node indexes fit u32"));
-                    write_node(buf, node, state, extra)
+                    let extra = graph.extras.get(&node.state);
+                    write_node(
+                        buf,
+                        node,
+                        state.map(|state| (state, graph.priorities.at(state.priority))),
+                        extra,
+                        graph.demand.get(node.state),
+                    )
                 })?
             }
             ChunkKind::Edges => {
@@ -631,39 +631,19 @@ impl SpanEncoder {
                 })?
             }
             ChunkKind::Published => {
-                writer.fill_raw(self.items[at..].iter(), |buf, item| match item {
-                    SpanItem::Published(key, entry) => {
-                        buf.extend_from_slice(key);
-                        buf.push(entry.mask);
-                        buf.push(entry.slice.0);
-                        buf.push(entry.slice.1);
-                        Ok(())
-                    }
-                    _ => unreachable!("a published span holds published items"),
+                writer.fill_raw(self.items.published[at..].iter(), |buf, (key, entry)| {
+                    buf.extend_from_slice(key);
+                    buf.push(entry.mask);
+                    buf.push(entry.slice.0);
+                    buf.push(entry.slice.1);
+                    Ok(())
                 })?
             }
-            ChunkKind::Requests => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Requests(id, record) => (id, record),
-                _ => unreachable!("a requests span holds request items"),
-            }))?,
-            ChunkKind::Feed => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Feed(hour, page, entries) => (hour, page, entries),
-                _ => unreachable!("a feed span holds feed items"),
-            }))?,
-            ChunkKind::Batches => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Batches(id, batch) => (id, batch),
-                _ => unreachable!("a batches span holds batch items"),
-            }))?,
-            ChunkKind::Staged => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Staged(slice, generation, parts, part, rows) => {
-                    (slice, generation, parts, part, rows)
-                }
-                _ => unreachable!("a staged span holds staged items"),
-            }))?,
-            ChunkKind::Outcomes => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Outcomes(outcome) => outcome,
-                _ => unreachable!("an outcomes span holds outcome items"),
-            }))?,
+            ChunkKind::Requests => writer.fill(self.items.requests[at..].iter())?,
+            ChunkKind::Feed => writer.fill(self.items.feed[at..].iter())?,
+            ChunkKind::Batches => writer.fill(self.items.batches[at..].iter())?,
+            ChunkKind::Staged => writer.fill(self.items.staged[at..].iter())?,
+            ChunkKind::Outcomes => writer.fill(self.items.outcomes[at..].iter())?,
         };
         if taken == 0 {
             return Ok(None);
@@ -815,69 +795,71 @@ impl Graph {
     /// indexed kinds read the arena by index at each `next_row`.
     pub fn snapshot_encoder(&self, span: ChunkSpan) -> SpanEncoder {
         let bucket = span.range;
-        let items = match span.kind {
+        let mut materialized = SpanItems::default();
+        match span.kind {
             ChunkKind::Published => {
                 let mut items: Vec<_> = self
                     .published
                     .iter()
                     .filter(|(key, _)| published_bucket(key) == bucket)
-                    .map(|(&key, &entry)| SpanItem::Published(key, entry))
+                    .map(|(&key, &entry)| (key, entry))
                     .collect();
-                items.sort_by_key(|item| match item {
-                    SpanItem::Published(key, _) => *key,
-                    _ => unreachable!("a published span holds published items"),
-                });
-                items
+                items.sort_by_key(|(key, _)| *key);
+                materialized.published = items;
             }
-            ChunkKind::Requests => self
-                .requests
-                .iter()
-                .filter(|(id, _)| keyed_bucket(id, REQUESTS_BUCKETS) == bucket)
-                .map(|(id, record)| SpanItem::Requests(id.clone(), record.clone()))
-                .collect(),
-            ChunkKind::Feed => self
-                .feed_sessions
-                .iter()
-                .filter(|(hour, _)| keyed_bucket(hour, FEED_BUCKETS) == bucket)
-                .flat_map(|(hour, session)| {
-                    session
-                        .staged
-                        .iter()
-                        .enumerate()
-                        .map(move |(page, entries)| {
-                            SpanItem::Feed(hour.clone(), page, entries.clone())
-                        })
-                })
-                .collect(),
-            ChunkKind::Batches => self
-                .demand_batches
-                .iter()
-                .filter(|(id, _)| keyed_bucket(id, BATCHES_BUCKETS) == bucket)
-                .map(|(id, batch)| SpanItem::Batches(id.clone(), batch.clone()))
-                .collect(),
-            ChunkKind::Staged => self
-                .staged_slices
-                .iter()
-                .filter(|(slice, _)| staged_bucket(**slice) == bucket)
-                .flat_map(|(&slice, staged)| {
-                    staged.rows.iter().enumerate().map(move |(part, rows)| {
-                        SpanItem::Staged(
-                            slice,
-                            staged.generation,
-                            staged.parts,
-                            u32::try_from(part).expect("part fits u32"),
-                            rows.clone(),
-                        )
+            ChunkKind::Requests => {
+                materialized.requests = self
+                    .requests
+                    .iter()
+                    .filter(|(id, _)| keyed_bucket(id, REQUESTS_BUCKETS) == bucket)
+                    .map(|(id, record)| (id.clone(), record.clone()))
+                    .collect();
+            }
+            ChunkKind::Feed => {
+                materialized.feed = self
+                    .feed_sessions
+                    .iter()
+                    .filter(|(hour, _)| keyed_bucket(hour, FEED_BUCKETS) == bucket)
+                    .flat_map(|(hour, session)| {
+                        session
+                            .staged
+                            .iter()
+                            .enumerate()
+                            .map(move |(page, entries)| (hour.clone(), page, entries.clone()))
                     })
-                })
-                .collect(),
-            ChunkKind::Outcomes => self
-                .attempt_outcomes
-                .iter()
-                .map(|outcome| SpanItem::Outcomes(outcome.clone()))
-                .collect(),
-            _ => Vec::new(),
-        };
+                    .collect();
+            }
+            ChunkKind::Batches => {
+                materialized.batches = self
+                    .demand_batches
+                    .iter()
+                    .filter(|(id, _)| keyed_bucket(id, BATCHES_BUCKETS) == bucket)
+                    .map(|(id, batch)| (id.clone(), batch.clone()))
+                    .collect();
+            }
+            ChunkKind::Staged => {
+                materialized.staged = self
+                    .staged_slices
+                    .iter()
+                    .filter(|(slice, _)| staged_bucket(**slice) == bucket)
+                    .flat_map(|(&slice, staged)| {
+                        staged.rows.iter().enumerate().map(move |(part, rows)| {
+                            (
+                                slice,
+                                staged.generation,
+                                staged.parts,
+                                u32::try_from(part).expect("part fits u32"),
+                                rows.clone(),
+                            )
+                        })
+                    })
+                    .collect();
+            }
+            ChunkKind::Outcomes => {
+                materialized.outcomes = self.attempt_outcomes.iter().cloned().collect();
+            }
+            _ => {}
+        }
         // The indexed kinds start at their range's first index.
         let at = match span.kind {
             ChunkKind::Intern => span.range * INTERN_RANGE,
@@ -885,7 +867,11 @@ impl Graph {
             ChunkKind::Edges => span.range * EDGES_RANGE,
             _ => 0,
         };
-        SpanEncoder { span, at, items }
+        SpanEncoder {
+            span,
+            at,
+            items: materialized,
+        }
     }
 
     /// The store holds every dirty range: clear the marks and lift the
@@ -1098,12 +1084,15 @@ impl SnapshotLoader {
         let rustc = bytes.u8()?;
         let status = Status::from_byte(bytes.u8()?)?;
         let flags = Flags(bytes.u8()?);
-        let state = if status.has_state() {
+        let (state, demand) = if status.has_state() {
+            let first_requested = bytes.i64()?;
+            let updated = bytes.i64()?;
+            let priority = bytes.i64()?;
+            let demand = bytes.i64()?;
             let state = State {
-                first_requested: bytes.i64()?,
-                updated: bytes.i64()?,
-                priority: bytes.i64()?,
-                demand: bytes.i64()?,
+                first_requested,
+                updated,
+                priority: graph.priorities.intern(priority),
                 downloads: bytes.u64()?,
                 attempt: bytes.u8()?,
                 dispatch_attempts: bytes.u16()?,
@@ -1111,9 +1100,9 @@ impl SnapshotLoader {
             let at = u32::try_from(graph.states.len())
                 .map_err(|_| QueueError::Invariant("snapshot state slab overflows u32".into()))?;
             graph.states.push(state);
-            at
+            (at, demand)
         } else {
-            NO_STATE
+            (NO_STATE, 0)
         };
         let node = Node {
             digest,
@@ -1131,16 +1120,15 @@ impl SnapshotLoader {
             status,
             flags,
         };
-        let ix = u32::try_from(graph.nodes.len())
-            .map_err(|_| QueueError::Invariant("node count overflows u32".into()))?;
         graph.nodes.push(node);
+        graph.demand.set(state, demand);
         match bytes.u8()? {
             0 => Ok(()),
             1 => {
                 let len = bytes.u32()? as usize;
                 let extra: Extra =
                     rmp_serde::from_slice(bytes.bytes(len)?).map_err(encode_error)?;
-                graph.extras.insert(ix, extra);
+                graph.extras.insert(state, extra);
                 Ok(())
             }
             flag => Err(QueueError::Invariant(format!(
@@ -1188,7 +1176,6 @@ impl SnapshotLoader {
         graph.outcome_hours = head.outcome_hours.into_iter().collect();
         graph.last_run_update_ms = head.last_run_update_ms;
         graph.intern.reserve_exact(head.lens.intern);
-        graph.edges.reserve_exact(head.lens.edges);
         graph.published.reserve(head.lens.published);
         *lens = Some(head.lens);
         Ok(())

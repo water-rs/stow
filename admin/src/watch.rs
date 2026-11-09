@@ -11,15 +11,16 @@ use std::io::Write;
 
 use futures_util::StreamExt;
 use stow_types::api::SchedulerStatus;
+use stow_types::ci::{CiEndpoint, CiRequest, CiRunPages, CiRunsPage, DispatchError};
 use stow_types::records::parse_run_title;
 use stow_types::runs::{RunFailure, RunJobRow, RunJobsPage};
 use stow_types::stow_error;
 use stow_types::transient::Backoff;
-use stow_types::trusted_builder::{WORKFLOW_FILE, WORKFLOW_NAME};
+use stow_types::trusted_builder::WORKFLOW_NAME;
 use time::OffsetDateTime;
 
 use crate::Edge;
-use crate::github::{self, ConditionalPages, RunsPage, WorkflowRunRow};
+use crate::github::{self, ConditionalPages, WorkflowRunRow};
 use crate::render::Screen;
 use crate::runs::{self, FailureClass, LiveTask, TaskProgress};
 
@@ -539,9 +540,9 @@ pub struct Watch {
     /// The model — runs, tasks, failures, the log-class memo.
     fleet: Fleet,
     /// The `queued` listing's per-URL page cache.
-    queued: ConditionalPages<RunsPage<WorkflowRunRow>>,
+    queued: ConditionalPages<CiRunsPage<WorkflowRunRow>>,
     /// The `in_progress` listing's per-URL page cache.
-    in_progress: ConditionalPages<RunsPage<WorkflowRunRow>>,
+    in_progress: ConditionalPages<CiRunsPage<WorkflowRunRow>>,
     /// Each in-flight run's jobs-page cache — dropped at `retire`.
     run_pages: HashMap<u64, ConditionalPages<RunJobsPage>>,
 }
@@ -638,11 +639,31 @@ impl Watch {
         base: &str,
         now: OffsetDateTime,
     ) -> stow_types::error::Result<()> {
-        let (queued, in_progress) = tokio::join!(
-            fetch_listing(token, base, "queued", &mut self.queued),
-            fetch_listing(token, base, "in_progress", &mut self.in_progress),
-        );
-        let rows = queued?.into_iter().chain(in_progress?).collect::<Vec<_>>();
+        let endpoint = if base == github::API_BASE {
+            CiEndpoint::GitHub {
+                repo: github::REPO.to_owned(),
+                token: token.to_owned(),
+            }
+        } else {
+            CiEndpoint::Local {
+                base: base.to_owned(),
+            }
+        };
+        let rows = endpoint
+            .status_runs_with(
+                &mut WatchRunPages {
+                    token,
+                    pages: &mut self.queued,
+                },
+                &mut WatchRunPages {
+                    token,
+                    pages: &mut self.in_progress,
+                },
+            )
+            .await?
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect::<Vec<_>>();
         let dropped = self.fleet.apply_listing(rows)?;
 
         let in_flight = self.fleet.in_progress();
@@ -733,48 +754,33 @@ impl Watch {
     }
 }
 
-/// One listing's rows — the `runs?status=<s>&per_page=100` walk
-/// through `pages`, following `Link: rel="next"` until
-/// `total_count` is in hand (§2.1). Fails past
-/// `github::RUNS_LISTING_CAP` and on a `Link` off `base`, same as the
-/// jobs pager.
-async fn fetch_listing(
-    token: &str,
-    base: &str,
-    status: &str,
-    pages: &mut ConditionalPages<RunsPage<WorkflowRunRow>>,
-) -> stow_types::error::Result<Vec<WorkflowRunRow>> {
-    let mut url = format!(
-        "{base}/repos/{}/actions/workflows/{WORKFLOW_FILE}/runs?status={status}&per_page=100",
-        github::REPO
-    );
-    let mut rows = Vec::new();
-    loop {
-        let (page, next) = pages
-            .get(Some(token), &url, Backoff::new())
+/// Each status owns its cache; concurrent reads share no mutable state.
+struct WatchRunPages<'a> {
+    token: &'a str,
+    pages: &'a mut ConditionalPages<CiRunsPage<WorkflowRunRow>>,
+}
+
+impl CiRunPages for WatchRunPages<'_> {
+    type Row = WorkflowRunRow;
+
+    async fn get(
+        &mut self,
+        request: CiRequest,
+    ) -> Result<(CiRunsPage<WorkflowRunRow>, Option<String>), DispatchError> {
+        let (page, next) = self
+            .pages
+            .get(Some(self.token), &request.url, Backoff::new())
             .await
-            .map_err(|error| stow_error!("GET {url}: {error}"))?;
-        rows.extend(page.workflow_runs.iter().cloned());
-        if u64::try_from(rows.len()).unwrap_or(u64::MAX) >= page.total_count {
-            break;
-        }
-        if rows.len() > github::RUNS_LISTING_CAP {
-            return Err(stow_error!(
-                "runs listing passed {} rows — the cap is {}",
-                rows.len(),
+            .map_err(|error| DispatchError::Network(error.to_string()))?;
+        if page.total_count > github::RUNS_LISTING_CAP as u64 {
+            return Err(DispatchError::Response(format!(
+                "runs listing has {} rows — the cap is {}",
+                page.total_count,
                 github::RUNS_LISTING_CAP
-            ));
+            )));
         }
-        let Some(next) = next else { break };
-        let next = next.to_owned();
-        if !next.starts_with(&format!("{base}/")) {
-            return Err(stow_error!(
-                "listing page link {next} leaves the read's base {base}"
-            ));
-        }
-        url = next;
+        Ok((page.clone(), next.map(str::to_owned)))
     }
-    Ok(rows)
 }
 
 #[cfg(test)]
