@@ -343,6 +343,9 @@ pub struct PhaseCost {
     pub tasks: u64,
     /// Wall milliseconds from the phase's first to its last ledger read.
     pub wall_ms: u64,
+    /// Union of mock DO handler intervals, including probe observers.
+    /// External latency assumptions remain separate from this observation.
+    pub active_ms: u64,
 }
 
 impl PhaseCost {
@@ -487,8 +490,19 @@ pub fn ledger_delta(
         .collect()
 }
 
+fn active_delta(earlier: &SchedulerLedger, later: &SchedulerLedger) -> crate::error::Result<u64> {
+    later
+        .active_ms
+        .checked_sub(earlier.active_ms)
+        .ok_or_else(|| crate::stow_error!("probe activity counter moved backwards"))
+}
+
 /// `base + delta`, per operation.
-fn ledger_sum(base: &SchedulerLedger, delta: &[SchedulerLedgerOp]) -> SchedulerLedger {
+fn ledger_sum(
+    base: &SchedulerLedger,
+    delta: &[SchedulerLedgerOp],
+    active_delta_ms: u64,
+) -> SchedulerLedger {
     let mut ops: BTreeMap<&str, SchedulerLedgerOp> = base
         .ops
         .iter()
@@ -509,6 +523,7 @@ fn ledger_sum(base: &SchedulerLedger, delta: &[SchedulerLedgerOp]) -> SchedulerL
     }
     SchedulerLedger {
         woken_at_ms: base.woken_at_ms,
+        active_ms: base.active_ms + active_delta_ms,
         ops: ops.into_values().collect(),
     }
 }
@@ -584,6 +599,9 @@ impl<'a> Timeline<'a> {
         Ok(ledger_sum(
             &self.carried[last],
             &ledger_delta(&restart.after.ledger, &snapshot.ledger)?,
+            // Activity is not snapshotted: the new instance starts at zero.
+            // Include its startup and first probe read, unlike restored row counts.
+            active_delta(&restart.after.ledger, &snapshot.ledger)? + restart.after.ledger.active_ms,
         ))
     }
 
@@ -706,6 +724,7 @@ fn phase_cost(phase: &PhaseObservations, runs: &[LocalCiRun]) -> crate::error::R
         .collect();
     let tasks = build_tasks_between(runs, phase.start.taken_at_ms, phase.end.taken_at_ms);
     Ok(PhaseCost {
+        active_ms: active_delta(&phase.start.ledger, &phase.end.ledger)?,
         kinds: kind_costs(&ops),
         other_ops,
         rows_read: counted.iter().map(|op| op.rows_read).sum(),
@@ -1205,12 +1224,51 @@ mod tests {
     use crate::api::{SchedulerLedger, SchedulerLedgerOp};
     use crate::local_ci::LocalCiRun;
 
+    #[test]
+    fn activity_is_carried_across_restart_and_counter_regression_is_rejected() {
+        let before = snapshot(
+            100,
+            crate::api::SchedulerLedger {
+                active_ms: 40,
+                ..Default::default()
+            },
+        );
+        let after = snapshot(
+            200,
+            crate::api::SchedulerLedger {
+                active_ms: 5,
+                woken_at_ms: 200,
+                ..Default::default()
+            },
+        );
+        let restarts = [super::EdgeRestart { before, after }];
+        let timeline = super::Timeline::new(&restarts).expect("restart");
+        let later = snapshot(
+            300,
+            crate::api::SchedulerLedger {
+                active_ms: 25,
+                woken_at_ms: 200,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            timeline.snapshot(&later).expect("carried").ledger.active_ms,
+            65
+        );
+        let regressed = crate::api::SchedulerLedger {
+            active_ms: 4,
+            ..Default::default()
+        };
+        assert!(super::active_delta(&restarts[0].after.ledger, &regressed).is_err());
+    }
+
     /// A ledger whose kinds each ran `events` times — completions
     /// `completions` times, one per build run — at `rate` rows read and
     /// one written per event, plus `completion_extra` reads on
     /// completions.
     fn ledger(events: u64, completions: u64, rate: u64, completion_extra: u64) -> SchedulerLedger {
         SchedulerLedger {
+            active_ms: events * 10,
             woken_at_ms: 0,
             ops: EventKind::ALL
                 .iter()
@@ -1366,6 +1424,7 @@ mod tests {
                     super::ledger_sum(
                         &restart.reloaded,
                         &ledger_delta(&restart.truth, truth).expect("truth only grows"),
+                        super::active_delta(&restart.truth, truth).expect("activity only grows"),
                     )
                 },
             )
@@ -1407,6 +1466,7 @@ mod tests {
     /// read that woke it.
     fn reloaded(mut ledger: SchedulerLedger, woken_at_ms: i64) -> SchedulerLedger {
         ledger.woken_at_ms = woken_at_ms;
+        ledger.active_ms = 0;
         for op in ["GET /budget/ledger", "GET /status"] {
             ledger.ops.push(SchedulerLedgerOp {
                 op: op.to_owned(),

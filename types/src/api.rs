@@ -2497,6 +2497,9 @@ pub struct SchedulerRearmReport {
 /// cost` lane (stow#773) snapshots it between layers and diffs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerLedger {
+    /// Union of mock request/alarm processing intervals in this object instance.
+    /// This is handler wall time, not production billable duration.
+    pub active_ms: u64,
     /// When the object last loaded its graph, unix ms. The ledger lives
     /// on that graph and persists only through its snapshot, so a
     /// reload drops every booking since the snapshot: two reads that

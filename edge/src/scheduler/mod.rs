@@ -6,6 +6,7 @@
 //! host-test while the `CfFetch` plumbing stays `wasm32`-only — and
 //! `object` is the Durable Object glue.
 
+mod activity;
 /// The hourly demand feed's durable hour/page state machine —
 /// backend-abstracted like `queue` so it host-tests on every target.
 pub mod feed;

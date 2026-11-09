@@ -4050,6 +4050,8 @@ impl Graph {
 /// `.await`, so the DO input gate's serialization holds either way.
 #[derive(Clone, Default)]
 pub struct GraphCell {
+    /// Mock handler intervals, independent of graph snapshot/load/reset.
+    activity: std::sync::Arc<std::sync::Mutex<super::activity::Activity>>,
     graph: std::sync::Arc<std::sync::Mutex<Graph>>,
     /// Whether `graph` holds the woken state rather than the empty
     /// placeholder a reset leaves behind.
@@ -4134,6 +4136,18 @@ impl<'a> LoadedGraph<'a> {
 }
 
 impl GraphCell {
+    pub(crate) fn probe_active_ms(&self, now: i64) -> u64 {
+        self.activity
+            .lock()
+            .expect("activity counter poisoned")
+            .read(now)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(super) fn probe_invocation(&self) -> super::activity::Invocation<'_, fn() -> i64> {
+        super::activity::Invocation::start(&self.activity, super::object::now_ms)
+    }
+
     /// The loaded-graph handle, or `None` while the graph is not yet
     /// loaded this isolate (before the wake, or after a reset).
     pub(crate) fn loaded(&self) -> Option<LoadedGraph<'_>> {

@@ -287,6 +287,7 @@ pub(super) fn test_report(nodes: u64) -> MeasuredReport {
     use stow_types::preheat_cost::{EventKind, KindCost, PreheatCostReport};
 
     let phase = PhaseCost {
+        active_ms: 0,
         kinds: vec![KindCost {
             kind: EventKind::Completion,
             events: 100,
