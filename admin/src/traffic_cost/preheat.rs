@@ -261,7 +261,7 @@ impl PreheatMonthly {
 pub fn not_measured(product: &str, dimension: &str) -> &'static str {
     match (product, dimension) {
         ("durable_objects", "duration_gb_s") => {
-            "the report carries the harness's phase wall, not Durable Object duration"
+            "mock handler activity is not projected; production external-I/O duration remains unmodelled"
         }
         _ => "the preheat report does not measure this dimension",
     }

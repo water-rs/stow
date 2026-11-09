@@ -604,9 +604,9 @@ impl UsageLine {
         self.allowance * fraction
     }
 
-    /// Traffic plus preheat — what the bound is compared with.
-    pub fn total(&self) -> f64 {
-        self.traffic + self.preheat.unwrap_or(0.0)
+    /// Complete traffic plus preheat usage, absent when a contribution is unmeasured.
+    pub fn total(&self) -> Option<f64> {
+        self.preheat.map(|preheat| self.traffic + preheat)
     }
 }
 
@@ -914,8 +914,12 @@ fn diagnostic_lines(projection: &Projection) -> Vec<UsageLine> {
 fn usage_breaches(usage: &[UsageLine], top_routes: &[RouteShare]) -> Vec<Breach> {
     let mut breaches = Vec::new();
     for line in usage {
+        let Some(preheat) = line.preheat else {
+            continue;
+        };
+        let projected = line.traffic + preheat;
         let bound = line.bound();
-        if line.total() > bound {
+        if projected > bound {
             // `RouteShare::dimension` keys the share dimension by
             // product prefix — `do_`, `worker_`.
             let prefix = match line.product {
@@ -924,7 +928,6 @@ fn usage_breaches(usage: &[UsageLine], top_routes: &[RouteShare]) -> Vec<Breach>
                 other => other,
             };
             let share_key = format!("{prefix}_{}", line.dimension);
-            let preheat = line.preheat.unwrap_or(0.0);
             let top_route = if preheat > line.traffic {
                 PREHEAT_ROUTE
             } else {
@@ -936,7 +939,7 @@ fn usage_breaches(usage: &[UsageLine], top_routes: &[RouteShare]) -> Vec<Breach>
             breaches.push(Breach {
                 product: line.product,
                 dimension: line.dimension,
-                projected: line.total(),
+                projected,
                 traffic: line.traffic,
                 preheat,
                 bound,
@@ -1037,6 +1040,24 @@ impl ProjectionReport {
             ("clean", &self.projection),
             ("post-load", &self.projection_after_load),
         ] {
+            failures.extend(
+                evaluation
+                    .usage
+                    .iter()
+                    .filter(|line| line.preheat.is_none())
+                    .map(|line| {
+                        format!(
+                            "{label} projection: {} {} incomplete — {}",
+                            line.product,
+                            line.dimension,
+                            super::preheat::not_measured(line.product, line.dimension)
+                        )
+                    }),
+            );
+            failures.extend(evaluation.unmeasured_cpu.iter().filter(|gap| gap.monthly_events > 0.0).map(|gap| {
+                format!("{label} projection: Worker CPU for {} is unmeasured ({:.3e} events/month) — {}",
+                    gap.route, gap.monthly_events, gap.reason)
+            }));
             failures.extend(evaluation.breaches.iter().map(|breach| {
                 format!(
                     "{label} projection: {} {} {:.3e} over bound {:.3e} \
@@ -1144,17 +1165,26 @@ fn render_usage(usage: &[UsageLine]) -> String {
     let mut unmeasured = Vec::new();
     for line in usage {
         let bound = line.bound();
+        let total = line.total();
         table.push([
             line.product.to_owned(),
             line.dimension.to_owned(),
             format!("{:.3e}", line.traffic),
             line.preheat
                 .map_or_else(|| "n/m".to_owned(), |preheat| format!("{preheat:.3e}")),
-            format!("{:.3e}", line.total()),
+            total.map_or_else(|| "n/m".to_owned(), |total| format!("{total:.3e}")),
             format!("{:.3e}", line.allowance),
             format!("{bound:.3e}"),
-            format!("{:.1}%", 100.0 * line.total() / line.allowance),
-            if line.total() > bound { "OVER" } else { "" }.to_owned(),
+            total.map_or_else(
+                || "n/m".to_owned(),
+                |total| format!("{:.1}%", 100.0 * total / line.allowance),
+            ),
+            match total {
+                None => "UNMEASURED",
+                Some(total) if total > bound => "OVER",
+                Some(_) => "",
+            }
+            .to_owned(),
         ]);
         if line.preheat.is_none() {
             unmeasured.push(format!(
@@ -1296,7 +1326,7 @@ pub async fn run(args: &ProjectArgs, output: Output) -> stow_types::error::Resul
         Ok(())
     } else {
         Err(stow_error!(
-            "monthly projection: {} breach(es)",
+            "monthly projection: {} failure(s)",
             failures.len()
         ))
     }
@@ -1382,11 +1412,37 @@ mod tests {
     }
 
     #[test]
-    fn a_healthy_run_passes() {
+    fn incomplete_measurements_cannot_pass_even_when_known_usage_fits() {
         let small = fixture_report(100_000, |_| 0.5);
         let after = fixture_report(100_000, |_| 0.5);
-        let report =
+        let mut report =
             project_with(&small, &after, &no_preheat(), &fixture_cpu(|_| 0.5)).expect("project");
+        assert!(report.projection.breaches.is_empty());
+        let failures = report.failures();
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("duration_gb_s incomplete"))
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("Worker CPU") && failure.contains("unmeasured"))
+        );
+        assert!(super::render_projection(&report).contains("monthly projection: FAIL"));
+        assert!(super::render_usage(&report.projection.usage).contains("UNMEASURED"));
+        // Supply a complete low-cost measurement fixture to distinguish
+        // missing contributions from an actual numerical budget breach.
+        for evaluation in [&mut report.projection, &mut report.projection_after_load] {
+            for line in &mut evaluation.usage {
+                if line.preheat.is_none() {
+                    line.preheat = Some(0.0);
+                }
+            }
+            for gap in &mut evaluation.unmeasured_cpu {
+                gap.monthly_events = 0.0;
+            }
+        }
         let rendered = super::render_projection(&report);
         assert!(report.failures().is_empty(), "{rendered}");
         assert!(rendered.contains("monthly projection: PASS"), "{rendered}");
@@ -1436,11 +1492,11 @@ mod tests {
         // 500 rows/node × 10 nodes.
         let preheat = after.preheat.expect("measured");
         assert!((preheat - 15_000.0).abs() < 1e-6, "{preheat}");
-        assert!((after.total() - (after.traffic + 15_000.0)).abs() < 1e-6);
+        assert!((after.total().expect("complete") - (after.traffic + 15_000.0)).abs() < 1e-6);
 
         let workers = usage(&with, "workers", "requests");
         assert_eq!(workers.preheat, Some(0.0));
-        assert!((workers.total() - workers.traffic).abs() < f64::EPSILON);
+        assert!((workers.total().expect("complete") - workers.traffic).abs() < f64::EPSILON);
         assert_eq!(usage(&with, "workers", "cpu_ms").preheat, Some(0.0));
     }
 
@@ -1497,7 +1553,9 @@ mod tests {
         // phase exceeds the removed daily wave limit, but fits the month.
         let fits = rows_written_per_node(headroom * 0.4 / 10.0);
         let report = project_with(&small, &after, &preheat_of(fits, fits), &cpu).expect("project");
-        assert!(report.failures().is_empty(), "{:?}", report.failures());
+        assert!(report.projection.breaches.is_empty());
+        assert!(report.projection_after_load.breaches.is_empty());
+        assert!(!report.failures().is_empty(), "unmeasured costs still fail");
 
         // A month of preheat as large as the whole allowance remains
         // over the combined monthly bound.
@@ -1505,7 +1563,14 @@ mod tests {
         let report =
             project_with(&small, &after, &preheat_of(overflows, overflows), &cpu).expect("project");
         let failures = report.failures();
-        assert_eq!(failures.len(), 2, "clean and post-load: {failures:?}");
+        assert_eq!(
+            failures
+                .iter()
+                .filter(|failure| failure.contains("over bound"))
+                .count(),
+            2,
+            "clean and post-load: {failures:?}"
+        );
         let breach = &report.projection.breaches[0];
         assert_eq!(breach.product, "durable_objects");
         assert_eq!(breach.dimension, "rows_written");
