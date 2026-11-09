@@ -26,13 +26,12 @@ pub(super) struct IxTable {
 }
 
 impl IxTable {
-    /// A table sized so `entries` ids insert without growing.
-    pub(super) fn with_entries(entries: usize) -> Self {
+    /// Clear the table and reuse its buffer for `entries` ids.
+    pub(super) fn clear_for(&mut self, entries: usize) {
         let wanted = (entries * 10 / 7 + 1).next_power_of_two().max(16);
-        Self {
-            slots: vec![EMPTY; wanted],
-            used: 0,
-        }
+        self.slots.resize(wanted, EMPTY);
+        self.slots.fill(EMPTY);
+        self.used = 0;
     }
 
     /// The ids sharing `hash`'s probe run, in slot order. A caller
@@ -164,7 +163,7 @@ impl Interner {
 
     /// Build the lookup table over the loaded strings.
     pub(super) fn index(&mut self) {
-        self.table = IxTable::with_entries(self.ends.len());
+        self.table.clear_for(self.ends.len());
         let Self { text, ends, table } = self;
         for id in 0..ends.len() {
             let id = u32::try_from(id).expect("interner ids fit u32");
@@ -186,4 +185,52 @@ fn slice<'a>(text: &'a str, ends: &[u32], id: u32) -> &'a str {
         .checked_sub(1)
         .map_or(0, |prev| ends[prev as usize] as usize);
     &text[start..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Interner, IxTable};
+
+    #[test]
+    fn repeated_index_rebuilds_discard_old_ids_and_preserve_collisions() {
+        let mut table = IxTable::default();
+        for count in [0u32, 128, 7, 7, 256, 0, 19] {
+            let previous = table.slots.as_ptr();
+            let capacity = table.slots.capacity();
+            table.clear_for(count as usize);
+            if table.slots.len() <= capacity {
+                assert_eq!(table.slots.as_ptr(), previous);
+            }
+            // Many identities share each probe hash; rebuilding must both
+            // retain every collision and remove the preceding population.
+            let hash = |id: u32| u64::from(id % 3);
+            for id in 0..count {
+                table.insert(hash(id), id, hash);
+            }
+            for key in 0..3 {
+                let mut actual: Vec<_> = table
+                    .candidates(key)
+                    .filter(|&id| hash(id) == key)
+                    .collect();
+                actual.sort_unstable();
+                let expected: Vec<_> = (0..count).filter(|&id| hash(id) == key).collect();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn interner_reindex_preserves_loaded_and_new_strings() {
+        let mut intern = Interner::default();
+        for value in ["serde", "1.0.229", "derive", "std"] {
+            intern.load(value);
+        }
+        for value in ["alloc", "serde", "derive"] {
+            intern.index();
+            intern.intern(value);
+            for (id, held) in intern.iter_from(0).enumerate() {
+                assert_eq!(intern.get(held), Some(u32::try_from(id).unwrap()));
+            }
+        }
+    }
 }
