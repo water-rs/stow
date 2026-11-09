@@ -100,6 +100,48 @@ impl Iterator for Candidates<'_> {
     }
 }
 
+/// A priority value owned by one graph's priority pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PriorityId(u32);
+
+/// Exact source/operator priorities shared by states in the same rank class.
+#[derive(Debug, Default)]
+pub(super) struct Priorities {
+    values: Vec<i64>,
+    table: IxTable,
+}
+
+impl Priorities {
+    pub(super) const fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub(super) fn at(&self, id: PriorityId) -> i64 {
+        self.values[id.0 as usize]
+    }
+
+    pub(super) fn intern(&mut self, value: i64) -> PriorityId {
+        let hash = hash_of(&value);
+        if let Some(id) = self
+            .table
+            .candidates(hash)
+            .find(|&id| self.values[id as usize] == value)
+        {
+            return PriorityId(id);
+        }
+        let id =
+            u32::try_from(self.values.len()).expect("priority pool holds fewer than 2^32 values");
+        self.values.push(value);
+        let Self { values, table } = self;
+        table.insert(hash, id, |held| hash_of(&values[held as usize]));
+        PriorityId(id)
+    }
+
+    pub(super) const fn heap_bytes(&self) -> usize {
+        self.values.capacity() * size_of::<i64>() + self.table.heap_bytes()
+    }
+}
+
 /// String interner: every repeated string (crate names, versions,
 /// feature lists) is stored once, back to back in one buffer, and
 /// referred to by a `u32` everywhere else.
@@ -189,7 +231,23 @@ fn slice<'a>(text: &'a str, ends: &[u32], id: u32) -> &'a str {
 
 #[cfg(test)]
 mod tests {
-    use super::{Interner, IxTable};
+    use super::{Interner, IxTable, Priorities};
+
+    #[test]
+    fn priority_indexes_survive_growth_and_reuse_exact_values() {
+        let mut pool = Priorities::default();
+        let values = [i64::MIN, i64::MAX, -1, 0, 1];
+        let ids: Vec<_> = values.iter().map(|&value| pool.intern(value)).collect();
+        for value in 2..1024 {
+            pool.intern(value);
+        }
+        let count = pool.values.len();
+        for (&value, &id) in values.iter().zip(&ids) {
+            assert_eq!(pool.intern(value), id);
+            assert_eq!(pool.at(id), value);
+        }
+        assert_eq!(pool.values.len(), count);
+    }
 
     #[test]
     fn repeated_index_rebuilds_discard_old_ids_and_preserve_collisions() {

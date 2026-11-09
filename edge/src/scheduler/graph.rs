@@ -10,7 +10,7 @@
 //! interned once as `u32` ids and its dependency digest an inline
 //! 32-byte value; its task id is never stored but re-minted from those
 //! fields. The queue state of a node that has not published rides a
-//! 40-byte slab entry, freed on publish; the fields few nodes carry sit
+//! 32-byte slab entry, freed on publish; the fields few nodes carry sit
 //! in a side table. Edges are flat `u32` arrays — forward spans per node
 //! plus a CSR reverse index — and the ready set holds node indexes
 //! only, ordered at claim time. A published node stays only while a
@@ -45,7 +45,7 @@ mod sparse;
 
 use arena::Arena;
 use edges::Edges;
-use index::{Interner, IxTable, hash_of};
+use index::{Interner, IxTable, Priorities, hash_of};
 pub use node::RunCompletion;
 use node::{Extra, Flags, Lane, NO_STATE, Node, State, Status};
 use sparse::SparseDemand;
@@ -460,6 +460,8 @@ pub struct Graph {
     demand: SparseDemand,
     /// Vacant `states` slots, reused before the slab grows.
     free_states: Vec<u32>,
+    /// Full priority values shared by state rank classes.
+    priorities: Priorities,
     /// Sparse fields keyed by stable state slot, so node compaction never
     /// rekeys or copies this table; see [`Extra`].
     extras: HashMap<u32, Extra>,
@@ -781,7 +783,7 @@ impl Graph {
     /// A node's rank operand: its priority — what the rank multiplies
     /// by time waited and what the admission floor compares (stow#879).
     fn operand_of(&self, ix: u32) -> i64 {
-        self.state(ix).priority
+        self.priorities.at(self.state(ix).priority)
     }
 
     /// The node's claim rank: `operand × (now − first_requested)`,
@@ -1250,6 +1252,7 @@ impl Graph {
                 .map(|node| (node.edges_start as usize, usize::from(node.edges_len))),
             &remap,
         );
+        let mut priorities = Priorities::default();
         let mut write = 0usize;
         let mut edges_end = 0u32;
         for read in 0..self.nodes.len() {
@@ -1257,12 +1260,17 @@ impl Graph {
                 continue;
             }
             let mut node = self.nodes[read];
+            if node.state != NO_STATE {
+                let state = &mut self.states[node.state as usize];
+                state.priority = priorities.intern(self.priorities.at(state.priority));
+            }
             node.edges_start = edges_end;
             edges_end += u32::from(node.edges_len);
             self.nodes[write] = node;
             write += 1;
         }
         self.nodes.truncate(write);
+        self.priorities = priorities;
         for ready in [&mut self.ready, &mut self.ready_macos] {
             *ready = std::mem::take(ready)
                 .into_iter()
@@ -1385,9 +1393,10 @@ impl Graph {
                     // the highest priority; its first-requested instant
                     // never moves (stow#879).
                     self.remove_ready(ix);
+                    let priority = self.priorities.intern(self.operand_of(ix).max(priority));
                     let state = self.state_mut(ix);
                     state.downloads = state.downloads.max(sub.downloads);
-                    state.priority = state.priority.max(priority);
+                    state.priority = priority;
                     self.refresh_ready(ix);
                 }
                 node_ixs.push(ix);
@@ -1489,10 +1498,10 @@ impl Graph {
         let own = self.targets[usize::from(target)].own_masks[usize::from(sub.host_side)]
             [usize::from(explicit)];
         let published = self.published.get(&keys.key).map_or(0, |entry| entry.mask);
-        let state = (published & own != own).then_some(State {
+        let state = (published & own != own).then(|| State {
             first_requested: now,
             updated: now,
-            priority,
+            priority: self.priorities.intern(priority),
             downloads: sub.downloads,
             attempt: 1,
             dispatch_attempts: 0,
@@ -1529,7 +1538,7 @@ impl Graph {
                 continue;
             }
             let state = self.state(ix);
-            if sub.downloads > state.downloads || state.priority < priority {
+            if sub.downloads > state.downloads || self.priorities.at(state.priority) < priority {
                 return true;
             }
         }
@@ -2686,8 +2695,10 @@ impl Graph {
                     self.edit_flags(ix, |flags| flags.set_lane(Lane::Human));
                     // The verb's raise is the website class's operand —
                     // what a request someone asked for by name carries.
-                    self.state_mut(ix).priority =
-                        self.state(ix).priority.max(queue::REQUEST_PRIORITY);
+                    let priority = self
+                        .priorities
+                        .intern(self.operand_of(ix).max(queue::REQUEST_PRIORITY));
+                    self.state_mut(ix).priority = priority;
                     (true, false, false)
                 }
                 MutationKind::Purge if matches!(status, Status::Completed | Status::Failed) => {
@@ -2848,11 +2859,14 @@ impl Graph {
             };
             if self.node(ix).status.has_state() {
                 self.remove_ready(ix);
+                let priority = self
+                    .priorities
+                    .intern(self.operand_of(ix).max(queue::MISS_PRIORITY));
                 let state = self.state_mut(ix);
                 state.downloads = state.downloads.max(entry.downloads);
                 // A re-requested id is miss-class demand (stow#879):
                 // the lane's source priority, never a computed one.
-                state.priority = state.priority.max(queue::MISS_PRIORITY);
+                state.priority = priority;
                 self.refresh_ready(ix);
             }
             inserted += 1;
@@ -3129,6 +3143,10 @@ impl Graph {
             state_storage_bytes = self.states.capacity() * size_of::<State>(),
             demand_storage_bytes = self.demand.heap_bytes(),
             intern_storage_bytes = self.intern.heap_bytes(),
+            ready_entries = self.ready_sets().map(BTreeSet::len).sum::<usize>(),
+            ready_classes = self.ready.len() + self.ready_macos.len(),
+            priority_values = self.priorities.len(),
+            priority_storage_bytes = self.priorities.heap_bytes(),
             task_id_index_bytes = self.ids.heap_bytes(),
             identity_index_bytes = self.idents.heap_bytes(),
             dependency_edges = self.edges.len(),
@@ -3210,6 +3228,7 @@ impl Graph {
     #[cfg(test)]
     pub(crate) fn heap_bytes(&self) -> usize {
         self.intern.heap_bytes()
+            + self.priorities.heap_bytes()
             + self.ids.heap_bytes()
             + self.idents.heap_bytes()
             + self.nodes.capacity() * size_of::<Node>()
@@ -5095,7 +5114,7 @@ mod tests {
     #[test]
     fn records_keep_their_sizes() {
         assert_eq!(size_of::<Node>(), 68);
-        assert_eq!(size_of::<State>(), 40);
+        assert_eq!(size_of::<State>(), 32);
     }
 
     #[test]
@@ -6106,7 +6125,7 @@ mod tests {
             .merge(&single("rival", SubmissionSource::HumanRequest), 1_000)
             .expect("rival merge");
         let ix = graph.node_ix(&id("shared")).expect("node");
-        assert_eq!(graph.state(ix).priority, queue::REQUEST_PRIORITY);
+        assert_eq!(graph.operand_of(ix), queue::REQUEST_PRIORITY);
         assert_eq!(graph.state(ix).first_requested, 0);
         // Same class as the rival, but twice the wait — it leads.
         let claimed = graph
@@ -6114,6 +6133,81 @@ mod tests {
             .expect("claim");
         let ids: Vec<_> = claimed.iter().map(|claim| claim.task_id.clone()).collect();
         assert_eq!(ids, vec![id("shared"), id("rival")]);
+    }
+
+    #[test]
+    fn shared_priorities_preserve_values_and_order_through_wake_and_updates() {
+        let mut graph = Graph::default();
+        let values = [i64::MIN, 1, queue::REQUEST_PRIORITY, i64::MAX];
+        for (at, &priority) in values.iter().enumerate() {
+            let name = format!("priority-{at}");
+            graph
+                .merge(&single(&name, SubmissionSource::Operations { priority }), 0)
+                .expect("merge");
+        }
+        let mut restored = round_trip(&graph);
+        for (at, &priority) in values.iter().enumerate() {
+            let ix = restored
+                .node_ix(&id(&format!("priority-{at}")))
+                .expect("restored node");
+            assert_eq!(restored.operand_of(ix), priority);
+        }
+        restored
+            .merge(
+                &single(
+                    "priority-1",
+                    SubmissionSource::Operations { priority: i64::MAX },
+                ),
+                1,
+            )
+            .expect("raise after wake");
+        restored
+            .merge(
+                &single(
+                    "priority-tail",
+                    SubmissionSource::Operations { priority: i64::MAX },
+                ),
+                0,
+            )
+            .expect("append after wake");
+        let raised = restored.node_ix(&id("priority-1")).expect("raised");
+        let tail = restored.node_ix(&id("priority-tail")).expect("tail");
+        assert_eq!(
+            restored.state(raised).priority,
+            restored.state(tail).priority,
+            "equal values share their index"
+        );
+        restored
+            .merge(
+                &single(
+                    "priority-drop",
+                    SubmissionSource::Operations { priority: 17 },
+                ),
+                0,
+            )
+            .expect("temporary priority");
+        report(&mut restored, None, 1, &["priority-drop"], &[]).expect("publish temporary node");
+        restored.compact();
+        assert_eq!(
+            restored.priorities.len(),
+            3,
+            "compaction drops superseded and freed priorities"
+        );
+        let mut reloaded = round_trip(&restored);
+        let expected: Vec<_> = restored
+            .claim(&claim_settings(500, 50), 1000, u32::MAX)
+            .expect("claim")
+            .into_iter()
+            .map(|claim| claim.task_id)
+            .collect();
+        let actual: Vec<_> = reloaded
+            .claim(&claim_settings(500, 50), 1000, u32::MAX)
+            .expect("claim after wake")
+            .into_iter()
+            .map(|claim| claim.task_id)
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(actual[0], id("priority-1"));
     }
 
     /// stow#879: operations submissions carry the caller's operand.

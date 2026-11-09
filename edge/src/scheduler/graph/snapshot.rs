@@ -413,7 +413,7 @@ fn encode_error(error: impl std::fmt::Display) -> QueueError {
 fn write_node(
     buf: &mut Vec<u8>,
     node: &Node,
-    state: Option<&State>,
+    state: Option<(&State, i64)>,
     extra: Option<&Extra>,
     demand: i64,
 ) -> Result<(), QueueError> {
@@ -427,10 +427,10 @@ fn write_node(
     buf.push(node.rustc);
     buf.push(node.status as u8);
     buf.push(node.flags.0);
-    if let Some(state) = state {
+    if let Some((state, priority)) = state {
         buf.extend_from_slice(&state.first_requested.to_le_bytes());
         buf.extend_from_slice(&state.updated.to_le_bytes());
-        buf.extend_from_slice(&state.priority.to_le_bytes());
+        buf.extend_from_slice(&priority.to_le_bytes());
         buf.extend_from_slice(&demand.to_le_bytes());
         buf.extend_from_slice(&state.downloads.to_le_bytes());
         buf.push(state.attempt);
@@ -612,7 +612,13 @@ impl SpanEncoder {
                     let state =
                         (node.state != NO_STATE).then(|| &graph.states[node.state as usize]);
                     let extra = graph.extras.get(&node.state);
-                    write_node(buf, node, state, extra, graph.demand.get(node.state))
+                    write_node(
+                        buf,
+                        node,
+                        state.map(|state| (state, graph.priorities.at(state.priority))),
+                        extra,
+                        graph.demand.get(node.state),
+                    )
                 })?
             }
             ChunkKind::Edges => {
@@ -1084,7 +1090,7 @@ impl SnapshotLoader {
             let state = State {
                 first_requested,
                 updated,
-                priority,
+                priority: graph.priorities.intern(priority),
                 downloads: bytes.u64()?,
                 attempt: bytes.u8()?,
                 dispatch_attempts: bytes.u16()?,
