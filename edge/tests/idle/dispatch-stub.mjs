@@ -4,6 +4,8 @@ import { externalResponse } from "./external-responses.mjs";
 // in arrival order — scheduled.test.ts reads and clears them through
 // /__control/periodic.
 const periodic = [];
+let ciLimit = null;
+let dispatchAttempts = 0;
 const resolves = [];
 const externalCalls = [];
 // The stems of the workflows STOW_PERIODIC_WORKFLOWS names in
@@ -83,6 +85,14 @@ export default {
 		// STOW_LOCAL_CI_URL: the /dispatch event POST and the
 		// GitHub-shaped run endpoints under /repos/{owner}/{repo}/actions.
 		if (url.port === "28124") {
+			if (url.pathname === "/__control/ci-limit") {
+				if (request.method === "POST") {
+					ciLimit = (await request.json()).mode;
+					dispatchAttempts = 0;
+					return new Response(null, { status: 204 });
+				}
+				return Response.json({ attempts: dispatchAttempts });
+			}
 			if (url.pathname === "/__control/human-reset" && request.method === "POST") {
 				resolves.length = 0;
 				externalCalls.length = 0;
@@ -93,12 +103,22 @@ export default {
 			if (url.pathname === "/__control/periodic") {
 				if (request.method === "POST") {
 					periodic.length = 0;
+					ciLimit = null;
+					dispatchAttempts = 0;
 					return new Response(null, { status: 204 });
 				}
 				return Response.json(periodic);
 			}
 			if (request.method === "POST" && url.pathname === "/dispatch") {
+				dispatchAttempts++;
+				if (ciLimit) {
+					const headers = ciLimit === "primary"
+						? { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 60) }
+						: { "retry-after": "60" };
+					return new Response("rate limited", { status: 403, headers });
+				}
 				const body = await request.json();
+				if (body.event_type === "preheat") return new Response(null, { status: 204 });
 				if (body.event_type === "resolve-request" && body.client_payload) {
 					resolves.push(body.client_payload);
 					return new Response(null, { status: 204 });

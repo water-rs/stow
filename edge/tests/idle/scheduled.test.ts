@@ -12,12 +12,19 @@
 
 import { env } from "cloudflare:test";
 import { exports } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 
 const CI = "http://127.0.0.1:28124/__control/periodic";
 
 async function reset() {
-	await fetch(CI, { method: "POST", body: JSON.stringify({}) });
+	const cleared = await fetch(CI, { method: "POST", body: JSON.stringify({}) });
+	expect(cleared.status).toBe(204);
+	const stub = env.SCHEDULER.get(env.SCHEDULER.idFromName("scheduler"));
+	const response = await stub.fetch("https://scheduler.invalid/reset", {
+		method: "POST",
+		headers: { "x-stow-actor": "scheduled-test" },
+	});
+	expect(response.status, await response.text()).toBe(200);
 }
 
 // The stub only answers the Worker under test (outboundService), so the
@@ -44,5 +51,32 @@ describe("scheduled handler", () => {
 				workflows.map((entry) => file(entry).replace(/\.ya?ml$/, "")).sort(),
 			);
 		}
+	});
+});
+
+
+describe("control dispatch recovery fence", () => {
+	beforeEach(reset);
+	it.each(["primary", "secondary"])("shares a %s recovery deadline across control entry points", async (mode) => {
+		const control = "http://127.0.0.1:28124/__control/ci-limit";
+		const configured = await fetch(control, { method: "POST", body: JSON.stringify({ mode }) });
+		expect(configured.status).toBe(204);
+		const stub = env.SCHEDULER.get(env.SCHEDULER.idFromName("scheduler"));
+		const call = async (route: string, body: unknown) => {
+			const response = await stub.fetch(`https://scheduler.invalid${route}`, {
+				method: "POST", headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+			});
+			await response.arrayBuffer();
+			return response.status;
+		};
+		const periodic = { workflow: "watchdog.yml", ref: "main" };
+		const release = { rustc_version: "1.99.1" };
+		const first = mode === "primary" ? "/periodic/dispatch" : "/preheat/release";
+		expect(await call(first, mode === "primary" ? periodic : release)).toBe(502);
+		expect(await call("/periodic/dispatch", periodic)).toBe(503);
+		expect(await call("/preheat/release", release)).toBe(503);
+		const observed = await (await fetch(control)).json() as { attempts: number };
+		expect(observed.attempts).toBe(1);
 	});
 });
