@@ -89,32 +89,24 @@ impl MeteredBackend {
 }
 
 impl DurableDbBackend for MeteredBackend {
-    fn query(
-        &self,
-        query: &str,
-        params: &[DbValue],
-    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
-        async move {
-            let mut source = &self.inner;
-            let started_ms = clock_ms();
-            let result = QuerySource::query(&mut source, query, params).await;
-            Self::record(&result, &self.log, query, started_ms);
-            result
-        }
+    async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
+        let mut source = &self.inner;
+        let started_ms = clock_ms();
+        let result = QuerySource::query(&mut source, query, params).await;
+        Self::record(&result, &self.log, query, started_ms);
+        result
     }
 
-    fn execute(
+    async fn execute(
         &self,
         query: &str,
         params: &[DbValue],
-    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
-        async move {
-            let mut source = &self.inner;
-            let started_ms = clock_ms();
-            let result = QuerySource::execute(&mut source, query, params).await;
-            Self::record(&result, &self.log, query, started_ms);
-            result
-        }
+    ) -> Result<DbExecResult, DurableDbError> {
+        let mut source = &self.inner;
+        let started_ms = clock_ms();
+        let result = QuerySource::execute(&mut source, query, params).await;
+        Self::record(&result, &self.log, query, started_ms);
+        result
     }
 
     fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send {
