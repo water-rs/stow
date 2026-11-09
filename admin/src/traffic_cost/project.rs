@@ -91,12 +91,6 @@ pub struct ProjectArgs {
 // its dimension-specific fraction of the included allowance. The runtime
 // breaker retains the default fraction declared in `stow-types`.
 
-/// GB-s each serialized DO wall second is priced at. Cloudflare's
-/// billing rule is fixed — 128 MB of memory per Durable Object
-/// instance, so 0.125 GB-s per wall second — and 0.25 deliberately
-/// over-reads it by 2×, so the projection errs on the bill's side.
-const DO_DURATION_GB_PER_WALL_S: f64 = 0.25;
-
 /// Tasks the enqueue drives' `submit_batch` carries — the denominator
 /// a single-task insert prices against.
 const SUBMIT_BATCH_TASKS: f64 = 3.0;
@@ -577,8 +571,9 @@ pub struct UsageLine {
     /// The billed dimension (e.g. `requests`, `rows_read`,
     /// `duration_gb_s`).
     pub dimension: &'static str,
-    /// Projected monthly usage from user traffic at launch scale.
-    pub traffic: f64,
+    /// Projected monthly usage from user traffic at launch scale. Absent
+    /// when the reports cannot establish production usage.
+    pub traffic: Option<f64>,
     /// Projected monthly usage from preheat — one wave per stable
     /// release plus one resubmit per day. `None` when the Preheat cost
     /// report does not measure the dimension.
@@ -588,6 +583,24 @@ pub struct UsageLine {
 }
 
 impl UsageLine {
+    /// Contributions for which no production measurement is available.
+    fn unmeasured(&self) -> impl Iterator<Item = (&'static str, &'static str)> {
+        [
+            (
+                self.traffic.is_none(),
+                "traffic",
+                "mock handler wall time does not establish production I/O duration",
+            ),
+            (
+                self.preheat.is_none(),
+                "preheat",
+                super::preheat::not_measured(self.product, self.dimension),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(missing, contribution, reason)| missing.then_some((contribution, reason)))
+    }
+
     /// The monthly budget for this product and dimension.
     fn bound(&self) -> f64 {
         let fraction = if self.product == "durable_objects" && self.dimension == "requests" {
@@ -600,7 +613,7 @@ impl UsageLine {
 
     /// Complete traffic plus preheat usage, absent when a contribution is unmeasured.
     pub fn total(&self) -> Option<f64> {
-        self.preheat.map(|preheat| self.traffic + preheat)
+        Some(self.traffic? + self.preheat?)
     }
 }
 
@@ -695,10 +708,9 @@ pub struct GateEvaluation {
     pub breaches: Vec<Breach>,
 }
 
-/// Σ over every event kind: projected monthly usage per product
-/// dimension and the DO wall seconds that price duration — plus the
-/// per-route shares for the report's top-N table and the unmeasured
-/// diagnostics.
+/// Σ over every event kind: projected monthly usage per measured
+/// product dimension, per-route shares for the report's top-N table,
+/// and unmeasured diagnostics.
 #[derive(Debug, Default)]
 struct Projection {
     /// Projected monthly worker requests.
@@ -711,8 +723,6 @@ struct Projection {
     do_rows_read: f64,
     /// Projected monthly DO rows written.
     do_rows_written: f64,
-    /// Projected monthly DO wall seconds — duration is billed on this.
-    do_wall_s: f64,
     /// Projected monthly subrequests — diagnostic, not gated.
     diag_subrequests: f64,
     /// Projected monthly R2 ops — diagnostic, not gated.
@@ -785,18 +795,12 @@ fn fold_kind(
     let kind = drives.event(cost)?;
     projection.do_rows_read = monthly.mul_add(kind.rows_read, projection.do_rows_read);
     projection.do_rows_written = monthly.mul_add(kind.rows_written, projection.do_rows_written);
-    projection.do_wall_s += monthly * kind.wall_ms / 1000.0;
     // The route's heaviest dimension decides its allowance share — the
     // number the top-N table ranks.
     let shares = [
         (
             "do_requests",
             monthly * cost.do_requests() / DO_REQUESTS_MONTHLY,
-        ),
-        (
-            "do_duration_gb_s",
-            monthly * (kind.wall_ms / 1000.0) * DO_DURATION_GB_PER_WALL_S
-                / DO_DURATION_GB_S_MONTHLY,
         ),
         (
             "do_rows_read",
@@ -837,7 +841,7 @@ fn usage_lines(projection: &Projection, preheat: &PreheatMonthly) -> Vec<UsageLi
         |product: &'static str, dimension: &'static str, traffic: f64, allowance: f64| UsageLine {
             product,
             dimension,
-            traffic,
+            traffic: Some(traffic),
             preheat: preheat.monthly(product, dimension),
             allowance,
         };
@@ -872,12 +876,13 @@ fn usage_lines(projection: &Projection, preheat: &PreheatMonthly) -> Vec<UsageLi
             projection.do_rows_written,
             DO_ROWS_WRITTEN_MONTHLY,
         ),
-        line(
-            "durable_objects",
-            "duration_gb_s",
-            projection.do_wall_s * DO_DURATION_GB_PER_WALL_S,
-            DO_DURATION_GB_S_MONTHLY,
-        ),
+        UsageLine {
+            product: "durable_objects",
+            dimension: "duration_gb_s",
+            traffic: None,
+            preheat: preheat.monthly("durable_objects", "duration_gb_s"),
+            allowance: DO_DURATION_GB_S_MONTHLY,
+        },
     ]
 }
 
@@ -887,7 +892,7 @@ fn diagnostic_lines(projection: &Projection) -> Vec<UsageLine> {
     let line = |product: &'static str, dimension: &'static str, traffic: f64| UsageLine {
         product,
         dimension,
-        traffic,
+        traffic: Some(traffic),
         preheat: None,
         allowance: f64::INFINITY,
     };
@@ -903,10 +908,10 @@ fn diagnostic_lines(projection: &Projection) -> Vec<UsageLine> {
 fn usage_breaches(usage: &[UsageLine], top_routes: &[RouteShare]) -> Vec<Breach> {
     let mut breaches = Vec::new();
     for line in usage {
-        let Some(preheat) = line.preheat else {
+        let (Some(traffic), Some(preheat)) = (line.traffic, line.preheat) else {
             continue;
         };
-        let projected = line.traffic + preheat;
+        let projected = traffic + preheat;
         let bound = line.bound();
         if projected > bound {
             // `RouteShare::dimension` keys the share dimension by
@@ -917,7 +922,7 @@ fn usage_breaches(usage: &[UsageLine], top_routes: &[RouteShare]) -> Vec<Breach>
                 other => other,
             };
             let share_key = format!("{prefix}_{}", line.dimension);
-            let top_route = if preheat > line.traffic {
+            let top_route = if preheat > traffic {
                 PREHEAT_ROUTE
             } else {
                 top_routes
@@ -929,7 +934,7 @@ fn usage_breaches(usage: &[UsageLine], top_routes: &[RouteShare]) -> Vec<Breach>
                 product: line.product,
                 dimension: line.dimension,
                 projected,
-                traffic: line.traffic,
+                traffic,
                 preheat,
                 bound,
                 top_route,
@@ -1029,20 +1034,14 @@ impl ProjectionReport {
             ("clean", &self.projection),
             ("post-load", &self.projection_after_load),
         ] {
-            failures.extend(
-                evaluation
-                    .usage
-                    .iter()
-                    .filter(|line| line.preheat.is_none())
-                    .map(|line| {
-                        format!(
-                            "{label} projection: {} {} incomplete — {}",
-                            line.product,
-                            line.dimension,
-                            super::preheat::not_measured(line.product, line.dimension)
-                        )
-                    }),
-            );
+            failures.extend(evaluation.usage.iter().flat_map(|line| {
+                line.unmeasured().map(move |(contribution, reason)| {
+                    format!(
+                        "{label} projection: {} {} incomplete — {contribution}: {reason}",
+                        line.product, line.dimension,
+                    )
+                })
+            }));
             failures.extend(evaluation.unmeasured_cpu.iter().filter(|gap| gap.monthly_events > 0.0).map(|gap| {
                 format!("{label} projection: Worker CPU for {} is unmeasured ({:.3e} events/month) — {}",
                     gap.route, gap.monthly_events, gap.reason)
@@ -1158,7 +1157,8 @@ fn render_usage(usage: &[UsageLine]) -> String {
         table.push([
             line.product.to_owned(),
             line.dimension.to_owned(),
-            format!("{:.3e}", line.traffic),
+            line.traffic
+                .map_or_else(|| "n/m".to_owned(), |traffic| format!("{traffic:.3e}")),
             line.preheat
                 .map_or_else(|| "n/m".to_owned(), |preheat| format!("{preheat:.3e}")),
             total.map_or_else(|| "n/m".to_owned(), |total| format!("{total:.3e}")),
@@ -1175,12 +1175,10 @@ fn render_usage(usage: &[UsageLine]) -> String {
             }
             .to_owned(),
         ]);
-        if line.preheat.is_none() {
+        for (contribution, reason) in line.unmeasured() {
             unmeasured.push(format!(
-                "  {} {}: {}",
-                line.product,
-                line.dimension,
-                super::preheat::not_measured(line.product, line.dimension)
+                "  {} {} {contribution}: {reason}",
+                line.product, line.dimension,
             ));
         }
     }
@@ -1188,7 +1186,7 @@ fn render_usage(usage: &[UsageLine]) -> String {
     if !unmeasured.is_empty() {
         let _ = writeln!(
             out,
-            "\nn/m — preheat not measured by the Preheat cost report (traffic only):\n{}",
+            "\nn/m — contributions without production usage evidence:\n{}",
             unmeasured.join("\n")
         );
     }
@@ -1222,7 +1220,8 @@ fn render_evaluation(title: &str, evaluation: &GateEvaluation) -> String {
     for line in &evaluation.diagnostics {
         diag.push([
             format!("{} {}", line.product, line.dimension),
-            format!("{:.3e}", line.traffic),
+            line.traffic
+                .map_or_else(|| "n/m".to_owned(), |traffic| format!("{traffic:.3e}")),
         ]);
     }
     let _ = writeln!(out, "\n{}", diag.render());
@@ -1387,12 +1386,12 @@ mod tests {
             let mut line = super::UsageLine {
                 product,
                 dimension,
-                traffic: 0.0,
+                traffic: Some(0.0),
                 preheat: Some(limit),
                 allowance: 100.0,
             };
             assert!(super::usage_breaches(std::slice::from_ref(&line), &[]).is_empty());
-            line.traffic = 1.0;
+            line.traffic = Some(1.0);
             let breaches = super::usage_breaches(std::slice::from_ref(&line), &[]);
             assert_eq!(breaches.len(), 1, "{product}/{dimension}");
             assert_eq!(breaches[0].bound, limit);
@@ -1422,10 +1421,37 @@ mod tests {
         );
         assert!(super::render_projection(&report).contains("monthly projection: FAIL"));
         assert!(super::render_usage(&report.projection.usage).contains("UNMEASURED"));
+        let duration = usage(&report.projection, "durable_objects", "duration_gb_s");
+        assert!(duration.traffic.is_none());
+        assert!(duration.total().is_none());
+        assert!(
+            failures
+                .iter()
+                .any(|failure| { failure.contains("duration_gb_s incomplete — traffic:") })
+        );
+        // Measuring preheat alone cannot make local mock latency a
+        // production measurement of traffic duration.
+        for evaluation in [&mut report.projection, &mut report.projection_after_load] {
+            for line in &mut evaluation.usage {
+                line.preheat.get_or_insert(0.0);
+            }
+        }
+        assert!(
+            report
+                .failures()
+                .iter()
+                .any(|failure| { failure.contains("duration_gb_s incomplete — traffic:") })
+        );
+        assert!(
+            usage(&report.projection, "durable_objects", "duration_gb_s")
+                .total()
+                .is_none()
+        );
         // Supply a complete low-cost measurement fixture to distinguish
         // missing contributions from an actual numerical budget breach.
         for evaluation in [&mut report.projection, &mut report.projection_after_load] {
             for line in &mut evaluation.usage {
+                line.traffic.get_or_insert(0.0);
                 if line.preheat.is_none() {
                     line.preheat = Some(0.0);
                 }
@@ -1478,16 +1504,28 @@ mod tests {
 
         let before = usage(&base, "durable_objects", "rows_written");
         let after = usage(&with, "durable_objects", "rows_written");
-        assert!((before.traffic - after.traffic).abs() < 1e-6);
+        assert!(
+            (before.traffic.expect("measured traffic") - after.traffic.expect("measured traffic"))
+                .abs()
+                < 1e-6
+        );
         // 1 wave/mo × 1000 rows/node × 10 nodes + 1 resubmit/mo ×
         // 500 rows/node × 10 nodes.
         let preheat = after.preheat.expect("measured");
         assert!((preheat - 15_000.0).abs() < 1e-6, "{preheat}");
-        assert!((after.total().expect("complete") - (after.traffic + 15_000.0)).abs() < 1e-6);
+        assert!(
+            (after.total().expect("complete")
+                - (after.traffic.expect("measured traffic") + 15_000.0))
+                .abs()
+                < 1e-6
+        );
 
         let workers = usage(&with, "workers", "requests");
         assert_eq!(workers.preheat, Some(0.0));
-        assert!((workers.total().expect("complete") - workers.traffic).abs() < f64::EPSILON);
+        assert!(
+            (workers.total().expect("complete") - workers.traffic.expect("measured traffic")).abs()
+                < f64::EPSILON
+        );
         assert_eq!(usage(&with, "workers", "cpu_ms").preheat, Some(0.0));
     }
 
@@ -1498,9 +1536,10 @@ mod tests {
         let base = evaluate(&model(), &report, &cpu, &no_preheat()).expect("evaluate");
         assert!(base.breaches.is_empty());
         let line = usage(&base, "workers", "requests");
-        let headroom = line
-            .allowance
-            .mul_add(super::ALLOWANCE_FRACTION, -line.traffic);
+        let headroom = line.allowance.mul_add(
+            super::ALLOWANCE_FRACTION,
+            -line.traffic.expect("measured traffic"),
+        );
         assert!(headroom > 0.0);
         let wave = PerNode {
             worker_requests: headroom / 10.0 + 1.0,
@@ -1535,9 +1574,10 @@ mod tests {
         assert!(base.breaches.is_empty(), "{:?}", base.breaches);
 
         let line = usage(&base, "durable_objects", "rows_written");
-        let headroom = line
-            .allowance
-            .mul_add(super::ALLOWANCE_FRACTION, -line.traffic);
+        let headroom = line.allowance.mul_add(
+            super::ALLOWANCE_FRACTION,
+            -line.traffic.expect("measured traffic"),
+        );
         assert!(headroom > 0.0);
         // One wave and one resubmit of 10 nodes each: the combined
         // month uses 80% of the remaining monthly headroom. Each
@@ -1883,7 +1923,11 @@ mod tests {
             .map(|cost| model().monthly_events(cost.kind) * cost.do_requests())
             .sum();
         let line = usage(&evaluation, "durable_objects", "requests");
-        assert!((line.traffic - expected).abs() < 1e-6, "{}", line.traffic);
+        assert!(
+            (line.traffic.expect("measured traffic") - expected).abs() < 1e-6,
+            "{}",
+            line.traffic.expect("measured traffic")
+        );
         // Every event kind the model counts is priced exactly once.
         let mut kinds: Vec<String> = super::EVENT_COSTS
             .iter()
