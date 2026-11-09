@@ -1746,17 +1746,16 @@ impl Graph {
             self.target_id(target).expect("target ids fit u8"),
             self.rustc_id(rustc_version).expect("rustc ids fit u8"),
         );
+        if base_generation.is_none() {
+            return self.apply_full_slice(slice, target, rustc_version, generation, added);
+        }
         self.slice_generations.insert(slice, generation);
         let mut flips = 0;
-        if base_generation.is_none() {
-            flips += self.replace_slice(slice, target, rustc_version, added);
-        } else {
-            for row in retired {
-                flips += self.apply_slice_row(slice, target, rustc_version, row, false);
-            }
-            for row in added {
-                flips += self.apply_slice_row(slice, target, rustc_version, row, true);
-            }
+        for row in retired {
+            flips += self.apply_slice_row(slice, target, rustc_version, row, false);
+        }
+        for row in added {
+            flips += self.apply_slice_row(slice, target, rustc_version, row, true);
         }
         self.maybe_compact();
         flips
@@ -1836,18 +1835,37 @@ impl Graph {
             return 0;
         }
         let staged = self.staged_slices.remove(&slice).expect("staged report");
-        let rows: Vec<PublishedSliceRow> = staged.rows.into_iter().flatten().collect();
-        self.apply_slice_report(target, rustc_version, None, generation, &rows, &[])
+        self.apply_full_slice(
+            slice,
+            target,
+            rustc_version,
+            generation,
+            staged.rows.iter().flatten(),
+        )
     }
 
-    /// A full report: `rows` become the slice's whole set. Cost is the
-    /// report's rows plus the slice's own members.
-    fn replace_slice(
+    fn apply_full_slice<'a>(
         &mut self,
         slice: SliceId,
         target: &str,
         rustc: &str,
-        rows: &[PublishedSliceRow],
+        generation: i64,
+        rows: impl IntoIterator<Item = &'a PublishedSliceRow>,
+    ) -> u32 {
+        self.slice_generations.insert(slice, generation);
+        let flips = self.replace_slice(slice, target, rustc, rows);
+        self.maybe_compact();
+        flips
+    }
+
+    /// A full report: `rows` become the slice's whole set. Cost is the
+    /// report's rows plus the slice's own members.
+    fn replace_slice<'a>(
+        &mut self,
+        slice: SliceId,
+        target: &str,
+        rustc: &str,
+        rows: impl IntoIterator<Item = &'a PublishedSliceRow>,
     ) -> u32 {
         let mut next: HashMap<IdKey, u8> = HashMap::new();
         for row in rows {
