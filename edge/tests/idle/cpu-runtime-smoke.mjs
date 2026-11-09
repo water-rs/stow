@@ -28,6 +28,12 @@ try {
 		await setTimeout(25);
 	}
 	assert(ready, "CPU runtime did not become ready within 30 seconds");
+	assert(ready.modules.some((module) => module.path === ready.main), "deployment entrypoint must be registered");
+	for (const module of ready.modules) {
+		const relative = path.relative(ready.modulesRoot, module.path);
+		assert(relative && !relative.startsWith("..") && !path.isAbsolute(relative),
+			`module must come from Wrangler's deployment output: ${module.path}`);
+	}
 	const response = await fetch(new URL("/", ready.url), { signal: AbortSignal.timeout(5_000) });
 	assert.equal(response.status, 200, await response.text());
 	const inspector = new URL(ready.inspector);
