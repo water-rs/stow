@@ -29,7 +29,11 @@ if (Object.keys(define).length) throw new Error("CPU runtime needs a built artif
 // rules with Miniflare's own compiler and matcher over the built output.
 const { modulesRules, ...runtimeOptions } = workerOptions;
 const modulesRoot = path.dirname(main);
-const rules = compileModuleRules(modulesRules);
+const rules = compileModuleRules([
+	...modulesRules,
+	{ type: "ESModule", include: ["**/*.js", "**/*.mjs"] },
+	{ type: "CommonJS", include: ["**/*.cjs"] },
+]);
 const modules = [{ type: "ESModule", path: main }];
 for (const file of (await readdir(modulesRoot, { recursive: true, withFileTypes: true }))
 	.filter((entry) => entry.isFile())
