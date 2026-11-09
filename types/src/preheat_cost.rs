@@ -179,6 +179,8 @@ pub struct ProductionTask {
     pub task_id: String,
     /// The target the task mints on.
     pub target: String,
+    /// Direct dependency task ids in the resolved production plan.
+    pub dependencies: Vec<String>,
 }
 
 /// One production preheat lane's plan-only output.
@@ -214,6 +216,18 @@ pub struct ProductionWave {
     pub nodes_per_target: BTreeMap<String, u64>,
     /// Each lane's planned and first-seen counts, in lane order.
     pub lanes: Vec<ProductionLaneCount>,
+    /// Dependency depth, with leaves at depth zero. Counts retain the
+    /// target split needed to price each runner family separately.
+    pub layers: Vec<ProductionLayer>,
+}
+
+/// Nodes whose longest dependency chain has the same depth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductionLayer {
+    /// Number of dependency edges on the longest path to a leaf.
+    pub depth: usize,
+    /// Distinct nodes at this depth, per target triple.
+    pub nodes_per_target: BTreeMap<String, u64>,
 }
 
 impl ProductionWave {
@@ -246,32 +260,94 @@ impl ProductionWave {
 
 /// Count the distinct nodes across the production lanes, dedup'd by
 /// task id exactly as the scheduler's queue would.
-#[must_use]
-pub fn count_production(lanes: &[ProductionLane]) -> ProductionWave {
-    let mut seen = BTreeSet::<&str>::new();
+///
+/// # Errors
+/// A repeated identity disagrees, a dependency is absent, or the graph
+/// contains a cycle.
+pub fn count_production(lanes: &[ProductionLane]) -> crate::error::Result<ProductionWave> {
+    let mut seen = BTreeMap::<&str, &ProductionTask>::new();
     let mut nodes_per_target = BTreeMap::<String, u64>::new();
     let counts = lanes
         .iter()
-        .map(|lane| {
+        .map(|lane| -> crate::error::Result<_> {
             let mut new_nodes = 0_u64;
             for task in &lane.tasks {
-                if seen.insert(task.task_id.as_str()) {
+                if let Some(previous) = seen.get(task.task_id.as_str()) {
+                    if previous.target != task.target
+                        || previous.dependencies.iter().collect::<BTreeSet<_>>()
+                            != task.dependencies.iter().collect::<BTreeSet<_>>()
+                    {
+                        return Err(crate::stow_error!(
+                            "production task {} has inconsistent target or dependencies",
+                            task.task_id
+                        ));
+                    }
+                } else {
+                    seen.insert(task.task_id.as_str(), task);
                     new_nodes += 1;
                     *nodes_per_target.entry(task.target.clone()).or_default() += 1;
                 }
             }
-            ProductionLaneCount {
+            Ok(ProductionLaneCount {
                 lane: lane.lane.clone(),
                 planned: lane.tasks.len() as u64,
                 new_nodes,
-            }
+            })
         })
-        .collect();
-    ProductionWave {
+        .collect::<crate::error::Result<_>>()?;
+    let layers = production_layers(&seen)?;
+    Ok(ProductionWave {
         nodes: seen.len() as u64,
         nodes_per_target,
         lanes: counts,
+        layers,
+    })
+}
+
+fn production_layers(
+    tasks: &BTreeMap<&str, &ProductionTask>,
+) -> crate::error::Result<Vec<ProductionLayer>> {
+    let mut graph = petgraph::graph::DiGraph::<&ProductionTask, ()>::new();
+    let indexes: BTreeMap<_, _> = tasks
+        .iter()
+        .map(|(&id, &task)| (id, graph.add_node(task)))
+        .collect();
+    for (&id, task) in tasks {
+        for dependency in &task.dependencies {
+            let from = indexes.get(dependency.as_str()).ok_or_else(|| {
+                crate::stow_error!("production task {id} has missing dependency {dependency}")
+            })?;
+            graph.add_edge(*from, indexes[id], ());
+        }
     }
+    let order = petgraph::algo::toposort(&graph, None).map_err(|cycle| {
+        crate::stow_error!(
+            "production dependency cycle includes {}",
+            graph[cycle.node_id()].task_id
+        )
+    })?;
+    let mut depths = vec![0; graph.node_count()];
+    let mut layers = BTreeMap::<usize, BTreeMap<String, u64>>::new();
+    for index in order {
+        let depth = graph
+            .neighbors_directed(index, petgraph::Direction::Incoming)
+            .map(|dependency| depths[dependency.index()] + 1)
+            .max()
+            .unwrap_or(0);
+        depths[index.index()] = depth;
+        *layers
+            .entry(depth)
+            .or_default()
+            .entry(graph[index].target.clone())
+            .or_default() += 1;
+    }
+    Ok(layers
+        .into_iter()
+        .map(|(depth, nodes_per_target)| ProductionLayer {
+            depth,
+            nodes_per_target,
+        })
+        .collect())
 }
 
 /// Everything the harness observed.
@@ -1507,6 +1583,7 @@ mod tests {
                 .map(|(task_id, target)| ProductionTask {
                     task_id: (*task_id).to_owned(),
                     target: (*target).to_owned(),
+                    dependencies: Vec::new(),
                 })
                 .collect(),
         }
@@ -1706,7 +1783,8 @@ mod tests {
             // same shared node land on one task id.
             production_lane("top-binaries", &[("a", "t1"), ("b", "t1"), ("a", "t1")]),
             production_lane("projects", &[("a", "t1"), ("b", "t1"), ("c", "t2")]),
-        ]);
+        ])
+        .expect("consistent production graph");
         assert_eq!(wave.nodes, 3);
         assert_eq!(wave.nodes_per_target["t1"], 2);
         assert_eq!(wave.nodes_per_target["t2"], 1);
@@ -1720,15 +1798,69 @@ mod tests {
 
     #[test]
     fn a_lane_that_planned_nothing_is_refused() {
-        let planned = count_production(&[production_lane("top-binaries", &[("a", "t1")])]);
+        let planned = count_production(&[production_lane("top-binaries", &[("a", "t1")])])
+            .expect("valid graph");
         planned.require_planned().expect("every lane planned");
         let empty = count_production(&[
             production_lane("top-binaries", &[("a", "t1")]),
             production_lane("projects", &[]),
-        ]);
+        ])
+        .expect("valid graph");
         let error = empty.require_planned().expect_err("an empty lane");
         assert!(error.to_string().contains("projects"), "{error}");
-        assert!(count_production(&[]).require_planned().is_err());
+        assert!(
+            count_production(&[])
+                .expect("empty graph")
+                .require_planned()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn production_depths_keep_shared_dependencies_across_lanes() {
+        let leaf = production_lane("top-binaries", &[("a", "linux")]);
+        let mut diamond = production_lane(
+            "projects",
+            &[
+                ("d", "apple"),
+                ("c", "apple"),
+                ("b", "linux"),
+                ("a", "linux"),
+            ],
+        );
+        diamond.tasks[0].dependencies = vec!["b".into(), "c".into()];
+        diamond.tasks[1].dependencies = vec!["a".into()];
+        diamond.tasks[2].dependencies = vec!["a".into()];
+        let wave = count_production(&[leaf, diamond]).expect("shared acyclic graph");
+        assert_eq!(wave.nodes, 4);
+        assert_eq!(wave.layers.len(), 3);
+        assert_eq!(wave.layers[0].depth, 0);
+        assert_eq!(wave.layers[0].nodes_per_target["linux"], 1);
+        assert_eq!(wave.layers[1].nodes_per_target["linux"], 1);
+        assert_eq!(wave.layers[1].nodes_per_target["apple"], 1);
+        assert_eq!(wave.layers[2].nodes_per_target["apple"], 1);
+    }
+
+    #[test]
+    fn invalid_production_graphs_are_refused() {
+        let mut lane = production_lane("projects", &[("a", "t1"), ("b", "t2")]);
+        lane.tasks[0].dependencies = vec!["missing".into()];
+        let error = count_production(&[lane.clone()]).expect_err("missing dependency");
+        assert!(error.to_string().contains("missing dependency missing"));
+        lane.tasks[0].dependencies = vec!["b".into()];
+        lane.tasks[1].dependencies = vec!["a".into()];
+        let error = count_production(&[lane]).expect_err("cycle");
+        assert!(error.to_string().contains("cycle"));
+        let error = count_production(&[
+            production_lane("one", &[("a", "t1")]),
+            production_lane("two", &[("a", "t2")]),
+        ])
+        .expect_err("inconsistent identity");
+        assert!(
+            error
+                .to_string()
+                .contains("inconsistent target or dependencies")
+        );
     }
 
     #[test]

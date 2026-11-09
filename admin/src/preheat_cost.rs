@@ -313,6 +313,11 @@ async fn production_lanes(lanes_dir: &Path) -> stow_types::error::Result<Vec<Pro
                     Ok(ProductionTask {
                         task_id: node.task_id.clone(),
                         target: node.target.as_str().to_owned(),
+                        dependencies: node
+                            .deps
+                            .iter()
+                            .map(|&dependency| tree.nodes[dependency as usize].task_id.clone())
+                            .collect(),
                     })
                 })
                 .collect::<stow_types::error::Result<_>>()?,
@@ -493,7 +498,7 @@ async fn report(args: &ReportArgs, output: Output) -> stow_types::error::Result<
 /// nodes, write them as `production-wave.json` and refuse a count a
 /// failed or empty lane would have understated.
 async fn production(args: &ProductionArgs, output: Output) -> stow_types::error::Result<()> {
-    let wave = count_production(&production_lanes(&args.lanes_dir).await?);
+    let wave = count_production(&production_lanes(&args.lanes_dir).await?)?;
     wave.require_planned()?;
     tokio::fs::write(&args.out, serde_json::to_vec_pretty(&wave)?)
         .await

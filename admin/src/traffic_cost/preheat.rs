@@ -318,6 +318,7 @@ pub(super) const fn test_production(nodes: u64) -> ProductionWave {
         nodes,
         nodes_per_target: std::collections::BTreeMap::new(),
         lanes: Vec::new(),
+        layers: Vec::new(),
     }
 }
 
