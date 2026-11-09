@@ -438,14 +438,14 @@ fn write_node(
     match extra {
         None => buf.push(0),
         Some(extra) => {
-            let bytes = rmp_serde::to_vec(extra).map_err(encode_error)?;
             buf.push(1);
-            buf.extend_from_slice(
-                &u32::try_from(bytes.len())
-                    .map_err(|_| QueueError::Invariant("node extra exceeds u32".into()))?
-                    .to_le_bytes(),
-            );
-            buf.extend_from_slice(&bytes);
+            let length_at = buf.len();
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            let payload_at = buf.len();
+            rmp_serde::encode::write(&mut *buf, extra).map_err(encode_error)?;
+            let length = u32::try_from(buf.len() - payload_at)
+                .map_err(|_| QueueError::Invariant("node extra exceeds u32".into()))?;
+            buf[length_at..payload_at].copy_from_slice(&length.to_le_bytes());
         }
     }
     Ok(())
