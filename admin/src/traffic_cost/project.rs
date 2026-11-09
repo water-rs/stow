@@ -1439,7 +1439,9 @@ mod tests {
                     line.preheat = Some(0.0);
                 }
             }
-            evaluation.unmeasured_cpu.clear();
+            for gap in &mut evaluation.unmeasured_cpu {
+                gap.monthly_events = 0.0;
+            }
         }
         let rendered = super::render_projection(&report);
         assert!(report.failures().is_empty(), "{rendered}");
