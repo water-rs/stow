@@ -693,6 +693,32 @@ async fn index_report_plan(
     })
 }
 
+fn preheat_release_plan(base: &str, secret: &str, rustc: &str) -> Result<Plan, String> {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "provider": "github", "project": "rust-lang/rust", "version": rustc,
+        "is_prerelease": false,
+    }))
+    .map_err(|error| error.to_string())?;
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|error| error.to_string())?;
+    mac.update(timestamp.as_bytes());
+    mac.update(b".");
+    mac.update(&body);
+    Ok(Plan::PostBytes {
+        url: format!("{base}/api/v1/newreleases/release"),
+        headers: vec![
+            ("X-Newreleases-Timestamp".to_owned(), timestamp),
+            (
+                "X-Newreleases-Signature".to_owned(),
+                hex::encode(mac.finalize().into_bytes()),
+            ),
+            ("Content-Type".to_owned(), "application/json".to_owned()),
+        ],
+        body,
+    })
+}
+
 /// Resolve one lane event into its request — the index pull's pointer
 /// hop and the bearer fetches happen here.
 async fn plan(
@@ -774,31 +800,7 @@ async fn plan(
         Fire::IndexReport { token_file, rustc } => {
             index_report_plan(base, token_file, rustc, counter).await
         }
-        Fire::PreheatRelease { secret, rustc } => {
-            let body = serde_json::to_vec(&serde_json::json!({
-                "provider": "github", "project": "rust-lang/rust", "version": rustc,
-                "is_prerelease": false,
-            }))
-            .map_err(|error| error.to_string())?;
-            let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
-            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-                .map_err(|error| error.to_string())?;
-            mac.update(timestamp.as_bytes());
-            mac.update(b".");
-            mac.update(&body);
-            Ok(Plan::PostBytes {
-                url: format!("{base}/api/v1/newreleases/release"),
-                headers: vec![
-                    ("X-Newreleases-Timestamp".to_owned(), timestamp),
-                    (
-                        "X-Newreleases-Signature".to_owned(),
-                        hex::encode(mac.finalize().into_bytes()),
-                    ),
-                    ("Content-Type".to_owned(), "application/json".to_owned()),
-                ],
-                body,
-            })
-        }
+        Fire::PreheatRelease { secret, rustc } => preheat_release_plan(base, secret, rustc),
         Fire::WorkflowDelivery {
             secret,
             action,
@@ -1039,73 +1041,7 @@ pub fn build_lanes(
             },
         ]);
     }
-    if let Some(secret) = &args.newreleases_secret {
-        let cron = args
-            .preheat_cron
-            .as_ref()
-            .ok_or("preheat CPU needs --preheat-cron")?;
-        lanes.push(Lane {
-            name: "preheat-release",
-            eps: model.monthly_stable_releases()
-                / (f64::from(model.scale.days_per_month) * 86_400.0)
-                * scale,
-            fire: Fire::PreheatRelease {
-                secret: secret.clone(),
-                rustc: args.rustc.clone(),
-            },
-            expected: ok2xx,
-        });
-        let query =
-            serde_html_form::to_string([("cron", cron)]).map_err(|error| error.to_string())?;
-        lanes.push(Lane {
-            name: "preheat-scheduled",
-            eps: model.monthly_resubmits() / (f64::from(model.scale.days_per_month) * 86_400.0)
-                * scale,
-            fire: Fire::PublicGet(vec![format!("/cdn-cgi/local/scheduled?{query}")]),
-            expected: ok2xx,
-        });
-        let webhook = args
-            .webhook_secret
-            .as_ref()
-            .ok_or("preheat CPU needs --webhook-secret")?;
-        for (name, action) in [
-            ("preheat-requested", "requested"),
-            ("preheat-in-progress", "in_progress"),
-            ("preheat-completed", "completed"),
-        ] {
-            lanes.push(Lane {
-                name,
-                eps: (model.monthly_stable_releases() + model.monthly_resubmits())
-                    / (f64::from(model.scale.days_per_month) * 86_400.0)
-                    * scale,
-                fire: Fire::WorkflowDelivery {
-                    secret: webhook.clone(),
-                    action,
-                    workflow: stow_types::trusted_builder::PREHEAT_WORKFLOW_FILE,
-                    title: "Preheat",
-                },
-                expected: ok2xx,
-            });
-        }
-        for (name, action) in [
-            ("preheat-cron-requested", "requested"),
-            ("preheat-cron-in-progress", "in_progress"),
-            ("preheat-cron-completed", "completed"),
-        ] {
-            lanes.push(Lane {
-                name,
-                eps: model.monthly_resubmits() / (f64::from(model.scale.days_per_month) * 86_400.0)
-                    * scale,
-                fire: Fire::WorkflowDelivery {
-                    secret: webhook.clone(),
-                    action,
-                    workflow: "preheat-cron.yml",
-                    title: "Preheat cron",
-                },
-                expected: ok2xx,
-            });
-        }
-    }
+    lanes.extend(preheat_lanes(args, model, scale)?);
     lanes.extend(build_workflow_lanes(
         args,
         model,
@@ -1117,6 +1053,76 @@ pub fn build_lanes(
         if lanes.is_empty() {
             return Err(format!("no lane matches --lanes {}", args.lanes.join(",")));
         }
+    }
+    Ok(lanes)
+}
+
+fn preheat_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<Vec<Lane>, String> {
+    let Some(secret) = &args.newreleases_secret else {
+        return Ok(Vec::new());
+    };
+    let mut lanes = Vec::new();
+    let cron = args
+        .preheat_cron
+        .as_ref()
+        .ok_or("preheat CPU needs --preheat-cron")?;
+    lanes.push(Lane {
+        name: "preheat-release",
+        eps: model.monthly_stable_releases() / (f64::from(model.scale.days_per_month) * 86_400.0)
+            * scale,
+        fire: Fire::PreheatRelease {
+            secret: secret.clone(),
+            rustc: args.rustc.clone(),
+        },
+        expected: ok2xx,
+    });
+    let query = serde_html_form::to_string([("cron", cron)]).map_err(|error| error.to_string())?;
+    lanes.push(Lane {
+        name: "preheat-scheduled",
+        eps: model.monthly_resubmits() / (f64::from(model.scale.days_per_month) * 86_400.0) * scale,
+        fire: Fire::PublicGet(vec![format!("/cdn-cgi/local/scheduled?{query}")]),
+        expected: ok2xx,
+    });
+    let webhook = args
+        .webhook_secret
+        .as_ref()
+        .ok_or("preheat CPU needs --webhook-secret")?;
+    for (name, action) in [
+        ("preheat-requested", "requested"),
+        ("preheat-in-progress", "in_progress"),
+        ("preheat-completed", "completed"),
+    ] {
+        lanes.push(Lane {
+            name,
+            eps: (model.monthly_stable_releases() + model.monthly_resubmits())
+                / (f64::from(model.scale.days_per_month) * 86_400.0)
+                * scale,
+            fire: Fire::WorkflowDelivery {
+                secret: webhook.clone(),
+                action,
+                workflow: stow_types::trusted_builder::PREHEAT_WORKFLOW_FILE,
+                title: "Preheat",
+            },
+            expected: ok2xx,
+        });
+    }
+    for (name, action) in [
+        ("preheat-cron-requested", "requested"),
+        ("preheat-cron-in-progress", "in_progress"),
+        ("preheat-cron-completed", "completed"),
+    ] {
+        lanes.push(Lane {
+            name,
+            eps: model.monthly_resubmits() / (f64::from(model.scale.days_per_month) * 86_400.0)
+                * scale,
+            fire: Fire::WorkflowDelivery {
+                secret: webhook.clone(),
+                action,
+                workflow: "preheat-cron.yml",
+                title: "Preheat cron",
+            },
+            expected: ok2xx,
+        });
     }
     Ok(lanes)
 }
@@ -1469,7 +1475,7 @@ mod tests {
 
     #[tokio::test]
     async fn preheat_lanes_sign_real_entrypoints_and_keep_workflow_identities() {
-        use hmac::Mac as _;
+        use hmac::{KeyInit as _, Mac as _};
         let model =
             LaunchModel::from_toml(include_str!("../../../launch-model.toml")).expect("model");
         let args = lane_args();
