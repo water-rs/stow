@@ -521,7 +521,7 @@ fg admin --json traffic-cost cpu "${LANE_ARGS[@]}" \
         echo "[traffic] Worker CPU budget failed; collecting peak and post-load evidence before failing" >&2
     }
 jq -r '"Worker CPU per event (idle window \(.idle_window_ms) ms collected \(.idle_cpu_ms) ms):",
-       "  reference workload \(.reference.cpu_ms * 100 | round / 100) ms (before \(.reference.rounds_before | map(. * 100 | round / 100)), after \(.reference.rounds_after | map(. * 100 | round / 100)))",
+       "  reference workload \(.reference.cpu_ms * 100 | round / 100) ms (before \(.reference.rounds_before | map(.sampled_cpu_ms / .invocations * 100 | round / 100)), after \(.reference.rounds_after | map(.sampled_cpu_ms / .invocations * 100 | round / 100)))",
        (.rows[] | "  \(.lane | . + " " * (20 - length)) \(.cpu_ms * 100 | round / 100) ms = \(.relative_cpu * 10000 | round / 10000) × reference (budget \(.budget_relative_cpu)) rounds \(.rounds_cpu_ms | map(. * 100 | round / 100))")' \
     "$REPORT_DIR/worker-cpu.json"
 drain_builds "cpu"
