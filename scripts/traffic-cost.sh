@@ -57,6 +57,7 @@
 #   STOW_TRAFFIC_SEGMENTS       drive segments; the edge restarts between
 #                               them (default 4 — see the note above the
 #                               edge lifecycle)
+#   STOW_TRAFFIC_BUILD_CALLBACK_EPS  optional absolute build delivery rate
 #   STOW_TRAFFIC_RATE_SCALE     multiplier over the model's peak rates
 #                               (default 1.0)
 #   STOW_TRAFFIC_MAX_JOBS       override both probe and mock dispatch caps
@@ -85,6 +86,10 @@ SIZES="${STOW_TRAFFIC_SIZES:-100000 480000}"
 DURATION_SECS="${STOW_TRAFFIC_DURATION_SECS:-1800}"
 SEGMENTS="${STOW_TRAFFIC_SEGMENTS:-4}"
 RATE_SCALE="${STOW_TRAFFIC_RATE_SCALE:-1.0}"
+PEAK_RATE_ARGS=()
+if [ -n "${STOW_TRAFFIC_BUILD_CALLBACK_EPS:-}" ]; then
+    PEAK_RATE_ARGS+=(--build-callback-eps "$STOW_TRAFFIC_BUILD_CALLBACK_EPS")
+fi
 RUSTC_VERSION="${STOW_TRAFFIC_RUSTC:-1.85.0}"
 # A bundle the size of production's average fetch (stow#738: 1.4 MB
 # per bundle) — the CPU pass streams it through the byte path.
@@ -531,7 +536,7 @@ for ((seg = 1; seg <= SEGMENTS; seg++)); do
         --duration-secs "$seg_secs" \
         --inspector-url "$INSPECTOR_URL" \
         --cpu-out "$REPORT_DIR/peak-seg${seg}-cpu.json" \
-        --rate-scale "$RATE_SCALE" \
+        --rate-scale "$RATE_SCALE" "${PEAK_RATE_ARGS[@]}" \
         >"$REPORT_DIR/peak-seg${seg}.json" 2>"$LOG_DIR/peak-seg${seg}.log" \
         || { cat "$LOG_DIR/peak-seg${seg}.log" >&2; \
              die "peak drive segment $seg breached — see $REPORT_DIR/peak-seg${seg}.json"; }

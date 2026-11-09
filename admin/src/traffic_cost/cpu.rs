@@ -890,8 +890,8 @@ pub async fn run(edge: &Edge, args: &CpuArgs, output: Output) -> stow_types::err
         return Err(stow_error!("--events-per-round must be at least 1"));
     }
     let model = super::read_model(&args.lanes.model).await?;
-    let lanes =
-        lanes::build_lanes(&args.lanes, &model, 1.0).map_err(|error| stow_error!("{error}"))?;
+    let lanes = lanes::build_lanes(&args.lanes, &model, 1.0, None)
+        .map_err(|error| stow_error!("{error}"))?;
     let (inspector, mut artifacts, idle_cpu_ms) = prepare_sampler(&args.inspector_url).await?;
 
     let rounds_before = measure_reference(&inspector, &mut artifacts).await?;

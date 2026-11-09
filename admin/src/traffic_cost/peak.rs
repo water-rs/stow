@@ -34,6 +34,10 @@ pub struct PeakArgs {
     /// for a smoke run, `1.0` for the launch rate.
     #[arg(long, default_value_t = 1.0)]
     pub rate_scale: f64,
+    /// Absolute events per second for each build workflow delivery lane.
+    /// Omitted uses the launch model and global rate multiplier.
+    #[arg(long)]
+    pub build_callback_eps: Option<f64>,
     /// Per-lane p99 bound in milliseconds — the serialization sanity
     /// check, not a latency SLO.
     #[arg(long, default_value_t = 10_000.0)]
@@ -104,6 +108,8 @@ struct LoadReport {
     duration_secs: u64,
     /// `rate_scale` the lanes ran at.
     rate_scale: f64,
+    /// Explicit build delivery rate, independent of other traffic, when supplied.
+    build_callback_eps: Option<f64>,
     /// The bounded number of independent request slots in each lane.
     max_in_flight_per_lane: usize,
     /// Per-lane stats keyed by lane name.
@@ -389,8 +395,13 @@ pub async fn run(edge: &Edge, args: &PeakArgs, output: Output) -> stow_types::er
 
 async fn drive(edge: &Edge, args: &PeakArgs) -> stow_types::error::Result<LoadReport> {
     let model = super::read_model(&args.lanes.model).await?;
-    let lanes = lanes::build_lanes(&args.lanes, &model, args.rate_scale)
-        .map_err(|error| stow_error!("{error}"))?;
+    let lanes = lanes::build_lanes(
+        &args.lanes,
+        &model,
+        args.rate_scale,
+        args.build_callback_eps,
+    )
+    .map_err(|error| stow_error!("{error}"))?;
 
     let duration = Duration::from_secs(args.duration_secs);
     let concurrency = match args.max_in_flight_per_lane {
@@ -415,6 +426,7 @@ async fn drive(edge: &Edge, args: &PeakArgs) -> stow_types::error::Result<LoadRe
     let report = LoadReport {
         duration_secs: args.duration_secs,
         rate_scale: args.rate_scale,
+        build_callback_eps: args.build_callback_eps,
         max_in_flight_per_lane: concurrency.get(),
         lanes: lanes_map,
         breaches,
