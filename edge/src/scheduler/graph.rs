@@ -3776,7 +3776,7 @@ impl Graph {
                     | stow_types::api::QueueTaskStatus::Failed
             )
         );
-        ixs.sort_by_key(|&ix| {
+        let order = |&ix: &u32| {
             let state = self.state(ix);
             std::cmp::Reverse((
                 if terminal {
@@ -3786,11 +3786,17 @@ impl Graph {
                 },
                 ix,
             ))
-        });
+        };
         let limit = selector
             .limit
             .map_or(ADMIN_LIST_LIMIT, |limit| limit.clamp(1, ADMIN_LIST_LIMIT));
-        ixs.truncate(limit as usize);
+        // Select only the returned prefix before sorting it. The rest
+        // of a large matching queue has no ordering work to pay.
+        if ixs.len() > limit as usize {
+            ixs.select_nth_unstable_by_key(limit as usize, order);
+            ixs.truncate(limit as usize);
+        }
+        ixs.sort_by_key(order);
         ixs.into_iter()
             .map(|ix| {
                 let node = self.node(ix);
@@ -4239,6 +4245,60 @@ mod tests {
     /// The canonical task id of the test node `name`.
     fn id(name: &str) -> String {
         sub(name).task_id
+    }
+
+    #[test]
+    fn limited_queue_listing_matches_full_order_with_timestamp_ties() {
+        use stow_types::api::{QueueSelector, QueueTaskStatus};
+
+        for (status, wire) in [
+            (Status::Pending, QueueTaskStatus::Pending),
+            (Status::Failed, QueueTaskStatus::Failed),
+        ] {
+            let mut graph = Graph::default();
+            for number in 0..257 {
+                let name = format!("node-{number}");
+                let requested = (number * 37 % 19) * 1000;
+                graph
+                    .merge(&single(&name, SubmissionSource::CacheMiss), requested)
+                    .expect("merge");
+                let ix = graph.node_ix(&id(&name)).expect("node");
+                graph.set_status(ix, status);
+                graph.state_mut(ix).updated = (number * 23 % 17) * 1000;
+            }
+            let mut expected: Vec<_> = (0..257).collect();
+            expected.sort_by_key(|&ix| {
+                let state = graph.state(ix);
+                std::cmp::Reverse((
+                    if status == Status::Failed {
+                        state.updated
+                    } else {
+                        state.first_requested
+                    },
+                    ix,
+                ))
+            });
+            for limit in [0, 1, 2, 50, 256, 257, 258, u32::MAX] {
+                let selector = QueueSelector {
+                    status: Some(wire),
+                    limit: Some(limit),
+                    ..QueueSelector::default()
+                };
+                let actual = graph.list(&selector, 100_000).expect("listing");
+                let expected: Vec<_> = expected
+                    .iter()
+                    .take(limit.clamp(1, ADMIN_LIST_LIMIT) as usize)
+                    .map(|&ix| graph.task_id_of(ix))
+                    .collect();
+                assert_eq!(
+                    actual
+                        .into_iter()
+                        .map(|task| task.task_id)
+                        .collect::<Vec<_>>(),
+                    expected,
+                );
+            }
+        }
     }
 
     /// A verified failure is terminal, including after event replay and reload.
