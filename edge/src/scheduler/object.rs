@@ -194,6 +194,10 @@ pub struct Scheduler {
     /// the store like a fresh isolate.
     #[serde(skip)]
     graph: graph::GraphCell,
+    /// Immutable routes belong to this object instance, not one invocation.
+    /// The framework injects request-scoped bindings into each request.
+    #[serde(skip)]
+    router: std::cell::OnceCell<Router>,
 }
 
 impl DurableObject for Scheduler {
@@ -210,6 +214,12 @@ impl DurableObject for Scheduler {
         // where its logging gets installed.
         #[cfg(target_arch = "wasm32")]
         crate::console_log::init();
+        self.router.get_or_init(|| self.build_router()).clone()
+    }
+}
+
+impl Scheduler {
+    fn build_router(&self) -> Router {
         Route::new((
             // Grouped to stay under the router's route-tuple arity —
             // the URLs are unchanged.
