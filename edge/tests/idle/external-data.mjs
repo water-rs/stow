@@ -1,4 +1,12 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
+
+export function outboundModules(entry) {
+	return [entry, "external-responses.mjs"].map((file) => ({
+		type: "ESModule",
+		path: path.resolve(import.meta.dirname, file),
+	}));
+}
 
 // Full upstream inputs, fetched before the profiled Worker starts.
 const sources = {

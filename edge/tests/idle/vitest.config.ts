@@ -1,5 +1,5 @@
 import path from "node:path";
-import { externalBindings } from "./external-data.mjs";
+import { externalBindings, outboundModules } from "./external-data.mjs";
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
 
@@ -42,8 +42,8 @@ export default defineConfig(async () => ({
 				workers: [
 					{
 						name: "dispatch-stub",
-						modules: true,
-						scriptPath: path.resolve(import.meta.dirname, "dispatch-stub.mjs"),
+						modules: outboundModules("dispatch-stub.mjs"),
+						modulesRoot: import.meta.dirname,
 						bindings: await externalBindings(),
 						compatibilityDate: "2025-02-01",
 					},
