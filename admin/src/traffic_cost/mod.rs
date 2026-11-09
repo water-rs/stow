@@ -29,7 +29,7 @@ use crate::Edge;
 use crate::render::Output;
 
 mod cpu;
-pub use cpu::ReferenceCpu;
+pub use cpu::{ReferenceCpu, ReferenceRound};
 pub use cpu::{SegmentArgs, segment as profile_preheat};
 mod fixture_runs;
 mod lanes;
