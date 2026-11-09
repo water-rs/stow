@@ -35,7 +35,7 @@ pub async fn open_blob(
         "{}/v2/{repo}/blobs/{digest}",
         base_url.trim_end_matches('/')
     );
-    send_request(&url, tokens, &pull_scope(repo), None, pool).await
+    send_request(&url, tokens, &pull_scope(repo), None, pool, None).await
 }
 
 /// `GET manifests/<reference>` — the image manifest JSON an admin
@@ -49,6 +49,17 @@ pub async fn open_manifest(
     tokens: &RegistryTokens,
     pool: &OutboundPool,
 ) -> Result<worker::Response, FetchError> {
+    open_manifest_with_signal(base_url, repo, reference, tokens, pool, None).await
+}
+
+async fn open_manifest_with_signal(
+    base_url: &str,
+    repo: RepositoryPath<'_>,
+    reference: &str,
+    tokens: &RegistryTokens,
+    pool: &OutboundPool,
+    signal: Option<&cf_http::RequestSignal>,
+) -> Result<worker::Response, FetchError> {
     let url = format!(
         "{}/v2/{repo}/manifests/{reference}",
         base_url.trim_end_matches('/')
@@ -59,6 +70,7 @@ pub async fn open_manifest(
         &pull_scope(repo),
         Some(OCI_MANIFEST_ACCEPT),
         pool,
+        signal,
     )
     .await
 }
@@ -82,9 +94,10 @@ async fn send_request(
     scope: &str,
     accept: Option<&str>,
     pool: &OutboundPool,
+    signal: Option<&cf_http::RequestSignal>,
 ) -> Result<worker::Response, FetchError> {
     let attached = tokens.bearer_for(scope, now_ms());
-    let response = send(url, attached.as_deref(), accept, pool).await?;
+    let response = send(url, attached.as_deref(), accept, pool, signal).await?;
     if response.get_ref().status_code() != 401 {
         return classify_status(response).await;
     }
@@ -92,9 +105,11 @@ async fn send_request(
     let challenge = parse_challenge(response).await?;
     let bearer = match tokens.resolve_retry(&challenge, attached.as_deref(), scope, now_ms()) {
         RetryAuth::Cached(token) => token,
-        RetryAuth::Exchange(scope) => exchange_and_cache(&challenge, &scope, tokens, pool).await?,
+        RetryAuth::Exchange(scope) => {
+            exchange_and_cache(&challenge, &scope, tokens, pool, signal).await?
+        }
     };
-    let response = send(url, Some(&bearer), accept, pool).await?;
+    let response = send(url, Some(&bearer), accept, pool, signal).await?;
     classify_status(response).await
 }
 
@@ -123,8 +138,9 @@ async fn exchange_and_cache(
     scope: &str,
     tokens: &RegistryTokens,
     pool: &OutboundPool,
+    signal: Option<&cf_http::RequestSignal>,
 ) -> Result<String, FetchError> {
-    let (token, expires_in) = exchange_token(challenge, pool).await?;
+    let (token, expires_in) = exchange_token(challenge, pool, signal).await?;
     tokens.insert(scope, token.clone(), expires_in, now_ms());
     Ok(token)
 }
@@ -136,9 +152,10 @@ async fn exchange_and_cache(
 async fn exchange_token(
     challenge: &BearerChallenge,
     pool: &OutboundPool,
+    signal: Option<&cf_http::RequestSignal>,
 ) -> Result<(String, u64), FetchError> {
     let url = token_request_url(challenge)?;
-    let response = send(&url, None, None, pool).await?;
+    let response = send(&url, None, None, pool, signal).await?;
     let status = response.get_ref().status_code();
     let body = body_text(response).await;
     if !(200..300).contains(&status) {
@@ -186,12 +203,18 @@ async fn send(
     token: Option<&str>,
     accept: Option<&str>,
     pool: &OutboundPool,
+    signal: Option<&cf_http::RequestSignal>,
 ) -> Result<GuardedResponse<worker::Response>, FetchError> {
     // The slot covers the headers exchange the runtime meters; a 2xx
     // body the caller streams on is past this function's reach — the
     // guard still frees the connection if the body is never read.
     let _slot = pool.slot().await;
     let request = build_request(url, token, accept)?;
+    let request = match signal {
+        Some(signal) => cf_http::with_abort_signal(request, signal)
+            .map_err(|error| FetchError::InvalidRequest(error.to_string()))?,
+        None => request,
+    };
     CfFetch
         .request(&request)
         .await
@@ -316,12 +339,14 @@ pub async fn records_artifact_exists(
     })?;
     let tag = stow_types::records::records_tag(rustc_version, task_id, build);
     let repository = stow_types::registry::cache_repository(&rustc);
-    let response = open_manifest(
+    let signal = cf_http::control_deadline();
+    let response = open_manifest_with_signal(
         &config.base_url,
         repository.path(),
         &tag,
         &config.tokens,
         pool,
+        Some(&signal),
     )
     .await;
     let manifest = match response {

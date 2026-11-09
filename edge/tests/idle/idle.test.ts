@@ -38,6 +38,7 @@ import {
 	runInDurableObject,
 } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { workflowRunDelivery } from "./webhook-fixture";
 
 const TARGET = "x86_64-unknown-linux-gnu";
 const RUSTC = "1.98.1";
@@ -249,6 +250,34 @@ async function expectQuiescent(
 }
 
 describe("scheduler idle proof (stow#593)", () => {
+	it.each(["records-timeout-headers", "records-timeout-body"])(
+		"cancels %s without recording a source failure",
+		async (name) => {
+			const stub = env.SCHEDULER.get(env.SCHEDULER.idFromName("scheduler"));
+			await reset(stub);
+			expect((await submit(stub, [enqueue(name)])).status).toBe(200);
+			const runId = await waitForRun(stub, taskId(name));
+			const started = Date.now();
+			const response = await workflowRunDelivery({
+				action: "completed",
+				repository: { full_name: "water-rs/stow" },
+				workflow_run: {
+					display_title: `${RUSTC}-${taskId(name)}`, event: "workflow_dispatch",
+					head_branch: "main", path: ".github/workflows/build-crate.yml",
+					conclusion: "success", id: Number(runId), run_attempt: 1,
+					html_url: `https://github.com/water-rs/stow/actions/runs/${runId}`,
+					head_repository: { full_name: "water-rs/stow" },
+					triggering_actor: { login: "octo-dispatcher" },
+				},
+			});
+			expect(response.status, await response.text()).toBe(200);
+			expect(Date.now() - started).toBeLessThan(6500);
+			const row = (await tasks(stub)).find((task) => task.task_id === taskId(name))!;
+			expect(["pending", "dispatched", "running"]).toContain(row.status);
+		},
+		15_000,
+	);
+
 	it.each(["timeout-headers", "timeout-body"])(
 		"dispatch aborts %s and leaves the task in retry backoff",
 		async (name) => {

@@ -38,13 +38,6 @@ impl CfTransport {
     }
 }
 
-/// The per-fetch cap every outbound CI call rides (stow#940): a
-/// `workflow_dispatch` POST runs inside the `complete-run` webhook.
-/// Both headers and body must finish within the fetch's five seconds;
-/// expiry aborts the network request and releases its outbound slot.
-#[cfg(target_arch = "wasm32")]
-const DISPATCH_FETCH_TIMEOUT_MS: u32 = 5_000;
-
 #[cfg(target_arch = "wasm32")]
 impl CiTransport for CfTransport {
     async fn send(&self, request: CiRequest) -> Result<CiResponse, DispatchError> {
@@ -69,15 +62,9 @@ impl CiTransport for CfTransport {
         // The native signal stays attached through CfFetch's Request
         // clone and response consumption. A Rust future race would only
         // bound headers and would not abort the underlying fetch.
-        let worker_request = {
-            let init = web_sys::RequestInit::new();
-            init.set_signal(Some(&web_sys::AbortSignal::timeout_with_u32(
-                DISPATCH_FETCH_TIMEOUT_MS,
-            )));
-            web_sys::Request::new_with_request_and_init(worker_request.inner(), &init)
-                .map(worker::Request::from)
-                .map_err(|error| DispatchError::Network(worker::Error::from(error).to_string()))?
-        };
+        let worker_request =
+            cf_http::with_abort_signal(worker_request, &cf_http::control_deadline())
+                .map_err(|error| DispatchError::Network(error.to_string()))?;
         let response = CfFetch
             .request(&worker_request)
             .await

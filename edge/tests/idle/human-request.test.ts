@@ -1,6 +1,7 @@
 import { env } from "cloudflare:test";
 import { exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
+import { workflowRunDelivery } from "./webhook-fixture";
 import { claims, mint, newSigner, publish } from "./oidc-fixture";
 
 const CONTROL = "http://127.0.0.1:28124/__control";
@@ -46,7 +47,7 @@ async function status(requestId: string) {
 }
 
 async function delivery(requestId: string, action: string, conclusion: string | null) {
-	const body = JSON.stringify({
+	const response = await workflowRunDelivery({
 		action,
 		repository: { full_name: "water-rs/stow" },
 		workflow_run: {
@@ -57,15 +58,6 @@ async function delivery(requestId: string, action: string, conclusion: string | 
 			head_repository: { full_name: "water-rs/stow" },
 			triggering_actor: { login: "octo-dispatcher" },
 		},
-	});
-	const key = await crypto.subtle.importKey("raw",
-		new TextEncoder().encode("mock-github-webhook-secret"),
-		{ name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-	const signature = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body)));
-	const hex = Array.from(signature, (byte) => byte.toString(16).padStart(2, "0")).join("");
-	const response = await exports.default.fetch("https://stow.test/api/v1/github/workflow-run", {
-		method: "POST", body,
-		headers: { "content-type": "application/json", "x-github-event": "workflow_run", "x-hub-signature-256": `sha256=${hex}` },
 	});
 	expect(response.status, await response.text()).toBe(200);
 }

@@ -236,6 +236,19 @@ export default {
 				const runId = match[1].split("-").slice(-2)[0];
 				const task = runs.get(Number(runId));
 				if (task) {
+					if (task.crate_name === "records-timeout-headers") {
+						await new Promise((resolve) => setTimeout(resolve, 8000));
+					}
+					if (task.crate_name === "records-timeout-body") {
+						let timer;
+						return new Response(new ReadableStream({
+							start(controller) {
+								controller.enqueue(new TextEncoder().encode("{"));
+								timer = setTimeout(() => controller.close(), 8000);
+							},
+							cancel() { clearTimeout(timer); },
+						}), { headers: { "content-type": "application/json" } });
+					}
 					// ghcr::records_artifact_exists reads only
 					// artifactType and the task-id annotation.
 					return Response.json({
