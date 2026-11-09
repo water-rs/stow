@@ -1190,7 +1190,6 @@ impl SnapshotLoader {
         graph.outcome_hours = head.outcome_hours.into_iter().collect();
         graph.last_run_update_ms = head.last_run_update_ms;
         graph.intern.reserve_exact(head.lens.intern);
-        graph.edges.reserve_exact(head.lens.edges);
         graph.published.reserve(head.lens.published);
         *lens = Some(head.lens);
         Ok(())
