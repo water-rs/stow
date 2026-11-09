@@ -537,7 +537,24 @@ impl Session {
             let reply: serde_json::Value = serde_json::from_str(&text)
                 .map_err(|error| stow_error!("inspector {method}: decode: {error}"))?;
             if reply.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
-                if reply.get("method").is_some() {
+                if let Some(event) = reply.get("method").and_then(serde_json::Value::as_str) {
+                    if matches!(
+                        event,
+                        "Debugger.scriptParsed"
+                            | "Runtime.executionContextCreated"
+                            | "Runtime.executionContextDestroyed"
+                            | "Runtime.executionContextsCleared"
+                    ) {
+                        tracing::info!(
+                            event,
+                            command = method,
+                            script_id = reply["params"]["scriptId"].as_str(),
+                            url = reply["params"]["url"].as_str(),
+                            context_id = reply["params"]["executionContextId"].as_u64(),
+                            created_context_id = reply["params"]["context"]["id"].as_u64(),
+                            "inspector lifecycle"
+                        );
+                    }
                     observe(&reply)?;
                 }
                 continue;
