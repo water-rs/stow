@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use orx_split_vec::{Collection, PinnedVec};
 use stow_types::api::{
     BuildTaskPayload, PublishedSliceRow, RunnerFamily, SchedulerEvent, SubgraphNode,
     SubmissionNode, SubmissionTree, SubmitTaskIdEntry, TaskSubgraph, runner_family,
@@ -35,11 +36,13 @@ use stow_types::task_graph::{TaskIdFields, canonical_task_id};
 use crate::errors::QueueError;
 use crate::scheduler::queue;
 
+mod arena;
 mod edges;
 mod index;
 mod node;
 mod snapshot;
 
+use arena::Arena;
 use edges::Edges;
 use index::{Interner, IxTable, Priorities, hash_of};
 pub use node::RunCompletion;
@@ -445,12 +448,12 @@ pub struct Graph {
     idents: IxTable,
     /// The node arena. Indexes are stable between compactions and
     /// compactions keep creation order.
-    nodes: Vec<Node>,
+    nodes: Arena<Node>,
     /// Derived queue-state candidates; published and free nodes have no entry.
     /// Rebuilt with the identity indexes after loading or renumbering nodes.
     by_status: [fixedbitset::FixedBitSet; Status::COUNT],
     /// Queue state of the nodes that have not published.
-    states: Vec<State>,
+    states: Arena<State>,
     /// Vacant `states` slots, reused before the slab grows.
     free_states: Vec<u32>,
     /// Full priority values shared by state rank classes.
@@ -3094,10 +3097,12 @@ impl Graph {
             retained_nodes = self.nodes.len() - self.counts[Status::Free.index()] as usize,
             node_slots = self.nodes.len(),
             node_capacity = self.nodes.capacity(),
+            node_fragments = self.nodes.fragments().len(),
             node_storage_bytes = self.nodes.capacity() * size_of::<Node>(),
             active_states = self.states.len() - self.free_states.len(),
             state_slots = self.states.len(),
             state_capacity = self.states.capacity(),
+            state_fragments = self.states.fragments().len(),
             state_storage_bytes = self.states.capacity() * size_of::<State>(),
             intern_storage_bytes = self.intern.heap_bytes(),
             ready_entries = self.ready_sets().map(BTreeSet::len).sum::<usize>(),
@@ -6332,6 +6337,60 @@ mod tests {
         ]);
         assert_eq!(inserted, 1);
         assert_eq!(unknown, vec!["ghost"]);
+    }
+
+    #[test]
+    fn arena_append_after_snapshot_keeps_fragment_bounded_slack() {
+        let mut graph = Graph::default();
+        let fragment_capacity = graph.nodes.fragments()[0].capacity();
+        let count = fragment_capacity * 2 + 1;
+        for start in (0..count).step_by(137) {
+            let end = (start + 137).min(count);
+            let nodes = (start..end).map(|at| sub(&format!("arena-{at}"))).collect();
+            graph
+                .merge(&forest(SubmissionSource::Preheat, nodes), 0)
+                .expect("merge batch");
+        }
+        let mut restored = round_trip(&graph);
+        for held in [&graph, &restored] {
+            assert_eq!(held.nodes.len(), count);
+            assert_eq!(held.states.len(), count);
+            assert!(held.nodes.capacity() - count < fragment_capacity);
+            assert!(held.states.capacity() - count < fragment_capacity);
+            for at in 0..count {
+                let ix = u32::try_from(at).expect("test index fits");
+                assert_eq!(held.task_id_of(ix), id(&format!("arena-{at}")));
+            }
+        }
+        restored
+            .merge(
+                &forest(SubmissionSource::Preheat, vec![sub("arena-tail")]),
+                1,
+            )
+            .expect("append after snapshot");
+        assert_eq!(restored.nodes.len(), count + 1);
+        assert!(restored.nodes.capacity() - restored.nodes.len() < fragment_capacity);
+        assert!(restored.states.capacity() - restored.states.len() < fragment_capacity);
+        assert_eq!(
+            restored.task_id_of(u32::try_from(count).expect("test index fits")),
+            id("arena-tail")
+        );
+        let mut reloaded = round_trip(&restored);
+        let settings = claim_settings(500, 50);
+        let claimed = restored
+            .claim(&settings, 2, u32::MAX)
+            .expect("claim after append");
+        let reloaded_claims = reloaded
+            .claim(&settings, 2, u32::MAX)
+            .expect("claim after reload");
+        assert_eq!(claimed.len(), 500);
+        assert_eq!(
+            claimed.iter().map(|node| &node.task_id).collect::<Vec<_>>(),
+            reloaded_claims
+                .iter()
+                .map(|node| &node.task_id)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
