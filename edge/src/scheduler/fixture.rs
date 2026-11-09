@@ -365,7 +365,10 @@ fn merge_run(
     for n in lo..=hi {
         builder.owner(n, &deps(n));
     }
-    merge(graph, &builder.into_tree(source), at)
+    merge(graph, &builder.into_tree(source), at)?;
+    #[cfg(target_arch = "wasm32")]
+    trace_population(graph, "incremental merge completed");
+    Ok(())
 }
 
 /// The instant node `n` was first requested, spread over the last two
@@ -592,6 +595,7 @@ pub(super) fn trace_population(graph: &Graph, phase: &str) {
         .buffer()
         .dyn_into::<js_sys::ArrayBuffer>()
         .expect("the module uses unshared linear memory");
+    graph.trace_occupancy("fixture population", phase, "observation");
     let (nodes, edges, published) = graph.sizes();
     let status = graph.status();
     let state_nodes = u64::from(status.pending)

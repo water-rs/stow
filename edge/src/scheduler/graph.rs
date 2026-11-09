@@ -3051,6 +3051,34 @@ impl Graph {
         )
     }
 
+    /// Probe-only occupancy and allocated buffer sizes. This excludes map
+    /// overhead, side allocations and transient memory; it is not a total.
+    pub(super) fn trace_occupancy(&self, drive: &str, phase: &str, boundary: &str) {
+        tracing::info!(
+            drive,
+            phase,
+            boundary,
+            graph_loaded = true,
+            retained_nodes = self.nodes.len() - self.counts[Status::Free.index()] as usize,
+            node_slots = self.nodes.len(),
+            node_capacity = self.nodes.capacity(),
+            node_storage_bytes = self.nodes.capacity() * size_of::<Node>(),
+            active_states = self.states.len() - self.free_states.len(),
+            state_slots = self.states.len(),
+            state_capacity = self.states.capacity(),
+            state_storage_bytes = self.states.capacity() * size_of::<State>(),
+            intern_storage_bytes = self.intern.heap_bytes(),
+            task_id_index_bytes = self.ids.heap_bytes(),
+            identity_index_bytes = self.idents.heap_bytes(),
+            dependency_edges = self.edges.len(),
+            published_identities = self.published.len(),
+            published_capacity = self.published.capacity(),
+            pending_age_entries = self.pending_ages.len(),
+            extra_entries = self.extras.len(),
+            "budget graph occupancy"
+        );
+    }
+
     /// The miss lane's pending depth, which `STOW_MAX_QUEUE_PENDING`
     /// gates: work other lanes queued is not the miss lane's to bound.
     pub const fn miss_pending_depth(&self) -> u32 {
