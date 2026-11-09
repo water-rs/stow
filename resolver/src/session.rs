@@ -375,6 +375,18 @@ impl Resolver {
         Ok(gctx)
     }
 
+    /// Reclaim derived sources after an input has returned its owned graph.
+    /// The caller exclusively owns this session's Cargo home; the mutable
+    /// borrow excludes concurrent resolves through this session. Downloaded
+    /// archives, registry indexes and Git databases remain reusable.
+    ///
+    /// # Errors
+    /// Cargo cache tracking, locking or source removal fails.
+    pub fn reclaim_sources(&mut self) -> CargoResult<()> {
+        let gctx = self.gctx(self.dir.path(), &self.host_triple)?;
+        reclaim_sources(&gctx)
+    }
+
     /// Resolve `manifest`'s workspace once per target: the vendored
     /// `ResolveSession::prepare` + `project` semantics —
     /// `Packages::Default` specs, `HasDevUnits::No`, one selection
@@ -701,8 +713,85 @@ impl Resolver {
     }
 }
 
+/// Use Cargo's cache tracking and mutation lock rather than deleting directories
+/// behind a reader. A zero checkout age retains entries used in the current
+/// second, matching Cargo's strict timestamp comparison.
+fn reclaim_sources(gctx: &GlobalContext) -> CargoResult<()> {
+    use cargo::core::gc::{Gc, GcOpts};
+    use cargo::ops::CleanContext;
+    use cargo::util::cache_lock::CacheLockMode;
+
+    let _lock = gctx.acquire_package_cache_lock(CacheLockMode::MutateExclusive)?;
+    let mut tracker = gctx.global_cache_tracker()?;
+    let mut gc = Gc::new(gctx, &mut tracker)?;
+    gc.gc(
+        &mut CleanContext::new(gctx),
+        &GcOpts {
+            max_src_size: Some(0),
+            max_git_co_age: Some(std::time::Duration::ZERO),
+            ..GcOpts::default()
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_gc_retains_downloads_and_reclaims_derived_sources() {
+        use cargo::core::global_cache_tracker::{DeferredGlobalLastUse, GitCheckout};
+        use cargo::util::GlobalContext;
+        use cargo::util::cache_lock::CacheLockMode;
+        use cargo_util_terminal::Shell;
+
+        let home = tempfile::tempdir().unwrap();
+        let gctx = GlobalContext::new(Shell::new(), home.path().into(), home.path().into());
+        let archive = home.path().join("registry/cache/local/serde-1.0.229.crate");
+        let index = home.path().join("registry/index/local/config.json");
+        let source = home.path().join("registry/src/local/serde-1.0.229");
+        let database = home.path().join("git/db/project/objects");
+        let checkout = home.path().join("git/checkouts/project/0123456");
+        for path in [&source, &database, &checkout] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        for path in [&archive, &index] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"retained download").unwrap();
+        }
+        std::fs::write(source.join("Cargo.toml"), b"extracted source").unwrap();
+        std::fs::write(checkout.join("Cargo.toml"), b"checkout source").unwrap();
+        std::fs::write(database.join("pack"), b"retained git object").unwrap();
+        {
+            let _lock = gctx
+                .acquire_package_cache_lock(CacheLockMode::MutateExclusive)
+                .unwrap();
+            let mut tracker = gctx.global_cache_tracker().unwrap();
+            let mut used = DeferredGlobalLastUse::new();
+            // Explicit historical metadata avoids sleeping across Cargo's
+            // one-second timestamp boundary.
+            let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(86_400);
+            used.mark_git_checkout_used_stamp(
+                GitCheckout {
+                    encoded_git_name: "project".into(),
+                    short_name: "0123456".into(),
+                    size: None,
+                },
+                Some(&old),
+            );
+            used.save(&mut tracker).unwrap();
+        }
+        for _ in 0..2 {
+            super::reclaim_sources(&gctx).unwrap();
+            assert!(!source.exists());
+            assert!(!checkout.exists());
+            assert_eq!(std::fs::read(&archive).unwrap(), b"retained download");
+            assert_eq!(std::fs::read(&index).unwrap(), b"retained download");
+            assert_eq!(
+                std::fs::read(database.join("pack")).unwrap(),
+                b"retained git object"
+            );
+        }
+    }
+
     /// A `--config` value built through `toml::Value`'s `Display`
     /// parses back to the verbatim path — backslashes and quotes
     /// escape instead of breaking the dotted-key expression.
