@@ -808,9 +808,10 @@ impl PublishedRead {
 /// returns. A key without a row is held as mask 0.
 ///
 /// The keyed statement joins the `json_each` list to the table's
-/// primary key: two rows read per key found and one per key without a
-/// row (the sqlite test backend's meter counts only the table rows);
-/// a members page reads its rows alone.
+/// primary key: workerd bills one row read per key listed and one per
+/// key found (the sqlite test backend's meter counts only the table
+/// rows). A members page bills two rows read per member it returns and
+/// the row that ends the range.
 ///
 /// # Errors
 /// `QueueError::Sql` on a failed read, `QueueError::Invariant` on a
@@ -871,11 +872,11 @@ pub async fn read_published(db: &DurableDb, needs: &PublishedNeeds) -> Result<Fe
 
 /// Write published rows to the `published` table: a non-zero mask
 /// upserts, a zero mask deletes the row. One statement per kind per
-/// [`LIST_BATCH`] rows; an upsert is two rows read plus one written per
-/// row and a delete two rows read plus one written, the `json_each`
-/// row counting as one of the reads (the sqlite test backend's meter
-/// counts only the written rows). Only a snapshot's storage turn, and
-/// the fixture seed that stands in for one, call this.
+/// [`LIST_BATCH`] rows; workerd bills an upsert of a new row as one row
+/// read (its `json_each` row) and one written (the sqlite test
+/// backend's meter counts only the written rows). Only a snapshot's
+/// storage turn, and the fixture seed that stands in for one, call
+/// this.
 ///
 /// # Errors
 /// `QueueError::Sql` on a failed statement.
