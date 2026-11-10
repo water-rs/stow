@@ -1675,6 +1675,9 @@ async fn serve_v2(
 /// files land as `sha256_*`, so they cannot leak in), honoring the spec's
 /// `n`/`last` window: a page under the limit is the whole list, one at
 /// the limit answers `Link: rel="next"` so the caller continues.
+/// GHCR's listing is not ordered by name and rejects a `last` that is not
+/// a tag (`{"tags": null}`), so tags come in ascending SHA-256 of the name
+/// and `last` continues after that tag in this order only when it exists.
 async fn list_tags(
     state: &MockRegistryState,
     repository: &str,
@@ -1695,17 +1698,30 @@ async fn list_tags(
             names.push(name);
         }
     }
-    names.sort();
-    let after = query.get("last").cloned();
+    names.sort_by_cached_key(|name| sha2::Sha256::digest(name.as_bytes()));
     let limit: usize = query
         .get("n")
         .and_then(|value| value.parse().ok())
         .unwrap_or(usize::MAX);
-    let window: Vec<String> = names
-        .into_iter()
-        .filter(|name| after.as_ref().is_none_or(|last| name > last))
-        .take(limit)
-        .collect();
+    let start = match query.get("last") {
+        None => Some(0),
+        Some(last) => names
+            .iter()
+            .position(|name| name == last)
+            .map(|position| position + 1),
+    };
+    let Some(start) = start else {
+        let mut response = Response::new(Body::from(
+            serde_json::to_vec(&serde_json::json!({ "name": repository, "tags": null }))
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        ));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return Ok(response);
+    };
+    let window: Vec<String> = names.into_iter().skip(start).take(limit).collect();
     let has_more = window.len() == limit;
     let body = serde_json::json!({
         "name": repository,
@@ -2717,6 +2733,106 @@ mod tests {
             .await
             .expect("forged response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// One `tags/list` answer for `query` over a package holding `tags`:
+    /// the body and its `Link` header.
+    async fn tags_answer(tags: &[&str], query: &str) -> (serde_json::Value, Option<String>) {
+        let root = tempfile::tempdir().expect("registry root");
+        let dir = root.path().join("manifests/water-rs/stow-cache-v2-1.98.0");
+        std::fs::create_dir_all(&dir).expect("manifest dir");
+        for tag in tags {
+            std::fs::write(dir.join(tag), b"{}").expect("tag file");
+        }
+        let app = registry_app_with_probe("127.0.0.1:28123", root.path().to_path_buf(), None, None);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/token?service=mock-registry&scope=repository:water-rs/stow-cache-v2-1.98.0:pull")
+                    .body(Body::empty())
+                    .expect("token request builds"),
+            )
+            .await
+            .expect("token response");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("token body");
+        let token =
+            serde_json::from_slice::<serde_json::Value>(&body).expect("token json")["token"]
+                .as_str()
+                .expect("token field")
+                .to_owned();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v2/water-rs/stow-cache-v2-1.98.0/tags/list{query}"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("tags request builds"),
+            )
+            .await
+            .expect("tags response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let link = response
+            .headers()
+            .get(header::LINK)
+            .map(|value| value.to_str().expect("link header").to_owned());
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("tags body");
+        (serde_json::from_slice(&body).expect("tags json"), link)
+    }
+
+    /// The listing is ordered by the SHA-256 of the tag name, not the
+    /// name, and `last=<tag>` pages continue after that tag in that order
+    /// with a `Link` while more remain.
+    #[tokio::test]
+    async fn tags_list_in_hash_order_and_continue_after_a_listed_tag() {
+        let tags = ["records-a", "index.x", "folded.x", "records-b", "zeta"];
+        let mut expected = tags.map(str::to_owned).to_vec();
+        expected.sort_by_cached_key(|name| sha2::Sha256::digest(name.as_bytes()));
+        assert_ne!(expected, {
+            let mut sorted = expected.clone();
+            sorted.sort();
+            sorted
+        });
+
+        let (body, link) = tags_answer(&tags, "").await;
+        assert_eq!(body["tags"], serde_json::json!(expected));
+        assert_eq!(link, None);
+
+        let (body, link) = tags_answer(&tags, "?n=2").await;
+        assert_eq!(body["tags"], serde_json::json!(expected[..2]));
+        assert_eq!(
+            link.as_deref(),
+            Some(
+                format!(
+                    "</v2/water-rs/stow-cache-v2-1.98.0/tags/list?n=2&last={}>; rel=\"next\"",
+                    expected[1]
+                )
+                .as_str()
+            )
+        );
+
+        let (body, link) = tags_answer(&tags, &format!("?n=2&last={}", expected[1])).await;
+        assert_eq!(body["tags"], serde_json::json!(expected[2..4]));
+        assert!(link.is_some());
+
+        let (body, link) = tags_answer(&tags, &format!("?n=2&last={}", expected[3])).await;
+        assert_eq!(body["tags"], serde_json::json!(expected[4..]));
+        assert_eq!(link, None);
+    }
+
+    /// GHCR rejects a `last` that is not a tag of the repository: the
+    /// answer is `"tags": null` with no `Link`, a bare prefix included.
+    #[tokio::test]
+    async fn tags_list_answers_null_for_a_cursor_that_is_not_a_tag() {
+        let (body, link) = tags_answer(&["records-a", "records-b"], "?n=1&last=records-").await;
+        assert!(body["tags"].is_null(), "{body}");
+        assert_eq!(link, None);
     }
 
     /// stow#844: a package that was never published answers the way GHCR

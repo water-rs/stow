@@ -768,6 +768,14 @@ fn merge_local_programs(
     Ok(programs.into_values().collect())
 }
 
+/// Whether `tag` is in a namespace an export pass reads: the folded sets,
+/// the index slices and the records.
+fn is_export_tag(tag: &str) -> bool {
+    ["folded.", "index.", "records-"]
+        .iter()
+        .any(|prefix| tag.starts_with(prefix))
+}
+
 /// One export pass over the whole registry: writes each changed slice as
 /// `index.<target>.<rustc>` plus its `folded.<target>.<rustc>` companion
 /// under `--out-dir`, `slices.json` for the publish/report loop, and
@@ -780,14 +788,11 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
     let repository = cache_repository(&rustc_version);
     let session = base.session(&repository, &http);
     let trust = stow_oci::verify::records_trust().await?;
-    // Three independent OCI namespaces, at most three listings in flight.
-    let (folded, indexes, records) = futures_util::try_join!(
-        session.list_tags_with_prefix("folded."),
-        session.list_tags_with_prefix("index."),
-        session.list_tags_with_prefix("records-"),
-    )
-    .map_err(|error| stow_error!("list registry tags: {error}"))?;
-    let mut tags: Vec<_> = folded.into_iter().chain(indexes).chain(records).collect();
+    let mut tags = session
+        .list_tags()
+        .await
+        .map_err(|error| stow_error!("list registry tags: {error}"))?;
+    tags.retain(|tag| is_export_tag(tag));
     tags.sort();
     let ctx = std::sync::Arc::new(PullContext {
         session,
@@ -1255,10 +1260,11 @@ async fn index_reconcile(edge: &Edge, args: IndexReconcileArgs) -> stow_types::e
     let repository = cache_repository(&rustc_version);
     let session = base.session(&repository, &http);
     let trust = stow_oci::verify::records_trust().await?;
-    let tags = session
-        .list_tags_with_prefix("index.")
+    let mut tags = session
+        .list_tags()
         .await
         .map_err(|error| stow_error!("list registry tags: {error}"))?;
+    tags.retain(|tag| tag.starts_with("index."));
     let ctx = PullContext {
         session,
         repository,
@@ -1577,9 +1583,10 @@ async fn index_join(args: IndexJoinArgs) -> stow_types::error::Result<()> {
         let repository = cache_repository(&rustc_version);
         let session = base.session(&repository, &http);
         let mut tags = session
-            .list_tags_with_prefix("index.")
+            .list_tags()
             .await
             .map_err(|error| stow_error!("list registry tags: {error}"))?;
+        tags.retain(|tag| tag.starts_with("index."));
         tags.sort();
         let pulls = tags.into_iter().filter_map(|tag| {
             let target = index_tag_parts(&tag)?.0.to_owned();
