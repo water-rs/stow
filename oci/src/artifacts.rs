@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use async_fs::read;
+use futures_util::{StreamExt as _, TryStreamExt as _, stream};
 use oci_client::Reference;
 use oci_client::client::{Config, ImageLayer};
 use oci_client::manifest::OciImageManifest;
@@ -20,6 +21,10 @@ use crate::client::{RegistrySession, canonical_manifest_bytes};
 use crate::publisher::Publisher;
 use crate::sign;
 
+/// How many plans [`push_artifacts_with`] publishes at once: the packs (and
+/// the bundle assembled from each) held in memory at the same time.
+const PUBLISH_CONCURRENCY: usize = 4;
+
 /// What [`push_artifacts`] did: the published coordinates of every plan.
 #[derive(Debug, Clone)]
 pub struct UploadOutcome {
@@ -32,8 +37,9 @@ pub struct UploadOutcome {
 /// Publish every plan: push the artifact, sign it, assemble the bundle
 /// tar, and push that as the `<tag>.bundle` artifact.
 ///
-/// One session mints one bearer for the whole batch, and one plan at a time
-/// keeps the layer bytes of only one artifact ever in memory.
+/// One session mints one bearer for the whole batch. Plans publish
+/// concurrently, at most [`PUBLISH_CONCURRENCY`] at a time, which bounds the
+/// packs held in memory at once.
 ///
 /// # Errors
 ///
@@ -69,11 +75,18 @@ where
     S: Fn(String, String) -> Fut + Send + Sync,
     Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
 {
+    let sign = &sign;
+    // `buffered` yields in plan order, so a repeated reference keeps the
+    // later plan's coordinates exactly as the one-by-one loop did.
+    let artifacts: Vec<PublishedArtifact> = stream::iter(plans)
+        .map(|plan| publish_artifact(session, plan, sign))
+        .buffered(PUBLISH_CONCURRENCY)
+        .try_collect()
+        .await?;
+
     let mut published = BTreeMap::new();
     let mut newly_pushed = 0u32;
-
-    for plan in plans {
-        let artifact = publish_artifact(session, plan, &sign).await?;
+    for (plan, artifact) in plans.iter().zip(artifacts) {
         published.insert(plan.oci_reference.clone(), artifact);
         newly_pushed = newly_pushed.saturating_add(1);
     }
