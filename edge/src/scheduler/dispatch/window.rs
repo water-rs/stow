@@ -280,8 +280,7 @@ mod tests {
                     .is_empty()
             );
         }
-        let (mut loaded, events) = store::load(&db).await.expect("load");
-        store::apply_events(&mut loaded, &events);
+        let (loaded, _) = store::restore(&db).await.expect("load");
         assert!(loaded.ci_waiting(until - 1));
     }
 

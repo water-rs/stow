@@ -1070,8 +1070,7 @@ mod eviction_tests {
 
     /// What a woken Durable Object holds: the store replayed.
     async fn wake(db: &DurableDb) -> GraphCell {
-        let (mut graph, tail) = store::load(db).await.expect("load");
-        store::apply_events(&mut graph, &tail);
+        let (graph, _) = store::restore(db).await.expect("load");
         let cell = GraphCell::default();
         cell.install(graph);
         cell
@@ -1320,8 +1319,7 @@ mod inline_dispatch_tests {
 
     /// What a woken Durable Object holds: the store replayed.
     async fn wake(db: &DurableDb) -> GraphCell {
-        let (mut graph, tail) = store::load(db).await.expect("load");
-        store::apply_events(&mut graph, &tail);
+        let (graph, _) = store::restore(db).await.expect("load");
         let cell = GraphCell::default();
         cell.install(graph);
         cell
@@ -1900,8 +1898,7 @@ mod attribution_tests {
     }
 
     async fn woken(db: &DurableDb) -> GraphCell {
-        let (mut graph, tail) = store::load(db).await.expect("load");
-        store::apply_events(&mut graph, &tail);
+        let (graph, _) = store::restore(db).await.expect("load");
         let cell = GraphCell::default();
         cell.install(graph);
         cell
@@ -2179,8 +2176,7 @@ mod snapshot_trigger_tests {
         assert_eq!(unpublished.len(), 6);
         let before = tail_bytes(&db).await;
         assert!(before > 0);
-        let (mut replayed, tail) = store::load(&db).await.expect("load");
-        store::apply_events(&mut replayed, &tail);
+        let (replayed, _) = store::restore(&db).await.expect("load");
         assert_eq!(replayed.status().pending, 4);
         let replay_owner = GraphCell::default();
         let replay_cell = replay_owner.install(replayed);
@@ -2247,13 +2243,8 @@ mod snapshot_trigger_tests {
             }
             assert!(snapshots >= 1, "{nodes}-node turns never snapshotted");
             // A wake of this store replays that tail into the same graph.
-            let (mut woken, events) = store::load(&db).await.expect("load");
-            eprintln!(
-                "tail events {} bytes {}",
-                events.len(),
-                tail_bytes(&db).await
-            );
-            store::apply_events(&mut woken, &events);
+            let (woken, events) = store::restore(&db).await.expect("load");
+            eprintln!("tail events {events} bytes {}", tail_bytes(&db).await);
             assert_eq!(woken.sizes(), cell.with(|graph| graph.sizes()));
             eprintln!("{nodes}-node submissions: widest tail {widest} B, {snapshots} snapshots");
         }
@@ -2283,8 +2274,8 @@ mod snapshot_trigger_tests {
         );
         assert_eq!(tail_bytes(&db).await, 0);
         drop(wave);
-        let (woken, events) = store::load(&db).await.expect("load");
-        assert!(events.is_empty());
+        let (woken, events) = store::restore(&db).await.expect("load");
+        assert_eq!(events, 0);
         assert_eq!(woken.sizes().0, u64::from(WAVE));
         let heap = woken.heap_bytes();
         eprintln!("woken wave graph: {heap} B of arenas for {WAVE} nodes");
