@@ -189,7 +189,8 @@ auth token`); every edge call it makes carries a token from
 | `STOW_PREHEAT_COST_PROJECTS` | every listed repository | `preheat projects submit --limit`: resolve only the first N repositories of `preheat/projects.toml`. |
 | `STOW_PREHEAT_COST_TARGETS` | every `CI_TARGET_TRIPLES` entry | Comma-separated `--targets` for every lane. |
 | `STOW_PREHEAT_COST_MAX_JOBS` / `STOW_PREHEAT_COST_MAX_MACOS_JOBS` | `45` / `11` | The scheduler's dispatch caps for the run — `edge/Skyzen.toml`'s production values, replacing the mock manifest's. |
-| `STOW_PREHEAT_COST_DEADLINE` | `21600` | Seconds the wave (and, separately, the resubmit) may run before the script fails. |
+| `STOW_PREHEAT_COST_DEADLINE` | `21600` | Seconds the wave (and, separately, each resubmit pass) may run before the script fails. |
+| `STOW_PREHEAT_COST_RESUBMIT_PASSES` | `3` | Most resubmit passes the run makes. The lanes resolve online, so a crate published since the previous phase gives a pass nodes it never planned; the resubmit repeats until a pass inserts nothing, and that pass is the measured resubmit. A pass still inserting when the bound is reached fails `Resubmit rebuilt nothing`. Must be a positive integer. |
 | `STOW_PREHEAT_COST_EDGE_RSS_MB` | `1200` | Restart the `wrangler dev` edge at an idle point once its process tree passes this resident size; the probe ledger is read on both sides of the restart. |
 | `STOW_E2E_TOOLCHAIN` / `STOW_E2E_READY_DEADLINE` | `stable` / `600` | The rustup toolchain the run builds for, and how long each service may take to come up — shared with `scripts/mock-e2e.sh`. |
 

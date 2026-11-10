@@ -111,7 +111,10 @@ outputs (`STOW_BUILD_MOCK_COMPILE`, compiled in only with the
 task's target is dispatched to, so one machine builds every target's
 host-side nodes as its runner would; publish rounds release the graph layer by
 layer; then the same lists are resubmitted the way the daily cron
-does. The edge runs the budget-probe manifest at production's
+does, repeating the resubmit until a pass inserts nothing (the lanes
+resolve online, so a release published meanwhile gives a pass new
+nodes; each such drift pass is built and reported, never priced) and
+measuring that last pass. The edge runs the budget-probe manifest at production's
 dispatch caps and cost multiplier, and its probe ledger (`stow-admin
 preheat cost ledger`) is read at every lane and round boundary and on
 both sides of every edge restart, so the report carries the ledger
@@ -120,7 +123,8 @@ across a restart.
 `stow-admin preheat cost report` turns the run into
 `preheat-cost-report.json` — per event kind (submit, alarm dispatch,
 completion, slice report) per layer, wave and resubmit totals, nodes
-per target, wall time — and fails when a resubmit rebuilds anything, a
+per target, wall time — and fails when the last resubmit pass rebuilds
+or inserts anything, any pass rebuilds a node an earlier phase planned, a
 per-event cost grows from the first layer to the last past the
 scheduler-budget tolerance, a fixed-size event exceeds its drive
 budget, a node is dispatched before its dependencies are published, a

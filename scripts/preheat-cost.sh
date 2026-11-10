@@ -25,7 +25,13 @@
 #      The wave is over when the lanes are done and nothing is pending
 #      or in flight
 #   5. resubmit the same lists, as the daily preheat-cron does, and
-#      drive whatever that releases
+#      drive whatever that releases (`resubmit/001`). The lanes resolve
+#      online, so a crate published since the wave gives the pass nodes
+#      the wave never planned; a pass that inserted tasks is a drift
+#      pass, driven to completion, and the resubmit repeats
+#      (`resubmit/002`, …) until a pass inserts nothing, at most
+#      STOW_PREHEAT_COST_RESUBMIT_PASSES passes. The last pass is the
+#      measured resubmit
 #   6. `stow-admin preheat cost report` reads the probe ledger snapshots
 #      taken at every lane and round boundary and around every edge
 #      restart, the local CI's runs and
@@ -34,8 +40,11 @@
 #      per-event cost growing first → last layer past the stow#433
 #      tolerance, a fixed-size event over its drive budget, a node
 #      dispatched before its dependencies were published, a submitted
-#      node never published, an `overloaded` answer, a failed submit, or
-#      a resubmit that rebuilt anything. The wave and resubmit totals it
+#      node never published, an `overloaded` answer, a failed submit, a
+#      resubmit pass that rebuilt a node an earlier phase planned, or a
+#      last resubmit pass that rebuilt or inserted anything (the pass
+#      bound ran out). Drift passes are reported, with the releases that
+#      explain them, never priced. The wave and resubmit totals it
 #      reports are bounded by the monthly projection — scaled to the
 #      production wave's node count and monthly cadence, combined with
 #      user traffic against 80% of each monthly allowance.
@@ -67,10 +76,15 @@
 #   STOW_PREHEAT_COST_MAX_JOBS     scheduler dispatch cap (default 45 —
 #                                  edge/Skyzen.toml)
 #   STOW_PREHEAT_COST_MAX_MACOS_JOBS
-#                                  macOS-family dispatch cap (default 16 —
+#                                  macOS-family dispatch cap (default 11 —
 #                                  edge/Skyzen.toml)
-#   STOW_PREHEAT_COST_DEADLINE     seconds each phase may take before the
-#                                  run fails (default 21600)
+#   STOW_PREHEAT_COST_DEADLINE     seconds each phase (the wave, and each
+#                                  resubmit pass) may take before the run
+#                                  fails (default 21600)
+#   STOW_PREHEAT_COST_RESUBMIT_PASSES
+#                                  resubmit passes before the run stops
+#                                  repeating a resubmit that keeps
+#                                  inserting tasks (default 3)
 #   STOW_PREHEAT_COST_EDGE_RSS_MB  restart the dev edge at an idle point
 #                                  once its process tree passes this RSS
 #                                  (default 1200; see traffic-cost.sh)
@@ -112,6 +126,16 @@ MAX_JOBS="${STOW_PREHEAT_COST_MAX_JOBS:-45}"
 MAX_MACOS_JOBS="${STOW_PREHEAT_COST_MAX_MACOS_JOBS:-11}"
 PHASE_DEADLINE="${STOW_PREHEAT_COST_DEADLINE:-21600}"
 EDGE_RSS_MB="${STOW_PREHEAT_COST_EDGE_RSS_MB:-1200}"
+# Resubmit passes the run may make before it gives up on the resubmit
+# going quiet. 3 because the first pass follows the whole wave (about half
+# an hour of registry time in CI) while every later pass follows only the
+# previous pass (well under a minute plus the builds of its few new
+# nodes), so three consecutive passes each catching a release is not a
+# realistic outcome; a resolver that is not deterministic inserts on every
+# pass and exhausts the bound.
+RESUBMIT_PASSES="${STOW_PREHEAT_COST_RESUBMIT_PASSES:-3}"
+[[ "$RESUBMIT_PASSES" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "[preheat-cost] STOW_PREHEAT_COST_RESUBMIT_PASSES must be a positive integer" >&2; exit 1; }
 POLL_SECS=5
 
 export RUSTUP_TOOLCHAIN="${STOW_E2E_TOOLCHAIN:-stable}"
@@ -476,7 +500,9 @@ LANES_IDX=-1
 
 start_lanes() {
     local phase="$1"
-    run_lanes "$phase" >>"$LOG_DIR/lanes-$phase.log" 2>&1 &
+    # A resubmit pass is `resubmit/NNN`; its log name carries no slash.
+    local log_name="${phase//\//-}"
+    run_lanes "$phase" >>"$LOG_DIR/lanes-$log_name.log" 2>&1 &
     LANES_PID=$!
     if [ "$LANES_IDX" -lt 0 ]; then
         LANES_IDX=${#CHILD_PIDS[@]}
@@ -485,7 +511,7 @@ start_lanes() {
     else
         CHILD_PIDS[LANES_IDX]=$LANES_PID
     fi
-    log "started the $phase lanes (pid $LANES_PID), log: $LOG_DIR/lanes-$phase.log"
+    log "started the $phase lanes (pid $LANES_PID), log: $LOG_DIR/lanes-$log_name.log"
 }
 
 # The local CI's `build-crate.yml` runs, as four counts: runs still in
@@ -657,7 +683,7 @@ publish_round bootstrap
 
 # --- the wave ---------------------------------------------------------------
 
-mkdir -p "$COST_DIR/wave" "$COST_DIR/resubmit"
+mkdir -p "$COST_DIR/wave"
 start_profile wave
 snapshot "$COST_DIR/wave/start.json"
 start_lanes wave
@@ -667,17 +693,64 @@ stop_profile
 
 # --- the daily resubmit -----------------------------------------------------
 
-start_profile resubmit
-snapshot "$COST_DIR/resubmit/start.json"
-start_lanes resubmit
-drive_phase resubmit
-snapshot "$COST_DIR/resubmit/end.json"
-stop_profile
+# Whether any lane of the phase directory $1 exited nonzero.
+phase_lane_failed() {
+    local lane
+    for lane in "$1"/lanes/*/; do
+        [ "$(cat "${lane}exit")" = "0" ] || return 0
+    done
+    return 1
+}
+
+# Tasks the phase directory $1's lanes inserted: the sum of each lane's
+# submit outcome in its `plan.json`.
+phase_inserted() {
+    local lane count total=0
+    for lane in "$1"/lanes/*/; do
+        count="$(jq -r '.result.inserted // 0' "${lane}plan.json")" \
+            || die "unreadable ${lane}plan.json"
+        total=$((total + count))
+    done
+    echo "$total"
+}
+
+# The lanes resolve online, as the daily cron does, so a crate published
+# since the previous phase gives a pass nodes that phase never planned. The
+# resubmit therefore repeats until one pass inserts nothing, and that pass
+# is the measured resubmit; each pass before it is a drift pass, driven to
+# completion like any phase so its new nodes are built and published. A
+# failed lane ends the loop (the report fails on it).
+pass=0
+while :; do
+    pass=$((pass + 1))
+    phase="resubmit/$(printf '%03d' "$pass")"
+    mkdir -p "$COST_DIR/$phase"
+    start_profile "$phase"
+    snapshot "$COST_DIR/$phase/start.json"
+    start_lanes "$phase"
+    drive_phase "$phase"
+    snapshot "$COST_DIR/$phase/end.json"
+    stop_profile
+    if phase_lane_failed "$COST_DIR/$phase"; then
+        log "$phase: a lane failed; no further resubmit pass"
+        break
+    fi
+    inserted="$(phase_inserted "$COST_DIR/$phase")"
+    log "$phase inserted $inserted tasks"
+    if [ "$inserted" -eq 0 ]; then
+        break
+    fi
+    if [ "$pass" -ge "$RESUBMIT_PASSES" ]; then
+        log "$phase: still inserting after $pass passes; the report fails on it"
+        break
+    fi
+done
 
 # --- the report -------------------------------------------------------------
 
 scan=(--scan "$LOG_DIR/edge.log" --scan "$LOG_DIR/local-ci.log")
-for stderr_log in "$COST_DIR"/*/lanes/*/stderr.log "$LOG_DIR"/index-report.log; do
+for stderr_log in "$COST_DIR"/wave/lanes/*/stderr.log "$COST_DIR"/resubmit/*/lanes/*/stderr.log \
+    "$LOG_DIR"/index-report.log; do
     [ -e "$stderr_log" ] && scan+=(--scan "$stderr_log")
 done
 admin preheat cost report \

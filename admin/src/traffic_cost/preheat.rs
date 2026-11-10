@@ -341,6 +341,8 @@ pub(super) fn test_report(nodes: u64) -> MeasuredReport {
             nodes_per_target: BTreeMap::new(),
             wave: phase.clone(),
             resubmit: phase,
+            resubmit_passes: 1,
+            drift_passes: Vec::new(),
             layers: Vec::new(),
             lanes: Vec::new(),
             checks: Vec::new(),
