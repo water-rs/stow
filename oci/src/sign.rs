@@ -36,9 +36,9 @@ use sigstore::cosign::payload::simple_signing::{
 use sigstore::crypto::SigningScheme;
 use sigstore::crypto::signing_key::SigStoreSigner;
 use stow_types::bundle::{
-    OCI_IMAGE_MANIFEST_MEDIA_TYPE, SIGSTORE_BUNDLE_ANNOTATION, SIGSTORE_CERT_ANNOTATION,
-    SIGSTORE_OCI_MEDIA_TYPE, SIGSTORE_SIGNATURE_ANNOTATION, SigstoreSignature,
-    sigstore_payload_path, sigstore_signature_tag,
+    BundleSignatureMaterial, OCI_IMAGE_MANIFEST_MEDIA_TYPE, SIGSTORE_BUNDLE_ANNOTATION,
+    SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE, SIGSTORE_SIGNATURE_ANNOTATION,
+    SigstoreSignature, sigstore_payload_path, sigstore_signature_tag,
 };
 use stow_types::error::Context as _;
 use stow_types::registry::sha256_digest;
@@ -49,9 +49,19 @@ use crate::client::{RegistryHttp, RegistrySession, Response, SessionRequest};
 use crate::retry::retry_with_backoff;
 use crate::verify::{TrustMaterial, verify_logged_signature, verify_payload_identity};
 
-/// Push `manifest` so that `reference`'s tag never names an unsigned
-/// manifest: the bytes go up by digest first, `sign` signs that digest
-/// under the tagged identity, and only then does the tag move to it.
+/// A published manifest and the result of signing its digest.
+#[derive(Debug)]
+pub struct SignedManifest<T> {
+    /// Digest of the bytes published under the tag.
+    pub digest: String,
+    /// Signing result retained for the publisher's next operation.
+    pub signing: T,
+}
+
+/// Sign `manifest` before publishing its tag, without a staging upload.
+///
+/// `sign` signs the bytes' digest under the tagged identity, and only then
+/// are the bytes published under the tag.
 ///
 /// Tagging first leaves a window, as long as signing takes, in which every
 /// reader resolves the tag to a digest whose `.sig` does not exist yet and
@@ -59,39 +69,28 @@ use crate::verify::{TrustMaterial, verify_logged_signature, verify_payload_ident
 /// good. Pushed this way, a reader sees the previous signed manifest or the
 /// new signed one, and a failed signature leaves the tag untouched.
 ///
-/// Returns the manifest digest.
+/// Returns the manifest digest and the signing result.
 ///
 /// # Errors
 ///
-/// Returns an error when either manifest `PUT` or the signature fails.
-pub async fn put_signed_manifest<S, Fut>(
+/// Returns an error when the manifest `PUT` or the signature fails.
+pub async fn put_signed_manifest<S, Fut, T>(
     session: &RegistrySession,
     reference: &Reference,
     manifest: &[u8],
     sign: S,
-) -> stow_types::error::Result<String>
+) -> stow_types::error::Result<SignedManifest<T>>
 where
     S: FnOnce(String) -> Fut,
-    Fut: Future<Output = stow_types::error::Result<()>>,
+    Fut: Future<Output = stow_types::error::Result<T>>,
 {
     let digest = sha256_digest(manifest);
-    let by_digest: Reference = format!(
-        "{}/{}@{digest}",
-        reference.registry(),
-        reference.repository()
-    )
-    .parse()
-    .map_err(|error| stow_types::stow_error!("parse digest reference for {reference}: {error}"))?;
-    session
-        .put_manifest(&by_digest, manifest)
-        .await
-        .map_err(|error| stow_types::stow_error!("push manifest {by_digest}: {error}"))?;
-    sign(digest.clone()).await?;
+    let signing = sign(digest.clone()).await?;
     session
         .put_manifest(reference, manifest)
         .await
         .map_err(|error| stow_types::stow_error!("tag manifest {reference}: {error}"))?;
-    Ok(digest)
+    Ok(SignedManifest { digest, signing })
 }
 
 /// The public-good Fulcio instance — cosign's default with the TUF signing
@@ -267,7 +266,8 @@ impl KeylessSigner {
     ///
     /// The signature is logged in Rekor and checked against the trust
     /// root before anything is pushed: a signature no reader would accept
-    /// is an error here, never a published layer.
+    /// is an error here, never a published layer. Returns that verified
+    /// material for bundle assembly without a registry read-back.
     ///
     /// # Errors
     ///
@@ -278,7 +278,7 @@ impl KeylessSigner {
         session: &RegistrySession,
         reference: &str,
         digest: &str,
-    ) -> stow_types::error::Result<()> {
+    ) -> stow_types::error::Result<BundleSignatureMaterial> {
         let payload = simple_signing_payload(reference, digest)?;
         let identity = self.identity().await?;
         let signature = identity
@@ -301,7 +301,13 @@ impl KeylessSigner {
             log_index = bundle.payload.log_index,
             "signed OCI artifact"
         );
-        Ok(())
+        Ok(BundleSignatureMaterial {
+            payload_path: sigstore_payload_path(0),
+            payload_bytes: layer.payload,
+            signature: layer.signature,
+            certificate_pem: layer.certificate_pem,
+            rekor_bundle_json: Some(layer.bundle_json),
+        })
     }
 
     /// The signature as a reader will check it: the payload binds
@@ -888,17 +894,12 @@ async fn push_signature_layer(
     });
     let (manifest, config) = signature_manifest(layers)?;
     session
-        .push_blob(&payload_digest, &layer.payload)
+        .push_blob_pair(
+            (&payload_digest, &layer.payload),
+            (&sha256_digest(&config), &config),
+        )
         .await
-        .map_err(|error| {
-            stow_types::stow_error!("push the signature payload of {reference}: {error}")
-        })?;
-    session
-        .push_blob(&sha256_digest(&config), &config)
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("push the signature config of {reference}: {error}")
-        })?;
+        .map_err(|error| stow_types::stow_error!("push signature blobs {reference}: {error}"))?;
     session
         .put_manifest(&reference, &manifest)
         .await

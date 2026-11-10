@@ -643,6 +643,22 @@ impl RegistrySession {
         verify_stored_digest(&response, digest, "push blob", &url)
     }
 
+    /// Upload the two independent blobs of a manifest concurrently.
+    /// Both retain this session's shared write budget; callers publish
+    /// the manifest only after both uploads succeed.
+    pub(crate) async fn push_blob_pair(
+        &self,
+        first: (&str, &[u8]),
+        second: (&str, &[u8]),
+    ) -> Result<(), RegistryError> {
+        futures_util::future::try_join(
+            self.push_blob(first.0, first.1),
+            self.push_blob(second.0, second.1),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// The distribution spec's fallback after a `POST` answered `202`:
     /// `PUT` the `Location` the session opened, with the body and the
     /// `digest` query the commit requires. The location is absolute or
@@ -756,17 +772,18 @@ impl RegistrySession {
     }
 
     /// `GET tags/list` — every tag the session's repository carries,
-    /// following the spec's `n`/`last` continuation while the registry
-    /// answers a `Link: …rel="next"` header. Admin's records export lists
-    /// the `records-*` tag space through this.
+    /// following the registry's own continuation: the last tag of a page is
+    /// the next page's `last` while the registry answers a
+    /// `Link: …rel="next"` header. The order of the listing is the
+    /// registry's own (GHCR does not list by name) and no cursor the
+    /// registry did not hand out is sent, so a caller that wants a tag
+    /// namespace selects it from this full listing.
     ///
     /// # Errors
     ///
     /// Returns [`RegistryError`] on a transport failure, a refusal, or an
     /// undecodable page body.
     pub async fn list_tags(&self) -> Result<Vec<String>, RegistryError> {
-        /// Tags per page — large enough that the records tag space is one
-        /// request for a long time.
         const PAGE_SIZE: u32 = 1000;
         let mut tags = Vec::new();
         let mut last: Option<String> = None;
@@ -1420,6 +1437,78 @@ mod tests {
         (session, http)
     }
 
+    /// Neither blob may wait for its sibling's response before starting.
+    #[tokio::test]
+    async fn blob_pair_overlaps_reads_and_uploads() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let url = format!("http://{}", listener.local_addr().expect("addr"));
+            let (session, _http) = session_on(&url).await;
+            let first = b"layer";
+            let second = b"config";
+            let first_digest = stow_types::registry::sha256_digest(first);
+            let second_digest = stow_types::registry::sha256_digest(second);
+            let server = async {
+                let mut uploaded = Vec::new();
+                for (method, count) in [("GET", 1), ("HEAD", 2), ("POST", 2)] {
+                    let mut pending = Vec::new();
+                    for _ in 0..count {
+                        let (mut stream, _) = listener.accept().await.expect("accept");
+                        let mut request = Vec::new();
+                        loop {
+                            let byte = stream.read_u8().await.expect("request byte");
+                            request.push(byte);
+                            if request.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let request = String::from_utf8(request).expect("request headers");
+                        let mut words = request.lines().next().expect("request line").split_whitespace();
+                        assert_eq!(words.next(), Some(method));
+                        let path = words.next().expect("request path");
+                        let response = if method == "GET" {
+                            assert_eq!(path, "/v2/");
+                            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+                        } else if method == "HEAD" {
+                            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+                        } else {
+                            let request_url = reqwest::Url::parse(&url).expect("url").join(path).expect("upload url");
+                            let digest = request_url.query_pairs().find(|(key, _)| key == "digest").expect("digest").1.into_owned();
+                            let length = request.lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().expect("content length"))
+                            }).expect("body length");
+                            let mut body = vec![0; length];
+                            stream.read_exact(&mut body).await.expect("blob body");
+                            assert_eq!(stow_types::registry::sha256_digest(&body), digest);
+                            uploaded.push(digest.clone());
+                            format!("HTTP/1.1 201 Created\r\ndocker-content-digest: {digest}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        };
+                        pending.push((stream, response));
+                    }
+                    for (mut stream, response) in pending {
+                        stream.write_all(response.as_bytes()).await.expect("respond");
+                    }
+                }
+                uploaded.sort();
+                let mut expected = vec![first_digest.clone(), second_digest.clone()];
+                expected.sort();
+                assert_eq!(uploaded, expected);
+            };
+            let (result, ()) = tokio::join!(
+                session.push_blob_pair((&first_digest, first), (&second_digest, second)),
+                server,
+            );
+            result.expect("both blobs uploaded");
+        })
+        .await
+        .expect("both requests must start before either response");
+    }
+
     /// `has_tags` asks for one tag, and answers from it.
     #[tokio::test]
     async fn has_tags_asks_for_one_tag() {
@@ -1482,5 +1571,43 @@ mod tests {
         let (session, _http) = session_on(&url).await;
         assert_eq!(session.list_tags().await.expect("list"), ["a", "b"]);
         task.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn list_tags_continues_from_the_last_tag_of_each_page_in_registry_order() {
+        let (url, task) = scripted_registry(|url| {
+            let mut answers = script(url, false, vec![]);
+            answers.extend([
+                (
+                    200,
+                    "link: </v2/cache/tags/list?last=records-b>; rel=\"next\"\r\n".to_owned(),
+                    r#"{"tags":["signature-a","records-b"]}"#,
+                ),
+                (
+                    200,
+                    "link: </v2/cache/tags/list?last=index.x>; rel=\"next\"\r\n".to_owned(),
+                    r#"{"tags":["records-a","index.x"]}"#,
+                ),
+                (200, String::new(), r#"{"tags":["folded.x"]}"#),
+            ]);
+            answers
+        })
+        .await;
+        let (session, _http) = session_on(&url).await;
+        assert_eq!(
+            session.list_tags().await.expect("list"),
+            [
+                "signature-a",
+                "records-b",
+                "records-a",
+                "index.x",
+                "folded.x"
+            ]
+        );
+        let lines = task.await.expect("server");
+        assert_eq!(lines.len(), 5, "three listing pages plus authentication");
+        assert!(!lines[2].contains("last="), "{lines:?}");
+        assert!(lines[3].contains("last=records-b "), "{lines:?}");
+        assert!(lines[4].contains("last=index.x "), "{lines:?}");
     }
 }

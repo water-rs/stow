@@ -14,7 +14,10 @@ use stow_types::api::{
     MutationKind, QueueSelector, SchedulerEvent, SubmissionTree, SubmitTaskIdEntry,
 };
 
-use super::graph::{Claimed, FinishOutcome, Graph, GraphCell, LoadedGraph, StartOutcome};
+use super::graph::{
+    Claimed, FinishOutcome, Graph, GraphCell, LoadedGraph, PublishedNeeds, ReadSource, Reads,
+    RootProbe, StartOutcome, ValidatedSubmission, Wanted,
+};
 use super::queue::{self, AlarmPlan, SchedulerSettings};
 use super::store;
 use crate::errors::QueueError;
@@ -24,13 +27,26 @@ use skyzen_services::durable::DurableDb;
 /// splits so no row nears the platform's row bound.
 const MUTATE_PART_IDS: usize = 4096;
 
+/// Refuse a CI call while its durable recovery deadline is in the future.
+///
+/// # Errors
+/// `QueueError::CiRateLimited` until the server's recovery deadline.
+pub(super) fn require_ci_ready(graph: LoadedGraph<'_>, now: i64) -> Result<(), QueueError> {
+    if graph.with(|graph| graph.ci_waiting(now)) {
+        return Err(QueueError::CiRateLimited);
+    }
+    Ok(())
+}
+
 /// Append `events` to the log at `now`, then apply each to the graph.
 /// The append lands first: an event is acknowledged only once it is
 /// durable, and a wake replays exactly what was acknowledged. `Submit`
-/// parts go through [`commit_trees`] — their apply is the merge.
+/// parts go through [`commit_trees`] — their apply is the merge. The
+/// published rows a slice report consults are read before the append.
 ///
 /// # Errors
-/// `QueueError::Sql` when the append fails; nothing is applied then.
+/// `QueueError::Sql` when the read or the append fails; nothing is
+/// applied then.
 pub(super) async fn commit(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
@@ -54,13 +70,22 @@ pub(super) async fn commit_as(
     events: &[SchedulerEvent],
     now: i64,
 ) -> Result<(), QueueError> {
+    // The published rows an event consults are read before anything
+    // appends or mutates — the ordering the replay follows too.
+    let needs = graph.with(|graph| {
+        let mut needs = PublishedNeeds::default();
+        for event in events {
+            graph.event_needs(event, &mut needs);
+        }
+        needs
+    });
+    let mut base = store::read_published(db, &needs).await?;
     append(graph, db, actor, events, now).await?;
     graph.with(|graph| {
-        for event in events {
-            graph.apply(event, now);
-        }
-    });
-    Ok(())
+        events
+            .iter()
+            .try_for_each(|event| graph.apply_logged(event, now, &mut base))
+    })
 }
 
 /// Append `events` to the log — the first row attributed to `actor`
@@ -70,12 +95,18 @@ async fn append(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
     actor: Option<&str>,
-    events: &[SchedulerEvent],
+    events: impl IntoIterator<Item: std::borrow::Borrow<SchedulerEvent>>,
     now: i64,
 ) -> Result<(), QueueError> {
     let appended = store::append_events(db, actor, events, now).await?;
     graph.with(|graph| graph.log_appended(appended.bytes, appended.seq));
     Ok(())
+}
+
+fn changing_submission<'a>(
+    (tree, changes): (&'a SubmissionTree, &bool),
+) -> Option<store::SubmissionParts<'a>> {
+    changes.then(|| store::submission_events(tree))
 }
 
 /// Append the `Submit` parts of every tree that changes the graph in
@@ -84,9 +115,13 @@ async fn append(
 /// held at their downloads — appends nothing: replaying it would be a
 /// no-op.
 ///
+/// The published rows the merges consult are read first, in batched
+/// statements and before anything is appended or mutated: the key of
+/// every tree node the graph does not hold yet and of its dependencies.
+///
 /// # Errors
-/// `QueueError::Sql` on a failed append, `QueueError::Invariant` when
-/// a tree is malformed.
+/// `QueueError::Sql` on a failed read or append, `QueueError::Invariant`
+/// when a tree is malformed.
 pub(super) async fn commit_trees(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
@@ -94,29 +129,225 @@ pub(super) async fn commit_trees(
     actor: Option<&str>,
     now: i64,
 ) -> Result<(u32, Vec<String>), QueueError> {
+    let validated = trees
+        .iter()
+        .map(ValidatedSubmission::new)
+        .collect::<Result<Vec<_>, _>>()?;
     let changing = graph.with(|graph| {
-        trees
+        validated
             .iter()
             .map(|tree| graph.merge_changes(tree))
-            .collect::<Result<Vec<_>, _>>()
-    })?;
-    let events: Vec<_> = trees
+            .collect::<Vec<_>>()
+    });
+    let needs = graph.with(|graph| {
+        let mut needs = PublishedNeeds::default();
+        for tree in &validated {
+            graph.merge_needs(tree, &mut needs);
+        }
+        needs
+    });
+    let mut base = store::read_published(db, &needs).await?;
+    let events = trees
         .iter()
         .zip(&changing)
-        .filter(|&(_, &changes)| changes)
-        .flat_map(|(tree, _)| store::submission_events(tree))
-        .collect();
-    append(graph, db, actor, &events, now).await?;
-    graph.with(|graph| {
-        trees
-            .iter()
-            .try_fold((0u32, Vec::new()), |(inserted, mut unpublished), tree| {
-                graph.merge(tree, now).map(|report| {
+        .filter_map(changing_submission)
+        .flatten();
+    append(graph, db, actor, events, now).await?;
+    let (inserted, unpublished, fresh) = graph.with(|graph| {
+        validated.iter().try_fold(
+            (0u32, Vec::new(), Vec::new()),
+            |(inserted, mut unpublished, mut fresh), tree| {
+                graph.merge_validated(tree, now, &mut base).map(|report| {
                     unpublished.extend(report.unpublished);
-                    (inserted.saturating_add(report.inserted), unpublished)
+                    fresh.extend(report.digests);
+                    (inserted.saturating_add(report.inserted), unpublished, fresh)
                 })
-            })
-    })
+            },
+        )
+    })?;
+    // The digest rows of the fresh slots land in the turn that appended
+    // the log rows, so they always describe the slab the log ends at.
+    store::write_digests(db, &fresh).await?;
+    Ok((inserted, unpublished))
+}
+
+/// A pure read of the graph that mints task ids and checks published
+/// masks. It runs twice: against [`Wanted`] to name the state slots it
+/// mints from and the published rows it looks up, then against their
+/// rows.
+pub(super) trait DigestRead: Sync {
+    /// What the read returns.
+    type Output;
+
+    /// Read `graph`, minting task ids from the digests and checking
+    /// published masks against the rows of `source`.
+    ///
+    /// # Errors
+    /// Whatever the read refuses, and `QueueError::Invariant` when
+    /// `source` lacks a row it consults.
+    fn read<D: ReadSource>(
+        &self,
+        graph: &Graph,
+        source: &mut D,
+    ) -> Result<Self::Output, QueueError>;
+}
+
+/// Run `read` over the graph twice: once to learn which state slots it
+/// mints task ids from and which published rows it looks up, then —
+/// after one batched read of exactly those rows — against the rows
+/// themselves. `read` must be a pure read of the graph: it runs twice
+/// and nothing may change between.
+///
+/// # Errors
+/// `QueueError::Sql`/`Invariant` from the row reads, otherwise `read`'s.
+pub(super) async fn with_digests<R: DigestRead>(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+    read: &R,
+) -> Result<R::Output, QueueError> {
+    let mut wanted = Wanted::default();
+    graph.with(|graph| read.read(graph, &mut wanted))?;
+    let mut rows = Reads {
+        digests: store::read_digests(db, &wanted.slots()).await?,
+        published: store::read_published(db, wanted.published()).await?,
+    };
+    graph.with(|graph| read.read(graph, &mut rows))
+}
+
+/// The task listing of [`list_tasks`].
+struct ListTasks<'a> {
+    selector: &'a QueueSelector,
+    now: i64,
+}
+
+impl DigestRead for ListTasks<'_> {
+    type Output = Vec<stow_types::api::QueueTask>;
+
+    fn read<D: ReadSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError> {
+        graph.list_with(self.selector, self.now, digests)
+    }
+}
+
+/// The occupancy status of [`admin_status`].
+struct AdminStatus {
+    now: i64,
+}
+
+impl DigestRead for AdminStatus {
+    type Output = stow_types::api::AdminStatus;
+
+    fn read<D: ReadSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError> {
+        graph.admin_status_with(self.now, digests)
+    }
+}
+
+/// The live status of one request record, for [`request_status`].
+struct RequestStatus<'a> {
+    request_id: &'a str,
+    now: i64,
+}
+
+impl DigestRead for RequestStatus<'_> {
+    type Output = Option<stow_types::api::CrateRequestStatus>;
+
+    fn read<D: ReadSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError> {
+        queue::crate_request_status(graph, self.request_id, self.now, digests)
+    }
+}
+
+/// The post-enqueue probe of a request's roots, for [`request_outcome`].
+struct RootsProbe<'a> {
+    ids: &'a [String],
+    now: i64,
+}
+
+impl DigestRead for RootsProbe<'_> {
+    type Output = RootProbe;
+
+    fn read<D: ReadSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError> {
+        graph.probe_roots_with(self.ids, self.now, digests)
+    }
+}
+
+/// The task ids a mutation's selector resolves to, for [`mutate`].
+struct SelectedIds<'a> {
+    op: MutationKind,
+    selector: &'a QueueSelector,
+    now: i64,
+}
+
+impl DigestRead for SelectedIds<'_> {
+    type Output = Vec<String>;
+
+    fn read<D: ReadSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError> {
+        graph.select_ids_with(self.op, self.selector, self.now, digests)
+    }
+}
+
+/// One demand batch's pass, for [`demand`].
+struct DemandBatch<'a> {
+    request: &'a stow_types::api::SchedulerDemandRequest,
+    settings: &'a SchedulerSettings,
+    now: i64,
+}
+
+impl DigestRead for DemandBatch<'_> {
+    type Output = (
+        stow_types::api::SchedulerDemandReport,
+        Option<SchedulerEvent>,
+        AlarmPlan,
+    );
+
+    fn read<D: ReadSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError> {
+        queue::demand_pass(graph, self.request, self.now, self.settings, digests)
+    }
+}
+
+/// One demand-feed hour's delivery, for [`feed_deliver`].
+struct FeedDelivery<'a> {
+    hour: &'a stow_types::api::DemandFeedHour,
+    settings: &'a SchedulerSettings,
+    now_ms: i64,
+}
+
+impl DigestRead for FeedDelivery<'_> {
+    type Output = (
+        stow_types::api::DemandFeedDeliverReport,
+        Vec<SchedulerEvent>,
+        AlarmPlan,
+    );
+
+    fn read<D: ReadSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError> {
+        super::feed::feed_deliver(graph, self.hour, self.now_ms, self.settings, digests)
+    }
 }
 
 /// `POST /tasks/submit[/trusted]`: the miss-lane pending-depth cap gates
@@ -187,7 +418,7 @@ pub(super) async fn mutate(
     actor: Option<&str>,
     now: i64,
 ) -> Result<u32, QueueError> {
-    let task_ids = graph.with(|graph| graph.select_ids(op, selector, now))?;
+    let task_ids = with_digests(graph, db, &SelectedIds { op, selector, now }).await?;
     let events: Vec<_> = task_ids
         .chunks(MUTATE_PART_IDS)
         .map(|ids| SchedulerEvent::Mutate {
@@ -220,8 +451,16 @@ pub(super) async fn demand(
     actor: Option<&str>,
     now: i64,
 ) -> Result<(stow_types::api::SchedulerDemandReport, AlarmPlan), QueueError> {
-    let (report, event, plan) =
-        graph.with(|graph| queue::demand_pass(graph, request, now, settings))?;
+    let (report, event, plan) = with_digests(
+        graph,
+        db,
+        &DemandBatch {
+            request,
+            settings,
+            now,
+        },
+    )
+    .await?;
     if let Some(event) = event {
         commit_as(graph, db, actor, &[event], now).await?;
     }
@@ -453,6 +692,7 @@ pub(super) async fn snapshot(
                 encoder.as_mut().expect("encoder").next_row(graph)
             })
         },
+        |after, limit| graph.with(|graph| graph.published_page(after, limit)),
         &meter,
         graph.cell(),
         now_ms,
@@ -521,7 +761,7 @@ pub(super) async fn persist_freeze(
 /// An empty claim set appends nothing.
 ///
 /// # Errors
-/// `QueueError::Invariant` when a claimed payload cannot rebuild,
+/// `QueueError::Invariant` when a target has no runner family,
 /// `QueueError::Sql` on a failed append.
 pub(super) async fn claim_pass(
     graph: LoadedGraph<'_>,
@@ -531,10 +771,15 @@ pub(super) async fn claim_pass(
     bound: u32,
 ) -> Result<Vec<Claimed>, QueueError> {
     graph.with(|graph| graph.set_floor(settings.min_dispatch_value));
-    let claims = graph.with(|graph| graph.claim(settings, now, bound))?;
-    if claims.is_empty() {
-        return Ok(claims);
+    let nodes = graph.with(|graph| graph.claim_nodes(settings, now, bound))?;
+    if nodes.is_empty() {
+        return Ok(Vec::new());
     }
+    // The claimed nodes' task ids are minted from their digest rows,
+    // read in batched statements right after the claim.
+    let slots = graph.with(|graph| graph.claim_slots(&nodes));
+    let mut digests = store::read_digests(db, &slots).await?;
+    let claims = graph.with(|graph| graph.claimed(&nodes, &mut digests))?;
     let event = SchedulerEvent::Claims {
         claims: claims
             .iter()
@@ -607,7 +852,7 @@ pub(super) async fn request_outcome(
                 .collect();
             (
                 queued_before,
-                graph.with(|graph| graph.probe_roots(&ids, now)),
+                with_digests(graph, db, &RootsProbe { ids: &ids, now }).await?,
             )
         } else {
             Default::default()
@@ -654,7 +899,7 @@ pub(super) async fn admit_request(
     now: i64,
 ) -> Result<queue::RequestAdmissionStep, QueueError> {
     let (step, event) =
-        graph.with(|graph| queue::admit_request(graph, admission, dispatched_at, settings))?;
+        graph.with(|graph| queue::admit_request(graph, admission, dispatched_at, settings, now))?;
     if let Some(event) = event {
         commit(graph, db, &[event], now).await?;
     }
@@ -766,10 +1011,60 @@ pub(super) async fn feed_deliver(
     actor: &str,
     now_ms: i64,
 ) -> Result<(stow_types::api::DemandFeedDeliverReport, AlarmPlan), QueueError> {
-    let (report, events, plan) =
-        graph.with(|graph| super::feed::feed_deliver(graph, hour, now_ms, settings))?;
+    let (report, events, plan) = with_digests(
+        graph,
+        db,
+        &FeedDelivery {
+            hour,
+            settings,
+            now_ms,
+        },
+    )
+    .await?;
     commit_as(graph, db, Some(actor), &events, now_ms).await?;
     Ok((report, plan))
+}
+
+/// `GET /tasks`: the queue listing, the task ids of its unnamed rows
+/// minted from the digest rows of exactly the nodes listed.
+///
+/// # Errors
+/// `QueueError::Invariant` on a node whose digest row is missing,
+/// `QueueError::Sql` on a failed read.
+pub(super) async fn list_tasks(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+    selector: &QueueSelector,
+    now: i64,
+) -> Result<Vec<stow_types::api::QueueTask>, QueueError> {
+    with_digests(graph, db, &ListTasks { selector, now }).await
+}
+
+/// `GET /admin/status`: the occupancy counts plus the in-flight rows,
+/// whose task ids come from their digest rows.
+///
+/// # Errors
+/// As [`list_tasks`].
+pub(super) async fn admin_status(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+    now: i64,
+) -> Result<stow_types::api::AdminStatus, QueueError> {
+    with_digests(graph, db, &AdminStatus { now }).await
+}
+
+/// `GET /requests/{id}`: the record's live status, its stored roots
+/// re-probed against the queue.
+///
+/// # Errors
+/// As [`list_tasks`].
+pub(super) async fn request_status(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+    request_id: &str,
+    now: i64,
+) -> Result<Option<stow_types::api::CrateRequestStatus>, QueueError> {
+    with_digests(graph, db, &RequestStatus { request_id, now }).await
 }
 
 /// Forced-eviction invariants (stow#878): a Durable Object evicted at
@@ -805,8 +1100,7 @@ mod eviction_tests {
 
     /// What a woken Durable Object holds: the store replayed.
     async fn wake(db: &DurableDb) -> GraphCell {
-        let (mut graph, tail) = store::load(db).await.expect("load");
-        store::apply_events(&mut graph, &tail);
+        let (graph, _) = store::restore(db).await.expect("load");
         let cell = GraphCell::default();
         cell.install(graph);
         cell
@@ -815,10 +1109,296 @@ mod eviction_tests {
     async fn seeded() -> (DurableDb, GraphCell) {
         let db = test_db::memory_db().await.expect("memory db");
         let cell = GraphCell::default();
-        fixture::seed(&db, &cell, SHAPE, HOST_NOW_MS)
-            .await
-            .expect("seed");
+        fixture::seed(
+            &db,
+            &cell,
+            SHAPE,
+            &crate::scheduler::queue::SchedulerSettings::default(),
+            HOST_NOW_MS,
+        )
+        .await
+        .expect("seed");
         (db, cell)
+    }
+
+    /// Mint every live state slot's task id from its stored row and
+    /// check it is the id of the node holding the slot; returns how many
+    /// slots it checked.
+    async fn verify_rows(db: &DurableDb, cell: LoadedGraph<'_>) -> usize {
+        let slots: Vec<u32> = cell.with(|graph| graph.slots_by_key().into_values().collect());
+        let mut digests = store::read_digests(db, &slots).await.expect("rows");
+        let checked = cell
+            .with(|graph| graph.verify_digest_rows(&mut digests))
+            .expect("every live slot's row mints its node's id");
+        assert_eq!(checked, slots.len());
+        checked
+    }
+
+    /// Slots free up as nodes publish and the next merge reuses the
+    /// lowest of them, an eviction replays the same allocation, and
+    /// through all of it every live slot's row mints its own node's id.
+    #[tokio::test]
+    async fn digest_rows_follow_their_slots_through_reuse_and_eviction() {
+        let (db, owner) = seeded().await;
+        let live = owner.loaded().expect("seeded");
+        let base = SHAPE.queue_rows;
+        let fresh = |lo: u32| {
+            let tree = fixture::fresh_tree(base + lo, base + lo + 299);
+            std::slice::from_ref(&tree).to_vec()
+        };
+        let publish = |lo: u32, hi: u32| {
+            move |cell: LoadedGraph<'_>| cell.with(|graph| fixture::slice_reports(graph, lo, hi))
+        };
+        assert!(verify_rows(&db, live).await > 0);
+        // Fresh nodes, a partly covered block among them.
+        commit_trees(live, &db, &fresh(1), None, HOST_NOW_MS)
+            .await
+            .expect("first wave");
+        verify_rows(&db, live).await;
+        // Publishing frees slots; the next wave reuses the lowest.
+        let events = publish(1, 40)(live);
+        commit(live, &db, &events, HOST_NOW_MS)
+            .await
+            .expect("publish");
+        let before = live.with(|graph| graph.slots_by_key().len());
+        commit_trees(live, &db, &fresh(301), None, HOST_NOW_MS)
+            .await
+            .expect("reusing wave");
+        let after = live.with(|graph| graph.slots_by_key().len());
+        assert_eq!(after, before + 300, "the wave added 300 live slots");
+        verify_rows(&db, live).await;
+        // Evict mid-stream: the woken graph holds the same slot for
+        // every node, and the rows describe it.
+        let woken_owner = wake(&db).await;
+        let woken = woken_owner.loaded().expect("woken");
+        assert_eq!(
+            live.with(|graph| graph.slots_by_key()),
+            woken.with(|graph| graph.slots_by_key()),
+            "replay allocates the slots the live graph did"
+        );
+        verify_rows(&db, woken).await;
+        // The woken graph carries on: more frees, more reuse.
+        let events = publish(41, 80)(woken);
+        commit(woken, &db, &events, HOST_NOW_MS)
+            .await
+            .expect("publish on the woken graph");
+        commit_trees(woken, &db, &fresh(601), None, HOST_NOW_MS)
+            .await
+            .expect("wave on the woken graph");
+        verify_rows(&db, woken).await;
+        let second = wake(&db).await;
+        assert_eq!(
+            woken.with(|graph| graph.slots_by_key()),
+            second
+                .loaded()
+                .expect("woken")
+                .with(|graph| graph.slots_by_key()),
+            "a second eviction agrees too"
+        );
+        verify_rows(&db, second.loaded().expect("woken")).await;
+    }
+
+    /// The ids among `ids` the index reports published, answered the way
+    /// a route does: the graph names its needs, the table is read, the
+    /// graph answers from the overlay and the rows read.
+    async fn answers(
+        db: &DurableDb,
+        cell: LoadedGraph<'_>,
+        ids: &[String],
+    ) -> std::collections::BTreeSet<String> {
+        let mut needs = PublishedNeeds::default();
+        cell.with(|graph| graph.published_of_with(ids, &mut needs))
+            .expect("needs");
+        let mut base = store::read_published(db, &needs).await.expect("read");
+        cell.with(|graph| graph.published_of_with(ids, &mut base))
+            .expect("answers")
+    }
+
+    /// Rows of the `published` table holding a live mask.
+    async fn table_rows(db: &DurableDb) -> i64 {
+        db.query("SELECT count(*) FROM published WHERE mask <> 0")
+            .fetch_scalar()
+            .await
+            .expect("count")
+    }
+
+    /// Node ids of the published block the slice-report tests use: past
+    /// every node the seed or any tree here merges, so no graph node
+    /// shadows a row.
+    fn block(lo: u32, hi: u32) -> Vec<String> {
+        (lo..=hi)
+            .map(|n| stow_types::fixture::fixture_task_id(u64::from(n)))
+            .collect()
+    }
+
+    /// A slice report followed by an eviction before any snapshot: the
+    /// woken graph replays the report into its overlay and answers the
+    /// masks and holds the queue the live graph does.
+    #[tokio::test]
+    async fn a_slice_report_replays_into_the_overlay_before_any_snapshot() {
+        let (db, owner) = seeded().await;
+        let live = owner.loaded().expect("seeded");
+        let (lo, hi) = (SHAPE.queue_rows + 3000, SHAPE.queue_rows + 3039);
+        let events = live.with(|graph| fixture::slice_reports(graph, lo, hi));
+        commit(live, &db, &events, HOST_NOW_MS)
+            .await
+            .expect("report");
+        let ids = block(lo - 20, hi + 20);
+        let expected = block(lo, hi).into_iter().collect();
+        assert_eq!(answers(&db, live, &ids).await, expected);
+        assert!(live.with(|graph| graph.published_overlay_len()) > 0);
+        let woken_owner = wake(&db).await;
+        let woken = woken_owner.loaded().expect("woken");
+        assert_eq!(answers(&db, woken, &ids).await, expected);
+        assert_eq!(
+            live.with(|graph| graph.shape_by_key()),
+            woken.with(|graph| graph.shape_by_key())
+        );
+        assert_eq!(
+            live.with(|graph| graph.status().pending),
+            woken.with(|graph| graph.status().pending)
+        );
+    }
+
+    /// The same after a snapshot: the table holds the rows and the
+    /// overlay is empty.
+    #[tokio::test]
+    async fn a_snapshot_moves_the_overlay_into_the_table() {
+        let (db, owner) = seeded().await;
+        let live = owner.loaded().expect("seeded");
+        let (lo, hi) = (SHAPE.queue_rows + 3000, SHAPE.queue_rows + 3039);
+        let before = table_rows(&db).await;
+        let events = live.with(|graph| fixture::slice_reports(graph, lo, hi));
+        commit(live, &db, &events, HOST_NOW_MS)
+            .await
+            .expect("report");
+        assert_eq!(table_rows(&db).await, before, "the report writes no row");
+        snapshot(live, &db, HOST_NOW_MS).await.expect("snapshot");
+        assert_eq!(live.with(|graph| graph.published_overlay_len()), 0);
+        assert_eq!(
+            table_rows(&db).await,
+            before + i64::from(hi - lo + 1),
+            "one row per published node"
+        );
+        let ids = block(lo - 20, hi + 20);
+        let expected = block(lo, hi).into_iter().collect();
+        assert_eq!(answers(&db, live, &ids).await, expected);
+        let woken_owner = wake(&db).await;
+        let woken = woken_owner.loaded().expect("woken");
+        assert_eq!(woken.with(|graph| graph.published_overlay_len()), 0);
+        assert_eq!(answers(&db, woken, &ids).await, expected);
+        assert_eq!(
+            live.with(|graph| graph.shape_by_key()),
+            woken.with(|graph| graph.shape_by_key())
+        );
+    }
+
+    /// A slice report and then a tree gating on a node it published,
+    /// both in the tail: the replay reads the same masks the live merge
+    /// did, so the woken graph holds the same edges and states.
+    #[tokio::test]
+    async fn a_tail_report_and_a_tree_on_its_node_replay_to_the_same_edges() {
+        let (db, owner) = seeded().await;
+        let live = owner.loaded().expect("seeded");
+        let published = SHAPE.queue_rows + 3000;
+        let events = live.with(|graph| fixture::slice_reports(graph, published, published + 9));
+        commit(live, &db, &events, HOST_NOW_MS)
+            .await
+            .expect("report");
+        let tree = SubmissionTree {
+            source: stow_types::api::SubmissionSource::CacheMiss,
+            roots: Vec::new(),
+            nodes: vec![
+                fixture::fixture_node(published + 5, Vec::new()),
+                fixture::fixture_node(SHAPE.queue_rows + 4000, vec![0]),
+            ],
+        };
+        commit_trees(live, &db, &[tree], None, HOST_NOW_MS)
+            .await
+            .expect("tree");
+        let woken_owner = wake(&db).await;
+        let woken = woken_owner.loaded().expect("woken");
+        assert_eq!(
+            live.with(|graph| graph.shape_by_key()),
+            woken.with(|graph| graph.shape_by_key()),
+            "the woken graph holds the live graph's edges and states"
+        );
+    }
+
+    /// A full report dropping members that exist only in the table
+    /// retires them: the overlay carries the retirement and the next
+    /// snapshot deletes the rows.
+    #[tokio::test]
+    async fn a_full_report_retires_members_held_only_in_the_table() {
+        use stow_types::api::PublishedSlice;
+        let (db, owner) = seeded().await;
+        let live = owner.loaded().expect("seeded");
+        let slice = |added| PublishedSlice {
+            target: stow_types::identity::TargetTriple::parse(
+                stow_types::api::CI_TARGET_TRIPLES[8],
+            )
+            .expect("target"),
+            rustc_version: stow_types::identity::WireRustcVersion::parse("1.84.0").expect("rustc"),
+            base_generation: None,
+            generation: 1,
+            part: 0,
+            parts: 1,
+            added,
+            retired: Vec::new(),
+        };
+        let before = table_rows(&db).await;
+        slice_reports(
+            live,
+            &db,
+            &[slice(fixture::full_slice_report())],
+            None,
+            HOST_NOW_MS,
+        )
+        .await
+        .expect("full report");
+        snapshot(live, &db, HOST_NOW_MS).await.expect("snapshot");
+        assert_eq!(
+            table_rows(&db).await,
+            before + 50,
+            "50 members in the table"
+        );
+        assert_eq!(live.with(|graph| graph.published_overlay_len()), 0);
+        // The report that follows drops every member; none is in memory.
+        slice_reports(live, &db, &[slice(Vec::new())], None, HOST_NOW_MS)
+            .await
+            .expect("empty full report");
+        assert_eq!(
+            live.with(|graph| graph.published_overlay_len()),
+            50,
+            "the overlay carries the 50 retirements"
+        );
+        let woken_owner = wake(&db).await;
+        assert_eq!(
+            woken_owner
+                .loaded()
+                .expect("woken")
+                .with(|graph| graph.published_overlay_len()),
+            50,
+            "the replay retires the same members"
+        );
+        snapshot(live, &db, HOST_NOW_MS).await.expect("snapshot");
+        assert_eq!(table_rows(&db).await, before, "the rows are deleted");
+    }
+
+    /// A lookup the overlay and the fetched base both lack is a defect
+    /// of the caller's needs, not an absent row.
+    #[tokio::test]
+    async fn a_lookup_outside_the_overlay_and_the_base_is_an_invariant_error() {
+        let (_db, owner) = seeded().await;
+        let live = owner.loaded().expect("seeded");
+        let ids = block(SHAPE.queue_rows + 3000, SHAPE.queue_rows + 3003);
+        let outcome = live.with(|graph| {
+            graph.published_of_with(&ids, &mut crate::scheduler::graph::Fetched::default())
+        });
+        assert!(
+            matches!(outcome, Err(QueueError::Invariant(_))),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test]
@@ -958,16 +1538,21 @@ mod inline_dispatch_tests {
     async fn seeded() -> (DurableDb, GraphCell) {
         let db = test_db::memory_db().await.expect("memory db");
         let cell = GraphCell::default();
-        fixture::seed(&db, &cell, SHAPE, HOST_NOW_MS)
-            .await
-            .expect("seed");
+        fixture::seed(
+            &db,
+            &cell,
+            SHAPE,
+            &crate::scheduler::queue::SchedulerSettings::default(),
+            HOST_NOW_MS,
+        )
+        .await
+        .expect("seed");
         (db, cell)
     }
 
     /// What a woken Durable Object holds: the store replayed.
     async fn wake(db: &DurableDb) -> GraphCell {
-        let (mut graph, tail) = store::load(db).await.expect("load");
-        store::apply_events(&mut graph, &tail);
+        let (graph, _) = store::restore(db).await.expect("load");
         let cell = GraphCell::default();
         cell.install(graph);
         cell
@@ -1546,8 +2131,7 @@ mod attribution_tests {
     }
 
     async fn woken(db: &DurableDb) -> GraphCell {
-        let (mut graph, tail) = store::load(db).await.expect("load");
-        store::apply_events(&mut graph, &tail);
+        let (graph, _) = store::restore(db).await.expect("load");
         let cell = GraphCell::default();
         cell.install(graph);
         cell
@@ -1812,6 +2396,54 @@ mod snapshot_trigger_tests {
             .expect("tail size")
     }
 
+    #[tokio::test]
+    async fn overlapping_validated_submissions_replay_and_resubmit_without_writes() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = GraphCell::default();
+        let cell = owner.install(Graph::default());
+        let trees = [tree(FIRST_ROW, 3), tree(FIRST_ROW + 1, 3)];
+        let (inserted, unpublished) = commit_trees(cell, &db, &trees, None, HOST_NOW_MS)
+            .await
+            .expect("overlapping submit");
+        assert_eq!(inserted, 4);
+        assert_eq!(unpublished.len(), 6);
+        let before = tail_bytes(&db).await;
+        assert!(before > 0);
+        let (replayed, _) = store::restore(&db).await.expect("load");
+        assert_eq!(replayed.status().pending, 4);
+        let replay_owner = GraphCell::default();
+        let replay_cell = replay_owner.install(replayed);
+        let (inserted, replay_unpublished) =
+            commit_trees(replay_cell, &db, &trees, None, HOST_NOW_MS + 1)
+                .await
+                .expect("resubmit after replay");
+        assert_eq!(inserted, 0);
+        assert_eq!(replay_unpublished, unpublished);
+        assert_eq!(tail_bytes(&db).await, before);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_later_tree_changes_neither_graph_nor_log() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = GraphCell::default();
+        let cell = owner.install(Graph::default());
+        let mut invalid_id = tree(FIRST_ROW + 10, 1);
+        invalid_id.nodes[0].task_id = "invalid".to_owned();
+        let mut invalid_root = tree(FIRST_ROW + 10, 1);
+        invalid_root.roots = vec![1];
+        let mut invalid_dep = tree(FIRST_ROW + 10, 1);
+        invalid_dep.nodes[0].deps = vec![1];
+        for invalid in [invalid_id, invalid_root, invalid_dep] {
+            let trees = [tree(FIRST_ROW, 3), invalid];
+            assert!(matches!(
+                commit_trees(cell, &db, &trees, None, HOST_NOW_MS).await,
+                Err(QueueError::Invariant(_))
+            ));
+            assert_eq!(cell.with(|graph| graph.status().pending), 0);
+            assert_eq!(tail_bytes(&db).await, 0);
+        }
+    }
+
     /// Submissions of any weight leave a tail of at most the byte
     /// threshold at the end of every turn, long before the event count
     /// is near its own.
@@ -1844,13 +2476,8 @@ mod snapshot_trigger_tests {
             }
             assert!(snapshots >= 1, "{nodes}-node turns never snapshotted");
             // A wake of this store replays that tail into the same graph.
-            let (mut woken, events) = store::load(&db).await.expect("load");
-            eprintln!(
-                "tail events {} bytes {}",
-                events.len(),
-                tail_bytes(&db).await
-            );
-            store::apply_events(&mut woken, &events);
+            let (woken, events) = store::restore(&db).await.expect("load");
+            eprintln!("tail events {events} bytes {}", tail_bytes(&db).await);
             assert_eq!(woken.sizes(), cell.with(|graph| graph.sizes()));
             eprintln!("{nodes}-node submissions: widest tail {widest} B, {snapshots} snapshots");
         }
@@ -1880,8 +2507,8 @@ mod snapshot_trigger_tests {
         );
         assert_eq!(tail_bytes(&db).await, 0);
         drop(wave);
-        let (woken, events) = store::load(&db).await.expect("load");
-        assert!(events.is_empty());
+        let (woken, events) = store::restore(&db).await.expect("load");
+        assert_eq!(events, 0);
         assert_eq!(woken.sizes().0, u64::from(WAVE));
         let heap = woken.heap_bytes();
         eprintln!("woken wave graph: {heap} B of arenas for {WAVE} nodes");

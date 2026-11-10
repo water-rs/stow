@@ -1,7 +1,6 @@
 //! Durable Object glue: routes scheduler HTTP/alarm events into the queue
 //! state machine and GitHub dispatch.
 
-use futures_util::stream::{self, StreamExt as _};
 use js_sys::Reflect;
 use serde::{Deserialize, Serialize};
 use skyzen::durable::DurableObject;
@@ -57,6 +56,7 @@ fn route_error(error: QueueError) -> Error {
             StatusCode::TOO_MANY_REQUESTS
         }
         QueueError::Sql(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        QueueError::CiRateLimited => StatusCode::SERVICE_UNAVAILABLE,
     };
     to_error(error).set_status(status)
 }
@@ -79,7 +79,7 @@ async fn ensure_graph<'a>(
     // wake plan and claim reads the one stamped here.
     let floor = binding_settings(env)?.min_dispatch_value;
     loaded.with(|graph| graph.set_floor(floor));
-    if cell.take_reconcile() {
+    if !loaded.with(|graph| graph.ci_waiting(now_ms())) && cell.take_reconcile() {
         // The CI `status` listing is the truth for runs a snapshot's
         // eviction could have orphaned (claims whose bindings never
         // landed). A failure leaves the replayed state: the delivery
@@ -93,6 +93,9 @@ async fn ensure_graph<'a>(
                 loaded.with(|graph| graph.reconcile_runs(&runs, now_ms()));
             }
             Err(error) => {
+                dispatch::retain_ci_limit(loaded, db, &error, now_ms())
+                    .await
+                    .map_err(route_error)?;
                 loaded.with(|graph| graph.reconcile_failed(now_ms()));
                 tracing::warn!(%error, "post-wake CI status reconcile failed — keeping replayed state");
             }
@@ -194,6 +197,10 @@ pub struct Scheduler {
     /// the store like a fresh isolate.
     #[serde(skip)]
     graph: graph::GraphCell,
+    /// Immutable routes belong to this object instance, not one invocation.
+    /// The framework injects request-scoped bindings into each request.
+    #[serde(skip)]
+    router: std::cell::OnceCell<Router>,
 }
 
 impl DurableObject for Scheduler {
@@ -210,6 +217,12 @@ impl DurableObject for Scheduler {
         // where its logging gets installed.
         #[cfg(target_arch = "wasm32")]
         crate::console_log::init();
+        self.router.get_or_init(|| self.build_router()).clone()
+    }
+}
+
+impl Scheduler {
+    fn build_router(&self) -> Router {
         Route::new((
             // Grouped to stay under the router's route-tuple arity —
             // the URLs are unchanged.
@@ -373,7 +386,7 @@ async fn scheduler_budget_seed(
             .unwrap_or(stow_types::fixture::FixtureShape::PRODUCTION.queue_rows),
     };
     Ok(Json(
-        fixture::seed(&db, &graph, shape, now_ms())
+        fixture::seed(&db, &graph, shape, &binding_settings(&env)?, now_ms())
             .await
             .map_err(to_error)?,
     ))
@@ -807,25 +820,28 @@ pub(super) async fn complete_run_pass(
     let mut verified_report = report.clone();
     // Evidence is read from GitHub, never accepted from the serving edge.
     verified_report.source_failure = None;
-    if !report.success && !report.cancelled {
+    if !report.success && !report.cancelled && !graph.with(|graph| graph.ci_waiting(now_ms())) {
         let verification = async {
             let run_id = report
                 .github_run_id
                 .parse::<u64>()
-                .map_err(|error| to_error(error.to_string()))?;
-            unloaded_ci_interface(graph.cell(), env)
-                .await?
+                .map_err(|error| dispatch::DispatchError::Response(error.to_string()))?;
+            ci_interface(env, graph)
+                .await
+                .map_err(|error| dispatch::DispatchError::TokenMint(error.to_string()))?
                 .source_failure_verification(stow_types::records::BuildRun {
                     run_id,
                     run_attempt: report.github_run_attempt,
                 })
                 .await
-                .map_err(|error| to_error(error.to_string()))
         }
         .await;
         match verification {
             Ok(proof) => verified_report.source_failure = proof,
             Err(error) => {
+                dispatch::retain_ci_limit(graph, db, &error, now_ms())
+                    .await
+                    .map_err(to_error)?;
                 tracing::warn!(%error, "source failure unverified; counting infrastructure failure");
             }
         }
@@ -938,8 +954,8 @@ async fn admin_status(
     db: DurableDb,
 ) -> Result<Json<stow_types::api::AdminStatus>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
-    let status = graph
-        .with(|graph| graph.admin_status(now_ms()))
+    let status = routes::admin_status(graph, &db, now_ms())
+        .await
         .map_err(to_error)?;
     Ok(Json(status))
 }
@@ -954,8 +970,8 @@ async fn list_tasks(
     skyzen::extract::Query(selector): skyzen::extract::Query<stow_types::api::QueueSelector>,
 ) -> Result<Json<Vec<stow_types::api::QueueTask>>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
-    let tasks = graph
-        .with(|graph| graph.list(&selector, now_ms()))
+    let tasks = routes::list_tasks(graph, &db, &selector, now_ms())
+        .await
         .map_err(to_error)?;
     Ok(Json(tasks))
 }
@@ -1122,8 +1138,8 @@ pub(super) async fn admit_request_pass(
         .map_err(route_error)?;
     let queue::RequestAdmissionStep::Dispatch { attempt } = step else {
         // A live record already serves this request — answer it.
-        return graph
-            .with(|graph| queue::crate_request_status(graph, &admission.request_id, now_ms()))
+        return routes::request_status(graph, db, &admission.request_id, now_ms())
+            .await
             .map_err(to_error)?
             .ok_or_else(|| {
                 Error::msg(format!(
@@ -1183,6 +1199,9 @@ pub(super) async fn admit_request_pass(
         }
     };
     if let Err(error) = outcome {
+        dispatch::retain_ci_limit(graph, db, &error, now_ms())
+            .await
+            .map_err(to_error)?;
         routes::fail_request_dispatch(
             graph,
             db,
@@ -1195,8 +1214,8 @@ pub(super) async fn admit_request_pass(
         .map_err(route_error)?;
         return Err(Error::msg(error.to_string()).set_status(StatusCode::BAD_GATEWAY));
     }
-    graph
-        .with(|graph| queue::crate_request_status(graph, &admission.request_id, now_ms()))
+    routes::request_status(graph, db, &admission.request_id, now_ms())
+        .await
         .map_err(to_error)?
         .ok_or_else(|| {
             Error::msg(format!(
@@ -1215,8 +1234,8 @@ async fn read_request(
 ) -> Result<Json<stow_types::api::CrateRequestStatus>> {
     let request_id = request_id_param(&params)?;
     let graph = ensure_graph(&env, &db, &graph).await?;
-    graph
-        .with(|graph| queue::crate_request_status(graph, request_id, now_ms()))
+    routes::request_status(graph, &db, request_id, now_ms())
+        .await
         .map_err(to_error)?
         .map(Json)
         .ok_or_else(|| {
@@ -1695,17 +1714,17 @@ fn trip_trigger(
 /// dispatch pass uses; the workflow's own manifest check is the
 /// authority on the version, so the payload is only a hint.
 ///
-/// The route creates nothing: no event, no graph load — its cost is
-/// the delivery's own (binding reads, the token cache read, one
-/// `workflow_dispatch` POST), never a replay of stored data. A
-/// dispatch failure answers 502 so newreleases.io's backoff retry
-/// redelivers.
+/// Check the shared recovery fence before dispatch. A rate-limit
+/// response appends its recovery deadline before answering 502 so
+/// newreleases.io's retry cannot bypass the shared fence. Graph recovery
+/// precedes dispatch rather than occurring in the metering tail.
 async fn preheat_release(
     State(graph): State<graph::GraphCell>,
     env: WasmEnv,
+    db: DurableDb,
     Json(request): Json<stow_types::api::PreheatReleaseRequest>,
 ) -> Result<Json<OkResponse>> {
-    preheat_release_pass(&graph, &env, &request).await?;
+    preheat_release_pass(&graph, &env, &db, &request).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -1715,62 +1734,37 @@ async fn preheat_release(
 pub(super) async fn preheat_release_pass(
     graph: &graph::GraphCell,
     env: &WasmEnv,
+    db: &DurableDb,
     request: &stow_types::api::PreheatReleaseRequest,
 ) -> Result<()> {
-    let interface = unloaded_ci_interface(graph, env).await?;
-    interface
+    let graph = ensure_graph(env, db, graph).await?;
+    routes::require_ci_ready(graph, now_ms()).map_err(route_error)?;
+    let interface = ci_interface(env, graph).await?;
+    routes::require_ci_ready(graph, now_ms()).map_err(route_error)?;
+    if let Err(error) = interface
         .submit_preheat(request.rustc_version.as_str())
         .await
-        .map_err(|error| {
-            let error = to_error(error.to_string());
-            tracing::error!(%error, "preheat release dispatch failed");
-            error.set_status(StatusCode::BAD_GATEWAY)
-        })
-}
-
-/// The CI interface a route that reads no stored row resolves: the
-/// credential arm plus the cached installation token, minted inline on
-/// expiry. A failed mint answers 502, like a failed dispatch.
-async fn unloaded_ci_interface(
-    graph: &graph::GraphCell,
-    env: &WasmEnv,
-) -> Result<dispatch::CiInterface<dispatch::CfTransport>> {
-    let pool = crate::fetch_guard::OutboundPool::new();
-    match credential_source(env)? {
-        CredentialSource::LocalCi(url) => Ok(dispatch::CiInterface::local_ci(
-            &url,
-            dispatch::CfTransport::new(pool),
-        )),
-        CredentialSource::GitHub(config) => {
-            let token = github_app::installation_token(graph.tokens(), &config)
-                .await
-                .map_err(|error| {
-                    let error =
-                        to_error(dispatch::DispatchError::TokenMint(error.to_string()).to_string());
-                    tracing::error!(%error, "installation token mint failed");
-                    error.set_status(StatusCode::BAD_GATEWAY)
-                })?;
-            let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
-            Ok(dispatch::CiInterface::github(
-                &github_repo,
-                &token.token,
-                dispatch::CfTransport::new(pool),
-            ))
-        }
+    {
+        dispatch::retain_ci_limit(graph, db, &error, now_ms())
+            .await
+            .map_err(route_error)?;
+        tracing::error!(%error, "preheat release dispatch failed");
+        return Err(to_error(error).set_status(StatusCode::BAD_GATEWAY));
     }
+    Ok(())
 }
 
 /// `POST /periodic/dispatch` — the edge's Cron Trigger names one due
-/// periodic workflow (stow#1100). Like `/preheat/release` the route
-/// creates nothing and touches no store row: its cost is the binding
-/// reads, the token cache read and one `workflow_dispatch` POST. A
-/// dispatch failure answers 502 so the Worker's handler reports it.
+/// periodic workflow (stow#1100). Like `/preheat/release`, it checks
+/// and persists the shared API recovery fence. A dispatch failure
+/// answers 502 so the Worker's handler reports it.
 async fn periodic_dispatch(
     State(graph): State<graph::GraphCell>,
     env: WasmEnv,
+    db: DurableDb,
     Json(request): Json<stow_types::periodic::PeriodicWorkflow>,
 ) -> Result<Json<OkResponse>> {
-    periodic_dispatch_pass(&graph, &env, &request).await?;
+    periodic_dispatch_pass(&graph, &env, &db, &request).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -1780,17 +1774,21 @@ async fn periodic_dispatch(
 pub(super) async fn periodic_dispatch_pass(
     graph: &graph::GraphCell,
     env: &WasmEnv,
+    db: &DurableDb,
     request: &stow_types::periodic::PeriodicWorkflow,
 ) -> Result<()> {
-    let interface = unloaded_ci_interface(graph, env).await?;
-    interface
-        .submit_periodic(request)
-        .await
-        .map_err(|error| {
-            let error = to_error(error.to_string());
-            tracing::error!(%error, workflow = request.workflow.as_str(), dispatch_ref = request.dispatch_ref.as_str(), "periodic dispatch failed");
-            error.set_status(StatusCode::BAD_GATEWAY)
-        })
+    let graph = ensure_graph(env, db, graph).await?;
+    routes::require_ci_ready(graph, now_ms()).map_err(route_error)?;
+    let interface = ci_interface(env, graph).await?;
+    routes::require_ci_ready(graph, now_ms()).map_err(route_error)?;
+    if let Err(error) = interface.submit_periodic(request).await {
+        dispatch::retain_ci_limit(graph, db, &error, now_ms())
+            .await
+            .map_err(route_error)?;
+        tracing::error!(%error, workflow = request.workflow.as_str(), dispatch_ref = request.dispatch_ref.as_str(), "periodic dispatch failed");
+        return Err(to_error(error).set_status(StatusCode::BAD_GATEWAY));
+    }
+    Ok(())
 }
 
 /// `POST /index/published` — the index-publish path's report that a
@@ -1860,6 +1858,7 @@ async fn run_alarm(
     db: DurableDb,
     alarm: Alarm,
 ) -> Result<&'static str> {
+    let _invocation = budget_probe_enabled(&env).then(|| graph.probe_invocation());
     let multiplier = cost_budget_multiplier(&env)?;
     let (metered, meter) = Meter::wrap(db.clone(), &graph);
     let meter = if budget_probe_enabled(&env) {
@@ -2023,6 +2022,9 @@ pub(super) async fn dispatch_pass(
     reconcile: PassReconcile,
 ) -> Result<Vec<String>> {
     let graph = ensure_graph(env, db, graph).await?;
+    if graph.with(|graph| graph.ci_waiting(now_ms())) {
+        return Ok(Vec::new());
+    }
     // Binding resolution precedes claiming: a misconfigured binding fails
     // the pass with every row still `pending` instead of burned as a
     // dispatch attempt.
@@ -2036,7 +2038,7 @@ pub(super) async fn dispatch_pass(
     let pool = crate::fetch_guard::OutboundPool::new();
     let interface = match &bindings.credential_source {
         CredentialSource::LocalCi(url) => {
-            tracing::info!(url = %url, "dispatching via local-CI endpoint");
+            tracing::debug!(url = %url, "dispatching via local-CI endpoint");
             dispatch::CiInterface::local_ci(url, dispatch::CfTransport::new(pool.clone()))
         }
         CredentialSource::GitHub(config) => {
@@ -2069,6 +2071,9 @@ pub(super) async fn dispatch_pass(
                 graph.with(|graph| graph.reconcile_runs(&listed, now_ms()));
             }
             Err(error) => {
+                dispatch::retain_ci_limit(graph, db, &error, now_ms())
+                    .await
+                    .map_err(route_error)?;
                 graph.with(|graph| graph.reconcile_failed(now_ms()));
                 tracing::warn!(%error, "CI status reconcile failed — keeping delivery-tracked external occupancy");
             }
@@ -2083,14 +2088,16 @@ pub(super) async fn dispatch_pass(
         .await
         .map_err(route_error)?;
     let task_ids: Vec<String> = claims.iter().map(|claim| claim.task_id.clone()).collect();
-    tracing::info!(
+    tracing::debug!(
         claimed = task_ids.len(),
         "scheduler dispatch_pending selected tasks"
     );
     if claims.is_empty() {
         return Ok(Vec::new());
     }
-    dispatch_claims(graph, db, &interface, claims).await?;
+    dispatch::dispatch_claims(graph, db, &interface, claims, now_ms)
+        .await
+        .map_err(route_error)?;
     Ok(task_ids)
 }
 
@@ -2116,69 +2123,6 @@ pub(super) fn now_ms() -> i64 {
     {
         js_sys::Date::now() as i64
     }
-}
-
-/// The `build-crate.yml` dispatch fan-out over one resolved backend —
-/// one `workflow_dispatch` per claimed task, concurrently, then the
-/// ordered outcome apply (stow#876).
-///
-/// The POSTs run under the invocation's outbound bound: the stream's
-/// `buffered` admits at most `MAX_OUTBOUND_INFLIGHT` (4) at once, and
-/// the pool slot `trigger_build` waits on enforces the same bound
-/// before any request posts. `buffered` — not `buffer_unordered` —
-/// yields results in the tasks' own order, so each outcome stays
-/// matched to its task. The queue writes then apply sequentially:
-/// `&DurableDb` is not `Send`, so it never enters a concurrent future.
-async fn dispatch_claims(
-    graph: graph::LoadedGraph<'_>,
-    db: &DurableDb,
-    backend: &dispatch::CiInterface<dispatch::CfTransport>,
-    claims: Vec<graph::Claimed>,
-) -> Result<()> {
-    // Collected before streaming: a closure inside the stream's type
-    // borrows each claim under a higher-ranked lifetime, and the alarm
-    // future then cannot prove itself `Send`.
-    let dispatches: Vec<_> = claims
-        .iter()
-        .map(|claim| {
-            let encoded = claim.payload.encode_dispatch_task().map_err(|error| {
-                dispatch::DispatchError::Response(format!("encode task: {error}"))
-            });
-            async move {
-                match encoded {
-                    Ok(encoded) => backend.submit(&encoded).await,
-                    Err(error) => Err(error),
-                }
-            }
-        })
-        .collect();
-    let outcomes = stream::iter(dispatches)
-        .buffered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
-        .collect::<Vec<_>>()
-        .await;
-    // ONE `Bindings` row for every returned binding (review); POST
-    // failures re-queue their claim under backoff in memory only —
-    // the failure is not a persistent event: a wake replays the claim
-    // as dispatched-unbound, which the run-listing reconcile binds or
-    // the stale lease returns.
-    let mut bindings = Vec::new();
-    let mut fails: Vec<(String, u64, String)> = Vec::new();
-    for (claim, outcome) in claims.iter().zip(outcomes) {
-        match outcome {
-            Ok(run) => bindings.push(stow_types::api::DispatchBinding {
-                task_id: claim.task_id.clone(),
-                generation: claim.generation,
-                run_id: run.workflow_run_id.to_string(),
-            }),
-            Err(error) => {
-                tracing::error!(task_id = %claim.task_id, %error, "failed to dispatch build");
-                fails.push((claim.task_id.clone(), claim.generation, error.to_string()));
-            }
-        }
-    }
-    routes::settle_dispatch(graph, db, bindings, fails, now_ms())
-        .await
-        .map_err(route_error)
 }
 
 async fn schedule_alarm(

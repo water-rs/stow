@@ -168,7 +168,7 @@ struct Signal {
 //   25G rows read/mo, 50M rows written/mo (SQLite storage billing).
 //   `activeTime` and `cpuTime` are collected as diagnostics.
 //   <https://developers.cloudflare.com/durable-objects/platform/pricing/>
-use stow_types::do_budgets::ALLOWANCE_FRACTION;
+use stow_types::do_budgets::{ALLOWANCE_FRACTION, DO_REQUEST_ALLOWANCE_FRACTION};
 pub use stow_types::do_budgets::{DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY};
 pub const DO_REQUESTS_MONTHLY: f64 = 1e6;
 pub const DO_DURATION_GB_S_MONTHLY: f64 = 400e3;
@@ -187,7 +187,7 @@ const QUARTER_HOUR: u64 = 900;
 /// threshold and trip/alert effect in one place.
 const SIGNALS: &[Signal] = &[
     // ── Cloudflare usage, billed dimensions: the month to date against the
-    // 80% line of the monthly allowance — breach trips ──
+    // dimension's configured line of the monthly allowance — breach trips ──
     Signal {
         id: "cf.do.rows_read",
         label: "DO rows read this month vs 80% of the 25G/mo allowance",
@@ -217,10 +217,10 @@ const SIGNALS: &[Signal] = &[
     },
     Signal {
         id: "cf.do.requests",
-        label: "DO requests this month vs 80% of the 1M/mo allowance",
+        label: "DO requests this month vs 90% of the 1M/mo allowance",
         window: Window::MonthToDate,
         min_sample: 0,
-        threshold: DO_REQUESTS_MONTHLY * ALLOWANCE_FRACTION,
+        threshold: DO_REQUESTS_MONTHLY * DO_REQUEST_ALLOWANCE_FRACTION,
         unit: "requests",
         effect: Effect::Trip(MaintenanceScope::Lanes),
     },
@@ -849,8 +849,8 @@ impl Watcher<'_> {
     /// share and dispatch-retry signals, with per-target and
     /// per-class evidence.
     ///
-    /// A task's outcome lives only on its run's jobs page — one read
-    /// per completed run, bounded-concurrent. A page that cannot be
+    /// A successful run's conclusion settles its outcome. Other runs
+    /// need their jobs page, read with bounded concurrency. A page that cannot be
     /// read or whose classification fails is a failed read: the
     /// collector returns `Err`, never an understated share.
     #[allow(clippy::too_many_lines)]
@@ -862,12 +862,16 @@ impl Watcher<'_> {
             ))
             .ok_or("window underflow")?;
         let runs = fetch_completed_runs(self.gh_token, since).await?;
-        // One jobs read per completed run, bounded-concurrent — a
+        // Successful runs need no jobs page: classify_page uses only
+        // their conclusion. Other reads remain bounded-concurrent — a
         // failed read or an unreadable page fails the reading rather
         // than understating the task share (a collector failure is an
         // incident of its own).
         let pages: Vec<Vec<RunJobRow>> =
             futures_util::stream::iter(runs.iter().map(|run| async move {
+                if run.conclusion.as_deref() == Some("success") {
+                    return Ok(Vec::new());
+                }
                 runs::fetch_run_jobs(self.gh_token, run.id, run.run_attempt)
                     .await
                     .map_err(|error| format!("run {}: jobs fetch: {error}", run.id))
@@ -1989,15 +1993,17 @@ impl From<AccountGroups> for CfSnapshot {
 
 /// The month-to-date trip reading of one billed dimension.
 fn month_reading(id: &str, allowance: f64, total: f64) -> Reading {
-    let line = allowance * ALLOWANCE_FRACTION;
+    let signal = signal(id);
+    let line = signal.threshold;
     Reading {
-        signal: signal(id),
+        signal,
         sample: 1,
         value: total,
         threshold: None,
         evidence: vec![format!(
-            "{:.1}% of the 80% line this UTC month ({:.1}% of the allowance)",
+            "{:.1}% of the {:.0}% line this UTC month ({:.1}% of the allowance)",
             total / line * 100.0,
+            line / allowance * 100.0,
             total / allowance * 100.0
         )],
     }
@@ -3874,7 +3880,6 @@ mod tests {
             ("cf.do.rows_read", DO_ROWS_READ_MONTHLY),
             ("cf.do.rows_written", DO_ROWS_WRITTEN_MONTHLY),
             ("cf.do.duration_gb_s", DO_DURATION_GB_S_MONTHLY),
-            ("cf.do.requests", DO_REQUESTS_MONTHLY),
             ("cf.worker.requests", WORKER_REQUESTS_MONTHLY),
             ("cf.worker.cpu_ms", WORKER_CPU_MS_MONTHLY),
         ] {
@@ -3884,6 +3889,15 @@ mod tests {
             let over = decide(&[reading(id, 1, line)], &[]);
             assert_eq!(over.tripped.len(), 1, "{id} at the line");
         }
+    }
+
+    #[test]
+    fn do_requests_use_the_ninety_percent_monthly_line() {
+        let under = month_reading("cf.do.requests", DO_REQUESTS_MONTHLY, 850_000.0);
+        assert!(!decide(std::slice::from_ref(&under), &[]).incident);
+        assert!(under.evidence[0].contains("90% line"));
+        let at = month_reading("cf.do.requests", DO_REQUESTS_MONTHLY, 900_000.0);
+        assert_eq!(decide(&[at], &[]).tripped.len(), 1);
     }
 
     /// The DO duration guard can fire: a month of one 128 MB object

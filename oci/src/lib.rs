@@ -18,8 +18,8 @@ mod throttle;
 pub mod verify;
 
 pub use artifacts::{
-    UploadOutcome, publish_packed, pull_pushed_signature_materials, pull_signature_materials,
-    push_artifacts, push_artifacts_with, verify_artifact_signature,
+    UploadOutcome, publish_packed, pull_signature_materials, push_artifacts, push_artifacts_with,
+    verify_artifact_signature,
 };
 pub use client::{
     OPERATOR_LOG_FILTER, RegistryError, RegistryHttp, RegistrySession, TransportPolicy,
@@ -36,5 +36,7 @@ pub use records::{
 };
 pub use registry::{RegistryBase, RegistryCredentials, pull_blob_verified, pull_tagged_manifest};
 pub use repack::repack_record;
-pub use sign::{FULCIO_URL, KeylessSigner, REKOR_URL, SigstoreServices, put_signed_manifest};
+pub use sign::{
+    FULCIO_URL, KeylessSigner, REKOR_URL, SignedManifest, SigstoreServices, put_signed_manifest,
+};
 pub use throttle::WriteBudget;

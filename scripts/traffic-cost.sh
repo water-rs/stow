@@ -6,21 +6,30 @@
 #   1. the scheduler budget pass at two fixture sizes (100k and 1M queue
 #      rows, same shape) — every drive's statements, rowsRead and
 #      rowsWritten against DO_BUDGETS, measured under workerd's billed
-#      cursor counters;
+#      cursor counters; the 1M-row population pass is followed by a
+#      restart of the edge over the persisted store and a status read
+#      that wakes the scheduler, with V8's collections traced into the
+#      edge log (`stow-admin traffic-cost restart`): the JavaScript heap
+#      in use stays within 24 MiB of the empty scheduler's through the
+#      population pass, its snapshot write and the wake, and the wake's
+#      Wasm linear memory exceeds the graph storage it accounts for by
+#      no more than 10 MiB;
 #   2. Worker CPU per traffic lane, sampled by the isolate's V8 profiler
-#      through `wrangler dev`'s DevTools inspector and divided by a fixed
+#      through workerd's DevTools inspector and divided by a fixed
 #      reference workload profiled in the same isolate before and after
 #      the lanes, so the runner's speed cancels, against
 #      WORKER_CPU_BUDGETS (`stow-admin traffic-cost cpu`);
 #   3. the peak-concurrency drive: every lane at the launch model's peak
 #      rate for 30 minutes (`stow-admin traffic-cost peak`);
 #   4. the budget pass again on the loaded fixture;
-#   5. the verdict (`stow-admin traffic-cost verdict`): row budgets, rows
-#      that grow with the stored bulk (more than 10% + 50 rows from the
-#      small fixture to the large), and the peak serialized Durable
-#      Object wall.
+#   5. the verdict (`stow-admin traffic-cost verdict`): row budgets, an
+#      event drive's rows that grow with the stored bulk (more than
+#      10% + 50 rows from the small fixture to the large; the wake and
+#      the snapshot write read and store that bulk and are held by their
+#      budgets alone), and the peak serialized Durable Object wall.
 #
-# The test fails on any of: a drive over its row budget, a drive that
+# The test fails on any of: a restart past the memory bounds above, a
+# drive over its row budget, a drive that
 # grows with stored rows, a lane over its CPU budget relative to the
 # reference workload, an unusable reference, peak serialized DO
 # wall above 0.5 s/s, any `overloaded` signal or 5xx under the peak
@@ -36,7 +45,7 @@
 #
 # Every service is local: the mock GHCR (`stow-mock-registry`, the
 # edge's GHCR_BASE_URL and the stats SQL endpoint), the edge under
-# `wrangler dev` (workerd), and `stow-build serve` under
+# the native workerd test runtime, and `stow-build serve` under
 # STOW_LOCAL_CI_STUB (the edge's STOW_LOCAL_CI_URL — the dispatch POST
 # and the signed `workflow_run` callback are real, the cargo build
 # behind them is not). Each pass's dispatches complete asynchronously
@@ -57,11 +66,14 @@
 #   STOW_TRAFFIC_SEGMENTS       drive segments; the edge restarts between
 #                               them (default 4 — see the note above the
 #                               edge lifecycle)
+#   STOW_TRAFFIC_BUILD_CALLBACK_EPS  optional absolute build delivery rate
 #   STOW_TRAFFIC_RATE_SCALE     multiplier over the model's peak rates
 #                               (default 1.0)
+#   STOW_TRAFFIC_MAX_JOBS       override both probe and mock dispatch caps
+#   STOW_TRAFFIC_MAX_MACOS_JOBS override the mock macOS dispatch cap
 #   STOW_TRAFFIC_RUSTC          rustc the lanes request and the index
 #                               slice publishes under (default 1.85.0)
-#   STOW_TRAFFIC_EDGE_PORT      port `wrangler dev` binds (default 8788)
+#   STOW_TRAFFIC_EDGE_PORT      port the test runtime binds (default 8788)
 #   STOW_TRAFFIC_INSPECTOR_PORT port the workerd inspector binds (default 9230)
 #   STOW_TRAFFIC_REGISTRY_PORT  port `stow-mock-registry serve` binds
 #                               (default 28123)
@@ -77,12 +89,16 @@ REGISTRY_ADDR="127.0.0.1:${STOW_TRAFFIC_REGISTRY_PORT:-28123}"
 LOCAL_CI_ADDR="127.0.0.1:${STOW_TRAFFIC_LOCAL_CI_PORT:-28124}"
 EDGE_URL="http://127.0.0.1:${EDGE_PORT}"
 SCHEDULER_URL="${EDGE_URL}/api/v1/scheduler"
-INSPECTOR_URL="ws://127.0.0.1:${INSPECTOR_PORT}/ws"
+INSPECTOR_URL=
 READY_DEADLINE="${STOW_E2E_READY_DEADLINE:-600}"
 SIZES="${STOW_TRAFFIC_SIZES:-100000 480000}"
 DURATION_SECS="${STOW_TRAFFIC_DURATION_SECS:-1800}"
 SEGMENTS="${STOW_TRAFFIC_SEGMENTS:-4}"
 RATE_SCALE="${STOW_TRAFFIC_RATE_SCALE:-1.0}"
+PEAK_RATE_ARGS=()
+if [ -n "${STOW_TRAFFIC_BUILD_CALLBACK_EPS:-}" ]; then
+    PEAK_RATE_ARGS+=(--build-callback-eps "$STOW_TRAFFIC_BUILD_CALLBACK_EPS")
+fi
 RUSTC_VERSION="${STOW_TRAFFIC_RUSTC:-1.85.0}"
 # A bundle the size of production's average fetch (stow#738: 1.4 MB
 # per bundle) — the CPU pass streams it through the byte path.
@@ -100,7 +116,12 @@ manifest_var() {
     [ -n "$value" ] || { echo "[traffic] ERROR: $2 not found in edge/$1" >&2; exit 1; }
     echo "$value"
 }
-DISPATCH_LIMIT="$(manifest_var Skyzen.toml STOW_MAX_CONCURRENT_JOBS)"
+DISPATCH_LIMIT="${STOW_TRAFFIC_MAX_JOBS:-$(manifest_var Skyzen.toml STOW_MAX_CONCURRENT_JOBS)}"
+MOCK_MAX_JOBS="${STOW_TRAFFIC_MAX_JOBS:-$(manifest_var Skyzen.mock.toml STOW_MAX_CONCURRENT_JOBS)}"
+MOCK_CAP_ARGS=(--var "STOW_MAX_CONCURRENT_JOBS:$MOCK_MAX_JOBS")
+if [ -n "${STOW_TRAFFIC_MAX_MACOS_JOBS:-}" ]; then
+    MOCK_CAP_ARGS+=(--var "STOW_MAX_CONCURRENT_MACOS_JOBS:$STOW_TRAFFIC_MAX_MACOS_JOBS")
+fi
 WEBHOOK_SECRET="$(manifest_var Skyzen.mock.toml STOW_GITHUB_WEBHOOK_SECRET)"
 APP_SLUG="$(manifest_var Skyzen.mock.toml GITHUB_APP_SLUG)"
 POW_SECRET="$(manifest_var Skyzen.mock.toml STOW_POW_CHALLENGE_SECRET)"
@@ -167,6 +188,11 @@ cleanup() {
     for ((i = ${#CHILD_PIDS[@]} - 1; i >= 0; i--)); do
         stop_tree "${CHILD_PIDS[$i]}"
     done
+    # Keep population and Wasm-memory boundaries with successful reports too.
+    # All writers have stopped, so the retained log includes the final sample.
+    if [ -f "$LOG_DIR/edge.log" ]; then
+        cp "$LOG_DIR/edge.log" "$REPORT_DIR/edge.log" || status=1
+    fi
     if [ "$status" -ne 0 ]; then
         local dump="$WORK_DIR/cleanup-dump.txt" log
         echo "[traffic] FAILED (exit $status) — log tails:" >"$dump"
@@ -265,7 +291,7 @@ require_command curl
 require_command jq
 require_command openssl
 require_command skyzen
-require_command wrangler
+require_command bun
 
 read -r -a size_list <<<"$SIZES"
 [ "${#size_list[@]}" -eq 2 ] || die "STOW_TRAFFIC_SIZES must name exactly two sizes"
@@ -276,6 +302,7 @@ SEG_SECS=$((DURATION_SECS / SEGMENTS))
 [ "$SEG_SECS" -ge 60 ] || die "STOW_TRAFFIC_DURATION_SECS=$DURATION_SECS too small for $SEGMENTS segments"
 
 echo "[traffic] work dir: $WORK_DIR"
+echo "[traffic] dispatch caps: probe=$DISPATCH_LIMIT mock=$MOCK_MAX_JOBS macos=${STOW_TRAFFIC_MAX_MACOS_JOBS:-default}"
 
 if ! rustup target list --installed --toolchain "$RUSTUP_TOOLCHAIN" \
     | grep -qx wasm32-unknown-unknown; then
@@ -344,32 +371,34 @@ sed -e "s/127\.0\.0\.1:28123/127.0.0.1:${REGISTRY_ADDR##*:}/g" \
     -e "s/127\.0\.0\.1:28124/127.0.0.1:${LOCAL_CI_ADDR##*:}/g" \
     "$REPO_ROOT/edge/Skyzen.mock.toml" >"$MOCK_MANIFEST"
 fg in_dir "$REPO_ROOT/edge" \
-    skyzen build --provider cloudflare --manifest "$(basename "$MOCK_MANIFEST")" \
+    skyzen build --release --provider cloudflare --manifest "$(basename "$MOCK_MANIFEST")" \
     >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
 rm -f "$MOCK_MANIFEST"
-# Wrangler writes its own ISO-timestamped log to WRANGLER_LOG_PATH.
-mkdir -p "$LOG_DIR/wrangler"
-export WRANGLER_LOG_PATH="$LOG_DIR/wrangler"
+fg in_dir "$REPO_ROOT/edge/tests/idle" bun install --frozen-lockfile \
+    >"$LOG_DIR/native-runtime-install.log" 2>&1 \
+    || die "native runtime install failed — see $LOG_DIR/native-runtime-install.log"
 
-# The edge runs under `wrangler dev`, whose miniflare service graph (the
-# ProxyWorker in front of every request plus the dev-time tail and
-# live-reload plumbing) retains native memory per request — ~50-190KB on
-# these lanes, linear and never released on idle (upstream:
-# cloudflare/workers-sdk#14701; reproduced on wrangler 4.100.0 and
-# 4.145.0). The isolates' own JS heaps stay flat, so no repo code is
-# implicated; what dies is the dev process around ~1.4GB. The peak drive
-# therefore runs in SEGMENTS fixed segments and the edge restarts
-# between them, persisting Durable Object state on disk. Lane mix,
-# rate and total request volume are unchanged.
+# Run the built artifact and generated bindings through Wrangler's native
+# Miniflare configuration adapter. The outbound service supplies pinned
+# external responses and forwards only to the local CI/registry. Retain
+# the existing segments and durable state across their restarts.
 EDGE_IDX=-1
 EDGE_PID=
+INSPECTOR_URL_FILE="$WORK_DIR/edge-runtime-ready.json"
 
 start_edge() {
+    rm -f "$INSPECTOR_URL_FILE"
     (
         cd "$REPO_ROOT/edge"
-        exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
+        # workerd takes V8 flags from this variable: every collection
+        # is traced into the edge log, where `traffic-cost restart`
+        # reads the JavaScript heap in use before each one.
+        exec env MINIFLARE_WORKERD_V8_FLAGS=--trace-gc \
+            bun tests/idle/cpu-runtime.mjs --config .skyzen/gen/wrangler.toml \
+            "${MOCK_CAP_ARGS[@]}" \
             --port "$EDGE_PORT" --inspector-port "$INSPECTOR_PORT" \
+            --ready-file "$INSPECTOR_URL_FILE" \
             --persist-to "$WORK_DIR/edge-state"
     ) >>"$LOG_DIR/edge.log" 2>&1 &
     EDGE_PID=$!
@@ -383,6 +412,9 @@ start_edge() {
     echo "[traffic] started edge (pid $EDGE_PID), log: $LOG_DIR/edge.log"
     wait_for "edge listener" "$READY_DEADLINE" "$EDGE_PID" \
         http_listening "$SCHEDULER_URL/status"
+    wait_for "edge inspector target" "$READY_DEADLINE" "$EDGE_PID" \
+        test -s "$INSPECTOR_URL_FILE"
+    INSPECTOR_URL="$(jq -er '.inspector' "$INSPECTOR_URL_FILE")"
 }
 
 # Resident set size of the edge process tree, logged at segment
@@ -394,6 +426,12 @@ edge_rss_kb() {
         [ -n "$rss" ] && total=$((total + rss))
     done
     echo "$total"
+}
+
+# Bytes the edge log holds now — the offsets `traffic-cost restart` cuts
+# its windows at.
+edge_log_bytes() {
+    wc -c <"$LOG_DIR/edge.log" | tr -d ' '
 }
 
 start_edge
@@ -423,6 +461,9 @@ wait_for "local CI dispatch endpoint" 60 "$!" \
 fg admin scheduler reset --yes >"$WORK_DIR/scheduler-reset.log" 2>&1 \
     || die "stow-admin scheduler reset failed — see $WORK_DIR/scheduler-reset.log"
 echo "[traffic] $(cat "$WORK_DIR/scheduler-reset.log")"
+# Everything the edge logged up to here is the empty scheduler's: the
+# baseline the population's JavaScript heap peak is judged against.
+EMPTY_LOG_BYTES="$(edge_log_bytes)"
 
 # One budget pass: $1 is the label, the rest the `scheduler budget`
 # arguments. `--json` keeps the per-statement detail; the command exits
@@ -440,10 +481,40 @@ budget_pass() {
         (.rows[] | "  \(.name | . + " " * (48 - length)) stmts=\(.statements)/\(.statement_budget) rows_read=\(.rows_read)/\(.read_budget) rows_written=\(.rows_written)/\(.write_budget) wall_ms=\(.wall_ms)\(if .over_budget then " OVER" else "" end)")
     ' "$REPORT_DIR/budget-$label.json"
     drain_builds "$label"
+    # Observe retained memory before the next pass replaces this population.
+    # These native counters do not establish transient peaks or billed memory.
+    fg admin --json traffic-cost memory --inspector-url "$INSPECTOR_URL" \
+        >"$REPORT_DIR/memory-$label.json" 2>"$LOG_DIR/memory-$label.log" \
+        || die "memory observation $label failed — see $LOG_DIR/memory-$label.log"
 }
 
 # The large fixture first, so the CPU pass and the peak drive run on the
 # small one the last reseed leaves.
+# One million fixture rows start with 600k pending nodes, covering the
+# 572,283 pending tasks observed in incident #1233. Keep both existing
+# scale-comparison cases and their budgets unchanged.
+budget_pass "population" --queue-rows 1000000
+
+# Restart the edge over the persisted population and wake the scheduler
+# with a status read: the wake logs the graph's occupancy and the Wasm
+# linear memory. `traffic-cost restart` judges the traced JavaScript
+# heap through the population pass, its snapshot write and the wake
+# against the empty scheduler's, and the wake's linear memory against
+# the graph storage it accounts for (stow#1380).
+echo "[traffic] restart over the persisted population"
+RESTART_LOG_BYTES="$(edge_log_bytes)"
+stop_tree "$EDGE_PID"
+start_edge
+curl -sf --max-time "$READY_DEADLINE" "$SCHEDULER_URL/status" >/dev/null \
+    || die "scheduler status read after the restart failed — see $LOG_DIR/edge.log"
+fg admin --json traffic-cost restart --edge-log "$LOG_DIR/edge.log" \
+    --empty-bytes "$EMPTY_LOG_BYTES" --restart-bytes "$RESTART_LOG_BYTES" \
+    >"$REPORT_DIR/restart-memory.json" 2>"$LOG_DIR/restart-memory.log" \
+    || { cat "$LOG_DIR/restart-memory.log" >&2; \
+         die "restart memory over its bounds — see $REPORT_DIR/restart-memory.json"; }
+jq -r '"restart memory: JS heap in use peak \(.run_heap_peak_mib) MiB (empty scheduler \(.empty_heap_peak_mib) MiB, bound +\(.heap_bound_mib) MiB); wasm linear \(.wake.wasm_linear_bytes) B vs accounted \(.wake.accounted_storage_bytes) B (bound +\(.linear_bound_bytes) B)"' \
+    "$REPORT_DIR/restart-memory.json"
+
 budget_pass "large" --queue-rows "$LARGE"
 budget_pass "small" --queue-rows "$SMALL"
 
@@ -466,24 +537,49 @@ curl -sf --max-time 60 -X POST -H 'Content-Type: application/json' \
     || die "local CI refused the fixture's runs — see $LOG_DIR/local-ci.log"
 echo "[traffic] recorded $(jq '.runs | length' "$WORK_DIR/fixture-runs.json") in-flight fixture task runs and their records artifacts"
 
+INDEX_PUBLISH_TOKEN_FILE="$WORK_DIR/index-publish-token"
+(umask 077; "$BIN/stow-mock-registry" oidc-token --workflow index-publish.yml \
+    --lifetime-secs 7200 > "$INDEX_PUBLISH_TOKEN_FILE")
+RESOLVE_TOKEN_FILE="$WORK_DIR/resolve-token"
+(umask 077; "$BIN/stow-mock-registry" oidc-token --workflow resolve-request.yml \
+    --lifetime-secs 7200 > "$RESOLVE_TOKEN_FILE")
+
+PREHEAT_CRON="$(bun -e 'console.log(Bun.TOML.parse(await Bun.file(process.argv[1]).text()).cloudflare.vars.STOW_PERIODIC_WORKFLOWS)' \
+    "$REPO_ROOT/edge/Skyzen.mock.toml" | jq -er '
+    to_entries | map(select(any(.value[]; . == "preheat-cron.yml")))
+    | if length == 1 then .[0].key else error("expected one preheat cron") end')"
 LANE_ARGS=(
+    --newreleases-secret "$(manifest_var Skyzen.mock.toml STOW_NEWRELEASES_WEBHOOK_SECRET)"
+    --preheat-cron "$PREHEAT_CRON"
+    --resolve-token-file "$RESOLVE_TOKEN_FILE"
+    --index-publish-token-file "$INDEX_PUBLISH_TOKEN_FILE"
+    --index-publish-rustc "$(rustc --version | awk '{print $2}')"
     --model "$REPO_ROOT/launch-model.toml"
     --queue-rows "$SMALL"
     --rustc "$RUSTC_VERSION"
+    --bundle-digest "$BUNDLE_DIGEST"
     --scheduler
     --webhook-secret "$WEBHOOK_SECRET"
     --pow-secret "$POW_SECRET"
 )
 
 echo "[traffic] Worker CPU per lane"
+CPU_FAILED=0
 fg admin --json traffic-cost cpu "${LANE_ARGS[@]}" \
-    --bundle-digest "$BUNDLE_DIGEST" \
     --inspector-url "$INSPECTOR_URL" \
     >"$REPORT_DIR/worker-cpu.json" 2>"$LOG_DIR/worker-cpu.log" \
-    || { cat "$LOG_DIR/worker-cpu.log" >&2; \
-         die "Worker CPU pass failed — see $REPORT_DIR/worker-cpu.json"; }
+    || {
+        cat "$LOG_DIR/worker-cpu.log" >&2
+        # A completed measurement can breach its budget without making
+        # the independent peak and post-load measurements unusable.
+        # Inspector, reference and transport errors produce no report.
+        jq -e 'any(.rows[]; .over_budget)' "$REPORT_DIR/worker-cpu.json" >/dev/null \
+            || die "Worker CPU measurement failed — see $LOG_DIR/worker-cpu.log"
+        CPU_FAILED=1
+        echo "[traffic] Worker CPU budget failed; collecting peak and post-load evidence before failing" >&2
+    }
 jq -r '"Worker CPU per event (idle window \(.idle_window_ms) ms collected \(.idle_cpu_ms) ms):",
-       "  reference workload \(.reference.cpu_ms * 100 | round / 100) ms (before \(.reference.rounds_before | map(. * 100 | round / 100)), after \(.reference.rounds_after | map(. * 100 | round / 100)))",
+       "  reference workload \(.reference.cpu_ms * 100 | round / 100) ms (before \(.reference.rounds_before | map(.sampled_cpu_ms / .invocations * 100 | round / 100)), after \(.reference.rounds_after | map(.sampled_cpu_ms / .invocations * 100 | round / 100)))",
        (.rows[] | "  \(.lane | . + " " * (20 - length)) \(.cpu_ms * 100 | round / 100) ms = \(.relative_cpu * 10000 | round / 10000) × reference (budget \(.budget_relative_cpu)) rounds \(.rounds_cpu_ms | map(. * 100 | round / 100))")' \
     "$REPORT_DIR/worker-cpu.json"
 drain_builds "cpu"
@@ -501,7 +597,9 @@ for ((seg = 1; seg <= SEGMENTS; seg++)); do
     echo "[traffic] segment $seg/$SEGMENTS: ${seg_secs}s"
     fg admin --json traffic-cost peak "${LANE_ARGS[@]}" \
         --duration-secs "$seg_secs" \
-        --rate-scale "$RATE_SCALE" \
+        --inspector-url "$INSPECTOR_URL" \
+        --cpu-out "$REPORT_DIR/peak-seg${seg}-cpu.json" \
+        --rate-scale "$RATE_SCALE" "${PEAK_RATE_ARGS[@]}" \
         >"$REPORT_DIR/peak-seg${seg}.json" 2>"$LOG_DIR/peak-seg${seg}.log" \
         || { cat "$LOG_DIR/peak-seg${seg}.log" >&2; \
              die "peak drive segment $seg breached — see $REPORT_DIR/peak-seg${seg}.json"; }
@@ -520,5 +618,8 @@ fg admin traffic-cost verdict \
     --after "$REPORT_DIR/budget-after.json" \
     --model "$REPO_ROOT/launch-model.toml" \
     || die "traffic cost over its bounds — see the verdict above"
+
+[ "$CPU_FAILED" -eq 0 ] \
+    || die "Worker CPU budget failed — see $REPORT_DIR/worker-cpu.json; peak and post-load reports collected"
 
 echo "[traffic] OK — within every budget and bound; reports for the projection: $REPORT_DIR"

@@ -89,40 +89,24 @@ impl MeteredBackend {
 }
 
 impl DurableDbBackend for MeteredBackend {
-    fn query(
-        &self,
-        query: &str,
-        params: &[DbValue],
-    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
-        let inner = self.inner.clone();
-        let log = self.log.clone();
-        let sql = query.to_owned();
-        let params = params.to_vec();
-        async move {
-            let mut source = &inner;
-            let started_ms = clock_ms();
-            let result = QuerySource::query(&mut source, &sql, &params).await;
-            Self::record(&result, &log, &sql, started_ms);
-            result
-        }
+    async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
+        let mut source = &self.inner;
+        let started_ms = clock_ms();
+        let result = QuerySource::query(&mut source, query, params).await;
+        Self::record(&result, &self.log, query, started_ms);
+        result
     }
 
-    fn execute(
+    async fn execute(
         &self,
         query: &str,
         params: &[DbValue],
-    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
-        let inner = self.inner.clone();
-        let log = self.log.clone();
-        let sql = query.to_owned();
-        let params = params.to_vec();
-        async move {
-            let mut source = &inner;
-            let started_ms = clock_ms();
-            let result = QuerySource::execute(&mut source, &sql, &params).await;
-            Self::record(&result, &log, &sql, started_ms);
-            result
-        }
+    ) -> Result<DbExecResult, DurableDbError> {
+        let mut source = &self.inner;
+        let started_ms = clock_ms();
+        let result = QuerySource::execute(&mut source, query, params).await;
+        Self::record(&result, &self.log, query, started_ms);
+        result
     }
 
     fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send {
@@ -179,7 +163,7 @@ pub async fn run(
     let shape = FixtureShape { queue_rows };
     // Every run starts from the canonical graph: reseeding restores
     // what earlier runs, passes and the callback lane moved.
-    fixture::seed(db, graph, shape, super::object::now_ms()).await?;
+    fixture::seed(db, graph, shape, &settings, super::object::now_ms()).await?;
     let ctx = drives::DriveContext::worker(env, graph.clone(), alarm);
     // Seed the cached installation token once, outside any measured
     // window: the probe dispatches to the local-CI endpoint, so no real
@@ -198,7 +182,13 @@ pub async fn run(
     let mut rows = Vec::with_capacity(drives::DRIVES.len());
     let mut over_budget = false;
     for drive in drives::DRIVES {
+        graph.loaded().expect("probe graph loaded").with(|graph| {
+            fixture::trace_population(graph, drive.name);
+        });
         let row = run_drive(drive, db, &metered, shape, &settings, &ctx, &log).await?;
+        graph.loaded().expect("probe graph loaded").with(|graph| {
+            fixture::trace_population(graph, "drive completed");
+        });
         over_budget |= row.over_budget;
         rows.push(row);
     }
@@ -356,6 +346,25 @@ async fn run_drive(
     let mut measure = WindowMeasure::new(drive.name, log);
     let outcome = drives::drive_lifecycle(drive, db, metered, shape, settings, ctx, &mut |mark| {
         measure.mark(mark);
+        // Keep diagnostic work outside the measured run + durability barrier.
+        let (phase, boundary) = match mark {
+            drives::PhaseMark::Starting(drives::LifecyclePhase::Setup) => ("setup", "before"),
+            drives::PhaseMark::Finished(drives::LifecyclePhase::Setup) => ("setup", "after"),
+            drives::PhaseMark::Finished(drives::LifecyclePhase::PostSync) => ("run", "after"),
+            drives::PhaseMark::Finished(drives::LifecyclePhase::Cleanup) => ("cleanup", "after"),
+            _ => return,
+        };
+        if let Some(loaded) = ctx.graph.loaded() {
+            loaded.with(|graph| graph.trace_occupancy(drive.name, phase, boundary));
+        } else {
+            tracing::info!(
+                drive = drive.name,
+                phase,
+                boundary,
+                graph_loaded = false,
+                "budget graph occupancy"
+            );
+        }
     })
     .await;
     if let Err(error) = outcome.setup {

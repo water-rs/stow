@@ -23,15 +23,15 @@ on:
 
 permissions:
   contents: read
-  # `gh workflow run` mints the dispatch with the run's own GITHUB_TOKEN.
+  # Dispatch with the run's own GITHUB_TOKEN.
   actions: write
 
-# A wave of build completions queues one dispatch per run; a pending tick
-# is superseded by the next, and `index-publish.yml`'s own concurrency
-# group collapses the dispatches into at most one queued publish.
+# Keep the active dispatch alive during a wave of build completions.
+# GitHub supersedes only the pending tick; `index-publish.yml`'s own
+# concurrency group likewise retains one running and one pending publish.
 concurrency:
   group: index-publish-cron
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   dispatch:
@@ -52,11 +52,11 @@ jobs:
           RUN_TITLE: ${{ github.event.workflow_run.display_title }}
         run: |
           set -euo pipefail
-          args=(--repo "$GITHUB_REPOSITORY" --ref main)
+          args=(--method POST -f ref=main)
           if [ -n "$STOW_EDGE_URL" ]; then
-            args+=(-f report=true)
+            args+=(-f 'inputs[report]=true')
           fi
           if [[ "$EVENT_NAME" == "workflow_run" ]]; then
-            args+=(-f "rustc_version=${RUN_TITLE%%-*}")
+            args+=(-f "inputs[rustc_version]=${RUN_TITLE%%-*}")
           fi
-          gh workflow run index-publish.yml "${args[@]}"
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/index-publish.yml/dispatches" "${args[@]}"

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/water-rs/stow/compare/stow-types-v0.14.0...stow-types-v0.15.0) - 2026-11-10
+
+### Added
+
+- report scheduler backlog by compilation target ([#1212](https://github.com/water-rs/stow/pull/1212))
+
+### Fixed
+
+- *(admin)* bound Durable Object duration by its billing ceiling ([#1396](https://github.com/water-rs/stow/pull/1396))
+- *(admin)* hold the wake and the snapshot write to their budgets in the traffic verdict ([#1388](https://github.com/water-rs/stow/pull/1388))
+- *(scheduler)* honor CI rate-limit recovery across restarts ([#1355](https://github.com/water-rs/stow/pull/1355))
+- measure fixed preheat trigger CPU ([#1354](https://github.com/water-rs/stow/pull/1354))
+- *(edge)* observe mock scheduler processing intervals ([#1305](https://github.com/water-rs/stow/pull/1305))
+- account for preheat workflow lifecycle CPU ([#1286](https://github.com/water-rs/stow/pull/1286))
+- apply traffic capacity overrides to the mock scheduler ([#1215](https://github.com/water-rs/stow/pull/1215))
+
+### Other
+
+- *(scheduler)* keep the published masks in a table and only their changes in memory ([#1389](https://github.com/water-rs/stow/pull/1389))
+- *(scheduler)* cap snapshot rows at 64 KiB and page the wake's log tail ([#1382](https://github.com/water-rs/stow/pull/1382))
+- *(scheduler)* shrink node and queue-state records and move digests to storage ([#1381](https://github.com/water-rs/stow/pull/1381))
+- *(ci)* join status listings through shared pagination ([#1352](https://github.com/water-rs/stow/pull/1352))
+- *(edge)* measure the human request lifecycle on native mocked egress ([#1340](https://github.com/water-rs/stow/pull/1340))
+- measure health and index lifecycle CPU ([#1276](https://github.com/water-rs/stow/pull/1276))
+- keep routine dispatch diagnostics at debug level ([#1232](https://github.com/water-rs/stow/pull/1232))
+
 ## [0.14.0](https://github.com/water-rs/stow/compare/stow-types-v0.13.1...stow-types-v0.14.0) - 2026-11-01
 
 ### Added

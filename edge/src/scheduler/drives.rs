@@ -30,7 +30,8 @@ use std::sync::{Arc, Mutex};
 use skyzen_services::durable::{Alarm, DurableDb};
 use stow_types::api::{
     CI_TARGET_TRIPLES, DispatchBinding, DispatchClaim, MutationKind, PublishedSlice, QueueSelector,
-    QueueTaskStatus, SchedulerEvent, SubmissionSource, SubmissionTree, SubmitTaskIdEntry,
+    QueueTaskStatus, RunnerFamily, SchedulerEvent, SubmissionSource, SubmissionTree,
+    SubmitTaskIdEntry,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -423,9 +424,9 @@ async fn schedule(
         .map_err(text)
 }
 
-fn list(ctx: &DriveContext, selector: &QueueSelector) -> Result<(), String> {
-    ctx.loaded()
-        .with(|graph| graph.list(selector, now_ms()))
+async fn list(ctx: &DriveContext, db: &DurableDb, selector: &QueueSelector) -> Result<(), String> {
+    routes::list_tasks(ctx.loaded(), db, selector, now_ms())
+        .await
         .map(|_| ())
         .map_err(text)
 }
@@ -756,6 +757,16 @@ async fn admit_request_drive(
 }
 
 // ===== The dispatch passes =====
+
+fn occupied_slots(ctx: &DriveContext) -> (u32, u32) {
+    ctx.loaded().with(|graph| {
+        let (total, macos) = graph.inflight();
+        (
+            total + graph.external_total(),
+            macos + graph.external_family(RunnerFamily::MacOs),
+        )
+    })
+}
 
 /// One dispatch pass exactly as `run_alarm` runs it, minus the metering
 /// tail. On workerd the real `dispatch_pass` (stale recovery, the claim,
@@ -1372,13 +1383,18 @@ pub const DRIVES: &[Drive] = &[
         // the in-flight section by the dispatch cap — neither tracks the
         // stored node bulk. `ready` sums the lengths of the ready
         // queues, one per rank-operand class: memory only, no statement,
-        // so the budget row is unchanged (stow#1096).
+        // so the budget row is unchanged (stow#1096). The in-flight
+        // rows' task ids are minted from their digest rows (stow#1378):
+        // one statement, two rows read per in-flight row (the
+        // `json_each` list row and the table row; the sqlite test
+        // backend's meter counts only the table row) — at most the
+        // dispatch cap at any population.
         name: "GET /admin/status",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
-                ctx.loaded()
-                    .with(|graph| graph.admin_status(now_ms()))
+                routes::admin_status(ctx.loaded(), db, now_ms())
+                    .await
                     .map(|_| ())
                     .map_err(text)
             })
@@ -1386,25 +1402,37 @@ pub const DRIVES: &[Drive] = &[
         cleanup: None,
     },
     Drive {
+        // The listing drives (stow#1378) mint the task id of each
+        // unnamed row they return, and of a blocked row's failed
+        // dependency, from digest rows: one statement, two rows read
+        // per id (the list row and the table row; the sqlite test
+        // backend's meter counts only the table row). A listing
+        // returns at most `ADMIN_LIST_LIMIT` rows, so it reads at most
+        // that many digests plus as many blocked-by ids at any
+        // population; the cost follows the matching rows only until
+        // that cap. The crate listing is one too, bounded by the same
+        // cap rather than by the name's version set.
         name: "GET /tasks",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
-            Box::pin(async move { list(ctx, &QueueSelector::default()) })
+        run: |db, _shape, _settings, ctx| {
+            Box::pin(async move { list(ctx, db, &QueueSelector::default()).await })
         },
         cleanup: None,
     },
     Drive {
         name: "GET /tasks?status=failed",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 list(
                     ctx,
+                    db,
                     &QueueSelector {
                         status: Some(QueueTaskStatus::Failed),
                         ..QueueSelector::default()
                     },
                 )
+                .await
             })
         },
         cleanup: None,
@@ -1412,15 +1440,17 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         name: "GET /tasks?status=pending",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 list(
                     ctx,
+                    db,
                     &QueueSelector {
                         status: Some(QueueTaskStatus::Pending),
                         ..QueueSelector::default()
                     },
                 )
+                .await
             })
         },
         cleanup: None,
@@ -1428,15 +1458,17 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         name: "GET /tasks?status=blocked",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 list(
                     ctx,
+                    db,
                     &QueueSelector {
                         status: Some(QueueTaskStatus::Blocked),
                         ..QueueSelector::default()
                     },
                 )
+                .await
             })
         },
         cleanup: None,
@@ -1444,10 +1476,11 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         name: "GET /tasks?target=…",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 list(
                     ctx,
+                    db,
                     &QueueSelector {
                         target: Some(
                             CI_TARGET_TRIPLES[0]
@@ -1457,6 +1490,7 @@ pub const DRIVES: &[Drive] = &[
                         ..QueueSelector::default()
                     },
                 )
+                .await
             })
         },
         cleanup: None,
@@ -1466,10 +1500,11 @@ pub const DRIVES: &[Drive] = &[
         // at `fixture::CRATE_NAME_ROWS` nodes across sizes.
         name: "GET /tasks?crate=…",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 list(
                     ctx,
+                    db,
                     &QueueSelector {
                         crate_name: Some(
                             "crate123"
@@ -1479,6 +1514,7 @@ pub const DRIVES: &[Drive] = &[
                         ..QueueSelector::default()
                     },
                 )
+                .await
             })
         },
         cleanup: None,
@@ -1488,15 +1524,17 @@ pub const DRIVES: &[Drive] = &[
         // `FixtureShape::LAST_24H_ROWS`.
         name: "GET /tasks?older_than=86400",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 list(
                     ctx,
+                    db,
                     &QueueSelector {
                         older_than_secs: Some(86_400),
                         ..QueueSelector::default()
                     },
                 )
+                .await
             })
         },
         cleanup: None,
@@ -1507,25 +1545,24 @@ pub const DRIVES: &[Drive] = &[
         // listing must return their exact decimal text.
         name: "GET /tasks?task_ids=…",
         setup: None,
-        run: |_db, shape, _settings, ctx| {
+        run: |db, shape, _settings, ctx| {
             Box::pin(async move {
-                let tasks = ctx
-                    .loaded()
-                    .with(|graph| {
-                        graph.list(
-                            &QueueSelector {
-                                task_ids: vec![
-                                    id_of(FixtureShape::pending_row(600)),
-                                    id_of(shape.failed_row(0)),
-                                    id_of(1993),
-                                    id_of(1994),
-                                ],
-                                ..QueueSelector::default()
-                            },
-                            now_ms(),
-                        )
-                    })
-                    .map_err(text)?;
+                let tasks = routes::list_tasks(
+                    ctx.loaded(),
+                    db,
+                    &QueueSelector {
+                        task_ids: vec![
+                            id_of(FixtureShape::pending_row(600)),
+                            id_of(shape.failed_row(0)),
+                            id_of(1993),
+                            id_of(1994),
+                        ],
+                        ..QueueSelector::default()
+                    },
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?;
                 let value_of = |n: u32| {
                     tasks
                         .iter()
@@ -1663,19 +1700,18 @@ pub const DRIVES: &[Drive] = &[
         // live status re-probe against the graph.
         name: "GET /requests/{id}",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
-                ctx.loaded()
-                    .with(|graph| {
-                        queue::crate_request_status(
-                            graph,
-                            stow_types::fixture::REQUEST_FIXTURE_ENQUEUED,
-                            now_ms(),
-                        )
-                    })
-                    .map_err(text)?
-                    .map(|_| ())
-                    .ok_or_else(|| "the fixture request record is missing".to_owned())
+                routes::request_status(
+                    ctx.loaded(),
+                    db,
+                    stow_types::fixture::REQUEST_FIXTURE_ENQUEUED,
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?
+                .map(|_| ())
+                .ok_or_else(|| "the fixture request record is missing".to_owned())
             })
         },
         cleanup: None,
@@ -1716,7 +1752,10 @@ pub const DRIVES: &[Drive] = &[
         // A `Resolved` report on the live record: the trusted merge of
         // its tree, the pre/post status probes and the `enqueued`
         // event — the same merge machinery the submit drives price, at
-        // the request batch's size.
+        // the request batch's size. Its digest rows (stow#1378) are the
+        // submit drives' cost for its two tree nodes (two rows read and
+        // one written each), plus two rows read per root (two roots)
+        // for the post-merge probe's blocked-by ids.
         name: "POST /requests/{id}/outcome",
         setup: None,
         run: |db, shape, settings, ctx| {
@@ -1958,6 +1997,13 @@ pub const DRIVES: &[Drive] = &[
     // One drive per submission entry point (stow#879): the source's
     // priority is what the node's `priority × waited` rank reads, so
     // each lane that sets it is measured through the same submit core.
+    // Every submit writes the digest rows of its fresh nodes' state
+    // slots in the turn that appends its `Submit` parts (stow#1378):
+    // one upsert row per fresh node, a statement per 4,096 rows. F
+    // fresh nodes cost 2F rows read (the `json_each` row and its
+    // source row) and F rows written beyond the log rows at any
+    // population; the sqlite test backend's meter counts only the
+    // written rows.
     Drive {
         name: "POST /tasks/submit (operations)",
         setup: None,
@@ -2016,14 +2062,12 @@ pub const DRIVES: &[Drive] = &[
         }),
     },
     Drive {
-        // The newreleases.io forward's object half (stow#880): on
-        // wasm the real `preheat_release_pass` — credential arm plus
-        // the `workflow_dispatch` POST to the local-CI dispatcher; on
-        // host the arm is a no-op `Ok(())` — no store work runs and
-        // there is nothing to measure.
+        // The release forward checks the shared recovery fence before
+        // its credential arm and workflow dispatch. The fixture is
+        // resident; the separate wake drive prices cold recovery.
         name: "POST /preheat/release",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 #[cfg(target_arch = "wasm32")]
                 {
@@ -2034,6 +2078,7 @@ pub const DRIVES: &[Drive] = &[
                     super::object::preheat_release_pass(
                         &ctx.graph,
                         env,
+                        db,
                         &stow_types::api::PreheatReleaseRequest {
                             rustc_version: "1.90.0".parse().map_err(|error| {
                                 format!("preheat release rustc version: {error}")
@@ -2045,22 +2090,19 @@ pub const DRIVES: &[Drive] = &[
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let _ = ctx;
-                    Ok(())
+                    let _ = db;
+                    routes::require_ci_ready(ctx.loaded(), HOST_NOW_MS).map_err(text)
                 }
             })
         },
         cleanup: None,
     },
     Drive {
-        // The edge Cron Trigger's per-workflow dispatch (stow#1100):
-        // on wasm the real `periodic_dispatch_pass` — credential arm
-        // plus the `workflow_dispatch` POST to the local-CI
-        // dispatcher; on host the arm is a no-op `Ok(())` — no store
-        // work runs and there is nothing to measure.
+        // Periodic dispatch uses the same recovery fence as release
+        // preheat. The separate wake drive prices cold recovery.
         name: "POST /periodic/dispatch",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 #[cfg(target_arch = "wasm32")]
                 {
@@ -2071,6 +2113,7 @@ pub const DRIVES: &[Drive] = &[
                     super::object::periodic_dispatch_pass(
                         &ctx.graph,
                         env,
+                        db,
                         &stow_types::periodic::PeriodicWorkflow {
                             workflow: "watchdog.yml"
                                 .parse()
@@ -2083,8 +2126,8 @@ pub const DRIVES: &[Drive] = &[
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let _ = ctx;
-                    Ok(())
+                    let _ = db;
+                    routes::require_ci_ready(ctx.loaded(), HOST_NOW_MS).map_err(text)
                 }
             })
         },
@@ -2122,6 +2165,11 @@ pub const DRIVES: &[Drive] = &[
         }),
     },
     Drive {
+        // The batch's contributions mint their task ids from digest
+        // rows (stow#1378): one statement, two rows read per touched
+        // task (the list row and the table row; the sqlite test
+        // backend's meter counts only the table row) — the keyed root
+        // and its 11 unmet dependencies.
         name: "POST /demand",
         setup: Some(|_db, _shape, _settings, ctx| {
             Box::pin(async move {
@@ -2223,8 +2271,38 @@ pub const DRIVES: &[Drive] = &[
         // size is held across fixtures; its cost is bounded by the
         // report's own membership. The tail's claims are restored by the
         // cleanup, so the alarm-pass drives still see the planted window.
+        //
+        // stow#1379: the published masks live in a keyed table, so the
+        // report reads the slice's members from it. The setup lands the
+        // same report and snapshots it, which moves the 100 members out
+        // of the overlay into the table; the measured report then pages
+        // them back and drops none.
         name: "POST /index/published (full)",
-        setup: None,
+        setup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                routes::slice_reports(
+                    ctx.loaded(),
+                    db,
+                    &[PublishedSlice {
+                        target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
+                        rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
+                        base_generation: None,
+                        generation: 1,
+                        part: 0,
+                        parts: 1,
+                        added: fixture::full_slice_report(),
+                        retired: Vec::new(),
+                    }],
+                    Some(DRIVE_ACTOR),
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?;
+                routes::snapshot(ctx.loaded(), db, now_ms())
+                    .await
+                    .map_err(text)
+            })
+        }),
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
                 routes::slice_reports(
@@ -2475,12 +2553,26 @@ pub const DRIVES: &[Drive] = &[
         // dispatcher — the HTTP wall the launch gate's peak-wall bound
         // exists to measure — then the wake re-plan. External-run
         // occupancy (stow#877) reconciles at most once per ten minutes
-        // and only while the graph holds work.
+        // and only while the graph holds work. A pass that claims reads
+        // the claimed slots' digest rows (stow#1378): one statement and
+        // two rows read per claim (the list row and the table row) — at
+        // most the dispatch cap — ahead of the `Claims` append; a pass
+        // that claims nothing reads none.
         name: "alarm pass",
         setup: None,
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
+                let (occupied_before, macos_before) = occupied_slots(ctx);
                 let task_ids = pass(db, settings, ctx).await?;
+                let (occupied_after, macos_after) = occupied_slots(ctx);
+                tracing::info!(
+                    occupied_before,
+                    macos_before,
+                    occupied_after,
+                    macos_after,
+                    claimed = task_ids.len(),
+                    "budget dispatch occupancy"
+                );
                 ctx.record_claimed(task_ids);
                 let _plan = routes::wake_plan(ctx.loaded(), settings, now_ms());
                 Ok(())
@@ -2554,7 +2646,7 @@ pub const DRIVES: &[Drive] = &[
         }),
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
-                let (inflight, macos_inflight) = ctx.loaded().with(|graph| graph.inflight());
+                let (inflight, macos_inflight) = occupied_slots(ctx);
                 routes::commit_as(
                     ctx.loaded(),
                     db,
@@ -2771,7 +2863,7 @@ pub const DRIVES: &[Drive] = &[
         }),
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
-                let (inflight, _) = ctx.loaded().with(|graph| graph.inflight());
+                let (inflight, _) = occupied_slots(ctx);
                 let saturated = SchedulerSettings {
                     dispatch: queue::Dispatch::from_max_concurrent_jobs(inflight),
                     ..*settings
@@ -3449,7 +3541,10 @@ pub const DRIVES: &[Drive] = &[
         // The submit lane at its merge: a 1,000-node tree — each node
         // gating on a published pool leaf — appended as its `Submit`
         // parts and merged into the graph. The cost is the log rows of
-        // the tree's bytes, one per ~1 MiB part, plus the merge's CPU.
+        // the tree's bytes, one per ~1 MiB part, plus the merge's CPU
+        // and the digest rows of its fresh slots (stow#1378): one
+        // two rows read and one written per fresh node (1,000), one
+        // statement.
         name: "POST /tasks/submit (1k-node merge)",
         setup: None,
         run: |db, shape, settings, ctx| {
@@ -3484,7 +3579,13 @@ pub const DRIVES: &[Drive] = &[
         // A cold wake: the snapshot's chunks and the log tail replayed
         // into a fresh graph — the only operation that reads the
         // graph's bulk. Bounded by the snapshot chunks plus the
-        // `SNAPSHOT_EVENT_THRESHOLD`-bounded tail.
+        // `SNAPSHOT_EVENT_THRESHOLD`-bounded tail. Rows are billed,
+        // statements are not: the chunks are 64 KiB rows read 16 to a
+        // statement, the tail pages 16 rows to a statement — the
+        // derivation is the drive's budget row in `DO_BUDGETS`. The
+        // published masks are table rows, not chunks (stow#1379): the
+        // replay reads the rows its tail events name, one keyed
+        // statement per event that needs any.
         name: "wake (snapshot + log replay)",
         // An evicted isolate wakes empty: the live graph is dropped
         // first, so the wake never sits beside a second graph.
@@ -3512,7 +3613,12 @@ pub const DRIVES: &[Drive] = &[
         // published-slice report), so the measured run rewrites only
         // the spans the batch dirtied. Each event touches a constant
         // number of chunks, so the snapshot's rows scale with the
-        // events since the last one, never with the stored graph.
+        // events since the last one, never with the stored graph. A
+        // dirty span rewrites its whole range as 64 KiB rows (up to 13
+        // for the widest), upserted 16 to a statement; the derivation
+        // is the drive's budget row in `DO_BUDGETS`. The turn also
+        // writes the published overlay (the batch's slice report) to the
+        // `published` table and clears it (stow#1379).
         name: "snapshot write",
         setup: Some(|db, shape, settings, ctx| {
             Box::pin(async move {

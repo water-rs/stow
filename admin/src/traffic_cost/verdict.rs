@@ -6,9 +6,11 @@
 //!
 //! - any drive over its row budget in any report (statements, rows read,
 //!   rows written — `DO_BUDGETS`);
-//! - a drive whose rows read or written grow with the stored bulk: the
-//!   large fixture's count more than 10% plus 50 rows over the small
-//!   one's;
+//! - an event drive whose rows read or written grow with the stored
+//!   bulk: the large fixture's count past the shared growth tolerance
+//!   over the small one's. The wake and the snapshot write
+//!   (`BULK_DRIVES`) read and store that bulk, so their row budgets
+//!   alone bound them;
 //! - a peak second whose serialized Durable Object wall exceeds half a
 //!   second, priced from the small report and from the post-load report.
 //!
@@ -21,6 +23,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use stow_types::api::SchedulerBudgetReport;
+use stow_types::do_budgets::{BULK_DRIVES, grew};
 use stow_types::launch_model::LaunchModel;
 use stow_types::stow_error;
 
@@ -49,14 +52,6 @@ pub struct VerdictArgs {
 /// Object wall must stay under half a second.
 const PEAK_SERIALIZED_S_PER_S: f64 = 0.5;
 
-/// The growth rule: a drive grows with the stored bulk when its count
-/// on the large fixture exceeds the small one's by more than this
-/// fraction …
-const GROWTH_FRACTION: f64 = 0.1;
-
-/// … plus this many rows.
-const GROWTH_SLACK_ROWS: f64 = 50.0;
-
 /// One drive's counts on both fixture sizes.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GrowthRow {
@@ -70,7 +65,10 @@ pub struct GrowthRow {
     pub written_small: u64,
     /// `rowsWritten` on the large fixture.
     pub written_large: u64,
-    /// Whether either count grows with the stored bulk.
+    /// Whether the drive reads or stores the bulk itself (`BULK_DRIVES`).
+    pub bulk: bool,
+    /// Whether either count of an event drive grows with the stored
+    /// bulk.
     pub grows: bool,
 }
 
@@ -78,6 +76,7 @@ pub struct GrowthRow {
 /// may legitimately be bounded by a held quantity — lane depth, the
 /// 24 h outcome window, in-flight count, the report's own size — and
 /// the fixture pins those across sizes, so only the stored bulk grows.
+/// A bulk drive's counts are listed and never judged here.
 #[expect(clippy::cast_precision_loss, reason = "row counters fit f64 exactly")]
 fn growth(
     small: &SchedulerBudgetReport,
@@ -90,8 +89,7 @@ fn growth(
             small.queue_rows, large.queue_rows
         ));
     }
-    let grows =
-        |a: u64, b: u64| b as f64 > (a as f64).mul_add(1.0 + GROWTH_FRACTION, GROWTH_SLACK_ROWS);
+    let grows = |a: u64, b: u64| grew(a as f64, b as f64);
     let rows: Vec<GrowthRow> = small
         .rows
         .iter()
@@ -101,13 +99,16 @@ fn growth(
                 .iter()
                 .find(|b| b.name == a.name)
                 .ok_or_else(|| format!("the large report carries no row for `{}`", a.name))?;
+            let bulk = BULK_DRIVES.contains(&a.name.as_str());
             Ok(GrowthRow {
                 name: a.name.clone(),
                 read_small: a.rows_read,
                 read_large: b.rows_read,
                 written_small: a.rows_written,
                 written_large: b.rows_written,
-                grows: grows(a.rows_read, b.rows_read) || grows(a.rows_written, b.rows_written),
+                bulk,
+                grows: !bulk
+                    && (grows(a.rows_read, b.rows_read) || grows(a.rows_written, b.rows_written)),
             })
         })
         .collect::<Result<_, String>>()?;
@@ -240,7 +241,12 @@ fn render_verdict(verdict: &Verdict) -> String {
             row.name.clone(),
             format!("{}→{}", row.read_small, row.read_large),
             format!("{}→{}", row.written_small, row.written_large),
-            if row.grows { "GROWS" } else { "" }.to_owned(),
+            match (row.bulk, row.grows) {
+                (true, _) => "bulk",
+                (false, true) => "GROWS",
+                (false, false) => "",
+            }
+            .to_owned(),
         ]);
     }
     let _ = writeln!(
@@ -286,6 +292,8 @@ pub async fn run(args: &VerdictArgs, output: Output) -> stow_types::error::Resul
 
 #[cfg(test)]
 mod tests {
+    use stow_types::do_budgets::BULK_DRIVES;
+
     use super::{growth, judge, render_verdict};
     use crate::traffic_cost::test_support::{fixture_report, model};
 
@@ -330,6 +338,28 @@ mod tests {
             .map(|row| row.name.as_str())
             .collect();
         assert_eq!(rising, ["GET /tasks"]);
+    }
+
+    /// The wake and the snapshot write follow the stored bulk by design:
+    /// the growth check lists them as bulk and never fails on them.
+    #[test]
+    fn bulk_drives_are_listed_and_never_judged() {
+        let small = fixture_report(100_000, |_| 0.5);
+        let mut grown = fixture_report(1_000_000, |_| 0.5);
+        for row in &mut grown.rows {
+            if BULK_DRIVES.contains(&row.name.as_str()) {
+                row.rows_read += 1_000;
+                row.rows_written += 1_000;
+            }
+        }
+        let rows = growth(&small, &grown).expect("growth");
+        let bulk: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.bulk)
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(bulk, BULK_DRIVES);
+        assert!(rows.iter().all(|row| !row.grows));
     }
 
     /// An over-budget row in the post-load report fails the verdict.

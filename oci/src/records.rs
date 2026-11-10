@@ -88,7 +88,7 @@ pub async fn push_records(
 /// # Errors
 ///
 /// Same as [`push_records`].
-pub async fn push_records_with<S, Fut>(
+pub async fn push_records_with<S, Fut, T>(
     session: &RegistrySession,
     rustc_version: &WireRustcVersion,
     task_id: &str,
@@ -98,7 +98,7 @@ pub async fn push_records_with<S, Fut>(
 ) -> stow_types::error::Result<RecordsPublishOutcome>
 where
     S: Fn(String, String) -> Fut + Send + Sync,
-    Fut: Future<Output = stow_types::error::Result<()>> + Send,
+    Fut: Future<Output = stow_types::error::Result<T>> + Send,
 {
     let tag = records_tag(rustc_version.as_str(), task_id, build);
     let reference = session.reference(&tag)?;
@@ -108,13 +108,12 @@ where
     let config_bytes = b"{}".to_vec();
 
     session
-        .push_blob(&layer.sha256_digest(), &layer.data)
+        .push_blob_pair(
+            (&layer.sha256_digest(), &layer.data),
+            (&sha256_digest(&config_bytes), &config_bytes),
+        )
         .await
-        .map_err(|error| stow_types::stow_error!("push records layer {reference}: {error}"))?;
-    session
-        .push_blob(&sha256_digest(&config_bytes), &config_bytes)
-        .await
-        .map_err(|error| stow_types::stow_error!("push records config {reference}: {error}"))?;
+        .map_err(|error| stow_types::stow_error!("push records blobs {reference}: {error}"))?;
     let mut manifest = OciImageManifest::build(
         std::slice::from_ref(&layer),
         &Config::new(config_bytes, RECORDS_CONFIG_MEDIA_TYPE.to_owned(), None),
@@ -130,7 +129,8 @@ where
             sign(reference.to_string(), digest)
         })
         .await
-        .map_err(|error| stow_types::stow_error!("push records manifest {reference}: {error}"))?;
+        .map_err(|error| stow_types::stow_error!("push records manifest {reference}: {error}"))?
+        .digest;
     // The `built-<rustc>-<task_id hash>` marker points at the same
     // manifest (stow#877): a run checking whether the task's signed
     // records already exist fetches one tag — no re-sign needed, the
@@ -236,8 +236,7 @@ pub async fn pull_records_by_tag(
 }
 
 /// Every `records-*` tag in the session's repository — the export's
-/// catalog listing. Pagination is the distribution spec's `n`/`last`
-/// continuation.
+/// catalog listing, selected from the repository's full tag listing.
 ///
 /// # Errors
 ///

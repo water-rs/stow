@@ -1064,6 +1064,10 @@ mod tests {
             classify_page(&jobs, "success", at(1_000)).expect("classified"),
             TaskOutcome::Succeeded
         );
+        assert_eq!(
+            classify_page(&[], "success", at(1_000)).expect("conclusion needs no jobs page"),
+            TaskOutcome::Succeeded
+        );
     }
 
     /// A cancelled run's task was never attempted — the report does

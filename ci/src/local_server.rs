@@ -30,6 +30,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_net::TcpListener;
 use executor_core::tokio::TokioGlobal;
@@ -48,9 +49,10 @@ use stow_types::local_ci::{
     LocalCiSeededStatus,
 };
 use stow_types::runs::VERDICT_STEPS;
-use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 use zenwave::{Client, ResponseExt};
+
+use crate::runners::{Runner, RunnerPool};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -117,7 +119,9 @@ pub struct LocalServerState {
     /// it, but at most one build or publish per core executes: on Actions
     /// every job has a machine of its own, here they all share one with
     /// the edge under test, and an unbounded wave of builds starves it.
-    runners: Arc<Semaphore>,
+    /// Each runner owns its cargo home, as an Actions runner does, so
+    /// concurrent tasks never queue on one package-cache lock.
+    runners: RunnerPool,
     /// The bound listen address, filled by `serve` — the `html_url` a
     /// mock run reports.
     pub listen: SocketAddr,
@@ -142,6 +146,7 @@ impl LocalServerState {
         mock_private_key_path: String,
         mock_registry_root: String,
         app_slug: String,
+        runners: RunnerPool,
     ) -> Self {
         Self {
             edge_url,
@@ -157,11 +162,7 @@ impl LocalServerState {
             task_payloads: Arc::new(Mutex::new(BTreeMap::new())),
             periodic: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(AtomicU64::new(1)),
-            runners: Arc::new(Semaphore::new(
-                std::thread::available_parallelism()
-                    .expect("read the machine's available parallelism")
-                    .get(),
-            )),
+            runners,
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         }
     }
@@ -1525,6 +1526,19 @@ struct TaskRun {
     exe: PathBuf,
 }
 
+impl TaskRun {
+    fn log_stage(&self, stage: &str, started: Instant, succeeded: bool) {
+        tracing::info!(
+            task_id = %self.task.task_id,
+            run_id = self.workflow_run_id,
+            stage,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            succeeded,
+            "local CI stage timing"
+        );
+    }
+}
+
 /// Filesystem layout of the task's working directory: the workspace the
 /// build stage unpacks into, the output directory it writes to, and the
 /// files the two stages exchange.
@@ -1654,7 +1668,10 @@ async fn drive_stages(run: &TaskRun) -> Result<(), String> {
     };
 
     let publish_job = state.begin_job(workflow_run_id, publish_job_name(), PUBLISH_JOB_STEPS);
-    match publish_stage(run, &layout).await {
+    let started = Instant::now();
+    let publication = publish_stage(run, &layout).await;
+    run.log_stage("publish", started, publication.is_ok());
+    match publication {
         Ok(()) => {
             state.finish_job(workflow_run_id, publish_job, "success", &["success"]);
             state.set_task(workflow_run_id, "completed", Some("success"), None);
@@ -1675,16 +1692,20 @@ async fn build_stage(run: &TaskRun) -> stow_types::error::Result<TaskLayout> {
     if run.stub {
         return Ok(layout);
     }
-    let _runner = run
-        .state
-        .runners
-        .acquire()
-        .await
-        .expect("the runner pool is never closed");
+    let waiting = Instant::now();
+    let runner = run.state.runners.acquire().await;
+    run.log_stage("build-runner-wait", waiting, true);
     run.state.mark_built(run.workflow_run_id);
     // The child is the untrusted build stage: it gets the event file and
     // nothing else, exactly as the production build job does.
-    let status = run_build_stage(run, &layout).await?;
+    let started = Instant::now();
+    let result = run_build_stage(run, &runner, &layout).await;
+    run.log_stage(
+        "build",
+        started,
+        result.as_ref().is_ok_and(std::process::ExitStatus::success),
+    );
+    let status = result?;
     if !status.success() {
         return Err(stow_types::stow_error!(
             "stow-build exited with status {status}: {}",
@@ -1708,9 +1729,12 @@ async fn verify_failure_stage(run: &TaskRun) -> stow_types::error::Result<()> {
         stow_types::build_failure::VERIFICATION_JOB_NAME.to_owned(),
         &["Replay without cached artifacts"],
     );
+    let waiting = Instant::now();
     let replay = async {
-        let _runner = run.state.runners.acquire().await.expect("runner pool open");
-        untrusted_command(run)
+        let runner = run.state.runners.acquire().await;
+        run.log_stage("failure-replay-runner-wait", waiting, true);
+        let started = Instant::now();
+        let result = untrusted_command(run, &runner)
             .arg("verify-failure")
             .arg("--input-dir")
             .arg(&layout.output_dir)
@@ -1722,7 +1746,13 @@ async fn verify_failure_stage(run: &TaskRun) -> stow_types::error::Result<()> {
             )
             .stderr(std::fs::File::create(layout.root.join("replay.log"))?)
             .status()
-            .await
+            .await;
+        run.log_stage(
+            "failure-replay",
+            started,
+            result.as_ref().is_ok_and(std::process::ExitStatus::success),
+        );
+        result
     }
     .await;
     let conclusion = if replay.as_ref().is_ok_and(std::process::ExitStatus::success) {
@@ -1745,21 +1775,22 @@ async fn verify_failure_stage(run: &TaskRun) -> stow_types::error::Result<()> {
 async fn publish_stage(run: &TaskRun, layout: &TaskLayout) -> stow_types::error::Result<()> {
     let task = &run.task;
     if !run.stub {
-        let _runner = run
-            .state
-            .runners
-            .acquire()
-            .await
-            .expect("the runner pool is never closed");
+        let waiting = Instant::now();
+        let runner = run.state.runners.acquire().await;
+        run.log_stage("publish-runner-wait", waiting, true);
         // The task is read back from the event file, as `stow-build
         // publish` reads it, and validated exactly as it validates it:
         // the mock registry below stands in for GHCR and the signer, not for
         // the validation that gates them.
         let event = async_fs::read(&run.event_path).await?;
         let dispatched = crate::task_from_event(&event, &run.event_path)?;
-        let output = crate::validated_build_output(&dispatched, &layout.output_dir)
-            .await
-            .map_err(|error| error.wrap_err("publish-stage validation"))?;
+        let started = Instant::now();
+        let result =
+            crate::validated_build_output(&dispatched, &layout.output_dir, runner.cargo_home())
+                .await
+                .map_err(|error| error.wrap_err("publish-stage validation"));
+        run.log_stage("publish-validation", started, result.is_ok());
+        let output = result?;
         // `stow-build build` exits non-zero when any cargo phase failed —
         // the outcome is binary: a build that reached here ran to
         // completion and whatever it plans is the whole closure. An
@@ -1811,9 +1842,10 @@ async fn stage_error(build_log_path: &Path) -> String {
 /// production build job.
 async fn run_build_stage(
     run: &TaskRun,
+    runner: &Runner,
     layout: &TaskLayout,
 ) -> stow_types::error::Result<std::process::ExitStatus> {
-    Ok(untrusted_command(run)
+    Ok(untrusted_command(run, runner)
         .arg("build")
         .arg("--output-dir")
         .arg(&layout.output_dir)
@@ -1823,7 +1855,7 @@ async fn run_build_stage(
         .await?)
 }
 
-fn untrusted_command(run: &TaskRun) -> async_process::Command {
+fn untrusted_command(run: &TaskRun, runner: &Runner) -> async_process::Command {
     let mut command = async_process::Command::new(&run.exe);
     for name in [
         "SCHEDULER_URL",
@@ -1839,6 +1871,7 @@ fn untrusted_command(run: &TaskRun) -> async_process::Command {
         command.env_remove(name);
     }
     command
+        .env("CARGO_HOME", runner.cargo_home())
         .env("GITHUB_EVENT_PATH", &run.event_path)
         .env("GITHUB_RUN_ID", run.workflow_run_id.to_string())
         .env("GITHUB_RUN_ATTEMPT", RUN_ATTEMPT.to_string());
@@ -2140,6 +2173,7 @@ mod tests {
         TaskRun, WorkflowRunReport, attempt_jobs_page, build_job_name, cancel_response,
         dispatch_response, drive_stages, publish_job_name, run_response,
     };
+    use super::{PathBuf, Runner, RunnerPool};
 
     fn state() -> LocalServerState {
         LocalServerState::new(
@@ -2148,6 +2182,17 @@ mod tests {
             String::new(),
             String::new(),
             "mock-stow-ci".to_owned(),
+            // Runner directories are never created: these tests run stubbed
+            // stages or fake executables that read no cargo home.
+            RunnerPool::new(
+                (0..4)
+                    .map(|index| {
+                        Runner::new(PathBuf::from(format!(
+                            "/nonexistent/stow-test-runner/{index}/cargo-home"
+                        )))
+                    })
+                    .collect(),
+            ),
         )
     }
 

@@ -84,6 +84,22 @@ LANES_DIR="$WORK_DIR/lanes"
 RESOLVE_ROOT="${STOW_RESOLVE_CARGO_HOME:-$WORK_DIR/resolve-cargo}"
 mkdir -p "$LOG_DIR" "$LANES_DIR" "$RESOLVE_ROOT"
 
+# Console output remains available when a full filesystem cannot accept a
+# diagnostic artifact. Keep each scan bounded; a failed scan must not replace
+# the resolver's exit status.
+disk_usage() {
+    local phase="$1" status=0
+    echo "[production-wave] disk usage: $phase"
+    timeout --kill-after=5 30 df -B1 "$RESOLVE_ROOT" "${TMPDIR:-/tmp}" || status=$?
+    echo "[production-wave] filesystem scan exited $status"
+    status=0
+    timeout --kill-after=5 30 du -x -B1 --max-depth=4 "$RESOLVE_ROOT" || status=$?
+    echo "[production-wave] resolver directory scan exited $status"
+    status=0
+    timeout --kill-after=5 30 du -x -B1 --max-depth=1 "${TMPDIR:-/tmp}" || status=$?
+    echo "[production-wave] source scratch scan exited $status"
+}
+
 LANE_PIDS=()
 
 die() {
@@ -122,6 +138,7 @@ cleanup() {
         kill "${victims[@]}" 2>/dev/null || true
         kill -9 "${victims[@]}" 2>/dev/null || true
     fi
+    disk_usage "exit-$status"
     log "logs: $LOG_DIR; lanes: $LANES_DIR"
     exit "$status"
 }
@@ -136,6 +153,13 @@ require_command rustc
 require_command rustup
 require_command timeout
 require_command yq
+require_command python3
+
+disk_usage before-materialize
+# Native cache restoration preserves packed hardlinks. Mutable Cargo
+# files must be independently writable before any worker is started.
+python3 "$REPO_ROOT/scripts/compact-resolver-cache.py" materialize "$RESOLVE_ROOT"
+disk_usage after-materialize
 
 # The production wave is the one preheat-admin.yml runs, so its defaults
 # come from that file rather than a copy here. preheat-cron.yml

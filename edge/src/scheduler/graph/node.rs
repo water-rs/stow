@@ -1,13 +1,17 @@
-//! The graph's fixed-size records (stow#878). A node is one 68-byte
-//! record in an arena; the fields only an unpublished node needs ride
-//! a 48-byte [`State`] slab entry that is freed when the node
-//! publishes, and the rare ones (a bound run, a backoff, an error)
-//! ride [`Extra`] side-table entries.
+//! The graph's fixed-size records (stow#878). A node is one 48-byte
+//! record in an arena, identified by the 16-byte hash of its task id;
+//! the fields only an unpublished node needs ride a 24-byte [`State`]
+//! slab entry that is freed when the node publishes, and the rare ones
+//! (a bound run, a backoff, an error, a retry count) ride [`Extra`]
+//! side-table entries. The dependency digest a task id spells is not in
+//! memory at all: it lives in the `node_digests` rows, by state slot.
 
 use serde::{Deserialize, Serialize};
 use stow_types::api::SubmissionSource;
 use stow_types::node_profile::NodeProfile;
 
+use super::IdKey;
+use super::index::PriorityId;
 use crate::errors::QueueError;
 
 /// Queue status — the graph's lifecycle states. `Published` is a node
@@ -186,19 +190,17 @@ impl Flags {
 pub(super) const NO_STATE: u32 = u32::MAX;
 
 /// One graph node: its identity, interned, and the counters the gate
-/// reads. 68 bytes.
+/// reads. 48 bytes.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Node {
-    /// The node's dependency digest, the 32 bytes its task id spells
-    /// as 64 hex digits.
-    pub(super) digest: [u8; 32],
+    /// The first 16 bytes of the BLAKE3 hash of the task id — the
+    /// node's identity, the published map's key, and (its first four
+    /// bytes) the probe key of the id index. The id string itself is
+    /// minted on demand from the interned fields and the digest row.
+    pub(super) key: IdKey,
     pub(super) crate_name: u32,
     pub(super) version: u32,
     pub(super) features: u32,
-    /// The first four bytes of the BLAKE3 hash of the task id — the
-    /// probe key of the id index. The id string itself is re-minted
-    /// on demand.
-    pub(super) id_tag: u32,
     /// Index into the state slab, [`NO_STATE`] once published.
     pub(super) state: u32,
     /// First forward edge in the edge arrays.
@@ -215,18 +217,54 @@ pub(super) struct Node {
     pub(super) flags: Flags,
 }
 
-/// The queue state of an unpublished node. 48 bytes.
+/// The queue state of an unpublished node. 24 bytes.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct State {
     pub(super) first_requested: i64,
-    /// The last state transition (unix ms) — the admin listing's
-    /// `updated_at` and the purge age floor.
-    pub(super) updated: i64,
-    pub(super) priority: i64,
-    pub(super) demand: i64,
+    /// Changes with every daily resubmission, so it stays in memory.
     pub(super) downloads: u64,
-    pub(super) attempt: u8,
-    pub(super) dispatch_attempts: u16,
+    /// The last state transition (unix seconds) — the admin listing's
+    /// `updated_at` and the purge age floor.
+    pub(super) updated: u32,
+    pub(super) priority: PriorityId,
+}
+
+const _: () = assert!(size_of::<Node>() == 48, "a node record is 48 bytes");
+const _: () = assert!(size_of::<State>() == 24, "a queue state is 24 bytes");
+
+impl State {
+    /// A state last transitioned at `now_ms`.
+    pub(super) fn new(
+        first_requested: i64,
+        now_ms: i64,
+        priority: PriorityId,
+        downloads: u64,
+    ) -> Self {
+        Self {
+            first_requested,
+            downloads,
+            updated: seconds_of(now_ms),
+            priority,
+        }
+    }
+
+    /// The last transition as unix milliseconds, at second resolution.
+    pub(super) fn updated_ms(&self) -> i64 {
+        i64::from(self.updated) * 1000
+    }
+
+    /// Stamp a transition at `now_ms`.
+    pub(super) fn touch(&mut self, now_ms: i64) {
+        self.updated = seconds_of(now_ms);
+    }
+}
+
+/// Unix seconds of a unix-ms instant.
+///
+/// # Panics
+/// Past the year 2106, where the 32-bit stamp ends, or before 1970.
+fn seconds_of(ms: i64) -> u32 {
+    u32::try_from(ms.div_euclid(1000)).expect("a transition instant is unix seconds below 2^32")
 }
 
 /// A verified completion that beat its dispatch response — parked on
@@ -241,12 +279,20 @@ pub struct RunCompletion {
     pub error: Option<String>,
 }
 
+/// A node's attempt before any run counted against it.
+pub(super) const FIRST_ATTEMPT: u8 = 1;
+
 /// The fields few nodes carry: a claim's generation and bound run, its
 /// claim and lease-renewal stamps, a retry backoff, the last error, a
-/// parked completion. A node has an entry only while one of them is
-/// set.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// parked completion, and the attempt counters only a dispatched node
+/// moves off their defaults. A node has an entry only while one of
+/// them is set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct Extra {
+    /// The build attempt cycle; [`FIRST_ATTEMPT`] unless a run failed.
+    pub(super) attempt: u8,
+    /// Dispatches claimed for the node; zero until its first claim.
+    pub(super) dispatch_attempts: u16,
     pub(super) generation: u64,
     pub(super) run_id: u64,
     pub(super) claimed_at: i64,
@@ -258,13 +304,33 @@ pub(super) struct Extra {
     pub(super) lease_at: i64,
     pub(super) not_before: i64,
     pub(super) error: Option<Box<str>>,
-    pub(super) parked: Option<RunCompletion>,
+    /// Only a completion racing its dispatch binding owns this payload.
+    /// Keep absent payloads out of every other side-table entry.
+    pub(super) parked: Option<Box<RunCompletion>>,
+}
+
+impl Default for Extra {
+    fn default() -> Self {
+        Self {
+            attempt: FIRST_ATTEMPT,
+            dispatch_attempts: 0,
+            generation: 0,
+            run_id: 0,
+            claimed_at: 0,
+            lease_at: 0,
+            not_before: 0,
+            error: None,
+            parked: None,
+        }
+    }
 }
 
 impl Extra {
-    /// Whether no field is set — the entry can go.
+    /// Whether no field is off its default — the entry can go.
     pub(super) const fn is_blank(&self) -> bool {
-        self.generation == 0
+        self.attempt == FIRST_ATTEMPT
+            && self.dispatch_attempts == 0
+            && self.generation == 0
             && self.run_id == 0
             && self.claimed_at == 0
             && self.lease_at == 0

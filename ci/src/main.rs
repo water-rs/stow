@@ -35,6 +35,7 @@ mod object_arch;
 mod plan;
 mod repack;
 mod rlib_members;
+mod runners;
 mod stage;
 mod task;
 mod validate;
@@ -417,7 +418,7 @@ async fn publish(
         );
         return Ok(0);
     }
-    let output = validated_build_output(task, input_dir).await?;
+    let output = validated_build_output(task, input_dir, &task::cargo_home()?).await?;
     let upload_outcome =
         stow_oci::push_artifacts(&output.plan, &task.rustc_version, &publisher).await?;
     let artifact_records = stow_types::upload_plan::build_artifact_records(
@@ -461,13 +462,16 @@ async fn publish(
 /// each consumption claim verified against the signed index. `publish`
 /// runs it before pushing to GHCR; the local CI runs the same function
 /// before writing the mock registry, so a mock build lands only what
-/// production would have accepted.
+/// production would have accepted. `cargo_home` is the cargo home the
+/// closure resolves in: the job's own for `publish`, the runner's for the
+/// local CI.
 async fn validated_build_output(
     task: &BuildTaskPayload,
     input_dir: &std::path::Path,
+    cargo_home: &std::path::Path,
 ) -> stow_types::error::Result<stage::BuildOutput> {
     let output = stage::read_build_output(input_dir).await?;
-    let closure = closure::resolve(task).await?;
+    let closure = closure::resolve(task, cargo_home).await?;
     // Every cache-consumption claim is only as good as the signed index
     // vouching for it — the publisher pulls the slices itself rather than
     // trusting the untrusted job's copy. No claims means the old failure
@@ -553,12 +557,23 @@ fn measure_glibc_floors(
 }
 
 async fn serve_stage(listen: std::net::SocketAddr) -> stow_types::error::Result<()> {
+    // One runner per core, each with a cargo home of its own beside the
+    // dispatch directories the server keeps its state in.
+    let runners = runners::RunnerPool::create(
+        &std::env::current_dir()?.join(".tmp").join("runners"),
+        std::thread::available_parallelism()
+            .map_err(|error| {
+                stow_types::stow_error!("read the machine's available parallelism: {error}")
+            })?
+            .get(),
+    )?;
     let state = local_server::LocalServerState::new(
         env_required(STOW_EDGE_URL_ENV)?,
         env_required(STOW_GITHUB_WEBHOOK_SECRET_ENV)?,
         env_required(STOW_MOCK_PRIVATE_KEY_PATH_ENV)?,
         env_required(STOW_MOCK_REGISTRY_ROOT_ENV)?,
         env_required(GITHUB_APP_SLUG_ENV)?,
+        runners,
     );
     local_server::serve(listen, state).await
 }

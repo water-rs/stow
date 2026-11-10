@@ -66,9 +66,17 @@ pub(super) fn fixture_cpu(scale: impl Fn(&str) -> f64) -> WorkerCpuReport {
         sampling_interval_us: 100,
         idle_window_ms: 3000,
         idle_cpu_ms: 0.0,
+        profiles: Vec::new(),
+        scripts: Vec::new(),
         reference: ReferenceCpu {
-            rounds_before: vec![FIXTURE_REFERENCE_CPU_MS],
-            rounds_after: vec![FIXTURE_REFERENCE_CPU_MS],
+            rounds_before: vec![super::ReferenceRound {
+                invocations: std::num::NonZeroU32::new(1).expect("one"),
+                sampled_cpu_ms: FIXTURE_REFERENCE_CPU_MS,
+            }],
+            rounds_after: vec![super::ReferenceRound {
+                invocations: std::num::NonZeroU32::new(1).expect("one"),
+                sampled_cpu_ms: FIXTURE_REFERENCE_CPU_MS,
+            }],
             cpu_ms: FIXTURE_REFERENCE_CPU_MS,
         },
         rows: WORKER_CPU_BUDGETS

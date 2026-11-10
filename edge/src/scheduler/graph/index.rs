@@ -17,8 +17,7 @@ pub(super) fn hash_of<T: Hash + ?Sized>(value: &T) -> u64 {
 
 /// An open-addressing multimap from a hash to `u32` ids: linear
 /// probing over a power-of-two slot array kept under 70% full. It
-/// never deletes — a stale id is skipped by its caller and a rebuild
-/// drops it — so a probe ends at the first free slot.
+/// closes deleted probe-chain holes, so a probe ends at the first free slot.
 #[derive(Debug, Default)]
 pub(super) struct IxTable {
     slots: Vec<u32>,
@@ -26,13 +25,12 @@ pub(super) struct IxTable {
 }
 
 impl IxTable {
-    /// A table sized so `entries` ids insert without growing.
-    pub(super) fn with_entries(entries: usize) -> Self {
+    /// Clear the table and reuse its buffer for `entries` ids.
+    pub(super) fn clear_for(&mut self, entries: usize) {
         let wanted = (entries * 10 / 7 + 1).next_power_of_two().max(16);
-        Self {
-            slots: vec![EMPTY; wanted],
-            used: 0,
-        }
+        self.slots.resize(wanted, EMPTY);
+        self.slots.fill(EMPTY);
+        self.used = 0;
     }
 
     /// The ids sharing `hash`'s probe run, in slot order. A caller
@@ -70,7 +68,6 @@ impl IxTable {
     }
 
     /// Heap bytes the slot array holds.
-    #[cfg(test)]
     pub(super) const fn heap_bytes(&self) -> usize {
         self.slots.len() * size_of::<u32>()
     }
@@ -99,6 +96,48 @@ impl Iterator for Candidates<'_> {
         }
         self.at = (self.at + 1) & (self.slots.len() - 1);
         Some(id)
+    }
+}
+
+/// A priority value owned by one graph's priority pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PriorityId(u32);
+
+/// Exact source/operator priorities shared by states in the same rank class.
+#[derive(Debug, Default)]
+pub(super) struct Priorities {
+    values: Vec<i64>,
+    table: IxTable,
+}
+
+impl Priorities {
+    pub(super) const fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub(super) fn at(&self, id: PriorityId) -> i64 {
+        self.values[id.0 as usize]
+    }
+
+    pub(super) fn intern(&mut self, value: i64) -> PriorityId {
+        let hash = hash_of(&value);
+        if let Some(id) = self
+            .table
+            .candidates(hash)
+            .find(|&id| self.values[id as usize] == value)
+        {
+            return PriorityId(id);
+        }
+        let id =
+            u32::try_from(self.values.len()).expect("priority pool holds fewer than 2^32 values");
+        self.values.push(value);
+        let Self { values, table } = self;
+        table.insert(hash, id, |held| hash_of(&values[held as usize]));
+        PriorityId(id)
+    }
+
+    pub(super) const fn heap_bytes(&self) -> usize {
+        self.values.capacity() * size_of::<i64>() + self.table.heap_bytes()
     }
 }
 
@@ -165,7 +204,7 @@ impl Interner {
 
     /// Build the lookup table over the loaded strings.
     pub(super) fn index(&mut self) {
-        self.table = IxTable::with_entries(self.ends.len());
+        self.table.clear_for(self.ends.len());
         let Self { text, ends, table } = self;
         for id in 0..ends.len() {
             let id = u32::try_from(id).expect("interner ids fit u32");
@@ -176,7 +215,6 @@ impl Interner {
     }
 
     /// Heap bytes held: text, offsets and table.
-    #[cfg(test)]
     pub(super) const fn heap_bytes(&self) -> usize {
         self.text.capacity() + self.ends.capacity() * size_of::<u32>() + self.table.heap_bytes()
     }
@@ -188,4 +226,68 @@ fn slice<'a>(text: &'a str, ends: &[u32], id: u32) -> &'a str {
         .checked_sub(1)
         .map_or(0, |prev| ends[prev as usize] as usize);
     &text[start..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Interner, IxTable, Priorities};
+
+    #[test]
+    fn priority_indexes_survive_growth_and_reuse_exact_values() {
+        let mut pool = Priorities::default();
+        let values = [i64::MIN, i64::MAX, -1, 0, 1];
+        let ids: Vec<_> = values.iter().map(|&value| pool.intern(value)).collect();
+        for value in 2..1024 {
+            pool.intern(value);
+        }
+        let count = pool.values.len();
+        for (&value, &id) in values.iter().zip(&ids) {
+            assert_eq!(pool.intern(value), id);
+            assert_eq!(pool.at(id), value);
+        }
+        assert_eq!(pool.values.len(), count);
+    }
+
+    #[test]
+    fn repeated_index_rebuilds_discard_old_ids_and_preserve_collisions() {
+        let mut table = IxTable::default();
+        for count in [0u32, 128, 7, 7, 256, 0, 19] {
+            let previous = table.slots.as_ptr();
+            let capacity = table.slots.capacity();
+            table.clear_for(count as usize);
+            if table.slots.len() <= capacity {
+                assert_eq!(table.slots.as_ptr(), previous);
+            }
+            // Many identities share each probe hash; rebuilding must both
+            // retain every collision and remove the preceding population.
+            let hash = |id: u32| u64::from(id % 3);
+            for id in 0..count {
+                table.insert(hash(id), id, hash);
+            }
+            for key in 0..3 {
+                let mut actual: Vec<_> = table
+                    .candidates(key)
+                    .filter(|&id| hash(id) == key)
+                    .collect();
+                actual.sort_unstable();
+                let expected: Vec<_> = (0..count).filter(|&id| hash(id) == key).collect();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn interner_reindex_preserves_loaded_and_new_strings() {
+        let mut intern = Interner::default();
+        for value in ["serde", "1.0.229", "derive", "std"] {
+            intern.load(value);
+        }
+        for value in ["alloc", "serde", "derive"] {
+            intern.index();
+            intern.intern(value);
+            for (id, held) in intern.iter_from(0).enumerate() {
+                assert_eq!(intern.get(held), Some(u32::try_from(id).unwrap()));
+            }
+        }
+    }
 }

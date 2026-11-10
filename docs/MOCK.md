@@ -56,7 +56,12 @@ without overloading the scheduler. In one stack start it:
 1. seeds the fixture at 20k and then 10k queue rows and runs every
    scheduler drive (`edge/src/scheduler/drives.rs`) through the Durable
    Object's budget probe, reading workerd's billed `rowsRead` and
-   `rowsWritten`;
+   `rowsWritten`. After the 1M-row population pass it restarts the
+   edge over the persisted store, wakes the scheduler with a status
+   read and judges V8's traced collections and the wake's Wasm linear
+   memory (`stow-admin traffic-cost restart`): the JavaScript heap in
+   use stays within 24 MiB of an empty scheduler's, and linear memory
+   exceeds the graph storage the wake accounts for by at most 10 MiB;
 2. measures Worker CPU per traffic lane with the isolate's V8 CPU
    profiler, reached through `wrangler dev --inspector-port`
    (`stow-admin traffic-cost cpu`), and gates each lane on its CPU
@@ -162,10 +167,16 @@ multiplies by the production count: one wave per stable rustc release
 (`[cadence]` in `launch-model.toml`, counted from Rust's release
 history by `stow-admin launch-model export`) plus one resubmit per day,
 added to each product's traffic before comparing with its allowance:
-90% for Durable Object requests and 80% for every other dimension. `stow-admin traffic-cost project` takes the report as
-`--preheat` and the count as `--production`. Only the scheduler Durable
-Object's billed calls and rows are measured; the table marks every
-other dimension `n/m` and prices it from traffic alone.
+90% for Durable Object requests and 80% for Worker requests, Worker CPU
+and Durable Object rows. `stow-admin traffic-cost project` takes the
+report as `--preheat` and the count as `--production`.
+
+Durable Object duration is not modelled. Cloudflare bills 128 MB per
+object for every second it is active, so the scheduler, the only
+Durable Object, bills at most 0.128 GB-s for each second of a 31-day
+month: 342,835.2 GB-s. The table reports that ceiling as the duration usage and judges it
+against the full 400,000 GB-s allowance; the 80% line is held at run
+time by the watchdog signal `cf.do.duration_gb_s`.
 
 ## Prerequisites
 
@@ -173,7 +184,7 @@ other dimension `n/m` and prices it from traffic alone.
 brew install hyperfine sqlite3
 npm i -g wrangler@4    # or use the version pinned in skyzen/cli
 cargo install wasm-bindgen-cli --version 0.2.120  # match Cargo.lock
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/zen-rs/skyzen/releases/download/skyzen-cli-v0.4.2/skyzen-cli-installer.sh | sh  # provides `skyzen dev`/`deploy`/`provision`/`secret`
+cargo install skyzen-cli --version 0.4.2  # provides `skyzen dev`/`deploy`/`provision`/`secret`
 ```
 
 You also need a sigstore-loadable PEM key pair. ECDSA P256 in PKCS#8

@@ -30,7 +30,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use skyzen_services::durable::DurableDb;
-use stow_types::do_budgets::{DO_BUDGETS, DriveBudget, grew};
+use stow_types::do_budgets::{BULK_DRIVES, DO_BUDGETS, DriveBudget, grew};
 
 use super::drives::{self, DriveContext};
 use super::fixture::{self, FixtureShape};
@@ -38,10 +38,19 @@ use super::graph::{GraphCell, LoadedGraph};
 use super::queue::SchedulerSettings;
 use super::test_db::{LoggedStatement, counting_memory_db};
 
-/// The two drives whose job is the graph's bulk: the wake reads the
-/// snapshot, the snapshot writes it. Every other drive is an event and
-/// costs the same at any size.
-const BULK_DRIVES: &[&str] = &["wake (snapshot + log replay)", "snapshot write"];
+/// The listings that mint a task id per row they return: each reads one
+/// digest row per listed row, so its cost follows the matching rows
+/// until `ADMIN_LIST_LIMIT` caps them — and never grows past its budget,
+/// which states that cap.
+const LISTING_DRIVES: &[&str] = &[
+    "GET /tasks",
+    "GET /tasks?status=failed",
+    "GET /tasks?status=pending",
+    "GET /tasks?status=blocked",
+    "GET /tasks?target=…",
+    "GET /tasks?crate=…",
+    "GET /tasks?older_than=86400",
+];
 
 /// One measured drive run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,9 +250,15 @@ async fn measure_all(shape: FixtureShape) -> Vec<Measured> {
     let (db, log) = counting_memory_db().await.expect("counting db");
     let cell = GraphCell::default();
     let seed_base = log.lock().expect("log").len();
-    fixture::seed(&db, &cell, shape, drives::HOST_NOW_MS)
-        .await
-        .expect("seed fixture");
+    fixture::seed(
+        &db,
+        &cell,
+        shape,
+        &SchedulerSettings::default(),
+        drives::HOST_NOW_MS,
+    )
+    .await
+    .expect("seed fixture");
     // The fixture obeys the gate too: it is seeded with DML only.
     for statement in &log.lock().expect("log")[seed_base..] {
         assert!(
@@ -292,15 +307,65 @@ async fn per_request_cost_gate() {
     }
 }
 
+#[tokio::test]
+async fn capacity_drives_include_external_occupancy() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let cell = GraphCell::default();
+    fixture::seed(
+        &db,
+        &cell,
+        fixture::GATE,
+        &SchedulerSettings::default(),
+        drives::HOST_NOW_MS,
+    )
+    .await
+    .expect("seed fixture");
+    let ctx = DriveContext::host(cell);
+    super::routes::task_run_update(
+        ctx.loaded(),
+        &db,
+        &stow_types::api::TaskRunUpdate {
+            task_id: stow_types::fixture::named_task_id(
+                "external-capacity",
+                1,
+                "x86_64-unknown-linux-gnu",
+            ),
+            github_run_id: "9000200000".to_owned(),
+        },
+        drives::HOST_NOW_MS,
+    )
+    .await
+    .expect("external run");
+    assert_eq!(ctx.loaded().with(|graph| graph.external_total()), 1);
+    for name in ["POST /dispatch-cap", "alarm pass (stale recovery)"] {
+        let drive = drives::DRIVES
+            .iter()
+            .find(|drive| drive.name == name)
+            .unwrap();
+        run_one_drive(
+            &db,
+            fixture::GATE,
+            &SchedulerSettings::default(),
+            &ctx,
+            &log,
+            drive,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(ctx.loaded().with(|graph| graph.external_total()), 1);
+    }
+}
+
 /// Event drives cost the same at any fixture size: two sizes, and no
-/// drive but the bulk ones may grow past the shared growth tolerance.
+/// drive but the bulk ones and the capped listings may grow past the
+/// shared growth tolerance.
 #[tokio::test]
 async fn event_drives_are_flat_across_fixture_sizes() {
     let small = measure_all(FixtureShape { queue_rows: 5_000 }).await;
     let large = measure_all(fixture::GATE).await;
     for (small, large) in small.iter().zip(&large) {
         assert_eq!(small.name, large.name);
-        if BULK_DRIVES.contains(&small.name) {
+        if BULK_DRIVES.contains(&small.name) || LISTING_DRIVES.contains(&small.name) {
             continue;
         }
         #[expect(
@@ -331,9 +396,15 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     let shape = fixture::GATE;
     let mut runs = Vec::new();
     for _ in 0..2 {
-        fixture::seed(&db, &cell, shape, drives::HOST_NOW_MS)
-            .await
-            .expect("seed fixture");
+        fixture::seed(
+            &db,
+            &cell,
+            shape,
+            &SchedulerSettings::default(),
+            drives::HOST_NOW_MS,
+        )
+        .await
+        .expect("seed fixture");
         let ctx = DriveContext::host(cell.clone());
         let mut measured = Vec::new();
         for drive in drives::DRIVES {
@@ -393,9 +464,15 @@ fn injected_cleanup_failure<'a>(
 async fn cleanup_still_runs_after_a_failing_drive() {
     let (db, log) = counting_memory_db().await.expect("counting db");
     let cell = GraphCell::default();
-    fixture::seed(&db, &cell, fixture::GATE, drives::HOST_NOW_MS)
-        .await
-        .expect("seed fixture");
+    fixture::seed(
+        &db,
+        &cell,
+        fixture::GATE,
+        &SchedulerSettings::default(),
+        drives::HOST_NOW_MS,
+    )
+    .await
+    .expect("seed fixture");
     let ctx = DriveContext::host(cell);
     let settings = SchedulerSettings::default();
     let drive = drives::Drive {
@@ -431,17 +508,22 @@ async fn cleanup_still_runs_after_a_failing_drive() {
     );
 }
 
-/// Re-arming reloads the seed's snapshot and replays its tail, so a
-/// run the lanes completed is in flight again and the graph matches a
-/// fresh seed - without building the fixture a second time.
+/// Re-arming persists reopened nodes before binding the fixture runs
+/// again. Both the live graph and store replay match a fresh seed.
 #[tokio::test]
 async fn rearm_restores_the_seeded_state() {
     let db = crate::scheduler::test_db::memory_db().await.expect("db");
     let cell = GraphCell::default();
     let shape = FixtureShape { queue_rows: 5_000 };
-    fixture::seed(&db, &cell, shape, drives::HOST_NOW_MS)
-        .await
-        .expect("seed fixture");
+    fixture::seed(
+        &db,
+        &cell,
+        shape,
+        &SchedulerSettings::default(),
+        drives::HOST_NOW_MS,
+    )
+    .await
+    .expect("seed fixture");
     let cell = cell.loaded().expect("seeded");
     let seeded = cell.with(|graph| graph.status());
     let run = shape.in_flight_run(0);
@@ -464,4 +546,72 @@ async fn rearm_restores_the_seeded_state() {
         .await
         .expect("rearm");
     assert_eq!(cell.with(|graph| graph.status()), seeded);
+    let (mut replayed, _) = super::store::restore(&db).await.expect("load");
+    fixture::mark_running(&mut replayed, shape, drives::HOST_NOW_MS);
+    assert_eq!(replayed.status(), seeded);
+    assert_eq!(replayed.inflight(), cell.with(|graph| graph.inflight()));
+}
+
+#[tokio::test]
+async fn rearm_without_completions_keeps_snapshot_and_replays_refreshed_leases() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let cell = GraphCell::default();
+    let shape = FixtureShape { queue_rows: 5_000 };
+    fixture::seed(
+        &db,
+        &cell,
+        shape,
+        &SchedulerSettings::default(),
+        drives::HOST_NOW_MS,
+    )
+    .await
+    .expect("seed fixture");
+    let cell = cell.loaded().expect("seeded");
+    let seeded = cell.with(|graph| graph.status());
+    log.lock().expect("log").clear();
+    let now = drives::HOST_NOW_MS + 1_000;
+    fixture::rearm(&db, cell, shape, now).await.expect("rearm");
+    {
+        let statements = log.lock().expect("log");
+        assert!(
+            statements
+                .iter()
+                .all(|row| !row.sql.contains("snapshot_chunks"))
+        );
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|row| row.sql.starts_with("INSERT INTO event_log"))
+                .count(),
+            2,
+            "claims and bindings must remain durable"
+        );
+    }
+    assert_eq!(cell.with(|graph| graph.status()), seeded);
+    let (mut replayed, _) = super::store::restore(&db).await.expect("load");
+    fixture::mark_running(&mut replayed, shape, now);
+    assert_eq!(replayed.status(), seeded);
+    assert_eq!(replayed.inflight(), cell.with(|graph| graph.inflight()));
+}
+
+#[tokio::test]
+async fn capacity_fixture_fills_enterprise_dispatch_slots() {
+    let settings = fixture::claim_settings(500, 50);
+    let db = crate::scheduler::test_db::memory_db().await.expect("db");
+    let cell = GraphCell::default();
+    fixture::seed(&db, &cell, fixture::GATE, &settings, drives::HOST_NOW_MS)
+        .await
+        .expect("seed fixture");
+    let claims = cell.loaded().expect("loaded").with(|graph| {
+        graph
+            .claim(&settings, drives::HOST_NOW_MS, u32::MAX)
+            .expect("claim")
+    });
+    assert_eq!(claims.len(), 500 - FixtureShape::IN_FLIGHT_ROWS as usize);
+    assert_eq!(
+        cell.loaded()
+            .expect("loaded")
+            .with(|graph| graph.inflight()),
+        (500, 50)
+    );
 }

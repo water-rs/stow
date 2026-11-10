@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/water-rs/stow/compare/stow-cli-v0.14.0...stow-cli-v0.15.0) - 2026-11-10
+
+### Fixed
+
+- finish stale drain cleanup outside the network timeout ([#1253](https://github.com/water-rs/stow/pull/1253))
+- publish explicit build-script shapes for native nodes ([#1228](https://github.com/water-rs/stow/pull/1228))
+
+### Other
+
+- *(cli)* move registry source parsing off async tasks ([#1369](https://github.com/water-rs/stow/pull/1369))
+- *(cli)* read coverage totals and error names together ([#1346](https://github.com/water-rs/stow/pull/1346))
+- *(cli)* overlap registry sources with Cargo launch preparation ([#1268](https://github.com/water-rs/stow/pull/1268))
+
 ## [0.14.0](https://github.com/water-rs/stow/compare/stow-cli-v0.13.1...stow-cli-v0.14.0) - 2026-11-01
 
 ### Added

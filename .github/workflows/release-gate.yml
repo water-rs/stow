@@ -19,6 +19,22 @@ name: Release gate
 # the group's target branch).
 on:
   workflow_dispatch:
+    inputs:
+      capacity_jobs:
+        description: "Mock scheduler total job capacity; empty keeps the test defaults"
+        required: false
+        default: ""
+        type: string
+      capacity_macos_jobs:
+        description: "Mock scheduler macOS job capacity; empty keeps the test defaults"
+        required: false
+        default: ""
+        type: string
+      traffic_rate_scale:
+        description: "Peak traffic rate multiplier; empty keeps the test default"
+        required: false
+        default: ""
+        type: string
   pull_request:
     branches: [main]
   merge_group:
@@ -175,6 +191,9 @@ jobs:
       - run: scripts/traffic-cost.sh
         env:
           STOW_TRAFFIC_WORK_DIR: ${{ runner.temp }}/stow-traffic
+          STOW_TRAFFIC_MAX_JOBS: ${{ inputs.capacity_jobs }}
+          STOW_TRAFFIC_MAX_MACOS_JOBS: ${{ inputs.capacity_macos_jobs }}
+          STOW_TRAFFIC_RATE_SCALE: ${{ inputs.traffic_rate_scale }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # The reports are the run's numbers — kept on a pass too, so the
       # budgets can be calibrated from them.
@@ -209,8 +228,9 @@ jobs:
     needs: tools
     name: Preheat cost
     runs-on: ubuntu-26.04
-    # The full wave exceeded 40 minutes; tool compilation runs separately.
-    timeout-minutes: 45
+    # The full wave keeps the runner's four cores busy for 40 to 45
+    # minutes (#1344); tool compilation runs separately.
+    timeout-minutes: 60
     permissions:
       # The local edge authenticates its trusted endpoints against the
       # credential's own repo permissions — GITHUB_TOKEN needs push
@@ -233,6 +253,8 @@ jobs:
       - run: scripts/preheat-cost.sh
         env:
           STOW_PREHEAT_COST_WORK_DIR: ${{ runner.temp }}/stow-preheat-cost
+          STOW_PREHEAT_COST_MAX_JOBS: ${{ inputs.capacity_jobs }}
+          STOW_PREHEAT_COST_MAX_MACOS_JOBS: ${{ inputs.capacity_macos_jobs }}
           STOW_PREHEAT_COST_LIMIT: 2
           STOW_PREHEAT_COST_PROJECTS: 0
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -289,6 +311,7 @@ jobs:
       # restore-key prefixes hand every run the most recent index — the
       # repo's 10 GB Actions allowance is not spent on per-request saves.
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        id: resolver-cache
         with:
           # Cargo recreates extracted sources and Git checkouts from these
           # downloads. Saving the whole home duplicated both representations
@@ -301,6 +324,8 @@ jobs:
           restore-keys: |
             production-wave-cargo-${{ runner.os }}-${{ steps.rustc-version.outputs.version }}-
             production-wave-cargo-${{ runner.os }}-
+      - name: Check resolver cache compaction
+        run: python3 -m unittest discover -s scripts -p test_compact_resolver_cache.py -v
       - run: scripts/production-wave.sh
         env:
           STOW_PRODUCTION_WAVE_WORK_DIR: ${{ runner.temp }}/stow-production-wave
@@ -308,13 +333,23 @@ jobs:
           # Full projects lane: 29m51s at 16 workers (run 41703355413);
           # four workers had not completed the list after 55 minutes.
           STOW_RESOLVE_CONCURRENCY: 16
+      # An exact-key hit is never saved again by actions/cache. Only pay
+      # for packing when the successful wave can create a new cache entry.
+      - name: Compact resolver cache for saving
+        if: steps.resolver-cache.outputs.cache-hit != 'true'
+        run: >-
+          python3 scripts/compact-resolver-cache.py compact
+          "$RUNNER_TEMP/stow-resolve-cargo"
+          "$RUNNER_TEMP/stow-production-wave/resolver-cache.json"
       # The count is the run's number — kept on a pass too; the monthly
       # projection job downloads it.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: production-wave
-          path: ${{ runner.temp }}/stow-production-wave/production-wave.json
+          path: |
+            ${{ runner.temp }}/stow-production-wave/production-wave.json
+            ${{ runner.temp }}/stow-production-wave/resolver-cache.json
           if-no-files-found: ignore
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure() || cancelled()

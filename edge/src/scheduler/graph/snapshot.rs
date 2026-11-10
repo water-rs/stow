@@ -1,15 +1,18 @@
 //! The graph's incremental chunked snapshot (stow#878 §3.3, stow#902).
 //!
 //! The persisted graph is split into fixed chunks addressed by a
-//! stable key — `kind * 2^48 + range * 64 + sub` — so a snapshot
+//! stable key — `kind * 2^48 + range * 1024 + sub` — so a snapshot
 //! rewrites only the ranges a mutation touched: node state and
 //! adjacency by node/edge index range, interned strings by id range
-//! (append-only, only the tail range changes), the published map and
-//! the unbounded side tables by key-hash bucket, and the small global
-//! state in one unconditional `meta` row. `sub` bounds a range to 64
-//! rows (`SNAPSHOT_SPAN_ROWS`): a range whose items spill past one row
-//! — a giant interned string, a skewed bucket — splits instead of
-//! nearing the platform's ~2 MB row bound.
+//! (append-only, only the tail range changes), the unbounded side
+//! tables by key-hash bucket, and the small global state in one
+//! unconditional `meta` row. The published masks are not chunks: the
+//! `published` table holds them and the snapshot's storage turn
+//! upserts the changes since the last one (`store.rs`); only their count
+//! rides the head. A row closes at
+//! `CHUNK_TEXT_BYTES` (64 KiB) of text, so a range whose items spill
+//! past one row — a skewed bucket, a long run of nodes — splits into
+//! sub-rows; `sub` bounds a range to `SNAPSHOT_SPAN_ROWS` of them.
 //!
 //! Dirty tracking lives in memory (`Graph::dirty` plus the interner's
 //! `intern_committed` watermark), never persisted: a wake starts clean
@@ -18,66 +21,81 @@
 //! takes the full path — delete every row, then write every range —
 //! which is also how a shrunk extent's stale rows go.
 //!
-//! The node, edge and published rows are fixed-size records written
+//! The node and edge rows are fixed-size records written
 //! little-endian, back to back, as base64 (`TEXT` payloads); a node's
 //! optional [`Extra`] rides its record as a length-prefixed
 //! `MessagePack` blob. The side states are `MessagePack` in base64;
 //! the meta row, interned strings, requests, feed pages and batches
 //! are JSON. What the loader can recompute is not written: edge spans,
-//! retention counts, unmet counts, state slab indexes and every
-//! lookup table.
+//! retention counts, unmet counts and every lookup table. A state's
+//! slab slot is written, though: the `node_digests` rows are keyed by
+//! it, and the lowest-vacant-slot allocation replays only from the slab
+//! the live graph had.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine as _;
+use orx_split_vec::PinnedVec;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::index::hash_of;
 use super::node::{Extra, Flags, NO_STATE, Node, State, Status};
 use super::{
-    AttemptOutcome, FeedSession, Graph, IdKey, Published, RequestRecord, SliceId, StagedSlice,
+    AttemptOutcome, FeedSession, Graph, IdKey, PublishedRow, RequestRecord, SliceId, StagedSlice,
 };
 use crate::errors::QueueError;
 
 /// The payload text one row carries, about: a range's row closes once
 /// its encoded items reach this size, so a row is this plus at most
-/// one item — far under the platform's 2 MB row bound.
-const CHUNK_TEXT_BYTES: usize = 1 << 20;
+/// one item. 64 KiB keeps every row — and the JavaScript string it
+/// crosses the heap as — small enough that a statement of
+/// [`STATEMENT_ROWS`] rows carries about 1 MiB (stow#1380).
+const CHUNK_TEXT_BYTES: usize = 1 << 16;
 
 /// The binary bytes that encode to [`CHUNK_TEXT_BYTES`] of base64.
 const CHUNK_BINARY_BYTES: usize = CHUNK_TEXT_BYTES / 4 * 3;
 
+/// Rows per 1 MiB statement: how many [`CHUNK_TEXT_BYTES`] rows a wake
+/// read or a snapshot upsert carries so that one statement holds about
+/// 1 MiB of payload (16 rows of 64 KiB).
+pub const STATEMENT_ROWS: usize = (1 << 20) / CHUNK_TEXT_BYTES;
+
 /// Rows one range may emit — the sub-key bound of a chunk key. A range
 /// needing more fails the snapshot as an invariant rather than
 /// silently colliding with the next range's keys.
-pub const SNAPSHOT_SPAN_ROWS: i64 = 64;
+///
+/// A span keeps its byte capacity across row sizes: 1024 rows of
+/// [`CHUNK_TEXT_BYTES`] is 64 MiB, the 64 rows of 1 MiB it replaces. A
+/// key is `kind << 48 | range * SNAPSHOT_SPAN_ROWS + sub`; the widest
+/// range ordinal is `u32::MAX`, so the product stays under
+/// `2^32 * 2^10 = 2^42`, below the kind bits at 2^48 and inside `i64`,
+/// and distinct ranges own disjoint runs of `SNAPSHOT_SPAN_ROWS` keys.
+pub const SNAPSHOT_SPAN_ROWS: i64 = 1024;
+
+const _: () = assert!(
+    (u32::MAX as i64 + 1) * SNAPSHOT_SPAN_ROWS <= 1 << 48,
+    "a span's keys must stay under the kind bits"
+);
 
 /// Interned strings per `intern` range: the dirty granularity of an
 /// append-only table — only the tail range is ever rewritten, so this
-/// bounds one snapshot's string rewrite. ~50 bytes a name keeps a
-/// range near the ~1 MiB row density today's snapshot kept.
+/// bounds one snapshot's string rewrite. ~50 bytes a name makes a
+/// range ~800 KB, about a dozen rows.
 const INTERN_RANGE: u32 = 16_384;
 
 /// Nodes per `nodes` range: ~100 bytes of node + state + a rare extra
-/// in the common case keeps a rewrite near the ~1 MiB row density
-/// today's snapshot kept; oversize ranges sub-split.
+/// in the common case makes a range ~800 KB, about a dozen rows;
+/// oversize ranges sub-split further.
 const NODES_RANGE: u32 = 8_192;
 
 /// Edges per `edges` range: five fixed bytes an edge, 640 KB a range.
 const EDGES_RANGE: u32 = 131_072;
 
-/// Published-mask buckets: the dense table — 19 fixed bytes an entry —
-/// sized so a bucket rewrite stays one row at the largest graph the
-/// 128 MiB object holds (#878 measured ~345k nodes at 480k rows): an
-/// all-published graph is 345k x 19 B / 16 = ~410 KB a bucket, ~52% of
-/// the ~786 KB binary row bound, still one row at twice that size.
-const PUBLISHED_BUCKETS: u32 = 16;
-
 /// Request-record buckets, by request-id hash: ~512 bytes of JSON a
 /// record, and the request history a 345k-node graph carries stays
 /// far under ~100k admissions (each admits at least one node) — 96k x
-/// 512 B / 64 = ~770 KB a bucket, ~98% of a row at that bound.
+/// 512 B / 64 = ~770 KB a bucket, about a dozen rows.
 const REQUESTS_BUCKETS: u32 = 64;
 
 /// Staged-page buckets, by hour hash: staged pages live only until a
@@ -89,14 +107,15 @@ const FEED_BUCKETS: u32 = 16;
 /// Demand-batch buckets, by batch-id hash: ~60 bytes of JSON a
 /// `(id, hash, count)` entry — batches accrue for the graph's life;
 /// at 64 buckets a ~780k-batch history fills a bucket at ~730 KB,
-/// ~93% of a row, and the object hits its memory bound first.
+/// about a dozen rows, and the object hits its memory bound first.
 const BATCHES_BUCKETS: u32 = 64;
 
 /// Staged-report buckets, by slice: an incomplete multi-part full
 /// report lives only until its last part arrives or a newer one
 /// supersedes it, so the staged set is a few slices' parts. Each part
-/// is at most `SLICE_REPORT_PART_BYTES` (half a mebibyte), so a row
-/// that closes at `CHUNK_TEXT_BYTES` holds under 1.5 MiB.
+/// is at most `SLICE_REPORT_PART_BYTES` (half a mebibyte) and a row is
+/// never split inside an item, so a staged row that closes at
+/// `CHUNK_TEXT_BYTES` holds under 0.6 MiB.
 const STAGED_BUCKETS: u32 = 16;
 
 /// How a row's payload is encoded.
@@ -119,7 +138,6 @@ enum ChunkKind {
     Intern,
     Nodes,
     Edges,
-    Published,
     Outcomes,
     Requests,
     Feed,
@@ -138,7 +156,6 @@ impl ChunkKind {
             Self::Intern => "intern",
             Self::Nodes => "nodes",
             Self::Edges => "edges",
-            Self::Published => "published",
             Self::Outcomes => "outcomes",
             Self::Requests => "requests",
             Self::Feed => "feed",
@@ -153,12 +170,11 @@ impl ChunkKind {
             1 => Self::Intern,
             2 => Self::Nodes,
             3 => Self::Edges,
-            4 => Self::Published,
-            5 => Self::Outcomes,
-            6 => Self::Requests,
-            7 => Self::Feed,
-            8 => Self::Batches,
-            9 => Self::Staged,
+            4 => Self::Outcomes,
+            5 => Self::Requests,
+            6 => Self::Feed,
+            7 => Self::Batches,
+            8 => Self::Staged,
             other => {
                 return Err(QueueError::Invariant(format!(
                     "unknown snapshot kind {other}"
@@ -169,7 +185,7 @@ impl ChunkKind {
 
     const fn encoding(self) -> Encoding {
         match self {
-            Self::Nodes | Self::Edges | Self::Published => Encoding::Raw,
+            Self::Nodes | Self::Edges => Encoding::Raw,
             Self::Outcomes => Encoding::Packed,
             Self::Meta
             | Self::Intern
@@ -227,8 +243,6 @@ pub(super) struct Dirty {
     pub nodes: BTreeSet<u32>,
     /// Edge-index ranges.
     pub edges: BTreeSet<u32>,
-    /// Published-mask buckets.
-    pub published: BTreeSet<u32>,
     /// Request-record buckets.
     pub requests: BTreeSet<u32>,
     /// Feed-page buckets.
@@ -239,11 +253,6 @@ pub(super) struct Dirty {
     pub staged: BTreeSet<u32>,
     /// The bounded outcome ring — one range, so one flag.
     pub outcomes: bool,
-}
-
-/// The published map's bucket of one key — its leading bytes.
-const fn published_bucket(key: &IdKey) -> u32 {
-    u32::from_le_bytes([key[0], key[1], key[2], key[3]]) % PUBLISHED_BUCKETS
 }
 
 /// The staged-report map's bucket of one slice.
@@ -278,6 +287,7 @@ struct SnapshotHead {
     /// probe state a `store_meta` row cannot hold without a billed
     /// statement the replay cannot re-count.
     seeded_rows: Option<u32>,
+    ci_not_before: i64,
     freeze: Option<stow_types::api::DispatchFreezeRecord>,
     /// The operator's dispatch-cap setting (stow#1039) — `None` until
     /// the first `set`, when the deploy bindings apply.
@@ -305,6 +315,9 @@ struct SnapshotHead {
     /// The instant the last `workflow_run` delivery was accepted
     /// (stow#860) — the health check's last-delivery age reads it.
     last_run_update_ms: Option<i64>,
+    /// How many task ids hold a non-zero published mask, in the
+    /// `published` table the snapshot's storage turn leaves.
+    published_ids: u64,
     lens: SectionLens,
 }
 
@@ -314,8 +327,11 @@ struct SnapshotHead {
 struct SectionLens {
     intern: usize,
     nodes: usize,
+    /// The state slab's length, vacant slots included: the vacant ones
+    /// are the slots no node names, and the next allocation takes the
+    /// lowest of them or the slab's end.
+    states: usize,
     edges: usize,
-    published: usize,
     outcomes: usize,
     requests: usize,
     feed_pages: usize,
@@ -412,39 +428,41 @@ fn encode_error(error: impl std::fmt::Display) -> QueueError {
 fn write_node(
     buf: &mut Vec<u8>,
     node: &Node,
-    state: Option<&State>,
+    state: Option<(&State, i64)>,
     extra: Option<&Extra>,
+    demand: i64,
 ) -> Result<(), QueueError> {
-    buf.extend_from_slice(&node.digest);
+    buf.extend_from_slice(&node.key);
     buf.extend_from_slice(&node.crate_name.to_le_bytes());
     buf.extend_from_slice(&node.version.to_le_bytes());
     buf.extend_from_slice(&node.features.to_le_bytes());
-    buf.extend_from_slice(&node.id_tag.to_le_bytes());
     buf.extend_from_slice(&node.edges_len.to_le_bytes());
     buf.push(node.target);
     buf.push(node.rustc);
     buf.push(node.status as u8);
     buf.push(node.flags.0);
-    if let Some(state) = state {
+    if let Some((state, priority)) = state {
+        // The slot is part of the record: the `node_digests` rows are
+        // keyed by it, so a wake must give every state the slot it
+        // held.
+        buf.extend_from_slice(&node.state.to_le_bytes());
         buf.extend_from_slice(&state.first_requested.to_le_bytes());
         buf.extend_from_slice(&state.updated.to_le_bytes());
-        buf.extend_from_slice(&state.priority.to_le_bytes());
-        buf.extend_from_slice(&state.demand.to_le_bytes());
+        buf.extend_from_slice(&priority.to_le_bytes());
+        buf.extend_from_slice(&demand.to_le_bytes());
         buf.extend_from_slice(&state.downloads.to_le_bytes());
-        buf.push(state.attempt);
-        buf.extend_from_slice(&state.dispatch_attempts.to_le_bytes());
     }
     match extra {
         None => buf.push(0),
         Some(extra) => {
-            let bytes = rmp_serde::to_vec(extra).map_err(encode_error)?;
             buf.push(1);
-            buf.extend_from_slice(
-                &u32::try_from(bytes.len())
-                    .map_err(|_| QueueError::Invariant("node extra exceeds u32".into()))?
-                    .to_le_bytes(),
-            );
-            buf.extend_from_slice(&bytes);
+            let length_at = buf.len();
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            let payload_at = buf.len();
+            rmp_serde::encode::write(&mut *buf, extra).map_err(encode_error)?;
+            let length = u32::try_from(buf.len() - payload_at)
+                .map_err(|_| QueueError::Invariant("node extra exceeds u32".into()))?;
+            buf[length_at..payload_at].copy_from_slice(&length.to_le_bytes());
         }
     }
     Ok(())
@@ -557,19 +575,13 @@ type StagedItem = (
 /// One keyed span's materialized entries — collected sorted at the
 /// encoder's creation, bounded by the bucket's own size (the graph is
 /// never copied whole).
-enum SpanItem {
-    Published(IdKey, Published),
-    Requests(String, RequestRecord),
-    Feed(String, usize, Vec<stow_types::api::SchedulerDemandEntry>),
-    Batches(String, (String, i64)),
-    Staged(
-        SliceId,
-        i64,
-        u32,
-        u32,
-        Vec<stow_types::api::PublishedSliceRow>,
-    ),
-    Outcomes(AttemptOutcome),
+#[derive(Default)]
+struct SpanItems {
+    requests: Vec<(String, RequestRecord)>,
+    feed: Vec<(String, usize, Vec<stow_types::api::SchedulerDemandEntry>)>,
+    batches: Vec<(String, (String, i64))>,
+    staged: Vec<StagedItem>,
+    outcomes: Vec<AttemptOutcome>,
 }
 
 /// The rows of one dirty span, emitted one at a time so peak memory is
@@ -580,7 +592,7 @@ pub struct SpanEncoder {
     /// indexed kinds, a position in `items` for the keyed kinds.
     at: u32,
     /// The keyed kinds' entries, sorted for a stable encoding.
-    items: Vec<SpanItem>,
+    items: SpanItems,
 }
 
 impl SpanEncoder {
@@ -614,10 +626,14 @@ impl SpanEncoder {
                     let node = &graph.nodes[ix];
                     let state =
                         (node.state != NO_STATE).then(|| &graph.states[node.state as usize]);
-                    let extra = graph
-                        .extras
-                        .get(&u32::try_from(ix).expect("node indexes fit u32"));
-                    write_node(buf, node, state, extra)
+                    let extra = graph.extras.get(&node.state);
+                    write_node(
+                        buf,
+                        node,
+                        state.map(|state| (state, graph.priorities.at(state.priority))),
+                        extra,
+                        graph.demand.get(node.state),
+                    )
                 })?
             }
             ChunkKind::Edges => {
@@ -628,40 +644,11 @@ impl SpanEncoder {
                     Ok(())
                 })?
             }
-            ChunkKind::Published => {
-                writer.fill_raw(self.items[at..].iter(), |buf, item| match item {
-                    SpanItem::Published(key, entry) => {
-                        buf.extend_from_slice(key);
-                        buf.push(entry.mask);
-                        buf.push(entry.slice.0);
-                        buf.push(entry.slice.1);
-                        Ok(())
-                    }
-                    _ => unreachable!("a published span holds published items"),
-                })?
-            }
-            ChunkKind::Requests => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Requests(id, record) => (id, record),
-                _ => unreachable!("a requests span holds request items"),
-            }))?,
-            ChunkKind::Feed => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Feed(hour, page, entries) => (hour, page, entries),
-                _ => unreachable!("a feed span holds feed items"),
-            }))?,
-            ChunkKind::Batches => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Batches(id, batch) => (id, batch),
-                _ => unreachable!("a batches span holds batch items"),
-            }))?,
-            ChunkKind::Staged => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Staged(slice, generation, parts, part, rows) => {
-                    (slice, generation, parts, part, rows)
-                }
-                _ => unreachable!("a staged span holds staged items"),
-            }))?,
-            ChunkKind::Outcomes => writer.fill(self.items[at..].iter().map(|item| match item {
-                SpanItem::Outcomes(outcome) => outcome,
-                _ => unreachable!("an outcomes span holds outcome items"),
-            }))?,
+            ChunkKind::Requests => writer.fill(self.items.requests[at..].iter())?,
+            ChunkKind::Feed => writer.fill(self.items.feed[at..].iter())?,
+            ChunkKind::Batches => writer.fill(self.items.batches[at..].iter())?,
+            ChunkKind::Staged => writer.fill(self.items.staged[at..].iter())?,
+            ChunkKind::Outcomes => writer.fill(self.items.outcomes[at..].iter())?,
         };
         if taken == 0 {
             return Ok(None);
@@ -693,11 +680,6 @@ impl Graph {
     /// Mark edge `edge`'s chunk dirty.
     pub(super) fn touch_edge(&mut self, edge: u32) {
         self.dirty.edges.insert(edge / EDGES_RANGE);
-    }
-
-    /// Mark the published bucket of `key` dirty.
-    pub(super) fn touch_published(&mut self, key: &IdKey) {
-        self.dirty.published.insert(published_bucket(key));
     }
 
     /// Mark the request bucket of `request_id` dirty.
@@ -777,12 +759,6 @@ impl Graph {
             ranges(self.edges.len(), EDGES_RANGE),
             &self.dirty.edges,
         );
-        add(
-            &mut spans,
-            ChunkKind::Published,
-            PUBLISHED_BUCKETS,
-            &self.dirty.published,
-        );
         if all || self.dirty.outcomes {
             spans.push(ChunkSpan::new(ChunkKind::Outcomes, 0));
         }
@@ -813,69 +789,61 @@ impl Graph {
     /// indexed kinds read the arena by index at each `next_row`.
     pub fn snapshot_encoder(&self, span: ChunkSpan) -> SpanEncoder {
         let bucket = span.range;
-        let items = match span.kind {
-            ChunkKind::Published => {
-                let mut items: Vec<_> = self
-                    .published
+        let mut materialized = SpanItems::default();
+        match span.kind {
+            ChunkKind::Requests => {
+                materialized.requests = self
+                    .requests
                     .iter()
-                    .filter(|(key, _)| published_bucket(key) == bucket)
-                    .map(|(&key, &entry)| SpanItem::Published(key, entry))
+                    .filter(|(id, _)| keyed_bucket(id, REQUESTS_BUCKETS) == bucket)
+                    .map(|(id, record)| (id.clone(), record.clone()))
                     .collect();
-                items.sort_by_key(|item| match item {
-                    SpanItem::Published(key, _) => *key,
-                    _ => unreachable!("a published span holds published items"),
-                });
-                items
             }
-            ChunkKind::Requests => self
-                .requests
-                .iter()
-                .filter(|(id, _)| keyed_bucket(id, REQUESTS_BUCKETS) == bucket)
-                .map(|(id, record)| SpanItem::Requests(id.clone(), record.clone()))
-                .collect(),
-            ChunkKind::Feed => self
-                .feed_sessions
-                .iter()
-                .filter(|(hour, _)| keyed_bucket(hour, FEED_BUCKETS) == bucket)
-                .flat_map(|(hour, session)| {
-                    session
-                        .staged
-                        .iter()
-                        .enumerate()
-                        .map(move |(page, entries)| {
-                            SpanItem::Feed(hour.clone(), page, entries.clone())
-                        })
-                })
-                .collect(),
-            ChunkKind::Batches => self
-                .demand_batches
-                .iter()
-                .filter(|(id, _)| keyed_bucket(id, BATCHES_BUCKETS) == bucket)
-                .map(|(id, batch)| SpanItem::Batches(id.clone(), batch.clone()))
-                .collect(),
-            ChunkKind::Staged => self
-                .staged_slices
-                .iter()
-                .filter(|(slice, _)| staged_bucket(**slice) == bucket)
-                .flat_map(|(&slice, staged)| {
-                    staged.rows.iter().enumerate().map(move |(part, rows)| {
-                        SpanItem::Staged(
-                            slice,
-                            staged.generation,
-                            staged.parts,
-                            u32::try_from(part).expect("part fits u32"),
-                            rows.clone(),
-                        )
+            ChunkKind::Feed => {
+                materialized.feed = self
+                    .feed_sessions
+                    .iter()
+                    .filter(|(hour, _)| keyed_bucket(hour, FEED_BUCKETS) == bucket)
+                    .flat_map(|(hour, session)| {
+                        session
+                            .staged
+                            .iter()
+                            .enumerate()
+                            .map(move |(page, entries)| (hour.clone(), page, entries.clone()))
                     })
-                })
-                .collect(),
-            ChunkKind::Outcomes => self
-                .attempt_outcomes
-                .iter()
-                .map(|outcome| SpanItem::Outcomes(outcome.clone()))
-                .collect(),
-            _ => Vec::new(),
-        };
+                    .collect();
+            }
+            ChunkKind::Batches => {
+                materialized.batches = self
+                    .demand_batches
+                    .iter()
+                    .filter(|(id, _)| keyed_bucket(id, BATCHES_BUCKETS) == bucket)
+                    .map(|(id, batch)| (id.clone(), batch.clone()))
+                    .collect();
+            }
+            ChunkKind::Staged => {
+                materialized.staged = self
+                    .staged_slices
+                    .iter()
+                    .filter(|(slice, _)| staged_bucket(**slice) == bucket)
+                    .flat_map(|(&slice, staged)| {
+                        staged.rows.iter().enumerate().map(move |(part, rows)| {
+                            (
+                                slice,
+                                staged.generation,
+                                staged.parts,
+                                u32::try_from(part).expect("part fits u32"),
+                                rows.clone(),
+                            )
+                        })
+                    })
+                    .collect();
+            }
+            ChunkKind::Outcomes => {
+                materialized.outcomes = self.attempt_outcomes.iter().cloned().collect();
+            }
+            _ => {}
+        }
         // The indexed kinds start at their range's first index.
         let at = match span.kind {
             ChunkKind::Intern => span.range * INTERN_RANGE,
@@ -883,14 +851,36 @@ impl Graph {
             ChunkKind::Edges => span.range * EDGES_RANGE,
             _ => 0,
         };
-        SpanEncoder { span, at, items }
+        SpanEncoder {
+            span,
+            at,
+            items: materialized,
+        }
     }
 
-    /// The store holds every dirty range: clear the marks and lift the
-    /// intern watermark to the interner's end.
+    /// The store holds every dirty range and, in its `published` table,
+    /// every published change: clear the marks, lift the intern
+    /// watermark to the interner's end and drop the changes.
     pub(crate) fn snapshot_written(&mut self) {
         self.dirty = Dirty::default();
         self.intern_committed = self.intern.len();
+        self.published_flushed();
+    }
+
+    /// Up to `limit` of the published changes since the last snapshot
+    /// after `after`, in key order, for the storage turn that upserts
+    /// them into the `published` table.
+    pub fn published_page(&self, after: Option<&super::IdKey>, limit: usize) -> Vec<PublishedRow> {
+        self.published.page(after, limit)
+    }
+
+    /// The `published` table holds every change: forget them.
+    pub fn published_flushed(&mut self) {
+        #[cfg(test)]
+        {
+            self.test_published = self.test_table_after_snapshot();
+        }
+        self.published.clear();
     }
 
     fn snapshot_head(&self) -> SnapshotHead {
@@ -898,6 +888,7 @@ impl Graph {
             next_generation: self.next_generation,
             meter_ops: self.meter.ops.clone(),
             seeded_rows: self.seeded_rows,
+            ci_not_before: self.ci_not_before,
             freeze: self.freeze.clone(),
             dispatch_cap: self.dispatch_cap.clone(),
             release_priority: self.release_priority.clone(),
@@ -939,6 +930,7 @@ impl Graph {
                 .map(|(&key, &tally)| (key, tally))
                 .collect(),
             last_run_update_ms: self.last_run_update_ms,
+            published_ids: self.published_ids,
             lens: self.section_lens(),
         }
     }
@@ -947,8 +939,8 @@ impl Graph {
         SectionLens {
             intern: self.intern.len(),
             nodes: self.nodes.len(),
+            states: self.states.len(),
             edges: self.edges.len(),
-            published: self.published.len(),
             outcomes: self.attempt_outcomes.len(),
             requests: self.requests.len(),
             feed_pages: self
@@ -1003,16 +995,8 @@ impl SnapshotLoader {
                 graph.edges.load(dep, flags);
                 Ok(())
             }),
-            ChunkKind::Published => decode_raw(kind, payload, |bytes| {
-                let key: IdKey = bytes.take()?;
-                let mask = bytes.u8()?;
-                let slice = (bytes.u8()?, bytes.u8()?);
-                graph.published.insert(key, Published { mask, slice });
-                graph.slice_members.entry(slice).or_default().insert(key);
-                Ok(())
-            }),
             ChunkKind::Outcomes => decode_items(kind, payload, |outcome: AttemptOutcome| {
-                graph.attempt_outcomes.push_back(outcome);
+                graph.record_attempt_outcome(outcome);
                 Ok(())
             }),
             ChunkKind::Requests => {
@@ -1085,39 +1069,45 @@ impl SnapshotLoader {
     }
 
     fn load_node(graph: &mut Graph, bytes: &mut Bytes<'_>) -> Result<(), QueueError> {
-        let digest = bytes.take::<32>()?;
+        let key: IdKey = bytes.take()?;
         let crate_name = bytes.u32()?;
         let version = bytes.u32()?;
         let features = bytes.u32()?;
-        let id_tag = bytes.u32()?;
         let edges_len = bytes.u16()?;
         let target = bytes.u8()?;
         let rustc = bytes.u8()?;
         let status = Status::from_byte(bytes.u8()?)?;
         let flags = Flags(bytes.u8()?);
-        let state = if status.has_state() {
+        let (state, demand) = if status.has_state() {
+            let slot = bytes.u32()?;
+            let first_requested = bytes.i64()?;
+            let updated = bytes.u32()?;
+            let priority = bytes.i64()?;
+            let demand = bytes.i64()?;
             let state = State {
-                first_requested: bytes.i64()?,
-                updated: bytes.i64()?,
-                priority: bytes.i64()?,
-                demand: bytes.i64()?,
+                first_requested,
                 downloads: bytes.u64()?,
-                attempt: bytes.u8()?,
-                dispatch_attempts: bytes.u16()?,
+                updated,
+                priority: graph.priorities.intern(priority),
             };
-            let at = u32::try_from(graph.states.len())
-                .map_err(|_| QueueError::Invariant("snapshot state slab overflows u32".into()))?;
-            graph.states.push(state);
-            at
+            // Slots the nodes do not name are vacant: filler holds the
+            // place until `rebuild_after_load` frees them.
+            if slot == NO_STATE {
+                return Err(QueueError::Invariant(
+                    "snapshot state slot is the no-state marker".into(),
+                ));
+            }
+            graph.fill_states(slot as usize + 1, state);
+            graph.states[slot as usize] = state;
+            (slot, demand)
         } else {
-            NO_STATE
+            (NO_STATE, 0)
         };
         let node = Node {
-            digest,
+            key,
             crate_name,
             version,
             features,
-            id_tag,
             state,
             edges_start: 0,
             refs: 0,
@@ -1128,16 +1118,15 @@ impl SnapshotLoader {
             status,
             flags,
         };
-        let ix = u32::try_from(graph.nodes.len())
-            .map_err(|_| QueueError::Invariant("node count overflows u32".into()))?;
         graph.nodes.push(node);
+        graph.demand.set(state, demand);
         match bytes.u8()? {
             0 => Ok(()),
             1 => {
                 let len = bytes.u32()? as usize;
                 let extra: Extra =
                     rmp_serde::from_slice(bytes.bytes(len)?).map_err(encode_error)?;
-                graph.extras.insert(ix, extra);
+                graph.extras.insert(state, extra);
                 Ok(())
             }
             flag => Err(QueueError::Invariant(format!(
@@ -1159,6 +1148,7 @@ impl SnapshotLoader {
         graph.meter.ops = head.meter_ops;
         graph.seeded_rows = head.seeded_rows;
         graph.freeze = head.freeze;
+        graph.ci_not_before = head.ci_not_before;
         graph.dispatch_cap = head.dispatch_cap;
         graph.release_priority = head.release_priority;
         graph.external_runs = head.external_runs.into_iter().collect();
@@ -1184,10 +1174,7 @@ impl SnapshotLoader {
         graph.outcome_hours = head.outcome_hours.into_iter().collect();
         graph.last_run_update_ms = head.last_run_update_ms;
         graph.intern.reserve_exact(head.lens.intern);
-        graph.nodes.reserve_exact(head.lens.nodes);
-        graph.states.reserve(head.lens.nodes);
-        graph.edges.reserve_exact(head.lens.edges);
-        graph.published.reserve(head.lens.published);
+        graph.published_ids = head.published_ids;
         *lens = Some(head.lens);
         Ok(())
     }
@@ -1204,6 +1191,14 @@ impl SnapshotLoader {
             return Ok(self.graph);
         };
         let mut graph = std::mem::take(&mut self.graph);
+        if graph.states.len() > lens.states {
+            return Err(QueueError::Invariant(format!(
+                "snapshot nodes name state slot {} past the {}-slot slab its head records",
+                graph.states.len() - 1,
+                lens.states
+            )));
+        }
+        graph.pad_states(lens.states);
         let loaded = graph.section_lens();
         if loaded != lens {
             return Err(QueueError::Invariant(format!(
@@ -1258,6 +1253,7 @@ mod store_tests {
                 emitted += 1;
                 Ok(Some("new".to_owned()))
             },
+            |_, _| Vec::new(),
             &Graph::default().meter,
             &GraphCell::default(),
             0,

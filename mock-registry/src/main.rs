@@ -1675,6 +1675,9 @@ async fn serve_v2(
 /// files land as `sha256_*`, so they cannot leak in), honoring the spec's
 /// `n`/`last` window: a page under the limit is the whole list, one at
 /// the limit answers `Link: rel="next"` so the caller continues.
+/// GHCR's listing is not ordered by name and rejects a `last` that is not
+/// a tag (`{"tags": null}`), so tags come in ascending SHA-256 of the name
+/// and `last` continues after that tag in this order only when it exists.
 async fn list_tags(
     state: &MockRegistryState,
     repository: &str,
@@ -1695,17 +1698,30 @@ async fn list_tags(
             names.push(name);
         }
     }
-    names.sort();
-    let after = query.get("last").cloned();
+    names.sort_by_cached_key(|name| sha2::Sha256::digest(name.as_bytes()));
     let limit: usize = query
         .get("n")
         .and_then(|value| value.parse().ok())
         .unwrap_or(usize::MAX);
-    let window: Vec<String> = names
-        .into_iter()
-        .filter(|name| after.as_ref().is_none_or(|last| name > last))
-        .take(limit)
-        .collect();
+    let start = match query.get("last") {
+        None => Some(0),
+        Some(last) => names
+            .iter()
+            .position(|name| name == last)
+            .map(|position| position + 1),
+    };
+    let Some(start) = start else {
+        let mut response = Response::new(Body::from(
+            serde_json::to_vec(&serde_json::json!({ "name": repository, "tags": null }))
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        ));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return Ok(response);
+    };
+    let window: Vec<String> = names.into_iter().skip(start).take(limit).collect();
     let has_more = window.len() == limit;
     let body = serde_json::json!({
         "name": repository,
@@ -2719,6 +2735,106 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// One `tags/list` answer for `query` over a package holding `tags`:
+    /// the body and its `Link` header.
+    async fn tags_answer(tags: &[&str], query: &str) -> (serde_json::Value, Option<String>) {
+        let root = tempfile::tempdir().expect("registry root");
+        let dir = root.path().join("manifests/water-rs/stow-cache-v2-1.98.0");
+        std::fs::create_dir_all(&dir).expect("manifest dir");
+        for tag in tags {
+            std::fs::write(dir.join(tag), b"{}").expect("tag file");
+        }
+        let app = registry_app_with_probe("127.0.0.1:28123", root.path().to_path_buf(), None, None);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/token?service=mock-registry&scope=repository:water-rs/stow-cache-v2-1.98.0:pull")
+                    .body(Body::empty())
+                    .expect("token request builds"),
+            )
+            .await
+            .expect("token response");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("token body");
+        let token =
+            serde_json::from_slice::<serde_json::Value>(&body).expect("token json")["token"]
+                .as_str()
+                .expect("token field")
+                .to_owned();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v2/water-rs/stow-cache-v2-1.98.0/tags/list{query}"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("tags request builds"),
+            )
+            .await
+            .expect("tags response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let link = response
+            .headers()
+            .get(header::LINK)
+            .map(|value| value.to_str().expect("link header").to_owned());
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("tags body");
+        (serde_json::from_slice(&body).expect("tags json"), link)
+    }
+
+    /// The listing is ordered by the SHA-256 of the tag name, not the
+    /// name, and `last=<tag>` pages continue after that tag in that order
+    /// with a `Link` while more remain.
+    #[tokio::test]
+    async fn tags_list_in_hash_order_and_continue_after_a_listed_tag() {
+        let tags = ["records-a", "index.x", "folded.x", "records-b", "zeta"];
+        let mut expected = tags.map(str::to_owned).to_vec();
+        expected.sort_by_cached_key(|name| sha2::Sha256::digest(name.as_bytes()));
+        assert_ne!(expected, {
+            let mut sorted = expected.clone();
+            sorted.sort();
+            sorted
+        });
+
+        let (body, link) = tags_answer(&tags, "").await;
+        assert_eq!(body["tags"], serde_json::json!(expected));
+        assert_eq!(link, None);
+
+        let (body, link) = tags_answer(&tags, "?n=2").await;
+        assert_eq!(body["tags"], serde_json::json!(expected[..2]));
+        assert_eq!(
+            link.as_deref(),
+            Some(
+                format!(
+                    "</v2/water-rs/stow-cache-v2-1.98.0/tags/list?n=2&last={}>; rel=\"next\"",
+                    expected[1]
+                )
+                .as_str()
+            )
+        );
+
+        let (body, link) = tags_answer(&tags, &format!("?n=2&last={}", expected[1])).await;
+        assert_eq!(body["tags"], serde_json::json!(expected[2..4]));
+        assert!(link.is_some());
+
+        let (body, link) = tags_answer(&tags, &format!("?n=2&last={}", expected[3])).await;
+        assert_eq!(body["tags"], serde_json::json!(expected[4..]));
+        assert_eq!(link, None);
+    }
+
+    /// GHCR rejects a `last` that is not a tag of the repository: the
+    /// answer is `"tags": null` with no `Link`, a bare prefix included.
+    #[tokio::test]
+    async fn tags_list_answers_null_for_a_cursor_that_is_not_a_tag() {
+        let (body, link) = tags_answer(&["records-a", "records-b"], "?n=1&last=records-").await;
+        assert!(body["tags"].is_null(), "{body}");
+        assert_eq!(link, None);
+    }
+
     /// stow#844: a package that was never published answers the way GHCR
     /// answers — the anonymous token exchange gets `403` carrying the OCI
     /// `DENIED` code, while a credentialed exchange still mints (a publish
@@ -3212,16 +3328,30 @@ mod tests {
         stow_oci::WriteBudget::per_minute(std::num::NonZeroU32::new(6_000_000).expect("rate"))
     }
 
-    /// The in-process signer the push tests inject: writes the signature
-    /// pair into the mock root so `pull_signature_materials` reads it back
-    /// over HTTP — no cosign binary involved.
+    fn mock_signature_material(
+        (signature, payload_bytes): (String, Vec<u8>),
+    ) -> stow_types::bundle::BundleSignatureMaterial {
+        stow_types::bundle::BundleSignatureMaterial {
+            payload_path: stow_types::bundle::sigstore_payload_path(0),
+            payload_bytes,
+            signature,
+            certificate_pem: super::MOCK_CERTIFICATE.to_owned(),
+            rekor_bundle_json: None,
+        }
+    }
+
+    /// Write the mock signature and return the same material to the publisher.
     fn mock_sign(
         root: &std::path::Path,
     ) -> impl Fn(
         String,
         String,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = stow_types::error::Result<()>> + Send>,
+        Box<
+            dyn std::future::Future<
+                    Output = stow_types::error::Result<stow_types::bundle::BundleSignatureMaterial>,
+                > + Send,
+        >,
     > {
         let root = root.to_path_buf();
         move |oci_reference: String, manifest_digest: String| {
@@ -3232,7 +3362,7 @@ mod tests {
                     .map_err(|error| stow_types::stow_error!("create mock signer: {error}"))?;
                 write_mock_signature(&root, &signer, &oci_reference, &manifest_digest)
                     .await
-                    .map(|_| ())
+                    .map(mock_signature_material)
             })
         }
     }
@@ -3240,7 +3370,7 @@ mod tests {
     /// The push path's request count against a served registry: the
     /// challenge ping and a single token mint for the whole push, one HEAD
     /// per blob with a monolithic `POST ?digest=` per miss, one PUT per
-    /// manifest, and the signature pull pair — never a chunked session or
+    /// manifest, without reading the new signature back — never a chunked session or
     /// a per-operation token.
     #[tokio::test]
     async fn one_push_is_one_token_and_monolithic_uploads() {
@@ -3283,7 +3413,7 @@ mod tests {
         assert_eq!(
             count(Method::POST, "/blobs/uploads"),
             4,
-            "one monolithic POST per missing blob"
+            "one monolithic POST per missing blob: {log:?}"
         );
         let manifest_puts: Vec<&str> = log
             .iter()
@@ -3292,33 +3422,34 @@ mod tests {
             .collect();
         assert_eq!(
             manifest_puts.len(),
-            3,
-            "the artifact by digest, then its tag, then the bundle: {manifest_puts:?}"
+            2,
+            "the signed artifact tag, then the bundle: {manifest_puts:?}"
         );
         assert!(
-            manifest_puts[0].contains("/manifests/sha256:"),
-            "the artifact manifest goes up by digest before it is tagged: {manifest_puts:?}"
+            manifest_puts
+                .iter()
+                .all(|path| !path.contains("/manifests/sha256:")),
+            "no redundant digest upload: {manifest_puts:?}"
         );
         assert_eq!(
             count(Method::GET, "/manifests/"),
-            1,
-            "the signature manifest pull"
+            0,
+            "no signature manifest read-back"
         );
         assert_eq!(
             count(Method::GET, "/blobs/"),
-            1,
-            "the signature payload pull"
+            0,
+            "no signature payload read-back"
         );
         assert!(
             !log.iter().any(|record| record.method == Method::PATCH),
             "no chunked upload session"
         );
-        assert_eq!(log.len(), 15, "the full push in fifteen requests");
+        assert_eq!(log.len(), 12, "the full push in twelve requests");
     }
 
-    /// The signer runs while the artifact manifest is stored by digest
-    /// alone: the tag appears only once its signature exists, so no reader
-    /// can resolve the tag to an unsigned manifest.
+    /// The signer runs before either the digest or tag exists. Publishing
+    /// the tag once signing succeeds also makes the digest readable.
     #[tokio::test]
     async fn push_signs_before_it_tags() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -3342,17 +3473,143 @@ mod tests {
                     "{tag} was tagged before it was signed"
                 );
                 assert!(
-                    manifests
+                    !manifests
                         .join(&repo)
                         .join(manifest_file_name(&manifest_digest))
                         .exists(),
-                    "{manifest_digest} was signed before it was stored"
+                    "{manifest_digest} was uploaded before signing"
                 );
                 sign(oci_reference, manifest_digest)
             },
         )
         .await
         .expect("push succeeds");
+    }
+
+    /// A task's artifacts publish together: each signature completes only
+    /// once both artifacts' signs are in flight, so a one-by-one publish
+    /// times out instead of finishing.
+    #[tokio::test]
+    async fn artifacts_publish_concurrently() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let first = test_plan(root.path());
+        let mut second = test_plan(root.path());
+        second.oci_reference = second.oci_reference.replace("serde.1.0.0", "serde.1.0.1");
+        assert_ne!(first.oci_reference, second.oci_reference);
+        let (listen, _probe) = serve_probe_registry(root.path()).await;
+        let sign = mock_sign(root.path());
+        let both_signing = tokio::sync::Barrier::new(2);
+
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
+        let session = push_session(&listen, &http, &ample_writes());
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stow_oci::push_artifacts_with(
+                &session,
+                &[first.clone(), second.clone()],
+                |oci_reference: String, manifest_digest: String| {
+                    let (sign, both_signing) = (&sign, &both_signing);
+                    async move {
+                        both_signing.wait().await;
+                        sign(oci_reference, manifest_digest).await
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("both artifacts reach signing together")
+        .expect("push succeeds");
+
+        assert_eq!(outcome.newly_pushed, 2);
+        assert_eq!(
+            outcome
+                .published_by_reference
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![first.oci_reference.clone(), second.oci_reference.clone()]
+        );
+    }
+
+    /// Either blob's refusal prevents signing and publishing the manifest.
+    #[tokio::test]
+    async fn failed_blob_upload_never_publishes_a_manifest() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let plan = test_plan(root.path());
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+        probe.refuse(
+            Method::POST,
+            "/blobs/uploads",
+            1,
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"errors": [{"code": "BLOB_UPLOAD_INVALID", "message": "refused"}]}),
+        );
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
+        let session = push_session(&listen, &http, &ample_writes());
+        let error = stow_oci::push_artifacts_with(&session, &[plan], |_, _| async {
+            panic!("failed blob must not reach signing");
+        })
+        .await
+        .expect_err("refused blob");
+        assert!(error.to_string().contains("400"), "{error}");
+        assert!(probe.request_log().iter().all(|request| {
+            request.method != Method::PUT || !request.path.contains("/manifests/")
+        }));
+    }
+
+    /// Failed signing never writes a manifest, whether the destination
+    /// tag is new or already serves a signed artifact.
+    #[tokio::test]
+    async fn failed_signing_preserves_existing_and_absent_tags() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let plan = test_plan(root.path());
+        let reference = plan.oci_reference.parse().expect("reference");
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
+        let session = push_session(&listen, &http, &ample_writes());
+        stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
+            .await
+            .expect("initial signed artifact");
+        let (manifest, digest) = session.pull_manifest(&reference).await.expect("manifest");
+        let absent = session.reference("unpublished").expect("new reference");
+        let writes = || {
+            probe
+                .request_log()
+                .iter()
+                .filter(|request| request.method == Method::PUT)
+                .count()
+        };
+        let before = writes();
+        for destination in [&reference, &absent] {
+            let error =
+                stow_oci::put_signed_manifest(&session, destination, &manifest, |_| async {
+                    Err::<(), _>(stow_types::stow_error!("signing refused"))
+                })
+                .await
+                .expect_err("failed signature");
+            assert!(error.to_string().contains("signing refused"), "{error}");
+        }
+        assert_eq!(writes(), before, "failed signing uploads no manifest");
+        assert_eq!(
+            session.pull_manifest(&reference).await.expect("old tag"),
+            (manifest, digest)
+        );
+        assert!(
+            session
+                .pull_manifest(&absent)
+                .await
+                .expect_err("absent tag")
+                .is_not_found()
+        );
     }
 
     /// GHCR's cap shape — `429 TOOMANYREQUESTS` carrying
@@ -3423,8 +3680,8 @@ mod tests {
         );
         assert_eq!(
             count(Method::PUT, "/manifests/"),
-            3,
-            "manifest puts are unchanged by the upload fallback: the artifact by digest and by tag, then the bundle"
+            2,
+            "manifest puts are unchanged by the upload fallback: the signed artifact tag and the bundle"
         );
     }
 
@@ -3455,8 +3712,8 @@ mod tests {
             })
             .count();
         assert_eq!(
-            read_backs, 3,
-            "every manifest PUT verified by digest: the artifact's digest and tag pushes, and the bundle"
+            read_backs, 2,
+            "every manifest PUT verified by digest: the signed artifact tag and the bundle"
         );
     }
 
@@ -3583,7 +3840,13 @@ mod tests {
             String,
             String,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = stow_types::error::Result<()>> + Send>,
+            Box<
+                dyn std::future::Future<
+                        Output = stow_types::error::Result<
+                            stow_types::bundle::BundleSignatureMaterial,
+                        >,
+                    > + Send,
+            >,
         >,
         stow_oci::verify::Trust,
     ) {
@@ -3606,10 +3869,16 @@ mod tests {
             Box::pin(async move {
                 write_mock_signature(&root, &signer, &oci_reference, &manifest_digest)
                     .await
-                    .map(|_| ())
+                    .map(mock_signature_material)
             })
                 as std::pin::Pin<
-                    Box<dyn std::future::Future<Output = stow_types::error::Result<()>> + Send>,
+                    Box<
+                        dyn std::future::Future<
+                                Output = stow_types::error::Result<
+                                    stow_types::bundle::BundleSignatureMaterial,
+                                >,
+                            > + Send,
+                    >,
                 >
         };
         (sign, stow_oci::verify::Trust::MockKey(public_key_path))
@@ -3627,7 +3896,9 @@ mod tests {
     ) -> ArtifactRecord
     where
         S: Fn(String, String) -> Fut,
-        Fut: std::future::Future<Output = stow_types::error::Result<()>>,
+        Fut: std::future::Future<
+                Output = stow_types::error::Result<stow_types::bundle::BundleSignatureMaterial>,
+            >,
     {
         let (packed_manifest, _) = session
             .pull_manifest(
@@ -3678,7 +3949,8 @@ mod tests {
             sign(packed.oci_reference.clone(), digest)
         })
         .await
-        .expect("publish retired layout");
+        .expect("publish retired layout")
+        .digest;
         ArtifactRecord {
             oci_digest,
             ..packed.clone()
@@ -3733,9 +4005,25 @@ mod tests {
             .expect("the retired layout repacks")
             .expect("and is rewritten");
         assert_eq!(
-            repacked, packed,
-            "repack publishes what the build published"
+            ArtifactRecord {
+                bundle_digest: packed.bundle_digest.clone(),
+                bundle_size: packed.bundle_size,
+                ..repacked.clone()
+            },
+            packed,
+            "repack preserves the node; a fresh signature may change bundle bytes"
         );
+        let reference = repacked.oci_reference.parse().expect("reference");
+        stow_oci::verify_artifact_signature(
+            &session,
+            &trust,
+            &reference,
+            &repacked.oci_reference,
+            &repacked.oci_digest,
+            "",
+        )
+        .await
+        .expect("repacked signature verifies");
 
         assert_eq!(
             stow_oci::repack_record(&session, &trust, "", &repacked, &sign)
@@ -3809,12 +4097,12 @@ mod tests {
         );
         assert_eq!(
             manifest_puts(),
-            puts_before + 2,
+            puts_before + 1,
             "a refused node pushes nothing; only the untrusted node's own manifest went up"
         );
     }
 
-    // ---- stow#709 pushed-signature read-back tests ----
+    // ---- signature publication and absence tests ----
 
     /// How many `GET /manifests/{signature_tag}` requests the served
     /// registry saw — the pulls a signature read made.
@@ -3827,83 +4115,32 @@ mod tests {
             .count()
     }
 
-    /// The registry may not show a `.sig` tag the instant cosign's push
-    /// returned — the read-back of a just-pushed signature retries the
-    /// `MANIFEST_UNKNOWN` and reads it on a later attempt.
+    /// Bundle assembly uses the signer's material even when signature
+    /// reads remain unavailable after publication.
     #[tokio::test]
-    async fn a_pushed_signature_the_registry_does_not_show_yet_is_read_on_a_later_attempt() {
+    async fn publication_does_not_read_back_its_signature() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let root = tempfile::tempdir().expect("registry root");
-        let signer = SigningScheme::ECDSA_P256_SHA256_ASN1
-            .create_signer()
-            .expect("mock signer");
-        let digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let tag = "serde.1.0.0-x86_64-linux-gnu-1_98.0-000000-aabbccddeeff0011";
-        write_mock_signature(
-            root.path(),
-            &signer,
-            &format!("{REFERENCE_BASE}:{tag}"),
-            digest,
-        )
-        .await
-        .expect("mock signature");
+        let plan = test_plan(root.path());
         let (listen, probe) = serve_probe_registry(root.path()).await;
-        let signature_tag = sigstore_signature_tag(digest);
-        probe.manifest_unknown(Method::GET, &format!("/manifests/{signature_tag}"), 1);
-
+        probe.manifest_unknown(Method::GET, "/manifests/sha256-", usize::MAX);
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
             .await
             .expect("registry http");
         let session = push_session(&listen, &http, &ample_writes());
-        let reference = session.reference(tag).expect("reference");
-        let materials = stow_oci::pull_pushed_signature_materials(&session, &reference, digest)
+        let outcome = stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
-            .expect("the registry catches up within the bound");
-        assert_eq!(materials.len(), 1, "the one simple-signing layer");
+            .expect("publish without signature read-back");
+        let artifact = outcome
+            .published_by_reference
+            .values()
+            .next()
+            .expect("artifact");
         assert_eq!(
-            signature_manifest_pulls(&probe, &signature_tag),
-            2,
-            "a MANIFEST_UNKNOWN, then the manifest"
+            signature_manifest_pulls(&probe, &sigstore_signature_tag(&artifact.oci_digest)),
+            0
         );
-    }
-
-    /// A `.sig` tag that never appears fails after exactly
-    /// `PUSHED_READ_MAX_ATTEMPTS` pulls and the error names the signature
-    /// reference — the publish fails rather than waiting on a push that
-    /// never landed.
-    #[tokio::test]
-    async fn a_pushed_signature_that_never_appears_fails_at_the_bound() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let root = tempfile::tempdir().expect("registry root");
-        let (listen, probe) = serve_probe_registry(root.path()).await;
-        let digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-        let signature_tag = sigstore_signature_tag(digest);
-        probe.manifest_unknown(
-            Method::GET,
-            &format!("/manifests/{signature_tag}"),
-            usize::MAX,
-        );
-
-        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
-            .await
-            .expect("registry http");
-        let session = push_session(&listen, &http, &ample_writes());
-        let tag = "serde.1.0.0-x86_64-linux-gnu-1_98.0-000000-aabbccddeeff0011";
-        let reference = session.reference(tag).expect("reference");
-        let error = stow_oci::pull_pushed_signature_materials(&session, &reference, digest)
-            .await
-            .expect_err("a signature that never lands fails at the bound");
-        assert_eq!(
-            signature_manifest_pulls(&probe, &signature_tag),
-            5,
-            "the first pull plus its four retries"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("{REPOSITORY}:{signature_tag}")),
-            "the error names the signature reference: {error}"
-        );
+        assert!(!artifact.bundle_digest.is_empty());
     }
 
     /// A signature nobody pushed is absent, not retryable — the plain

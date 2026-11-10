@@ -592,16 +592,8 @@ pub const RUNS_LISTING_CAP: usize = 1000;
 /// per-run jobs and log reads included, stow#853).
 pub const RANGE_READ_CONCURRENCY: usize = 8;
 
-/// The `runs` listing's page shape — `total_count` is what makes the cap
-/// visible before page 11 silently empties.
-#[derive(Debug, serde::Deserialize)]
-#[serde(bound(deserialize = "Row: serde::de::DeserializeOwned"))]
-pub struct RunsPage<Row> {
-    /// The listing's declared row count — required: a body without it is
-    /// not a runs page and must fail deserialize, never read as empty.
-    pub total_count: u64,
-    pub workflow_runs: Vec<Row>,
-}
+/// Shared GitHub workflow-run listing envelope.
+pub use stow_types::ci::CiRunsPage as RunsPage;
 
 /// A workflow-run row's identity — dedup across subdivision boundaries
 /// and the cap decision live on it.

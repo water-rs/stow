@@ -118,15 +118,15 @@ impl MeteringBackend {
         inner: &Arc<DurableDb>,
         pending: &Arc<Pending>,
         unsettled: &Arc<Unsettled>,
-        sql: String,
-        params: Vec<DbValue>,
+        sql: &str,
+        params: &[DbValue],
         write: bool,
     ) -> Result<DbExecResult, DurableDbError> {
         let mut source: &DurableDb = inner;
         let result = if write {
-            QuerySource::execute(&mut source, &sql, &params).await?
+            QuerySource::execute(&mut source, sql, params).await?
         } else {
-            QuerySource::query(&mut source, &sql, &params).await?
+            QuerySource::query(&mut source, sql, params).await?
         };
         pending.add(result.rows_read, result.rows_written);
         unsettled.add(result.rows_read, result.rows_written);
@@ -144,8 +144,8 @@ impl DurableDbBackend for MeteringBackend {
             &self.inner,
             &self.pending,
             &self.unsettled,
-            query.to_owned(),
-            params.to_vec(),
+            query,
+            params,
             false,
         )
     }
@@ -159,8 +159,8 @@ impl DurableDbBackend for MeteringBackend {
             &self.inner,
             &self.pending,
             &self.unsettled,
-            query.to_owned(),
-            params.to_vec(),
+            query,
+            params,
             true,
         )
     }
@@ -350,11 +350,22 @@ pub fn ledger_op(method: &str, path: &str) -> String {
     format!("{method} {route}")
 }
 
+#[cfg(target_arch = "wasm32")]
+fn ledger_now_ms() -> i64 {
+    super::object::now_ms()
+}
+#[cfg(not(target_arch = "wasm32"))]
+const fn ledger_now_ms() -> i64 {
+    0
+}
+
 /// Every op the day meter booked since the last reset — the
 /// `GET /budget/ledger` answer. Bounded by the number of distinct
 /// operations the object serves, never by the queue.
 pub fn ledger(graph: LoadedGraph<'_>) -> stow_types::api::SchedulerLedger {
+    let active_ms = graph.cell().probe_active_ms(ledger_now_ms());
     graph.with(|graph| stow_types::api::SchedulerLedger {
+        active_ms,
         woken_at_ms: graph.woken_at_ms,
         ops: graph
             .meter
@@ -409,10 +420,11 @@ impl skyzen::middleware::Middleware for MeterGuard {
             .extensions()
             .get::<skyzen::runtime::wasm::WasmEnv>()
             .cloned();
-        let meter = if env
+        let probe = env
             .as_ref()
-            .is_some_and(super::object::budget_probe_enabled)
-        {
+            .is_some_and(super::object::budget_probe_enabled);
+        let _invocation = probe.then(|| self.graph.probe_invocation());
+        let meter = if probe {
             meter.with_ledger_op(ledger_op(request.method().as_str(), request.uri().path()))
         } else {
             meter
@@ -604,7 +616,7 @@ mod tests {
         store::append_events(&db, None, &[mutate(), mutate()], NOW_MS)
             .await
             .expect("append");
-        store::log_tail(&db, 0).await.expect("tail");
+        store::log_page(&db, 0, u32::MAX).await.expect("tail");
         let totals = meter.settle(cell, NOW_MS).expect("a settle");
         assert!(totals.rows_written >= 2, "two appended rows");
         assert!(totals.rows_read >= 2, "the tail read both rows back");
@@ -709,7 +721,7 @@ mod tests {
         // More metered work while frozen: the meter still accrues, the
         // trip re-evaluates, and the store answers Unchanged — the email
         // count stays at one.
-        store::log_tail(&db, 0).await.expect("tail");
+        store::log_page(&db, 0, u32::MAX).await.expect("tail");
         let again = meter
             .settle_and_trip(
                 cell,
@@ -732,7 +744,7 @@ mod tests {
         let (db, meter) = metered(&owner).await;
         let sink = Sink::default();
         let cell = owner.loaded().expect("installed");
-        store::log_tail(&db, 0).await.expect("tail");
+        store::log_page(&db, 0, u32::MAX).await.expect("tail");
         let transition = meter
             .settle_and_trip(
                 cell,

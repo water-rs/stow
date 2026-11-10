@@ -2,7 +2,7 @@
   "name": "stow-edge-idle-tests",
   "private": true,
   "type": "module",
-  "scripts": { "test": "vitest run" },
+  "scripts": { "test": "vitest run && bun cpu-runtime-smoke.mjs" },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.4.0",
     "vitest": "^4.1.0",

@@ -218,6 +218,94 @@ pub enum CiEndpoint {
     },
 }
 
+impl CiEndpoint {
+    /// Read complete caller-defined rows through a caller-owned page cache.
+    /// Both status chains start together; at most two reads are in flight.
+    ///
+    /// # Errors
+    /// The page reader's failure or a Link outside this endpoint's origin.
+    pub async fn status_runs_with<P: CiRunPages>(
+        &self,
+        queued: &mut P,
+        running: &mut P,
+    ) -> Result<Vec<(P::Row, CiRunStatus)>, DispatchError> {
+        let (queued, running) = futures_lite::future::zip(
+            self.status_pages(CiRunStatus::Queued, "queued", queued),
+            self.status_pages(CiRunStatus::InProgress, "in_progress", running),
+        )
+        .await;
+        let mut rows = queued?;
+        rows.extend(running?);
+        Ok(rows)
+    }
+
+    async fn status_pages<P: CiRunPages>(
+        &self,
+        status: CiRunStatus,
+        query: &str,
+        pages: &mut P,
+    ) -> Result<Vec<(P::Row, CiRunStatus)>, DispatchError> {
+        let mut url = self.resolve(&format!(
+            "repos/{}/actions/workflows/{}/runs?status={query}&per_page=100",
+            self.repo(),
+            crate::trusted_builder::WORKFLOW_FILE,
+        ))?;
+        let mut rows = Vec::new();
+        loop {
+            let (page, next) = pages.get(self.api_request("GET", &url, None)).await?;
+            rows.extend(page.workflow_runs.into_iter().map(|row| (row, status)));
+            let Some(next) = next else { break };
+            url = self.resolve(&next)?;
+        }
+        Ok(rows)
+    }
+
+    fn repo(&self) -> &str {
+        match self {
+            Self::GitHub { repo, .. } => repo,
+            Self::Local { .. } => crate::trusted_builder::REPOSITORY,
+        }
+    }
+
+    /// Resolve a relative path or a `Link`-returned absolute URL inside
+    /// the endpoint's origin — anything else is refused, since a
+    /// followed URL carries the endpoint's credentials to a host the
+    /// API never named.
+    fn resolve(&self, path_or_url: &str) -> Result<String, DispatchError> {
+        let base = match self {
+            Self::GitHub { .. } => "https://api.github.com",
+            Self::Local { base } => base.as_str(),
+        };
+        scoped_url(base, path_or_url)
+    }
+
+    /// One API request against the endpoint — GitHub's bearer headers,
+    /// or the local server's unauthenticated POST/GET.
+    fn api_request(&self, method: &'static str, url: &str, body: Option<Vec<u8>>) -> CiRequest {
+        let mut headers = Vec::new();
+        if let Self::GitHub { token, .. } = self {
+            headers.extend([
+                (
+                    "Accept".to_owned(),
+                    "application/vnd.github+json".to_owned(),
+                ),
+                ("X-GitHub-Api-Version".to_owned(), "2022-11-28".to_owned()),
+                ("User-Agent".to_owned(), "stow-ci".to_owned()),
+                ("Authorization".to_owned(), format!("Bearer {token}")),
+            ]);
+        }
+        if body.is_some() {
+            headers.push(("Content-Type".to_owned(), "application/json".to_owned()));
+        }
+        CiRequest {
+            method,
+            url: url.to_owned(),
+            headers,
+            body,
+        }
+    }
+}
+
 /// The privileged CI interface (stow#877).
 ///
 /// One type over endpoint and transport. `status` reports
@@ -279,7 +367,7 @@ impl<T: CiTransport> CiInterface<T> {
         let body = String::from_utf8(response.body)
             .map_err(|error| DispatchError::Response(error.to_string()))?;
         decode_run_details(&body).inspect(|run| {
-            tracing::info!(
+            tracing::debug!(
                 run_id = run.workflow_run_id,
                 run_url = %run.run_url,
                 "submitted build task"
@@ -311,7 +399,7 @@ impl<T: CiTransport> CiInterface<T> {
             false,
         )?;
         self.send_checked(request).await.map(|_| ()).inspect(|()| {
-            tracing::info!(
+            tracing::debug!(
                 request_id = %dispatch.request_id,
                 attempt = dispatch.attempt,
                 "submitted resolve run"
@@ -397,9 +485,9 @@ impl<T: CiTransport> CiInterface<T> {
         struct Page {
             jobs: Vec<Job>,
         }
-        let mut url = self.resolve(&format!(
+        let mut url = self.endpoint.resolve(&format!(
             "repos/{}/actions/runs/{}/attempts/{}/jobs?per_page=100",
-            self.repo(),
+            self.endpoint.repo(),
             run.run_id,
             run.run_attempt,
         ))?;
@@ -407,7 +495,7 @@ impl<T: CiTransport> CiInterface<T> {
         let mut seen = false;
         loop {
             let response = self
-                .send_checked(self.api_request("GET", &url, None))
+                .send_checked(self.endpoint.api_request("GET", &url, None))
                 .await?;
             let page: Page = serde_json::from_slice(&response.body)
                 .map_err(|error| DispatchError::Response(error.to_string()))?;
@@ -432,68 +520,38 @@ impl<T: CiTransport> CiInterface<T> {
             let Some(next) = crate::runs::link_next(response.header("link")) else {
                 break;
             };
-            url = self.resolve(next)?;
+            url = self.endpoint.resolve(next)?;
         }
         Ok(verification)
     }
 
-    /// `build-crate.yml` runs queued and in progress, per runner
-    /// family — two API calls per query (`?status=queued` and
-    /// `?status=in_progress` on the workflow's runs listing), plus one
-    /// call per `Link` page a status runs past 100 rows.
+    /// Read queued and running builds concurrently, with at most two page
+    /// requests in flight. Each status follows its own Link chain in order.
     ///
     /// # Errors
-    ///
-    /// Returns [`DispatchError`] on a transport failure, a refused
-    /// listing, or a `Link` page pointing outside the endpoint's
-    /// origin.
-    /// The `queued` and `in_progress` `build-crate.yml` runs the
-    /// listing reports — two API calls per query plus one per `Link`
-    /// page a status runs past 100 rows.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DispatchError`] on a transport failure, a refused
-    /// listing, or a `Link` page pointing outside the endpoint's
-    /// origin.
+    /// A refused read, malformed page or next link outside the endpoint.
     pub async fn status_runs(&self) -> Result<Vec<CiRunListing>, DispatchError> {
-        let mut runs = Vec::new();
-        for (status, query) in [
-            (CiRunStatus::Queued, "queued"),
-            (CiRunStatus::InProgress, "in_progress"),
-        ] {
-            let mut url = self.resolve(&format!(
-                "repos/{}/actions/workflows/{}/runs?status={query}&per_page=100",
-                self.repo(),
-                crate::trusted_builder::WORKFLOW_FILE,
-            ))?;
-            loop {
-                let request = self.api_request("GET", &url, None);
-                let response = self.send_checked(request).await?;
-                let page: RunsPage = serde_json::from_slice(&response.body)
-                    .map_err(|error| DispatchError::Response(format!("{error}")))?;
-                runs.extend(page.workflow_runs.iter().map(|run| {
-                    let family = family_of_run_title(&run.display_title);
-                    if family.is_none() {
-                        tracing::warn!(
-                            title = %run.display_title,
-                            "build-crate run's title attributes to no runner family"
-                        );
-                    }
-                    CiRunListing {
-                        workflow_run_id: run.id,
-                        title: run.display_title.clone(),
-                        family,
-                        status,
-                    }
-                }));
-                let Some(next) = crate::runs::link_next(response.header("link")) else {
-                    break;
-                };
-                url = self.resolve(next)?;
-            }
-        }
-        Ok(runs)
+        let mut queued = TransportRunPages(self);
+        let mut running = TransportRunPages(self);
+        Ok(self
+            .endpoint
+            .status_runs_with(&mut queued, &mut running)
+            .await?
+            .into_iter()
+            .map(|(run, status)| {
+                let family = family_of_run_title(&run.display_title);
+                if family.is_none() {
+                    tracing::warn!(title = %run.display_title,
+                        "build-crate run's title attributes to no runner family");
+                }
+                CiRunListing {
+                    workflow_run_id: run.id,
+                    title: run.display_title,
+                    family,
+                    status,
+                }
+            })
+            .collect())
     }
 
     /// `build-crate.yml` runs queued and in progress, per runner
@@ -513,54 +571,6 @@ impl<T: CiTransport> CiInterface<T> {
         Ok(occupancy)
     }
 
-    /// The repository the GitHub-shaped paths address — the endpoint's
-    /// own repo on GitHub, [`crate::trusted_builder::REPOSITORY`] on
-    /// the local server (which ignores the value but serves the path).
-    fn repo(&self) -> &str {
-        match &self.endpoint {
-            CiEndpoint::GitHub { repo, .. } => repo,
-            CiEndpoint::Local { .. } => crate::trusted_builder::REPOSITORY,
-        }
-    }
-
-    /// Resolve a relative path or a `Link`-returned absolute URL inside
-    /// the endpoint's origin — anything else is refused, since a
-    /// followed URL carries the endpoint's credentials to a host the
-    /// API never named.
-    fn resolve(&self, path_or_url: &str) -> Result<String, DispatchError> {
-        let base = match &self.endpoint {
-            CiEndpoint::GitHub { .. } => "https://api.github.com",
-            CiEndpoint::Local { base } => base.as_str(),
-        };
-        scoped_url(base, path_or_url)
-    }
-
-    /// One API request against the endpoint — GitHub's bearer headers,
-    /// or the local server's unauthenticated POST/GET.
-    fn api_request(&self, method: &'static str, url: &str, body: Option<Vec<u8>>) -> CiRequest {
-        let mut headers = Vec::new();
-        if let CiEndpoint::GitHub { token, .. } = &self.endpoint {
-            headers.extend([
-                (
-                    "Accept".to_owned(),
-                    "application/vnd.github+json".to_owned(),
-                ),
-                ("X-GitHub-Api-Version".to_owned(), "2022-11-28".to_owned()),
-                ("User-Agent".to_owned(), "stow-ci".to_owned()),
-                ("Authorization".to_owned(), format!("Bearer {token}")),
-            ]);
-        }
-        if body.is_some() {
-            headers.push(("Content-Type".to_owned(), "application/json".to_owned()));
-        }
-        CiRequest {
-            method,
-            url: url.to_owned(),
-            headers,
-            body,
-        }
-    }
-
     /// The `workflow_dispatch` request for a workflow whose inputs are
     /// plain named values (GitHub's `inputs` object as given), or the
     /// local server's `event_type` event carrying them as its payload.
@@ -577,10 +587,12 @@ impl<T: CiTransport> CiInterface<T> {
                 if inputs.as_object().is_some_and(|inputs| !inputs.is_empty()) {
                     payload["inputs"] = inputs.clone();
                 }
-                let url = self.resolve(&workflow_dispatch_path(repo, workflow_file))?;
+                let url = self
+                    .endpoint
+                    .resolve(&workflow_dispatch_path(repo, workflow_file))?;
                 let body = serde_json::to_vec(&payload)
                     .map_err(|error| DispatchError::Network(error.to_string()))?;
-                Ok(self.api_request("POST", &url, Some(body)))
+                Ok(self.endpoint.api_request("POST", &url, Some(body)))
             }
             CiEndpoint::Local { base } => {
                 let payload = serde_json::json!({
@@ -589,7 +601,9 @@ impl<T: CiTransport> CiInterface<T> {
                 });
                 let body = serde_json::to_vec(&payload)
                     .map_err(|error| DispatchError::Network(error.to_string()))?;
-                Ok(self.api_request("POST", &format!("{base}/dispatch"), Some(body)))
+                Ok(self
+                    .endpoint
+                    .api_request("POST", &format!("{base}/dispatch"), Some(body)))
             }
         }
     }
@@ -617,10 +631,12 @@ impl<T: CiTransport> CiInterface<T> {
                 if return_run_details {
                     payload["return_run_details"] = serde_json::Value::Bool(true);
                 }
-                let url = self.resolve(&workflow_dispatch_path(repo, workflow_file))?;
+                let url = self
+                    .endpoint
+                    .resolve(&workflow_dispatch_path(repo, workflow_file))?;
                 let body = serde_json::to_vec(&payload)
                     .map_err(|error| DispatchError::Network(error.to_string()))?;
-                Ok(self.api_request("POST", &url, Some(body)))
+                Ok(self.endpoint.api_request("POST", &url, Some(body)))
             }
             CiEndpoint::Local { base } => {
                 let payload = serde_json::json!({
@@ -629,7 +645,9 @@ impl<T: CiTransport> CiInterface<T> {
                 });
                 let body = serde_json::to_vec(&payload)
                     .map_err(|error| DispatchError::Network(error.to_string()))?;
-                Ok(self.api_request("POST", &format!("{base}/dispatch"), Some(body)))
+                Ok(self
+                    .endpoint
+                    .api_request("POST", &format!("{base}/dispatch"), Some(body)))
             }
         }
     }
@@ -670,11 +688,43 @@ fn scoped_url(base: &str, path_or_url: &str) -> Result<String, DispatchError> {
     Ok(format!("{base}/{path_or_url}"))
 }
 
-/// GitHub's `{"total_count", "workflow_runs"}` envelope — only the
-/// title the occupancy attribution reads is decoded.
-#[derive(serde::Deserialize)]
-struct RunsPage {
-    workflow_runs: Vec<RunRow>,
+/// GitHub's workflow-run listing, retaining the caller's chosen row fields.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CiRunsPage<Row> {
+    /// Declared result count, including pages not yet read.
+    pub total_count: u64,
+    /// Complete rows; consumers choose the fields they need.
+    pub workflow_runs: Vec<Row>,
+}
+
+/// A caller-owned reader, optionally retaining each page's `ETag` and body.
+/// The interface supplies authenticated requests and validates next links.
+pub trait CiRunPages {
+    /// The caller's complete run metadata.
+    type Row;
+
+    /// Read one page and its next link without following that link.
+    fn get(
+        &mut self,
+        request: CiRequest,
+    ) -> impl Future<Output = Result<(CiRunsPage<Self::Row>, Option<String>), DispatchError>> + Send;
+}
+
+struct TransportRunPages<'a, T: CiTransport>(&'a CiInterface<T>);
+
+impl<T: CiTransport> CiRunPages for TransportRunPages<'_, T> {
+    type Row = RunRow;
+
+    async fn get(
+        &mut self,
+        request: CiRequest,
+    ) -> Result<(CiRunsPage<RunRow>, Option<String>), DispatchError> {
+        let response = self.0.send_checked(request).await?;
+        let page = serde_json::from_slice(&response.body)
+            .map_err(|error| DispatchError::Response(format!("{error}")))?;
+        let next = crate::runs::link_next(response.header("link")).map(str::to_owned);
+        Ok((page, next))
+    }
 }
 
 /// One run row — `display_title` is the `run-name`
@@ -710,17 +760,18 @@ fn decode_run_details(body: &str) -> Result<DispatchedRun, DispatchError> {
 /// provably did not happen.
 fn classify_failure(response: &CiResponse) -> DispatchError {
     let status = response.status;
-    let retry_after = response
-        .header("retry-after")
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    let primary_exhausted = response
-        .header("x-ratelimit-remaining")
-        .is_some_and(|remaining| remaining.trim() == "0");
-    if status == 429 || (status == 403 && (retry_after.is_some() || primary_exhausted)) {
-        return DispatchError::RateLimited {
-            status,
-            retry_after_secs: retry_after,
-        };
+    let headers: http::HeaderMap = response
+        .headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                http::HeaderName::from_bytes(name.as_bytes()).expect("valid CI header name"),
+                http::HeaderValue::from_str(value).expect("valid CI header value"),
+            )
+        })
+        .collect();
+    if crate::transient::rate_limit(status, &headers, 0).is_some() {
+        return DispatchError::RateLimited { status, headers };
     }
     let body = String::from_utf8_lossy(&response.body);
     let body = body.chars().take(512).collect::<String>();
@@ -752,13 +803,13 @@ pub enum DispatchError {
         body: String,
     },
     /// GitHub's rate limit answered — the write did not happen, and
-    /// `retry_after_secs` is the wait it named when it named one.
+    /// Its headers retain the recovery hints for the caller's clock.
     #[error("GitHub rate limit (HTTP {status})")]
     RateLimited {
         /// HTTP status — `429`, or a `403` carrying the limit's marks.
         status: u16,
-        /// `Retry-After` seconds the answer named, when it named one.
-        retry_after_secs: Option<u64>,
+        /// The response headers, including primary and secondary limit hints.
+        headers: http::HeaderMap,
     },
     /// The dispatch POST succeeded but its run-details body did not
     /// read or decode — the run may exist unbound, so the caller
@@ -770,6 +821,20 @@ pub enum DispatchError {
     /// bearer it bears, to a host the API never named.
     #[error("out-of-origin URL refused: {0}")]
     OutOfScope(String),
+}
+
+impl DispatchError {
+    /// The server's recovery wait at the caller's epoch-second clock.
+    /// A non-limit failure returns `None`; an unstated limit stays typed.
+    #[must_use]
+    pub fn rate_limit(&self, now: i64) -> Option<crate::transient::RateLimit> {
+        match self {
+            Self::RateLimited { status, headers } => {
+                crate::transient::rate_limit(*status, headers, now)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -973,6 +1038,55 @@ mod tests {
     }
 
     #[test]
+    fn status_starts_both_queries_before_either_finishes() {
+        struct Overlap {
+            started: Mutex<Vec<String>>,
+            waiter: Mutex<Option<std::task::Waker>>,
+        }
+        impl super::CiTransport for Overlap {
+            async fn send(&self, request: CiRequest) -> Result<CiResponse, DispatchError> {
+                self.started.lock().unwrap().push(request.url);
+                let waiter = self.waiter.lock().unwrap().take();
+                if let Some(waiter) = waiter {
+                    waiter.wake();
+                }
+                std::future::poll_fn(|cx| {
+                    if self.started.lock().unwrap().len() == 2 {
+                        std::task::Poll::Ready(())
+                    } else {
+                        *self.waiter.lock().unwrap() = Some(cx.waker().clone());
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                Ok(Stub::answer(
+                    200,
+                    &[],
+                    r#"{"total_count":0,"workflow_runs":[]}"#,
+                ))
+            }
+        }
+        let transport = Overlap {
+            started: Mutex::new(Vec::new()),
+            waiter: Mutex::new(None),
+        };
+        let interface = CiInterface::github("water-rs/stow", "token", transport);
+        let mut work = std::pin::pin!(interface.status());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let _ = work.as_mut().poll(&mut context);
+        assert_eq!(interface.transport.started.lock().unwrap().len(), 2);
+        assert_eq!(futures_lite::future::block_on(work).unwrap().total(), 0);
+        let requests = interface.transport.started.lock().unwrap();
+        assert!(requests.iter().any(|url| url.contains("status=queued")));
+        assert!(
+            requests
+                .iter()
+                .any(|url| url.contains("status=in_progress"))
+        );
+        drop(requests);
+    }
+
+    #[test]
     fn a_refused_submit_classifies() {
         let answers = vec![Stub::answer(429, &[("retry-after", "30")], "{}")];
         let stub = Stub {
@@ -982,12 +1096,40 @@ mod tests {
         let interface = CiInterface::github("water-rs/stow", "token", stub);
         let error = futures_lite::future::block_on(interface.submit("{}")).expect_err("refused");
         assert!(matches!(
-            error,
-            DispatchError::RateLimited {
-                status: 429,
-                retry_after_secs: Some(30)
-            }
+            &error,
+            DispatchError::RateLimited { status: 429, .. }
         ));
+        assert_eq!(
+            error.rate_limit(1_000),
+            Some(crate::transient::RateLimit::Wait {
+                wait: std::time::Duration::from_secs(30),
+                reset: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_primary_limit_retains_its_reset_for_the_callers_clock() {
+        let response = Stub::answer(
+            403,
+            &[
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset", "1100"),
+            ],
+            "{}",
+        );
+        let error = super::classify_failure(&response);
+        assert_eq!(
+            error.rate_limit(1_000),
+            Some(crate::transient::RateLimit::Wait {
+                wait: std::time::Duration::from_secs(102),
+                reset: Some(1_100),
+            })
+        );
+        assert_eq!(
+            super::classify_failure(&Stub::answer(429, &[], "{}")).rate_limit(1_000),
+            Some(crate::transient::RateLimit::Unstated)
+        );
     }
 
     /// A periodic dispatch is the workflow file on `main` with no

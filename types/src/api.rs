@@ -2497,6 +2497,9 @@ pub struct SchedulerRearmReport {
 /// cost` lane (stow#773) snapshots it between layers and diffs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerLedger {
+    /// Union of mock request/alarm processing intervals in this object instance.
+    /// This is handler wall time, not production billable duration.
+    pub active_ms: u64,
     /// When the object last loaded its graph, unix ms. The ledger lives
     /// on that graph and persists only through its snapshot, so a
     /// reload drops every booking since the snapshot: two reads that
@@ -3223,11 +3226,21 @@ pub struct AdminInFlight {
     pub github_run_id: Option<String>,
 }
 
-/// Per-target completion tallies over the trailing 24 hours.
+/// Current per-target queue counts and trailing-day completion tallies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AdminTargetStats {
     /// Compilation target.
     pub target: TargetTriple,
+    /// Pending nodes, including those blocked by a failed dependency.
+    pub pending: u32,
+    /// Nodes dispatched but not yet observed running.
+    pub dispatched: u32,
+    /// Nodes observed running.
+    pub running: u32,
+    /// Terminally failed nodes.
+    pub failed: u32,
+    /// Pending nodes blocked by a terminally failed dependency.
+    pub blocked: u32,
     /// Rows that completed in the window.
     pub completed_24h: u32,
     /// Rows that failed in the window.
@@ -3253,7 +3266,7 @@ pub struct AdminStatus {
     pub oldest_pending_seconds: Option<u64>,
     /// Dispatched/running rows, oldest transition first.
     pub in_flight: Vec<AdminInFlight>,
-    /// Per-target completion tallies over the trailing 24 hours.
+    /// Per-target queue counts and completion tallies over the trailing day.
     pub targets: Vec<AdminTargetStats>,
     /// Whether the dispatch-freeze breaker is engaged — dispatch stopped,
     /// enqueue still open.
@@ -6035,6 +6048,11 @@ pub enum SchedulerEvent {
         /// The pass's claims, in claim order.
         claims: Vec<DispatchClaim>,
     },
+    /// Claims known not to have created a run, returned without an attempt.
+    ClaimsRefused {
+        /// Unsent claims or claims explicitly refused by the CI rate limiter.
+        claims: Vec<DispatchClaim>,
+    },
     /// One dispatch pass's whole binding set — one row after the
     /// concurrent dispatch POSTs return.
     Bindings {
@@ -6117,6 +6135,11 @@ pub enum SchedulerEvent {
         hour: String,
         /// The step.
         kind: FeedEvent,
+    },
+    /// The earliest epoch-millisecond instant CI requests may resume.
+    CiRateLimited {
+        /// Absolute recovery deadline, retained across eviction.
+        until: i64,
     },
     /// An operator's dispatch-cap setting (stow#1039): replaces the
     /// `STOW_MAX_CONCURRENT_JOBS` / `STOW_MAX_CONCURRENT_MACOS_JOBS`
