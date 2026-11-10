@@ -1248,6 +1248,32 @@ fn full_slice(
     }
 }
 
+/// The verified `index.<target>.<rustc>` slices that exist for `rustc_version`,
+/// in `CI_TARGET_TRIPLES` order. The slice tags follow from the supported
+/// targets and the rustc, so no tag listing is needed; a target whose slice
+/// was never published is skipped.
+async fn published_slices(
+    ctx: &PullContext,
+    rustc_version: &WireRustcVersion,
+) -> stow_types::error::Result<Vec<ArtifactIndex>> {
+    let targets = CI_TARGET_TRIPLES
+        .iter()
+        .map(|target| {
+            TargetTriple::parse(*target)
+                .map_err(|error| stow_error!("CI_TARGET_TRIPLES entry {target}: {error}"))
+        })
+        .collect::<stow_types::error::Result<Vec<_>>>()?;
+    let live = futures_util::stream::iter(
+        targets
+            .iter()
+            .map(|target| ctx.live_index(target, rustc_version)),
+    )
+    .buffered(PREV_PULL_CONCURRENCY)
+    .try_collect::<Vec<_>>()
+    .await?;
+    Ok(live.into_iter().flatten().collect())
+}
+
 /// `stow-admin index reconcile`: the published slices of one rustc the
 /// scheduler does not hold at their live generation, reported in full.
 /// Every slice read is signature-verified against the index workflow's
@@ -1260,11 +1286,6 @@ async fn index_reconcile(edge: &Edge, args: IndexReconcileArgs) -> stow_types::e
     let repository = cache_repository(&rustc_version);
     let session = base.session(&repository, &http);
     let trust = stow_oci::verify::records_trust().await?;
-    let mut tags = session
-        .list_tags()
-        .await
-        .map_err(|error| stow_error!("list registry tags: {error}"))?;
-    tags.retain(|tag| tag.starts_with("index."));
     let ctx = PullContext {
         session,
         repository,
@@ -1276,28 +1297,7 @@ async fn index_reconcile(edge: &Edge, args: IndexReconcileArgs) -> stow_types::e
         .into_iter()
         .map(|slice| ((slice.target, slice.rustc_version), slice.generation))
         .collect();
-    let pulls = tags.iter().filter_map(|tag| {
-        let (target, tag_rustc) = index_tag_parts(tag)?;
-        WireRustcVersion::parse(tag_rustc)
-            .is_ok_and(|tag_rustc| tag_rustc == rustc_version)
-            .then_some((tag, target))
-    });
-    let indexes = futures_util::stream::iter(pulls.map(|(tag, target)| {
-        let ctx = &ctx;
-        let rustc_version = &rustc_version;
-        async move {
-            let target = TargetTriple::parse(target)
-                .map_err(|error| stow_error!("index tag {tag} target: {error}"))?;
-            ctx.live_index(&target, rustc_version)
-                .await?
-                .ok_or_else(|| {
-                    stow_error!("index tag {tag} listed but its manifest does not exist")
-                })
-        }
-    }))
-    .buffered(PREV_PULL_CONCURRENCY)
-    .try_collect::<Vec<_>>()
-    .await?;
+    let indexes = published_slices(&ctx, &rustc_version).await?;
     let report = unreported_slices(indexes, &reported)?;
     tracing::info!(
         slices = report.slices.len(),
@@ -1582,45 +1582,12 @@ async fn index_join(args: IndexJoinArgs) -> stow_types::error::Result<()> {
             .map_err(|error| stow_error!("--rustc-version: {error}"))?;
         let repository = cache_repository(&rustc_version);
         let session = base.session(&repository, &http);
-        let mut tags = session
-            .list_tags()
-            .await
-            .map_err(|error| stow_error!("list registry tags: {error}"))?;
-        tags.retain(|tag| tag.starts_with("index."));
-        tags.sort();
-        let pulls = tags.into_iter().filter_map(|tag| {
-            let target = index_tag_parts(&tag)?.0.to_owned();
-            Some((tag, target))
-        });
-        let pulls: Vec<_> = pulls
-            .map(|(tag, target)| {
-                let session = &session;
-                let repository = &repository;
-                let trust = &trust;
-                let rustc_version = &rustc_version;
-                async move {
-                    let Some(pulled) =
-                        stow_oci::pull_index(session, &target, rustc_version.as_str()).await?
-                    else {
-                        return Err(stow_error!(
-                            "index tag {tag} listed but its manifest does not exist"
-                        ));
-                    };
-                    let reference = session.reference(&tag)?;
-                    verify_artifact(
-                        session,
-                        trust,
-                        &reference,
-                        &repository.reference(&tag),
-                        &pulled.manifest_digest,
-                        INDEX_CERT_URL,
-                    )
-                    .await?;
-                    decode_published_slice(&reference, rustc_version, &pulled.bytes)
-                }
-            })
-            .collect();
-        slices.extend(futures_util::future::try_join_all(pulls).await?);
+        let ctx = PullContext {
+            session,
+            repository,
+            trust: trust.clone(),
+        };
+        slices.extend(published_slices(&ctx, &rustc_version).await?);
     }
 
     for entry in join_leaderboard(digests, &slices) {
@@ -2987,5 +2954,59 @@ mod tests {
             error.to_string().contains("stow-cache-v2-1.98.0"),
             "{error}"
         );
+    }
+
+    /// stow#1393: the published slices are found by probing the
+    /// `index.<target>.<rustc>` manifest of every `CI_TARGET_TRIPLES`
+    /// entry, never by listing the package's tags, and a target with no
+    /// published slice is skipped rather than an error.
+    #[test]
+    fn published_slices_probe_each_target_without_listing_tags() {
+        block_on(async {
+            // The session's `/v2/` challenge, answered without asking for a
+            // token, then one absent manifest per target.
+            let steps = std::iter::once(respond(200, "{}"))
+                .chain(CI_TARGET_TRIPLES.iter().map(|_| respond(404, "")))
+                .collect::<Vec<_>>();
+            let server = crate::test_server::Loopback::start(steps).await;
+            let base = stow_oci::RegistryBase::parse(&server.url).expect("registry base");
+            let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+                .await
+                .expect("registry http");
+            let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+            let repository = cache_repository(&rustc);
+            let ctx = PullContext {
+                session: base.session(&repository, &http),
+                repository,
+                trust: stow_oci::verify::Trust::MockKey(std::path::PathBuf::new()),
+            };
+            let slices = published_slices(&ctx, &rustc).await;
+            let paths = server
+                .join()
+                .await
+                .iter()
+                .map(|request| request.head.uri.path().to_owned())
+                .collect::<Vec<_>>();
+            let slices = slices.unwrap_or_else(|error| panic!("{error}: {paths:?}"));
+            assert_eq!(slices, Vec::<ArtifactIndex>::new());
+            let (challenge, manifests) = paths.split_first().expect("the challenge");
+            assert_eq!(challenge, "/v2/");
+            // The pulls run concurrently, so their arrival order is not
+            // the target order.
+            let asked = manifests
+                .iter()
+                .map(|path| path.rsplit('/').next().expect("a path segment"))
+                .collect::<std::collections::BTreeSet<_>>();
+            let expected = CI_TARGET_TRIPLES
+                .iter()
+                .map(|target| format!("index.{target}.{RUSTC}"))
+                .collect::<Vec<_>>();
+            assert_eq!(manifests.len(), expected.len(), "{paths:?}");
+            assert_eq!(
+                asked,
+                expected.iter().map(String::as_str).collect(),
+                "{paths:?}"
+            );
+        });
     }
 }

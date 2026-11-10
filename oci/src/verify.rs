@@ -144,7 +144,7 @@ pub fn verify_materials(
 }
 
 /// The verification material a caller resolved for its verify mode.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Trust {
     /// Fulcio/Rekor with a pinned GitHub certificate identity.
     GithubCi(std::sync::Arc<TrustMaterial>),
