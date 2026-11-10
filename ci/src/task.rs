@@ -640,12 +640,12 @@ async fn stage_consumption_store(
     Option<PathBuf>,
     Vec<stow_types::records::LocalProcMacro>,
 )> {
-    let packages = consumption_packages(task, unit_graphs)?;
-    if packages.libraries.is_empty() && packages.scripts.is_empty() {
+    let scripts = consumption_scripts(task, unit_graphs)?;
+    if task.dependency_subgraph.nodes.is_empty() && scripts.is_empty() {
         return Ok((None, None, Vec::new()));
     }
     let store_dir = TempDir::new()?;
-    let consumption = consume::prefetch(task, packages, store_dir.path())
+    let consumption = consume::prefetch(task, scripts, store_dir.path())
         .await
         .map_err(|error| error.wrap_err("stage cache consumption"))?;
     Ok(if consumption.artifacts > 0 {
@@ -854,15 +854,13 @@ pub async fn phase_unit_graphs(
     Ok(graphs)
 }
 
-/// The consumable set across every phase×invocation unit graph.
-fn consumption_packages(
+/// The crates.io build scripts across every phase×invocation unit graph.
+fn consumption_scripts(
     task: &BuildTaskPayload,
     unit_graphs: &[PhaseUnitGraph],
-) -> stow_types::error::Result<dep_scan::ConsumablePackages> {
+) -> stow_types::error::Result<Vec<dep_scan::ConsumablePackage>> {
     let mut scripts = BTreeSet::new();
-    let mut entries = Vec::new();
     for unit_graph in unit_graphs {
-        entries.extend(unit_graph.graph.entries.iter().cloned());
         for unit in unit_graph.task_units(runner_host_triple(task)?)? {
             if unit.is_crates_io
                 && unit.key.kind == stow_types::unit_graph::TaskUnitKind::BuildScript
@@ -871,15 +869,11 @@ fn consumption_packages(
                     crate_name: unit.name,
                     version: semver::Version::parse(&unit.version)?,
                     features: unit.features.into_iter().collect(),
-                    host_side: true,
                 });
             }
         }
     }
-    Ok(dep_scan::ConsumablePackages {
-        libraries: dep_scan::consumable_packages(task, &entries),
-        scripts: scripts.into_iter().collect(),
-    })
+    Ok(scripts.into_iter().collect())
 }
 
 /// The compiled dependency-context gate (stow#588): every phase×invocation

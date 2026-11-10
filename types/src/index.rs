@@ -163,6 +163,26 @@ impl ArtifactIndexRow {
     }
 }
 
+impl ArtifactIndex {
+    /// The task id of the node that published `row` into this slice — the
+    /// id a dependent's pinned subtree carries for it.
+    ///
+    /// # Errors
+    /// Mirrors [`ArtifactIndexRow::dependency_identity`].
+    pub fn row_task_id(&self, row: &ArtifactIndexRow) -> crate::error::Result<String> {
+        Ok(crate::task_graph::TaskNodeIdentity::of_published_row(
+            &row.crate_name,
+            &row.version,
+            &row.features_json,
+            &self.header.target,
+            &self.header.rustc_version,
+            row.unit_shape.side,
+            row.node_profile,
+        )
+        .task_id(&row.dependency_identity()?))
+    }
+}
+
 /// The OCI tag of the index artifact for one slice:
 /// `index.<target>.<rustc_short>` on `ghcr.io/water-rs/stow-cache-v2-<rustc>`.
 ///

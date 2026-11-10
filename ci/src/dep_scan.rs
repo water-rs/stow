@@ -6,7 +6,7 @@ use async_process::Command;
 use cargo_metadata::{Metadata, Package, Target, TargetKind};
 use futures_util::StreamExt;
 use sha2::Digest as _;
-use stow_types::api::{BuildTaskPayload, ResolvedDependencyGraphEntry};
+use stow_types::api::BuildTaskPayload;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
 use stow_types::unit_graph::{TaskUnitKind, TaskUnitSide};
@@ -280,52 +280,11 @@ async fn plan_selected(
     Ok((artifacts, programs))
 }
 
-/// The consumable set: every registry unit this build's own cargo unit
-/// graph compiles, at the per-side feature set cargo activated for it —
-/// the same identities a consumer's build computes, so a dep the build
-/// can compile is always staged and one it cannot is never fetched
-/// (stow#589). The task crate itself is excluded: a re-run after a
-/// successful publish must never consume the artifact the task exists
-/// to produce.
-pub fn consumable_packages(
-    task: &BuildTaskPayload,
-    entries: &[ResolvedDependencyGraphEntry],
-) -> Vec<ConsumablePackage> {
-    entries
-        .iter()
-        // Only the task's own node is never consumable — it is the one
-        // unit the task exists to produce. An outcome-3 host task
-        // legitimately serves its crate's target-side twin: same name,
-        // version and features, the other side (stow#723).
-        .filter(|entry| {
-            entry.crate_name.as_str() != task.crate_name.as_str()
-                || &entry.version != task.version.as_semver()
-                || entry.host_side != task.host_side
-                || entry.features.iter().cloned().collect::<BTreeSet<_>>()
-                    != task
-                        .features_json
-                        .features()
-                        .iter()
-                        .cloned()
-                        .collect::<BTreeSet<_>>()
-        })
-        .map(|entry| ConsumablePackage {
-            crate_name: entry.crate_name.as_str().to_owned(),
-            version: entry.version.clone(),
-            features: entry.features.iter().cloned().collect(),
-            host_side: entry.host_side,
-        })
-        .collect()
-}
-
-/// The library nodes and build-script outputs this task may consume.
-pub struct ConsumablePackages {
-    pub libraries: Vec<ConsumablePackage>,
-    pub scripts: Vec<ConsumablePackage>,
-}
-
-/// One unit of the build workspace's own unit graph — a
-/// consumption-prefetch candidate.
+/// One build script of the build workspace's own unit graph — a
+/// consumption-prefetch candidate (stow#589). A script's row records the
+/// host shape whichever side its crate's node is on, so the unit graph is
+/// what names it; library rows are named by the pinned subtree's nodes
+/// instead (#1415).
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ConsumablePackage {
     /// Canonical package name.
@@ -335,9 +294,6 @@ pub struct ConsumablePackage {
     /// The feature set cargo activated for this unit — the identity the
     /// dep's own task published it under.
     pub(crate) features: BTreeSet<String>,
-    /// Which half of the unit graph the unit compiles on: proc-macros,
-    /// build dependencies and their subtree are host-side.
-    pub(crate) host_side: bool,
 }
 
 /// Re-hash every output of every selected capture — the snapshot when the
@@ -3890,172 +3846,6 @@ mod tests {
         });
     }
 
-    /// stow#589: the consumable set is the build workspace's own cargo
-    /// unit graph — a build-script dep lands host-side and a transitive
-    /// dep of a pinned crate lands target-side, each at the feature set
-    /// cargo activated — while the task crate itself never becomes
-    /// consumable. The fixture is the graph `cargo --unit-graph` emits
-    /// for a native spelling of a target-side task whose manifest pins
-    /// `direct-dep` and build-dep `host-dep`.
-    #[test]
-    fn consumable_packages_follow_the_builds_unit_graph() {
-        // `path+` units' manifests are hashed at parse — the wrapper's
-        // pkg id must name a real manifest, and a spaced directory
-        // exercises the file-URL percent-encoding `path_pkg_root`
-        // decodes.
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let project = tempdir.path().join("wrapper workspace");
-        std::fs::create_dir(&project).expect("wrapper dir");
-        std::fs::write(
-            project.join("Cargo.toml"),
-            "[package]\nname = \"stow-ci-wrapper\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
-        )
-        .expect("write wrapper manifest");
-        let wrapper_url = url::Url::from_directory_path(&project).expect("dir url");
-        let wrapper_pkg = format!("path+{wrapper_url}#stow-ci-wrapper@0.0.0");
-        let mut graph_json: serde_json::Value =
-            serde_json::from_str(UNIT_GRAPH_JSON).expect("fixture parses");
-        for index in [0usize, 1] {
-            graph_json["units"][index]["pkg_id"] = serde_json::Value::String(wrapper_pkg.clone());
-        }
-        let graph_json = serde_json::to_vec(&graph_json).expect("serialize fixture");
-        let graph = stow_cli::expanded_dependency_graph(
-            &graph_json,
-            None,
-            "x86_64-unknown-linux-gnu",
-            &stow_types::identity::WireRustcVersion::parse("1.99.0").unwrap(),
-        )
-        .expect("unit graph parses");
-
-        let task = BuildTaskPayload {
-            task_id: "task-crate-1.2.3".to_owned(),
-            attempt: 1,
-            crate_name: stow_types::identity::CrateName::parse("task-crate").unwrap(),
-            version: stow_types::identity::CrateVersion::new(semver::Version::new(1, 2, 3)),
-            features_json: stow_types::identity::FeaturesJson::default(),
-            target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
-            rustc_version: stow_types::identity::WireRustcVersion::parse("1.99.0").unwrap(),
-            preserve_lockfile: false,
-            host_side: false,
-            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
-            dependency_subgraph: stow_types::api::TaskSubgraph {
-                root_deps: Vec::new(),
-                nodes: Vec::new(),
-            },
-            profile: stow_types::node_profile::NodeProfile::Dev,
-        };
-        let packages = super::consumable_packages(&task, &graph.entries);
-        let found = packages
-            .iter()
-            .map(|package| {
-                (
-                    package.crate_name.as_str(),
-                    package.version.to_string(),
-                    package.features.iter().cloned().collect::<Vec<_>>(),
-                    package.host_side,
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            found,
-            BTreeSet::from([
-                (
-                    "direct-dep",
-                    "2.0.0".to_owned(),
-                    vec!["compress".to_owned()],
-                    false
-                ),
-                ("host-dep", "3.1.0".to_owned(), vec![], true),
-                ("transitive-dep", "0.4.0".to_owned(), vec![], false),
-                // stow#723: only the task's own *node* — name, version,
-                // side and feature set — is never consumable. The
-                // task's package at another feature set is a different
-                // node and is served like any other.
-                (
-                    "task-crate",
-                    "1.2.3".to_owned(),
-                    vec!["std".to_owned()],
-                    false
-                ),
-            ]),
-            "the whole closure — build-script deps host-side, transitives target-side — is consumable at activated features"
-        );
-    }
-
-    /// The `cargo --unit-graph` shape a native-spelling phase emits for a
-    /// target-side task: the generated wrapper's lib unit (root) spells
-    /// the task crate as a normal dep and hangs `[build-dependencies]`
-    /// under its own custom-build unit. `@WRAPPER@` fills in the path pkg
-    /// id, which must name a real manifest.
-    const UNIT_GRAPH_JSON: &str = r#"{
-        "version": 1,
-        "units": [
-            {
-                "pkg_id": "@WRAPPER@",
-                "target": {"kind": ["lib"]},
-                "platform": "aarch64-apple-darwin",
-                "mode": "build",
-                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
-                "features": [],
-                "dependencies": [
-                    {"index": 1, "extern_crate_name": "stow_ci_wrapper"},
-                    {"index": 2, "extern_crate_name": "task_crate"}
-                ]
-            },
-            {
-                "pkg_id": "@WRAPPER@",
-                "target": {"kind": ["custom-build"]},
-                "platform": "aarch64-apple-darwin",
-                "mode": "build",
-                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
-                "features": [],
-                "dependencies": [
-                    {"index": 4, "extern_crate_name": "host_dep"}
-                ]
-            },
-            {
-                "pkg_id": "registry+https://github.com/rust-lang/crates.io-index#task-crate@1.2.3",
-                "target": {"kind": ["lib"]},
-                "platform": "aarch64-apple-darwin",
-                "mode": "build",
-                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
-                "features": ["std"],
-                "dependencies": [
-                    {"index": 3, "extern_crate_name": "direct_dep"}
-                ]
-            },
-            {
-                "pkg_id": "registry+https://github.com/rust-lang/crates.io-index#direct-dep@2.0.0",
-                "target": {"kind": ["lib"]},
-                "platform": "aarch64-apple-darwin",
-                "mode": "build",
-                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
-                "features": ["compress"],
-                "dependencies": [
-                    {"index": 5, "extern_crate_name": "transitive_dep"}
-                ]
-            },
-            {
-                "pkg_id": "registry+https://github.com/rust-lang/crates.io-index#host-dep@3.1.0",
-                "target": {"kind": ["lib"]},
-                "platform": "aarch64-apple-darwin",
-                "mode": "build",
-                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
-                "features": [],
-                "dependencies": []
-            },
-            {
-                "pkg_id": "registry+https://github.com/rust-lang/crates.io-index#transitive-dep@0.4.0",
-                "target": {"kind": ["lib"]},
-                "platform": "aarch64-apple-darwin",
-                "mode": "build",
-                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
-                "features": [],
-                "dependencies": []
-            }
-        ],
-        "roots": [0]
-    }"#;
     /// stow#736: a `KeysAsNative` contract is wrong when the task's own
     /// unit's `--extern` set holds a proc-macro — the flag the
     /// resolution handed down and the compiled graph disagree, and
