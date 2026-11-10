@@ -2271,8 +2271,38 @@ pub const DRIVES: &[Drive] = &[
         // size is held across fixtures; its cost is bounded by the
         // report's own membership. The tail's claims are restored by the
         // cleanup, so the alarm-pass drives still see the planted window.
+        //
+        // stow#1379: the published masks live in a keyed table, so the
+        // report reads the slice's members from it. The setup lands the
+        // same report and snapshots it, which moves the 100 members out
+        // of the overlay into the table; the measured report then pages
+        // them back and drops none.
         name: "POST /index/published (full)",
-        setup: None,
+        setup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                routes::slice_reports(
+                    ctx.loaded(),
+                    db,
+                    &[PublishedSlice {
+                        target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
+                        rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
+                        base_generation: None,
+                        generation: 1,
+                        part: 0,
+                        parts: 1,
+                        added: fixture::full_slice_report(),
+                        retired: Vec::new(),
+                    }],
+                    Some(DRIVE_ACTOR),
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?;
+                routes::snapshot(ctx.loaded(), db, now_ms())
+                    .await
+                    .map_err(text)
+            })
+        }),
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
                 routes::slice_reports(
@@ -3552,7 +3582,10 @@ pub const DRIVES: &[Drive] = &[
         // `SNAPSHOT_EVENT_THRESHOLD`-bounded tail. Rows are billed,
         // statements are not: the chunks are 64 KiB rows read 16 to a
         // statement, the tail pages 16 rows to a statement — the
-        // derivation is the drive's budget row in `DO_BUDGETS`.
+        // derivation is the drive's budget row in `DO_BUDGETS`. The
+        // published masks are table rows, not chunks (stow#1379): the
+        // replay reads the rows its tail events name, one keyed
+        // statement per event that needs any.
         name: "wake (snapshot + log replay)",
         // An evicted isolate wakes empty: the live graph is dropped
         // first, so the wake never sits beside a second graph.
@@ -3583,7 +3616,9 @@ pub const DRIVES: &[Drive] = &[
         // events since the last one, never with the stored graph. A
         // dirty span rewrites its whole range as 64 KiB rows (up to 13
         // for the widest), upserted 16 to a statement; the derivation
-        // is the drive's budget row in `DO_BUDGETS`.
+        // is the drive's budget row in `DO_BUDGETS`. The turn also
+        // writes the published overlay (the batch's slice report) to the
+        // `published` table and clears it (stow#1379).
         name: "snapshot write",
         setup: Some(|db, shape, settings, ctx| {
             Box::pin(async move {

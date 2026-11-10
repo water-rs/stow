@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
-use crate::scheduler::graph::{DigestSource, RootProbe};
+use crate::scheduler::graph::{DigestSource, ReadSource, RootProbe};
 use skyzen_services::durable::Alarm;
 use stow_types::identity::TargetTriple;
 
@@ -558,7 +558,7 @@ pub fn crate_request_status(
     graph: &crate::scheduler::graph::Graph,
     request_id: &str,
     now: i64,
-    digests: &mut impl DigestSource,
+    digests: &mut impl ReadSource,
 ) -> Result<Option<stow_types::api::CrateRequestStatus>, QueueError> {
     match load_request(graph, request_id) {
         Some(record) => Ok(Some(request_record_status(record, |ids: &[String]| {
