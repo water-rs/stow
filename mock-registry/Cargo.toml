@@ -33,6 +33,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 tempfile = "3"
+# The concurrent-publish test parks both signs on a barrier under a timeout.
+tokio = { version = "1", features = ["sync", "time"] }
 # The keyless-signing tests' mock Sigstore: a Fulcio issuing under a
 # throwaway CA, a Rekor signing canonical entry timestamps, and the
 # concurrent sweep they publish.

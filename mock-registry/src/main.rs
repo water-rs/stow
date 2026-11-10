@@ -3370,6 +3370,54 @@ mod tests {
         .expect("push succeeds");
     }
 
+    /// A task's artifacts publish together: each signature completes only
+    /// once both artifacts' signs are in flight, so a one-by-one publish
+    /// times out instead of finishing.
+    #[tokio::test]
+    async fn artifacts_publish_concurrently() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let first = test_plan(root.path());
+        let mut second = test_plan(root.path());
+        second.oci_reference = second.oci_reference.replace("serde.1.0.0", "serde.1.0.1");
+        assert_ne!(first.oci_reference, second.oci_reference);
+        let (listen, _probe) = serve_probe_registry(root.path()).await;
+        let sign = mock_sign(root.path());
+        let both_signing = tokio::sync::Barrier::new(2);
+
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
+        let session = push_session(&listen, &http, &ample_writes());
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stow_oci::push_artifacts_with(
+                &session,
+                &[first.clone(), second.clone()],
+                |oci_reference: String, manifest_digest: String| {
+                    let (sign, both_signing) = (&sign, &both_signing);
+                    async move {
+                        both_signing.wait().await;
+                        sign(oci_reference, manifest_digest).await
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("both artifacts reach signing together")
+        .expect("push succeeds");
+
+        assert_eq!(outcome.newly_pushed, 2);
+        assert_eq!(
+            outcome
+                .published_by_reference
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![first.oci_reference.clone(), second.oci_reference.clone()]
+        );
+    }
+
     /// Either blob's refusal prevents signing and publishing the manifest.
     #[tokio::test]
     async fn failed_blob_upload_never_publishes_a_manifest() {
