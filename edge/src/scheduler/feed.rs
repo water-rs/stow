@@ -46,7 +46,7 @@ use stow_types::api::{
     DemandFeedUnfinished, SchedulerDemandRequest, SchedulerEvent,
 };
 
-use super::graph::Graph;
+use super::graph::{DigestSource, Graph};
 use super::queue::{self, AlarmPlan, SchedulerSettings};
 use crate::errors::QueueError;
 
@@ -338,6 +338,7 @@ pub fn feed_deliver(
     hour: &DemandFeedHour,
     now_ms: i64,
     settings: &SchedulerSettings,
+    digests: &mut impl DigestSource,
 ) -> Result<(DemandFeedDeliverReport, Vec<SchedulerEvent>, AlarmPlan), QueueError> {
     hour.ensure_closed(now_ms / 1_000)
         .map_err(QueueError::Invariant)?;
@@ -384,7 +385,8 @@ pub fn feed_deliver(
             batch_id: format!("{DEMAND_FEED_BATCH_PREFIX}{hour}/{next_page}"),
             entries: session.staged[next_page].clone(),
         };
-        let (report, demand_event, _plan) = queue::demand_pass(graph, &request, now_ms, settings)?;
+        let (report, demand_event, _plan) =
+            queue::demand_pass(graph, &request, now_ms, settings, digests)?;
         let mut events = Vec::new();
         if let Some(event) = demand_event {
             events.push(event);
@@ -624,7 +626,8 @@ mod tests {
         g: &mut Graph,
         hour: &DemandFeedHour,
     ) -> Result<DemandFeedDeliverReport, QueueError> {
-        let (report, events, _) = feed_deliver(g, hour, NOW_MS, &settings())?;
+        let (report, events, _) =
+            feed_deliver(g, hour, NOW_MS, &settings(), &mut g.test_digest_source())?;
         for event in &events {
             g.apply(event, NOW_MS);
         }
@@ -841,7 +844,9 @@ mod tests {
         let h = hour(H1);
         let pages = vec![vec![entry("alpha", 1)], vec![entry("beta", 1)]];
         stage_and_freeze(&mut g, &h, &pages);
-        let (first, events, _) = feed_deliver(&g, &h, NOW_MS, &settings()).expect("deliver page 0");
+        let (first, events, _) =
+            feed_deliver(&g, &h, NOW_MS, &settings(), &mut g.test_digest_source())
+                .expect("deliver page 0");
         assert_eq!(first.delivered_page, Some(0));
         assert!(first.applied, "first delivery accepts the batch");
         // Only the demand fold lands; the ack is lost.
@@ -854,7 +859,8 @@ mod tests {
         // The redelivery finds the batch accepted: same frozen bytes,
         // zero fold.
         let (replay, events, _) =
-            feed_deliver(&g, &h, NOW_MS, &settings()).expect("lost-ack redelivery");
+            feed_deliver(&g, &h, NOW_MS, &settings(), &mut g.test_digest_source())
+                .expect("lost-ack redelivery");
         assert_eq!(replay.delivered_page, Some(0));
         assert!(!replay.applied, "same bytes replay as the accepted batch");
         assert!(

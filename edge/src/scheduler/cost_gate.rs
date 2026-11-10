@@ -43,6 +43,20 @@ use super::test_db::{LoggedStatement, counting_memory_db};
 /// costs the same at any size.
 const BULK_DRIVES: &[&str] = &["wake (snapshot + log replay)", "snapshot write"];
 
+/// The listings that mint a task id per row they return: each reads one
+/// digest row per listed row, so its cost follows the matching rows
+/// until `ADMIN_LIST_LIMIT` caps them — and never grows past its budget,
+/// which states that cap.
+const LISTING_DRIVES: &[&str] = &[
+    "GET /tasks",
+    "GET /tasks?status=failed",
+    "GET /tasks?status=pending",
+    "GET /tasks?status=blocked",
+    "GET /tasks?target=…",
+    "GET /tasks?crate=…",
+    "GET /tasks?older_than=86400",
+];
+
 /// One measured drive run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Measured {
@@ -348,14 +362,15 @@ async fn capacity_drives_include_external_occupancy() {
 }
 
 /// Event drives cost the same at any fixture size: two sizes, and no
-/// drive but the bulk ones may grow past the shared growth tolerance.
+/// drive but the bulk ones and the capped listings may grow past the
+/// shared growth tolerance.
 #[tokio::test]
 async fn event_drives_are_flat_across_fixture_sizes() {
     let small = measure_all(FixtureShape { queue_rows: 5_000 }).await;
     let large = measure_all(fixture::GATE).await;
     for (small, large) in small.iter().zip(&large) {
         assert_eq!(small.name, large.name);
-        if BULK_DRIVES.contains(&small.name) {
+        if BULK_DRIVES.contains(&small.name) || LISTING_DRIVES.contains(&small.name) {
             continue;
         }
         #[expect(

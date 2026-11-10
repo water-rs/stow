@@ -139,58 +139,87 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 100,
     },
     DriveBudget {
+        // stow#1378: the in-flight rows' task ids are minted from their
+        // digest rows in one statement. A digest read bills two rows
+        // read (the `json_each` list row and the `node_digests` row;
+        // the sqlite test backend's meter counts only the table row).
+        // The bound is the in-flight section, at most the dispatch cap
+        // (45 at the gate's settings): 4 + 2×45 reads, 2 + 1 statements.
         name: "GET /admin/status",
-        statements: 2,
-        rows_read: 4,
+        statements: 3,
+        rows_read: 94,
         rows_written: 4,
         wall_ms: 200,
     },
     DriveBudget {
+        // stow#1378: a listing mints the task id of each unnamed row it
+        // returns and, for a blocked row, its failed dependency's, from
+        // digest rows in one statement; each digest read bills two rows
+        // read (the list row and the table row; the sqlite test
+        // backend's meter counts only the table row). The bound is
+        // `ADMIN_LIST_LIMIT` (500) rows plus at most as many blocked-by
+        // ids: 4 + 2×1,000 reads, 2 + 1 statements, at any population.
         name: "GET /tasks",
-        statements: 2,
-        rows_read: 4,
+        statements: 3,
+        rows_read: 2004,
         rows_written: 4,
         wall_ms: 150,
     },
     DriveBudget {
+        // stow#1378: failed rows name no blocked-by id, so the bound is
+        // `ADMIN_LIST_LIMIT` (500) digest reads of two rows each:
+        // 4 + 2×500, 2 + 1.
         name: "GET /tasks?status=failed",
-        statements: 2,
-        rows_read: 4,
+        statements: 3,
+        rows_read: 1004,
         rows_written: 4,
         wall_ms: 150,
     },
     DriveBudget {
+        // stow#1378: as the unfiltered listing — a pending row may be
+        // blocked: 4 + 2×(500 rows + 500 blocked-by ids) reads,
+        // 2 + 1 statements.
         name: "GET /tasks?status=pending",
-        statements: 2,
-        rows_read: 4,
+        statements: 3,
+        rows_read: 2004,
         rows_written: 4,
         wall_ms: 150,
     },
     DriveBudget {
+        // stow#1378: as the unfiltered listing — every row is blocked
+        // and names its failed dependency: 4 + 2×(500 + 500) reads,
+        // 2 + 1 statements.
         name: "GET /tasks?status=blocked",
-        statements: 2,
-        rows_read: 4,
+        statements: 3,
+        rows_read: 2004,
         rows_written: 4,
         wall_ms: 200,
     },
     DriveBudget {
+        // stow#1378: as the unfiltered listing: 4 + 2×(500 + 500)
+        // reads, 2 + 1 statements.
         name: "GET /tasks?target=…",
-        statements: 2,
-        rows_read: 4,
+        statements: 3,
+        rows_read: 2004,
         rows_written: 4,
         wall_ms: 150,
     },
     DriveBudget {
+        // stow#1378: a listing like the others, bounded by
+        // `ADMIN_LIST_LIMIT` rather than by the name's version set:
+        // 4 + 2×(500 + 500) reads, 2 + 1 statements.
         name: "GET /tasks?crate=…",
-        statements: 2,
-        rows_read: 4,
+        statements: 3,
+        rows_read: 2004,
         rows_written: 4,
         wall_ms: 150,
     },
     DriveBudget {
+        // stow#1378: as the unfiltered listing: 4 + 2×(500 + 500)
+        // reads, 2 + 1 statements.
         name: "GET /tasks?older_than=86400",
-        statements: 2,
-        rows_read: 4,
+        statements: 3,
+        rows_read: 2004,
         rows_written: 4,
         wall_ms: 150,
     },
@@ -251,10 +280,16 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 150,
     },
     DriveBudget {
+        // stow#1378: the tree's fresh nodes upsert their digest rows (at
+        // most the tree's 2 nodes: 2 written, 1 statement) and the
+        // post-merge probe mints at most one blocked-by id per root
+        // (2 roots: 2 read, 1 statement). A digest write bills two rows
+        // read and one written, a digest read two rows read: 4 + 2
+        // statements, 6 + 2×2 + 2×2 reads, 6 + 2 writes.
         name: "POST /requests/{id}/outcome",
-        statements: 4,
-        rows_read: 6,
-        rows_written: 6,
+        statements: 6,
+        rows_read: 14,
+        rows_written: 8,
         wall_ms: 600,
     },
     DriveBudget {
@@ -272,17 +307,24 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 300,
     },
     DriveBudget {
+        // stow#1378: the batch's fresh nodes (3 named nodes over its two
+        // trees) upsert their digest rows in one statement; a digest
+        // write bills two rows read and one written: 4 + 1 statements,
+        // 6 + 2×3 reads, 6 + 3 writes.
         name: "POST /enqueue (untrusted accept)",
-        statements: 4,
-        rows_read: 6,
-        rows_written: 6,
+        statements: 5,
+        rows_read: 12,
+        rows_written: 9,
         wall_ms: 600,
     },
     DriveBudget {
+        // stow#1378: as the untrusted accept — 3 fresh nodes, one digest
+        // upsert statement: 3 + 1 statements, 5 + 2×3 reads, 5 + 3
+        // writes.
         name: "POST /admin/enqueue (trusted)",
-        statements: 3,
-        rows_read: 5,
-        rows_written: 5,
+        statements: 4,
+        rows_read: 11,
+        rows_written: 8,
         wall_ms: 400,
     },
     DriveBudget {
@@ -300,17 +342,21 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
+        // stow#1378: one fresh node, one digest upsert statement:
+        // 3 + 1 statements, 5 + 2×1 reads (a digest write bills two
+        // rows read), 5 + 1 writes.
         name: "POST /tasks/submit (operations)",
-        statements: 3,
-        rows_read: 5,
-        rows_written: 5,
+        statements: 4,
+        rows_read: 7,
+        rows_written: 6,
         wall_ms: 400,
     },
     DriveBudget {
+        // stow#1378: as the operations lane — one fresh node.
         name: "POST /tasks/submit (preheat)",
-        statements: 3,
-        rows_read: 5,
-        rows_written: 5,
+        statements: 4,
+        rows_read: 7,
+        rows_written: 6,
         wall_ms: 400,
     },
     DriveBudget {
@@ -335,51 +381,70 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 500,
     },
     DriveBudget {
+        // stow#1378: as the operations lane — one fresh node.
         name: "POST /tasks/submit (inexact-hit)",
-        statements: 3,
-        rows_read: 5,
-        rows_written: 5,
+        statements: 4,
+        rows_read: 7,
+        rows_written: 6,
         wall_ms: 400,
     },
     DriveBudget {
+        // stow#1378: each task the batch touches mints its id from its
+        // digest row in one statement; a digest read bills two rows
+        // read. The drive's closure is its keyed root plus the root's
+        // 11 unmet dependencies, a fixture constant: 5 + 2×12 reads,
+        // 3 + 1 statements.
         name: "POST /demand",
-        statements: 3,
-        rows_read: 5,
+        statements: 4,
+        rows_read: 29,
         rows_written: 5,
         wall_ms: 500,
     },
     DriveBudget {
+        // stow#1378: the inline claim pass mints the ids it claims from
+        // their digest rows in one statement, two rows read per digest
+        // read; claims are bounded by the dispatch cap (45 at the
+        // gate's settings): 4 + 1 statements, 6 + 2×45 reads.
         name: "POST /index/published (full)",
-        statements: 4,
-        rows_read: 6,
+        statements: 5,
+        rows_read: 96,
         rows_written: 6,
         wall_ms: 500,
     },
     DriveBudget {
+        // stow#1378: as the full report — claims bounded by the dispatch
+        // cap: 4 + 1 statements, 6 + 2×45 reads.
         name: "POST /index/published (part)",
-        statements: 4,
-        rows_read: 6,
+        statements: 5,
+        rows_read: 96,
         rows_written: 6,
         wall_ms: 500,
     },
     DriveBudget {
+        // stow#1378: as the full report — claims bounded by the dispatch
+        // cap: 4 + 1 statements, 6 + 2×45 reads.
         name: "POST /index/published (delta)",
-        statements: 4,
-        rows_read: 6,
+        statements: 5,
+        rows_read: 96,
         rows_written: 6,
         wall_ms: 500,
     },
     DriveBudget {
+        // stow#1378: the claim mints its ids from their digest rows in
+        // one statement, two rows read per digest read, at most the
+        // dispatch cap (45): 3 + 1 statements, 5 + 2×45 reads.
         name: "alarm pass (floor claim)",
-        statements: 3,
-        rows_read: 5,
+        statements: 4,
+        rows_read: 95,
         rows_written: 5,
         wall_ms: 3,
     },
     DriveBudget {
+        // stow#1378: as the floor claim — claims bounded by the dispatch
+        // cap (45): 4 + 1 statements, 6 + 2×45 reads.
         name: "alarm pass",
-        statements: 4,
-        rows_read: 6,
+        statements: 5,
+        rows_read: 96,
         rows_written: 6,
         wall_ms: 3,
     },
@@ -402,9 +467,12 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // freed slots' `Claims` and `Bindings` — the same shape as
         // `POST /tasks/complete-run (dispatching)`; the workerd
         // absolute awaits a probe run.
+        // stow#1378: its `Claims` mint their ids from digest rows, at
+        // most the dispatch cap (45) in one statement, two rows read
+        // per digest read: 5 + 1 statements, 7 + 2×45 reads.
         name: "POST /dispatch-cap",
-        statements: 5,
-        rows_read: 7,
+        statements: 6,
+        rows_read: 97,
         rows_written: 7,
         wall_ms: 500,
     },
@@ -446,9 +514,13 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 150,
     },
     DriveBudget {
+        // stow#1378: the re-claim mints its ids from digest rows, one
+        // read each in one statement; the stale claims are in flight,
+        // so at most the dispatch cap (45); two rows read per digest
+        // read: 2 + 1 statements, 4 + 2×45 reads.
         name: "alarm pass (stale recovery)",
-        statements: 2,
-        rows_read: 4,
+        statements: 3,
+        rows_read: 94,
         rows_written: 4,
         wall_ms: 300,
     },
@@ -458,9 +530,12 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // and `Bindings` — the host gate measured 3/3/3; the workerd
         // absolute awaits a mock-stack `stow-admin scheduler budget`
         // run.
+        // stow#1378: the pass's claims mint their ids from digest rows,
+        // at most the dispatch cap (45) in one statement, two rows
+        // read per digest read: 5 + 1 statements, 7 + 2×45 reads.
         name: "POST /tasks/complete-run (dispatching)",
-        statements: 5,
-        rows_read: 7,
+        statements: 6,
+        rows_read: 97,
         rows_written: 7,
         wall_ms: 500,
     },
@@ -468,9 +543,12 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // stow#940 provisional: the slice append plus the inline
         // pass's `Claims` and `Bindings` — host-measured 3/3/3; the
         // workerd absolute awaits the same probe run.
+        // stow#1378: claims bounded by the dispatch cap (45), one
+        // statement, two rows read per digest read: 5 + 1 statements,
+        // 7 + 2×45 reads.
         name: "POST /index/published (dispatching)",
-        statements: 5,
-        rows_read: 7,
+        statements: 6,
+        rows_read: 97,
         rows_written: 7,
         wall_ms: 500,
     },
@@ -478,10 +556,15 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // stow#940 provisional: the outcome's merge rows plus the
         // inline pass's `Claims` and `Bindings` — host-measured 3/3/3;
         // the workerd absolute awaits the same probe run.
+        // stow#1378: the outcome's costs (2 fresh digest writes, 2
+        // probe reads) plus claims bounded by the dispatch cap (45); a
+        // digest write bills two rows read and one written, a digest
+        // read two rows read: 5 + 3 statements, 7 + 2×2 + 2×2 + 2×45
+        // reads, 7 + 2 writes.
         name: "POST /requests/{id}/outcome (dispatching)",
-        statements: 5,
-        rows_read: 7,
-        rows_written: 7,
+        statements: 8,
+        rows_read: 105,
+        rows_written: 9,
         wall_ms: 500,
     },
     DriveBudget {
@@ -534,9 +617,15 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 50,
     },
     DriveBudget {
+        // stow#1378: the page's demand pass mints the id of each task
+        // it touches from its digest row, one read each in one
+        // statement. The drive's 256-entry page walks a closure of
+        // exactly 256 roots + 128 dependencies (the event graph's
+        // construction); two rows read per digest read: 6 + 2×384
+        // reads, 4 + 1 statements.
         name: "POST /scheduler/demand-feed/deliver (page apply)",
-        statements: 4,
-        rows_read: 6,
+        statements: 5,
+        rows_read: 774,
         rows_written: 6,
         wall_ms: 600,
     },
@@ -569,10 +658,15 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 60,
     },
     DriveBudget {
+        // stow#1378: the merge upserts its fresh slots' digest rows in
+        // the same turn; a digest write bills two rows read and one
+        // written per fresh node. The tree has 1,000 fresh nodes
+        // (`MERGE_NODES`), under the 4,096 a statement carries: 4 + 1
+        // statements, 6 + 2×1,000 reads, 6 + 1,000 writes.
         name: "POST /tasks/submit (1k-node merge)",
-        statements: 4,
-        rows_read: 6,
-        rows_written: 6,
+        statements: 5,
+        rows_read: 2006,
+        rows_written: 1006,
         wall_ms: 5000,
     },
     DriveBudget {

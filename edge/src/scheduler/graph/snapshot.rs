@@ -24,8 +24,10 @@
 //! `MessagePack` blob. The side states are `MessagePack` in base64;
 //! the meta row, interned strings, requests, feed pages and batches
 //! are JSON. What the loader can recompute is not written: edge spans,
-//! retention counts, unmet counts, state slab indexes and every
-//! lookup table.
+//! retention counts, unmet counts and every lookup table. A state's
+//! slab slot is written, though: the `node_digests` rows are keyed by
+//! it, and the lowest-vacant-slot allocation replays only from the slab
+//! the live graph had.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -316,6 +318,10 @@ struct SnapshotHead {
 struct SectionLens {
     intern: usize,
     nodes: usize,
+    /// The state slab's length, vacant slots included: the vacant ones
+    /// are the slots no node names, and the next allocation takes the
+    /// lowest of them or the slab's end.
+    states: usize,
     edges: usize,
     published: usize,
     outcomes: usize,
@@ -418,24 +424,25 @@ fn write_node(
     extra: Option<&Extra>,
     demand: i64,
 ) -> Result<(), QueueError> {
-    buf.extend_from_slice(&node.digest);
+    buf.extend_from_slice(&node.key);
     buf.extend_from_slice(&node.crate_name.to_le_bytes());
     buf.extend_from_slice(&node.version.to_le_bytes());
     buf.extend_from_slice(&node.features.to_le_bytes());
-    buf.extend_from_slice(&node.id_tag.to_le_bytes());
     buf.extend_from_slice(&node.edges_len.to_le_bytes());
     buf.push(node.target);
     buf.push(node.rustc);
     buf.push(node.status as u8);
     buf.push(node.flags.0);
     if let Some((state, priority)) = state {
+        // The slot is part of the record: the `node_digests` rows are
+        // keyed by it, so a wake must give every state the slot it
+        // held.
+        buf.extend_from_slice(&node.state.to_le_bytes());
         buf.extend_from_slice(&state.first_requested.to_le_bytes());
         buf.extend_from_slice(&state.updated.to_le_bytes());
         buf.extend_from_slice(&priority.to_le_bytes());
         buf.extend_from_slice(&demand.to_le_bytes());
         buf.extend_from_slice(&state.downloads.to_le_bytes());
-        buf.push(state.attempt);
-        buf.extend_from_slice(&state.dispatch_attempts.to_le_bytes());
     }
     match extra {
         None => buf.push(0),
@@ -936,6 +943,7 @@ impl Graph {
         SectionLens {
             intern: self.intern.len(),
             nodes: self.nodes.len(),
+            states: self.states.len(),
             edges: self.edges.len(),
             published: self.published.len(),
             outcomes: self.attempt_outcomes.len(),
@@ -1073,42 +1081,45 @@ impl SnapshotLoader {
     }
 
     fn load_node(graph: &mut Graph, bytes: &mut Bytes<'_>) -> Result<(), QueueError> {
-        let digest = bytes.take::<32>()?;
+        let key: IdKey = bytes.take()?;
         let crate_name = bytes.u32()?;
         let version = bytes.u32()?;
         let features = bytes.u32()?;
-        let id_tag = bytes.u32()?;
         let edges_len = bytes.u16()?;
         let target = bytes.u8()?;
         let rustc = bytes.u8()?;
         let status = Status::from_byte(bytes.u8()?)?;
         let flags = Flags(bytes.u8()?);
         let (state, demand) = if status.has_state() {
+            let slot = bytes.u32()?;
             let first_requested = bytes.i64()?;
-            let updated = bytes.i64()?;
+            let updated = bytes.u32()?;
             let priority = bytes.i64()?;
             let demand = bytes.i64()?;
             let state = State {
                 first_requested,
+                downloads: bytes.u64()?,
                 updated,
                 priority: graph.priorities.intern(priority),
-                downloads: bytes.u64()?,
-                attempt: bytes.u8()?,
-                dispatch_attempts: bytes.u16()?,
             };
-            let at = u32::try_from(graph.states.len())
-                .map_err(|_| QueueError::Invariant("snapshot state slab overflows u32".into()))?;
-            graph.states.push(state);
-            (at, demand)
+            // Slots the nodes do not name are vacant: filler holds the
+            // place until `rebuild_after_load` frees them.
+            if slot == NO_STATE {
+                return Err(QueueError::Invariant(
+                    "snapshot state slot is the no-state marker".into(),
+                ));
+            }
+            graph.fill_states(slot as usize + 1, state);
+            graph.states[slot as usize] = state;
+            (slot, demand)
         } else {
             (NO_STATE, 0)
         };
         let node = Node {
-            digest,
+            key,
             crate_name,
             version,
             features,
-            id_tag,
             state,
             edges_start: 0,
             refs: 0,
@@ -1192,6 +1203,14 @@ impl SnapshotLoader {
             return Ok(self.graph);
         };
         let mut graph = std::mem::take(&mut self.graph);
+        if graph.states.len() > lens.states {
+            return Err(QueueError::Invariant(format!(
+                "snapshot nodes name state slot {} past the {}-slot slab its head records",
+                graph.states.len() - 1,
+                lens.states
+            )));
+        }
+        graph.pad_states(lens.states);
         let loaded = graph.section_lens();
         if loaded != lens {
             return Err(QueueError::Invariant(format!(

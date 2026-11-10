@@ -22,7 +22,7 @@ pub mod queue;
 /// Object handlers and the cost harness.
 pub mod routes;
 /// The flat persistence substrate — `event_log`, chunked
-/// `snapshot_chunks`, `store_meta` — plus the wake/replay half and the
+/// `snapshot_chunks`, `store_meta`, `node_digests` — plus the wake/replay half and the
 /// in-memory billed-row counting. `object.rs` calls `ensure_schema` at
 /// construction, `append_events` per accepted event, and `load` +
 /// `apply_events` on wake (stow#878 stage 4–6).

@@ -4,7 +4,12 @@
 -- accepted event, stamped with the instant it was accepted at and
 -- dropped to the watermark after each snapshot; `snapshot_chunks`
 -- carries the chunked serialized graph; `store_meta` holds the
--- snapshot watermark. `meter` (stow#931) is the one-row checkpoint of
+-- snapshot watermark. `node_digests` holds the dependency digest of
+-- every node that has queue state, one row per state slot: `digest` is
+-- the 64 hex digits the node's task id spells. A merge upserts the rows
+-- of its fresh slots in the turn that appends its log rows, a reused
+-- slot is overwritten, a vacant slot's stale row is harmless until its
+-- reuse, and a replay writes nothing. `meter` (stow#931) is the one-row checkpoint of
 -- the day's billed totals — `seq` is the last `event_log` seq whose
 -- append they already cover; request code and the alarm only UPDATE
 -- the row, never create it.
@@ -20,6 +25,10 @@ CREATE TABLE IF NOT EXISTS snapshot_chunks (
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
     value INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS node_digests (
+    slot INTEGER PRIMARY KEY,
+    digest TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meter (
     id INTEGER PRIMARY KEY CHECK (id = 0),

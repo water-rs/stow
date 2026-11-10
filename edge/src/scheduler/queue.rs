@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
-use crate::scheduler::graph::RootProbe;
+use crate::scheduler::graph::{DigestSource, RootProbe};
 use skyzen_services::durable::Alarm;
 use stow_types::identity::TargetTriple;
 
@@ -417,7 +417,7 @@ pub fn apply_request_outcome(
     }
     if matches!(record.state.as_str(), "enqueued" | "failed") {
         return Ok((
-            request_record_status(record, &move |ids: &[String]| probe_by_id(by_id, ids))?,
+            request_record_status(record, move |ids: &[String]| Ok(probe_by_id(by_id, ids)))?,
             None,
         ));
     }
@@ -436,7 +436,7 @@ pub fn apply_request_outcome(
                 },
             };
             Ok((
-                request_record_status(&settled, &move |ids: &[String]| probe_by_id(by_id, ids))?,
+                request_record_status(&settled, move |ids: &[String]| Ok(probe_by_id(by_id, ids)))?,
                 Some(event),
             ))
         }
@@ -558,10 +558,11 @@ pub fn crate_request_status(
     graph: &crate::scheduler::graph::Graph,
     request_id: &str,
     now: i64,
+    digests: &mut impl DigestSource,
 ) -> Result<Option<stow_types::api::CrateRequestStatus>, QueueError> {
     match load_request(graph, request_id) {
-        Some(record) => Ok(Some(request_record_status(record, &|ids: &[String]| {
-            graph.probe_roots(ids, now)
+        Some(record) => Ok(Some(request_record_status(record, |ids: &[String]| {
+            graph.probe_roots_with(ids, now, digests)
         })?)),
         None => Ok(None),
     }
@@ -571,7 +572,7 @@ pub fn crate_request_status(
 /// against the live queue when the record settled `enqueued`.
 fn request_record_status(
     record: &crate::scheduler::graph::RequestRecord,
-    status_of: &(impl Fn(&[String]) -> RootProbe + Send + Sync),
+    status_of: impl FnOnce(&[String]) -> Result<RootProbe, QueueError>,
 ) -> Result<stow_types::api::CrateRequestStatus, QueueError> {
     let phase = request_phase(&record.state)?;
     let targets = if phase == stow_types::api::CrateRequestPhase::Enqueued {
@@ -583,7 +584,7 @@ fn request_record_status(
             .iter()
             .filter_map(|root| root.task_id.clone())
             .collect();
-        let by_id = status_of(&ids);
+        let by_id = status_of(&ids)?;
         roots
             .iter()
             .map(|root| {
@@ -645,6 +646,7 @@ const MAX_DEMAND_BATCH_ENTRIES: usize = 256;
 pub fn apply_demand(
     graph: &crate::scheduler::graph::Graph,
     request: &stow_types::api::SchedulerDemandRequest,
+    digests: &mut impl DigestSource,
 ) -> Result<
     (
         stow_types::api::SchedulerDemandReport,
@@ -672,7 +674,7 @@ pub fn apply_demand(
             None,
         ));
     }
-    let contributions = graph.demand_contributions(&deltas)?;
+    let contributions = graph.demand_contributions_with(&deltas, digests)?;
     let entries: Vec<stow_types::api::DemandEntry> = contributions
         .into_iter()
         .map(|(task_id, delta)| stow_types::api::DemandEntry { task_id, delta })
@@ -701,6 +703,7 @@ pub fn demand_pass(
     request: &stow_types::api::SchedulerDemandRequest,
     now_ms: i64,
     settings: &SchedulerSettings,
+    digests: &mut impl DigestSource,
 ) -> Result<
     (
         stow_types::api::SchedulerDemandReport,
@@ -709,7 +712,7 @@ pub fn demand_pass(
     ),
     QueueError,
 > {
-    let (report, event) = apply_demand(graph, request)?;
+    let (report, event) = apply_demand(graph, request, digests)?;
     let plan = graph.wake_plan(now_ms, settings);
     Ok((report, event, plan))
 }
