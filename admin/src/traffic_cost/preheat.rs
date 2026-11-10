@@ -25,7 +25,8 @@
 //! does not deliver. Trigger costs are fixed per wave, not per node.
 //! Covered phase CPU includes scheduler and observer CPU. Missing build
 //! and index lifecycle deliveries use their separately measured lanes.
-//! Fixed trigger CPU uses its own entrypoint lanes; DO duration remains unmeasured.
+//! Fixed trigger CPU uses its own entrypoint lanes. DO duration is not
+//! measured here; the projection reports its monthly billing ceiling.
 
 use crate::preheat_cost::MeasuredReport;
 use stow_types::forwards::RunForwards;
@@ -300,17 +301,6 @@ impl PreheatMonthly {
     }
 }
 
-/// Why the Preheat cost report carries no preheat usage for a product
-/// dimension.
-pub fn not_measured(product: &str, dimension: &str) -> &'static str {
-    match (product, dimension) {
-        ("durable_objects", "duration_gb_s") => {
-            "mock handler activity is not projected; production external-I/O duration remains unmodelled"
-        }
-        _ => "the preheat report does not measure this dimension",
-    }
-}
-
 /// A production wave of `nodes` distinct nodes.
 #[cfg(test)]
 pub(super) const fn test_production(nodes: u64) -> ProductionWave {
@@ -361,7 +351,7 @@ pub(super) fn test_report(nodes: u64) -> MeasuredReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{PreheatMonthly, not_measured, test_production, test_report};
+    use super::{PreheatMonthly, test_production, test_report};
     use crate::traffic_cost::test_support::{fixture_cpu, model};
 
     fn monthly(nodes: u64, production: u64) -> PreheatMonthly {
@@ -659,12 +649,11 @@ mod tests {
         assert!(error.contains("POST /unknown"), "{error}");
     }
 
-    /// DO active duration remains absent, never phase wall time.
+    /// DO active duration has no preheat usage, never phase wall time.
     #[test]
-    fn unmeasured_products_have_no_preheat_usage() {
+    fn duration_has_no_preheat_usage() {
         let preheat = monthly(50, 50);
         assert_eq!(preheat.monthly("durable_objects", "duration_gb_s"), None);
-        assert_ne!(not_measured("durable_objects", "duration_gb_s"), "");
     }
 
     #[test]

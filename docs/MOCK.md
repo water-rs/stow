@@ -167,10 +167,16 @@ multiplies by the production count: one wave per stable rustc release
 (`[cadence]` in `launch-model.toml`, counted from Rust's release
 history by `stow-admin launch-model export`) plus one resubmit per day,
 added to each product's traffic before comparing with its allowance:
-90% for Durable Object requests and 80% for every other dimension. `stow-admin traffic-cost project` takes the report as
-`--preheat` and the count as `--production`. Only the scheduler Durable
-Object's billed calls and rows are measured; the table marks every
-other dimension `n/m` and prices it from traffic alone.
+90% for Durable Object requests and 80% for Worker requests, Worker CPU
+and Durable Object rows. `stow-admin traffic-cost project` takes the
+report as `--preheat` and the count as `--production`.
+
+Durable Object duration is not modelled. Cloudflare bills 128 MB per
+object for every second it is active, so the scheduler, the only
+Durable Object, bills at most 0.128 GB-s for each second of a 31-day
+month: 342,835.2 GB-s. The table reports that ceiling as the duration usage and judges it
+against the full 400,000 GB-s allowance; the 80% line is held at run
+time by the watchdog signal `cf.do.duration_gb_s`.
 
 ## Prerequisites
 

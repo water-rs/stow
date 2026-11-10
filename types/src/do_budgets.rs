@@ -16,6 +16,23 @@ pub const DO_ROWS_READ_MONTHLY: f64 = 25e9;
 /// every write budget below is the one that binds first.
 pub const DO_ROWS_WRITTEN_MONTHLY: f64 = 50e6;
 
+/// Memory Cloudflare bills a Durable Object for while it is active:
+/// 128 MB per object, in GB.
+/// <https://developers.cloudflare.com/durable-objects/platform/pricing/>
+pub const DO_BILLED_GB: f64 = 0.128;
+/// Durable Objects stow deploys: the scheduler, the only one.
+pub const DO_OBJECTS: f64 = 1.0;
+/// Seconds in the longest calendar month, 31 days.
+pub const LONGEST_MONTH_SECONDS: f64 = 31.0 * 24.0 * 60.0 * 60.0;
+/// The most Durable Object duration a month can bill, in GB-s.
+///
+/// Duration is billed per object for every second it is active, shared
+/// across all requests active on it at once, so each object bills at
+/// most its billed memory for every second of the month. The release
+/// gate reports this as the month's usage instead of modelling duration.
+/// <https://developers.cloudflare.com/durable-objects/platform/pricing/>
+pub const DO_DURATION_CEILING_GB_S_MONTHLY: f64 = DO_OBJECTS * DO_BILLED_GB * LONGEST_MONTH_SECONDS;
+
 /// The probe ledger's key for the scheduler alarm — the dispatch pass,
 /// which has no route of its own. Every other ledger key is the
 /// scheduler route as `<METHOD> <path>`.
@@ -27,7 +44,8 @@ pub const LEDGER_OP_ALARM: &str = "alarm";
 pub const LEDGER_OP_TASK_COMPLETE: &str = "POST /tasks/complete-run";
 
 /// The default cost line: 80% of the monthly Workers Paid allowance.
-/// Durable Object requests use [`DO_REQUEST_ALLOWANCE_FRACTION`].
+/// Durable Object requests use [`DO_REQUEST_ALLOWANCE_FRACTION`] and
+/// Durable Object duration [`DO_DURATION_ALLOWANCE_FRACTION`].
 ///
 /// The release gate's monthly projection bounds other dimensions' totals —
 /// user traffic plus preheat — at this fraction of its allowance
@@ -37,6 +55,11 @@ pub const ALLOWANCE_FRACTION: f64 = 0.8;
 
 /// Monthly request budget for the scheduler Durable Object.
 pub const DO_REQUEST_ALLOWANCE_FRACTION: f64 = 0.9;
+
+/// Monthly duration budget for the scheduler Durable Object: the whole
+/// allowance. The projection's duration usage is the month's ceiling,
+/// so the 80% line is held at run time by the watchdog instead.
+pub const DO_DURATION_ALLOWANCE_FRACTION: f64 = 1.0;
 
 /// One UTC day's share of the line — `ALLOWANCE_FRACTION / 30`.
 ///

@@ -47,7 +47,11 @@ use std::path::PathBuf;
 use crate::preheat_cost::MeasuredReport;
 use clap::Args;
 use stow_types::api::SchedulerBudgetReport;
-use stow_types::do_budgets::{ALLOWANCE_FRACTION, DO_REQUEST_ALLOWANCE_FRACTION};
+use stow_types::do_budgets::{
+    ALLOWANCE_FRACTION, DO_BILLED_GB, DO_DURATION_ALLOWANCE_FRACTION,
+    DO_DURATION_CEILING_GB_S_MONTHLY, DO_OBJECTS, DO_REQUEST_ALLOWANCE_FRACTION,
+    LONGEST_MONTH_SECONDS,
+};
 use stow_types::forwards::{self, RunForwards};
 use stow_types::launch_model::{EventKind, LaunchModel};
 use stow_types::preheat_cost::ProductionWave;
@@ -90,12 +94,6 @@ pub struct ProjectArgs {
 // The gate fires when a product's projected monthly usage exceeds
 // its dimension-specific fraction of the included allowance. The runtime
 // breaker retains the default fraction declared in `stow-types`.
-
-/// GB-s each serialized DO wall second is priced at. Cloudflare's
-/// billing rule is fixed — 128 MB of memory per Durable Object
-/// instance, so 0.125 GB-s per wall second — and 0.25 deliberately
-/// over-reads it by 2×, so the projection errs on the bill's side.
-const DO_DURATION_GB_PER_WALL_S: f64 = 0.25;
 
 /// Tasks the enqueue drives' `submit_batch` carries — the denominator
 /// a single-task insert prices against.
@@ -577,12 +575,14 @@ pub struct UsageLine {
     /// The billed dimension (e.g. `requests`, `rows_read`,
     /// `duration_gb_s`).
     pub dimension: &'static str,
-    /// Projected monthly usage from user traffic at launch scale.
+    /// Projected monthly usage from user traffic at launch scale. On
+    /// the Durable Object duration row, the month's billing ceiling:
+    /// it covers traffic and preheat together.
     pub traffic: f64,
     /// Projected monthly usage from preheat — one wave per stable
-    /// release plus one resubmit per day. `None` when the Preheat cost
-    /// report does not measure the dimension.
-    pub preheat: Option<f64>,
+    /// release plus one resubmit per day. `0.0` on the Durable Object
+    /// duration row, whose ceiling is in `traffic`.
+    pub preheat: f64,
     /// The included monthly allowance.
     pub allowance: f64,
 }
@@ -590,17 +590,17 @@ pub struct UsageLine {
 impl UsageLine {
     /// The monthly budget for this product and dimension.
     fn bound(&self) -> f64 {
-        let fraction = if self.product == "durable_objects" && self.dimension == "requests" {
-            DO_REQUEST_ALLOWANCE_FRACTION
-        } else {
-            ALLOWANCE_FRACTION
+        let fraction = match (self.product, self.dimension) {
+            ("durable_objects", "requests") => DO_REQUEST_ALLOWANCE_FRACTION,
+            ("durable_objects", "duration_gb_s") => DO_DURATION_ALLOWANCE_FRACTION,
+            _ => ALLOWANCE_FRACTION,
         };
         self.allowance * fraction
     }
 
-    /// Complete traffic plus preheat usage, absent when a contribution is unmeasured.
-    pub fn total(&self) -> Option<f64> {
-        self.preheat.map(|preheat| self.traffic + preheat)
+    /// Traffic plus preheat usage.
+    pub fn total(&self) -> f64 {
+        self.traffic + self.preheat
     }
 }
 
@@ -683,9 +683,8 @@ pub struct GateEvaluation {
 }
 
 /// Σ over every event kind: projected monthly usage per product
-/// dimension and the DO wall seconds that price duration — plus the
-/// per-route shares for the report's top-N table and the unmeasured
-/// diagnostics.
+/// dimension — plus the per-route shares for the report's top-N table
+/// and the unmeasured diagnostics.
 #[derive(Debug, Default)]
 struct Projection {
     /// Projected monthly worker requests.
@@ -698,8 +697,6 @@ struct Projection {
     do_rows_read: f64,
     /// Projected monthly DO rows written.
     do_rows_written: f64,
-    /// Projected monthly DO wall seconds — duration is billed on this.
-    do_wall_s: f64,
     /// Projected monthly subrequests — diagnostic, not gated.
     diag_subrequests: f64,
     /// Projected monthly R2 ops — diagnostic, not gated.
@@ -770,18 +767,12 @@ fn fold_kind(
     let kind = drives.event(cost)?;
     projection.do_rows_read = monthly.mul_add(kind.rows_read, projection.do_rows_read);
     projection.do_rows_written = monthly.mul_add(kind.rows_written, projection.do_rows_written);
-    projection.do_wall_s += monthly * kind.wall_ms / 1000.0;
     // The route's heaviest dimension decides its allowance share — the
     // number the top-N table ranks.
     let shares = [
         (
             "do_requests",
             monthly * cost.do_requests() / DO_REQUESTS_MONTHLY,
-        ),
-        (
-            "do_duration_gb_s",
-            monthly * (kind.wall_ms / 1000.0) * DO_DURATION_GB_PER_WALL_S
-                / DO_DURATION_GB_S_MONTHLY,
         ),
         (
             "do_rows_read",
@@ -816,14 +807,17 @@ fn fold_kind(
 
 /// The product/dimension rows the gate bounds — every line a measured
 /// quantity or a structural count — each with the preheat share the
-/// Preheat cost report measures for it.
+/// Preheat cost report measures for it. Durable Object duration is not
+/// measured: its row is the month's billing ceiling.
 fn usage_lines(projection: &Projection, preheat: &PreheatMonthly) -> Vec<UsageLine> {
     let line =
         |product: &'static str, dimension: &'static str, traffic: f64, allowance: f64| UsageLine {
             product,
             dimension,
             traffic,
-            preheat: preheat.monthly(product, dimension),
+            preheat: preheat
+                .monthly(product, dimension)
+                .expect("the Preheat cost report measures every gated dimension"),
             allowance,
         };
     vec![
@@ -857,12 +851,13 @@ fn usage_lines(projection: &Projection, preheat: &PreheatMonthly) -> Vec<UsageLi
             projection.do_rows_written,
             DO_ROWS_WRITTEN_MONTHLY,
         ),
-        line(
-            "durable_objects",
-            "duration_gb_s",
-            projection.do_wall_s * DO_DURATION_GB_PER_WALL_S,
-            DO_DURATION_GB_S_MONTHLY,
-        ),
+        UsageLine {
+            product: "durable_objects",
+            dimension: "duration_gb_s",
+            traffic: DO_DURATION_CEILING_GB_S_MONTHLY,
+            preheat: 0.0,
+            allowance: DO_DURATION_GB_S_MONTHLY,
+        },
     ]
 }
 
@@ -873,7 +868,7 @@ fn diagnostic_lines(projection: &Projection) -> Vec<UsageLine> {
         product,
         dimension,
         traffic,
-        preheat: None,
+        preheat: 0.0,
         allowance: f64::INFINITY,
     };
     vec![
@@ -888,10 +883,8 @@ fn diagnostic_lines(projection: &Projection) -> Vec<UsageLine> {
 fn usage_breaches(usage: &[UsageLine], top_routes: &[RouteShare]) -> Vec<Breach> {
     let mut breaches = Vec::new();
     for line in usage {
-        let Some(preheat) = line.preheat else {
-            continue;
-        };
-        let projected = line.traffic + preheat;
+        let preheat = line.preheat;
+        let projected = line.total();
         let bound = line.bound();
         if projected > bound {
             // `RouteShare::dimension` keys the share dimension by
@@ -1005,20 +998,6 @@ impl ProjectionReport {
             ("clean", &self.projection),
             ("post-load", &self.projection_after_load),
         ] {
-            failures.extend(
-                evaluation
-                    .usage
-                    .iter()
-                    .filter(|line| line.preheat.is_none())
-                    .map(|line| {
-                        format!(
-                            "{label} projection: {} {} incomplete — {}",
-                            line.product,
-                            line.dimension,
-                            super::preheat::not_measured(line.product, line.dimension)
-                        )
-                    }),
-            );
             failures.extend(evaluation.breaches.iter().map(|breach| {
                 format!(
                     "{label} projection: {} {} {:.3e} over bound {:.3e} \
@@ -1107,8 +1086,8 @@ fn render_preheat(preheat: &PreheatMonthly) -> String {
 }
 
 /// The per-product table: traffic, preheat and total beside the bound,
-/// and a note on every dimension the Preheat cost report does not
-/// measure.
+/// and a note that the run-time watchdog holds the 80% line on the
+/// Durable Object duration ceiling.
 fn render_usage(usage: &[UsageLine]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -1123,7 +1102,6 @@ fn render_usage(usage: &[UsageLine]) -> String {
         "share",
         "",
     ]);
-    let mut unmeasured = Vec::new();
     for line in usage {
         let bound = line.bound();
         let total = line.total();
@@ -1131,37 +1109,26 @@ fn render_usage(usage: &[UsageLine]) -> String {
             line.product.to_owned(),
             line.dimension.to_owned(),
             format!("{:.3e}", line.traffic),
-            line.preheat
-                .map_or_else(|| "n/m".to_owned(), |preheat| format!("{preheat:.3e}")),
-            total.map_or_else(|| "n/m".to_owned(), |total| format!("{total:.3e}")),
+            format!("{:.3e}", line.preheat),
+            format!("{total:.3e}"),
             format!("{:.3e}", line.allowance),
             format!("{bound:.3e}"),
-            total.map_or_else(
-                || "n/m".to_owned(),
-                |total| format!("{:.1}%", 100.0 * total / line.allowance),
-            ),
-            match total {
-                None => "UNMEASURED",
-                Some(total) if total > bound => "OVER",
-                Some(_) => "",
-            }
-            .to_owned(),
+            format!("{:.1}%", 100.0 * total / line.allowance),
+            if total > bound { "OVER" } else { "" }.to_owned(),
         ]);
-        if line.preheat.is_none() {
-            unmeasured.push(format!(
-                "  {} {}: {}",
-                line.product,
-                line.dimension,
-                super::preheat::not_measured(line.product, line.dimension)
-            ));
-        }
     }
     let _ = writeln!(out, "{}", table.render());
-    if !unmeasured.is_empty() {
+    if let Some(line) = usage
+        .iter()
+        .find(|line| line.product == "durable_objects" && line.dimension == "duration_gb_s")
+    {
         let _ = writeln!(
             out,
-            "\nn/m — preheat not measured by the Preheat cost report (traffic only):\n{}",
-            unmeasured.join("\n")
+            "durable_objects duration_gb_s is the month's billing ceiling ({DO_OBJECTS} object × \
+             {DO_BILLED_GB} GB × {LONGEST_MONTH_SECONDS} s); the {:.0}% line ({:.0} GB-s) is held \
+             at run time by the watchdog signal `cf.do.duration_gb_s`",
+            100.0 * ALLOWANCE_FRACTION,
+            line.allowance * ALLOWANCE_FRACTION
         );
     }
     out
@@ -1287,7 +1254,9 @@ mod tests {
     use clap::Parser as _;
     use stow_types::do_budgets::WORKER_CPU_BUDGETS;
 
-    use super::{ProjectArgs, evaluate, project};
+    use stow_types::do_budgets::DO_DURATION_CEILING_GB_S_MONTHLY;
+
+    use super::{DO_DURATION_GB_S_MONTHLY, ProjectArgs, evaluate, project};
     use crate::traffic_cost::preheat::{PerNode, PreheatMonthly};
     use crate::traffic_cost::test_support::{fixture_cpu, fixture_report, model};
 
@@ -1338,20 +1307,21 @@ mod tests {
     }
 
     #[test]
-    fn only_durable_object_requests_use_the_ninety_percent_budget() {
+    fn only_durable_object_requests_and_duration_leave_the_eighty_percent_budget() {
+        // Each row's bound as a percentage: its usage against an
+        // allowance of 100.
         for (product, dimension, limit) in [
             ("durable_objects", "requests", 90.0),
             ("workers", "requests", 80.0),
             ("workers", "cpu_ms", 80.0),
             ("durable_objects", "rows_read", 80.0),
             ("durable_objects", "rows_written", 80.0),
-            ("durable_objects", "duration_gb_s", 80.0),
         ] {
             let mut line = super::UsageLine {
                 product,
                 dimension,
                 traffic: 0.0,
-                preheat: Some(limit),
+                preheat: limit,
                 allowance: 100.0,
             };
             assert!(super::usage_breaches(std::slice::from_ref(&line), &[]).is_empty());
@@ -1363,37 +1333,49 @@ mod tests {
         }
     }
 
+    /// Durable Object duration is the month's billing ceiling, judged
+    /// against the whole allowance, and the report names the watchdog
+    /// that holds the 80% line.
     #[test]
-    fn incomplete_measurements_cannot_pass_even_when_known_usage_fits() {
+    fn duration_row_is_the_ceiling_against_the_full_allowance() {
+        let small = fixture_report(100_000, |_| 0.5);
+        let after = fixture_report(100_000, |_| 0.5);
+        let report =
+            project_with(&small, &after, &no_preheat(), &fixture_cpu(|_| 0.5)).expect("project");
+        for evaluation in [&report.projection, &report.projection_after_load] {
+            let line = usage(evaluation, "durable_objects", "duration_gb_s");
+            // 1 object × 0.128 GB billed × 2,678,400 s in a 31-day month.
+            assert!((line.total() - 342_835.2).abs() < 1e-6);
+            assert!((line.total() - DO_DURATION_CEILING_GB_S_MONTHLY).abs() < f64::EPSILON);
+            assert!((line.bound() - DO_DURATION_GB_S_MONTHLY).abs() < f64::EPSILON);
+            assert!(line.total() < line.bound());
+            assert!(evaluation.breaches.is_empty(), "{:?}", evaluation.breaches);
+        }
+        let rendered = super::render_projection(&report);
+        assert!(rendered.contains("monthly projection: PASS"), "{rendered}");
+        assert!(
+            rendered.contains("held at run time by the watchdog signal `cf.do.duration_gb_s`"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("(1 object × 0.128 GB × 2678400 s)"),
+            "{rendered}"
+        );
+        // 80% of the 400,000 GB-s allowance: the watchdog's threshold.
+        assert!(
+            rendered.contains("the 80% line (320000 GB-s)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_complete_projection_passes() {
         let small = fixture_report(100_000, |_| 0.5);
         let after = fixture_report(100_000, |_| 0.5);
         let mut preheat = no_preheat();
         preheat.wave_trigger_worker_requests = 1.0;
-        let mut report =
+        let report =
             project_with(&small, &after, &preheat, &fixture_cpu(|_| 0.5)).expect("project");
-        assert!(report.projection.breaches.is_empty());
-        let failures = report.failures();
-        assert!(
-            failures
-                .iter()
-                .any(|failure| failure.contains("duration_gb_s incomplete"))
-        );
-        assert!(
-            !failures
-                .iter()
-                .any(|failure| failure.contains("fixed trigger"))
-        );
-        assert!(super::render_projection(&report).contains("monthly projection: FAIL"));
-        assert!(super::render_usage(&report.projection.usage).contains("UNMEASURED"));
-        // Supply a complete low-cost measurement fixture to distinguish
-        // missing contributions from an actual numerical budget breach.
-        for evaluation in [&mut report.projection, &mut report.projection_after_load] {
-            for line in &mut evaluation.usage {
-                if line.preheat.is_none() {
-                    line.preheat = Some(0.0);
-                }
-            }
-        }
         let rendered = super::render_projection(&report);
         assert!(report.failures().is_empty(), "{rendered}");
         assert!(rendered.contains("monthly projection: PASS"), "{rendered}");
@@ -1441,14 +1423,17 @@ mod tests {
         assert!((before.traffic - after.traffic).abs() < 1e-6);
         // 1 wave/mo × 1000 rows/node × 10 nodes + 1 resubmit/mo ×
         // 500 rows/node × 10 nodes.
-        let preheat = after.preheat.expect("measured");
+        let preheat = after.preheat;
         assert!((preheat - 15_000.0).abs() < 1e-6, "{preheat}");
-        assert!((after.total().expect("complete") - (after.traffic + 15_000.0)).abs() < 1e-6);
+        assert!((after.total() - (after.traffic + 15_000.0)).abs() < 1e-6);
 
         let workers = usage(&with, "workers", "requests");
-        assert_eq!(workers.preheat, Some(0.0));
-        assert!((workers.total().expect("complete") - workers.traffic).abs() < f64::EPSILON);
-        assert_eq!(usage(&with, "workers", "cpu_ms").preheat, Some(0.0));
+        assert!(workers.preheat.abs() < f64::EPSILON);
+        assert!((workers.total() - workers.traffic).abs() < f64::EPSILON);
+        assert!(
+            usage(&with, "workers", "cpu_ms").preheat.abs() < f64::EPSILON,
+            "no preheat CPU"
+        );
     }
 
     #[test]
@@ -1506,7 +1491,7 @@ mod tests {
         let report = project_with(&small, &after, &preheat_of(fits, fits), &cpu).expect("project");
         assert!(report.projection.breaches.is_empty());
         assert!(report.projection_after_load.breaches.is_empty());
-        assert!(!report.failures().is_empty(), "unmeasured costs still fail");
+        assert!(report.failures().is_empty(), "{:?}", report.failures());
 
         // A month of preheat as large as the whole allowance remains
         // over the combined monthly bound.
