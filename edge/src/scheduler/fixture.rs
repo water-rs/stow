@@ -697,15 +697,6 @@ pub fn slice_reports(graph: &Graph, lo: u32, hi: u32) -> Vec<SchedulerEvent> {
 /// Cloudflare's billed memory. No platform memory claim derives from it.
 #[cfg(target_arch = "wasm32")]
 pub(super) fn trace_population(graph: &Graph, phase: &str) {
-    use wasm_bindgen::JsCast as _;
-
-    let memory = wasm_bindgen::memory()
-        .dyn_into::<js_sys::WebAssembly::Memory>()
-        .expect("the module exports WebAssembly.Memory");
-    let buffer = memory
-        .buffer()
-        .dyn_into::<js_sys::ArrayBuffer>()
-        .expect("the module uses unshared linear memory");
     graph.trace_occupancy("fixture population", phase, "observation");
     let (nodes, edges, published) = graph.sizes();
     let status = graph.status();
@@ -721,7 +712,7 @@ pub(super) fn trace_population(graph: &Graph, phase: &str) {
         published,
         pending = status.pending,
         state_nodes,
-        wasm_linear_bytes = buffer.byte_length(),
+        wasm_linear_bytes = super::memory::linear_bytes(),
         "scheduler probe population"
     );
 }

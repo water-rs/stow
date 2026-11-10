@@ -616,7 +616,7 @@ mod tests {
         store::append_events(&db, None, &[mutate(), mutate()], NOW_MS)
             .await
             .expect("append");
-        store::log_tail(&db, 0).await.expect("tail");
+        store::log_page(&db, 0, u32::MAX).await.expect("tail");
         let totals = meter.settle(cell, NOW_MS).expect("a settle");
         assert!(totals.rows_written >= 2, "two appended rows");
         assert!(totals.rows_read >= 2, "the tail read both rows back");
@@ -721,7 +721,7 @@ mod tests {
         // More metered work while frozen: the meter still accrues, the
         // trip re-evaluates, and the store answers Unchanged — the email
         // count stays at one.
-        store::log_tail(&db, 0).await.expect("tail");
+        store::log_page(&db, 0, u32::MAX).await.expect("tail");
         let again = meter
             .settle_and_trip(
                 cell,
@@ -744,7 +744,7 @@ mod tests {
         let (db, meter) = metered(&owner).await;
         let sink = Sink::default();
         let cell = owner.loaded().expect("installed");
-        store::log_tail(&db, 0).await.expect("tail");
+        store::log_page(&db, 0, u32::MAX).await.expect("tail");
         let transition = meter
             .settle_and_trip(
                 cell,

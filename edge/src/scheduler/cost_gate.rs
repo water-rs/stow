@@ -551,8 +551,7 @@ async fn rearm_restores_the_seeded_state() {
         .await
         .expect("rearm");
     assert_eq!(cell.with(|graph| graph.status()), seeded);
-    let (mut replayed, tail) = super::store::load(&db).await.expect("load");
-    super::store::apply_events(&mut replayed, &tail);
+    let (mut replayed, _) = super::store::restore(&db).await.expect("load");
     fixture::mark_running(&mut replayed, shape, drives::HOST_NOW_MS);
     assert_eq!(replayed.status(), seeded);
     assert_eq!(replayed.inflight(), cell.with(|graph| graph.inflight()));
@@ -594,8 +593,7 @@ async fn rearm_without_completions_keeps_snapshot_and_replays_refreshed_leases()
         );
     }
     assert_eq!(cell.with(|graph| graph.status()), seeded);
-    let (mut replayed, tail) = super::store::load(&db).await.expect("load");
-    super::store::apply_events(&mut replayed, &tail);
+    let (mut replayed, _) = super::store::restore(&db).await.expect("load");
     fixture::mark_running(&mut replayed, shape, now);
     assert_eq!(replayed.status(), seeded);
     assert_eq!(replayed.inflight(), cell.with(|graph| graph.inflight()));

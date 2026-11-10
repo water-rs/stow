@@ -6,7 +6,14 @@
 #   1. the scheduler budget pass at two fixture sizes (100k and 1M queue
 #      rows, same shape) — every drive's statements, rowsRead and
 #      rowsWritten against DO_BUDGETS, measured under workerd's billed
-#      cursor counters;
+#      cursor counters; the 1M-row population pass is followed by a
+#      restart of the edge over the persisted store and a status read
+#      that wakes the scheduler, with V8's collections traced into the
+#      edge log (`stow-admin traffic-cost restart`): the JavaScript heap
+#      in use stays within 24 MiB of the empty scheduler's through the
+#      population pass, its snapshot write and the wake, and the wake's
+#      Wasm linear memory exceeds the graph storage it accounts for by
+#      no more than 10 MiB;
 #   2. Worker CPU per traffic lane, sampled by the isolate's V8 profiler
 #      through workerd's DevTools inspector and divided by a fixed
 #      reference workload profiled in the same isolate before and after
@@ -20,7 +27,8 @@
 #      small fixture to the large), and the peak serialized Durable
 #      Object wall.
 #
-# The test fails on any of: a drive over its row budget, a drive that
+# The test fails on any of: a restart past the memory bounds above, a
+# drive over its row budget, a drive that
 # grows with stored rows, a lane over its CPU budget relative to the
 # reference workload, an unusable reference, peak serialized DO
 # wall above 0.5 s/s, any `overloaded` signal or 5xx under the peak
@@ -382,7 +390,11 @@ start_edge() {
     rm -f "$INSPECTOR_URL_FILE"
     (
         cd "$REPO_ROOT/edge"
-        exec bun tests/idle/cpu-runtime.mjs --config .skyzen/gen/wrangler.toml \
+        # workerd takes V8 flags from this variable: every collection
+        # is traced into the edge log, where `traffic-cost restart`
+        # reads the JavaScript heap in use before each one.
+        exec env MINIFLARE_WORKERD_V8_FLAGS=--trace-gc \
+            bun tests/idle/cpu-runtime.mjs --config .skyzen/gen/wrangler.toml \
             "${MOCK_CAP_ARGS[@]}" \
             --port "$EDGE_PORT" --inspector-port "$INSPECTOR_PORT" \
             --ready-file "$INSPECTOR_URL_FILE" \
@@ -415,6 +427,12 @@ edge_rss_kb() {
     echo "$total"
 }
 
+# Bytes the edge log holds now — the offsets `traffic-cost restart` cuts
+# its windows at.
+edge_log_bytes() {
+    wc -c <"$LOG_DIR/edge.log" | tr -d ' '
+}
+
 start_edge
 
 # The local dispatch endpoint the edge's STOW_LOCAL_CI_URL points at.
@@ -442,6 +460,9 @@ wait_for "local CI dispatch endpoint" 60 "$!" \
 fg admin scheduler reset --yes >"$WORK_DIR/scheduler-reset.log" 2>&1 \
     || die "stow-admin scheduler reset failed — see $WORK_DIR/scheduler-reset.log"
 echo "[traffic] $(cat "$WORK_DIR/scheduler-reset.log")"
+# Everything the edge logged up to here is the empty scheduler's: the
+# baseline the population's JavaScript heap peak is judged against.
+EMPTY_LOG_BYTES="$(edge_log_bytes)"
 
 # One budget pass: $1 is the label, the rest the `scheduler budget`
 # arguments. `--json` keeps the per-statement detail; the command exits
@@ -472,6 +493,27 @@ budget_pass() {
 # 572,283 pending tasks observed in incident #1233. Keep both existing
 # scale-comparison cases and their budgets unchanged.
 budget_pass "population" --queue-rows 1000000
+
+# Restart the edge over the persisted population and wake the scheduler
+# with a status read: the wake logs the graph's occupancy and the Wasm
+# linear memory. `traffic-cost restart` judges the traced JavaScript
+# heap through the population pass, its snapshot write and the wake
+# against the empty scheduler's, and the wake's linear memory against
+# the graph storage it accounts for (stow#1380).
+echo "[traffic] restart over the persisted population"
+RESTART_LOG_BYTES="$(edge_log_bytes)"
+stop_tree "$EDGE_PID"
+start_edge
+curl -sf --max-time "$READY_DEADLINE" "$SCHEDULER_URL/status" >/dev/null \
+    || die "scheduler status read after the restart failed — see $LOG_DIR/edge.log"
+fg admin --json traffic-cost restart --edge-log "$LOG_DIR/edge.log" \
+    --empty-bytes "$EMPTY_LOG_BYTES" --restart-bytes "$RESTART_LOG_BYTES" \
+    >"$REPORT_DIR/restart-memory.json" 2>"$LOG_DIR/restart-memory.log" \
+    || { cat "$LOG_DIR/restart-memory.log" >&2; \
+         die "restart memory over its bounds — see $REPORT_DIR/restart-memory.json"; }
+jq -r '"restart memory: JS heap in use peak \(.run_heap_peak_mib) MiB (empty scheduler \(.empty_heap_peak_mib) MiB, bound +\(.heap_bound_mib) MiB); wasm linear \(.wake.wasm_linear_bytes) B vs accounted \(.wake.accounted_storage_bytes) B (bound +\(.linear_bound_bytes) B)"' \
+    "$REPORT_DIR/restart-memory.json"
+
 budget_pass "large" --queue-rows "$LARGE"
 budget_pass "small" --queue-rows "$SMALL"
 
