@@ -24,9 +24,12 @@ pub mod routes;
 /// The flat persistence substrate — `event_log`, chunked
 /// `snapshot_chunks`, `store_meta`, `node_digests` — plus the wake/replay half and the
 /// in-memory billed-row counting. `object.rs` calls `ensure_schema` at
-/// construction, `append_events` per accepted event, and `load` +
-/// `apply_events` on wake (stow#878 stage 4–6).
+/// construction, `append_events` per accepted event, and `wake` on
+/// wake, which pages the log tail through `TailReplay` (stow#878
+/// stage 4–6, stow#1380).
 pub mod store;
+
+mod memory;
 
 /// The production-shaped fixture: host tests and the workerd budget
 /// probe both seed it, so the module builds on both targets.

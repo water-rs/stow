@@ -56,7 +56,12 @@ without overloading the scheduler. In one stack start it:
 1. seeds the fixture at 20k and then 10k queue rows and runs every
    scheduler drive (`edge/src/scheduler/drives.rs`) through the Durable
    Object's budget probe, reading workerd's billed `rowsRead` and
-   `rowsWritten`;
+   `rowsWritten`. After the 1M-row population pass it restarts the
+   edge over the persisted store, wakes the scheduler with a status
+   read and judges V8's traced collections and the wake's Wasm linear
+   memory (`stow-admin traffic-cost restart`): the JavaScript heap in
+   use stays within 24 MiB of an empty scheduler's, and linear memory
+   exceeds the graph storage the wake accounts for by at most 10 MiB;
 2. measures Worker CPU per traffic lane with the isolate's V8 CPU
    profiler, reached through `wrangler dev --inspector-port`
    (`stow-admin traffic-cost cpu`), and gates each lane on its CPU

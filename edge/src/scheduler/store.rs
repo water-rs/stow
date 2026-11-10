@@ -38,7 +38,7 @@ use stow_types::api::{
 
 use super::graph::{
     ChunkSpan, Digest, Digests, FreshDigest, Graph, GraphCell, Meter, SNAPSHOT_SPAN_ROWS,
-    SnapshotLoader, SnapshotPlan, SpanEncoder, utc_day,
+    STATEMENT_ROWS, SnapshotLoader, SnapshotPlan, SpanEncoder, utc_day,
 };
 use crate::errors::QueueError;
 
@@ -267,14 +267,30 @@ struct LogRow {
     event: String,
 }
 
-/// Read `event_log` rows after `seq` in order.
+/// Event-log rows one wake page reads. A page is the most event text
+/// the JavaScript heap and the most decoded events the Wasm heap hold
+/// at once. A row is a few hundred bytes; the widest are a full
+/// slice-report part (`SLICE_REPORT_PART_BYTES`, 512 KiB) and a
+/// `Submit` part of `SUBMIT_PART_NODES` nodes, so sixteen rows keep a
+/// page of the widest rows at 8 MiB. At `SNAPSHOT_EVENT_THRESHOLD`
+/// (8192) rows a wake reads at most `8192 / 16 + 1 = 513` pages;
+/// statements are not billed.
+const LOG_PAGE_ROWS: u32 = 16;
+
+/// Read up to `limit` `event_log` rows after `seq` in order — one page
+/// of the tail; the next page starts after the last `seq` returned.
 ///
 /// # Errors
 /// `QueueError::Sql` on a failed select, `QueueError::Invariant` on an
 /// undecodable row.
-pub async fn log_tail(db: &DurableDb, seq: i64) -> Result<Vec<(i64, Logged)>, QueueError> {
-    db.query("SELECT seq, at, event FROM event_log WHERE seq > ? ORDER BY seq")
+pub async fn log_page(
+    db: &DurableDb,
+    seq: i64,
+    limit: u32,
+) -> Result<Vec<(i64, Logged)>, QueueError> {
+    db.query("SELECT seq, at, event FROM event_log WHERE seq > ? ORDER BY seq LIMIT ?")
         .bind(seq)
+        .bind(i64::from(limit))
         .fetch_all::<LogRow>()
         .await
         .map_err(|error| QueueError::Sql(format!("log tail: {error}")))?
@@ -483,9 +499,9 @@ pub async fn write_snapshot_parts(
     // Rows upsert in batches — a statement's row count is what the
     // store bills, and one multi-row UPSERT keeps a many-span plan a
     // few statements instead of one per row. The buffer holds at most
-    // UPSERT_BATCH payloads: still one row at a time in flight, never
-    // a serialized graph.
-    let mut pending: Vec<(i64, String)> = Vec::with_capacity(UPSERT_BATCH);
+    // STATEMENT_ROWS payloads (~1 MiB): still one row at a time in
+    // flight, never a serialized graph.
+    let mut pending: Vec<(i64, String)> = Vec::with_capacity(STATEMENT_ROWS);
     let mut stale: Vec<(i64, i64)> = Vec::new();
     for &span in &plan.spans {
         let mut encoder = None;
@@ -498,7 +514,7 @@ pub async fn write_snapshot_parts(
                 )));
             }
             pending.push((span.lo_key() + sub, payload));
-            if pending.len() == UPSERT_BATCH {
+            if pending.len() == STATEMENT_ROWS {
                 flush_upserts(db, &mut pending).await?;
             }
             sub += 1;
@@ -554,11 +570,10 @@ pub async fn write_snapshot_parts(
     Ok(covered)
 }
 
-/// Rows one UPSERT statement carries: bounded so the in-flight
-/// payload stays a few MB — never a second copy of the graph.
-const UPSERT_BATCH: usize = 8;
-
-/// Write the buffered `(key, payload)` rows as one multi-row UPSERT.
+/// Write the buffered `(key, payload)` rows as one multi-row UPSERT:
+/// at most [`STATEMENT_ROWS`] rows, about 1 MiB of payload, so the
+/// JavaScript heap holds one statement's strings, never a second copy
+/// of the graph.
 async fn flush_upserts(db: &DurableDb, pending: &mut Vec<(i64, String)>) -> Result<(), QueueError> {
     if pending.is_empty() {
         return Ok(());
@@ -679,34 +694,25 @@ pub async fn write_digests(db: &DurableDb, fresh: &[FreshDigest]) -> Result<(), 
     Ok(())
 }
 
-/// Snapshot rows one wake statement reads. The buffer bound is
-/// `WAKE_READ_BATCH` × the ~1 MiB row cap ≈ 16 MB of payload in flight
-/// — a few percent of the 128 MiB object limit atop the arenas'
-/// measured ~50 MB at the largest fixture — while turning a ~470-row
-/// snapshot into ~30 statements instead of ~470.
-const WAKE_READ_BATCH: u32 = 16;
-
 #[derive(skyzen::FromRow)]
 struct SnapshotRow {
     chunk: i64,
     payload: String,
 }
 
-/// Wake: read the watermark, then the snapshot in batches of
-/// [`WAKE_READ_BATCH`] rows per statement — each row decodes into the
-/// graph as it is read, so the serialized image is never held whole —
-/// then the meter checkpoint's row and the log tail. Returns the
+/// Read the snapshot: the watermark, then the chunks in batches of
+/// [`STATEMENT_ROWS`] rows per statement — about 1 MiB of payload, the
+/// most the JavaScript heap holds live for the read — each row
+/// decoding into the graph as it is read, so the serialized image is
+/// never held whole. Then the meter checkpoint's row. Returns the
 /// rebuilt graph — its meter carries the checkpointed day totals and
-/// covered `seq` — and the log tail (`seq`, row) pairs to apply
-/// through [`apply_events`].
-///
-/// # Errors
-/// `QueueError::Sql`/`QueueError::Invariant` on a failed read or
-/// corrupt row.
-pub async fn load(db: &DurableDb) -> Result<(Graph, Vec<(i64, Logged)>), QueueError> {
+/// covered `seq` — and the snapshot watermark the log tail starts
+/// after.
+async fn load(db: &DurableDb) -> Result<(Graph, i64), QueueError> {
     let seq = watermark(db).await?;
     let mut loader = SnapshotLoader::default();
     let mut key = -1i64;
+    let limit = i64::try_from(STATEMENT_ROWS).expect("statement rows fit i64");
     loop {
         let batch = db
             .query(
@@ -714,11 +720,11 @@ pub async fn load(db: &DurableDb) -> Result<(Graph, Vec<(i64, Logged)>), QueueEr
                  ORDER BY chunk LIMIT ?",
             )
             .bind(key)
-            .bind(i64::from(WAKE_READ_BATCH))
+            .bind(limit)
             .fetch_all::<SnapshotRow>()
             .await
             .map_err(|error| QueueError::Sql(format!("snapshot read: {error}")))?;
-        let done = batch.len() < WAKE_READ_BATCH as usize;
+        let done = batch.len() < STATEMENT_ROWS;
         for row in batch {
             loader.apply(row.chunk, &row.payload)?;
             key = row.chunk;
@@ -748,46 +754,140 @@ pub async fn load(db: &DurableDb) -> Result<(Graph, Vec<(i64, Logged)>), QueueEr
             graph.meter.seq
         )));
     }
-    let tail = log_tail(db, seq).await?;
-    Ok((graph, tail))
+    Ok((graph, seq))
+}
+
+/// Restore the graph a wake serves: [`load`] the snapshot, then replay
+/// the log tail page by page through [`TailReplay`] — each page of
+/// [`LOG_PAGE_ROWS`] rows is applied before the next is read, so the
+/// decoded events of the whole tail are never held at once. One
+/// `tracing` line after each half reports the graph's occupancy and the
+/// Wasm linear memory (wasm32). Returns the graph and the tail rows
+/// replayed.
+///
+/// # Errors
+/// `QueueError::Sql`/`QueueError::Invariant` on a failed read or
+/// corrupt row.
+pub async fn restore(db: &DurableDb) -> Result<(Graph, u64), QueueError> {
+    let (mut graph, seq) = load(db).await?;
+    graph.trace_occupancy("scheduler wake", "snapshot loaded", "observation");
+    let mut replay = TailReplay::default();
+    let mut after = seq;
+    let mut rows = 0u64;
+    loop {
+        let page = log_page(db, after, LOG_PAGE_ROWS).await?;
+        let done = page.len() < LOG_PAGE_ROWS as usize;
+        if let Some(&(last, _)) = page.last() {
+            after = last;
+        }
+        rows += u64::try_from(page.len()).expect("page length fits u64");
+        replay.feed(&mut graph, page);
+        if done {
+            break;
+        }
+    }
+    replay.finish(&mut graph);
+    graph.trace_occupancy("scheduler wake", "log tail replayed", "observation");
+    Ok((graph, rows))
 }
 
 /// The wake sequence `ensure_graph` and the `wake` drive share —
-/// [`load`] the snapshot plus log tail, [`apply_events`] to replay it,
-/// then write the wake checkpoint: the restored totals, plus the
-/// isolate's unsettled counts (this operation's own reads among them),
-/// plus the checkpoint UPDATE itself — before any non-storage await
-/// opens the input gate (stow#931). Returns the rebuilt graph;
-/// `woken_at_ms` and `install` are the caller's.
+/// [`restore`] the snapshot plus log tail, then write the wake
+/// checkpoint: the restored totals, plus the isolate's unsettled counts
+/// (this operation's own reads among them), plus the checkpoint UPDATE
+/// itself — before any non-storage await opens the input gate
+/// (stow#931). Returns the rebuilt graph; `woken_at_ms` and `install`
+/// are the caller's.
 ///
 /// # Errors
 /// `QueueError::Sql`/`QueueError::Invariant` on a failed read or
 /// checkpoint write.
 pub async fn wake(db: &DurableDb, cell: &GraphCell, now_ms: i64) -> Result<Graph, QueueError> {
-    let (mut graph, events) = load(db).await?;
-    apply_events(&mut graph, &events);
+    let (graph, _) = restore(db).await?;
     checkpoint_meter(db, &graph.meter, cell, graph.meter.seq, now_ms).await?;
     Ok(graph)
 }
 
-/// Apply the log tail to the graph, each event at its own instant:
-/// `Submit` parts reassemble into one merge — a truncated tail (a
-/// submit whose ack never left, appended but never completed) drops,
-/// consistent with it never having been acknowledged — and every
-/// other kind goes through [`Graph::apply`]. Each row re-counts as
-/// one written row plus its `RETURNING` read on its day's meter —
-/// only rows past the checkpoint's `seq`.
-pub fn apply_events(graph: &mut Graph, events: &[(i64, Logged)]) {
-    struct Pending {
-        source: SubmissionSource,
-        parts: u32,
-        received: u32,
-        at: i64,
-        roots: Vec<u32>,
-        nodes: Vec<SubmissionNode>,
+/// A `Submit` whose parts are still arriving.
+struct PendingSubmit {
+    source: SubmissionSource,
+    parts: u32,
+    received: u32,
+    at: i64,
+    roots: Vec<u32>,
+    nodes: Vec<SubmissionNode>,
+}
+
+/// The state a log-tail replay carries across rows: the `Submit`
+/// whose parts span them. Feed it the tail page after page with
+/// [`feed`](Self::feed), then [`finish`](Self::finish).
+#[derive(Default)]
+pub struct TailReplay {
+    pending: Option<PendingSubmit>,
+}
+
+impl TailReplay {
+    /// Apply the next rows of the tail to the graph, each event at its
+    /// own instant: `Submit` parts reassemble into one merge and every
+    /// other kind goes through [`Graph::apply`]. Each row re-counts as
+    /// one written row plus its `RETURNING` read on its day's meter —
+    /// only rows past the checkpoint's `seq`.
+    pub fn feed(&mut self, graph: &mut Graph, events: impl IntoIterator<Item = (i64, Logged)>) {
+        for (seq, Logged { at, event, bytes }) in events {
+            graph.meter.replayed(at, seq);
+            graph.log_appended(bytes, seq);
+            match event {
+                SchedulerEvent::Submit {
+                    source,
+                    part,
+                    parts,
+                    roots,
+                    nodes,
+                } => {
+                    let continues = self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|p| p.source == source && p.parts == parts);
+                    if !continues {
+                        self.complete(graph);
+                        self.pending = Some(PendingSubmit {
+                            source,
+                            parts,
+                            received: 0,
+                            at,
+                            roots: Vec::new(),
+                            nodes: Vec::new(),
+                        });
+                    }
+                    let next = self.pending.as_mut().expect("pending submit just set");
+                    if part == 0 {
+                        next.roots = roots;
+                    }
+                    next.nodes.extend(nodes);
+                    next.received += 1;
+                    if part + 1 == parts {
+                        self.complete(graph);
+                    }
+                }
+                other => {
+                    self.complete(graph);
+                    graph.apply(&other, at);
+                }
+            }
+        }
     }
-    let complete = |graph: &mut Graph, pending: &mut Option<Pending>| {
-        if let Some(p) = pending.take()
+
+    /// End the tail: a `Submit` still missing parts — a submit whose
+    /// ack never left, appended but never completed — drops, consistent
+    /// with it never having been acknowledged.
+    pub fn finish(mut self, graph: &mut Graph) {
+        self.complete(graph);
+    }
+
+    /// Merge the pending submit when every part arrived; drop it
+    /// otherwise.
+    fn complete(&mut self, graph: &mut Graph) {
+        if let Some(p) = self.pending.take()
             && p.received == p.parts
         {
             let _ = graph.merge(
@@ -799,49 +899,7 @@ pub fn apply_events(graph: &mut Graph, events: &[(i64, Logged)]) {
                 p.at,
             );
         }
-    };
-    let mut pending: Option<Pending> = None;
-    for (seq, Logged { at, event, bytes }) in events {
-        graph.meter.replayed(*at, *seq);
-        graph.log_appended(*bytes, *seq);
-        match event {
-            SchedulerEvent::Submit {
-                source,
-                part,
-                parts,
-                roots,
-                nodes,
-            } => {
-                let next = match &mut pending {
-                    Some(p) if p.source == *source && p.parts == *parts => p,
-                    other => {
-                        complete(graph, other);
-                        other.insert(Pending {
-                            source: *source,
-                            parts: *parts,
-                            received: 0,
-                            at: *at,
-                            roots: Vec::new(),
-                            nodes: Vec::new(),
-                        })
-                    }
-                };
-                if *part == 0 {
-                    next.roots.clone_from(roots);
-                }
-                next.nodes.extend(nodes.iter().cloned());
-                next.received += 1;
-                if *part + 1 == *parts {
-                    complete(graph, &mut pending);
-                }
-            }
-            other => {
-                complete(graph, &mut pending);
-                graph.apply(other, *at);
-            }
-        }
     }
-    complete(graph, &mut pending);
 }
 
 #[cfg(test)]
@@ -968,6 +1026,13 @@ mod tests {
         );
     }
 
+    /// Replay `events` as one tail, the way a wake's pages do.
+    fn apply_events(graph: &mut Graph, events: &[(i64, Logged)]) {
+        let mut replay = TailReplay::default();
+        replay.feed(graph, events.iter().cloned());
+        replay.finish(graph);
+    }
+
     /// Append `events` and apply them — the store-and-graph pair a
     /// route's commit leaves.
     async fn commit_to(db: &DurableDb, graph: &mut Graph, events: &[SchedulerEvent], at: i64) {
@@ -1048,12 +1113,17 @@ mod tests {
             .await
             .expect("snapshot");
         assert!(covered > 0);
-        assert_eq!(log_tail(&db, covered).await.expect("tail").len(), 0);
+        assert_eq!(
+            log_page(&db, covered, LOG_PAGE_ROWS)
+                .await
+                .expect("tail")
+                .len(),
+            0
+        );
 
         // Forced eviction: reload from the store only.
-        let (mut restored, tail) = load(&db).await.expect("load");
-        assert!(tail.is_empty(), "snapshot covered the whole log");
-        apply_events(&mut restored, &tail);
+        let (mut restored, replayed) = restore(&db).await.expect("load");
+        assert_eq!(replayed, 0, "snapshot covered the whole log");
         restored.adopt_test_digests(&graph);
         assert_eq!(restored.status(), graph.status());
         let claimed = restored
@@ -1154,9 +1224,8 @@ mod tests {
         assert!(covered3 > covered2);
 
         // The wake reads every chunk set and replays nothing.
-        let (mut restored, tail) = load(&db).await.expect("load");
-        assert!(tail.is_empty());
-        apply_events(&mut restored, &tail);
+        let (mut restored, replayed) = restore(&db).await.expect("load");
+        assert_eq!(replayed, 0);
         restored.adopt_test_digests(&graph);
         assert_eq!(restored.status(), graph.status());
         assert_eq!(restored.sizes(), graph.sizes());
@@ -1352,8 +1421,7 @@ mod tests {
         .await
         .expect("claims row");
 
-        let (mut restored, tail) = load(&db).await.expect("wake");
-        apply_events(&mut restored, &tail);
+        let (mut restored, _) = restore(&db).await.expect("wake");
         // The claim replays as dispatched-unbound — no dispatch is lost
         // and nothing re-dispatches.
         assert_eq!(restored.status().dispatched, 1);
@@ -1425,8 +1493,7 @@ mod tests {
         append_events(&db, None, &events, 0)
             .await
             .expect("deliveries");
-        let (mut restored, tail) = load(&db).await.expect("wake");
-        apply_events(&mut restored, &tail);
+        let (restored, _) = restore(&db).await.expect("wake");
         assert_eq!(restored.status().completed, 1);
     }
 
@@ -1497,8 +1564,8 @@ mod tests {
                 .await
                 .expect("snapshot with parked completion");
             drop(graph);
-            let (mut restored, tail) = load(&db).await.expect("wake");
-            assert!(tail.is_empty(), "completion is in the snapshot");
+            let (mut restored, replayed) = restore(&db).await.expect("wake");
+            assert_eq!(replayed, 0, "completion is in the snapshot");
             assert!(restored.bind(&id("solo"), generation, 909, 4));
             assert_eq!(restored.status().completed, u32::from(success));
             assert_eq!(restored.status().failed, u32::from(!success));
@@ -1524,9 +1591,46 @@ mod tests {
         append_events(&db, None, &events[..1], 0)
             .await
             .expect("part 0");
-        let (mut restored, tail) = load(&db).await.expect("wake");
-        apply_events(&mut restored, &tail);
+        let (restored, _) = restore(&db).await.expect("wake");
         assert_eq!(restored.sizes().0, 0, "the unacknowledged submit dropped");
+    }
+
+    /// A tail longer than a page replays page by page: a submit whose
+    /// parts straddle the page boundary still merges once, and the
+    /// truncated submit at the end of the last page still drops.
+    #[tokio::test]
+    async fn a_submit_spanning_pages_merges_and_a_truncated_one_drops() {
+        let db = store().await;
+        let tree = |prefix: &str| SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![0],
+            nodes: (0..=SUBMIT_PART_NODES)
+                .map(|k| node(&format!("{prefix}{k}")))
+                .collect(),
+        };
+        let filler = SchedulerEvent::Mutate {
+            op: MutationKind::Cancel,
+            task_ids: Vec::new(),
+        };
+        // Part 0 is row 64 — the last of the first page — and part 1
+        // the first of the second.
+        let leading = vec![filler; LOG_PAGE_ROWS as usize - 1];
+        append_events(&db, None, &leading, 0)
+            .await
+            .expect("fillers");
+        let kept: Vec<_> = submission_events(&tree("kept")).collect();
+        assert_eq!(kept.len(), 2);
+        append_events(&db, None, &kept, 0).await.expect("kept");
+        let dropped: Vec<_> = submission_events(&tree("dropped")).collect();
+        append_events(&db, None, &dropped[..1], 0)
+            .await
+            .expect("part 0 of the truncated submit");
+        let (restored, replayed) = restore(&db).await.expect("wake");
+        assert_eq!(replayed, u64::from(LOG_PAGE_ROWS) + 2);
+        assert_eq!(
+            restored.sizes().0,
+            u64::try_from(SUBMIT_PART_NODES + 1).expect("node count fits u64")
+        );
     }
 
     #[tokio::test]
@@ -1558,9 +1662,8 @@ mod tests {
 
         // A wake re-counts what it replays: each appended row bills
         // one written row plus its `RETURNING` read (stow#931).
-        let (mut restored, tail) = load(&db).await.expect("load");
-        assert_eq!(tail.len(), 3);
-        apply_events(&mut restored, &tail);
+        let (restored, replayed) = restore(&db).await.expect("load");
+        assert_eq!(replayed, 3);
         assert_eq!(restored.meter.rows_written, 3);
         assert_eq!(restored.meter.rows_read, 3);
         assert_eq!(restored.meter.seq, 3);
@@ -1598,8 +1701,8 @@ mod tests {
         .await
         .expect("append");
         assert!(appended.seq > covered);
-        let (_, tail) = load(&db).await.expect("load");
-        assert_eq!(tail.len(), 1);
+        let (_, replayed) = restore(&db).await.expect("load");
+        assert_eq!(replayed, 1);
     }
 
     /// The stored row after a fresh checkpoint must equal every row the
@@ -1731,7 +1834,7 @@ mod tests {
             graph.log_appended(appended.bytes, appended.seq);
             apply_events(graph, &logged(&events, NOW_MS, appended));
         });
-        log_tail(&metered, 0).await.expect("tail read");
+        log_page(&metered, 0, u32::MAX).await.expect("tail read");
         meter.settle(loaded, NOW_MS);
 
         // The snapshot turn appends before snapshotting: the
@@ -1779,7 +1882,9 @@ mod tests {
         // rows: an empty read bills nothing and proves nothing.
         let loaded = cell.loaded().expect("woken");
         let (metered, meter) = Meter::wrap(db.clone(), &cell);
-        let tail = log_tail(&metered, 0).await.expect("read-only tail");
+        let tail = log_page(&metered, 0, u32::MAX)
+            .await
+            .expect("read-only tail");
         assert!(!tail.is_empty(), "the read-only step must bill rows");
         meter.settle(loaded, NOW_MS);
         let lost = u64::try_from(tail.len()).expect("tail length fits u64");

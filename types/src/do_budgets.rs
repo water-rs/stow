@@ -675,12 +675,25 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // billed reads (the UPDATE reads the row it changes plus the
         // RETURNING row on workerd, release gate run 40186665163; the
         // host backend bills it identically), +1 billed write over
-        // the pre-#931 row by construction. The workerd-scale absolute
-        // stands for a mock-stack `stow-admin scheduler budget` run to
-        // confirm.
+        // the pre-#931 row by construction.
+        //
+        // stow#1380: rows are billed, statements are not, and a
+        // snapshot row is 64 KiB (`CHUNK_TEXT_BYTES`) read 16 to a
+        // statement (`STATEMENT_ROWS`). The largest fixture the gate
+        // seeds (1M queue rows, 721,412 nodes, ~87 MB of snapshot
+        // text) is 1,415 rows on workerd (1,404 on the host): 1,325
+        // full rows plus the closing row of each range. The bound is
+        // 96 statements x 16 = 1,536 snapshot rows, 8.5% over that. The
+        // log tail reads in pages of 16 rows (`LOG_PAGE_ROWS`); the
+        // fixture's tail is bounded at 128 rows, eight full pages and
+        // the short one that ends the read. Statements: 96 snapshot +
+        // 1 watermark + 1 meter row + 9 tail pages + 1 checkpoint =
+        // 108. Rows read: 1,536 snapshot + 128 tail + 1 watermark + 1
+        // meter + 2 checkpoint (UPDATE .. RETURNING) = 1,668. Measured
+        // on workerd: 98 statements, 1,517 rows read.
         name: "wake (snapshot + log replay)",
-        statements: 62,
-        rows_read: 478,
+        statements: 108,
+        rows_read: 1668,
         rows_written: 5,
         wall_ms: 5000,
     },
@@ -689,12 +702,26 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // RETURNING` after the covered-log drop — +1 statement, +2
         // billed reads (the changed row plus the RETURNING row,
         // release gate run 40186665163), +1 billed write by
-        // construction; the host delta matches. The workerd-scale
-        // absolute awaits the same mock-stack probe run.
+        // construction; the host delta matches.
+        //
+        // stow#1380: a dirty span rewrites its whole range, now several
+        // 64 KiB rows (`CHUNK_TEXT_BYTES`) instead of one: the widest
+        // ranges, nodes (8,192 x ~100 B) and interned strings (16,384
+        // x ~50 B), are ~800 KB, 13 rows. The drive's fixed batch
+        // dirties 28 spans (measured on the host at 1M queue rows; 262
+        // rows upserted, 9.4 a span); the bound is 32 spans x 13 rows =
+        // 416 upserted rows. Rows written: 416 + 16 covered-log rows
+        // dropped (7 measured) + 1 watermark + 1 checkpoint = 434.
+        // Statements: ceil(416 / 16) = 26 upserts + 32 stale-range
+        // deletes (one per span) + 1 covered-seq read + 1 watermark +
+        // 1 log drop + 1 checkpoint = 62. Rows read are unchanged by
+        // the row size: the covered-seq read and the checkpoint,
+        // under the pre-#1380 allowance. Measured on the host: 49
+        // statements, 3 reads, 271 written (36 / 3 / 38 before).
         name: "snapshot write",
-        statements: 67,
+        statements: 62,
         rows_read: 481,
-        rows_written: 533,
+        rows_written: 434,
         wall_ms: 5000,
     },
 ];

@@ -3549,7 +3549,10 @@ pub const DRIVES: &[Drive] = &[
         // A cold wake: the snapshot's chunks and the log tail replayed
         // into a fresh graph — the only operation that reads the
         // graph's bulk. Bounded by the snapshot chunks plus the
-        // `SNAPSHOT_EVENT_THRESHOLD`-bounded tail.
+        // `SNAPSHOT_EVENT_THRESHOLD`-bounded tail. Rows are billed,
+        // statements are not: the chunks are 64 KiB rows read 16 to a
+        // statement, the tail pages 16 rows to a statement — the
+        // derivation is the drive's budget row in `DO_BUDGETS`.
         name: "wake (snapshot + log replay)",
         // An evicted isolate wakes empty: the live graph is dropped
         // first, so the wake never sits beside a second graph.
@@ -3577,7 +3580,10 @@ pub const DRIVES: &[Drive] = &[
         // published-slice report), so the measured run rewrites only
         // the spans the batch dirtied. Each event touches a constant
         // number of chunks, so the snapshot's rows scale with the
-        // events since the last one, never with the stored graph.
+        // events since the last one, never with the stored graph. A
+        // dirty span rewrites its whole range as 64 KiB rows (up to 13
+        // for the widest), upserted 16 to a statement; the derivation
+        // is the drive's budget row in `DO_BUDGETS`.
         name: "snapshot write",
         setup: Some(|db, shape, settings, ctx| {
             Box::pin(async move {

@@ -7,6 +7,8 @@
 //!   relative to a reference workload profiled in the same isolate;
 //! - `peak` drives every lane at the launch model's peak rate and fails
 //!   on any overload signal or 5xx;
+//! - `restart` judges the population scenario's restart from the edge
+//!   log: the traced JavaScript heap and the wake's Wasm linear memory;
 //! - `verdict` judges the scheduler budget reports: row budgets, growth
 //!   with stored rows, and the peak serialized Durable Object wall;
 //! - `project` is the monthly projection against dimension-specific budgets
@@ -39,6 +41,7 @@ mod lanes;
 mod peak;
 mod preheat;
 mod project;
+mod restart;
 #[cfg(test)]
 mod test_support;
 mod verdict;
@@ -54,6 +57,10 @@ pub struct TrafficCostArgs {
 enum TrafficCostCommand {
     /// Observe the local isolate's heap and backing-storage counters.
     Memory(cpu::MemoryArgs),
+    /// Judge the population scenario's restart from the edge log: the
+    /// traced JavaScript heap against an empty scheduler's, and the Wasm
+    /// linear memory of the wake against the accounted graph storage.
+    Restart(restart::RestartArgs),
     /// Measure Worker CPU per traffic lane through the edge's `DevTools`
     /// inspector and fail on a lane over its budget.
     Cpu(cpu::CpuArgs),
@@ -79,6 +86,7 @@ pub async fn run(
 ) -> stow_types::error::Result<()> {
     match args.command {
         TrafficCostCommand::Memory(args) => cpu::memory(&args, output).await,
+        TrafficCostCommand::Restart(args) => restart::run(&args, output).await,
         TrafficCostCommand::Cpu(args) => cpu::run(&Edge::connect(store)?, &args, output).await,
         TrafficCostCommand::Peak(args) => peak::run(&Edge::connect(store)?, &args, output).await,
         TrafficCostCommand::Verdict(args) => verdict::run(&args, output).await,

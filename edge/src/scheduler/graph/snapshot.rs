@@ -1,15 +1,15 @@
 //! The graph's incremental chunked snapshot (stow#878 §3.3, stow#902).
 //!
 //! The persisted graph is split into fixed chunks addressed by a
-//! stable key — `kind * 2^48 + range * 64 + sub` — so a snapshot
+//! stable key — `kind * 2^48 + range * 1024 + sub` — so a snapshot
 //! rewrites only the ranges a mutation touched: node state and
 //! adjacency by node/edge index range, interned strings by id range
 //! (append-only, only the tail range changes), the published map and
 //! the unbounded side tables by key-hash bucket, and the small global
-//! state in one unconditional `meta` row. `sub` bounds a range to 64
-//! rows (`SNAPSHOT_SPAN_ROWS`): a range whose items spill past one row
-//! — a giant interned string, a skewed bucket — splits instead of
-//! nearing the platform's ~2 MB row bound.
+//! state in one unconditional `meta` row. A row closes at
+//! `CHUNK_TEXT_BYTES` (64 KiB) of text, so a range whose items spill
+//! past one row — a skewed bucket, a long run of nodes — splits into
+//! sub-rows; `sub` bounds a range to `SNAPSHOT_SPAN_ROWS` of them.
 //!
 //! Dirty tracking lives in memory (`Graph::dirty` plus the interner's
 //! `intern_committed` watermark), never persisted: a wake starts clean
@@ -45,42 +45,61 @@ use crate::errors::QueueError;
 
 /// The payload text one row carries, about: a range's row closes once
 /// its encoded items reach this size, so a row is this plus at most
-/// one item — far under the platform's 2 MB row bound.
-const CHUNK_TEXT_BYTES: usize = 1 << 20;
+/// one item. 64 KiB keeps every row — and the JavaScript string it
+/// crosses the heap as — small enough that a statement of
+/// [`STATEMENT_ROWS`] rows carries about 1 MiB (stow#1380).
+const CHUNK_TEXT_BYTES: usize = 1 << 16;
 
 /// The binary bytes that encode to [`CHUNK_TEXT_BYTES`] of base64.
 const CHUNK_BINARY_BYTES: usize = CHUNK_TEXT_BYTES / 4 * 3;
 
+/// Rows per 1 MiB statement: how many [`CHUNK_TEXT_BYTES`] rows a wake
+/// read or a snapshot upsert carries so that one statement holds about
+/// 1 MiB of payload (16 rows of 64 KiB).
+pub const STATEMENT_ROWS: usize = (1 << 20) / CHUNK_TEXT_BYTES;
+
 /// Rows one range may emit — the sub-key bound of a chunk key. A range
 /// needing more fails the snapshot as an invariant rather than
 /// silently colliding with the next range's keys.
-pub const SNAPSHOT_SPAN_ROWS: i64 = 64;
+///
+/// A span keeps its byte capacity across row sizes: 1024 rows of
+/// [`CHUNK_TEXT_BYTES`] is 64 MiB, the 64 rows of 1 MiB it replaces. A
+/// key is `kind << 48 | range * SNAPSHOT_SPAN_ROWS + sub`; the widest
+/// range ordinal is `u32::MAX`, so the product stays under
+/// `2^32 * 2^10 = 2^42`, below the kind bits at 2^48 and inside `i64`,
+/// and distinct ranges own disjoint runs of `SNAPSHOT_SPAN_ROWS` keys.
+pub const SNAPSHOT_SPAN_ROWS: i64 = 1024;
+
+const _: () = assert!(
+    (u32::MAX as i64 + 1) * SNAPSHOT_SPAN_ROWS <= 1 << 48,
+    "a span's keys must stay under the kind bits"
+);
 
 /// Interned strings per `intern` range: the dirty granularity of an
 /// append-only table — only the tail range is ever rewritten, so this
-/// bounds one snapshot's string rewrite. ~50 bytes a name keeps a
-/// range near the ~1 MiB row density today's snapshot kept.
+/// bounds one snapshot's string rewrite. ~50 bytes a name makes a
+/// range ~800 KB, about a dozen rows.
 const INTERN_RANGE: u32 = 16_384;
 
 /// Nodes per `nodes` range: ~100 bytes of node + state + a rare extra
-/// in the common case keeps a rewrite near the ~1 MiB row density
-/// today's snapshot kept; oversize ranges sub-split.
+/// in the common case makes a range ~800 KB, about a dozen rows;
+/// oversize ranges sub-split further.
 const NODES_RANGE: u32 = 8_192;
 
 /// Edges per `edges` range: five fixed bytes an edge, 640 KB a range.
 const EDGES_RANGE: u32 = 131_072;
 
 /// Published-mask buckets: the dense table — 19 fixed bytes an entry —
-/// sized so a bucket rewrite stays one row at the largest graph the
+/// sized so a bucket stays a handful of rows at the largest graph the
 /// 128 MiB object holds (#878 measured ~345k nodes at 480k rows): an
-/// all-published graph is 345k x 19 B / 16 = ~410 KB a bucket, ~52% of
-/// the ~786 KB binary row bound, still one row at twice that size.
+/// all-published graph is 345k x 19 B / 16 = ~410 KB a bucket, about
+/// nine rows.
 const PUBLISHED_BUCKETS: u32 = 16;
 
 /// Request-record buckets, by request-id hash: ~512 bytes of JSON a
 /// record, and the request history a 345k-node graph carries stays
 /// far under ~100k admissions (each admits at least one node) — 96k x
-/// 512 B / 64 = ~770 KB a bucket, ~98% of a row at that bound.
+/// 512 B / 64 = ~770 KB a bucket, about a dozen rows.
 const REQUESTS_BUCKETS: u32 = 64;
 
 /// Staged-page buckets, by hour hash: staged pages live only until a
@@ -92,14 +111,15 @@ const FEED_BUCKETS: u32 = 16;
 /// Demand-batch buckets, by batch-id hash: ~60 bytes of JSON a
 /// `(id, hash, count)` entry — batches accrue for the graph's life;
 /// at 64 buckets a ~780k-batch history fills a bucket at ~730 KB,
-/// ~93% of a row, and the object hits its memory bound first.
+/// about a dozen rows, and the object hits its memory bound first.
 const BATCHES_BUCKETS: u32 = 64;
 
 /// Staged-report buckets, by slice: an incomplete multi-part full
 /// report lives only until its last part arrives or a newer one
 /// supersedes it, so the staged set is a few slices' parts. Each part
-/// is at most `SLICE_REPORT_PART_BYTES` (half a mebibyte), so a row
-/// that closes at `CHUNK_TEXT_BYTES` holds under 1.5 MiB.
+/// is at most `SLICE_REPORT_PART_BYTES` (half a mebibyte) and a row is
+/// never split inside an item, so a staged row that closes at
+/// `CHUNK_TEXT_BYTES` holds under 0.6 MiB.
 const STAGED_BUCKETS: u32 = 16;
 
 /// How a row's payload is encoded.
