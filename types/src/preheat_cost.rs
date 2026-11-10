@@ -172,6 +172,27 @@ pub struct PhaseObservations {
     pub end: LedgerSnapshot,
 }
 
+/// One resubmit pass: the phase's observations plus what the pass's lanes
+/// inserted and what the queue already carried when it began.
+///
+/// The daily cron resolves online, so a release published between the
+/// wave and the resubmit gives the resubmit nodes the wave never planned.
+/// The harness therefore repeats the resubmit until one pass inserts
+/// nothing; every pass before that one is a drift pass.
+#[derive(Debug, Clone)]
+pub struct ResubmitPass {
+    /// The pass's ledger reads, lanes and publish rounds.
+    pub phase: PhaseObservations,
+    /// Task ids the queue carried before the pass began: everything the
+    /// wave and the earlier passes planned.
+    pub known: BTreeSet<String>,
+    /// `crate_name version` of every release some earlier phase planned.
+    pub known_releases: BTreeSet<String>,
+    /// The pass's first-seen tasks — the rows its lanes inserted — by
+    /// task id, each with its `crate_name version`.
+    pub inserted: BTreeMap<String, String>,
+}
+
 /// One task a production lane planned, reduced to what the count needs.
 #[derive(Debug, Clone)]
 pub struct ProductionTask {
@@ -283,17 +304,29 @@ pub struct WaveObservations {
     pub nodes: BTreeMap<String, Node>,
     /// The first wave.
     pub wave: PhaseObservations,
-    /// The daily resubmit of the same lists.
-    pub resubmit: PhaseObservations,
-    /// Every edge restart across both phases, in the order they ran.
+    /// The daily resubmit of the same lists, repeated until a pass inserted
+    /// nothing: every pass in the order it ran, the last one the measured
+    /// resubmit. Never empty.
+    pub resubmit: Vec<ResubmitPass>,
+    /// Every edge restart across every phase, in the order they ran.
     pub restarts: Vec<EdgeRestart>,
-    /// Every run the local CI was dispatched, both phases.
+    /// Every run the local CI was dispatched, every phase.
     pub runs: Vec<LocalCiRun>,
     /// Task ids the final published slices serve — the gate's own
     /// coverage rule.
     pub covered: BTreeSet<String>,
     /// Every place an `overloaded` answer surfaced, one line each.
     pub overload_sightings: Vec<String>,
+}
+
+impl WaveObservations {
+    /// Every lane of the wave and of every resubmit pass, in run order.
+    fn every_lane(&self) -> impl Iterator<Item = &LaneRun> {
+        self.wave
+            .lanes
+            .iter()
+            .chain(self.resubmit.iter().flat_map(|pass| &pass.phase.lanes))
+    }
 }
 
 /// One kind's cost over a span.
@@ -393,6 +426,33 @@ pub struct LaneCost {
     pub wall_ms: u64,
 }
 
+/// A resubmit pass that inserted tasks, so the registry moved between it
+/// and the phase before it. Information, not a check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftPass {
+    /// The pass's place among the resubmit passes, from 1.
+    pub pass: u64,
+    /// Queue rows the pass's lanes inserted.
+    pub inserted: u64,
+    /// The distinct `crate_name version` pairs among them that no earlier
+    /// phase had planned — the releases that explain the pass.
+    pub new_releases: Vec<String>,
+    /// `build-crate.yml` runs the pass dispatched.
+    pub tasks: u64,
+}
+
+impl DriftPass {
+    /// [`Self::new_releases`], truncated for a line of text.
+    #[must_use]
+    pub fn releases_summary(&self) -> String {
+        if self.new_releases.is_empty() {
+            "none".to_owned()
+        } else {
+            summarise(&self.new_releases)
+        }
+    }
+}
+
 /// One gate outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Check {
@@ -415,11 +475,17 @@ pub struct PreheatCostReport {
     pub nodes_per_target: BTreeMap<String, u64>,
     /// The wave's totals.
     pub wave: PhaseCost,
-    /// The resubmit's totals.
+    /// The measured resubmit's totals: the last resubmit pass, the one that
+    /// inserted nothing.
     pub resubmit: PhaseCost,
+    /// Resubmit passes that ran, drift passes included.
+    pub resubmit_passes: u64,
+    /// The passes before the measured one, each of which inserted tasks.
+    /// They enter neither the wave's nor the resubmit's totals.
+    pub drift_passes: Vec<DriftPass>,
     /// The wave, layer by layer.
     pub layers: Vec<LayerCost>,
-    /// Each lane's submit, both phases.
+    /// Each lane's submit, the wave and the measured resubmit.
     pub lanes: Vec<LaneCost>,
     /// Every gate, passed or not.
     pub checks: Vec<Check>,
@@ -989,7 +1055,7 @@ fn order_check(observed: &WaveObservations) -> Check {
         .wave
         .rounds
         .iter()
-        .chain(&observed.resubmit.rounds)
+        .chain(observed.resubmit.iter().flat_map(|pass| &pass.phase.rounds))
         .collect();
     let mut violations = Vec::new();
     for run in &observed.runs {
@@ -1089,7 +1155,7 @@ fn overload_check(observed: &WaveObservations) -> Check {
                 .map(|error| format!("{} webhook: {error}", run.display_title)),
         );
     }
-    for lane in observed.wave.lanes.iter().chain(&observed.resubmit.lanes) {
+    for lane in observed.every_lane() {
         sightings.extend(
             lane.submit_failures
                 .iter()
@@ -1110,10 +1176,7 @@ fn overload_check(observed: &WaveObservations) -> Check {
 
 fn submit_failure_check(observed: &WaveObservations) -> Check {
     let failures: Vec<String> = observed
-        .wave
-        .lanes
-        .iter()
-        .chain(&observed.resubmit.lanes)
+        .every_lane()
         .flat_map(|lane| {
             lane.submit_failures
                 .iter()
@@ -1147,31 +1210,118 @@ fn summarise(lines: &[String]) -> String {
     }
 }
 
+/// The measured resubmit — the last pass — rebuilt nothing and inserted
+/// nothing. A last pass that still inserted means the harness's pass bound
+/// ran out while the registry (or a resolver that is not deterministic)
+/// kept giving the lanes new nodes.
+fn resubmit_clean_check(last: &ResubmitPass, passes: usize, cost: &PhaseCost) -> Check {
+    let inserted = last.inserted.len();
+    let detail = if inserted > 0 {
+        format!(
+            "{passes} resubmit passes ran and each inserted tasks ({inserted} in the last, \
+             which dispatched {} build runs)",
+            cost.tasks
+        )
+    } else {
+        format!(
+            "{} build runs dispatched by the resubmit (pass {passes} of {passes})",
+            cost.tasks
+        )
+    };
+    check(
+        "Resubmit rebuilt nothing",
+        cost.tasks == 0 && inserted == 0,
+        detail,
+    )
+}
+
+/// No resubmit pass dispatched a build for a node that the wave or an
+/// earlier pass had already planned. A node first planned by a pass is
+/// that pass's drift, never a rebuild.
+fn no_pass_rebuilt_check(observed: &WaveObservations) -> Check {
+    let path = format!(
+        ".github/workflows/{}",
+        crate::trusted_builder::WORKFLOW_FILE
+    );
+    let mut rebuilt = Vec::new();
+    for (index, pass) in observed.resubmit.iter().enumerate() {
+        rebuilt.extend(
+            observed
+                .runs
+                .iter()
+                .filter(|run| {
+                    run.path == path
+                        && run.dispatched_at_ms > pass.phase.start.taken_at_ms
+                        && run.dispatched_at_ms <= pass.phase.end.taken_at_ms
+                })
+                .filter_map(|run| run.task_id.as_deref())
+                .filter(|task_id| pass.known.contains(*task_id))
+                .map(|task_id| format!("pass {}: {task_id}", index + 1)),
+        );
+    }
+    check(
+        "No resubmit pass rebuilt a node already planned",
+        rebuilt.is_empty(),
+        if rebuilt.is_empty() {
+            format!("{} resubmit passes, none rebuilt", observed.resubmit.len())
+        } else {
+            format!("{} rebuilt: {}", rebuilt.len(), summarise(&rebuilt))
+        },
+    )
+}
+
 /// Build the report and run every check.
 ///
 /// # Errors
-/// A ledger snapshot went backwards between two reads.
+/// A ledger snapshot went backwards between two reads, no resubmit pass
+/// was observed, or a pass that inserted nothing was followed by another.
 pub fn analyse(observed: &WaveObservations) -> crate::error::Result<PreheatCostReport> {
     let nodes = observed.nodes.len() as u64;
     let mut nodes_per_target = BTreeMap::<String, u64>::new();
     for node in observed.nodes.values() {
         *nodes_per_target.entry(node.target.clone()).or_default() += 1;
     }
+    let Some((last, drift)) = observed.resubmit.split_last() else {
+        return Err(crate::stow_error!("the run observed no resubmit pass"));
+    };
+    // A pass is followed by another only because it inserted tasks.
+    if let Some(index) = drift.iter().position(|pass| pass.inserted.is_empty()) {
+        return Err(crate::stow_error!(
+            "resubmit pass {} inserted nothing but pass {} followed it",
+            index + 1,
+            index + 2
+        ));
+    }
     let timeline = Timeline::new(&observed.restarts)?;
     let wave_reads = timeline.phase(&observed.wave)?;
-    let resubmit_reads = timeline.phase(&observed.resubmit)?;
+    let resubmit_reads = timeline.phase(&last.phase)?;
     let wave = phase_cost(&wave_reads, &observed.runs)?;
     let resubmit = phase_cost(&resubmit_reads, &observed.runs)?;
     let layers = layers(&wave_reads, &observed.runs)?;
     let mut lanes = lane_costs("wave", &wave_reads)?;
     lanes.extend(lane_costs("resubmit", &resubmit_reads)?);
+    let drift_passes = drift
+        .iter()
+        .enumerate()
+        .map(|(index, pass)| {
+            let reads = timeline.phase(&pass.phase)?;
+            let releases: BTreeSet<&String> = pass
+                .inserted
+                .values()
+                .filter(|release| !pass.known_releases.contains(*release))
+                .collect();
+            Ok(DriftPass {
+                pass: index as u64 + 1,
+                inserted: pass.inserted.len() as u64,
+                new_releases: releases.into_iter().cloned().collect(),
+                tasks: phase_cost(&reads, &observed.runs)?.tasks,
+            })
+        })
+        .collect::<crate::error::Result<Vec<_>>>()?;
 
     let mut checks = vec![
-        check(
-            "Resubmit rebuilt nothing",
-            resubmit.tasks == 0,
-            format!("{} build runs dispatched by the resubmit", resubmit.tasks),
-        ),
+        resubmit_clean_check(last, observed.resubmit.len(), &resubmit),
+        no_pass_rebuilt_check(observed),
         completions_check("Wave completions equal its build runs", &wave),
         completions_check("Resubmit completions equal its build runs", &resubmit),
         external_run_updates_check(
@@ -1207,6 +1357,8 @@ pub fn analyse(observed: &WaveObservations) -> crate::error::Result<PreheatCostR
         nodes_per_target,
         wave,
         resubmit,
+        resubmit_passes: observed.resubmit.len() as u64,
+        drift_passes,
         layers,
         lanes,
         checks,
@@ -1219,7 +1371,8 @@ mod tests {
 
     use super::{
         EventKind, LaneRun, LedgerSnapshot, Node, PhaseObservations, ProductionLane,
-        ProductionTask, Round, WaveObservations, analyse, count_production, ledger_delta,
+        ProductionTask, ResubmitPass, Round, WaveObservations, analyse, count_production,
+        ledger_delta,
     };
     use crate::api::{SchedulerLedger, SchedulerLedgerOp};
     use crate::local_ci::LocalCiRun;
@@ -1384,12 +1537,21 @@ mod tests {
                 lanes: vec![lane.clone(), lane],
                 end: end.clone(),
             },
-            resubmit: PhaseObservations {
-                start: end.clone(),
-                rounds: vec![],
-                lanes: vec![],
-                end: snapshot(400, end.ledger),
-            },
+            resubmit: vec![ResubmitPass {
+                phase: PhaseObservations {
+                    start: end.clone(),
+                    rounds: vec![],
+                    lanes: vec![],
+                    end: snapshot(400, end.ledger),
+                },
+                known: BTreeSet::from(["a".to_owned(), "b".to_owned(), "c".to_owned()]),
+                known_releases: BTreeSet::from([
+                    "alpha 1.0.0".to_owned(),
+                    "beta 1.0.0".to_owned(),
+                    "gamma 1.0.0".to_owned(),
+                ]),
+                inserted: BTreeMap::new(),
+            }],
             // a dispatches before round 1; b after round 1's report
             // began; c after round 2's.
             restarts: vec![],
@@ -1436,7 +1598,9 @@ mod tests {
         let answer = |read: &mut LedgerSnapshot| {
             read.ledger = answered(&read.ledger, read.taken_at_ms, restarts);
         };
-        for phase in [&mut observed.wave, &mut observed.resubmit] {
+        for phase in std::iter::once(&mut observed.wave)
+            .chain(observed.resubmit.iter_mut().map(|pass| &mut pass.phase))
+        {
             answer(&mut phase.start);
             answer(&mut phase.end);
             for round in &mut phase.rounds {
@@ -1594,6 +1758,154 @@ mod tests {
         observed.runs.push(run("a", 350));
         let report = analyse(&observed).expect("analyse");
         assert!(failed(&report).contains(&"Resubmit rebuilt nothing"));
+    }
+
+    /// `chain(0)` whose resubmit ran `releases.len()` further passes, each
+    /// inserting the task and release it names and building it, the last
+    /// pass of all inserting and building nothing unless `last_inserts`
+    /// names its task. Pass k's window is `(300 + 100k, 400 + 100k]`.
+    fn with_passes(
+        releases: &[(&str, &str)],
+        last_inserts: Option<(&str, &str)>,
+    ) -> WaveObservations {
+        let mut observed = chain(0);
+        let ledger = observed.wave.end.ledger.clone();
+        let mut known = observed.resubmit[0].known.clone();
+        let known_releases = observed.resubmit[0].known_releases.clone();
+        let mut releases_seen = known_releases;
+        let mut passes = Vec::new();
+        let planned: Vec<(&str, &str)> = releases.iter().copied().chain(last_inserts).collect();
+        for (index, &(task_id, release)) in planned.iter().enumerate() {
+            let k = index as u64;
+            passes.push(ResubmitPass {
+                phase: PhaseObservations {
+                    start: snapshot(300 + 100 * k, ledger.clone()),
+                    rounds: vec![],
+                    lanes: vec![],
+                    end: snapshot(400 + 100 * k, ledger.clone()),
+                },
+                known: known.clone(),
+                known_releases: releases_seen.clone(),
+                inserted: BTreeMap::from([(task_id.to_owned(), release.to_owned())]),
+            });
+            observed.runs.push(run(task_id, 350 + 100 * k));
+            known.insert(task_id.to_owned());
+            releases_seen.insert(release.to_owned());
+        }
+        if last_inserts.is_none() {
+            let k = planned.len() as u64;
+            passes.push(ResubmitPass {
+                phase: PhaseObservations {
+                    start: snapshot(300 + 100 * k, ledger.clone()),
+                    rounds: vec![],
+                    lanes: vec![],
+                    end: snapshot(400 + 100 * k, ledger),
+                },
+                known,
+                known_releases: releases_seen,
+                inserted: BTreeMap::new(),
+            });
+        }
+        observed.resubmit = passes;
+        observed
+    }
+
+    #[test]
+    fn a_drift_pass_followed_by_a_clean_pass_passes_and_the_clean_pass_is_the_resubmit() {
+        let observed = with_passes(&[("d", "delta 2.0.0")], None);
+        let report = analyse(&observed).expect("analyse");
+        assert!(failed(&report).is_empty(), "{:?}", report.checks);
+        assert_eq!(report.resubmit_passes, 2);
+        // The measured resubmit is the clean pass, which dispatched nothing,
+        // although the drift pass before it built `d`.
+        assert_eq!(report.resubmit.tasks, 0);
+        assert_eq!(report.wave.tasks, 3);
+        assert_eq!(
+            report.drift_passes,
+            [super::DriftPass {
+                pass: 1,
+                inserted: 1,
+                new_releases: vec!["delta 2.0.0".to_owned()],
+                tasks: 1,
+            }]
+        );
+        assert_eq!(report.drift_passes[0].releases_summary(), "delta 2.0.0");
+    }
+
+    #[test]
+    fn a_drift_release_already_planned_is_not_reported_as_new() {
+        // A new version of a known crate is a new release; a node re-resolved
+        // under a known release (a dependency's new version changes its task
+        // id) is not.
+        let observed = with_passes(&[("d", "alpha 1.0.0")], None);
+        let report = analyse(&observed).expect("analyse");
+        assert!(failed(&report).is_empty(), "{:?}", report.checks);
+        assert_eq!(report.drift_passes[0].new_releases, Vec::<String>::new());
+        assert_eq!(report.drift_passes[0].releases_summary(), "none");
+    }
+
+    #[test]
+    fn a_pass_that_rebuilds_an_already_planned_node_fails() {
+        let name = "No resubmit pass rebuilt a node already planned";
+        // In the clean pass: `a` was planned by the wave.
+        let mut observed = with_passes(&[("d", "delta 2.0.0")], None);
+        observed.runs.push(run("a", 450));
+        let report = analyse(&observed).expect("analyse");
+        assert!(failed(&report).contains(&name), "{:?}", report.checks);
+        // In a drift pass: `d` (this pass's own insert) is no rebuild, `b` is.
+        let mut observed = with_passes(&[("d", "delta 2.0.0")], None);
+        observed.runs.push(run("d", 360));
+        let report = analyse(&observed).expect("analyse");
+        assert!(!failed(&report).contains(&name), "{:?}", report.checks);
+        observed.runs.push(run("b", 370));
+        let report = analyse(&observed).expect("analyse");
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == name)
+            .expect("the check");
+        assert!(
+            !check.passed && check.detail.contains("pass 1: b"),
+            "{check:?}"
+        );
+        // A node a drift pass inserted, rebuilt by a later pass.
+        let mut observed = with_passes(&[("d", "delta 2.0.0")], None);
+        observed.runs.push(run("d", 450));
+        let report = analyse(&observed).expect("analyse");
+        assert!(failed(&report).contains(&name), "{:?}", report.checks);
+    }
+
+    #[test]
+    fn passes_exhausted_while_still_inserting_fail_the_resubmit_check() {
+        let observed = with_passes(
+            &[("d", "delta 2.0.0"), ("e", "epsilon 1.0.0")],
+            Some(("f", "zeta 3.0.0")),
+        );
+        let report = analyse(&observed).expect("analyse");
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "Resubmit rebuilt nothing")
+            .expect("the check");
+        assert!(!check.passed, "{check:?}");
+        assert!(
+            check
+                .detail
+                .contains("3 resubmit passes ran and each inserted tasks"),
+            "{}",
+            check.detail
+        );
+        assert_eq!(report.drift_passes.len(), 2);
+        // Only the last pass is the measured resubmit.
+        assert_eq!(report.resubmit.tasks, 1);
+    }
+
+    #[test]
+    fn a_pass_that_inserted_nothing_cannot_be_followed_by_another() {
+        let mut observed = with_passes(&[("d", "delta 2.0.0")], None);
+        observed.resubmit[0].inserted.clear();
+        let error = analyse(&observed).expect_err("layout").to_string();
+        assert!(error.contains("pass 1 inserted nothing"), "{error}");
     }
 
     #[test]
@@ -1754,8 +2066,8 @@ mod tests {
         };
         book(&mut observed.wave.rounds[2].end);
         book(&mut observed.wave.end);
-        book(&mut observed.resubmit.start);
-        book(&mut observed.resubmit.end);
+        book(&mut observed.resubmit[0].phase.start);
+        book(&mut observed.resubmit[0].phase.end);
         observed
     }
 
@@ -1824,8 +2136,8 @@ mod tests {
             }
         }
         observed.wave.end = observed.wave.rounds.last().unwrap().end.clone();
-        observed.resubmit.start = observed.wave.end.clone();
-        observed.resubmit.end.ledger = observed.wave.end.ledger.clone();
+        observed.resubmit[0].phase.start = observed.wave.end.clone();
+        observed.resubmit[0].phase.end.ledger = observed.wave.end.ledger.clone();
         let report = analyse(&observed).expect("analyse");
         assert!(
             failed(&report).contains(&"Wave completions equal its build runs"),
