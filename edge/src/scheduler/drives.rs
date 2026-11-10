@@ -1385,8 +1385,10 @@ pub const DRIVES: &[Drive] = &[
         // queues, one per rank-operand class: memory only, no statement,
         // so the budget row is unchanged (stow#1096). The in-flight
         // rows' task ids are minted from their digest rows (stow#1378):
-        // one statement, one billed read per distinct 256-slot block the
-        // in-flight slots fall in — at most the dispatch cap.
+        // one statement, two rows read per in-flight row (the
+        // `json_each` list row and the table row; the sqlite test
+        // backend's meter counts only the table row) — at most the
+        // dispatch cap at any population.
         name: "GET /admin/status",
         setup: None,
         run: |db, _shape, _settings, ctx| {
@@ -1400,6 +1402,16 @@ pub const DRIVES: &[Drive] = &[
         cleanup: None,
     },
     Drive {
+        // The listing drives (stow#1378) mint the task id of each
+        // unnamed row they return, and of a blocked row's failed
+        // dependency, from digest rows: one statement, two rows read
+        // per id (the list row and the table row; the sqlite test
+        // backend's meter counts only the table row). A listing
+        // returns at most `ADMIN_LIST_LIMIT` rows, so it reads at most
+        // that many digests plus as many blocked-by ids at any
+        // population; the cost follows the matching rows only until
+        // that cap. The crate listing is one too, bounded by the same
+        // cap rather than by the name's version set.
         name: "GET /tasks",
         setup: None,
         run: |db, _shape, _settings, ctx| {
@@ -1741,8 +1753,9 @@ pub const DRIVES: &[Drive] = &[
         // its tree, the pre/post status probes and the `enqueued`
         // event — the same merge machinery the submit drives price, at
         // the request batch's size. Its digest rows (stow#1378) are the
-        // submit drives' cost, plus one block read for the post-merge
-        // probe's minted ids.
+        // submit drives' cost for its two tree nodes (two rows read and
+        // one written each), plus two rows read per root (two roots)
+        // for the post-merge probe's blocked-by ids.
         name: "POST /requests/{id}/outcome",
         setup: None,
         run: |db, shape, settings, ctx| {
@@ -1986,12 +1999,11 @@ pub const DRIVES: &[Drive] = &[
     // each lane that sets it is measured through the same submit core.
     // Every submit writes the digest rows of its fresh nodes' state
     // slots in the turn that appends its `Submit` parts (stow#1378):
-    // one read per partly covered 256-slot block (a statement per 64
-    // blocks) and one write per block touched (a statement per 8). F
-    // fresh nodes touch at most F blocks (reused slots may be scattered)
-    // and as few as ceil(F / 256), so the cost is at most F reads and F
-    // writes beyond the log rows; a block every slot of which is fresh
-    // is written without a read.
+    // one upsert row per fresh node, a statement per 4,096 rows. F
+    // fresh nodes cost 2F rows read (the `json_each` row and its
+    // source row) and F rows written beyond the log rows at any
+    // population; the sqlite test backend's meter counts only the
+    // written rows.
     Drive {
         name: "POST /tasks/submit (operations)",
         setup: None,
@@ -2154,8 +2166,10 @@ pub const DRIVES: &[Drive] = &[
     },
     Drive {
         // The batch's contributions mint their task ids from digest
-        // rows (stow#1378): one statement, one billed read per distinct
-        // block the contributing slots fall in.
+        // rows (stow#1378): one statement, two rows read per touched
+        // task (the list row and the table row; the sqlite test
+        // backend's meter counts only the table row) — the keyed root
+        // and its 11 unmet dependencies.
         name: "POST /demand",
         setup: Some(|_db, _shape, _settings, ctx| {
             Box::pin(async move {
@@ -2511,8 +2525,9 @@ pub const DRIVES: &[Drive] = &[
         // occupancy (stow#877) reconciles at most once per ten minutes
         // and only while the graph holds work. A pass that claims reads
         // the claimed slots' digest rows (stow#1378): one statement and
-        // one billed read per distinct 256-slot block among them, ahead
-        // of the `Claims` append; a pass that claims nothing reads none.
+        // two rows read per claim (the list row and the table row) — at
+        // most the dispatch cap — ahead of the `Claims` append; a pass
+        // that claims nothing reads none.
         name: "alarm pass",
         setup: None,
         run: |db, _shape, settings, ctx| {
@@ -3497,8 +3512,9 @@ pub const DRIVES: &[Drive] = &[
         // gating on a published pool leaf — appended as its `Submit`
         // parts and merged into the graph. The cost is the log rows of
         // the tree's bytes, one per ~1 MiB part, plus the merge's CPU
-        // and the digest rows of its fresh slots (stow#1378): one write
-        // per block touched, one read per partly covered block.
+        // and the digest rows of its fresh slots (stow#1378): one
+        // two rows read and one written per fresh node (1,000), one
+        // statement.
         name: "POST /tasks/submit (1k-node merge)",
         setup: None,
         run: |db, shape, settings, ctx| {

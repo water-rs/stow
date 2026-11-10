@@ -25,7 +25,7 @@ anyone integrating with or modifying the trust-critical paths.
   edge's crates.io reads; `scheduler/` is the DO — queue, dispatch
   and request state in an in-memory graph. SQLite persists the append-only
   event log, chunked snapshots, metering checkpoint and the dependency
-  digest of every node that has queue state, in 256-slot rows keyed by
+  digest of every node that has queue state, one row per node keyed by
   the node's state slot (`edge/src/scheduler/schema.sql`); a node in
   memory holds only a 16-byte key of its task id, and the digest is
   read back from its row when a task id is minted. Accepted events are

@@ -338,7 +338,7 @@ pub fn feed_deliver(
     hour: &DemandFeedHour,
     now_ms: i64,
     settings: &SchedulerSettings,
-    digests: &dyn DigestSource,
+    digests: &mut impl DigestSource,
 ) -> Result<(DemandFeedDeliverReport, Vec<SchedulerEvent>, AlarmPlan), QueueError> {
     hour.ensure_closed(now_ms / 1_000)
         .map_err(QueueError::Invariant)?;
@@ -627,7 +627,7 @@ mod tests {
         hour: &DemandFeedHour,
     ) -> Result<DemandFeedDeliverReport, QueueError> {
         let (report, events, _) =
-            feed_deliver(g, hour, NOW_MS, &settings(), &g.test_digest_source())?;
+            feed_deliver(g, hour, NOW_MS, &settings(), &mut g.test_digest_source())?;
         for event in &events {
             g.apply(event, NOW_MS);
         }
@@ -844,8 +844,9 @@ mod tests {
         let h = hour(H1);
         let pages = vec![vec![entry("alpha", 1)], vec![entry("beta", 1)]];
         stage_and_freeze(&mut g, &h, &pages);
-        let (first, events, _) = feed_deliver(&g, &h, NOW_MS, &settings(), &g.test_digest_source())
-            .expect("deliver page 0");
+        let (first, events, _) =
+            feed_deliver(&g, &h, NOW_MS, &settings(), &mut g.test_digest_source())
+                .expect("deliver page 0");
         assert_eq!(first.delivered_page, Some(0));
         assert!(first.applied, "first delivery accepts the batch");
         // Only the demand fold lands; the ack is lost.
@@ -858,7 +859,7 @@ mod tests {
         // The redelivery finds the batch accepted: same frozen bytes,
         // zero fold.
         let (replay, events, _) =
-            feed_deliver(&g, &h, NOW_MS, &settings(), &g.test_digest_source())
+            feed_deliver(&g, &h, NOW_MS, &settings(), &mut g.test_digest_source())
                 .expect("lost-ack redelivery");
         assert_eq!(replay.delivered_page, Some(0));
         assert!(!replay.applied, "same bytes replay as the accepted batch");

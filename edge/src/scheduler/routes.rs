@@ -15,7 +15,7 @@ use stow_types::api::{
 };
 
 use super::graph::{
-    Claimed, DigestSource, FinishOutcome, Graph, GraphCell, LoadedGraph, StartOutcome,
+    Claimed, DigestSource, FinishOutcome, Graph, GraphCell, LoadedGraph, RootProbe, StartOutcome,
     ValidatedSubmission, Wanted,
 };
 use super::queue::{self, AlarmPlan, SchedulerSettings};
@@ -148,6 +148,25 @@ pub(super) async fn commit_trees(
     Ok((inserted, unpublished))
 }
 
+/// A pure read of the graph that mints task ids. It runs twice: against
+/// [`Wanted`] to name the state slots it mints from, then against their
+/// rows.
+pub(super) trait DigestRead: Sync {
+    /// What the read returns.
+    type Output;
+
+    /// Read `graph`, minting task ids from `digests`.
+    ///
+    /// # Errors
+    /// Whatever the read refuses, and `QueueError::Invariant` when
+    /// `digests` lacks a row it mints from.
+    fn read<D: DigestSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError>;
+}
+
 /// Run `read` over the graph twice: once to learn which state slots it
 /// mints task ids from, then — after one batched read of exactly those
 /// digest rows — against the rows themselves. `read` must be a pure
@@ -155,15 +174,151 @@ pub(super) async fn commit_trees(
 ///
 /// # Errors
 /// `QueueError::Sql`/`Invariant` from the digest read, otherwise `read`'s.
-pub(super) async fn with_digests<T>(
+pub(super) async fn with_digests<R: DigestRead>(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
-    read: impl Fn(&Graph, &dyn DigestSource) -> Result<T, QueueError>,
-) -> Result<T, QueueError> {
-    let wanted = Wanted::default();
-    graph.with(|graph| read(graph, &wanted))?;
-    let digests = store::read_digests(db, &wanted.slots()).await?;
-    graph.with(|graph| read(graph, &digests))
+    read: &R,
+) -> Result<R::Output, QueueError> {
+    let mut wanted = Wanted::default();
+    graph.with(|graph| read.read(graph, &mut wanted))?;
+    let mut digests = store::read_digests(db, &wanted.slots()).await?;
+    graph.with(|graph| read.read(graph, &mut digests))
+}
+
+/// The task listing of [`list_tasks`].
+struct ListTasks<'a> {
+    selector: &'a QueueSelector,
+    now: i64,
+}
+
+impl DigestRead for ListTasks<'_> {
+    type Output = Vec<stow_types::api::QueueTask>;
+
+    fn read<D: DigestSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError> {
+        graph.list_with(self.selector, self.now, digests)
+    }
+}
+
+/// The occupancy status of [`admin_status`].
+struct AdminStatus {
+    now: i64,
+}
+
+impl DigestRead for AdminStatus {
+    type Output = stow_types::api::AdminStatus;
+
+    fn read<D: DigestSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError> {
+        graph.admin_status_with(self.now, digests)
+    }
+}
+
+/// The live status of one request record, for [`request_status`].
+struct RequestStatus<'a> {
+    request_id: &'a str,
+    now: i64,
+}
+
+impl DigestRead for RequestStatus<'_> {
+    type Output = Option<stow_types::api::CrateRequestStatus>;
+
+    fn read<D: DigestSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError> {
+        queue::crate_request_status(graph, self.request_id, self.now, digests)
+    }
+}
+
+/// The post-enqueue probe of a request's roots, for [`request_outcome`].
+struct RootsProbe<'a> {
+    ids: &'a [String],
+    now: i64,
+}
+
+impl DigestRead for RootsProbe<'_> {
+    type Output = RootProbe;
+
+    fn read<D: DigestSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError> {
+        graph.probe_roots_with(self.ids, self.now, digests)
+    }
+}
+
+/// The task ids a mutation's selector resolves to, for [`mutate`].
+struct SelectedIds<'a> {
+    op: MutationKind,
+    selector: &'a QueueSelector,
+    now: i64,
+}
+
+impl DigestRead for SelectedIds<'_> {
+    type Output = Vec<String>;
+
+    fn read<D: DigestSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError> {
+        graph.select_ids_with(self.op, self.selector, self.now, digests)
+    }
+}
+
+/// One demand batch's pass, for [`demand`].
+struct DemandBatch<'a> {
+    request: &'a stow_types::api::SchedulerDemandRequest,
+    settings: &'a SchedulerSettings,
+    now: i64,
+}
+
+impl DigestRead for DemandBatch<'_> {
+    type Output = (
+        stow_types::api::SchedulerDemandReport,
+        Option<SchedulerEvent>,
+        AlarmPlan,
+    );
+
+    fn read<D: DigestSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError> {
+        queue::demand_pass(graph, self.request, self.now, self.settings, digests)
+    }
+}
+
+/// One demand-feed hour's delivery, for [`feed_deliver`].
+struct FeedDelivery<'a> {
+    hour: &'a stow_types::api::DemandFeedHour,
+    settings: &'a SchedulerSettings,
+    now_ms: i64,
+}
+
+impl DigestRead for FeedDelivery<'_> {
+    type Output = (
+        stow_types::api::DemandFeedDeliverReport,
+        Vec<SchedulerEvent>,
+        AlarmPlan,
+    );
+
+    fn read<D: DigestSource>(
+        &self,
+        graph: &Graph,
+        digests: &mut D,
+    ) -> Result<Self::Output, QueueError> {
+        super::feed::feed_deliver(graph, self.hour, self.now_ms, self.settings, digests)
+    }
 }
 
 /// `POST /tasks/submit[/trusted]`: the miss-lane pending-depth cap gates
@@ -234,10 +389,7 @@ pub(super) async fn mutate(
     actor: Option<&str>,
     now: i64,
 ) -> Result<u32, QueueError> {
-    let task_ids = with_digests(graph, db, |graph, digests| {
-        graph.select_ids_with(op, selector, now, digests)
-    })
-    .await?;
+    let task_ids = with_digests(graph, db, &SelectedIds { op, selector, now }).await?;
     let events: Vec<_> = task_ids
         .chunks(MUTATE_PART_IDS)
         .map(|ids| SchedulerEvent::Mutate {
@@ -270,9 +422,15 @@ pub(super) async fn demand(
     actor: Option<&str>,
     now: i64,
 ) -> Result<(stow_types::api::SchedulerDemandReport, AlarmPlan), QueueError> {
-    let (report, event, plan) = with_digests(graph, db, |graph, digests| {
-        queue::demand_pass(graph, request, now, settings, digests)
-    })
+    let (report, event, plan) = with_digests(
+        graph,
+        db,
+        &DemandBatch {
+            request,
+            settings,
+            now,
+        },
+    )
     .await?;
     if let Some(event) = event {
         commit_as(graph, db, actor, &[event], now).await?;
@@ -590,8 +748,8 @@ pub(super) async fn claim_pass(
     // The claimed nodes' task ids are minted from their digest rows,
     // read in batched statements right after the claim.
     let slots = graph.with(|graph| graph.claim_slots(&nodes));
-    let digests = store::read_digests(db, &slots).await?;
-    let claims = graph.with(|graph| graph.claimed(&nodes, &digests))?;
+    let mut digests = store::read_digests(db, &slots).await?;
+    let claims = graph.with(|graph| graph.claimed(&nodes, &mut digests))?;
     let event = SchedulerEvent::Claims {
         claims: claims
             .iter()
@@ -664,10 +822,7 @@ pub(super) async fn request_outcome(
                 .collect();
             (
                 queued_before,
-                with_digests(graph, db, |graph, digests| {
-                    graph.probe_roots_with(&ids, now, digests)
-                })
-                .await?,
+                with_digests(graph, db, &RootsProbe { ids: &ids, now }).await?,
             )
         } else {
             Default::default()
@@ -826,9 +981,15 @@ pub(super) async fn feed_deliver(
     actor: &str,
     now_ms: i64,
 ) -> Result<(stow_types::api::DemandFeedDeliverReport, AlarmPlan), QueueError> {
-    let (report, events, plan) = with_digests(graph, db, |graph, digests| {
-        super::feed::feed_deliver(graph, hour, now_ms, settings, digests)
-    })
+    let (report, events, plan) = with_digests(
+        graph,
+        db,
+        &FeedDelivery {
+            hour,
+            settings,
+            now_ms,
+        },
+    )
     .await?;
     commit_as(graph, db, Some(actor), &events, now_ms).await?;
     Ok((report, plan))
@@ -846,10 +1007,7 @@ pub(super) async fn list_tasks(
     selector: &QueueSelector,
     now: i64,
 ) -> Result<Vec<stow_types::api::QueueTask>, QueueError> {
-    with_digests(graph, db, |graph, digests| {
-        graph.list_with(selector, now, digests)
-    })
-    .await
+    with_digests(graph, db, &ListTasks { selector, now }).await
 }
 
 /// `GET /admin/status`: the occupancy counts plus the in-flight rows,
@@ -862,10 +1020,7 @@ pub(super) async fn admin_status(
     db: &DurableDb,
     now: i64,
 ) -> Result<stow_types::api::AdminStatus, QueueError> {
-    with_digests(graph, db, |graph, digests| {
-        graph.admin_status_with(now, digests)
-    })
-    .await
+    with_digests(graph, db, &AdminStatus { now }).await
 }
 
 /// `GET /requests/{id}`: the record's live status, its stored roots
@@ -879,10 +1034,7 @@ pub(super) async fn request_status(
     request_id: &str,
     now: i64,
 ) -> Result<Option<stow_types::api::CrateRequestStatus>, QueueError> {
-    with_digests(graph, db, |graph, digests| {
-        queue::crate_request_status(graph, request_id, now, digests)
-    })
-    .await
+    with_digests(graph, db, &RequestStatus { request_id, now }).await
 }
 
 /// Forced-eviction invariants (stow#878): a Durable Object evicted at
@@ -945,9 +1097,9 @@ mod eviction_tests {
     /// slots it checked.
     async fn verify_rows(db: &DurableDb, cell: LoadedGraph<'_>) -> usize {
         let slots: Vec<u32> = cell.with(|graph| graph.slots_by_key().into_values().collect());
-        let digests = store::read_digests(db, &slots).await.expect("rows");
+        let mut digests = store::read_digests(db, &slots).await.expect("rows");
         let checked = cell
-            .with(|graph| graph.verify_digest_rows(&digests))
+            .with(|graph| graph.verify_digest_rows(&mut digests))
             .expect("every live slot's row mints its node's id");
         assert_eq!(checked, slots.len());
         checked

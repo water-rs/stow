@@ -417,7 +417,7 @@ pub fn apply_request_outcome(
     }
     if matches!(record.state.as_str(), "enqueued" | "failed") {
         return Ok((
-            request_record_status(record, &move |ids: &[String]| Ok(probe_by_id(by_id, ids)))?,
+            request_record_status(record, move |ids: &[String]| Ok(probe_by_id(by_id, ids)))?,
             None,
         ));
     }
@@ -436,9 +436,7 @@ pub fn apply_request_outcome(
                 },
             };
             Ok((
-                request_record_status(&settled, &move |ids: &[String]| {
-                    Ok(probe_by_id(by_id, ids))
-                })?,
+                request_record_status(&settled, move |ids: &[String]| Ok(probe_by_id(by_id, ids)))?,
                 Some(event),
             ))
         }
@@ -560,10 +558,10 @@ pub fn crate_request_status(
     graph: &crate::scheduler::graph::Graph,
     request_id: &str,
     now: i64,
-    digests: &dyn DigestSource,
+    digests: &mut impl DigestSource,
 ) -> Result<Option<stow_types::api::CrateRequestStatus>, QueueError> {
     match load_request(graph, request_id) {
-        Some(record) => Ok(Some(request_record_status(record, &|ids: &[String]| {
+        Some(record) => Ok(Some(request_record_status(record, |ids: &[String]| {
             graph.probe_roots_with(ids, now, digests)
         })?)),
         None => Ok(None),
@@ -574,7 +572,7 @@ pub fn crate_request_status(
 /// against the live queue when the record settled `enqueued`.
 fn request_record_status(
     record: &crate::scheduler::graph::RequestRecord,
-    status_of: &(impl Fn(&[String]) -> Result<RootProbe, QueueError> + Send + Sync),
+    status_of: impl FnOnce(&[String]) -> Result<RootProbe, QueueError>,
 ) -> Result<stow_types::api::CrateRequestStatus, QueueError> {
     let phase = request_phase(&record.state)?;
     let targets = if phase == stow_types::api::CrateRequestPhase::Enqueued {
@@ -648,7 +646,7 @@ const MAX_DEMAND_BATCH_ENTRIES: usize = 256;
 pub fn apply_demand(
     graph: &crate::scheduler::graph::Graph,
     request: &stow_types::api::SchedulerDemandRequest,
-    digests: &dyn DigestSource,
+    digests: &mut impl DigestSource,
 ) -> Result<
     (
         stow_types::api::SchedulerDemandReport,
@@ -705,7 +703,7 @@ pub fn demand_pass(
     request: &stow_types::api::SchedulerDemandRequest,
     now_ms: i64,
     settings: &SchedulerSettings,
-    digests: &dyn DigestSource,
+    digests: &mut impl DigestSource,
 ) -> Result<
     (
         stow_types::api::SchedulerDemandReport,

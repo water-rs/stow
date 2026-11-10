@@ -37,8 +37,8 @@ use stow_types::api::{
 };
 
 use super::graph::{
-    ChunkSpan, DIGEST_BLOCK_SLOTS, Digest, Digests, FreshDigest, Graph, GraphCell, Meter,
-    SNAPSHOT_SPAN_ROWS, SnapshotLoader, SnapshotPlan, SpanEncoder, utc_day,
+    ChunkSpan, Digest, Digests, FreshDigest, Graph, GraphCell, Meter, SNAPSHOT_SPAN_ROWS,
+    SnapshotLoader, SnapshotPlan, SpanEncoder, utc_day,
 };
 use crate::errors::QueueError;
 
@@ -579,186 +579,103 @@ async fn flush_upserts(db: &DurableDb, pending: &mut Vec<(i64, String)>) -> Resu
     Ok(())
 }
 
-/// Bytes of one `node_digests` row's decoded payload: every slot of the
-/// block, 32 bytes each, absent slots zero.
-const DIGEST_BLOCK_BYTES: usize = DIGEST_BLOCK_SLOTS as usize * size_of::<Digest>();
-
-/// Blocks one digest read statement names: two bindings under the
-/// platform's 100 for the `IN` list, with room to spare.
-const DIGEST_READ_BLOCKS: usize = 64;
-
-/// Rows one digest UPSERT statement carries, like [`UPSERT_BATCH`].
-const DIGEST_WRITE_BLOCKS: usize = 8;
+/// Digests one digest statement carries. The platform binds at most 100
+/// parameters per query, so a list travels as ONE parameter — a JSON
+/// array a statement unpacks with `json_each` — whose size is bounded
+/// by the 8 MB string limit, not the parameter count: at ~80 bytes an
+/// entry this batch is ~330 KB. A call costs `ceil(digests /
+/// DIGEST_BATCH)` statements; the platform bills the rows `json_each`
+/// yields as well as the table rows, so a digest read is two rows read
+/// and a digest write two rows read plus one written (the sqlite test
+/// backend's meter counts only the table rows).
+const DIGEST_BATCH: usize = 4_096;
 
 #[derive(skyzen::FromRow)]
 struct DigestRow {
-    block: i64,
-    digests: String,
+    slot: i64,
+    digest: String,
 }
 
-/// The digest block a state slot falls in.
-const fn block_of(slot: u32) -> u32 {
-    slot / DIGEST_BLOCK_SLOTS
-}
-
-/// Where a state slot's record sits inside its block's payload.
-const fn record_at(slot: u32) -> usize {
-    (slot % DIGEST_BLOCK_SLOTS) as usize * size_of::<Digest>()
-}
-
-/// Read the `node_digests` rows of `blocks` — ascending and distinct —
-/// each as its decoded payload, in `DIGEST_READ_BLOCKS`-row statements.
-/// A block with no row is absent from the answer.
-async fn read_digest_blocks(
-    db: &DurableDb,
-    blocks: &[u32],
-) -> Result<std::collections::BTreeMap<u32, Vec<u8>>, QueueError> {
-    use base64::Engine as _;
-    let mut found = std::collections::BTreeMap::new();
-    for batch in blocks.chunks(DIGEST_READ_BLOCKS) {
-        let mut sql = String::from("SELECT block, digests FROM node_digests WHERE block IN (?");
-        for _ in 1..batch.len() {
-            sql.push_str(", ?");
-        }
-        sql.push(')');
-        let mut query = db.query(&sql);
-        for &block in batch {
-            query = query.bind(i64::from(block));
-        }
-        let rows = query
+/// Read the dependency digest of every state slot in `slots` — the
+/// rows a task id is minted from, in `ceil(slots / DIGEST_BATCH)`
+/// statements. The statement joins the `json_each` list to the table,
+/// probing it once per distinct slot: two rows read per slot (the list
+/// row and the table row), of which the sqlite test backend's meter
+/// counts only the table row.
+///
+/// # Errors
+/// `QueueError::Invariant` when a slot has no row or its digest does
+/// not decode — every live state slot has a digest, so either is a
+/// corrupt store — `QueueError::Sql` on a failed read.
+pub async fn read_digests(db: &DurableDb, slots: &[u32]) -> Result<Digests, QueueError> {
+    let wanted: Vec<u32> = slots
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut digests = Digests::default();
+    for batch in wanted.chunks(DIGEST_BATCH) {
+        let list = serde_json::to_string(batch)
+            .map_err(|error| QueueError::Invariant(format!("digest slots: {error}")))?;
+        let rows = db
+            .query(
+                "SELECT d.slot, d.digest FROM json_each(?) AS j \
+                 JOIN node_digests AS d ON d.slot = j.value",
+            )
+            .bind(list)
             .fetch_all::<DigestRow>()
             .await
             .map_err(|error| QueueError::Sql(format!("digest read: {error}")))?;
         for row in rows {
-            let payload = base64::engine::general_purpose::STANDARD
-                .decode(&row.digests)
-                .map_err(|error| {
-                    QueueError::Invariant(format!("digest block {} decode: {error}", row.block))
-                })?;
-            if payload.len() != DIGEST_BLOCK_BYTES {
-                return Err(QueueError::Invariant(format!(
-                    "digest block {} holds {} bytes, not {DIGEST_BLOCK_BYTES}",
-                    row.block,
-                    payload.len()
-                )));
-            }
-            let block = u32::try_from(row.block).map_err(|_| {
-                QueueError::Invariant(format!("digest block {} is out of range", row.block))
+            let slot = u32::try_from(row.slot).map_err(|_| {
+                QueueError::Invariant(format!("digest slot {} is out of range", row.slot))
             })?;
-            found.insert(block, payload);
+            let mut digest = Digest::default();
+            hex::decode_to_slice(&row.digest, &mut digest).map_err(|error| {
+                QueueError::Invariant(format!("digest of state slot {slot} decode: {error}"))
+            })?;
+            digests.insert(slot, digest);
         }
-    }
-    Ok(found)
-}
-
-/// Read the dependency digest of every state slot in `slots` — the
-/// rows a task id is minted from. One statement per
-/// [`DIGEST_READ_BLOCKS`] distinct blocks the slots fall in; each block
-/// costs one row read.
-///
-/// # Errors
-/// `QueueError::Invariant` when a slot's block has no row or its record
-/// is empty — every live state slot has a digest, so either is a corrupt
-/// store — `QueueError::Sql` on a failed read.
-pub async fn read_digests(db: &DurableDb, slots: &[u32]) -> Result<Digests, QueueError> {
-    let blocks: Vec<u32> = slots
-        .iter()
-        .map(|&slot| block_of(slot))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let found = read_digest_blocks(db, &blocks).await?;
-    let mut digests = Digests::default();
-    for &slot in slots {
-        let payload = found.get(&block_of(slot)).ok_or_else(|| {
-            QueueError::Invariant(format!(
-                "digest row {} is missing for live state slot {slot}",
-                block_of(slot)
-            ))
-        })?;
-        let at = record_at(slot);
-        let digest: Digest = payload[at..at + size_of::<Digest>()]
-            .try_into()
-            .expect("a record is one digest long");
-        if digest == [0; size_of::<Digest>()] {
+        if let Some(&missing) = batch.iter().find(|&&slot| !digests.holds(slot)) {
             return Err(QueueError::Invariant(format!(
-                "digest row {} holds no record for live state slot {slot}",
-                block_of(slot)
+                "no digest row for live state slot {missing}"
             )));
         }
-        digests.insert(slot, digest);
     }
     Ok(digests)
 }
 
 /// Write the digests of the fresh state slots a merge allocated — in
 /// the turn that appended its log rows, so the rows always describe the
-/// state slab as of the log's end. A block every slot of which is fresh
-/// is written without a read; a block only partly covered is read,
-/// patched and written. Rows cost one write per block touched and one
-/// read per partly covered block; the statements are
-/// `ceil(partial / 64)` reads and `ceil(blocks / 8)` upserts.
+/// state slab as of the log's end. One UPSERT row per fresh slot (a
+/// slot named twice keeps its last digest) and no read of the table, in
+/// `ceil(slots / DIGEST_BATCH)` statements. Each slot is two rows read
+/// (the `json_each` row and its source row) plus one row written; the
+/// sqlite test backend's meter counts only the written row.
 ///
 /// # Errors
-/// `QueueError::Sql` on a failed statement, `QueueError::Invariant` on a
-/// stored block that does not decode.
+/// `QueueError::Sql` on a failed statement.
 pub async fn write_digests(db: &DurableDb, fresh: &[FreshDigest]) -> Result<(), QueueError> {
-    use base64::Engine as _;
-    let mut touched: std::collections::BTreeMap<u32, std::collections::BTreeMap<u32, Digest>> =
-        std::collections::BTreeMap::new();
-    for &(slot, digest) in fresh {
-        touched
-            .entry(block_of(slot))
-            .or_default()
-            .insert(slot, digest);
-    }
-    let partial: Vec<u32> = touched
-        .iter()
-        .filter(|(_, slots)| slots.len() != DIGEST_BLOCK_SLOTS as usize)
-        .map(|(&block, _)| block)
+    let latest: std::collections::BTreeMap<u32, Digest> = fresh.iter().copied().collect();
+    let entries: Vec<(u32, String)> = latest
+        .into_iter()
+        .map(|(slot, digest)| (slot, hex::encode(digest)))
         .collect();
-    let mut held = read_digest_blocks(db, &partial).await?;
-    let mut pending: Vec<(u32, String)> = Vec::with_capacity(DIGEST_WRITE_BLOCKS);
-    for (block, slots) in touched {
-        let mut payload = held
-            .remove(&block)
-            .unwrap_or_else(|| vec![0; DIGEST_BLOCK_BYTES]);
-        for (slot, digest) in slots {
-            let at = record_at(slot);
-            payload[at..at + size_of::<Digest>()].copy_from_slice(&digest);
-        }
-        pending.push((
-            block,
-            base64::engine::general_purpose::STANDARD.encode(&payload),
-        ));
-        if pending.len() == DIGEST_WRITE_BLOCKS {
-            flush_digest_rows(db, &mut pending).await?;
-        }
-    }
-    flush_digest_rows(db, &mut pending).await
-}
-
-/// Write the buffered `(block, payload)` rows as one multi-row UPSERT.
-async fn flush_digest_rows(
-    db: &DurableDb,
-    pending: &mut Vec<(u32, String)>,
-) -> Result<(), QueueError> {
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let mut sql = String::from("INSERT INTO node_digests(block, digests) VALUES (?, ?)");
-    for _ in 1..pending.len() {
-        sql.push_str(", (?, ?)");
-    }
-    sql.push_str(" ON CONFLICT(block) DO UPDATE SET digests = excluded.digests");
-    let mut query = db.query(&sql);
-    for (block, payload) in pending.drain(..) {
-        query = query.bind(i64::from(block)).bind(payload);
-    }
-    query
+    for batch in entries.chunks(DIGEST_BATCH) {
+        let list = serde_json::to_string(batch)
+            .map_err(|error| QueueError::Invariant(format!("digest rows: {error}")))?;
+        db.query(
+            "INSERT INTO node_digests(slot, digest) \
+             SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') \
+             FROM json_each(?) WHERE true \
+             ON CONFLICT(slot) DO UPDATE SET digest = excluded.digest",
+        )
+        .bind(list)
         .execute()
         .await
         .map_err(|error| QueueError::Sql(format!("digest write: {error}")))?;
+    }
     Ok(())
 }
 
@@ -1249,6 +1166,49 @@ mod tests {
         assert_eq!(claimed[0].task_id, id("b"));
     }
 
+    /// A digest write upserts exactly its slots, a later write of a slot
+    /// replaces the earlier row, a read returns exactly the slots asked
+    /// for, and a slot with no row refuses.
+    #[tokio::test]
+    async fn digest_rows_upsert_per_slot_and_a_missing_row_refuses() {
+        let db = test_db::memory_db().await.expect("db");
+        let digest = |byte: u8| [byte; 32];
+        // A batch that names slot 7 twice keeps its last digest, and a
+        // slot far from the others costs no neighbours.
+        write_digests(&db, &[(7, digest(1)), (70_000, digest(2)), (7, digest(3))])
+            .await
+            .expect("write");
+        let read = read_digests(&db, &[70_000, 7, 7]).await.expect("read");
+        assert_eq!(read.digest_for_test(7), Some(digest(3)));
+        assert_eq!(read.digest_for_test(70_000), Some(digest(2)));
+        // Reuse overwrites.
+        write_digests(&db, &[(7, digest(9))])
+            .await
+            .expect("rewrite");
+        let read = read_digests(&db, &[7]).await.expect("reread");
+        assert_eq!(read.digest_for_test(7), Some(digest(9)));
+        // A batch past one statement's bound still lands every slot.
+        let many: Vec<FreshDigest> = (0..2 * u32::try_from(DIGEST_BATCH).unwrap() + 5)
+            .map(|slot| (100 + slot, digest(4)))
+            .collect();
+        write_digests(&db, &many).await.expect("many");
+        let slots: Vec<u32> = many.iter().map(|&(slot, _)| slot).collect();
+        let read = read_digests(&db, &slots).await.expect("many read");
+        assert!(
+            slots
+                .iter()
+                .all(|&slot| read.digest_for_test(slot) == Some(digest(4)))
+        );
+        // No row: a corrupt store.
+        let error = read_digests(&db, &[7, 8])
+            .await
+            .expect_err("slot 8 has no row");
+        assert!(
+            matches!(&error, QueueError::Invariant(message) if message.contains("slot 8")),
+            "{error:?}"
+        );
+    }
+
     /// `snapshot write`'s rows scale with the events since the last
     /// snapshot, never with the stored graph (stow#902): the same
     /// event wave over a 4×-larger fixture writes the same rows.
@@ -1258,11 +1218,13 @@ mod tests {
         for queue_rows in [1_000u32, 4_000] {
             let shape = stow_types::fixture::FixtureShape { queue_rows };
             let (db, log) = test_db::counting_memory_db().await.expect("db");
-            let (mut graph, _) = crate::scheduler::fixture::build(
+            let mut graph = crate::scheduler::fixture::build(
                 shape,
                 &claim_settings(45, 16),
                 crate::scheduler::drives::HOST_NOW_MS,
+                crate::scheduler::fixture::Discarded,
             )
+            .await
             .expect("build");
             write_snapshot(&db, &mut graph, &GraphCell::default(), NOW_MS)
                 .await

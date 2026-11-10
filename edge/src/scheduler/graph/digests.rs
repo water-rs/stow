@@ -3,13 +3,12 @@
 //!
 //! A node's task id is minted from its interned fields and the 32-byte
 //! digest of its resolved dependency subgraph. No scheduling decision
-//! reads the digest, so the `node_digests` table holds it by state slot,
-//! [`DIGEST_BLOCK_SLOTS`] slots to a row (`store.rs`). A caller that
-//! needs a task id reads the rows its slots fall in and hands the graph
-//! a [`DigestSource`]; the graph itself never awaits.
+//! reads the digest, so the `node_digests` table holds it, one row per
+//! state slot (`store.rs`). A caller that needs a task id reads the rows
+//! of exactly the slots it mints from and hands the graph a
+//! [`DigestSource`]; the graph itself never awaits.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Mutex;
 
 use crate::errors::QueueError;
 
@@ -17,21 +16,18 @@ use crate::errors::QueueError;
 /// 64 hex digits.
 pub type Digest = [u8; 32];
 
-/// Digest slots one `node_digests` row holds.
-pub const DIGEST_BLOCK_SLOTS: u32 = 256;
-
 /// A fresh node's digest, by the state slot the merge gave it.
 pub type FreshDigest = (u32, Digest);
 
 /// Where the graph reads a dependency digest from while it mints a
 /// task id.
-pub trait DigestSource: Send + Sync {
+pub trait DigestSource {
     /// The digest stored for state slot `slot`.
     ///
     /// # Errors
     /// `QueueError::Invariant` when the source holds none: every live
     /// state slot has a row, so a missing one is a corrupt store.
-    fn digest(&self, slot: u32) -> Result<Digest, QueueError>;
+    fn digest(&mut self, slot: u32) -> Result<Digest, QueueError>;
 }
 
 /// Digests read from the `node_digests` rows, by state slot.
@@ -42,6 +38,17 @@ impl Digests {
     pub(crate) fn insert(&mut self, slot: u32, digest: Digest) {
         self.0.insert(slot, digest);
     }
+
+    /// Whether a row was read for `slot`.
+    pub(crate) fn holds(&self, slot: u32) -> bool {
+        self.0.contains_key(&slot)
+    }
+
+    /// The digest read for `slot`, if any.
+    #[cfg(test)]
+    pub(crate) fn digest_for_test(&self, slot: u32) -> Option<Digest> {
+        self.0.get(&slot).copied()
+    }
 }
 
 impl FromIterator<FreshDigest> for Digests {
@@ -51,7 +58,7 @@ impl FromIterator<FreshDigest> for Digests {
 }
 
 impl DigestSource for Digests {
-    fn digest(&self, slot: u32) -> Result<Digest, QueueError> {
+    fn digest(&mut self, slot: u32) -> Result<Digest, QueueError> {
         self.0.get(&slot).copied().ok_or_else(|| {
             QueueError::Invariant(format!("no digest row was read for state slot {slot}"))
         })
@@ -62,23 +69,18 @@ impl DigestSource for Digests {
 /// read-only graph pass run against it names exactly the rows a second
 /// pass, run against the real [`Digests`], will mint from.
 #[derive(Debug, Default)]
-pub struct Wanted(Mutex<BTreeSet<u32>>);
+pub struct Wanted(BTreeSet<u32>);
 
 impl Wanted {
     /// The recorded slots, ascending.
     pub fn slots(&self) -> Vec<u32> {
-        self.0
-            .lock()
-            .expect("wanted digest slots")
-            .iter()
-            .copied()
-            .collect()
+        self.0.iter().copied().collect()
     }
 }
 
 impl DigestSource for Wanted {
-    fn digest(&self, slot: u32) -> Result<Digest, QueueError> {
-        self.0.lock().expect("wanted digest slots").insert(slot);
+    fn digest(&mut self, slot: u32) -> Result<Digest, QueueError> {
+        self.0.insert(slot);
         Ok([0; 32])
     }
 }

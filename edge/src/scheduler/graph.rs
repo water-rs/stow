@@ -46,15 +46,17 @@ mod node;
 mod published;
 mod snapshot;
 mod sparse;
+mod vacant;
 
 use arena::Arena;
-pub use digests::{DIGEST_BLOCK_SLOTS, Digest, DigestSource, Digests, FreshDigest, Wanted};
+pub use digests::{Digest, DigestSource, Digests, FreshDigest, Wanted};
 use edges::Edges;
 use index::{Interner, IxTable, Priorities, hash_of};
 pub use node::RunCompletion;
 use node::{Extra, FIRST_ATTEMPT, Flags, Lane, NO_STATE, Node, State, Status};
 use published::PublishedEntries;
 use sparse::SparseDemand;
+use vacant::VacantSlots;
 
 pub use snapshot::{ChunkSpan, SNAPSHOT_SPAN_ROWS, SnapshotLoader, SnapshotPlan, SpanEncoder};
 
@@ -465,8 +467,9 @@ pub struct Graph {
     states: Arena<State>,
     /// Zero demand needs no backing page; indexed by stable state slot.
     demand: SparseDemand,
-    /// Vacant `states` slots, the lowest reused before the slab grows.
-    free_states: std::collections::BinaryHeap<std::cmp::Reverse<u32>>,
+    /// Vacant `states` slots, one bit each; the lowest is reused before
+    /// the slab grows.
+    free_states: VacantSlots,
     /// Full priority values shared by state rank classes.
     priorities: Priorities,
     /// Sparse fields keyed by stable state slot, so node compaction never
@@ -798,7 +801,7 @@ impl Graph {
     /// allocates the slots the live one did — the `node_digests` rows
     /// are keyed by them.
     fn alloc_state(&mut self, state: State) -> u32 {
-        if let Some(std::cmp::Reverse(slot)) = self.free_states.pop() {
+        if let Some(slot) = self.free_states.take_lowest() {
             self.states[slot as usize] = state;
             slot
         } else {
@@ -1154,7 +1157,7 @@ impl Graph {
     /// `QueueError::Invariant` for a published or free node, which
     /// holds no state slot and so no digest row, and when `digests`
     /// lacks the node's row.
-    fn mint(&self, ix: u32, digests: &dyn DigestSource) -> Result<String, QueueError> {
+    fn mint(&self, ix: u32, digests: &mut impl DigestSource) -> Result<String, QueueError> {
         let node = self.node(ix);
         if node.state == NO_STATE {
             return Err(QueueError::Invariant(format!(
@@ -1173,6 +1176,28 @@ impl Graph {
             host_side: node.flags.host(),
             profile: node.flags.profile(),
         }))
+    }
+
+    /// [`Self::mint`], proving the id belongs to the node: a digest row
+    /// is keyed by state slot, so a row describing another occupant
+    /// mints an id that hashes to another key.
+    ///
+    /// # Errors
+    /// As [`Self::mint`], and `QueueError::Invariant` when the minted id
+    /// does not hash to the node's own key.
+    fn mint_owned(&self, ix: u32, digests: &mut impl DigestSource) -> Result<String, QueueError> {
+        let id = self.mint(ix, digests)?;
+        let node = self.node(ix);
+        if IdKeys::of(&id).key == node.key {
+            Ok(id)
+        } else {
+            Err(QueueError::Invariant(format!(
+                "the digest row of state slot {} mints {id}, not node {ix} ({} {})",
+                node.state,
+                self.intern.at(node.crate_name),
+                self.intern.at(node.version),
+            )))
+        }
     }
 
     /// The live node whose canonical task id hashes to `key`.
@@ -1254,7 +1279,7 @@ impl Graph {
         self.remove_ready(ix);
         self.set_status(ix, Status::Published);
         let slot = std::mem::replace(&mut self.node_mut(ix).state, NO_STATE);
-        self.free_states.push(std::cmp::Reverse(slot));
+        self.free_states.release(slot);
         self.demand.set(slot, 0);
         self.extras.remove(&slot);
         if self.node(ix).refs == 0 {
@@ -1478,13 +1503,6 @@ impl Graph {
                     .digests
                     .push((slot, digest_bytes(&sub.dependency_identity)));
             }
-            #[cfg(test)]
-            {
-                if slot != NO_STATE {
-                    self.test_digests
-                        .insert(slot, digest_bytes(&sub.dependency_identity));
-                }
-            }
             node_ixs.push(ix);
             is_fresh.push(true);
             fresh.push(ix);
@@ -1522,6 +1540,8 @@ impl Graph {
             }
         }
         self.maybe_compact();
+        #[cfg(test)]
+        self.test_digests.extend(report.digests.iter().copied());
         Ok(report)
     }
 
@@ -2113,17 +2133,19 @@ impl Graph {
     /// index is stable only until the next compaction.
     ///
     /// # Errors
-    /// `QueueError::Invariant` when `digests` lacks a claimed node's row.
+    /// `QueueError::Invariant` when `digests` lacks a claimed node's row
+    /// or holds the row of another occupant of its state slot: a claim is
+    /// logged and posted to CI, so its id must be the node's own.
     pub fn claimed(
         &self,
         nodes: &[ClaimedNode],
-        digests: &dyn DigestSource,
+        digests: &mut impl DigestSource,
     ) -> Result<Vec<Claimed>, QueueError> {
         nodes
             .iter()
             .map(|node| {
                 Ok(Claimed {
-                    task_id: self.mint(node.ix, digests)?,
+                    task_id: self.mint_owned(node.ix, digests)?,
                     generation: node.generation,
                     attempt: node.attempt,
                 })
@@ -2678,7 +2700,7 @@ impl Graph {
     pub fn demand_contributions_with(
         &self,
         deltas: &BTreeMap<[String; 5], i64>,
-        digests: &dyn DigestSource,
+        digests: &mut impl DigestSource,
     ) -> Result<Vec<(String, i64)>, QueueError> {
         let mut contributions: BTreeMap<u32, i64> = BTreeMap::new();
         for (identity, delta) in deltas {
@@ -3273,9 +3295,7 @@ impl Graph {
             state_fragments = self.states.fragments().len(),
             state_storage_bytes = self.states.capacity() * size_of::<State>(),
             free_state_slots = self.free_states.len(),
-            free_state_storage_bytes =
-                self.free_states.capacity() * size_of::<std::cmp::Reverse<u32>>(),
-            digest_table_rows = self.states.len().div_ceil(DIGEST_BLOCK_SLOTS as usize),
+            free_state_storage_bytes = self.free_states.heap_bytes(),
             demand_storage_bytes = self.demand.heap_bytes(),
             intern_storage_bytes = self.intern.heap_bytes(),
             ready_entries = self.ready_sets().map(BTreeSet::len).sum::<usize>(),
@@ -3375,7 +3395,7 @@ impl Graph {
             + self.idents.heap_bytes()
             + self.nodes.capacity() * size_of::<Node>()
             + self.states.capacity() * size_of::<State>()
-            + self.free_states.capacity() * size_of::<std::cmp::Reverse<u32>>()
+            + self.free_states.heap_bytes()
             + self.demand.heap_bytes()
             + self.edges.heap_bytes()
             + self.published.heap_bytes()
@@ -3854,7 +3874,7 @@ impl Graph {
     fn blocked_by(
         &self,
         ix: u32,
-        digests: &dyn DigestSource,
+        digests: &mut impl DigestSource,
     ) -> Result<Option<String>, QueueError> {
         let node = self.node(ix);
         if node.status != Status::Pending || !node.flags.blocked() {
@@ -3899,7 +3919,7 @@ impl Graph {
         &self,
         task_id: &str,
         now: i64,
-        digests: &dyn DigestSource,
+        digests: &mut impl DigestSource,
     ) -> Result<Option<stow_types::api::RequestStatus>, QueueError> {
         let Some(ix) = self.node_ix(task_id) else {
             return Ok(None);
@@ -3938,7 +3958,7 @@ impl Graph {
         &self,
         ids: &[String],
         now: i64,
-        digests: &dyn DigestSource,
+        digests: &mut impl DigestSource,
     ) -> Result<RootProbe, QueueError> {
         let mut statuses = BTreeMap::new();
         for id in ids {
@@ -4041,7 +4061,7 @@ impl Graph {
         op: stow_types::api::MutationKind,
         selector: &stow_types::api::QueueSelector,
         now: i64,
-        digests: &dyn DigestSource,
+        digests: &mut impl DigestSource,
     ) -> Result<Vec<String>, QueueError> {
         if op == stow_types::api::MutationKind::Purge
             && selector.task_ids.is_empty()
@@ -4078,7 +4098,7 @@ impl Graph {
         &self,
         selector: &stow_types::api::QueueSelector,
         now: i64,
-        digests: &dyn DigestSource,
+        digests: &mut impl DigestSource,
     ) -> Result<Vec<stow_types::api::QueueTask>, QueueError> {
         // The ids a selector names need no digest read to be reported.
         let named: HashMap<u32, &str> = selector
@@ -4166,7 +4186,7 @@ impl Graph {
     pub fn admin_status_with(
         &self,
         now: i64,
-        digests: &dyn DigestSource,
+        digests: &mut impl DigestSource,
     ) -> Result<stow_types::api::AdminStatus, QueueError> {
         let status = self.status();
         let oldest_pending = self
@@ -4282,10 +4302,7 @@ impl Graph {
                 )));
             }
         }
-        self.free_states = held
-            .zeroes()
-            .map(|slot| std::cmp::Reverse(u32::try_from(slot).expect("state slots fit u32")))
-            .collect();
+        self.free_states = VacantSlots::from_held(held);
         for ix in 0..self.nodes.len() {
             let ix = u32::try_from(ix).expect("node indexes fit u32");
             let range = self.edge_range(ix);
@@ -4559,7 +4576,7 @@ struct Shadow<'a>(&'a HashMap<u32, Digest>);
 
 #[cfg(test)]
 impl DigestSource for Shadow<'_> {
-    fn digest(&self, slot: u32) -> Result<Digest, QueueError> {
+    fn digest(&mut self, slot: u32) -> Result<Digest, QueueError> {
         self.0.get(&slot).copied().ok_or_else(|| {
             QueueError::Invariant(format!("the test merged no digest for state slot {slot}"))
         })
@@ -4595,27 +4612,21 @@ impl Graph {
     /// Returns how many nodes it checked.
     pub(crate) fn verify_digest_rows(
         &self,
-        digests: &dyn DigestSource,
+        digests: &mut impl DigestSource,
     ) -> Result<usize, QueueError> {
         let mut checked = 0;
         for (ix, node) in (0u32..).zip(&self.nodes) {
             if node.state == NO_STATE {
                 continue;
             }
-            let id = self.mint(ix, digests)?;
-            if IdKeys::of(&id).key != node.key {
-                return Err(QueueError::Invariant(format!(
-                    "the digest row of state slot {} mints {id}, not node {ix}",
-                    node.state
-                )));
-            }
+            self.mint_owned(ix, digests)?;
             checked += 1;
         }
         Ok(checked)
     }
 
     pub(crate) fn task_id_of(&self, ix: u32) -> String {
-        self.mint(ix, &self.test_digest_source())
+        self.mint(ix, &mut self.test_digest_source())
             .expect("a test node's digest was merged")
     }
 
@@ -4626,7 +4637,7 @@ impl Graph {
         bound: u32,
     ) -> Result<Vec<Claimed>, QueueError> {
         let nodes = self.claim_nodes(settings, now, bound)?;
-        self.claimed(&nodes, &self.test_digest_source())
+        self.claimed(&nodes, &mut self.test_digest_source())
     }
 
     pub(crate) fn list(
@@ -4634,14 +4645,14 @@ impl Graph {
         selector: &stow_types::api::QueueSelector,
         now: i64,
     ) -> Result<Vec<stow_types::api::QueueTask>, QueueError> {
-        self.list_with(selector, now, &self.test_digest_source())
+        self.list_with(selector, now, &mut self.test_digest_source())
     }
 
     pub(crate) fn admin_status(
         &self,
         now: i64,
     ) -> Result<stow_types::api::AdminStatus, QueueError> {
-        self.admin_status_with(now, &self.test_digest_source())
+        self.admin_status_with(now, &mut self.test_digest_source())
     }
 
     pub(crate) fn select_ids(
@@ -4650,11 +4661,11 @@ impl Graph {
         selector: &stow_types::api::QueueSelector,
         now: i64,
     ) -> Result<Vec<String>, QueueError> {
-        self.select_ids_with(op, selector, now, &self.test_digest_source())
+        self.select_ids_with(op, selector, now, &mut self.test_digest_source())
     }
 
     pub(crate) fn probe_roots(&self, ids: &[String], now: i64) -> RootProbe {
-        self.probe_roots_with(ids, now, &self.test_digest_source())
+        self.probe_roots_with(ids, now, &mut self.test_digest_source())
             .expect("a test node's digest was merged")
     }
 
@@ -4662,7 +4673,7 @@ impl Graph {
         &self,
         deltas: &BTreeMap<[String; 5], i64>,
     ) -> Result<Vec<(String, i64)>, QueueError> {
-        self.demand_contributions_with(deltas, &self.test_digest_source())
+        self.demand_contributions_with(deltas, &mut self.test_digest_source())
     }
 }
 
@@ -6341,7 +6352,7 @@ mod tests {
             .claim_scanned(&claim_settings(45, 0), 10_000, u32::MAX, &mut scans)
             .expect("claim");
         let claimed = graph
-            .claimed(&claimed, &graph.test_digest_source())
+            .claimed(&claimed, &mut graph.test_digest_source())
             .expect("mint");
         assert_eq!(claimed.len(), 45);
         assert!(
@@ -6384,7 +6395,7 @@ mod tests {
             .claim_scanned(&claim_settings(5, 2), 60_000, u32::MAX, &mut scans)
             .expect("claim");
         let claimed = graph
-            .claimed(&claimed, &graph.test_digest_source())
+            .claimed(&claimed, &mut graph.test_digest_source())
             .expect("mint");
         let darwin = |claim: &Claimed| macos_ids.contains(&claim.task_id);
         assert_eq!(claimed.iter().filter(|claim| darwin(claim)).count(), 2);
@@ -6392,6 +6403,46 @@ mod tests {
         assert!(darwin(&claimed[0]) && darwin(&claimed[1]), "human leads");
         assert!(scans <= 2 * 5 + 2, "scans {scans}");
         assert_eq!(ready_count(&graph), 998, "unclaimed macOS stay ready");
+    }
+
+    /// A claim is logged and posted to CI, so a digest row describing
+    /// another occupant of the claimed slot fails before it leaves the
+    /// scheduler.
+    #[test]
+    fn a_claim_refuses_a_digest_row_of_another_occupant() {
+        let mut graph = Graph::default();
+        graph
+            .merge(&forest(SubmissionSource::CacheMiss, vec![sub("a0")]), 0)
+            .expect("merge");
+        let nodes = graph
+            .claim_nodes(&claim_settings(45, 0), 10_000, u32::MAX)
+            .expect("claim");
+        let [claim] = nodes.as_slice() else {
+            panic!("one node claims");
+        };
+        let slot = graph.node(claim.ix).state;
+        let own = graph
+            .test_digest_source()
+            .digest(slot)
+            .expect("the merge recorded the slot's digest");
+        let stranger = [!own[0]; 32];
+        assert_ne!(stranger, own);
+        let mut digests = Digests::default();
+        digests.insert(slot, stranger);
+        let error = graph
+            .claimed(&nodes, &mut digests)
+            .expect_err("a stranger's digest mints another node's id");
+        assert!(
+            matches!(&error, QueueError::Invariant(message)
+                if message.contains(&format!("state slot {slot}")) && message.contains("a0")),
+            "{error:?}"
+        );
+        let mut digests = Digests::default();
+        digests.insert(slot, own);
+        assert_eq!(
+            graph.claimed(&nodes, &mut digests).expect("own row").len(),
+            1
+        );
     }
 
     /// stow#1052: entries not yet due are examined once per pass, not
