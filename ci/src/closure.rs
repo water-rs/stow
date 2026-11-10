@@ -37,6 +37,7 @@
 //! outside the closure by construction.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use stow_types::api::BuildTaskPayload;
 use stow_types::error::Context;
@@ -110,7 +111,10 @@ impl DependencyClosure {
 /// Resolve the closure for `task` exactly the way the build job did — same
 /// toolchain, same feature set, same lockfile policy — but from a pristine
 /// source tree.
-pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<DependencyClosure> {
+pub async fn resolve(
+    task: &BuildTaskPayload,
+    cargo_home: &Path,
+) -> stow_types::error::Result<DependencyClosure> {
     // Same once-per-task check the build makes: the closure must resolve
     // under the task's pinned release — refuse before the first cargo.
     task::verified_run_toolchain(task).await?;
@@ -131,8 +135,7 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
             })?
             .to_path_buf(),
     );
-    let cargo_home = task::cargo_home()?;
-    task::fetch_workspace_dependencies(&cargo_home, task, &workspace).await?;
+    task::fetch_workspace_dependencies(cargo_home, task, &workspace).await?;
     // stow#588: the publisher verifies the dependency context the same
     // way the build job does — the pristine wrapper workspace's own
     // `cargo --unit-graph` answers projected onto the shared task-unit
@@ -140,7 +143,7 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
     // invocation spelling. The same graphs then answer the publishable
     // set: they are the exact set of units cargo planned to compile.
     let unit_graphs =
-        task::phase_unit_graphs(&cargo_home, task, &workspace, task::cargo_subcommand()?).await?;
+        task::phase_unit_graphs(cargo_home, task, &workspace, task::cargo_subcommand()?).await?;
     task::verify_dependency_context(task, &unit_graphs)?;
     let (packages, lib_packages, proc_macros) = package_sets(task, &unit_graphs)?;
     let dependency_identity = task
