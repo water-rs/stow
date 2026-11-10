@@ -4207,20 +4207,13 @@ impl Graph {
     ///
     /// # Errors
     /// `QueueError::EmptySelector` when no id and no predicate is set.
-    fn select(
-        &self,
-        selector: &stow_types::api::QueueSelector,
+    fn select<'a>(
+        &'a self,
+        selector: &'a stow_types::api::QueueSelector,
         now: i64,
-    ) -> Result<Vec<u32>, QueueError> {
-        if !selector.task_ids.is_empty() {
-            return Ok(selector
-                .task_ids
-                .iter()
-                .filter_map(|id| self.node_ix(id))
-                .filter(|&ix| self.node(ix).status.has_state())
-                .collect());
-        }
-        if selector.status.is_none()
+    ) -> Result<impl Iterator<Item = u32> + 'a, QueueError> {
+        if selector.task_ids.is_empty()
+            && selector.status.is_none()
             && selector.target.is_none()
             && selector.rustc_version.is_none()
             && selector.crate_name.is_none()
@@ -4228,6 +4221,19 @@ impl Graph {
         {
             return Err(QueueError::EmptySelector);
         }
+        Ok(self.matching(selector, now))
+    }
+
+    /// Lazily yields the nodes holding queue state that a selector
+    /// matches, allocating nothing proportional to the matches. A
+    /// selector with no id and no predicate matches every such node.
+    fn matching<'a>(
+        &'a self,
+        selector: &'a stow_types::api::QueueSelector,
+        now: i64,
+    ) -> impl Iterator<Item = u32> + 'a {
+        let by_ids = !selector.task_ids.is_empty();
+        let ids: &[String] = if by_ids { &selector.task_ids } else { &[] };
         let target = selector
             .target
             .as_ref()
@@ -4243,7 +4249,7 @@ impl Graph {
         let cutoff = selector
             .older_than_secs
             .map(|secs| now.saturating_sub(i64::try_from(secs).unwrap_or(i64::MAX) * 1000));
-        let status = selector.status.map(|status| {
+        let status = selector.status.filter(|_| !by_ids).map(|status| {
             use stow_types::api::QueueTaskStatus as S;
             match status {
                 S::Pending | S::Blocked => Status::Pending,
@@ -4253,30 +4259,28 @@ impl Graph {
                 S::Failed => Status::Failed,
             }
         });
-        let candidates = status
+        let named = ids.iter().filter_map(|id| self.node_ix(id));
+        let by_status = status
             .into_iter()
             .flat_map(|status| self.by_status[status.index()].ones())
-            .chain(
-                0..if status.is_none() {
-                    self.nodes.len()
-                } else {
-                    0
-                },
-            )
             .map(|ix| u32::try_from(ix).expect("node indexes fit u32"));
-        Ok(candidates
-            .filter(|&ix| {
-                let node = self.node(ix);
-                node.status.has_state()
-                    && selector
+        let all = 0..if status.is_none() && !by_ids {
+            u32::try_from(self.nodes.len()).expect("node indexes fit u32")
+        } else {
+            0
+        };
+        named.chain(by_status).chain(all).filter(move |&ix| {
+            let node = self.node(ix);
+            node.status.has_state()
+                && (by_ids
+                    || selector
                         .status
                         .is_none_or(|status| Self::wire_status(node) == status)
-                    && target.is_none_or(|t| t == Some(node.target))
-                    && rustc.is_none_or(|r| r == Some(node.rustc))
-                    && crate_name.is_none_or(|c| c == Some(node.crate_name))
-                    && cutoff.is_none_or(|cutoff| self.state(ix).updated_ms() <= cutoff)
-            })
-            .collect())
+                        && target.is_none_or(|t| t == Some(node.target))
+                        && rustc.is_none_or(|r| r == Some(node.rustc))
+                        && crate_name.is_none_or(|c| c == Some(node.crate_name))
+                        && cutoff.is_none_or(|cutoff| self.state(ix).updated_ms() <= cutoff))
+        })
     }
 
     /// The task ids a mutation selector resolves to — `purge` demands
@@ -4312,7 +4316,6 @@ impl Graph {
                 .collect());
         }
         self.select(selector, now)?
-            .into_iter()
             .map(|ix| self.mint(ix, digests))
             .collect()
     }
@@ -4335,14 +4338,6 @@ impl Graph {
             .iter()
             .filter_map(|id| self.node_ix(id).map(|ix| (ix, id.as_str())))
             .collect();
-        let mut ixs = match self.select(selector, now) {
-            Ok(ixs) => ixs,
-            Err(QueueError::EmptySelector) => (0..u32::try_from(self.nodes.len())
-                .expect("node indexes fit u32"))
-                .filter(|&ix| self.node(ix).status.has_state())
-                .collect(),
-            Err(error) => return Err(error),
-        };
         let terminal = matches!(
             selector.status,
             Some(
@@ -4364,14 +4359,23 @@ impl Graph {
         let limit = selector
             .limit
             .map_or(ADMIN_LIST_LIMIT, |limit| limit.clamp(1, ADMIN_LIST_LIMIT));
-        // Select only the returned prefix before sorting it. The rest
-        // of a large matching queue has no ordering work to pay.
-        if ixs.len() > limit as usize {
-            ixs.select_nth_unstable_by_key(limit as usize, order);
-            ixs.truncate(limit as usize);
+        // Keep only the `limit` best keys while scanning: the heap never
+        // holds more than `limit` entries, whatever the match count, and
+        // a match that would not be returned costs one comparison.
+        let mut best = std::collections::BinaryHeap::with_capacity(limit as usize);
+        for ix in self.matching(selector, now) {
+            let key = order(&ix);
+            if best.len() < limit as usize {
+                best.push(key);
+            } else if let Some(mut worst) = best.peek_mut()
+                && key < *worst
+            {
+                *worst = key;
+            }
         }
-        ixs.sort_by_key(order);
-        ixs.into_iter()
+        best.into_sorted_vec()
+            .into_iter()
+            .map(|std::cmp::Reverse((_, ix))| ix)
             .map(|ix| {
                 let node = self.node(ix);
                 let state = self.state(ix);
@@ -5250,6 +5254,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bounded_listing_matches_a_full_sort_of_every_match() {
+        use stow_types::api::{QueueSelector, QueueTaskStatus};
+
+        let mut graph = Graph::default();
+        for number in 0..90 {
+            let name = format!("mixed-{number}");
+            graph
+                .merge(
+                    &single(&name, SubmissionSource::CacheMiss),
+                    (number * 37 % 11) * 1000,
+                )
+                .expect("merge");
+            let ix = graph.node_ix(&id(&name)).expect("node");
+            let status = match number % 3 {
+                0 => Status::Pending,
+                1 => Status::Completed,
+                _ => Status::Failed,
+            };
+            graph.set_status(ix, status);
+            graph.state_mut(ix).touch((number * 23 % 7) * 1000);
+        }
+        for (status, terminal) in [
+            (None, false),
+            (Some(QueueTaskStatus::Completed), true),
+            (Some(QueueTaskStatus::Failed), true),
+        ] {
+            let mut matches: Vec<u32> = (0..90)
+                .filter(|&ix| {
+                    graph.node(ix).status.has_state()
+                        && status.is_none_or(|status| Graph::wire_status(graph.node(ix)) == status)
+                })
+                .collect();
+            matches.sort_by_key(|&ix| {
+                let state = graph.state(ix);
+                std::cmp::Reverse((
+                    if terminal {
+                        state.updated_ms()
+                    } else {
+                        state.first_requested
+                    },
+                    ix,
+                ))
+            });
+            for limit in [1, 7, 29, 30, 31, 89, 90, 91] {
+                let selector = QueueSelector {
+                    status,
+                    limit: Some(limit),
+                    ..QueueSelector::default()
+                };
+                let actual: Vec<_> = graph
+                    .list(&selector, 100_000)
+                    .expect("listing")
+                    .into_iter()
+                    .map(|task| task.task_id)
+                    .collect();
+                let expected: Vec<_> = matches
+                    .iter()
+                    .take(limit as usize)
+                    .map(|&ix| graph.task_id_of(ix))
+                    .collect();
+                assert_eq!(actual, expected, "status {status:?} limit {limit}");
+            }
+        }
+    }
+
     /// A verified failure is terminal, including after event replay and reload.
     #[test]
     fn source_verification_survives_event_replay_and_snapshot() {
@@ -5692,10 +5762,8 @@ mod tests {
                     })
                     .map(|(ix, _)| ix)
                     .collect();
-                assert_eq!(
-                    graph.select(&selector, 1_000_000).expect("select"),
-                    expected
-                );
+                let found: Vec<_> = graph.select(&selector, 1_000_000).expect("sel").collect();
+                assert_eq!(found, expected);
             }
         }
         let mut target_counts = vec![[0u32; Status::COUNT]; graph.targets.len()];
