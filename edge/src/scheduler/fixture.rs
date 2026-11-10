@@ -52,7 +52,7 @@ use stow_types::identity::{
 };
 use stow_types::public_cache::{ExplicitSpelling, UnitInvocation, UnitShape};
 
-use super::graph::{Graph, GraphCell, LoadedGraph};
+use super::graph::{FreshDigest, Graph, GraphCell, LoadedGraph};
 use super::routes;
 use super::store;
 use crate::errors::QueueError;
@@ -223,6 +223,16 @@ impl TreeBuilder {
     }
 }
 
+/// One miss-lane tree of the dependency-free fixture nodes `lo..=hi`.
+#[cfg(test)]
+pub fn fresh_tree(lo: u32, hi: u32) -> SubmissionTree {
+    let mut builder = TreeBuilder::new();
+    for n in lo..=hi {
+        builder.owner(n, &[]);
+    }
+    builder.into_tree(SubmissionSource::CacheMiss)
+}
+
 /// `n * multiplier mod modulus`, exact at any fixture size.
 fn spread(n: u32, multiplier: u64, modulus: u32) -> u32 {
     u32::try_from(u64::from(n) * multiplier % u64::from(modulus)).expect("below the modulus")
@@ -340,8 +350,14 @@ impl Generations {
 
 /// Merge `tree` and keep the merge honest: a fixture tree that fails to
 /// merge is a builder bug.
-fn merge(graph: &mut Graph, tree: &SubmissionTree, at: i64) -> Result<(), QueueError> {
-    graph.merge(tree, at).map(|_| ())
+fn merge(
+    graph: &mut Graph,
+    tree: &SubmissionTree,
+    at: i64,
+    ledger: &mut Vec<FreshDigest>,
+) -> Result<(), QueueError> {
+    ledger.extend(graph.merge(tree, at)?.digests);
+    Ok(())
 }
 
 /// The `(lo, hi)` runs of at most [`TREE_NODES`] ids covering
@@ -359,13 +375,14 @@ fn merge_run(
     (lo, hi): (u32, u32),
     source: SubmissionSource,
     at: i64,
+    ledger: &mut Vec<FreshDigest>,
     deps: impl Fn(u32) -> Vec<u32>,
 ) -> Result<(), QueueError> {
     let mut builder = TreeBuilder::new();
     for n in lo..=hi {
         builder.owner(n, &deps(n));
     }
-    merge(graph, &builder.into_tree(source), at)?;
+    merge(graph, &builder.into_tree(source), at, ledger)?;
     #[cfg(target_arch = "wasm32")]
     trace_population(graph, "incremental merge completed");
     Ok(())
@@ -386,6 +403,7 @@ fn build_completed(
     shape: FixtureShape,
     now: i64,
     generations: &mut Generations,
+    ledger: &mut Vec<FreshDigest>,
 ) -> Result<(), QueueError> {
     let completed_first = shape.completed_row(0);
     for (lo, hi) in runs(completed_first, shape.completed_end()) {
@@ -394,6 +412,7 @@ fn build_completed(
             (lo, hi),
             SubmissionSource::CacheMiss,
             first_at(shape, now, lo),
+            ledger,
             |_| Vec::new(),
         )?;
         let claims: Vec<DispatchClaim> = (lo..=hi)
@@ -442,7 +461,12 @@ fn build_completed(
 
 /// Failed rows: submitted, then cancelled — the failed state an
 /// operator verb produces, with the dependents' blocked refresh.
-fn build_failed(graph: &mut Graph, shape: FixtureShape, now: i64) -> Result<(), QueueError> {
+fn build_failed(
+    graph: &mut Graph,
+    shape: FixtureShape,
+    now: i64,
+    ledger: &mut Vec<FreshDigest>,
+) -> Result<(), QueueError> {
     let ranges = [
         (shape.failed_row(0), shape.failed_end()),
         (
@@ -457,6 +481,7 @@ fn build_failed(graph: &mut Graph, shape: FixtureShape, now: i64) -> Result<(), 
                 (lo, hi),
                 SubmissionSource::CacheMiss,
                 first_at(shape, now, lo),
+                ledger,
                 |_| Vec::new(),
             )?;
             let ids: Vec<String> = (lo..=hi).map(|n| fixture_task_id(u64::from(n))).collect();
@@ -479,6 +504,7 @@ fn build_pending(
     shape: FixtureShape,
     eligible_rows: u32,
     now: i64,
+    ledger: &mut Vec<FreshDigest>,
 ) -> Result<(), QueueError> {
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
@@ -493,9 +519,14 @@ fn build_pending(
     ];
     for (start, end, source) in segments {
         for (lo, hi) in runs(start, end) {
-            merge_run(graph, (lo, hi), source, first_at(shape, now, lo), |n| {
-                pending_deps(shape, eligible_rows, n)
-            })?;
+            merge_run(
+                graph,
+                (lo, hi),
+                source,
+                first_at(shape, now, lo),
+                ledger,
+                |n| pending_deps(shape, eligible_rows, n),
+            )?;
         }
     }
     let eligible_end = human_end + eligible_rows;
@@ -510,19 +541,24 @@ fn build_pending(
 /// node and every state except the in-flight claims and the demand
 /// tail, which [`tail`] appends after the snapshot is written.
 ///
+/// Also returns the ledger of every `(state slot, digest)` the merges
+/// allocated, in merge order — the `node_digests` rows the store holds
+/// for this graph, a reused slot's later entry overwriting its earlier.
+///
 /// # Errors
 /// `QueueError::Invariant` when a fixture tree fails to merge.
 pub fn build(
     shape: FixtureShape,
     settings: &super::queue::SchedulerSettings,
     now: i64,
-) -> Result<Graph, QueueError> {
+) -> Result<(Graph, Vec<FreshDigest>), QueueError> {
     let mut graph = Graph::default();
+    let mut ledger = Vec::new();
     let mut generations = Generations(0);
-    build_completed(&mut graph, shape, now, &mut generations)?;
+    build_completed(&mut graph, shape, now, &mut generations, &mut ledger)?;
     #[cfg(target_arch = "wasm32")]
     trace_population(&graph, "completed population built");
-    build_failed(&mut graph, shape, now)?;
+    build_failed(&mut graph, shape, now, &mut ledger)?;
     // The in-flight window's nodes (claimed in the tail).
     let mut builder = TreeBuilder::new();
     for k in 0..FixtureShape::IN_FLIGHT_ROWS {
@@ -532,8 +568,15 @@ pub fn build(
         &mut graph,
         &builder.into_tree(SubmissionSource::CacheMiss),
         now - 35 * MINUTE_MS,
+        &mut ledger,
     )?;
-    build_pending(&mut graph, shape, dispatch_window(settings), now)?;
+    build_pending(
+        &mut graph,
+        shape,
+        dispatch_window(settings),
+        now,
+        &mut ledger,
+    )?;
     #[cfg(target_arch = "wasm32")]
     trace_population(&graph, "pending population built");
     seed_requests(&mut graph, shape);
@@ -544,13 +587,13 @@ pub fn build(
     graph.log_since_snapshot = 0;
     graph.log_bytes_since_snapshot = 0;
     graph.compact();
-    Ok(graph)
+    Ok((graph, ledger))
 }
 
 /// `SliceReport` events publishing completed nodes `lo..=hi`, grouped by
 /// the `(target, rustc)` slice each belongs to: a slice's first report
 /// is full, every later one a delta on the graph's live generation.
-fn slice_reports(graph: &Graph, lo: u32, hi: u32) -> Vec<SchedulerEvent> {
+pub fn slice_reports(graph: &Graph, lo: u32, hi: u32) -> Vec<SchedulerEvent> {
     let mut groups: std::collections::BTreeMap<
         (&'static str, &'static str),
         Vec<PublishedSliceRow>,
@@ -775,7 +818,7 @@ pub fn mark_running(graph: &mut Graph, shape: FixtureShape, now: i64) {
 /// # Errors
 /// `QueueError::Sql` when a delete fails.
 pub async fn wipe(db: &DurableDb) -> Result<(), QueueError> {
-    for table in ["event_log", "snapshot_chunks", "store_meta"] {
+    for table in ["event_log", "snapshot_chunks", "store_meta", "node_digests"] {
         db.query(&format!("DELETE FROM {table}"))
             .execute()
             .await
@@ -806,8 +849,10 @@ pub async fn seed(
     // would hold two graphs at once.
     cell.clear();
     tracing::info!(rows = shape.queue_rows, "fixture seed: store wiped");
-    let mut graph = build(shape, settings, now)?;
+    let (mut graph, ledger) = build(shape, settings, now)?;
     tracing::info!(nodes = graph.sizes().0, "fixture seed: graph built");
+    store::write_digests(db, &ledger).await?;
+    drop(ledger);
     #[cfg(target_arch = "wasm32")]
     trace_population(&graph, "seed built");
     graph.seeded_rows = Some(shape.queue_rows);

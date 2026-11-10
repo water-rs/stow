@@ -1,7 +1,12 @@
 //! The scheduler's flat persistence substrate (stow#878): an
 //! append-only `event_log`, chunked `snapshot_chunks`, and one
-//! `store_meta` row carrying the snapshot watermark — the only tables
-//! the in-memory [`super::graph::Graph`] survives a forced eviction by.
+//! `store_meta` row carrying the snapshot watermark, plus the
+//! `node_digests` rows holding the dependency digest of every node that
+//! has queue state — the only tables the in-memory
+//! [`super::graph::Graph`] survives a forced eviction by. A merge
+//! writes the digest rows of its fresh state slots in the turn that
+//! appends its log rows; replay writes none, because it allocates the
+//! slots the live graph did and the rows are already there.
 //!
 //! Every accepted event is appended, stamped with the instant it was
 //! accepted at, before the request or pass that produced it is
@@ -32,8 +37,8 @@ use stow_types::api::{
 };
 
 use super::graph::{
-    ChunkSpan, Graph, GraphCell, Meter, SNAPSHOT_SPAN_ROWS, SnapshotLoader, SnapshotPlan,
-    SpanEncoder, utc_day,
+    ChunkSpan, DIGEST_BLOCK_SLOTS, Digest, Digests, FreshDigest, Graph, GraphCell, Meter,
+    SNAPSHOT_SPAN_ROWS, SnapshotLoader, SnapshotPlan, SpanEncoder, utc_day,
 };
 use crate::errors::QueueError;
 
@@ -574,6 +579,189 @@ async fn flush_upserts(db: &DurableDb, pending: &mut Vec<(i64, String)>) -> Resu
     Ok(())
 }
 
+/// Bytes of one `node_digests` row's decoded payload: every slot of the
+/// block, 32 bytes each, absent slots zero.
+const DIGEST_BLOCK_BYTES: usize = DIGEST_BLOCK_SLOTS as usize * size_of::<Digest>();
+
+/// Blocks one digest read statement names: two bindings under the
+/// platform's 100 for the `IN` list, with room to spare.
+const DIGEST_READ_BLOCKS: usize = 64;
+
+/// Rows one digest UPSERT statement carries, like [`UPSERT_BATCH`].
+const DIGEST_WRITE_BLOCKS: usize = 8;
+
+#[derive(skyzen::FromRow)]
+struct DigestRow {
+    block: i64,
+    digests: String,
+}
+
+/// The digest block a state slot falls in.
+const fn block_of(slot: u32) -> u32 {
+    slot / DIGEST_BLOCK_SLOTS
+}
+
+/// Where a state slot's record sits inside its block's payload.
+const fn record_at(slot: u32) -> usize {
+    (slot % DIGEST_BLOCK_SLOTS) as usize * size_of::<Digest>()
+}
+
+/// Read the `node_digests` rows of `blocks` — ascending and distinct —
+/// each as its decoded payload, in `DIGEST_READ_BLOCKS`-row statements.
+/// A block with no row is absent from the answer.
+async fn read_digest_blocks(
+    db: &DurableDb,
+    blocks: &[u32],
+) -> Result<std::collections::BTreeMap<u32, Vec<u8>>, QueueError> {
+    use base64::Engine as _;
+    let mut found = std::collections::BTreeMap::new();
+    for batch in blocks.chunks(DIGEST_READ_BLOCKS) {
+        let mut sql = String::from("SELECT block, digests FROM node_digests WHERE block IN (?");
+        for _ in 1..batch.len() {
+            sql.push_str(", ?");
+        }
+        sql.push(')');
+        let mut query = db.query(&sql);
+        for &block in batch {
+            query = query.bind(i64::from(block));
+        }
+        let rows = query
+            .fetch_all::<DigestRow>()
+            .await
+            .map_err(|error| QueueError::Sql(format!("digest read: {error}")))?;
+        for row in rows {
+            let payload = base64::engine::general_purpose::STANDARD
+                .decode(&row.digests)
+                .map_err(|error| {
+                    QueueError::Invariant(format!("digest block {} decode: {error}", row.block))
+                })?;
+            if payload.len() != DIGEST_BLOCK_BYTES {
+                return Err(QueueError::Invariant(format!(
+                    "digest block {} holds {} bytes, not {DIGEST_BLOCK_BYTES}",
+                    row.block,
+                    payload.len()
+                )));
+            }
+            let block = u32::try_from(row.block).map_err(|_| {
+                QueueError::Invariant(format!("digest block {} is out of range", row.block))
+            })?;
+            found.insert(block, payload);
+        }
+    }
+    Ok(found)
+}
+
+/// Read the dependency digest of every state slot in `slots` — the
+/// rows a task id is minted from. One statement per
+/// [`DIGEST_READ_BLOCKS`] distinct blocks the slots fall in; each block
+/// costs one row read.
+///
+/// # Errors
+/// `QueueError::Invariant` when a slot's block has no row or its record
+/// is empty — every live state slot has a digest, so either is a corrupt
+/// store — `QueueError::Sql` on a failed read.
+pub async fn read_digests(db: &DurableDb, slots: &[u32]) -> Result<Digests, QueueError> {
+    let blocks: Vec<u32> = slots
+        .iter()
+        .map(|&slot| block_of(slot))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let found = read_digest_blocks(db, &blocks).await?;
+    let mut digests = Digests::default();
+    for &slot in slots {
+        let payload = found.get(&block_of(slot)).ok_or_else(|| {
+            QueueError::Invariant(format!(
+                "digest row {} is missing for live state slot {slot}",
+                block_of(slot)
+            ))
+        })?;
+        let at = record_at(slot);
+        let digest: Digest = payload[at..at + size_of::<Digest>()]
+            .try_into()
+            .expect("a record is one digest long");
+        if digest == [0; size_of::<Digest>()] {
+            return Err(QueueError::Invariant(format!(
+                "digest row {} holds no record for live state slot {slot}",
+                block_of(slot)
+            )));
+        }
+        digests.insert(slot, digest);
+    }
+    Ok(digests)
+}
+
+/// Write the digests of the fresh state slots a merge allocated — in
+/// the turn that appended its log rows, so the rows always describe the
+/// state slab as of the log's end. A block every slot of which is fresh
+/// is written without a read; a block only partly covered is read,
+/// patched and written. Rows cost one write per block touched and one
+/// read per partly covered block; the statements are
+/// `ceil(partial / 64)` reads and `ceil(blocks / 8)` upserts.
+///
+/// # Errors
+/// `QueueError::Sql` on a failed statement, `QueueError::Invariant` on a
+/// stored block that does not decode.
+pub async fn write_digests(db: &DurableDb, fresh: &[FreshDigest]) -> Result<(), QueueError> {
+    use base64::Engine as _;
+    let mut touched: std::collections::BTreeMap<u32, std::collections::BTreeMap<u32, Digest>> =
+        std::collections::BTreeMap::new();
+    for &(slot, digest) in fresh {
+        touched
+            .entry(block_of(slot))
+            .or_default()
+            .insert(slot, digest);
+    }
+    let partial: Vec<u32> = touched
+        .iter()
+        .filter(|(_, slots)| slots.len() != DIGEST_BLOCK_SLOTS as usize)
+        .map(|(&block, _)| block)
+        .collect();
+    let mut held = read_digest_blocks(db, &partial).await?;
+    let mut pending: Vec<(u32, String)> = Vec::with_capacity(DIGEST_WRITE_BLOCKS);
+    for (block, slots) in touched {
+        let mut payload = held
+            .remove(&block)
+            .unwrap_or_else(|| vec![0; DIGEST_BLOCK_BYTES]);
+        for (slot, digest) in slots {
+            let at = record_at(slot);
+            payload[at..at + size_of::<Digest>()].copy_from_slice(&digest);
+        }
+        pending.push((
+            block,
+            base64::engine::general_purpose::STANDARD.encode(&payload),
+        ));
+        if pending.len() == DIGEST_WRITE_BLOCKS {
+            flush_digest_rows(db, &mut pending).await?;
+        }
+    }
+    flush_digest_rows(db, &mut pending).await
+}
+
+/// Write the buffered `(block, payload)` rows as one multi-row UPSERT.
+async fn flush_digest_rows(
+    db: &DurableDb,
+    pending: &mut Vec<(u32, String)>,
+) -> Result<(), QueueError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut sql = String::from("INSERT INTO node_digests(block, digests) VALUES (?, ?)");
+    for _ in 1..pending.len() {
+        sql.push_str(", (?, ?)");
+    }
+    sql.push_str(" ON CONFLICT(block) DO UPDATE SET digests = excluded.digests");
+    let mut query = db.query(&sql);
+    for (block, payload) in pending.drain(..) {
+        query = query.bind(i64::from(block)).bind(payload);
+    }
+    query
+        .execute()
+        .await
+        .map_err(|error| QueueError::Sql(format!("digest write: {error}")))?;
+    Ok(())
+}
+
 /// Snapshot rows one wake statement reads. The buffer bound is
 /// `WAKE_READ_BATCH` × the ~1 MiB row cap ≈ 16 MB of payload in flight
 /// — a few percent of the 128 MiB object limit atop the arenas'
@@ -949,6 +1137,7 @@ mod tests {
         let (mut restored, tail) = load(&db).await.expect("load");
         assert!(tail.is_empty(), "snapshot covered the whole log");
         apply_events(&mut restored, &tail);
+        restored.adopt_test_digests(&graph);
         assert_eq!(restored.status(), graph.status());
         let claimed = restored
             .claim(&claim_settings(45, 16), 20_000, u32::MAX)
@@ -1051,6 +1240,7 @@ mod tests {
         let (mut restored, tail) = load(&db).await.expect("load");
         assert!(tail.is_empty());
         apply_events(&mut restored, &tail);
+        restored.adopt_test_digests(&graph);
         assert_eq!(restored.status(), graph.status());
         assert_eq!(restored.sizes(), graph.sizes());
         let claimed = restored
@@ -1068,8 +1258,12 @@ mod tests {
         for queue_rows in [1_000u32, 4_000] {
             let shape = stow_types::fixture::FixtureShape { queue_rows };
             let (db, log) = test_db::counting_memory_db().await.expect("db");
-            let mut graph =
-                crate::scheduler::fixture::build(shape, &claim_settings(45, 16), 0).expect("build");
+            let (mut graph, _) = crate::scheduler::fixture::build(
+                shape,
+                &claim_settings(45, 16),
+                crate::scheduler::drives::HOST_NOW_MS,
+            )
+            .expect("build");
             write_snapshot(&db, &mut graph, &GraphCell::default(), NOW_MS)
                 .await
                 .expect("seed snapshot");

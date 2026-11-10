@@ -6,12 +6,14 @@
 //! whole structure from a snapshot plus the log tail.
 //!
 //! Layout is sized against the 128 MiB object bound (`target/878-plan.md`
-//! §2): a node is one fixed 68-byte record in an arena, its strings
-//! interned once as `u32` ids and its dependency digest an inline
-//! 32-byte value; its task id is never stored but re-minted from those
-//! fields. The queue state of a node that has not published rides a
-//! 32-byte slab entry, freed on publish; the fields few nodes carry sit
-//! in a side table. Edges are flat `u32` arrays — forward spans per node
+//! §2): a node is one fixed 48-byte record in an arena, identified by
+//! the 16-byte hash of its task id, its strings interned once as `u32`
+//! ids; its task id is never stored but minted from those fields and
+//! the dependency digest, which lives in storage by state slot
+//! (`digests.rs`) and never in memory. The queue state of a node that
+//! has not published rides a 24-byte slab entry, freed on publish; the
+//! fields few nodes carry (a retry count among them) sit in a side
+//! table. Edges are flat `u32` arrays — forward spans per node
 //! plus a CSR reverse index — and the ready set holds node indexes
 //! only, ordered at claim time. A published node stays only while a
 //! retained node still depends on it (dispatch payloads carry dependency
@@ -37,6 +39,7 @@ use crate::errors::QueueError;
 use crate::scheduler::queue;
 
 mod arena;
+mod digests;
 mod edges;
 mod index;
 mod node;
@@ -45,10 +48,11 @@ mod snapshot;
 mod sparse;
 
 use arena::Arena;
+pub use digests::{DIGEST_BLOCK_SLOTS, Digest, DigestSource, Digests, FreshDigest, Wanted};
 use edges::Edges;
 use index::{Interner, IxTable, Priorities, hash_of};
 pub use node::RunCompletion;
-use node::{Extra, Flags, Lane, NO_STATE, Node, State, Status};
+use node::{Extra, FIRST_ATTEMPT, Flags, Lane, NO_STATE, Node, State, Status};
 use published::PublishedEntries;
 use sparse::SparseDemand;
 
@@ -174,23 +178,24 @@ struct Published {
     slice: SliceId,
 }
 
-/// The probe keys of one canonical task id.
+/// The identity of one canonical task id.
 #[derive(Debug, Clone, Copy)]
 struct IdKeys {
-    /// Probe key of the id index.
-    tag: u32,
-    /// Key of the published-shape map.
+    /// Key of the id index and the published-shape map.
     key: IdKey,
 }
 
 impl IdKeys {
     fn of(task_id: &str) -> Self {
         let hash = blake3::hash(task_id.as_bytes());
-        let bytes = hash.as_bytes();
-        let tag = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let mut key = [0u8; 16];
-        key.copy_from_slice(&bytes[..16]);
-        Self { tag, key }
+        key.copy_from_slice(&hash.as_bytes()[..16]);
+        Self { key }
+    }
+
+    /// The id index's probe hash of `key`: its first four bytes.
+    fn probe(key: &IdKey) -> u64 {
+        u64::from(u32::from_le_bytes([key[0], key[1], key[2], key[3]]))
     }
 }
 
@@ -442,7 +447,7 @@ pub struct Graph {
     targets: Vec<TargetInfo>,
     /// Likewise the rustc versions.
     rustcs: Vec<Box<str>>,
-    /// Task-id probe index over `nodes`, keyed by `Node::id_tag`.
+    /// Task-id probe index over `nodes`, keyed by `Node::key`.
     /// Freed nodes stay in it until the next compaction and are
     /// skipped.
     ids: IxTable,
@@ -460,8 +465,8 @@ pub struct Graph {
     states: Arena<State>,
     /// Zero demand needs no backing page; indexed by stable state slot.
     demand: SparseDemand,
-    /// Vacant `states` slots, reused before the slab grows.
-    free_states: Vec<u32>,
+    /// Vacant `states` slots, the lowest reused before the slab grows.
+    free_states: std::collections::BinaryHeap<std::cmp::Reverse<u32>>,
     /// Full priority values shared by state rank classes.
     priorities: Priorities,
     /// Sparse fields keyed by stable state slot, so node compaction never
@@ -608,6 +613,10 @@ pub struct Graph {
     /// Interned strings the persisted chunks already cover — the
     /// interner's only dirty mark, since it is append-only.
     intern_committed: usize,
+    /// Unit tests that drive a graph without a store read digests from
+    /// here, filled by every merge; production reads the rows.
+    #[cfg(test)]
+    test_digests: HashMap<u32, Digest>,
 }
 
 /// Freeze transitions the graph keeps for `GET /dispatch-freeze`.
@@ -622,6 +631,16 @@ pub struct Claimed {
     pub generation: u64,
     /// The attempt cycle.
     pub attempt: u32,
+}
+
+/// One node a claim pass took, before its task id is minted: the id
+/// needs the digest row of the node's state slot, which only the
+/// caller can read.
+#[derive(Debug, Clone, Copy)]
+pub struct ClaimedNode {
+    ix: u32,
+    generation: u64,
+    attempt: u32,
 }
 
 /// A tree whose shape and identity keys have been checked. The borrow
@@ -650,6 +669,11 @@ pub struct MergeReport {
     /// Task ids of the nodes the published mask does not cover — the
     /// miss set the submit's caller logs (stow#886).
     pub unpublished: Vec<String>,
+    /// The dependency digests of the fresh nodes that took a state
+    /// slot, by slot, in insertion order: the rows the submit's caller
+    /// writes in the turn that appended the submission. A node born
+    /// published takes no slot and has none.
+    pub digests: Vec<FreshDigest>,
 }
 
 /// What one run-finished event resolved to.
@@ -711,7 +735,6 @@ struct NewNode<'a> {
     features: &'a str,
     target: &'a str,
     rustc: &'a str,
-    digest: [u8; 32],
     keys: IdKeys,
     flags: Flags,
     /// `None` inserts the node already published.
@@ -749,8 +772,33 @@ impl Graph {
         &mut self.states[slot as usize]
     }
 
+    /// Grow the slab to `len` slots, `filler` holding the new ones.
+    fn fill_states(&mut self, len: usize, filler: State) {
+        while self.states.len() < len {
+            self.states.push(filler);
+        }
+    }
+
+    /// [`Self::fill_states`] with a state no node reads, for slots the
+    /// snapshot names no node for.
+    fn pad_states(&mut self, len: usize) {
+        if self.states.len() >= len {
+            return;
+        }
+        let filler = match self.states.get(0) {
+            Some(state) => *state,
+            None => State::new(0, 0, self.priorities.intern(0), 0),
+        };
+        self.fill_states(len, filler);
+    }
+
+    /// Place a state in the lowest vacant slot, or past the slab's end
+    /// when none is. The choice depends on the set of vacant slots
+    /// alone, so a graph rebuilt from a snapshot and the log tail
+    /// allocates the slots the live one did — the `node_digests` rows
+    /// are keyed by them.
     fn alloc_state(&mut self, state: State) -> u32 {
-        if let Some(slot) = self.free_states.pop() {
+        if let Some(std::cmp::Reverse(slot)) = self.free_states.pop() {
             self.states[slot as usize] = state;
             slot
         } else {
@@ -1036,6 +1084,21 @@ impl Graph {
             .map_or(0, |extra| extra.not_before)
     }
 
+    /// The build attempt cycle; [`FIRST_ATTEMPT`] for a node no run has
+    /// counted against.
+    fn attempt_of(&self, ix: u32) -> u8 {
+        self.extras
+            .get(&self.node(ix).state)
+            .map_or(FIRST_ATTEMPT, |extra| extra.attempt)
+    }
+
+    /// Dispatches claimed for the node.
+    fn dispatch_attempts_of(&self, ix: u32) -> u16 {
+        self.extras
+            .get(&self.node(ix).state)
+            .map_or(0, |extra| extra.dispatch_attempts)
+    }
+
     fn error_of(&self, ix: u32) -> Option<&str> {
         self.extras
             .get(&self.node(ix).state)
@@ -1084,43 +1147,45 @@ impl Graph {
         Some(u8::try_from(at).expect("rustc ids fit u8"))
     }
 
-    /// Re-mint a node's canonical task id from its fields.
-    fn task_id_of(&self, ix: u32) -> String {
+    /// Mint a node's canonical task id from its interned fields and the
+    /// dependency digest `digests` holds for its state slot.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` for a published or free node, which
+    /// holds no state slot and so no digest row, and when `digests`
+    /// lacks the node's row.
+    fn mint(&self, ix: u32, digests: &dyn DigestSource) -> Result<String, QueueError> {
         let node = self.node(ix);
-        canonical_task_id(&TaskIdFields {
+        if node.state == NO_STATE {
+            return Err(QueueError::Invariant(format!(
+                "task id of node {ix} ({:?}) minted without a state slot",
+                node.status
+            )));
+        }
+        let digest = digests.digest(node.state)?;
+        Ok(canonical_task_id(&TaskIdFields {
             crate_name: self.intern.at(node.crate_name),
             version: self.intern.at(node.version),
             features_json: self.intern.at(node.features),
             target: &self.targets[usize::from(node.target)].name,
             rustc_version: &self.rustcs[usize::from(node.rustc)],
-            dependency_identity: &hex::encode(node.digest),
+            dependency_identity: &hex::encode(digest),
             host_side: node.flags.host(),
             profile: node.flags.profile(),
-        })
-    }
-
-    /// The live node whose canonical task id is `task_id`.
-    fn find_id(&self, task_id: &str, keys: IdKeys) -> Option<u32> {
-        self.ids.candidates(u64::from(keys.tag)).find(|&ix| {
-            let node = self.node(ix);
-            node.id_tag == keys.tag && node.status != Status::Free && self.task_id_of(ix) == task_id
-        })
+        }))
     }
 
     /// The live node whose canonical task id hashes to `key`.
     fn find_key(&self, key: IdKey) -> Option<u32> {
-        let tag = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
-        self.ids.candidates(u64::from(tag)).find(|&ix| {
+        self.ids.candidates(IdKeys::probe(&key)).find(|&ix| {
             let node = self.node(ix);
-            node.id_tag == tag
-                && node.status != Status::Free
-                && IdKeys::of(&self.task_id_of(ix)).key == key
+            node.key == key && node.status != Status::Free
         })
     }
 
     /// Look up a node index by task id string.
     fn node_ix(&self, task_id: &str) -> Option<u32> {
-        self.find_id(task_id, IdKeys::of(task_id))
+        self.find_key(IdKeys::of(task_id).key)
     }
 
     /// Append a node and index it.
@@ -1140,11 +1205,10 @@ impl Graph {
         };
         let state = new.state.map_or(NO_STATE, |state| self.alloc_state(state));
         self.nodes.push(Node {
-            digest: new.digest,
+            key: new.keys.key,
             crate_name,
             version,
             features,
-            id_tag: new.keys.tag,
             state,
             edges_start: u32::try_from(self.edges.len())
                 .map_err(|_| QueueError::Invariant("edge count overflows u32".into()))?,
@@ -1161,8 +1225,8 @@ impl Graph {
         self.targets[usize::from(target)].counts[status.index()] += 1;
         self.index_pending(ix, true);
         let nodes = &self.nodes;
-        self.ids.insert(u64::from(new.keys.tag), ix, |held| {
-            u64::from(nodes[held as usize].id_tag)
+        self.ids.insert(IdKeys::probe(&new.keys.key), ix, |held| {
+            IdKeys::probe(&nodes[held as usize].key)
         });
         self.idents.insert(
             ident_hash(crate_name, version, features, target, rustc),
@@ -1190,7 +1254,7 @@ impl Graph {
         self.remove_ready(ix);
         self.set_status(ix, Status::Published);
         let slot = std::mem::replace(&mut self.node_mut(ix).state, NO_STATE);
-        self.free_states.push(slot);
+        self.free_states.push(std::cmp::Reverse(slot));
         self.demand.set(slot, 0);
         self.extras.remove(&slot);
         if self.node(ix).refs == 0 {
@@ -1314,8 +1378,8 @@ impl Graph {
         self.idents.clear_for(nodes.len());
         for (at, node) in nodes.iter().enumerate() {
             let ix = u32::try_from(at).expect("node indexes fit u32");
-            self.ids.insert(u64::from(node.id_tag), ix, |held| {
-                u64::from(nodes[held as usize].id_tag)
+            self.ids.insert(IdKeys::probe(&node.key), ix, |held| {
+                IdKeys::probe(&nodes[held as usize].key)
             });
             self.idents.insert(
                 ident_hash(
@@ -1387,7 +1451,7 @@ impl Graph {
         let mut is_fresh = Vec::with_capacity(tree.nodes.len());
         let mut fresh = Vec::new();
         for (sub, keys) in tree.nodes.iter().zip(ids) {
-            if let Some(ix) = self.find_id(&sub.task_id, *keys) {
+            if let Some(ix) = self.find_key(keys.key) {
                 if self.node(ix).status.has_state() {
                     // A node reached from several entry points takes
                     // the highest priority; its first-requested instant
@@ -1408,6 +1472,19 @@ impl Graph {
                 continue;
             }
             let ix = self.insert_new(sub, *keys, lane, priority, now)?;
+            let slot = self.node(ix).state;
+            if slot != NO_STATE {
+                report
+                    .digests
+                    .push((slot, digest_bytes(&sub.dependency_identity)));
+            }
+            #[cfg(test)]
+            {
+                if slot != NO_STATE {
+                    self.test_digests
+                        .insert(slot, digest_bytes(&sub.dependency_identity));
+                }
+            }
             node_ixs.push(ix);
             is_fresh.push(true);
             fresh.push(ix);
@@ -1498,21 +1575,14 @@ impl Graph {
         let own = self.targets[usize::from(target)].own_masks[usize::from(sub.host_side)]
             [usize::from(explicit)];
         let published = self.published.get(&keys.key).map_or(0, |entry| entry.mask);
-        let state = (published & own != own).then(|| State {
-            first_requested: now,
-            updated: now,
-            priority: self.priorities.intern(priority),
-            downloads: sub.downloads,
-            attempt: 1,
-            dispatch_attempts: 0,
-        });
+        let state = (published & own != own)
+            .then(|| State::new(now, now, self.priorities.intern(priority), sub.downloads));
         self.insert_node(&NewNode {
             crate_name: sub.crate_name.as_str(),
             version: &sub.version.to_string(),
             features: &sub.features_json.raw(),
             target: sub.target.as_str(),
             rustc: sub.rustc_version.as_str(),
-            digest: digest_bytes(&sub.dependency_identity),
             keys,
             flags: Flags::new(
                 sub.host_side,
@@ -1531,7 +1601,7 @@ impl Graph {
         let ValidatedSubmission { tree, ids } = validated;
         let priority = queue::source_priority(tree.source);
         for (sub, keys) in tree.nodes.iter().zip(ids) {
-            let Some(ix) = self.find_id(&sub.task_id, *keys) else {
+            let Some(ix) = self.find_key(keys.key) else {
                 return true;
             };
             if !self.node(ix).status.has_state() {
@@ -2024,24 +2094,52 @@ impl Graph {
     ///
     /// # Errors
     /// `QueueError::Invariant` when a target has no runner family.
-    pub fn claim(
+    pub fn claim_nodes(
         &mut self,
         settings: &queue::SchedulerSettings,
         now: i64,
         bound: u32,
-    ) -> Result<Vec<Claimed>, QueueError> {
+    ) -> Result<Vec<ClaimedNode>, QueueError> {
         self.claim_scanned(settings, now, bound, &mut 0)
     }
 
-    /// [`Self::claim`], adding the ready entries the pass examined to
-    /// `scans` — the pass's cost, which tests bound.
+    /// The state slots whose digest rows [`Self::claimed`] mints from.
+    pub fn claim_slots(&self, nodes: &[ClaimedNode]) -> Vec<u32> {
+        nodes.iter().map(|node| self.node(node.ix).state).collect()
+    }
+
+    /// The claims `nodes` name, their task ids minted from `digests`.
+    /// Call it right after the claim that produced `nodes`: a node
+    /// index is stable only until the next compaction.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` when `digests` lacks a claimed node's row.
+    pub fn claimed(
+        &self,
+        nodes: &[ClaimedNode],
+        digests: &dyn DigestSource,
+    ) -> Result<Vec<Claimed>, QueueError> {
+        nodes
+            .iter()
+            .map(|node| {
+                Ok(Claimed {
+                    task_id: self.mint(node.ix, digests)?,
+                    generation: node.generation,
+                    attempt: node.attempt,
+                })
+            })
+            .collect()
+    }
+
+    /// [`Self::claim_nodes`], adding the ready entries the pass examined
+    /// to `scans` — the pass's cost, which tests bound.
     fn claim_scanned(
         &mut self,
         settings: &queue::SchedulerSettings,
         now: i64,
         bound: u32,
         scans: &mut u64,
-    ) -> Result<Vec<Claimed>, QueueError> {
+    ) -> Result<Vec<ClaimedNode>, QueueError> {
         // Stale-lease recovery first: in-flight nodes whose claim
         // outlived the lease return to pending.
         let stale_ms = i64::from(settings.stale_dispatch_minutes) * 60_000;
@@ -2053,7 +2151,7 @@ impl Graph {
             .collect();
         for ix in stale {
             self.set_status(ix, Status::Pending);
-            self.state_mut(ix).updated = now;
+            self.state_mut(ix).touch(now);
             self.edit_extra(ix, |extra| {
                 extra.claimed_at = 0;
                 extra.lease_at = 0;
@@ -2123,11 +2221,13 @@ impl Graph {
             let Some(((_, ix), family_is_macos)) = best else {
                 break;
             };
-            let target = &self.targets[usize::from(self.node(ix).target)];
+            let node = self.node(ix);
+            let target = &self.targets[usize::from(node.target)];
             target.family.ok_or_else(|| {
                 QueueError::Invariant(format!(
-                    "pending task {} targets `{}`, no runner family",
-                    self.task_id_of(ix),
+                    "pending task {} {} targets `{}`, no runner family",
+                    self.intern.at(node.crate_name),
+                    self.intern.at(node.version),
                     target.name
                 ))
             })?;
@@ -2137,10 +2237,10 @@ impl Graph {
             if family_is_macos {
                 macos_taken += 1;
             }
-            claimed.push(Claimed {
-                task_id: self.task_id_of(ix),
+            claimed.push(ClaimedNode {
+                ix,
                 generation,
-                attempt: u32::from(self.state(ix).attempt),
+                attempt: u32::from(self.attempt_of(ix)),
             });
         }
         Ok(claimed)
@@ -2152,10 +2252,9 @@ impl Graph {
     fn mark_claimed(&mut self, ix: u32, generation: u64, now: i64) {
         self.next_generation = self.next_generation.max(generation);
         self.set_status(ix, Status::Dispatched);
-        let state = self.state_mut(ix);
-        state.dispatch_attempts = state.dispatch_attempts.saturating_add(1);
-        state.updated = now;
+        self.state_mut(ix).touch(now);
         self.edit_extra(ix, |extra| {
+            extra.dispatch_attempts = extra.dispatch_attempts.saturating_add(1);
             extra.generation = generation;
             extra.claimed_at = now;
             extra.lease_at = 0;
@@ -2176,7 +2275,7 @@ impl Graph {
             return false;
         }
         self.settling.remove(&generation);
-        self.state_mut(ix).updated = now;
+        self.state_mut(ix).touch(now);
         let parked = self.edit_extra(ix, |extra| {
             extra.run_id = run_id;
             extra.parked.take()
@@ -2184,15 +2283,7 @@ impl Graph {
         if let Some(parked) = parked
             && parked.run_id == run_id
         {
-            let parked = *parked;
-            self.finish_run_inner(
-                ix,
-                parked.success,
-                parked.cancelled,
-                parked.error,
-                parked.source_failure,
-                now,
-            );
+            self.finish_run_inner(ix, task_id, *parked, now);
         }
         true
     }
@@ -2211,13 +2302,19 @@ impl Graph {
         }
         self.settling.remove(&claim.generation);
         self.set_status(ix, Status::Pending);
-        let state = self.state_mut(ix);
-        state.updated = now;
-        state.dispatch_attempts = state
-            .dispatch_attempts
-            .checked_sub(1)
-            .expect("claimed attempt");
-        self.extras.remove(&ix);
+        self.state_mut(ix).touch(now);
+        // The claim's fields go; the attempt counters stay, the
+        // dispatch attempt it spent given back.
+        self.edit_extra(ix, |extra| {
+            *extra = Extra {
+                attempt: extra.attempt,
+                dispatch_attempts: extra
+                    .dispatch_attempts
+                    .checked_sub(1)
+                    .expect("claimed attempt"),
+                ..Extra::default()
+            };
+        });
         self.refresh_ready(ix);
     }
 
@@ -2235,10 +2332,9 @@ impl Graph {
         }
         self.settling.remove(&generation);
         self.set_status(ix, Status::Pending);
-        let state = self.state_mut(ix);
-        state.updated = now;
+        self.state_mut(ix).touch(now);
         let backoff = i64::from(queue::dispatch_backoff_minutes(u32::from(
-            state.dispatch_attempts,
+            self.dispatch_attempts_of(ix),
         ))) * 60_000;
         self.edit_extra(ix, |extra| {
             extra.error = Some(error.into());
@@ -2268,7 +2364,7 @@ impl Graph {
                     self.edit_extra(ix, |extra| extra.run_id = run_id);
                 }
                 self.set_status(ix, Status::Running);
-                self.state_mut(ix).updated = now;
+                self.state_mut(ix).touch(now);
                 return StartOutcome::Applied;
             }
             return StartOutcome::Stale;
@@ -2323,7 +2419,7 @@ impl Graph {
                             && run.status == CiRunStatus::InProgress
                         {
                             self.set_status(ix, Status::Running);
-                            self.state_mut(ix).updated = now;
+                            self.state_mut(ix).touch(now);
                             // First sight of the run holding a runner —
                             // the instant the health rule's staleness
                             // measures from, in place of the
@@ -2391,13 +2487,17 @@ impl Graph {
             // run itself, exactly as `run_started`'s `bound == 0`
             // path does (stow#940).
             self.edit_extra(ix, |extra| extra.run_id = run_id);
-            self.finish_run_inner(ix, success, cancelled, error, source_failure, now);
-            return FinishOutcome::Applied;
-        }
-        if bound != run_id {
+        } else if bound != run_id {
             return FinishOutcome::Stale;
         }
-        self.finish_run_inner(ix, success, cancelled, error, source_failure, now);
+        let completion = RunCompletion {
+            run_id,
+            success,
+            cancelled,
+            source_failure,
+            error,
+        };
+        self.finish_run_inner(ix, task_id, completion, now);
         FinishOutcome::Applied
     }
 
@@ -2476,23 +2576,22 @@ impl Graph {
 
     /// The completion's own transition — shared by the direct apply and
     /// the parked-consume path.
-    fn finish_run_inner(
-        &mut self,
-        ix: u32,
-        success: bool,
-        cancelled: bool,
-        error: Option<String>,
-        source_failure: Option<stow_types::api::SourceFailureVerification>,
-        now: i64,
-    ) {
-        self.state_mut(ix).updated = now;
+    fn finish_run_inner(&mut self, ix: u32, task_id: &str, completion: RunCompletion, now: i64) {
+        let RunCompletion {
+            run_id: _,
+            success,
+            cancelled,
+            source_failure,
+            error,
+        } = completion;
+        self.state_mut(ix).touch(now);
         let target = self.node(ix).target;
         let source_failure_verified = source_failure.is_some();
         if !cancelled || success {
-            let attempt = self.state(ix).attempt;
+            let attempt = self.attempt_of(ix);
             self.dirty.outcomes = true;
             self.record_attempt_outcome(AttemptOutcome {
-                task_id: self.task_id_of(ix),
+                task_id: task_id.to_owned(),
                 generation_id: self.generation_of(ix).to_string(),
                 attempt: u32::from(attempt.saturating_add(u8::from(!success))),
                 target: self.targets[usize::from(target)].name.to_string(),
@@ -2518,9 +2617,10 @@ impl Graph {
             self.tally_outcome(now, target, true);
             return;
         }
-        let state = self.state_mut(ix);
-        state.attempt = state.attempt.saturating_add(1);
-        let attempt = u32::from(state.attempt);
+        let attempt = self.edit_extra(ix, |extra| {
+            extra.attempt = extra.attempt.saturating_add(1);
+            u32::from(extra.attempt)
+        });
         if source_failure_verified || attempt > queue::MAX_BUILD_ATTEMPTS {
             self.set_status(ix, Status::Failed);
             self.edit_extra(ix, |extra| extra.error = error.map(Into::into));
@@ -2575,9 +2675,10 @@ impl Graph {
     /// `QueueError::Overflow` on a delta sum, `QueueError::Invariant`
     /// when a delta would overflow a task's demand — checked for every
     /// task before anything folds, naming the offenders.
-    pub fn demand_contributions(
+    pub fn demand_contributions_with(
         &self,
         deltas: &BTreeMap<[String; 5], i64>,
+        digests: &dyn DigestSource,
     ) -> Result<Vec<(String, i64)>, QueueError> {
         let mut contributions: BTreeMap<u32, i64> = BTreeMap::new();
         for (identity, delta) in deltas {
@@ -2628,7 +2729,7 @@ impl Graph {
         let mut offending = Vec::new();
         let mut out = Vec::with_capacity(contributions.len());
         for (ix, delta) in contributions {
-            let task_id = self.task_id_of(ix);
+            let task_id = self.mint(ix, digests)?;
             if self.demand_of(ix).checked_add(delta).is_none() {
                 offending.push(task_id);
             } else {
@@ -2685,8 +2786,8 @@ impl Graph {
             let (changed, rose, fell) = match op {
                 MutationKind::Retry if status == Status::Failed => {
                     self.set_status(ix, Status::Pending);
-                    self.state_mut(ix).attempt = 1;
                     self.edit_extra(ix, |extra| {
+                        extra.attempt = FIRST_ATTEMPT;
                         extra.error = None;
                         extra.not_before = 0;
                     });
@@ -2727,7 +2828,7 @@ impl Graph {
             if !changed {
                 continue;
             }
-            self.state_mut(ix).updated = now;
+            self.state_mut(ix).touch(now);
             self.remove_ready(ix);
             // A dep entering or leaving `failed` flips its dependents'
             // blocked flag.
@@ -2788,20 +2889,21 @@ impl Graph {
         let ix = self.node_ix(&claim.task_id).ok_or_else(|| {
             QueueError::Invariant(format!("claimed task {} is missing", claim.task_id))
         })?;
-        let mut payload = self.task_payload(ix)?;
+        let mut payload = self.task_payload(ix, &claim.task_id)?;
         payload.attempt = claim.attempt;
         Ok(payload)
     }
 
     /// Rebuild a claimed node's `BuildTaskPayload` — identity fields
     /// plus the dependency subgraph walked over the retained nodes
-    /// (stow#588's contract, from memory).
+    /// (stow#588's contract, from memory). `task_id` is the node's own
+    /// id, which the caller holds; a dependency's digest is never part
+    /// of the payload.
     ///
     /// # Errors
     /// `QueueError::Invariant` when a dep identity no longer decodes —
     /// memory corruption, since identities were typed at merge.
-    pub fn task_payload(&self, ix: u32) -> Result<BuildTaskPayload, QueueError> {
-        let task_id = self.task_id_of(ix);
+    pub fn task_payload(&self, ix: u32, task_id: &str) -> Result<BuildTaskPayload, QueueError> {
         let invalid =
             |error: String| QueueError::Invariant(format!("claimed task {task_id}: {error}"));
         // BFS over dep nodes; visit order is the wire order.
@@ -2843,8 +2945,8 @@ impl Graph {
         let node = self.node(ix);
         let identity = self.identity_of(node).map_err(|e| invalid(e.to_string()))?;
         Ok(BuildTaskPayload {
-            task_id: task_id.clone(),
-            attempt: u32::from(self.state(ix).attempt),
+            task_id: task_id.to_owned(),
+            attempt: u32::from(self.attempt_of(ix)),
             crate_name: identity.crate_name,
             version: identity.version,
             features_json: identity.features_json,
@@ -3043,9 +3145,13 @@ impl Graph {
             return false;
         }
         self.set_status(ix, Status::Pending);
-        self.state_mut(ix).attempt = 0;
         let slot = self.node(ix).state;
+        let dispatch_attempts = self.dispatch_attempts_of(ix);
         self.extras.remove(&slot);
+        self.edit_extra(ix, |extra| {
+            extra.attempt = 0;
+            extra.dispatch_attempts = dispatch_attempts;
+        });
         self.refresh_ready(ix);
         true
     }
@@ -3166,6 +3272,10 @@ impl Graph {
             state_capacity = self.states.capacity(),
             state_fragments = self.states.fragments().len(),
             state_storage_bytes = self.states.capacity() * size_of::<State>(),
+            free_state_slots = self.free_states.len(),
+            free_state_storage_bytes =
+                self.free_states.capacity() * size_of::<std::cmp::Reverse<u32>>(),
+            digest_table_rows = self.states.len().div_ceil(DIGEST_BLOCK_SLOTS as usize),
             demand_storage_bytes = self.demand.heap_bytes(),
             intern_storage_bytes = self.intern.heap_bytes(),
             ready_entries = self.ready_sets().map(BTreeSet::len).sum::<usize>(),
@@ -3265,6 +3375,7 @@ impl Graph {
             + self.idents.heap_bytes()
             + self.nodes.capacity() * size_of::<Node>()
             + self.states.capacity() * size_of::<State>()
+            + self.free_states.capacity() * size_of::<std::cmp::Reverse<u32>>()
             + self.demand.heap_bytes()
             + self.edges.heap_bytes()
             + self.published.heap_bytes()
@@ -3365,7 +3476,8 @@ impl Graph {
                             Status::Pending | Status::Dispatched | Status::Running
                         )
                     {
-                        self.state_mut(ix).attempt = u8::try_from(claim.attempt).unwrap_or(u8::MAX);
+                        let attempt = u8::try_from(claim.attempt).unwrap_or(u8::MAX);
+                        self.edit_extra(ix, |extra| extra.attempt = attempt);
                         self.mark_claimed(ix, claim.generation, now);
                     }
                 }
@@ -3739,18 +3851,26 @@ impl Graph {
     /// What holds a blocked node: the first failed dependency's task
     /// id, or `unknown dependency identity` when no live failed node
     /// explains the flag.
-    fn blocked_by(&self, ix: u32) -> Option<String> {
+    fn blocked_by(
+        &self,
+        ix: u32,
+        digests: &dyn DigestSource,
+    ) -> Result<Option<String>, QueueError> {
         let node = self.node(ix);
         if node.status != Status::Pending || !node.flags.blocked() {
-            return None;
+            return Ok(None);
         }
-        self.edge_range(ix)
+        let failed = self
+            .edge_range(ix)
             .filter(|&edge| !self.edges.met(edge))
             .map(|edge| self.edges.dep(edge))
             .filter(|&dep| self.node(dep).status == Status::Failed)
-            .map(|dep| self.task_id_of(dep))
+            .map(|dep| self.mint(dep, digests))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(failed
+            .into_iter()
             .min()
-            .or_else(|| Some("unknown dependency identity".to_owned()))
+            .or_else(|| Some("unknown dependency identity".to_owned())))
     }
 
     /// 1-based position of a pending human node in dispatch order: the
@@ -3775,12 +3895,15 @@ impl Graph {
 
     /// A node's queue status for the request lane — the operator-facing
     /// fields `RequestStatus` carries.
-    pub fn request_status(
+    pub fn request_status_with(
         &self,
         task_id: &str,
         now: i64,
-    ) -> Option<stow_types::api::RequestStatus> {
-        let ix = self.node_ix(task_id)?;
+        digests: &dyn DigestSource,
+    ) -> Result<Option<stow_types::api::RequestStatus>, QueueError> {
+        let Some(ix) = self.node_ix(task_id) else {
+            return Ok(None);
+        };
         let node = self.node(ix);
         let identity = self
             .identity_of(node)
@@ -3789,7 +3912,7 @@ impl Graph {
         let lane = Self::wire_lane(node);
         let human_pending = lane == stow_types::api::TaskLane::Human
             && status == stow_types::api::QueueTaskStatus::Pending;
-        Some(stow_types::api::RequestStatus {
+        Ok(Some(stow_types::api::RequestStatus {
             task_id: task_id.to_owned(),
             crate_name: identity.crate_name,
             version: identity.version,
@@ -3799,25 +3922,34 @@ impl Graph {
             lane,
             status,
             human_lane_position: human_pending.then(|| self.human_position(ix, now)),
-            blocked_by: self.blocked_by(ix),
+            blocked_by: self.blocked_by(ix, digests)?,
             preserve_lockfile: node.flags.preserve(),
-        })
+        }))
     }
 
     /// What the graph says about a request's root ids: the queue
     /// status of the ones it holds and which ones are published (a
     /// published node with no dependents is freed and holds no status).
-    pub fn probe_roots(&self, ids: &[String], now: i64) -> RootProbe {
-        RootProbe {
-            statuses: ids
-                .iter()
-                .filter_map(|id| {
-                    self.request_status(id, now)
-                        .map(|status| (id.clone(), status))
-                })
-                .collect(),
-            published: self.published_of(ids),
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` when `digests` lacks the row of a failed
+    /// dependency a blocked root names.
+    pub fn probe_roots_with(
+        &self,
+        ids: &[String],
+        now: i64,
+        digests: &dyn DigestSource,
+    ) -> Result<RootProbe, QueueError> {
+        let mut statuses = BTreeMap::new();
+        for id in ids {
+            if let Some(status) = self.request_status_with(id, now, digests)? {
+                statuses.insert(id.clone(), status);
+            }
         }
+        Ok(RootProbe {
+            statuses,
+            published: self.published_of(ids),
+        })
     }
 
     /// The nodes a selector names. Explicit ids select those nodes;
@@ -3893,7 +4025,7 @@ impl Graph {
                     && target.is_none_or(|t| t == Some(node.target))
                     && rustc.is_none_or(|r| r == Some(node.rustc))
                     && crate_name.is_none_or(|c| c == Some(node.crate_name))
-                    && cutoff.is_none_or(|cutoff| self.state(ix).updated <= cutoff)
+                    && cutoff.is_none_or(|cutoff| self.state(ix).updated_ms() <= cutoff)
             })
             .collect())
     }
@@ -3904,11 +4036,12 @@ impl Graph {
     /// # Errors
     /// `QueueError::EmptySelector`, or `QueueError::PurgeRequiresAge`
     /// for an id-less purge without `older_than`.
-    pub fn select_ids(
+    pub fn select_ids_with(
         &self,
         op: stow_types::api::MutationKind,
         selector: &stow_types::api::QueueSelector,
         now: i64,
+        digests: &dyn DigestSource,
     ) -> Result<Vec<String>, QueueError> {
         if op == stow_types::api::MutationKind::Purge
             && selector.task_ids.is_empty()
@@ -3916,11 +4049,23 @@ impl Graph {
         {
             return Err(QueueError::PurgeRequiresAge);
         }
-        Ok(self
-            .select(selector, now)?
+        if !selector.task_ids.is_empty() {
+            // The caller named the ids: the ones that resolve to a node
+            // holding queue state pass through, no digest read.
+            return Ok(selector
+                .task_ids
+                .iter()
+                .filter(|id| {
+                    self.node_ix(id)
+                        .is_some_and(|ix| self.node(ix).status.has_state())
+                })
+                .cloned()
+                .collect());
+        }
+        self.select(selector, now)?
             .into_iter()
-            .map(|ix| self.task_id_of(ix))
-            .collect())
+            .map(|ix| self.mint(ix, digests))
+            .collect()
     }
 
     /// Queue rows matching a selector, newest first — by last
@@ -3929,11 +4074,18 @@ impl Graph {
     ///
     /// # Errors
     /// `QueueError::Invariant` when a node's identity cannot decode.
-    pub fn list(
+    pub fn list_with(
         &self,
         selector: &stow_types::api::QueueSelector,
         now: i64,
+        digests: &dyn DigestSource,
     ) -> Result<Vec<stow_types::api::QueueTask>, QueueError> {
+        // The ids a selector names need no digest read to be reported.
+        let named: HashMap<u32, &str> = selector
+            .task_ids
+            .iter()
+            .filter_map(|id| self.node_ix(id).map(|ix| (ix, id.as_str())))
+            .collect();
         let mut ixs = match self.select(selector, now) {
             Ok(ixs) => ixs,
             Err(QueueError::EmptySelector) => (0..u32::try_from(self.nodes.len())
@@ -3953,7 +4105,7 @@ impl Graph {
             let state = self.state(ix);
             std::cmp::Reverse((
                 if terminal {
-                    state.updated
+                    state.updated_ms()
                 } else {
                     state.first_requested
                 },
@@ -3977,7 +4129,10 @@ impl Graph {
                 let identity = self.identity_of(node)?;
                 let run_id = self.run_id_of(ix);
                 Ok(stow_types::api::QueueTask {
-                    task_id: self.task_id_of(ix),
+                    task_id: match named.get(&ix) {
+                        Some(id) => (*id).to_owned(),
+                        None => self.mint(ix, digests)?,
+                    },
                     crate_name: identity.crate_name,
                     version: identity.version,
                     features_json: identity.features_json,
@@ -3985,16 +4140,16 @@ impl Graph {
                     rustc_version: identity.rustc_version,
                     lane: Self::wire_lane(node),
                     status: Self::wire_status(node),
-                    attempt: u32::from(state.attempt),
+                    attempt: u32::from(self.attempt_of(ix)),
                     error: self.error_of(ix).unwrap_or_default().to_owned(),
                     downloads: state.downloads,
-                    dispatch_attempts: u32::from(state.dispatch_attempts),
+                    dispatch_attempts: u32::from(self.dispatch_attempts_of(ix)),
                     preserve_lockfile: node.flags.preserve(),
                     github_run_id: (run_id != 0).then(|| run_id.to_string()),
                     first_requested_at: format_utc(state.first_requested),
                     created_at: format_utc(state.first_requested),
-                    updated_at: format_utc(state.updated),
-                    blocked_by: self.blocked_by(ix),
+                    updated_at: format_utc(state.updated_ms()),
+                    blocked_by: self.blocked_by(ix, digests)?,
                     host_side: node.flags.host(),
                     value: self.operand_of(ix).to_string(),
                     demand: self.demand_of(ix),
@@ -4008,7 +4163,11 @@ impl Graph {
     /// # Errors
     /// `QueueError::Invariant` when an in-flight node's identity cannot
     /// decode.
-    pub fn admin_status(&self, now: i64) -> Result<stow_types::api::AdminStatus, QueueError> {
+    pub fn admin_status_with(
+        &self,
+        now: i64,
+        digests: &dyn DigestSource,
+    ) -> Result<stow_types::api::AdminStatus, QueueError> {
         let status = self.status();
         let oldest_pending = self
             .pending_ages
@@ -4020,18 +4179,17 @@ impl Graph {
             .into_iter()
             .map(|ix| {
                 let node = self.node(ix);
-                let state = self.state(ix);
                 let identity = self.identity_of(node)?;
                 let run_id = self.run_id_of(ix);
                 Ok(stow_types::api::AdminInFlight {
-                    task_id: self.task_id_of(ix),
+                    task_id: self.mint(ix, digests)?,
                     crate_name: identity.crate_name,
                     version: identity.version,
                     target: identity.target,
                     rustc_version: identity.rustc_version,
                     status: Self::wire_status(node),
-                    attempt: u32::from(state.attempt),
-                    dispatch_attempts: u32::from(state.dispatch_attempts),
+                    attempt: u32::from(self.attempt_of(ix)),
+                    dispatch_attempts: u32::from(self.dispatch_attempts_of(ix)),
                     claimed_at: format_utc(self.claimed_at_of(ix)),
                     github_run_id: (run_id != 0).then(|| run_id.to_string()),
                 })
@@ -4114,6 +4272,20 @@ impl Graph {
                 self.edges.len()
             )));
         }
+        // The slots no node holds are the vacant ones.
+        let mut held = fixedbitset::FixedBitSet::with_capacity(self.states.len());
+        for node in &self.nodes {
+            if node.state != NO_STATE && held.put(node.state as usize) {
+                return Err(QueueError::Invariant(format!(
+                    "snapshot gives state slot {} to two nodes",
+                    node.state
+                )));
+            }
+        }
+        self.free_states = held
+            .zeroes()
+            .map(|slot| std::cmp::Reverse(u32::try_from(slot).expect("state slots fit u32")))
+            .collect();
         for ix in 0..self.nodes.len() {
             let ix = u32::try_from(ix).expect("node indexes fit u32");
             let range = self.edge_range(ix);
@@ -4381,6 +4553,119 @@ impl crate::freeze::FreezeStore for GraphFreezeStore<'_> {
     }
 }
 
+/// The digests unit tests recorded as they merged.
+#[cfg(test)]
+struct Shadow<'a>(&'a HashMap<u32, Digest>);
+
+#[cfg(test)]
+impl DigestSource for Shadow<'_> {
+    fn digest(&self, slot: u32) -> Result<Digest, QueueError> {
+        self.0.get(&slot).copied().ok_or_else(|| {
+            QueueError::Invariant(format!("the test merged no digest for state slot {slot}"))
+        })
+    }
+}
+
+/// Test-only views that mint from the digests the merges recorded in
+/// the graph itself, for tests that drive a graph with no store.
+#[cfg(test)]
+impl Graph {
+    pub(crate) fn test_digest_source(&self) -> impl DigestSource + '_ {
+        Shadow(&self.test_digests)
+    }
+
+    /// Carry another graph's recorded digests over — a graph restored
+    /// from a snapshot holds the same slots.
+    pub(crate) fn adopt_test_digests(&mut self, other: &Self) {
+        self.test_digests.clone_from(&other.test_digests);
+    }
+
+    /// The state slot of every node that holds one, by the node's key.
+    pub(crate) fn slots_by_key(&self) -> std::collections::BTreeMap<IdKey, u32> {
+        self.nodes
+            .iter()
+            .filter(|node| node.state != NO_STATE)
+            .map(|node| (node.key, node.state))
+            .collect()
+    }
+
+    /// Mint the task id of every node holding a state slot from
+    /// `digests` and check it hashes to the node's own key — the
+    /// proof a stored row describes the slot's current occupant.
+    /// Returns how many nodes it checked.
+    pub(crate) fn verify_digest_rows(
+        &self,
+        digests: &dyn DigestSource,
+    ) -> Result<usize, QueueError> {
+        let mut checked = 0;
+        for (ix, node) in (0u32..).zip(&self.nodes) {
+            if node.state == NO_STATE {
+                continue;
+            }
+            let id = self.mint(ix, digests)?;
+            if IdKeys::of(&id).key != node.key {
+                return Err(QueueError::Invariant(format!(
+                    "the digest row of state slot {} mints {id}, not node {ix}",
+                    node.state
+                )));
+            }
+            checked += 1;
+        }
+        Ok(checked)
+    }
+
+    pub(crate) fn task_id_of(&self, ix: u32) -> String {
+        self.mint(ix, &self.test_digest_source())
+            .expect("a test node's digest was merged")
+    }
+
+    pub(crate) fn claim(
+        &mut self,
+        settings: &queue::SchedulerSettings,
+        now: i64,
+        bound: u32,
+    ) -> Result<Vec<Claimed>, QueueError> {
+        let nodes = self.claim_nodes(settings, now, bound)?;
+        self.claimed(&nodes, &self.test_digest_source())
+    }
+
+    pub(crate) fn list(
+        &self,
+        selector: &stow_types::api::QueueSelector,
+        now: i64,
+    ) -> Result<Vec<stow_types::api::QueueTask>, QueueError> {
+        self.list_with(selector, now, &self.test_digest_source())
+    }
+
+    pub(crate) fn admin_status(
+        &self,
+        now: i64,
+    ) -> Result<stow_types::api::AdminStatus, QueueError> {
+        self.admin_status_with(now, &self.test_digest_source())
+    }
+
+    pub(crate) fn select_ids(
+        &self,
+        op: stow_types::api::MutationKind,
+        selector: &stow_types::api::QueueSelector,
+        now: i64,
+    ) -> Result<Vec<String>, QueueError> {
+        self.select_ids_with(op, selector, now, &self.test_digest_source())
+    }
+
+    pub(crate) fn probe_roots(&self, ids: &[String], now: i64) -> RootProbe {
+        self.probe_roots_with(ids, now, &self.test_digest_source())
+            .expect("a test node's digest was merged")
+    }
+
+    pub(crate) fn demand_contributions(
+        &self,
+        deltas: &BTreeMap<[String; 5], i64>,
+    ) -> Result<Vec<(String, i64)>, QueueError> {
+        self.demand_contributions_with(deltas, &self.test_digest_source())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4539,14 +4824,14 @@ mod tests {
                     .expect("merge");
                 let ix = graph.node_ix(&id(&name)).expect("node");
                 graph.set_status(ix, status);
-                graph.state_mut(ix).updated = (number * 23 % 17) * 1000;
+                graph.state_mut(ix).touch((number * 23 % 17) * 1000);
             }
             let mut expected: Vec<_> = (0..257).collect();
             expected.sort_by_key(|&ix| {
                 let state = graph.state(ix);
                 std::cmp::Reverse((
                     if status == Status::Failed {
-                        state.updated
+                        state.updated_ms()
                     } else {
                         state.first_requested
                     },
@@ -4649,7 +4934,7 @@ mod tests {
             .expect("merge release");
         for node in [&dev, &release] {
             let ix = graph.node_ix(&node.task_id).expect("node by id");
-            let payload = graph.task_payload(ix).expect("payload");
+            let payload = graph.task_payload(ix, &node.task_id).expect("payload");
             assert_eq!(payload.profile, node.profile);
             assert_eq!(payload.task_id, node.task_id);
         }
@@ -5011,7 +5296,7 @@ mod tests {
                         node.status.has_state()
                             && Graph::wire_status(node) == status
                             && older_than_secs.is_none_or(|secs| {
-                                graph.state(ix).updated
+                                graph.state(ix).updated_ms()
                                     <= 1_000_000
                                         - i64::try_from(secs).expect("test age fits") * 1000
                             })
@@ -5090,7 +5375,9 @@ mod tests {
                 sub += 1;
             }
         }
-        loader.finish().expect("load")
+        let mut restored = loader.finish().expect("load");
+        restored.adopt_test_digests(graph);
+        restored
     }
 
     #[test]
@@ -5152,8 +5439,8 @@ mod tests {
 
     #[test]
     fn records_keep_their_sizes() {
-        assert_eq!(size_of::<Node>(), 68);
-        assert_eq!(size_of::<State>(), 32);
+        assert_eq!(size_of::<Node>(), 48);
+        assert_eq!(size_of::<State>(), 24);
     }
 
     #[test]
@@ -5346,7 +5633,7 @@ mod tests {
         graph.compact();
         let new_ix = graph.node_ix(&claim.task_id).expect("compacted index");
         assert_ne!(old_ix, new_ix, "the task moved in the arena");
-        graph.state_mut(new_ix).attempt += 1;
+        graph.edit_extra(new_ix, |extra| extra.attempt += 1);
         let after = graph.claimed_payload(claim).expect("after compaction");
         assert_eq!(after.attempt, claim.attempt);
         assert_eq!(
@@ -5443,7 +5730,10 @@ mod tests {
             .merge(&single("replacement", SubmissionSource::CacheMiss), 1)
             .unwrap();
         let next = restored.node_ix(&id("replacement")).unwrap();
-        assert_eq!(restored.node(next).state, slot);
+        // The lowest vacant slot is reused first: "retired" left slot 0
+        // before the snapshot, "retained" slot 1 just now.
+        assert_eq!(restored.node(next).state, 0);
+        assert!(restored.states.len() > slot as usize);
         assert_eq!(restored.demand_of(next), 0);
         assert_eq!(restored.generation_of(next), 0);
         assert_eq!(restored.error_of(next), None);
@@ -6050,6 +6340,9 @@ mod tests {
         let claimed = graph
             .claim_scanned(&claim_settings(45, 0), 10_000, u32::MAX, &mut scans)
             .expect("claim");
+        let claimed = graph
+            .claimed(&claimed, &graph.test_digest_source())
+            .expect("mint");
         assert_eq!(claimed.len(), 45);
         assert!(
             claimed
@@ -6090,6 +6383,9 @@ mod tests {
         let claimed = graph
             .claim_scanned(&claim_settings(5, 2), 60_000, u32::MAX, &mut scans)
             .expect("claim");
+        let claimed = graph
+            .claimed(&claimed, &graph.test_digest_source())
+            .expect("mint");
         let darwin = |claim: &Claimed| macos_ids.contains(&claim.task_id);
         assert_eq!(claimed.iter().filter(|claim| darwin(claim)).count(), 2);
         assert_eq!(claimed.len(), 5, "the Linux nodes fill the rest");
@@ -6581,7 +6877,7 @@ mod tests {
         graph.apply(&refused, 1);
         let mut graph = round_trip(&graph);
         let ix = graph.node_ix(&first.task_id).expect("node");
-        assert_eq!(graph.state(ix).dispatch_attempts, 0);
+        assert_eq!(graph.dispatch_attempts_of(ix), 0);
         assert_eq!(status_of(&graph, "solo"), Some(Status::Pending));
         let second = graph
             .claim(&settings, 2, 1)
@@ -6591,7 +6887,7 @@ mod tests {
         assert_ne!(first.generation, second.generation);
         graph.apply(&refused, 3);
         assert_eq!(status_of(&graph, "solo"), Some(Status::Dispatched));
-        assert_eq!(graph.state(ix).dispatch_attempts, 1);
+        assert_eq!(graph.dispatch_attempts_of(ix), 1);
         graph.bind(&second.task_id, second.generation, 42, 4);
         graph.apply(
             &SchedulerEvent::ClaimsRefused {
@@ -6604,7 +6900,7 @@ mod tests {
             5,
         );
         assert_eq!(graph.run_id_of(ix), 42);
-        assert_eq!(graph.state(ix).dispatch_attempts, 1);
+        assert_eq!(graph.dispatch_attempts_of(ix), 1);
     }
 
     #[test]
@@ -6751,7 +7047,7 @@ mod tests {
         assert_eq!(outcome, FinishOutcome::Applied);
         let ix = graph.node_ix(&id("solo")).expect("node");
         assert_eq!(graph.node(ix).status, Status::Pending);
-        assert_eq!(graph.state(ix).attempt, 1);
+        assert_eq!(graph.attempt_of(ix), 1);
     }
 
     #[test]

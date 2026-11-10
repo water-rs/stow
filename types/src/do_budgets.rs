@@ -167,16 +167,22 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 150,
     },
     DriveBudget {
+        // stow#1378: the listed rows' task ids are minted from their
+        // digest rows, one billed read per distinct 256-slot block the
+        // rows fall in (host-measured 24 on the 10k gate fixture; each
+        // blocked row also names its failed dependency).
         name: "GET /tasks?status=blocked",
         statements: 2,
-        rows_read: 4,
+        rows_read: 32,
         rows_written: 4,
         wall_ms: 200,
     },
     DriveBudget {
+        // stow#1378: one billed read per distinct digest block among
+        // the listed rows (host-measured 19 on the 10k gate fixture).
         name: "GET /tasks?target=…",
         statements: 2,
-        rows_read: 4,
+        rows_read: 24,
         rows_written: 4,
         wall_ms: 150,
     },
@@ -446,8 +452,10 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 150,
     },
     DriveBudget {
+        // stow#1378: the claim reads the digest rows of its claimed
+        // slots (+1 statement, +1 billed read per block).
         name: "alarm pass (stale recovery)",
-        statements: 2,
+        statements: 4,
         rows_read: 4,
         rows_written: 4,
         wall_ms: 300,
@@ -569,10 +577,13 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 60,
     },
     DriveBudget {
+        // stow#1378: the merge writes its fresh slots' digest rows in the
+        // same turn — one read per partly covered block and one write
+        // per block touched, in 8-row statements.
         name: "POST /tasks/submit (1k-node merge)",
-        statements: 4,
-        rows_read: 6,
-        rows_written: 6,
+        statements: 6,
+        rows_read: 8,
+        rows_written: 10,
         wall_ms: 5000,
     },
     DriveBudget {

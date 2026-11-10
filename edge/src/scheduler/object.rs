@@ -954,8 +954,8 @@ async fn admin_status(
     db: DurableDb,
 ) -> Result<Json<stow_types::api::AdminStatus>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
-    let status = graph
-        .with(|graph| graph.admin_status(now_ms()))
+    let status = routes::admin_status(graph, &db, now_ms())
+        .await
         .map_err(to_error)?;
     Ok(Json(status))
 }
@@ -970,8 +970,8 @@ async fn list_tasks(
     skyzen::extract::Query(selector): skyzen::extract::Query<stow_types::api::QueueSelector>,
 ) -> Result<Json<Vec<stow_types::api::QueueTask>>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
-    let tasks = graph
-        .with(|graph| graph.list(&selector, now_ms()))
+    let tasks = routes::list_tasks(graph, &db, &selector, now_ms())
+        .await
         .map_err(to_error)?;
     Ok(Json(tasks))
 }
@@ -1138,8 +1138,8 @@ pub(super) async fn admit_request_pass(
         .map_err(route_error)?;
     let queue::RequestAdmissionStep::Dispatch { attempt } = step else {
         // A live record already serves this request — answer it.
-        return graph
-            .with(|graph| queue::crate_request_status(graph, &admission.request_id, now_ms()))
+        return routes::request_status(graph, db, &admission.request_id, now_ms())
+            .await
             .map_err(to_error)?
             .ok_or_else(|| {
                 Error::msg(format!(
@@ -1214,8 +1214,8 @@ pub(super) async fn admit_request_pass(
         .map_err(route_error)?;
         return Err(Error::msg(error.to_string()).set_status(StatusCode::BAD_GATEWAY));
     }
-    graph
-        .with(|graph| queue::crate_request_status(graph, &admission.request_id, now_ms()))
+    routes::request_status(graph, db, &admission.request_id, now_ms())
+        .await
         .map_err(to_error)?
         .ok_or_else(|| {
             Error::msg(format!(
@@ -1234,8 +1234,8 @@ async fn read_request(
 ) -> Result<Json<stow_types::api::CrateRequestStatus>> {
     let request_id = request_id_param(&params)?;
     let graph = ensure_graph(&env, &db, &graph).await?;
-    graph
-        .with(|graph| queue::crate_request_status(graph, request_id, now_ms()))
+    routes::request_status(graph, &db, request_id, now_ms())
+        .await
         .map_err(to_error)?
         .map(Json)
         .ok_or_else(|| {

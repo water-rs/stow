@@ -24,9 +24,13 @@ anyone integrating with or modifying the trust-critical paths.
   and the trusted admin routes; `dependency_resolver.rs` holds the
   edge's crates.io reads; `scheduler/` is the DO — queue, dispatch
   and request state in an in-memory graph. SQLite persists the append-only
-  event log, chunked snapshots and metering checkpoint
-  (`edge/src/scheduler/schema.sql`); accepted events are appended before
-  acknowledgment.
+  event log, chunked snapshots, metering checkpoint and the dependency
+  digest of every node that has queue state, in 256-slot rows keyed by
+  the node's state slot (`edge/src/scheduler/schema.sql`); a node in
+  memory holds only a 16-byte key of its task id, and the digest is
+  read back from its row when a task id is minted. Accepted events are
+  appended before acknowledgment, and a merge writes its fresh digests
+  in the same turn.
   The crate is split by target: pure catalog/scheduler logic compiles
   and unit-tests on the host, Cloudflare-bound modules are
   `wasm32`-gated, and crates.io access goes through the

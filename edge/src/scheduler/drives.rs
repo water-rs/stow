@@ -424,9 +424,9 @@ async fn schedule(
         .map_err(text)
 }
 
-fn list(ctx: &DriveContext, selector: &QueueSelector) -> Result<(), String> {
-    ctx.loaded()
-        .with(|graph| graph.list(selector, now_ms()))
+async fn list(ctx: &DriveContext, db: &DurableDb, selector: &QueueSelector) -> Result<(), String> {
+    routes::list_tasks(ctx.loaded(), db, selector, now_ms())
+        .await
         .map(|_| ())
         .map_err(text)
 }
@@ -1383,13 +1383,16 @@ pub const DRIVES: &[Drive] = &[
         // the in-flight section by the dispatch cap — neither tracks the
         // stored node bulk. `ready` sums the lengths of the ready
         // queues, one per rank-operand class: memory only, no statement,
-        // so the budget row is unchanged (stow#1096).
+        // so the budget row is unchanged (stow#1096). The in-flight
+        // rows' task ids are minted from their digest rows (stow#1378):
+        // one statement, one billed read per distinct 256-slot block the
+        // in-flight slots fall in — at most the dispatch cap.
         name: "GET /admin/status",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
-                ctx.loaded()
-                    .with(|graph| graph.admin_status(now_ms()))
+                routes::admin_status(ctx.loaded(), db, now_ms())
+                    .await
                     .map(|_| ())
                     .map_err(text)
             })
@@ -1399,23 +1402,25 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         name: "GET /tasks",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
-            Box::pin(async move { list(ctx, &QueueSelector::default()) })
+        run: |db, _shape, _settings, ctx| {
+            Box::pin(async move { list(ctx, db, &QueueSelector::default()).await })
         },
         cleanup: None,
     },
     Drive {
         name: "GET /tasks?status=failed",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 list(
                     ctx,
+                    db,
                     &QueueSelector {
                         status: Some(QueueTaskStatus::Failed),
                         ..QueueSelector::default()
                     },
                 )
+                .await
             })
         },
         cleanup: None,
@@ -1423,15 +1428,17 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         name: "GET /tasks?status=pending",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 list(
                     ctx,
+                    db,
                     &QueueSelector {
                         status: Some(QueueTaskStatus::Pending),
                         ..QueueSelector::default()
                     },
                 )
+                .await
             })
         },
         cleanup: None,
@@ -1439,15 +1446,17 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         name: "GET /tasks?status=blocked",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 list(
                     ctx,
+                    db,
                     &QueueSelector {
                         status: Some(QueueTaskStatus::Blocked),
                         ..QueueSelector::default()
                     },
                 )
+                .await
             })
         },
         cleanup: None,
@@ -1455,10 +1464,11 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         name: "GET /tasks?target=…",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 list(
                     ctx,
+                    db,
                     &QueueSelector {
                         target: Some(
                             CI_TARGET_TRIPLES[0]
@@ -1468,6 +1478,7 @@ pub const DRIVES: &[Drive] = &[
                         ..QueueSelector::default()
                     },
                 )
+                .await
             })
         },
         cleanup: None,
@@ -1477,10 +1488,11 @@ pub const DRIVES: &[Drive] = &[
         // at `fixture::CRATE_NAME_ROWS` nodes across sizes.
         name: "GET /tasks?crate=…",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 list(
                     ctx,
+                    db,
                     &QueueSelector {
                         crate_name: Some(
                             "crate123"
@@ -1490,6 +1502,7 @@ pub const DRIVES: &[Drive] = &[
                         ..QueueSelector::default()
                     },
                 )
+                .await
             })
         },
         cleanup: None,
@@ -1499,15 +1512,17 @@ pub const DRIVES: &[Drive] = &[
         // `FixtureShape::LAST_24H_ROWS`.
         name: "GET /tasks?older_than=86400",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 list(
                     ctx,
+                    db,
                     &QueueSelector {
                         older_than_secs: Some(86_400),
                         ..QueueSelector::default()
                     },
                 )
+                .await
             })
         },
         cleanup: None,
@@ -1518,25 +1533,24 @@ pub const DRIVES: &[Drive] = &[
         // listing must return their exact decimal text.
         name: "GET /tasks?task_ids=…",
         setup: None,
-        run: |_db, shape, _settings, ctx| {
+        run: |db, shape, _settings, ctx| {
             Box::pin(async move {
-                let tasks = ctx
-                    .loaded()
-                    .with(|graph| {
-                        graph.list(
-                            &QueueSelector {
-                                task_ids: vec![
-                                    id_of(FixtureShape::pending_row(600)),
-                                    id_of(shape.failed_row(0)),
-                                    id_of(1993),
-                                    id_of(1994),
-                                ],
-                                ..QueueSelector::default()
-                            },
-                            now_ms(),
-                        )
-                    })
-                    .map_err(text)?;
+                let tasks = routes::list_tasks(
+                    ctx.loaded(),
+                    db,
+                    &QueueSelector {
+                        task_ids: vec![
+                            id_of(FixtureShape::pending_row(600)),
+                            id_of(shape.failed_row(0)),
+                            id_of(1993),
+                            id_of(1994),
+                        ],
+                        ..QueueSelector::default()
+                    },
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?;
                 let value_of = |n: u32| {
                     tasks
                         .iter()
@@ -1674,19 +1688,18 @@ pub const DRIVES: &[Drive] = &[
         // live status re-probe against the graph.
         name: "GET /requests/{id}",
         setup: None,
-        run: |_db, _shape, _settings, ctx| {
+        run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
-                ctx.loaded()
-                    .with(|graph| {
-                        queue::crate_request_status(
-                            graph,
-                            stow_types::fixture::REQUEST_FIXTURE_ENQUEUED,
-                            now_ms(),
-                        )
-                    })
-                    .map_err(text)?
-                    .map(|_| ())
-                    .ok_or_else(|| "the fixture request record is missing".to_owned())
+                routes::request_status(
+                    ctx.loaded(),
+                    db,
+                    stow_types::fixture::REQUEST_FIXTURE_ENQUEUED,
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?
+                .map(|_| ())
+                .ok_or_else(|| "the fixture request record is missing".to_owned())
             })
         },
         cleanup: None,
@@ -1727,7 +1740,9 @@ pub const DRIVES: &[Drive] = &[
         // A `Resolved` report on the live record: the trusted merge of
         // its tree, the pre/post status probes and the `enqueued`
         // event — the same merge machinery the submit drives price, at
-        // the request batch's size.
+        // the request batch's size. Its digest rows (stow#1378) are the
+        // submit drives' cost, plus one block read for the post-merge
+        // probe's minted ids.
         name: "POST /requests/{id}/outcome",
         setup: None,
         run: |db, shape, settings, ctx| {
@@ -1969,6 +1984,14 @@ pub const DRIVES: &[Drive] = &[
     // One drive per submission entry point (stow#879): the source's
     // priority is what the node's `priority × waited` rank reads, so
     // each lane that sets it is measured through the same submit core.
+    // Every submit writes the digest rows of its fresh nodes' state
+    // slots in the turn that appends its `Submit` parts (stow#1378):
+    // one read per partly covered 256-slot block (a statement per 64
+    // blocks) and one write per block touched (a statement per 8). F
+    // fresh nodes touch at most F blocks (reused slots may be scattered)
+    // and as few as ceil(F / 256), so the cost is at most F reads and F
+    // writes beyond the log rows; a block every slot of which is fresh
+    // is written without a read.
     Drive {
         name: "POST /tasks/submit (operations)",
         setup: None,
@@ -2130,6 +2153,9 @@ pub const DRIVES: &[Drive] = &[
         }),
     },
     Drive {
+        // The batch's contributions mint their task ids from digest
+        // rows (stow#1378): one statement, one billed read per distinct
+        // block the contributing slots fall in.
         name: "POST /demand",
         setup: Some(|_db, _shape, _settings, ctx| {
             Box::pin(async move {
@@ -2483,7 +2509,10 @@ pub const DRIVES: &[Drive] = &[
         // dispatcher — the HTTP wall the launch gate's peak-wall bound
         // exists to measure — then the wake re-plan. External-run
         // occupancy (stow#877) reconciles at most once per ten minutes
-        // and only while the graph holds work.
+        // and only while the graph holds work. A pass that claims reads
+        // the claimed slots' digest rows (stow#1378): one statement and
+        // one billed read per distinct 256-slot block among them, ahead
+        // of the `Claims` append; a pass that claims nothing reads none.
         name: "alarm pass",
         setup: None,
         run: |db, _shape, settings, ctx| {
@@ -3467,7 +3496,9 @@ pub const DRIVES: &[Drive] = &[
         // The submit lane at its merge: a 1,000-node tree — each node
         // gating on a published pool leaf — appended as its `Submit`
         // parts and merged into the graph. The cost is the log rows of
-        // the tree's bytes, one per ~1 MiB part, plus the merge's CPU.
+        // the tree's bytes, one per ~1 MiB part, plus the merge's CPU
+        // and the digest rows of its fresh slots (stow#1378): one write
+        // per block touched, one read per partly covered block.
         name: "POST /tasks/submit (1k-node merge)",
         setup: None,
         run: |db, shape, settings, ctx| {

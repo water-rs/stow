@@ -15,7 +15,8 @@ use stow_types::api::{
 };
 
 use super::graph::{
-    Claimed, FinishOutcome, Graph, GraphCell, LoadedGraph, StartOutcome, ValidatedSubmission,
+    Claimed, DigestSource, FinishOutcome, Graph, GraphCell, LoadedGraph, StartOutcome,
+    ValidatedSubmission, Wanted,
 };
 use super::queue::{self, AlarmPlan, SchedulerSettings};
 use super::store;
@@ -129,16 +130,40 @@ pub(super) async fn commit_trees(
         .filter_map(changing_submission)
         .flatten();
     append(graph, db, actor, events, now).await?;
-    graph.with(|graph| {
-        validated
-            .iter()
-            .try_fold((0u32, Vec::new()), |(inserted, mut unpublished), tree| {
+    let (inserted, unpublished, fresh) = graph.with(|graph| {
+        validated.iter().try_fold(
+            (0u32, Vec::new(), Vec::new()),
+            |(inserted, mut unpublished, mut fresh), tree| {
                 graph.merge_validated(tree, now).map(|report| {
                     unpublished.extend(report.unpublished);
-                    (inserted.saturating_add(report.inserted), unpublished)
+                    fresh.extend(report.digests);
+                    (inserted.saturating_add(report.inserted), unpublished, fresh)
                 })
-            })
-    })
+            },
+        )
+    })?;
+    // The digest rows of the fresh slots land in the turn that appended
+    // the log rows, so they always describe the slab the log ends at.
+    store::write_digests(db, &fresh).await?;
+    Ok((inserted, unpublished))
+}
+
+/// Run `read` over the graph twice: once to learn which state slots it
+/// mints task ids from, then — after one batched read of exactly those
+/// digest rows — against the rows themselves. `read` must be a pure
+/// read of the graph: it runs twice and nothing may change between.
+///
+/// # Errors
+/// `QueueError::Sql`/`Invariant` from the digest read, otherwise `read`'s.
+pub(super) async fn with_digests<T>(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+    read: impl Fn(&Graph, &dyn DigestSource) -> Result<T, QueueError>,
+) -> Result<T, QueueError> {
+    let wanted = Wanted::default();
+    graph.with(|graph| read(graph, &wanted))?;
+    let digests = store::read_digests(db, &wanted.slots()).await?;
+    graph.with(|graph| read(graph, &digests))
 }
 
 /// `POST /tasks/submit[/trusted]`: the miss-lane pending-depth cap gates
@@ -209,7 +234,10 @@ pub(super) async fn mutate(
     actor: Option<&str>,
     now: i64,
 ) -> Result<u32, QueueError> {
-    let task_ids = graph.with(|graph| graph.select_ids(op, selector, now))?;
+    let task_ids = with_digests(graph, db, |graph, digests| {
+        graph.select_ids_with(op, selector, now, digests)
+    })
+    .await?;
     let events: Vec<_> = task_ids
         .chunks(MUTATE_PART_IDS)
         .map(|ids| SchedulerEvent::Mutate {
@@ -242,8 +270,10 @@ pub(super) async fn demand(
     actor: Option<&str>,
     now: i64,
 ) -> Result<(stow_types::api::SchedulerDemandReport, AlarmPlan), QueueError> {
-    let (report, event, plan) =
-        graph.with(|graph| queue::demand_pass(graph, request, now, settings))?;
+    let (report, event, plan) = with_digests(graph, db, |graph, digests| {
+        queue::demand_pass(graph, request, now, settings, digests)
+    })
+    .await?;
     if let Some(event) = event {
         commit_as(graph, db, actor, &[event], now).await?;
     }
@@ -553,10 +583,15 @@ pub(super) async fn claim_pass(
     bound: u32,
 ) -> Result<Vec<Claimed>, QueueError> {
     graph.with(|graph| graph.set_floor(settings.min_dispatch_value));
-    let claims = graph.with(|graph| graph.claim(settings, now, bound))?;
-    if claims.is_empty() {
-        return Ok(claims);
+    let nodes = graph.with(|graph| graph.claim_nodes(settings, now, bound))?;
+    if nodes.is_empty() {
+        return Ok(Vec::new());
     }
+    // The claimed nodes' task ids are minted from their digest rows,
+    // read in batched statements right after the claim.
+    let slots = graph.with(|graph| graph.claim_slots(&nodes));
+    let digests = store::read_digests(db, &slots).await?;
+    let claims = graph.with(|graph| graph.claimed(&nodes, &digests))?;
     let event = SchedulerEvent::Claims {
         claims: claims
             .iter()
@@ -629,7 +664,10 @@ pub(super) async fn request_outcome(
                 .collect();
             (
                 queued_before,
-                graph.with(|graph| graph.probe_roots(&ids, now)),
+                with_digests(graph, db, |graph, digests| {
+                    graph.probe_roots_with(&ids, now, digests)
+                })
+                .await?,
             )
         } else {
             Default::default()
@@ -788,10 +826,63 @@ pub(super) async fn feed_deliver(
     actor: &str,
     now_ms: i64,
 ) -> Result<(stow_types::api::DemandFeedDeliverReport, AlarmPlan), QueueError> {
-    let (report, events, plan) =
-        graph.with(|graph| super::feed::feed_deliver(graph, hour, now_ms, settings))?;
+    let (report, events, plan) = with_digests(graph, db, |graph, digests| {
+        super::feed::feed_deliver(graph, hour, now_ms, settings, digests)
+    })
+    .await?;
     commit_as(graph, db, Some(actor), &events, now_ms).await?;
     Ok((report, plan))
+}
+
+/// `GET /tasks`: the queue listing, the task ids of its unnamed rows
+/// minted from the digest rows of exactly the nodes listed.
+///
+/// # Errors
+/// `QueueError::Invariant` on a node whose digest row is missing,
+/// `QueueError::Sql` on a failed read.
+pub(super) async fn list_tasks(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+    selector: &QueueSelector,
+    now: i64,
+) -> Result<Vec<stow_types::api::QueueTask>, QueueError> {
+    with_digests(graph, db, |graph, digests| {
+        graph.list_with(selector, now, digests)
+    })
+    .await
+}
+
+/// `GET /admin/status`: the occupancy counts plus the in-flight rows,
+/// whose task ids come from their digest rows.
+///
+/// # Errors
+/// As [`list_tasks`].
+pub(super) async fn admin_status(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+    now: i64,
+) -> Result<stow_types::api::AdminStatus, QueueError> {
+    with_digests(graph, db, |graph, digests| {
+        graph.admin_status_with(now, digests)
+    })
+    .await
+}
+
+/// `GET /requests/{id}`: the record's live status, its stored roots
+/// re-probed against the queue.
+///
+/// # Errors
+/// As [`list_tasks`].
+pub(super) async fn request_status(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+    request_id: &str,
+    now: i64,
+) -> Result<Option<stow_types::api::CrateRequestStatus>, QueueError> {
+    with_digests(graph, db, |graph, digests| {
+        queue::crate_request_status(graph, request_id, now, digests)
+    })
+    .await
 }
 
 /// Forced-eviction invariants (stow#878): a Durable Object evicted at
@@ -847,6 +938,83 @@ mod eviction_tests {
         .await
         .expect("seed");
         (db, cell)
+    }
+
+    /// Mint every live state slot's task id from its stored row and
+    /// check it is the id of the node holding the slot; returns how many
+    /// slots it checked.
+    async fn verify_rows(db: &DurableDb, cell: LoadedGraph<'_>) -> usize {
+        let slots: Vec<u32> = cell.with(|graph| graph.slots_by_key().into_values().collect());
+        let digests = store::read_digests(db, &slots).await.expect("rows");
+        let checked = cell
+            .with(|graph| graph.verify_digest_rows(&digests))
+            .expect("every live slot's row mints its node's id");
+        assert_eq!(checked, slots.len());
+        checked
+    }
+
+    /// Slots free up as nodes publish and the next merge reuses the
+    /// lowest of them, an eviction replays the same allocation, and
+    /// through all of it every live slot's row mints its own node's id.
+    #[tokio::test]
+    async fn digest_rows_follow_their_slots_through_reuse_and_eviction() {
+        let (db, owner) = seeded().await;
+        let live = owner.loaded().expect("seeded");
+        let base = SHAPE.queue_rows;
+        let fresh = |lo: u32| {
+            let tree = fixture::fresh_tree(base + lo, base + lo + 299);
+            std::slice::from_ref(&tree).to_vec()
+        };
+        let publish = |lo: u32, hi: u32| {
+            move |cell: LoadedGraph<'_>| cell.with(|graph| fixture::slice_reports(graph, lo, hi))
+        };
+        assert!(verify_rows(&db, live).await > 0);
+        // Fresh nodes, a partly covered block among them.
+        commit_trees(live, &db, &fresh(1), None, HOST_NOW_MS)
+            .await
+            .expect("first wave");
+        verify_rows(&db, live).await;
+        // Publishing frees slots; the next wave reuses the lowest.
+        let events = publish(1, 40)(live);
+        commit(live, &db, &events, HOST_NOW_MS)
+            .await
+            .expect("publish");
+        let before = live.with(|graph| graph.slots_by_key().len());
+        commit_trees(live, &db, &fresh(301), None, HOST_NOW_MS)
+            .await
+            .expect("reusing wave");
+        let after = live.with(|graph| graph.slots_by_key().len());
+        assert_eq!(after, before + 300, "the wave added 300 live slots");
+        verify_rows(&db, live).await;
+        // Evict mid-stream: the woken graph holds the same slot for
+        // every node, and the rows describe it.
+        let woken_owner = wake(&db).await;
+        let woken = woken_owner.loaded().expect("woken");
+        assert_eq!(
+            live.with(|graph| graph.slots_by_key()),
+            woken.with(|graph| graph.slots_by_key()),
+            "replay allocates the slots the live graph did"
+        );
+        verify_rows(&db, woken).await;
+        // The woken graph carries on: more frees, more reuse.
+        let events = publish(41, 80)(woken);
+        commit(woken, &db, &events, HOST_NOW_MS)
+            .await
+            .expect("publish on the woken graph");
+        commit_trees(woken, &db, &fresh(601), None, HOST_NOW_MS)
+            .await
+            .expect("wave on the woken graph");
+        verify_rows(&db, woken).await;
+        let second = wake(&db).await;
+        assert_eq!(
+            woken.with(|graph| graph.slots_by_key()),
+            second
+                .loaded()
+                .expect("woken")
+                .with(|graph| graph.slots_by_key()),
+            "a second eviction agrees too"
+        );
+        verify_rows(&db, second.loaded().expect("woken")).await;
     }
 
     #[tokio::test]

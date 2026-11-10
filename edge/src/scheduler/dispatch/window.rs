@@ -252,30 +252,30 @@ mod tests {
                 Err(QueueError::CiRateLimited)
             ));
             routes::require_ci_ready(held, until).expect("control dispatch resumes at deadline");
-            let rows = held
-                .with(|graph| {
-                    graph.list(
-                        &stow_types::api::QueueSelector {
-                            task_ids: ids.clone(),
-                            ..Default::default()
-                        },
-                        HOST_NOW_MS,
-                    )
-                })
-                .expect("rows");
+            let rows = routes::list_tasks(
+                held,
+                &db,
+                &stow_types::api::QueueSelector {
+                    task_ids: ids.clone(),
+                    ..Default::default()
+                },
+                HOST_NOW_MS,
+            )
+            .await
+            .expect("rows");
             let bound = rows
                 .iter()
                 .filter(|row| row.github_run_id.is_some())
                 .count();
             assert_eq!(bound, 2, "successful in-flight responses remain bound");
             assert!(
-                held.with(|graph| graph.claim(&settings, until - 1, 12))
+                held.with(|graph| graph.claim_nodes(&settings, until - 1, 12))
                     .expect("blocked claim")
                     .is_empty()
             );
             assert!(
                 !held
-                    .with(|graph| graph.claim(&settings, until, 12))
+                    .with(|graph| graph.claim_nodes(&settings, until, 12))
                     .expect("resumed claim")
                     .is_empty()
             );
