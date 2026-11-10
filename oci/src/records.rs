@@ -236,8 +236,7 @@ pub async fn pull_records_by_tag(
 }
 
 /// Every `records-*` tag in the session's repository — the export's
-/// catalog listing. Pagination is the distribution spec's `n`/`last`
-/// continuation.
+/// catalog listing, selected from the repository's full tag listing.
 ///
 /// # Errors
 ///
@@ -245,6 +244,6 @@ pub async fn pull_records_by_tag(
 pub async fn list_records_tags(
     session: &RegistrySession,
 ) -> Result<Vec<String>, crate::client::RegistryError> {
-    let tags = session.list_tags_with_prefix("records-").await?;
+    let tags = session.list_tags().await?;
     Ok(tags.into_iter().filter(|tag| is_records_tag(tag)).collect())
 }

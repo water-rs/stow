@@ -772,47 +772,27 @@ impl RegistrySession {
     }
 
     /// `GET tags/list` — every tag the session's repository carries,
-    /// following the spec's `n`/`last` continuation while the registry
-    /// answers a `Link: …rel="next"` header. Admin's records export lists
-    /// the `records-*` tag space through this.
+    /// following the registry's own continuation: the last tag of a page is
+    /// the next page's `last` while the registry answers a
+    /// `Link: …rel="next"` header. The order of the listing is the
+    /// registry's own (GHCR does not list by name) and no cursor the
+    /// registry did not hand out is sent, so a caller that wants a tag
+    /// namespace selects it from this full listing.
     ///
     /// # Errors
     ///
     /// Returns [`RegistryError`] on a transport failure, a refusal, or an
     /// undecodable page body.
     pub async fn list_tags(&self) -> Result<Vec<String>, RegistryError> {
-        self.collect_tags(None).await
-    }
-
-    /// List tags after `prefix` that remain in its namespace. The bare
-    /// prefix is the exclusive OCI cursor, not a member of the namespace.
-    /// Pages stop at the first tag outside it; matching follows OCI's
-    /// case-insensitive lexical ordering.
-    ///
-    /// # Errors
-    /// Returns the same transport and decoding errors as [`Self::list_tags`].
-    pub async fn list_tags_with_prefix(&self, prefix: &str) -> Result<Vec<String>, RegistryError> {
-        self.collect_tags(Some(prefix)).await
-    }
-
-    async fn collect_tags(&self, prefix: Option<&str>) -> Result<Vec<String>, RegistryError> {
         const PAGE_SIZE: u32 = 1000;
         let mut tags = Vec::new();
-        let mut last = prefix.map(str::to_owned);
+        let mut last: Option<String> = None;
         loop {
             let Some((page, has_next)) = self.tags_page(PAGE_SIZE, last.as_deref()).await? else {
                 break;
             };
             last = page.last().cloned();
-            for tag in page {
-                if prefix.is_some_and(|prefix| {
-                    !tag.get(..prefix.len())
-                        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
-                }) {
-                    return Ok(tags);
-                }
-                tags.push(tag);
-            }
+            tags.extend(page);
             if !has_next || last.is_none() {
                 break;
             }
@@ -1594,57 +1574,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefixed_tags_follow_pages_and_stop_before_unrelated_tags() {
+    async fn list_tags_continues_from_the_last_tag_of_each_page_in_registry_order() {
         let (url, task) = scripted_registry(|url| {
             let mut answers = script(url, false, vec![]);
             answers.extend([
                 (
                     200,
                     "link: </v2/cache/tags/list?last=records-b>; rel=\"next\"\r\n".to_owned(),
-                    r#"{"tags":["records-a","records-b"]}"#,
+                    r#"{"tags":["signature-a","records-b"]}"#,
                 ),
                 (
                     200,
-                    "link: </v2/cache/tags/list?last=signature-a>; rel=\"next\"\r\n".to_owned(),
-                    r#"{"tags":["records-c","signature-a"]}"#,
+                    "link: </v2/cache/tags/list?last=index.x>; rel=\"next\"\r\n".to_owned(),
+                    r#"{"tags":["records-a","index.x"]}"#,
                 ),
+                (200, String::new(), r#"{"tags":["folded.x"]}"#),
             ]);
             answers
         })
         .await;
         let (session, _http) = session_on(&url).await;
         assert_eq!(
-            session
-                .list_tags_with_prefix("records-")
-                .await
-                .expect("range"),
-            ["records-a", "records-b", "records-c"]
+            session.list_tags().await.expect("list"),
+            [
+                "signature-a",
+                "records-b",
+                "records-a",
+                "index.x",
+                "folded.x"
+            ]
         );
         let lines = task.await.expect("server");
-        assert_eq!(lines.len(), 4, "two listing pages plus authentication");
-        assert!(lines[2].contains("last=records- "), "{lines:?}");
+        assert_eq!(lines.len(), 5, "three listing pages plus authentication");
+        assert!(!lines[2].contains("last="), "{lines:?}");
         assert!(lines[3].contains("last=records-b "), "{lines:?}");
-    }
-
-    #[tokio::test]
-    async fn prefixed_tags_handle_absence_empty_ranges_and_final_matching_pages() {
-        for (status, body, expected) in [
-            (404, NAME_UNKNOWN, vec![]),
-            (200, r#"{"tags":null}"#, vec![]),
-            (200, r#"{"tags":["signature-a"]}"#, vec![]),
-            (200, r#"{"tags":["records-a"]}"#, vec!["records-a"]),
-        ] {
-            let (url, task) =
-                scripted_registry(|url| script(url, false, vec![(status, body)])).await;
-            let (session, _http) = session_on(&url).await;
-            assert_eq!(
-                session
-                    .list_tags_with_prefix("records-")
-                    .await
-                    .expect("range"),
-                expected
-            );
-            task.await.expect("server");
-        }
+        assert!(lines[4].contains("last=index.x "), "{lines:?}");
     }
 }
