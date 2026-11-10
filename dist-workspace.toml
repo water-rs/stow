@@ -17,6 +17,10 @@ packages = ["stow-cli"]
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# dist 0.30.2 builds aarch64-apple-darwin on macos-14, an image GitHub
+# retired on 2026-11-02; macos-26 is the image the rest of CI builds
+# Apple targets on.
+github-custom-runners.aarch64-apple-darwin = "macos-26"
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Where to host releases
