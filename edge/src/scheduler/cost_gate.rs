@@ -30,18 +30,13 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use skyzen_services::durable::DurableDb;
-use stow_types::do_budgets::{DO_BUDGETS, DriveBudget, grew};
+use stow_types::do_budgets::{BULK_DRIVES, DO_BUDGETS, DriveBudget, grew};
 
 use super::drives::{self, DriveContext};
 use super::fixture::{self, FixtureShape};
 use super::graph::{GraphCell, LoadedGraph};
 use super::queue::SchedulerSettings;
 use super::test_db::{LoggedStatement, counting_memory_db};
-
-/// The two drives whose job is the graph's bulk: the wake reads the
-/// snapshot, the snapshot writes it. Every other drive is an event and
-/// costs the same at any size.
-const BULK_DRIVES: &[&str] = &["wake (snapshot + log replay)", "snapshot write"];
 
 /// The listings that mint a task id per row they return: each reads one
 /// digest row per listed row, so its cost follows the matching rows

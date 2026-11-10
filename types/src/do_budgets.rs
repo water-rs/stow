@@ -118,6 +118,14 @@ pub fn grew(earlier: f64, later: f64) -> bool {
     later > earlier.mul_add(1.0 + GROWTH_TOLERANCE_FRACTION, GROWTH_TOLERANCE_ROWS)
 }
 
+/// The two drives whose work is the graph's bulk.
+///
+/// The wake reads the snapshot and the snapshot write stores it, so
+/// their rows follow the stored state. No scale check compares them
+/// across fixture sizes; their row budgets bound them at every size a
+/// gate runs.
+pub const BULK_DRIVES: &[&str] = &["wake (snapshot + log replay)", "snapshot write"];
+
 /// The workerd budget table the host gate carries.
 ///
 /// Measured in the units Cloudflare bills, filled from the harness's
