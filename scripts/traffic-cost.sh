@@ -22,10 +22,11 @@
 #   3. the peak-concurrency drive: every lane at the launch model's peak
 #      rate for 30 minutes (`stow-admin traffic-cost peak`);
 #   4. the budget pass again on the loaded fixture;
-#   5. the verdict (`stow-admin traffic-cost verdict`): row budgets, rows
-#      that grow with the stored bulk (more than 10% + 50 rows from the
-#      small fixture to the large), and the peak serialized Durable
-#      Object wall.
+#   5. the verdict (`stow-admin traffic-cost verdict`): row budgets, an
+#      event drive's rows that grow with the stored bulk (more than
+#      10% + 50 rows from the small fixture to the large; the wake and
+#      the snapshot write read and store that bulk and are held by their
+#      budgets alone), and the peak serialized Durable Object wall.
 #
 # The test fails on any of: a restart past the memory bounds above, a
 # drive over its row budget, a drive that

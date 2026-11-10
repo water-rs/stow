@@ -277,7 +277,7 @@ oidc-token`.
 | `STOW_TRAFFIC_WORK_DIR` | fresh `mktemp -d` under `TMPDIR` | Work directory: keys, mock registry, edge state, `logs/` and `reports/`. |
 | `STOW_E2E_TOOLCHAIN` | `stable` | rustup toolchain the script builds with (`RUSTUP_TOOLCHAIN`). |
 | `STOW_E2E_READY_DEADLINE` | `600` | Seconds to wait for each service to listen. |
-| `STOW_TRAFFIC_SIZES` | `100000 480000` | The two fixture sizes, small then large, the budget pass measures; a drive whose rows grow by more than 10% + 50 between them fails. The CPU pass, the peak drive and the post-load pass run on the small one. |
+| `STOW_TRAFFIC_SIZES` | `100000 480000` | The two fixture sizes, small then large, the budget pass measures; an event drive whose rows grow by more than 10% + 50 between them fails (the wake and the snapshot write follow the stored bulk and are held by their row budgets). The CPU pass, the peak drive and the post-load pass run on the small one. |
 | `STOW_TRAFFIC_DURATION_SECS` | `1800` | Seconds of peak-rate drive. |
 | `STOW_TRAFFIC_SEGMENTS` | `4` | Segments the drive runs in; the edge restarts between them to bound `wrangler dev`'s per-request memory retention. |
 | `STOW_TRAFFIC_BUILD_CALLBACK_EPS` | unset | Optional absolute events per second for each build workflow delivery lane in the mock peak test; other lanes retain their model rates and global multiplier. |
