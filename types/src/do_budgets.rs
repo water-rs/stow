@@ -286,9 +286,15 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // (2 roots: 2 read, 1 statement). A digest write bills two rows
         // read and one written, a digest read two rows read: 4 + 2
         // statements, 6 + 2×2 + 2×2 reads, 6 + 2 writes.
+        //
+        // stow#1379: the merge reads the published mask of the nodes it
+        // gates on from the `published` table in one keyed statement; a
+        // keyed read through `JOIN json_each` bills two rows read per
+        // key found. The tree's one node with a row is the most it can
+        // find: 6 + 1 statements, 14 + 2×1 reads.
         name: "POST /requests/{id}/outcome",
-        statements: 6,
-        rows_read: 14,
+        statements: 7,
+        rows_read: 16,
         rows_written: 8,
         wall_ms: 600,
     },
@@ -311,9 +317,14 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // trees) upsert their digest rows in one statement; a digest
         // write bills two rows read and one written: 4 + 1 statements,
         // 6 + 2×3 reads, 6 + 3 writes.
+        //
+        // stow#1379: the batch reads the published masks of the nodes
+        // its trees gate on in one keyed statement, two rows read per
+        // key found. The trees gate on 31 published nodes, the most the
+        // read can find: 4 + 1 + 1 statements, 12 + 2×31 reads.
         name: "POST /enqueue (untrusted accept)",
-        statements: 5,
-        rows_read: 12,
+        statements: 6,
+        rows_read: 74,
         rows_written: 9,
         wall_ms: 600,
     },
@@ -321,8 +332,13 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // stow#1378: as the untrusted accept — 3 fresh nodes, one digest
         // upsert statement: 3 + 1 statements, 5 + 2×3 reads, 5 + 3
         // writes.
+        //
+        // stow#1379: one keyed statement reads the published masks the
+        // batch gates on; its trees gate on no published node, so the
+        // read finds no key and bills no row (two rows read per key
+        // found): 3 + 1 + 1 statements, reads unchanged.
         name: "POST /admin/enqueue (trusted)",
-        statements: 4,
+        statements: 5,
         rows_read: 11,
         rows_written: 8,
         wall_ms: 400,
@@ -345,16 +361,20 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // stow#1378: one fresh node, one digest upsert statement:
         // 3 + 1 statements, 5 + 2×1 reads (a digest write bills two
         // rows read), 5 + 1 writes.
+        //
+        // stow#1379: plus one keyed published read, which finds no key
+        // (two rows read per key found): 3 + 1 + 1 statements.
         name: "POST /tasks/submit (operations)",
-        statements: 4,
+        statements: 5,
         rows_read: 7,
         rows_written: 6,
         wall_ms: 400,
     },
     DriveBudget {
-        // stow#1378: as the operations lane — one fresh node.
+        // stow#1378: as the operations lane — one fresh node; stow#1379:
+        // and its one keyed published read that finds no key.
         name: "POST /tasks/submit (preheat)",
-        statements: 4,
+        statements: 5,
         rows_read: 7,
         rows_written: 6,
         wall_ms: 400,
@@ -381,9 +401,10 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 500,
     },
     DriveBudget {
-        // stow#1378: as the operations lane — one fresh node.
+        // stow#1378: as the operations lane — one fresh node; stow#1379:
+        // and its one keyed published read that finds no key.
         name: "POST /tasks/submit (inexact-hit)",
-        statements: 4,
+        statements: 5,
         rows_read: 7,
         rows_written: 6,
         wall_ms: 400,
@@ -405,9 +426,14 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // their digest rows in one statement, two rows read per digest
         // read; claims are bounded by the dispatch cap (45 at the
         // gate's settings): 4 + 1 statements, 6 + 2×45 reads.
+        //
+        // stow#1379: a full report reads the slice's members from the
+        // `published` table, one row read per member, paged 4,096 to a
+        // statement. The drive's slice holds 50 members: +1 statement,
+        // +50 reads.
         name: "POST /index/published (full)",
-        statements: 5,
-        rows_read: 96,
+        statements: 6,
+        rows_read: 146,
         rows_written: 6,
         wall_ms: 500,
     },
@@ -423,9 +449,15 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
     DriveBudget {
         // stow#1378: as the full report — claims bounded by the dispatch
         // cap: 4 + 1 statements, 6 + 2×45 reads.
+        //
+        // stow#1379: the delta reads the published masks of the nodes
+        // it changes in one keyed statement, two rows read per key
+        // found. It names 45 nodes of which 30 hold a row, and 45 is
+        // the most a report of this size can find: +1 statement, +2×45
+        // reads.
         name: "POST /index/published (delta)",
-        statements: 5,
-        rows_read: 96,
+        statements: 6,
+        rows_read: 186,
         rows_written: 6,
         wall_ms: 500,
     },
@@ -546,9 +578,12 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // stow#1378: claims bounded by the dispatch cap (45), one
         // statement, two rows read per digest read: 5 + 1 statements,
         // 7 + 2×45 reads.
+        // stow#1379: the report is the full drive's, so it reads its
+        // slice's members from the `published` table: +1 statement,
+        // +50 reads (one row read per member, 50 members).
         name: "POST /index/published (dispatching)",
-        statements: 6,
-        rows_read: 97,
+        statements: 7,
+        rows_read: 147,
         rows_written: 7,
         wall_ms: 500,
     },
@@ -561,9 +596,11 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // digest write bills two rows read and one written, a digest
         // read two rows read: 5 + 3 statements, 7 + 2×2 + 2×2 + 2×45
         // reads, 7 + 2 writes.
+        // stow#1379: plus the outcome's keyed published read, finding
+        // at most its one gated node: +1 statement, +2×1 reads.
         name: "POST /requests/{id}/outcome (dispatching)",
-        statements: 8,
-        rows_read: 105,
+        statements: 9,
+        rows_read: 107,
         rows_written: 9,
         wall_ms: 500,
     },
@@ -663,9 +700,15 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // written per fresh node. The tree has 1,000 fresh nodes
         // (`MERGE_NODES`), under the 4,096 a statement carries: 4 + 1
         // statements, 6 + 2×1,000 reads, 6 + 1,000 writes.
+        //
+        // stow#1379: one keyed statement reads the published masks of
+        // the 1,064 nodes the merge touches (under the 4,096 a statement
+        // carries). Only the tree's 64 pool leaves it gates on can hold
+        // a row, two rows read per key found: +1 statement, +2×64
+        // reads.
         name: "POST /tasks/submit (1k-node merge)",
-        statements: 5,
-        rows_read: 2006,
+        statements: 6,
+        rows_read: 2134,
         rows_written: 1006,
         wall_ms: 5000,
     },
@@ -691,9 +734,19 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // 108. Rows read: 1,536 snapshot + 128 tail + 1 watermark + 1
         // meter + 2 checkpoint (UPDATE .. RETURNING) = 1,668. Measured
         // on workerd: 98 statements, 1,517 rows read.
+        //
+        // stow#1379: the published masks are no longer snapshot rows, so
+        // the snapshot term above only shrinks and stays as the bound.
+        // The replay adds the published reads of the tail's events: at
+        // most one keyed statement per tail row (128), two rows read per
+        // key found, and one members page per full report. The fixture's
+        // tail holds the 1,000-node merge (64 pool leaves with a row) and
+        // a slice report of at most 384 nodes, so at most 64 + 384 = 448
+        // keys are found and at most 384 members are paged: 108 + 128 =
+        // 236 statements, 1,668 + 2×448 + 384 = 2,948 rows read.
         name: "wake (snapshot + log replay)",
-        statements: 108,
-        rows_read: 1668,
+        statements: 236,
+        rows_read: 2948,
         rows_written: 5,
         wall_ms: 5000,
     },
@@ -718,10 +771,19 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // the row size: the covered-seq read and the checkpoint,
         // under the pre-#1380 allowance. Measured on the host: 49
         // statements, 3 reads, 271 written (36 / 3 / 38 before).
+        //
+        // stow#1379: the published masks are no longer snapshot rows;
+        // the turn writes the overlay's changes to the `published`
+        // table instead, through `json_each` at 4,096 to a statement
+        // (one upsert, one delete for retired keys). An upsert bills two
+        // rows read and one written per row. The batch's slice report
+        // changes 45 nodes: +2 statements, +2×45 reads, +45 writes. The
+        // dirty-span bound above only shrinks and stays: 62 + 2 = 64
+        // statements, 481 + 90 = 571 reads, 434 + 45 = 479 writes.
         name: "snapshot write",
-        statements: 62,
-        rows_read: 481,
-        rows_written: 434,
+        statements: 64,
+        rows_read: 571,
+        rows_written: 479,
         wall_ms: 5000,
     },
 ];

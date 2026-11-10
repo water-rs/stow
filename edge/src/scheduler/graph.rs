@@ -12,6 +12,9 @@
 //! the dependency digest, which lives in storage by state slot
 //! (`digests.rs`) and never in memory. The queue state of a node that
 //! has not published rides a 24-byte slab entry, freed on publish; the
+//! published unit-shape masks live in storage by slice and key
+//! (`published.rs`), the graph holding only the changes since the last
+//! snapshot; the
 //! fields few nodes carry (a retry count among them) sit in a side
 //! table. Edges are flat `u32` arrays — forward spans per node
 //! plus a CSR reverse index — and the ready set holds node indexes
@@ -49,12 +52,14 @@ mod sparse;
 mod vacant;
 
 use arena::Arena;
-pub use digests::{Digest, DigestSource, Digests, FreshDigest, Wanted};
+pub use digests::{Digest, DigestSource, Digests, FreshDigest, Reads, Wanted};
 use edges::Edges;
 use index::{Interner, IxTable, Priorities, hash_of};
 pub use node::RunCompletion;
 use node::{Extra, FIRST_ATTEMPT, Flags, Lane, NO_STATE, Node, State, Status};
-use published::PublishedEntries;
+pub use published::{
+    Fetched, PublishedNeeds, PublishedRow, PublishedSource, ReadSource, slice_column,
+};
 use sparse::SparseDemand;
 use vacant::VacantSlots;
 
@@ -103,10 +108,10 @@ fn node_published_mask(host_side: bool, target: &str, explicit: ExplicitSpelling
 
 /// The 16-byte key a task id keys the published-shape map by: the
 /// leading bytes of the BLAKE3 hash of its canonical string.
-type IdKey = [u8; 16];
+pub type IdKey = [u8; 16];
 
 /// An index slice: its target and rustc ids.
-type SliceId = (u8, u8);
+pub type SliceId = (u8, u8);
 
 /// One part of a slice report, as a log row carries it.
 #[derive(Debug, Clone, Copy)]
@@ -171,15 +176,6 @@ struct StagedSlice {
     parts: u32,
     /// The rows of parts `0..rows.len()`, in order.
     rows: Vec<Vec<PublishedSliceRow>>,
-}
-
-/// One published task id's entry: the unit shapes it serves and the
-/// slice that reported them, so a full report can replace its slice's
-/// set.
-#[derive(Debug, Clone, Copy)]
-struct Published {
-    mask: u8,
-    slice: SliceId,
 }
 
 /// The identity of one canonical task id.
@@ -479,8 +475,14 @@ pub struct Graph {
     extras: HashMap<u32, Extra>,
     /// Forward edges and the reverse index.
     edges: Edges,
-    /// Published unit-shape mask per task id.
-    published: PublishedEntries,
+    /// The published unit-shape masks changed since the last snapshot;
+    /// the `published` table holds the rest as of the snapshot's
+    /// watermark. A read consults this before the table.
+    published: published::Overlay,
+    /// How many task ids hold a non-zero published mask. Carried in the
+    /// snapshot's head and adjusted at each transition to or from zero,
+    /// so the occupancy reports never read the table.
+    published_ids: u64,
     /// The generation of the index each reported slice last applied.
     slice_generations: BTreeMap<SliceId, i64>,
     /// The incomplete multi-part full reports, one per slice: staged
@@ -622,6 +624,10 @@ pub struct Graph {
     /// here, filled by every merge; production reads the rows.
     #[cfg(test)]
     test_digests: HashMap<u32, Digest>,
+    /// The `published` table of a unit test that drives a graph without
+    /// a store: the rows a snapshot would have written.
+    #[cfg(test)]
+    test_published: HashMap<IdKey, (SliceId, u8)>,
 }
 
 /// Freeze transitions the graph keeps for `GET /dispatch-freeze`.
@@ -1447,6 +1453,94 @@ const COMPACT_FLOOR: usize = 1_024;
 
 /// Merge, publish and the claim gate.
 impl Graph {
+    /// The published rows a merge of `validated` reads, added to
+    /// `needs`: the key of every tree node the graph does not hold yet
+    /// and the key of every dependency of such a node, less the keys the
+    /// changes since the last snapshot already answer. A caller reads
+    /// them from the table and hands the answer to
+    /// [`Self::merge_validated`] against the graph as it stands now.
+    pub(super) fn merge_needs(
+        &self,
+        validated: &ValidatedSubmission<'_>,
+        needs: &mut PublishedNeeds,
+    ) {
+        let ValidatedSubmission { tree, ids } = validated;
+        let slice_of = |sub: &SubmissionNode| {
+            self.slice_lookup(sub.target.as_str(), sub.rustc_version.as_str())
+        };
+        for (sub, keys) in tree.nodes.iter().zip(ids) {
+            if self.find_key(keys.key).is_some() {
+                continue;
+            }
+            self.want_published(needs, keys.key, || slice_of(sub));
+            for &dep in &sub.deps {
+                let dep_sub = &tree.nodes[dep as usize];
+                self.want_published(needs, ids[dep as usize].key, || slice_of(dep_sub));
+            }
+        }
+    }
+
+    /// Ask the table for `key` unless the changes since the last
+    /// snapshot answer it.
+    fn want_published(
+        &self,
+        needs: &mut PublishedNeeds,
+        key: IdKey,
+        slice: impl FnOnce() -> Option<SliceId>,
+    ) {
+        if self.published.get(&key).is_none() {
+            needs.want_key(key, slice());
+        }
+    }
+
+    /// The mask of `key`: the changes since the last snapshot first,
+    /// then the table's row as `base` read it.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` when neither holds it.
+    fn published_mask(
+        &self,
+        key: &IdKey,
+        base: &mut impl PublishedSource,
+        slice: impl FnOnce() -> Option<SliceId>,
+    ) -> Result<u8, QueueError> {
+        self.published
+            .get(key)
+            .map_or_else(|| base.mask(key, slice), Ok)
+    }
+
+    /// The slice the index files `target` and `rustc` under, when the
+    /// graph has held both; a slice it never held was never reported
+    /// and has no rows.
+    fn slice_lookup(&self, target: &str, rustc: &str) -> Option<SliceId> {
+        self.target_lookup(target).zip(self.rustc_lookup(rustc))
+    }
+
+    /// The slice a task id is filed under: its `<target>-<rustc>`
+    /// segments, which sit right before the `-d<digest>` segment.
+    fn slice_of_task_id(&self, task_id: &str) -> Option<SliceId> {
+        let digest_at = task_id.rmatch_indices("-d").find_map(|(at, _)| {
+            let digest = task_id[at + 2..].split('-').next().unwrap_or_default();
+            (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .then_some(at)
+        })?;
+        let mut segments = task_id[..digest_at].rsplit('-');
+        let rustc = segments.next()?;
+        let target = segments.next()?;
+        let target = self
+            .targets
+            .iter()
+            .position(|info| stow_types::api::task_id_segment(&info.name) == target)?;
+        let rustc = self
+            .rustcs
+            .iter()
+            .position(|name| stow_types::api::task_id_segment(name) == rustc)?;
+        Some((
+            u8::try_from(target).expect("target ids fit u8"),
+            u8::try_from(rustc).expect("rustc ids fit u8"),
+        ))
+    }
+
     /// Merge one submission tree by task id. `now` is unix ms.
     ///
     /// A node id commits to its subtree: an existing id's edge set is
@@ -1455,19 +1549,18 @@ impl Graph {
     /// answers against the published-shape masks at insert. A node
     /// whose own shapes are already published is born published: it
     /// stays only as long as a node of this tree depends on it.
+    /// `base` holds the rows [`Self::merge_needs`] named, read from the
+    /// table before anything mutated.
     ///
     /// # Errors
     /// `QueueError::Invariant` on a malformed tree (a root or dep index
     /// out of range, or a task id that does not re-derive from its
-    /// identity columns).
-    pub fn merge(&mut self, tree: &SubmissionTree, now: i64) -> Result<MergeReport, QueueError> {
-        self.merge_validated(&ValidatedSubmission::new(tree)?, now)
-    }
-
+    /// identity columns), and when `base` lacks a row the merge reads.
     pub(super) fn merge_validated(
         &mut self,
         validated: &ValidatedSubmission<'_>,
         now: i64,
+        base: &mut impl PublishedSource,
     ) -> Result<MergeReport, QueueError> {
         let ValidatedSubmission { tree, ids } = validated;
         let lane = Lane::from_source(tree.source);
@@ -1498,7 +1591,7 @@ impl Graph {
                 }
                 continue;
             }
-            let ix = self.insert_new(sub, *keys, lane, priority, now)?;
+            let ix = self.insert_new(sub, *keys, lane, priority, now, base)?;
             let slot = self.node(ix).state;
             if slot != NO_STATE {
                 report
@@ -1530,7 +1623,7 @@ impl Graph {
         // subtree is committed by its first submission.
         for (sub_at, sub) in tree.nodes.iter().enumerate() {
             if is_fresh[sub_at] {
-                self.merge_edges(tree, ids, &node_ixs, sub, node_ixs[sub_at])?;
+                self.merge_edges(tree, ids, &node_ixs, sub, node_ixs[sub_at], base)?;
             }
         }
         // A node born published that nothing in the tree depends on
@@ -1591,12 +1684,15 @@ impl Graph {
         lane: Lane,
         priority: i64,
         now: i64,
+        base: &mut impl PublishedSource,
     ) -> Result<u32, QueueError> {
         let explicit = sub.explicit_spelling == ExplicitSpelling::KeysApart;
+        let published = self.published_mask(&keys.key, base, || {
+            self.slice_lookup(sub.target.as_str(), sub.rustc_version.as_str())
+        })?;
         let target = self.target_id(sub.target.as_str())?;
         let own = self.targets[usize::from(target)].own_masks[usize::from(sub.host_side)]
             [usize::from(explicit)];
-        let published = self.published.get(&keys.key).map_or(0, |entry| entry.mask);
         let state = (published & own != own)
             .then(|| State::new(now, now, self.priorities.intern(priority), sub.downloads));
         self.insert_node(&NewNode {
@@ -1645,6 +1741,7 @@ impl Graph {
         node_ixs: &[u32],
         sub: &SubmissionNode,
         owner: u32,
+        base: &mut impl PublishedSource,
     ) -> Result<(), QueueError> {
         let owner_explicit = if sub.explicit_spelling == ExplicitSpelling::KeysApart {
             ExplicitSpelling::KeysApart
@@ -1667,10 +1764,9 @@ impl Graph {
                 dep_sub.explicit_spelling,
             );
             let required = required_shape_mask(dep_sub.host_side, invocations);
-            let published = self
-                .published
-                .get(&ids[dep_at as usize].key)
-                .map_or(0, |entry| entry.mask);
+            let published = self.published_mask(&ids[dep_at as usize].key, base, || {
+                self.slice_lookup(dep_sub.target.as_str(), dep_sub.rustc_version.as_str())
+            })?;
             let met = published & required == required;
             if !met {
                 unmet = unmet.checked_add(1).ok_or_else(|| {
@@ -1831,41 +1927,62 @@ impl Graph {
             .collect()
     }
 
+    /// The published rows applying `report` reads, added to `needs`.
+    ///
+    /// A delta reads the key of each row it adds or retires; a full
+    /// report reads its slice's members, and only with its last part —
+    /// the earlier parts stage and read nothing. Keys the changes since
+    /// the last snapshot answer are left out, and a slice the graph has
+    /// never held has no rows to read.
+    pub fn slice_report_needs(&self, report: &SliceReportPart<'_>, needs: &mut PublishedNeeds) {
+        if report.part + 1 < report.parts {
+            return;
+        }
+        let known = self.slice_lookup(report.target, report.rustc_version);
+        if report.base_generation.is_none() {
+            if let Some(slice) = known {
+                needs.want_slice(slice);
+            }
+            return;
+        }
+        for row in report.retired.iter().chain(report.added) {
+            let (keys, _) = Self::slice_row_key(report.target, report.rustc_version, row);
+            self.want_published(needs, keys.key, || known);
+        }
+    }
+
     /// Apply a published-slice report: a delta adds and retires unit
     /// shapes; a full report (`base_generation` unset) makes `added`
     /// the slice's whole set, retiring every shape the slice held that
     /// it no longer lists. Flips the edges they touch and drops nodes
     /// whose own shapes are served. Returns the number of edge flips.
+    /// `base` holds the rows [`Self::slice_report_needs`] named.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` when `base` lacks a row the report reads.
     ///
     /// # Panics
     /// When the graph holds more than 256 targets or rustcs — the same
     /// bound every node insert enforces.
-    pub fn apply_slice_report(
+    fn apply_single_part(
         &mut self,
-        target: &str,
-        rustc_version: &str,
-        base_generation: Option<i64>,
-        generation: i64,
-        added: &[PublishedSliceRow],
-        retired: &[PublishedSliceRow],
-    ) -> u32 {
-        let slice = (
-            self.target_id(target).expect("target ids fit u8"),
-            self.rustc_id(rustc_version).expect("rustc ids fit u8"),
-        );
-        if base_generation.is_none() {
-            return self.apply_full_slice(slice, target, rustc_version, generation, added);
+        of: &ReportSlice<'_>,
+        report: &SliceReportPart<'_>,
+        base: &mut impl PublishedSource,
+    ) -> Result<u32, QueueError> {
+        if report.base_generation.is_none() {
+            return self.apply_full_slice(of, report.generation, report.added, base);
         }
-        self.slice_generations.insert(slice, generation);
+        self.slice_generations.insert(of.id, report.generation);
         let mut flips = 0;
-        for row in retired {
-            flips += self.apply_slice_row(slice, target, rustc_version, row, false);
+        for row in report.retired {
+            flips += self.apply_slice_row(of, row, false, base)?;
         }
-        for row in added {
-            flips += self.apply_slice_row(slice, target, rustc_version, row, true);
+        for row in report.added {
+            flips += self.apply_slice_row(of, row, true, base)?;
         }
         self.maybe_compact();
-        flips
+        Ok(flips)
     }
 
     /// Apply one validated part of a slice report. A delta, and a full
@@ -1875,11 +1992,20 @@ impl Graph {
     /// each later part joins it, and the last applies the whole
     /// membership as one full report. Returns the edge flips.
     ///
+    /// `base` holds the rows [`Self::slice_report_needs`] named.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` when `base` lacks a row the report reads.
+    ///
     /// # Panics
     /// When a later part does not continue its staged report -
     /// [`Self::check_slice_report`] refuses that before it is logged,
     /// so a logged row that does is a corrupt log.
-    pub fn apply_slice_report_part(&mut self, report: SliceReportPart<'_>) -> u32 {
+    pub fn apply_slice_report_part_with(
+        &mut self,
+        report: &SliceReportPart<'_>,
+        base: &mut impl PublishedSource,
+    ) -> Result<u32, QueueError> {
         let SliceReportPart {
             target,
             rustc_version,
@@ -1889,23 +2015,23 @@ impl Graph {
             parts,
             added,
             retired,
-        } = report;
+        } = *report;
+        let known = self.slice_lookup(target, rustc_version);
         let slice = (
             self.target_id(target).expect("target ids fit u8"),
             self.rustc_id(rustc_version).expect("rustc ids fit u8"),
         );
+        let of = ReportSlice {
+            id: slice,
+            known,
+            target,
+            rustc: rustc_version,
+        };
         if parts == 1 {
             if self.staged_slices.remove(&slice).is_some() {
                 self.touch_staged(slice);
             }
-            return self.apply_slice_report(
-                target,
-                rustc_version,
-                base_generation,
-                generation,
-                added,
-                retired,
-            );
+            return self.apply_single_part(&of, report, base);
         }
         assert!(
             base_generation.is_none() && retired.is_empty(),
@@ -1939,60 +2065,65 @@ impl Graph {
         }
         self.touch_staged(slice);
         if part + 1 < parts {
-            return 0;
+            return Ok(0);
         }
         let staged = self.staged_slices.remove(&slice).expect("staged report");
-        self.apply_full_slice(
-            slice,
-            target,
-            rustc_version,
-            generation,
-            staged.rows.iter().flatten(),
-        )
+        self.apply_full_slice(&of, generation, staged.rows.iter().flatten(), base)
     }
 
     fn apply_full_slice<'a>(
         &mut self,
-        slice: SliceId,
-        target: &str,
-        rustc: &str,
+        of: &ReportSlice<'_>,
         generation: i64,
         rows: impl IntoIterator<Item = &'a PublishedSliceRow>,
-    ) -> u32 {
-        self.slice_generations.insert(slice, generation);
-        let flips = self.replace_slice(slice, target, rustc, rows);
+        base: &mut impl PublishedSource,
+    ) -> Result<u32, QueueError> {
+        self.slice_generations.insert(of.id, generation);
+        let flips = self.replace_slice(of, rows, base)?;
         self.maybe_compact();
-        flips
+        Ok(flips)
     }
 
     /// A full report: `rows` become the slice's whole set. Cost is the
-    /// report's rows plus the slice's own members.
+    /// report's rows plus the slice's own members, which `base` holds as
+    /// the table's rows under the slice, overridden by the changes since
+    /// the last snapshot.
     fn replace_slice<'a>(
         &mut self,
-        slice: SliceId,
-        target: &str,
-        rustc: &str,
+        of: &ReportSlice<'_>,
         rows: impl IntoIterator<Item = &'a PublishedSliceRow>,
-    ) -> u32 {
+        base: &mut impl PublishedSource,
+    ) -> Result<u32, QueueError> {
         let mut next: HashMap<IdKey, u8> = HashMap::new();
         for row in rows {
-            let (keys, bit) = Self::slice_row_key(target, rustc, row);
+            let (keys, bit) = Self::slice_row_key(of.target, of.rustc, row);
             *next.entry(keys.key).or_default() |= bit;
         }
-        let mut flips = 0;
-        let stale: Vec<IdKey> = self
-            .published
-            .members(slice)
-            .filter(|key| !next.contains_key(*key))
-            .copied()
+        // A slice the graph never held has no rows to list.
+        let mut held: HashMap<IdKey, u8> = if of.known.is_some() {
+            base.members(of.id)?.into_iter().collect()
+        } else {
+            HashMap::new()
+        };
+        held.extend(
+            self.published
+                .members(of.id)
+                .map(|(key, mask)| (*key, mask)),
+        );
+        let stale: Vec<IdKey> = held
+            .iter()
+            .filter(|&(key, &mask)| mask != 0 && !next.contains_key(key))
+            .map(|(&key, _)| key)
             .collect();
+        let mut flips = 0;
         for key in stale {
-            flips += self.set_published(slice, key, 0);
+            flips += self.set_published(of.id, key, held[&key], 0);
         }
         for (key, mask) in next {
-            flips += self.set_published(slice, key, mask);
+            let old = held.get(&key).copied().unwrap_or(0);
+            flips += self.set_published(of.id, key, old, mask);
         }
-        flips
+        Ok(flips)
     }
 
     /// A slice row's published-map key and shape bit.
@@ -2012,29 +2143,28 @@ impl Graph {
 
     fn apply_slice_row(
         &mut self,
-        slice: SliceId,
-        target: &str,
-        rustc: &str,
+        of: &ReportSlice<'_>,
         row: &PublishedSliceRow,
         added: bool,
-    ) -> u32 {
-        let (keys, bit) = Self::slice_row_key(target, rustc, row);
-        let old = self.published.get(&keys.key).map_or(0, |entry| entry.mask);
+        base: &mut impl PublishedSource,
+    ) -> Result<u32, QueueError> {
+        let (keys, bit) = Self::slice_row_key(of.target, of.rustc, row);
+        let old = self.published_mask(&keys.key, base, || of.known)?;
         let mask = if added { old | bit } else { old & !bit };
-        self.set_published(slice, keys.key, mask)
+        Ok(self.set_published(of.id, keys.key, old, mask))
     }
 
-    /// Set one task id's published mask, flip the edges that depend on
-    /// it and release the node when its own shapes are covered.
-    fn set_published(&mut self, slice: SliceId, key: IdKey, mask: u8) -> u32 {
-        let old = self.published.get(&key).map_or(0, |entry| entry.mask);
+    /// Set one task id's published mask — `old` is the mask it held —
+    /// flip the edges that depend on it and release the node when its
+    /// own shapes are covered.
+    fn set_published(&mut self, slice: SliceId, key: IdKey, old: u8, mask: u8) -> u32 {
         if mask != old {
-            if mask == 0 {
-                self.published.remove(&key);
-            } else {
-                self.published.insert(key, Published { mask, slice });
+            self.published.set(slice, key, mask);
+            if old == 0 {
+                self.published_ids += 1;
+            } else if mask == 0 {
+                self.published_ids -= 1;
             }
-            self.touch_published(&key);
         }
         let Some(ix) = self.find_key(key) else {
             return 0;
@@ -2086,23 +2216,43 @@ impl Graph {
         flips
     }
 
-    /// Whether the index reports shapes for a task id the graph no
-    /// longer holds a node for — a node that published and was freed.
-    pub fn is_published(&self, task_id: &str) -> bool {
-        self.node_ix(task_id).is_none()
-            && self
-                .published
-                .get(&IdKeys::of(task_id).key)
-                .is_some_and(|entry| entry.mask != 0)
+    /// The ids among `ids` for which the index reports shapes while the
+    /// graph no longer holds a node — a node that published and was
+    /// freed. Only the ids the graph holds no node for are looked up.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` when `base` lacks a row it is asked for.
+    pub fn published_of_with(
+        &self,
+        ids: &[String],
+        base: &mut impl PublishedSource,
+    ) -> Result<BTreeSet<String>, QueueError> {
+        let mut published = BTreeSet::new();
+        for id in ids {
+            if self.node_ix(id).is_some() {
+                continue;
+            }
+            let mask =
+                self.published_mask(&IdKeys::of(id).key, base, || self.slice_of_task_id(id))?;
+            if mask != 0 {
+                published.insert(id.clone());
+            }
+        }
+        Ok(published)
     }
+}
 
-    /// The ids among `ids` that [`Self::is_published`] answers for.
-    pub fn published_of(&self, ids: &[String]) -> BTreeSet<String> {
-        ids.iter()
-            .filter(|id| self.is_published(id))
-            .cloned()
-            .collect()
-    }
+/// The slice a report part applies to, as it stood before the part
+/// interned its target and rustc.
+struct ReportSlice<'a> {
+    /// The slice's persisted id.
+    id: SliceId,
+    /// The id again when the graph held both names before this report,
+    /// `None` when the report introduced one of them: a slice the graph
+    /// never held has no rows in the table.
+    known: Option<SliceId>,
+    target: &'a str,
+    rustc: &'a str,
 }
 
 /// Claims and the run lifecycle.
@@ -3271,11 +3421,7 @@ impl Graph {
     /// nodes, their dependency edges, and published task ids.
     pub fn sizes(&self) -> (u64, u64, u64) {
         let live = self.nodes.len() - self.counts[Status::Free.index()] as usize;
-        (
-            live as u64,
-            self.edges.len() as u64,
-            self.published.len() as u64,
-        )
+        (live as u64, self.edges.len() as u64, self.published_ids)
     }
 
     /// Occupancy and allocated buffer sizes, with the Wasm linear memory
@@ -3293,7 +3439,7 @@ impl Graph {
         let task_id_index_bytes = self.ids.heap_bytes();
         let identity_index_bytes = self.idents.heap_bytes();
         let edge_array_storage_bytes = self.edges.array_bytes();
-        let published_storage_bytes = self.published.heap_bytes();
+        let published_overlay_bytes = self.published.heap_bytes();
         let extra_storage_bytes = self.extras.capacity() * size_of::<(u32, Extra)>();
         let accounted_storage_bytes = node_storage_bytes
             + state_storage_bytes
@@ -3304,7 +3450,7 @@ impl Graph {
             + task_id_index_bytes
             + identity_index_bytes
             + edge_array_storage_bytes
-            + published_storage_bytes
+            + published_overlay_bytes
             + extra_storage_bytes;
         tracing::info!(
             drive,
@@ -3333,9 +3479,9 @@ impl Graph {
             identity_index_bytes,
             dependency_edges = self.edges.len(),
             edge_array_storage_bytes,
-            published_identities = self.published.len(),
-            published_capacity = self.published.capacity(),
-            published_storage_bytes,
+            published_identities = self.published_ids,
+            published_overlay_entries = self.published.len(),
+            published_overlay_bytes,
             pending_age_entries = self.pending_ages.len(),
             extra_entries = self.extras.len(),
             extra_capacity = self.extras.capacity(),
@@ -3507,11 +3653,64 @@ impl Graph {
         }
     }
 
+    /// The published rows applying `event` reads, added to `needs`: a
+    /// slice report's, by [`Self::slice_report_needs`]; no other event
+    /// reads one. The live path and the replay both ask this, then read
+    /// the rows, then apply.
+    pub fn event_needs(&self, event: &SchedulerEvent, needs: &mut PublishedNeeds) {
+        if let report @ SchedulerEvent::SliceReport { .. } = event {
+            self.slice_report_needs(&SliceReportPart::of(report), needs);
+        }
+    }
+
+    /// Apply a `SliceReport` event; `base` holds the rows
+    /// [`Self::event_needs`] named. Returns the edge flips.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` when `base` lacks a row the report reads.
+    ///
+    /// # Panics
+    /// On any other event kind.
+    pub fn apply_slice_report_event(
+        &mut self,
+        event: &SchedulerEvent,
+        base: &mut impl PublishedSource,
+    ) -> Result<u32, QueueError> {
+        self.log_since_snapshot += 1;
+        self.apply_slice_report_part_with(&SliceReportPart::of(event), base)
+    }
+
+    /// Apply any logged event except a `Submit` (the replay reassembles
+    /// and merges it): the one apply the live path and the replay share.
+    /// `base` holds the rows [`Self::event_needs`] named for it.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` when `base` lacks a row the event reads.
+    pub fn apply_logged(
+        &mut self,
+        event: &SchedulerEvent,
+        now: i64,
+        base: &mut impl PublishedSource,
+    ) -> Result<(), QueueError> {
+        if matches!(event, SchedulerEvent::SliceReport { .. }) {
+            self.apply_slice_report_event(event, base)?;
+        } else {
+            self.apply(event, now);
+        }
+        Ok(())
+    }
+
+    /// Apply any event that reads no published row, which is every kind
+    /// but `Submit` (the replay reassembles and merges it) and
+    /// `SliceReport` ([`Self::apply_slice_report_event`]).
+    ///
+    /// # Panics
+    /// On a `SliceReport`.
     pub fn apply(&mut self, event: &SchedulerEvent, now: i64) {
         self.log_since_snapshot += 1;
         match event {
-            report @ SchedulerEvent::SliceReport { .. } => {
-                self.apply_slice_report_part(SliceReportPart::of(report));
+            SchedulerEvent::SliceReport { .. } => {
+                unreachable!("a slice report applies through apply_slice_report_event")
             }
             SchedulerEvent::Claims { claims } => {
                 for claim in claims {
@@ -3981,23 +4180,24 @@ impl Graph {
     /// published node with no dependents is freed and holds no status).
     ///
     /// # Errors
-    /// `QueueError::Invariant` when `digests` lacks the row of a failed
-    /// dependency a blocked root names.
+    /// `QueueError::Invariant` when `source` lacks the digest row of a
+    /// failed dependency a blocked root names or the published row of a
+    /// root the graph holds no node for.
     pub fn probe_roots_with(
         &self,
         ids: &[String],
         now: i64,
-        digests: &mut impl DigestSource,
+        source: &mut impl ReadSource,
     ) -> Result<RootProbe, QueueError> {
         let mut statuses = BTreeMap::new();
         for id in ids {
-            if let Some(status) = self.request_status_with(id, now, digests)? {
+            if let Some(status) = self.request_status_with(id, now, source)? {
                 statuses.insert(id.clone(), status);
             }
         }
         Ok(RootProbe {
             statuses,
-            published: self.published_of(ids),
+            published: self.published_of_with(ids, source)?,
         })
     }
 
@@ -4599,16 +4799,56 @@ impl crate::freeze::FreezeStore for GraphFreezeStore<'_> {
     }
 }
 
-/// The digests unit tests recorded as they merged.
+/// The digests unit tests recorded as they merged, and their published
+/// table.
 #[cfg(test)]
-struct Shadow<'a>(&'a HashMap<u32, Digest>);
+struct Shadow<'a> {
+    digests: &'a HashMap<u32, Digest>,
+    table: &'a HashMap<IdKey, (SliceId, u8)>,
+}
 
 #[cfg(test)]
 impl DigestSource for Shadow<'_> {
     fn digest(&mut self, slot: u32) -> Result<Digest, QueueError> {
-        self.0.get(&slot).copied().ok_or_else(|| {
+        self.digests.get(&slot).copied().ok_or_else(|| {
             QueueError::Invariant(format!("the test merged no digest for state slot {slot}"))
         })
+    }
+}
+
+#[cfg(test)]
+impl PublishedSource for Shadow<'_> {
+    fn mask(
+        &mut self,
+        key: &IdKey,
+        slice: impl FnOnce() -> Option<SliceId>,
+    ) -> Result<u8, QueueError> {
+        TestTable(self.table).mask(key, slice)
+    }
+
+    fn members(&mut self, slice: SliceId) -> Result<Vec<(IdKey, u8)>, QueueError> {
+        TestTable(self.table).members(slice)
+    }
+}
+
+/// The `published` table of a unit test that drives a graph with no
+/// store.
+#[cfg(test)]
+struct TestTable<'a>(&'a HashMap<IdKey, (SliceId, u8)>);
+
+#[cfg(test)]
+impl PublishedSource for TestTable<'_> {
+    fn mask(&mut self, key: &IdKey, _: impl FnOnce() -> Option<SliceId>) -> Result<u8, QueueError> {
+        Ok(self.0.get(key).map_or(0, |&(_, mask)| mask))
+    }
+
+    fn members(&mut self, slice: SliceId) -> Result<Vec<(IdKey, u8)>, QueueError> {
+        Ok(self
+            .0
+            .iter()
+            .filter(|(_, (held, _))| *held == slice)
+            .map(|(&key, &(_, mask))| (key, mask))
+            .collect())
     }
 }
 
@@ -4616,14 +4856,123 @@ impl DigestSource for Shadow<'_> {
 /// the graph itself, for tests that drive a graph with no store.
 #[cfg(test)]
 impl Graph {
-    pub(crate) fn test_digest_source(&self) -> impl DigestSource + '_ {
-        Shadow(&self.test_digests)
+    pub(crate) fn test_digest_source(&self) -> impl ReadSource + '_ {
+        Shadow {
+            digests: &self.test_digests,
+            table: &self.test_published,
+        }
     }
 
-    /// Carry another graph's recorded digests over — a graph restored
-    /// from a snapshot holds the same slots.
-    pub(crate) fn adopt_test_digests(&mut self, other: &Self) {
+    /// Carry another graph's recorded digests and published table over
+    /// — a graph restored from a snapshot holds the same state slots,
+    /// and the table the snapshot left: the other's table plus the
+    /// changes a snapshot of it would have written.
+    pub(crate) fn adopt_test_store(&mut self, other: &Self) {
         self.test_digests.clone_from(&other.test_digests);
+        self.test_published = other.test_table_after_snapshot();
+    }
+
+    /// The `published` table as a snapshot of this graph would leave it.
+    pub(crate) fn test_table_after_snapshot(&self) -> HashMap<IdKey, (SliceId, u8)> {
+        let mut table = self.test_published.clone();
+        for (slice, key, mask) in self.published.rows() {
+            if mask == 0 {
+                table.remove(&key);
+            } else {
+                table.insert(key, (slice, mask));
+            }
+        }
+        table
+    }
+
+    /// The published rows the graph holds in memory: the changes since
+    /// the last snapshot.
+    pub(crate) fn published_overlay_len(&self) -> usize {
+        self.published.len()
+    }
+
+    /// The published mask of `key` as the graph itself answers it: the
+    /// changes since the last snapshot, then the test table.
+    pub(crate) fn test_mask(&self, key: &IdKey) -> u8 {
+        self.published
+            .get(key)
+            .unwrap_or_else(|| self.test_published.get(key).map_or(0, |&(_, mask)| mask))
+    }
+
+    /// Merge a tree against the test table.
+    pub(crate) fn merge(
+        &mut self,
+        tree: &SubmissionTree,
+        now: i64,
+    ) -> Result<MergeReport, QueueError> {
+        let validated = ValidatedSubmission::new(tree)?;
+        let table = std::mem::take(&mut self.test_published);
+        let report = self.merge_validated(&validated, now, &mut TestTable(&table));
+        self.test_published = table;
+        report
+    }
+
+    /// Apply a slice report part against the test table.
+    pub(crate) fn apply_slice_report_part(&mut self, report: SliceReportPart<'_>) -> u32 {
+        let table = std::mem::take(&mut self.test_published);
+        let flips = self.apply_slice_report_part_with(&report, &mut TestTable(&table));
+        self.test_published = table;
+        flips.expect("the test table holds every row")
+    }
+
+    /// Apply a one-part slice report against the test table.
+    pub(crate) fn apply_slice_report(
+        &mut self,
+        target: &str,
+        rustc_version: &str,
+        base_generation: Option<i64>,
+        generation: i64,
+        added: &[PublishedSliceRow],
+        retired: &[PublishedSliceRow],
+    ) -> u32 {
+        self.apply_slice_report_part(SliceReportPart {
+            target,
+            rustc_version,
+            base_generation,
+            generation,
+            part: 0,
+            parts: 1,
+            added,
+            retired,
+        })
+    }
+
+    /// Whether the index reports shapes for a task id the graph no
+    /// longer holds a node for.
+    pub(crate) fn is_published(&self, task_id: &str) -> bool {
+        !self.published_of(&[task_id.to_owned()]).is_empty()
+    }
+
+    /// The ids among `ids` that [`Self::is_published`] answers for.
+    pub(crate) fn published_of(&self, ids: &[String]) -> BTreeSet<String> {
+        self.published_of_with(ids, &mut TestTable(&self.test_published))
+            .expect("the test table holds every row")
+    }
+
+    /// Every live node by its key: its status and the keys it depends
+    /// on, once per edge, sorted — the graph's shape without its
+    /// allocation order. A running node reads as dispatched: the
+    /// `in_progress` delivery is not logged, so a woken graph holds it
+    /// dispatched until the reconcile.
+    pub(crate) fn shape_by_key(&self) -> std::collections::BTreeMap<IdKey, (String, Vec<IdKey>)> {
+        (0u32..)
+            .zip(&self.nodes)
+            .filter(|(_, node)| node.status != Status::Free)
+            .map(|(ix, node)| {
+                let mut deps: Vec<IdKey> = self.deps_of(ix).map(|dep| self.node(dep).key).collect();
+                deps.sort_unstable();
+                let status = match node.status {
+                    Status::Running => Status::Dispatched,
+                    other => other,
+                };
+                (node.key, (format!("{status:?}"), deps))
+            })
+            .collect()
     }
 
     /// The state slot of every node that holds one, by the node's key.
@@ -5416,7 +5765,7 @@ mod tests {
             }
         }
         let mut restored = loader.finish().expect("load");
-        restored.adopt_test_digests(graph);
+        restored.adopt_test_store(graph);
         restored
     }
 

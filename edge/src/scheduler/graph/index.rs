@@ -67,27 +67,6 @@ impl IxTable {
         self.used += 1;
     }
 
-    /// Remove one id and close its probe-chain hole without tombstones.
-    pub(super) fn remove(&mut self, hash: u64, id: u32, rehash: impl Fn(u32) -> u64) {
-        let mask = self.slots.len() - 1;
-        let mut hole = probe_start(hash, self.slots.len());
-        while self.slots[hole] != id {
-            assert_ne!(self.slots[hole], EMPTY, "removed index id is absent");
-            hole = (hole + 1) & mask;
-        }
-        let mut at = (hole + 1) & mask;
-        while self.slots[at] != EMPTY {
-            let origin = probe_start(rehash(self.slots[at]), self.slots.len());
-            if (at.wrapping_sub(origin) & mask) >= (at.wrapping_sub(hole) & mask) {
-                self.slots[hole] = self.slots[at];
-                hole = at;
-            }
-            at = (at + 1) & mask;
-        }
-        self.slots[hole] = EMPTY;
-        self.used -= 1;
-    }
-
     /// Heap bytes the slot array holds.
     pub(super) const fn heap_bytes(&self) -> usize {
         self.slots.len() * size_of::<u32>()
@@ -309,39 +288,6 @@ mod tests {
             for (id, held) in intern.iter_from(0).enumerate() {
                 assert_eq!(intern.get(held), Some(u32::try_from(id).unwrap()));
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod deletion_tests {
-    use super::IxTable;
-
-    #[test]
-    fn deletion_closes_colliding_wrapped_probe_chains() {
-        for removed in 0..8u32 {
-            let hashes = [14, 14, 15, 0, 15, 1, 14, 2];
-            let mut table = IxTable::default();
-            table.clear_for(hashes.len());
-            for id in 0..8u32 {
-                table.insert(hashes[id as usize], id, |held| hashes[held as usize]);
-            }
-            table.remove(hashes[removed as usize], removed, |held| {
-                hashes[held as usize]
-            });
-            for id in 0..8u32 {
-                assert_eq!(
-                    table.candidates(hashes[id as usize]).any(|held| held == id),
-                    id != removed
-                );
-            }
-            table.insert(hashes[removed as usize], removed, |held| {
-                hashes[held as usize]
-            });
-            for id in (0..8u32).rev() {
-                table.remove(hashes[id as usize], id, |held| hashes[held as usize]);
-            }
-            assert!(table.candidates(14).next().is_none());
         }
     }
 }

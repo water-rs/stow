@@ -4,9 +4,12 @@
 //! stable key — `kind * 2^48 + range * 1024 + sub` — so a snapshot
 //! rewrites only the ranges a mutation touched: node state and
 //! adjacency by node/edge index range, interned strings by id range
-//! (append-only, only the tail range changes), the published map and
-//! the unbounded side tables by key-hash bucket, and the small global
-//! state in one unconditional `meta` row. A row closes at
+//! (append-only, only the tail range changes), the unbounded side
+//! tables by key-hash bucket, and the small global state in one
+//! unconditional `meta` row. The published masks are not chunks: the
+//! `published` table holds them and the snapshot's storage turn
+//! upserts the changes since the last one (`store.rs`); only their count
+//! rides the head. A row closes at
 //! `CHUNK_TEXT_BYTES` (64 KiB) of text, so a range whose items spill
 //! past one row — a skewed bucket, a long run of nodes — splits into
 //! sub-rows; `sub` bounds a range to `SNAPSHOT_SPAN_ROWS` of them.
@@ -18,7 +21,7 @@
 //! takes the full path — delete every row, then write every range —
 //! which is also how a shrunk extent's stale rows go.
 //!
-//! The node, edge and published rows are fixed-size records written
+//! The node and edge rows are fixed-size records written
 //! little-endian, back to back, as base64 (`TEXT` payloads); a node's
 //! optional [`Extra`] rides its record as a length-prefixed
 //! `MessagePack` blob. The side states are `MessagePack` in base64;
@@ -39,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use super::index::hash_of;
 use super::node::{Extra, Flags, NO_STATE, Node, State, Status};
 use super::{
-    AttemptOutcome, FeedSession, Graph, IdKey, Published, RequestRecord, SliceId, StagedSlice,
+    AttemptOutcome, FeedSession, Graph, IdKey, PublishedRow, RequestRecord, SliceId, StagedSlice,
 };
 use crate::errors::QueueError;
 
@@ -89,13 +92,6 @@ const NODES_RANGE: u32 = 8_192;
 /// Edges per `edges` range: five fixed bytes an edge, 640 KB a range.
 const EDGES_RANGE: u32 = 131_072;
 
-/// Published-mask buckets: the dense table — 19 fixed bytes an entry —
-/// sized so a bucket stays a handful of rows at the largest graph the
-/// 128 MiB object holds (#878 measured ~345k nodes at 480k rows): an
-/// all-published graph is 345k x 19 B / 16 = ~410 KB a bucket, about
-/// nine rows.
-const PUBLISHED_BUCKETS: u32 = 16;
-
 /// Request-record buckets, by request-id hash: ~512 bytes of JSON a
 /// record, and the request history a 345k-node graph carries stays
 /// far under ~100k admissions (each admits at least one node) — 96k x
@@ -142,7 +138,6 @@ enum ChunkKind {
     Intern,
     Nodes,
     Edges,
-    Published,
     Outcomes,
     Requests,
     Feed,
@@ -161,7 +156,6 @@ impl ChunkKind {
             Self::Intern => "intern",
             Self::Nodes => "nodes",
             Self::Edges => "edges",
-            Self::Published => "published",
             Self::Outcomes => "outcomes",
             Self::Requests => "requests",
             Self::Feed => "feed",
@@ -176,12 +170,11 @@ impl ChunkKind {
             1 => Self::Intern,
             2 => Self::Nodes,
             3 => Self::Edges,
-            4 => Self::Published,
-            5 => Self::Outcomes,
-            6 => Self::Requests,
-            7 => Self::Feed,
-            8 => Self::Batches,
-            9 => Self::Staged,
+            4 => Self::Outcomes,
+            5 => Self::Requests,
+            6 => Self::Feed,
+            7 => Self::Batches,
+            8 => Self::Staged,
             other => {
                 return Err(QueueError::Invariant(format!(
                     "unknown snapshot kind {other}"
@@ -192,7 +185,7 @@ impl ChunkKind {
 
     const fn encoding(self) -> Encoding {
         match self {
-            Self::Nodes | Self::Edges | Self::Published => Encoding::Raw,
+            Self::Nodes | Self::Edges => Encoding::Raw,
             Self::Outcomes => Encoding::Packed,
             Self::Meta
             | Self::Intern
@@ -250,8 +243,6 @@ pub(super) struct Dirty {
     pub nodes: BTreeSet<u32>,
     /// Edge-index ranges.
     pub edges: BTreeSet<u32>,
-    /// Published-mask buckets.
-    pub published: BTreeSet<u32>,
     /// Request-record buckets.
     pub requests: BTreeSet<u32>,
     /// Feed-page buckets.
@@ -262,11 +253,6 @@ pub(super) struct Dirty {
     pub staged: BTreeSet<u32>,
     /// The bounded outcome ring — one range, so one flag.
     pub outcomes: bool,
-}
-
-/// The published map's bucket of one key — its leading bytes.
-const fn published_bucket(key: &IdKey) -> u32 {
-    u32::from_le_bytes([key[0], key[1], key[2], key[3]]) % PUBLISHED_BUCKETS
 }
 
 /// The staged-report map's bucket of one slice.
@@ -329,6 +315,9 @@ struct SnapshotHead {
     /// The instant the last `workflow_run` delivery was accepted
     /// (stow#860) — the health check's last-delivery age reads it.
     last_run_update_ms: Option<i64>,
+    /// How many task ids hold a non-zero published mask, in the
+    /// `published` table the snapshot's storage turn leaves.
+    published_ids: u64,
     lens: SectionLens,
 }
 
@@ -343,7 +332,6 @@ struct SectionLens {
     /// lowest of them or the slab's end.
     states: usize,
     edges: usize,
-    published: usize,
     outcomes: usize,
     requests: usize,
     feed_pages: usize,
@@ -589,7 +577,6 @@ type StagedItem = (
 /// never copied whole).
 #[derive(Default)]
 struct SpanItems {
-    published: Vec<(IdKey, Published)>,
     requests: Vec<(String, RequestRecord)>,
     feed: Vec<(String, usize, Vec<stow_types::api::SchedulerDemandEntry>)>,
     batches: Vec<(String, (String, i64))>,
@@ -657,15 +644,6 @@ impl SpanEncoder {
                     Ok(())
                 })?
             }
-            ChunkKind::Published => {
-                writer.fill_raw(self.items.published[at..].iter(), |buf, (key, entry)| {
-                    buf.extend_from_slice(key);
-                    buf.push(entry.mask);
-                    buf.push(entry.slice.0);
-                    buf.push(entry.slice.1);
-                    Ok(())
-                })?
-            }
             ChunkKind::Requests => writer.fill(self.items.requests[at..].iter())?,
             ChunkKind::Feed => writer.fill(self.items.feed[at..].iter())?,
             ChunkKind::Batches => writer.fill(self.items.batches[at..].iter())?,
@@ -702,11 +680,6 @@ impl Graph {
     /// Mark edge `edge`'s chunk dirty.
     pub(super) fn touch_edge(&mut self, edge: u32) {
         self.dirty.edges.insert(edge / EDGES_RANGE);
-    }
-
-    /// Mark the published bucket of `key` dirty.
-    pub(super) fn touch_published(&mut self, key: &IdKey) {
-        self.dirty.published.insert(published_bucket(key));
     }
 
     /// Mark the request bucket of `request_id` dirty.
@@ -786,12 +759,6 @@ impl Graph {
             ranges(self.edges.len(), EDGES_RANGE),
             &self.dirty.edges,
         );
-        add(
-            &mut spans,
-            ChunkKind::Published,
-            PUBLISHED_BUCKETS,
-            &self.dirty.published,
-        );
         if all || self.dirty.outcomes {
             spans.push(ChunkSpan::new(ChunkKind::Outcomes, 0));
         }
@@ -824,16 +791,6 @@ impl Graph {
         let bucket = span.range;
         let mut materialized = SpanItems::default();
         match span.kind {
-            ChunkKind::Published => {
-                let mut items: Vec<_> = self
-                    .published
-                    .iter()
-                    .filter(|(key, _)| published_bucket(key) == bucket)
-                    .map(|(&key, &entry)| (key, entry))
-                    .collect();
-                items.sort_by_key(|(key, _)| *key);
-                materialized.published = items;
-            }
             ChunkKind::Requests => {
                 materialized.requests = self
                     .requests
@@ -901,11 +858,29 @@ impl Graph {
         }
     }
 
-    /// The store holds every dirty range: clear the marks and lift the
-    /// intern watermark to the interner's end.
+    /// The store holds every dirty range and, in its `published` table,
+    /// every published change: clear the marks, lift the intern
+    /// watermark to the interner's end and drop the changes.
     pub(crate) fn snapshot_written(&mut self) {
         self.dirty = Dirty::default();
         self.intern_committed = self.intern.len();
+        self.published_flushed();
+    }
+
+    /// Up to `limit` of the published changes since the last snapshot
+    /// after `after`, in key order, for the storage turn that upserts
+    /// them into the `published` table.
+    pub fn published_page(&self, after: Option<&super::IdKey>, limit: usize) -> Vec<PublishedRow> {
+        self.published.page(after, limit)
+    }
+
+    /// The `published` table holds every change: forget them.
+    pub fn published_flushed(&mut self) {
+        #[cfg(test)]
+        {
+            self.test_published = self.test_table_after_snapshot();
+        }
+        self.published.clear();
     }
 
     fn snapshot_head(&self) -> SnapshotHead {
@@ -955,6 +930,7 @@ impl Graph {
                 .map(|(&key, &tally)| (key, tally))
                 .collect(),
             last_run_update_ms: self.last_run_update_ms,
+            published_ids: self.published_ids,
             lens: self.section_lens(),
         }
     }
@@ -965,7 +941,6 @@ impl Graph {
             nodes: self.nodes.len(),
             states: self.states.len(),
             edges: self.edges.len(),
-            published: self.published.len(),
             outcomes: self.attempt_outcomes.len(),
             requests: self.requests.len(),
             feed_pages: self
@@ -1018,13 +993,6 @@ impl SnapshotLoader {
                 let dep = bytes.u32()?;
                 let flags = bytes.u8()?;
                 graph.edges.load(dep, flags);
-                Ok(())
-            }),
-            ChunkKind::Published => decode_raw(kind, payload, |bytes| {
-                let key: IdKey = bytes.take()?;
-                let mask = bytes.u8()?;
-                let slice = (bytes.u8()?, bytes.u8()?);
-                graph.published.insert(key, Published { mask, slice });
                 Ok(())
             }),
             ChunkKind::Outcomes => decode_items(kind, payload, |outcome: AttemptOutcome| {
@@ -1206,7 +1174,7 @@ impl SnapshotLoader {
         graph.outcome_hours = head.outcome_hours.into_iter().collect();
         graph.last_run_update_ms = head.last_run_update_ms;
         graph.intern.reserve_exact(head.lens.intern);
-        graph.published.reserve(head.lens.published);
+        graph.published_ids = head.published_ids;
         *lens = Some(head.lens);
         Ok(())
     }
@@ -1285,6 +1253,7 @@ mod store_tests {
                 emitted += 1;
                 Ok(Some("new".to_owned()))
             },
+            |_, _| Vec::new(),
             &Graph::default().meter,
             &GraphCell::default(),
             0,

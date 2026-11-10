@@ -52,7 +52,12 @@ use stow_types::identity::{
 };
 use stow_types::public_cache::{ExplicitSpelling, UnitInvocation, UnitShape};
 
-use super::graph::{FreshDigest, Graph, GraphCell, LoadedGraph};
+use super::graph::{
+    Fetched, FreshDigest, Graph, GraphCell, LoadedGraph, PublishedNeeds, PublishedRow,
+    ValidatedSubmission,
+};
+#[cfg(test)]
+use super::graph::{IdKey, SliceId};
 use super::routes;
 use super::store;
 use crate::errors::QueueError;
@@ -354,33 +359,98 @@ impl Generations {
 /// rows (36 bytes each) are never in memory at once.
 const LEDGER_FLUSH_ENTRIES: usize = 4_096;
 
-/// Where the build's digest rows go.
-pub trait DigestSink {
+/// Where the build's rows go and where its published reads come from:
+/// the store tables a live scheduler keeps, the seed never holding
+/// either population in memory.
+pub trait SeedStore {
     /// Write `fresh`, in build order: a later entry of a slot overwrites
     /// an earlier one.
     ///
     /// # Errors
     /// `QueueError::Sql` when the write fails.
-    async fn write(&mut self, fresh: &[FreshDigest]) -> Result<(), QueueError>;
+    async fn write_digests(&mut self, fresh: &[FreshDigest]) -> Result<(), QueueError>;
+
+    /// Read the `published` rows `needs` names.
+    ///
+    /// # Errors
+    /// `QueueError::Sql` when the read fails.
+    async fn read_published(&mut self, needs: &PublishedNeeds) -> Result<Fetched, QueueError>;
+
+    /// Write published `rows` to the `published` table, in the shape a
+    /// snapshot's storage turn writes them.
+    ///
+    /// # Errors
+    /// `QueueError::Sql` when the write fails.
+    async fn write_published(&mut self, rows: &[PublishedRow]) -> Result<(), QueueError>;
 }
 
-/// The store the seed writes the `node_digests` rows to.
+/// The store the seed writes the `node_digests` and `published` rows to.
 pub struct Stored<'a>(pub &'a DurableDb);
 
-impl DigestSink for Stored<'_> {
-    async fn write(&mut self, fresh: &[FreshDigest]) -> Result<(), QueueError> {
+impl SeedStore for Stored<'_> {
+    async fn write_digests(&mut self, fresh: &[FreshDigest]) -> Result<(), QueueError> {
         store::write_digests(self.0, fresh).await
+    }
+
+    async fn read_published(&mut self, needs: &PublishedNeeds) -> Result<Fetched, QueueError> {
+        store::read_published(self.0, needs).await
+    }
+
+    async fn write_published(&mut self, rows: &[PublishedRow]) -> Result<(), QueueError> {
+        store::write_published(self.0, rows).await
     }
 }
 
-/// Host tests that build a graph with no store mint from the graph's own
-/// test shadow and drop the rows.
+/// Host tests that build a graph with no database: the digest rows drop
+/// (the graph mints from its own test shadow) and the published rows
+/// live in a map standing in for the table.
 #[cfg(test)]
-pub struct Discarded;
+#[derive(Default)]
+pub struct InMemory {
+    table: HashMap<IdKey, (SliceId, u8)>,
+}
 
 #[cfg(test)]
-impl DigestSink for Discarded {
-    fn write(&mut self, _: &[FreshDigest]) -> impl Future<Output = Result<(), QueueError>> {
+impl SeedStore for InMemory {
+    fn write_digests(&mut self, _: &[FreshDigest]) -> impl Future<Output = Result<(), QueueError>> {
+        std::future::ready(Ok(()))
+    }
+
+    fn read_published(
+        &mut self,
+        needs: &PublishedNeeds,
+    ) -> impl Future<Output = Result<Fetched, QueueError>> {
+        let mut fetched = Fetched::default();
+        for (key, _) in needs.keys() {
+            fetched.expect(key);
+            if let Some(&(_, mask)) = self.table.get(&key) {
+                fetched.set_mask(key, mask);
+            }
+        }
+        for slice in needs.slices() {
+            fetched.set_members(
+                slice,
+                self.table
+                    .iter()
+                    .filter(|(_, (held, _))| *held == slice)
+                    .map(|(&key, &(_, mask))| (key, mask))
+                    .collect(),
+            );
+        }
+        std::future::ready(Ok(fetched))
+    }
+
+    fn write_published(
+        &mut self,
+        rows: &[PublishedRow],
+    ) -> impl Future<Output = Result<(), QueueError>> {
+        for &(slice, key, mask) in rows {
+            if mask == 0 {
+                self.table.remove(&key);
+            } else {
+                self.table.insert(key, (slice, mask));
+            }
+        }
         std::future::ready(Ok(()))
     }
 }
@@ -391,24 +461,42 @@ struct Ledger<S> {
     held: Vec<FreshDigest>,
 }
 
-impl<S: DigestSink> Ledger<S> {
+impl<S: SeedStore> Ledger<S> {
     /// Write what is held and empty the ledger.
     async fn flush(&mut self) -> Result<(), QueueError> {
-        self.sink.write(&self.held).await?;
+        self.sink.write_digests(&self.held).await?;
         self.held.clear();
+        Ok(())
+    }
+
+    /// Write the graph's published changes to the table and forget
+    /// them — the seed's stand-in for a snapshot's storage turn, run
+    /// after each batch of reports so the graph never holds the
+    /// population's masks.
+    async fn flush_published(&mut self, graph: &mut Graph) -> Result<(), QueueError> {
+        self.sink
+            .write_published(&graph.published_page(None, usize::MAX))
+            .await?;
+        graph.published_flushed();
         Ok(())
     }
 }
 
 /// Merge `tree` and keep the merge honest: a fixture tree that fails to
 /// merge is a builder bug.
-async fn merge<S: DigestSink>(
+async fn merge<S: SeedStore>(
     graph: &mut Graph,
     tree: &SubmissionTree,
     at: i64,
     ledger: &mut Ledger<S>,
 ) -> Result<(), QueueError> {
-    ledger.held.extend(graph.merge(tree, at)?.digests);
+    let validated = ValidatedSubmission::new(tree)?;
+    let mut needs = PublishedNeeds::default();
+    graph.merge_needs(&validated, &mut needs);
+    let mut base = ledger.sink.read_published(&needs).await?;
+    ledger
+        .held
+        .extend(graph.merge_validated(&validated, at, &mut base)?.digests);
     if ledger.held.len() >= LEDGER_FLUSH_ENTRIES {
         ledger.flush().await?;
     }
@@ -425,7 +513,7 @@ fn runs(start: u32, end: u32) -> impl Iterator<Item = (u32, u32)> {
 
 /// Merge fixture nodes `lo..=hi` as one tree of `source`, each on the
 /// dependencies `deps` names, born at `at`.
-async fn merge_run<S: DigestSink>(
+async fn merge_run<S: SeedStore>(
     graph: &mut Graph,
     (lo, hi): (u32, u32),
     source: SubmissionSource,
@@ -453,7 +541,7 @@ fn first_at(shape: FixtureShape, now: i64, n: u32) -> i64 {
 /// Completed rows: submit, claim, bind, finish at their spread
 /// instants, then publish their unit shapes — the node retires to its
 /// slim published identity.
-async fn build_completed<S: DigestSink>(
+async fn build_completed<S: SeedStore>(
     graph: &mut Graph,
     shape: FixtureShape,
     now: i64,
@@ -509,15 +597,19 @@ async fn build_completed<S: DigestSink>(
             );
         }
         for report in slice_reports(graph, lo, hi) {
-            graph.apply(&report, now);
+            let mut needs = PublishedNeeds::default();
+            graph.event_needs(&report, &mut needs);
+            let mut base = ledger.sink.read_published(&needs).await?;
+            graph.apply_slice_report_event(&report, &mut base)?;
         }
+        ledger.flush_published(graph).await?;
     }
     Ok(())
 }
 
 /// Failed rows: submitted, then cancelled — the failed state an
 /// operator verb produces, with the dependents' blocked refresh.
-async fn build_failed<S: DigestSink>(
+async fn build_failed<S: SeedStore>(
     graph: &mut Graph,
     shape: FixtureShape,
     now: i64,
@@ -556,7 +648,7 @@ async fn build_failed<S: DigestSink>(
 
 /// Pending rows, ascending, split at the human pins so each tree has
 /// one source, then the window's stored demand.
-async fn build_pending<S: DigestSink>(
+async fn build_pending<S: SeedStore>(
     graph: &mut Graph,
     shape: FixtureShape,
     eligible_rows: u32,
@@ -608,7 +700,7 @@ async fn build_pending<S: DigestSink>(
 /// # Errors
 /// `QueueError::Invariant` when a fixture tree fails to merge,
 /// otherwise `sink`'s.
-pub async fn build<S: DigestSink>(
+pub async fn build<S: SeedStore>(
     shape: FixtureShape,
     settings: &super::queue::SchedulerSettings,
     now: i64,
@@ -877,7 +969,13 @@ pub fn mark_running(graph: &mut Graph, shape: FixtureShape, now: i64) {
 /// # Errors
 /// `QueueError::Sql` when a delete fails.
 pub async fn wipe(db: &DurableDb) -> Result<(), QueueError> {
-    for table in ["event_log", "snapshot_chunks", "store_meta", "node_digests"] {
+    for table in [
+        "event_log",
+        "snapshot_chunks",
+        "store_meta",
+        "node_digests",
+        "published",
+    ] {
         db.query(&format!("DELETE FROM {table}"))
             .execute()
             .await
