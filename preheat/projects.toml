@@ -687,3 +687,27 @@ repo = "https://github.com/xerj-org/xerj"
 [[project]]
 repo = "https://github.com/storytold/lightcraft"
 
+[[project]]
+repo = "https://github.com/parcel-bundler/parcel"
+
+[[project]]
+repo = "https://github.com/meta/flow"
+
+[[project]]
+repo = "https://github.com/storytold/craft-anything"
+
+[[project]]
+repo = "https://github.com/mountain-loop/yaak"
+
+[[project]]
+repo = "https://github.com/vercel-labs/agent-desktop"
+
+[[project]]
+repo = "https://github.com/meta/relay"
+
+[[project]]
+repo = "https://github.com/akitaonrails/ai-memory"
+
+[[project]]
+repo = "https://github.com/jub0t/Concat"
+
