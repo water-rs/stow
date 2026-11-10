@@ -49,9 +49,10 @@ use stow_types::local_ci::{
     LocalCiSeededStatus,
 };
 use stow_types::runs::VERDICT_STEPS;
-use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 use zenwave::{Client, ResponseExt};
+
+use crate::runners::{Runner, RunnerPool};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -118,7 +119,9 @@ pub struct LocalServerState {
     /// it, but at most one build or publish per core executes: on Actions
     /// every job has a machine of its own, here they all share one with
     /// the edge under test, and an unbounded wave of builds starves it.
-    runners: Arc<Semaphore>,
+    /// Each runner owns its cargo home, as an Actions runner does, so
+    /// concurrent tasks never queue on one package-cache lock.
+    runners: RunnerPool,
     /// The bound listen address, filled by `serve` — the `html_url` a
     /// mock run reports.
     pub listen: SocketAddr,
@@ -143,6 +146,7 @@ impl LocalServerState {
         mock_private_key_path: String,
         mock_registry_root: String,
         app_slug: String,
+        runners: RunnerPool,
     ) -> Self {
         Self {
             edge_url,
@@ -158,11 +162,7 @@ impl LocalServerState {
             task_payloads: Arc::new(Mutex::new(BTreeMap::new())),
             periodic: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(AtomicU64::new(1)),
-            runners: Arc::new(Semaphore::new(
-                std::thread::available_parallelism()
-                    .expect("read the machine's available parallelism")
-                    .get(),
-            )),
+            runners,
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         }
     }
@@ -1693,18 +1693,13 @@ async fn build_stage(run: &TaskRun) -> stow_types::error::Result<TaskLayout> {
         return Ok(layout);
     }
     let waiting = Instant::now();
-    let _runner = run
-        .state
-        .runners
-        .acquire()
-        .await
-        .expect("the runner pool is never closed");
+    let runner = run.state.runners.acquire().await;
     run.log_stage("build-runner-wait", waiting, true);
     run.state.mark_built(run.workflow_run_id);
     // The child is the untrusted build stage: it gets the event file and
     // nothing else, exactly as the production build job does.
     let started = Instant::now();
-    let result = run_build_stage(run, &layout).await;
+    let result = run_build_stage(run, &runner, &layout).await;
     run.log_stage(
         "build",
         started,
@@ -1736,10 +1731,10 @@ async fn verify_failure_stage(run: &TaskRun) -> stow_types::error::Result<()> {
     );
     let waiting = Instant::now();
     let replay = async {
-        let _runner = run.state.runners.acquire().await.expect("runner pool open");
+        let runner = run.state.runners.acquire().await;
         run.log_stage("failure-replay-runner-wait", waiting, true);
         let started = Instant::now();
-        let result = untrusted_command(run)
+        let result = untrusted_command(run, &runner)
             .arg("verify-failure")
             .arg("--input-dir")
             .arg(&layout.output_dir)
@@ -1781,12 +1776,7 @@ async fn publish_stage(run: &TaskRun, layout: &TaskLayout) -> stow_types::error:
     let task = &run.task;
     if !run.stub {
         let waiting = Instant::now();
-        let _runner = run
-            .state
-            .runners
-            .acquire()
-            .await
-            .expect("the runner pool is never closed");
+        let runner = run.state.runners.acquire().await;
         run.log_stage("publish-runner-wait", waiting, true);
         // The task is read back from the event file, as `stow-build
         // publish` reads it, and validated exactly as it validates it:
@@ -1795,9 +1785,10 @@ async fn publish_stage(run: &TaskRun, layout: &TaskLayout) -> stow_types::error:
         let event = async_fs::read(&run.event_path).await?;
         let dispatched = crate::task_from_event(&event, &run.event_path)?;
         let started = Instant::now();
-        let result = crate::validated_build_output(&dispatched, &layout.output_dir)
-            .await
-            .map_err(|error| error.wrap_err("publish-stage validation"));
+        let result =
+            crate::validated_build_output(&dispatched, &layout.output_dir, runner.cargo_home())
+                .await
+                .map_err(|error| error.wrap_err("publish-stage validation"));
         run.log_stage("publish-validation", started, result.is_ok());
         let output = result?;
         // `stow-build build` exits non-zero when any cargo phase failed —
@@ -1851,9 +1842,10 @@ async fn stage_error(build_log_path: &Path) -> String {
 /// production build job.
 async fn run_build_stage(
     run: &TaskRun,
+    runner: &Runner,
     layout: &TaskLayout,
 ) -> stow_types::error::Result<std::process::ExitStatus> {
-    Ok(untrusted_command(run)
+    Ok(untrusted_command(run, runner)
         .arg("build")
         .arg("--output-dir")
         .arg(&layout.output_dir)
@@ -1863,7 +1855,7 @@ async fn run_build_stage(
         .await?)
 }
 
-fn untrusted_command(run: &TaskRun) -> async_process::Command {
+fn untrusted_command(run: &TaskRun, runner: &Runner) -> async_process::Command {
     let mut command = async_process::Command::new(&run.exe);
     for name in [
         "SCHEDULER_URL",
@@ -1879,6 +1871,7 @@ fn untrusted_command(run: &TaskRun) -> async_process::Command {
         command.env_remove(name);
     }
     command
+        .env("CARGO_HOME", runner.cargo_home())
         .env("GITHUB_EVENT_PATH", &run.event_path)
         .env("GITHUB_RUN_ID", run.workflow_run_id.to_string())
         .env("GITHUB_RUN_ATTEMPT", RUN_ATTEMPT.to_string());
@@ -2180,6 +2173,7 @@ mod tests {
         TaskRun, WorkflowRunReport, attempt_jobs_page, build_job_name, cancel_response,
         dispatch_response, drive_stages, publish_job_name, run_response,
     };
+    use super::{PathBuf, Runner, RunnerPool};
 
     fn state() -> LocalServerState {
         LocalServerState::new(
@@ -2188,6 +2182,17 @@ mod tests {
             String::new(),
             String::new(),
             "mock-stow-ci".to_owned(),
+            // Runner directories are never created: these tests run stubbed
+            // stages or fake executables that read no cargo home.
+            RunnerPool::new(
+                (0..4)
+                    .map(|index| {
+                        Runner::new(PathBuf::from(format!(
+                            "/nonexistent/stow-test-runner/{index}/cargo-home"
+                        )))
+                    })
+                    .collect(),
+            ),
         )
     }
 
