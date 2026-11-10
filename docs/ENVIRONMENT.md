@@ -207,7 +207,7 @@ credential is involved (`docs/MOCK.md`).
 | `STOW_PRODUCTION_WAVE_LIMIT` | the `limit` input's default in `.github/workflows/preheat-admin.yml` | `--limit` of `preheat top-binaries`. |
 | `STOW_PRODUCTION_WAVE_TARGETS` | the `targets` input's default in `.github/workflows/preheat-admin.yml` | Comma-separated `--targets` of every lane. |
 | `STOW_PRODUCTION_WAVE_DEADLINE` | `3300` | Seconds each lane may run before it is killed; the count then refuses the lane. |
-| `STOW_RESOLVE_CARGO_HOME` | `$WORK_DIR/resolve-cargo` | The shared resolve root the script exports to each lane as `<root>/<NN>-<lane>` — separate per lane because the lanes run concurrently and a worker's resolve holds cargo's exclusive package-cache lock. Point it at a cache-restored directory so warm runs skip the cold index/`.crate` fetch. |
+| `STOW_RESOLVE_CARGO_HOME` | `$WORK_DIR/resolve-cargo` | The shared resolve root the script exports to each lane as `<root>/<NN>-<lane>` — separate per lane because the lanes run concurrently and a worker's resolve holds cargo's exclusive package-cache lock. Point it at a directory kept between runs so a later run skips the cold index/`.crate` fetch. |
 | `STOW_E2E_TOOLCHAIN` | `stable` | The rustup toolchain whose version the lanes resolve for (`RUSTUP_TOOLCHAIN`). |
 
 ## scripts/mock-e2e.sh
