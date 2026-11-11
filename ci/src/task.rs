@@ -2138,15 +2138,12 @@ fn conditional_grants(
 /// them.
 ///
 /// `cargo`/`rustc` come off PATH (rustup proxies, a homebrew rust, a CI
-/// image toolchain). On Windows `link.exe` joins them: rustc runs the
-/// linker it finds on PATH whenever its own MSVC lookup comes up empty,
-/// which is what happens in here — that lookup runs `vswhere.exe` out of a
-/// Program Files tree this sandbox does not grant. Without this the
-/// fallback resolved to Git for Windows' msys `link`, which cannot start
-/// inside an `AppContainer` at all, and every Windows build that linked
-/// anything — every crate carrying a build script or a proc macro — died
-/// with `link.exe returned an unexpected error`. `LIB` and `INCLUDE` are
-/// the CRT and Windows SDK search lists that same linker reads.
+/// image toolchain). On Windows `link.exe` joins them: for the host
+/// architecture rustc's MSVC lookup takes the developer-prompt environment
+/// as it stands and runs the `link.exe` PATH resolves, so that one has to
+/// be MSVC's and reachable — Git for Windows' msys `link`, earlier on a
+/// runner's PATH, cannot start inside an `AppContainer` at all. `LIB` and
+/// `INCLUDE` are the CRT and Windows SDK search lists that linker reads.
 fn compiler_search_grants() -> Vec<(PathBuf, Access, &'static str)> {
     let mut grants = Vec::new();
     let path_tools: &[&str] = if cfg!(windows) {
@@ -2282,11 +2279,15 @@ fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec
         "CMAKE_PREFIX_PATH",
         // The MSVC developer environment. `LIB` and `INCLUDE` are how the
         // linker and the `cc` crate find the CRT and the Windows SDK; the
-        // install-root variables are how a build script locates the same
-        // toolchain for itself.
+        // install-root variables and `VSCMD_ARG_TGT_ARCH` are how rustc,
+        // `cc` and a build script locate the toolchain of another
+        // architecture for themselves. A runner already in a developer
+        // prompt passes them through; otherwise `MsvcToolchain` sets them.
         "LIB",
         "INCLUDE",
         "VCINSTALLDIR",
+        "VSINSTALLDIR",
+        "VSCMD_ARG_TGT_ARCH",
         "VCToolsInstallDir",
         "WindowsSdkDir",
         "WindowsSdkBinPath",
@@ -2368,147 +2369,82 @@ fn toolchain_grant_dirs(
     dirs
 }
 
-/// The MSVC toolchain a sandboxed Windows build needs, resolved out here
-/// on the host: the host architecture's linker for what a task links —
-/// its build scripts and proc macros are host binaries — and the task
-/// target's own compiler and archiver for what those build scripts
-/// compile.
+/// The MSVC toolchain a sandboxed Windows build sees, resolved out here
+/// on the host: the variables a Visual Studio developer prompt for the
+/// host architecture sets, and the directories the lookup that follows
+/// them reads or runs from.
 ///
-/// rustc looks the linker up for itself, but that lookup runs
-/// `vswhere.exe` from a Program Files tree the sandbox does not grant, so
-/// inside the container it comes up empty and rustc falls back to the
-/// first `link.exe` on PATH. On a GitHub Windows runner that is Git for
-/// Windows' msys `link`, which cannot even start inside an
-/// `AppContainer`: it dies in `NtCreateDirectoryObject` before it reads
-/// its arguments. Every Windows build that linked anything — every crate
-/// carrying a build script or a proc macro — failed that way, which is
-/// two of the nine target triples producing almost nothing.
+/// rustc's and the `cc` crate's own MSVC lookup runs `vswhere.exe` from a
+/// Program Files tree the sandbox does not grant, so inside the container
+/// it finds nothing on its own; rustc would link with the first `link.exe`
+/// on PATH, which on a GitHub Windows runner is Git for Windows' msys
+/// `link`, and `cc` would compile with the first `cl.exe` on PATH. Both
+/// read the developer-prompt variables instead (`find_msvc_tools`): with
+/// `VCINSTALLDIR` set, a tool asked for an architecture other than
+/// `VSCMD_ARG_TGT_ARCH` gets that architecture's tool directory, `LIB`,
+/// `INCLUDE` and `PATH` derived from `VSINSTALLDIR` and placed ahead of
+/// the inherited ones. The host's variables therefore serve every
+/// host-side link — build scripts and proc macros — while a link or a C
+/// compile for the task's target, a `cdylib`'s DLL or a build script's
+/// `cc` call, sees the target's own tools and libraries.
 ///
-/// A build script's `cc` call hits the same wall: the `cc` crate's own
-/// MSVC lookup cannot run inside the sandbox, and it falls back to the
-/// first `cl.exe` on PATH — the host's — so an arm64 task compiled its C
-/// sources for x86-64 and archived the objects into the artifact
-/// (stow#708). The target's own `cl.exe` and `lib.exe` therefore go in
-/// through the `cc` crate's per-target `CC_<target>`/`CXX_<target>`/
-/// `AR_<target>` variables, with the compiler's directory appended to
-/// PATH and granted to the sandbox.
-///
-/// Resolving all of it out here and handing the answer in costs one
-/// lookup per tool and keeps rustc's own behaviour for the linker: it is
-/// found on PATH, with `LIB` and `INCLUDE` pointing at the CRT and the
-/// Windows SDK.
+/// The target's `cl.exe`, `lib.exe` and `link.exe` are resolved here as
+/// well, so a task whose target toolchain is not installed fails naming
+/// the missing tool rather than building for the wrong machine.
 #[derive(Debug, Default)]
 pub struct MsvcToolchain {
-    /// `PATH`, `LIB`, `INCLUDE` and the `cc` crate's per-target
-    /// `CC_<target>`/`CXX_<target>`/`AR_<target>` as the toolchain needs
-    /// to see them, already composed with this process's own values.
+    /// The developer-prompt variables — `PATH`, `LIB`, `INCLUDE`, the
+    /// install roots, `VSCMD_ARG_TGT_ARCH` and the Windows SDK location —
+    /// composed with this process's own values. Empty when this process
+    /// already runs in a developer prompt, whose variables the sandbox
+    /// then passes through.
     pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
-    /// The host linker's own directory, which holds the DLLs it loads.
-    bin_dir: Option<PathBuf>,
-    /// The target compiler's own directory — the host linker's when the
-    /// task's machine is the host's.
-    compiler_dir: Option<PathBuf>,
+    /// The directories the host's and the target's lookups read or run
+    /// from.
+    grants: Vec<(PathBuf, Access, &'static str)>,
 }
 
 impl MsvcToolchain {
     /// Look the toolchain up for a task on `target`.
     ///
-    /// The linker is always the host architecture's — a dependency
-    /// crate's own units are rlibs and never reach a linker, so the only
-    /// linking a cross task does is its build scripts and proc macros —
-    /// while the compiler and archiver are `target`'s own, resolved only
-    /// when `target` spells `-windows-msvc`; a `-windows-msvc` task whose
-    /// target toolchain is not installed fails here, because its C
-    /// sources would otherwise silently come out for the wrong machine.
-    /// Empty on every non-Windows host; on a Windows host a missing host
-    /// linker still only warns, and the build fails on its own terms
-    /// rather than on a missing grant.
+    /// The environment and the grants come from `stow_cli::msvc`, the
+    /// code the CLI's own sandbox uses. When `target` spells
+    /// `-windows-msvc` its `cl.exe`, `lib.exe` and `link.exe` must exist
+    /// — a task whose target toolchain is not installed fails here naming
+    /// the tool, because its C sources and its DLLs would otherwise come
+    /// out for the wrong machine — and the grants cover the directories
+    /// of the target's lookup as well as the host's. Empty on every
+    /// non-Windows host; on a Windows host with no MSVC installation for
+    /// the host architecture a non-MSVC task still only warns.
+    ///
+    /// # Errors
+    ///
+    /// A `-windows-msvc` target missing one of its tools, or a host
+    /// linker outside the Visual Studio 2017+ layout.
     #[cfg(windows)]
     pub fn resolve(target: &str) -> stow_types::error::Result<Self> {
-        let tool = find_msvc_tools::find_tool(std::env::consts::ARCH, "link.exe");
-        let mut toolchain = match tool {
-            Some(tool) => {
-                let bin_dir = tool.path().parent().map(Path::to_path_buf);
-                tracing::debug!(linker = %tool.path().display(), "resolved the MSVC linker for the sandbox");
-                Self {
-                    env: tool.env().into_iter().cloned().collect(),
-                    bin_dir,
-                    compiler_dir: None,
+        let mut lookups = vec![std::env::consts::ARCH];
+        if target.ends_with("-windows-msvc") {
+            for tool in ["cl.exe", "lib.exe", "link.exe"] {
+                if find_msvc_tools::find_tool(target, tool).is_none() {
+                    return Err(stow_types::stow_error!(
+                        "no MSVC toolchain for {target} is installed on this builder: \
+                         {tool} was not found; its C sources and its linked outputs \
+                         would be built for the host's machine"
+                    ));
                 }
             }
-            None => {
-                tracing::warn!(
-                    arch = std::env::consts::ARCH,
-                    "no MSVC installation found for the host; a sandboxed build that links will fail"
-                );
-                Self::default()
-            }
-        };
-        if target.ends_with("-windows-msvc") {
-            let cl = find_msvc_tools::find_tool(target, "cl.exe").ok_or_else(|| {
-                stow_types::stow_error!(
-                    "no MSVC C toolchain for {target} is installed on this builder: \
-                     cl.exe was not found; its C sources would be compiled by the \
-                     host's compiler"
-                )
-            })?;
-            let lib = find_msvc_tools::find_tool(target, "lib.exe").ok_or_else(|| {
-                stow_types::stow_error!(
-                    "no MSVC C toolchain for {target} is installed on this builder: \
-                     lib.exe was not found; its C sources would be compiled by the \
-                     host's compiler"
-                )
-            })?;
-            let (cl_path, lib_path) = (cl.path(), lib.path());
-            toolchain.env.push((
-                cc_target_var("CC", target).into(),
-                cl_path.as_os_str().to_owned(),
-            ));
-            toolchain.env.push((
-                cc_target_var("CXX", target).into(),
-                cl_path.as_os_str().to_owned(),
-            ));
-            toolchain.env.push((
-                cc_target_var("AR", target).into(),
-                lib_path.as_os_str().to_owned(),
-            ));
-
-            let compiler_dir = cl_path.parent().map(Path::to_path_buf);
-            // One PATH entry: the host lookup's composed value, or this
-            // process's own when it came back empty. The compiler's
-            // directory goes last so a `link.exe` or `cl.exe` lookup by
-            // name still resolves to the host's, and is skipped entirely
-            // when it is the host's own bin directory — a native x64
-            // task.
-            let mut dirs: Vec<PathBuf> = match toolchain
-                .env
-                .iter()
-                .find(|(key, _)| env_name::eq(key, "PATH"))
-            {
-                Some((_, value)) => std::env::split_paths(value).collect(),
-                None => std::env::var_os("PATH")
-                    .map(|value| std::env::split_paths(&value).collect())
-                    .unwrap_or_default(),
-            };
-            if let Some(dir) = &compiler_dir
-                && toolchain.bin_dir.as_ref() != Some(dir)
-            {
-                dirs.push(dir.clone());
-            }
-            let path = std::env::join_paths(&dirs).map_err(|error| {
-                stow_types::stow_error!("compose the sandbox PATH for {target}: {error}")
-            })?;
-            match toolchain
-                .env
-                .iter_mut()
-                .find(|(key, _)| env_name::eq(key, "PATH"))
-            {
-                Some((_, value)) => *value = path,
-                None => toolchain.env.push(("PATH".into(), path)),
-            }
-            toolchain.compiler_dir = compiler_dir;
+            lookups.push(target);
         }
-        Ok(toolchain)
+        let env = stow_cli::msvc::developer_environment()?;
+        let grants = stow_cli::msvc::toolchain_grants(&lookups);
+        tracing::debug!(
+            task_target = target,
+            variables = env.len(),
+            grants = grants.len(),
+            "resolved the MSVC developer environment for the sandbox"
+        );
+        Ok(Self { env, grants })
     }
 
     // The signature is the Windows one's so call sites compile the same
@@ -2519,26 +2455,11 @@ impl MsvcToolchain {
         Ok(Self::default())
     }
 
-    /// Directories the sandbox must reach: the linker's own, the target
-    /// compiler's, and every library or include directory it searches.
+    /// Directories the sandbox must reach: those the host's and the
+    /// target's tool lookups read or run from, and every library or
+    /// include directory the handed-in environment names.
     fn grants(&self) -> Vec<(PathBuf, Access, &'static str)> {
-        let mut grants = Vec::new();
-        if let Some(bin_dir) = self.bin_dir.clone() {
-            grants.push((
-                bin_dir,
-                Access::READ | Access::EXEC,
-                "the MSVC linker and the DLLs it loads from its own directory",
-            ));
-        }
-        if let Some(compiler_dir) = self.compiler_dir.clone()
-            && self.bin_dir.as_ref() != Some(&compiler_dir)
-        {
-            grants.push((
-                compiler_dir,
-                Access::READ | Access::EXEC,
-                "the MSVC compiler and archiver for the task's target",
-            ));
-        }
+        let mut grants = self.grants.clone();
         for (key, value) in &self.env {
             if key != "LIB" && key != "INCLUDE" {
                 continue;
@@ -2553,13 +2474,6 @@ impl MsvcToolchain {
         }
         grants
     }
-}
-
-/// The `cc` crate's per-target environment variable spelling:
-/// `CC_aarch64_pc_windows_msvc` for `aarch64-pc-windows-msvc`.
-#[cfg(windows)]
-fn cc_target_var(prefix: &str, target: &str) -> String {
-    format!("{prefix}_{}", target.replace('-', "_"))
 }
 
 /// The directory PATH resolves `name` from, if any.
@@ -4071,12 +3985,14 @@ checksum = "33"
     ///
     /// One sandboxed `cargo build` over the probe crate rooted at `root` —
     /// the same shape `run_sandboxed_phase` drives, minus the capture
-    /// drain. `extra_env` lands on the command after `msvc`'s entries.
+    /// drain. `cargo_args` follow `build --offline --quiet`; `extra_env`
+    /// lands on the command after `msvc`'s entries.
     async fn cargo_build_probe(
         root: &Path,
         target_dir: &Path,
         msvc: &super::MsvcToolchain,
         target: &str,
+        cargo_args: &[&str],
         extra_env: &[(String, String)],
         cargo_home: &Path,
     ) {
@@ -4120,6 +4036,7 @@ checksum = "33"
         let mut command = sandbox
             .command("cargo")
             .args(["build", "--offline", "--quiet"])
+            .args(cargo_args.iter().copied())
             // The phase command pins both, and cargo then ignores what
             // the cargo home configures for them. With no shim to name,
             // the empty wrapper is cargo's spelling of "none".
@@ -4187,64 +4104,143 @@ checksum = "33"
             let host = host_triple();
             let msvc = super::MsvcToolchain::resolve(&host).expect("MSVC toolchain");
             let cargo_home = cargo_home().expect("cargo home");
-            cargo_build_probe(root, target_dir.path(), &msvc, &host, &[], &cargo_home).await;
+            cargo_build_probe(root, target_dir.path(), &msvc, &host, &[], &[], &cargo_home).await;
         });
     }
 
-    /// Two shapes that broke on Windows, in one build. A build script is
-    /// a host binary, so compiling one runs the linker, and the sandboxed
-    /// rustc could not find MSVC's. It picked up Git for Windows' msys
-    /// `link` instead, which cannot start inside an `AppContainer` at
-    /// all — every Windows build of every crate carrying a build script
-    /// or a proc macro failed, and nothing in the test suite noticed
-    /// because the only sandbox test was Unix-only.
+    /// `Machine` field of the COFF file header: `IMAGE_FILE_MACHINE_AMD64`.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+
+    /// `Machine` field of the COFF file header: `IMAGE_FILE_MACHINE_ARM64`.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    const IMAGE_FILE_MACHINE_ARM64: u16 = 0xAA64;
+
+    /// The `Machine` field of a PE image's COFF file header: the PE
+    /// signature's offset is the `u32` at 0x3C (`e_lfanew`), and the
+    /// field is the `u16` right after the four signature bytes
+    /// `PE\0\0`.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn pe_machine(path: &Path) -> u16 {
+        let bytes = std::fs::read(path).unwrap_or_else(|error| panic!("read {path:?}: {error}"));
+        let offset = u32::from_le_bytes(
+            bytes[0x3C..0x40]
+                .try_into()
+                .expect("e_lfanew is four bytes"),
+        ) as usize;
+        assert_eq!(
+            &bytes[offset..offset + 4],
+            b"PE\0\0",
+            "{path:?} has no PE signature at {offset:#x}"
+        );
+        u16::from_le_bytes([bytes[offset + 4], bytes[offset + 5]])
+    }
+
+    /// The `Machine` field a COFF object file starts with: no DOS stub,
+    /// so the file header is at offset 0.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn coff_object_machine(path: &Path) -> u16 {
+        let bytes = std::fs::read(path).unwrap_or_else(|error| panic!("read {path:?}: {error}"));
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    }
+
+    /// The `find-msvc-tools` source the registry holds — what a build
+    /// script depends on to ask the lookup the `cc` crate asks.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn registry_find_msvc_tools(cargo_home: &Path) -> PathBuf {
+        let mut found = Vec::new();
+        for index in std::fs::read_dir(cargo_home.join("registry").join("src"))
+            .expect("read the cargo registry sources")
+        {
+            for source in std::fs::read_dir(index.expect("registry index entry").path())
+                .expect("read a registry index directory")
+            {
+                let source = source.expect("registry source entry").path();
+                if source
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("find-msvc-tools-"))
+                {
+                    found.push(source);
+                }
+            }
+        }
+        found.sort();
+        found
+            .pop()
+            .expect("the cargo registry holds no find-msvc-tools source")
+    }
+
+    /// What a cross `-windows-msvc` task sees inside the phase sandbox.
+    /// It runs on an x64 host for `aarch64-pc-windows-msvc`, one
+    /// sandbox for all of it because a sandbox of its own grants the
+    /// machine's toolchain trees to one more container, which takes
+    /// minutes there.
     ///
-    /// stow#708 is the half the linker fix does not reach: inside the
-    /// sandbox the `cc` crate's own MSVC lookup comes up empty the same
-    /// way rustc's does, and a build script that compiles C for the
-    /// task's target then falls back to the first `cl.exe` on PATH —
-    /// the host's. `MsvcToolchain` answers by naming the target's own
-    /// compiler in `CC_<target>`; the probe uses exactly that variable,
-    /// the way `cc` resolves it, and the object it leaves behind must be
-    /// an ARM64 COFF (`IMAGE_FILE_MACHINE_ARM64`, `0xAA64`
-    /// little-endian).
-    #[cfg(windows)]
+    /// The probe crate declares `crate-type = ["cdylib", "rlib"]`, so
+    /// rustc links a DLL for ARM64 with the target's `link.exe` and its
+    /// CRT and Windows SDK libraries (the failure of stow#1421: the
+    /// host's `LIB` made `link.exe` take the x64 import libraries),
+    /// while its build script is a host binary linked for x64 — and
+    /// that build script, like the `cc` crate, asks `find_msvc_tools`
+    /// for the target's `cl.exe` with no `CC_<target>` set (the failure
+    /// of stow#708, where the host's `cl.exe` answered and an arm64
+    /// task compiled C for x86-64) and compiles a C file with it. Both
+    /// the sandbox's `PATH` and its linker environment come from
+    /// `MsvcToolchain`, which also keeps Git for Windows' msys `link`
+    /// — unable to start inside an `AppContainer` — from being the
+    /// linker rustc picks.
+    #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
-    fn the_target_c_compiler_runs_inside_the_phase_sandbox() {
+    fn a_cross_msvc_task_links_and_compiles_for_its_target_inside_the_phase_sandbox() {
         smol::block_on(async {
+            const TARGET: &str = "aarch64-pc-windows-msvc";
+            let cargo_home = cargo_home().expect("cargo home");
             let workspace_root = TempDir::new().expect("workspace root");
             let root = workspace_root.path();
             std::fs::create_dir_all(root.join("src")).expect("src dir");
             std::fs::write(
                 root.join("Cargo.toml"),
-                "[package]\nname = \"stow-sandbox-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+                format!(
+                    "[package]\nname = \"stow-sandbox-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
+                     [lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n\n\
+                     [build-dependencies]\nfind-msvc-tools = {{ path = '{}' }}\n",
+                    registry_find_msvc_tools(&cargo_home).display()
+                ),
             )
             .expect("write manifest");
-            std::fs::write(root.join("src/lib.rs"), "pub fn probe() {}\n").expect("write lib");
+            std::fs::write(
+                root.join("src/lib.rs"),
+                "#[unsafe(no_mangle)]\npub extern \"C\" fn stow_probe() -> u32 {\n    7\n}\n",
+            )
+            .expect("write lib");
             std::fs::write(
                 root.join("probe.c"),
                 "#include <stdint.h>\n#include <string.h>\nuint32_t probe(const char *s) { return (uint32_t)strlen(s); }\n",
             )
             .expect("write probe.c");
-            // The build script takes the compiler the toolchain env
-            // names — `cc` reads `CC_<target>` the same way — compiles
-            // the probe with it, and parks the object where the test can
-            // check what machine it was built for.
+            // The build script asks the lookup the `cc` crate asks for
+            // the target's compiler, compiles the probe with it, and
+            // parks the object where the test can check what machine it
+            // was built for.
             std::fs::write(
                 root.join("build.rs"),
                 r#"fn main() {
-    let compiler = std::env::var("CC_aarch64_pc_windows_msvc")
-        .expect("CC_aarch64_pc_windows_msvc is not set");
+    let target = std::env::var("TARGET").expect("TARGET is not set");
+    let mut compiler = find_msvc_tools::find_tool(&target, "cl.exe")
+        .unwrap_or_else(|| panic!("no cl.exe found for {target}"))
+        .to_command();
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is not set");
     let object = std::path::Path::new(&out_dir).join("probe.obj");
-    let output = std::process::Command::new(&compiler)
+    compiler
         .args(["/nologo", "/c", "probe.c"])
-        .arg(format!("/Fo{}", object.display()))
+        .arg(format!("/Fo{}", object.display()));
+    let output = compiler
         .output()
-        .unwrap_or_else(|error| panic!("run {compiler}: {error}"));
+        .unwrap_or_else(|error| panic!("run {compiler:?}: {error}"));
     assert!(
         output.status.success(),
-        "{compiler} failed:\nstderr: {}\nstdout: {}",
+        "{compiler:?} failed:\nstderr: {}\nstdout: {}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout),
     );
@@ -4257,14 +4253,14 @@ checksum = "33"
 
             let target_dir = TempDir::new().expect("target dir");
             let probe_object = target_dir.path().join("probe.obj");
-            let msvc = super::MsvcToolchain::resolve("aarch64-pc-windows-msvc")
-                .expect("resolve the arm64 MSVC toolchain");
-            let cargo_home = cargo_home().expect("cargo home");
+            let msvc =
+                super::MsvcToolchain::resolve(TARGET).expect("resolve the arm64 MSVC toolchain");
             cargo_build_probe(
                 root,
                 target_dir.path(),
                 &msvc,
-                "aarch64-pc-windows-msvc",
+                TARGET,
+                &["--target", TARGET],
                 &[(
                     "STOW_PROBE_OBJECT".to_owned(),
                     super::path_arg(&probe_object).expect("utf8 probe path"),
@@ -4272,10 +4268,55 @@ checksum = "33"
                 &cargo_home,
             )
             .await;
-            let bytes = std::fs::read(&probe_object).expect("read the probe object");
-            assert!(
-                bytes.len() >= 2 && bytes[..2] == [0x64, 0xAA],
-                "probe.obj must be an ARM64 COFF object; its first bytes are {bytes:02x?}"
+
+            assert_eq!(
+                coff_object_machine(&probe_object),
+                IMAGE_FILE_MACHINE_ARM64,
+                "probe.obj must be an ARM64 COFF object"
+            );
+            let dll = target_dir
+                .path()
+                .join(TARGET)
+                .join("debug")
+                .join("stow_sandbox_probe.dll");
+            assert_eq!(
+                pe_machine(&dll),
+                IMAGE_FILE_MACHINE_ARM64,
+                "the cdylib must be linked for ARM64"
+            );
+            // Cargo keeps a build script, a host artifact, under
+            // `debug/build/<package>-<hash>/` even with `--target`.
+            let build_scripts: Vec<PathBuf> =
+                std::fs::read_dir(target_dir.path().join("debug").join("build"))
+                    .expect("read the build directory")
+                    .map(|entry| entry.expect("build directory entry").path())
+                    .filter(|dir| {
+                        dir.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("stow-sandbox-probe-"))
+                    })
+                    .flat_map(|dir| {
+                        std::fs::read_dir(dir)
+                            .expect("read a build script directory")
+                            .map(|entry| entry.expect("build script entry").path())
+                    })
+                    .filter(|path| {
+                        path.extension().is_some_and(|extension| extension == "exe")
+                            && path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| name.starts_with("build_script_build-"))
+                    })
+                    .collect();
+            assert_eq!(
+                build_scripts.len(),
+                1,
+                "expected one build script executable, found {build_scripts:?}"
+            );
+            assert_eq!(
+                pe_machine(&build_scripts[0]),
+                IMAGE_FILE_MACHINE_AMD64,
+                "the build script is a host binary and must be linked for x64"
             );
         });
     }
