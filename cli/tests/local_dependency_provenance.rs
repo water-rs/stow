@@ -35,8 +35,8 @@ use build_fixture::{
 };
 
 /// The debug event `must_build_locally` emits when a linked `--extern`
-/// artifact is already locally built, emitted in the supervisor, which
-/// lives inside the `stow-cli` process this test drives.
+/// artifact is already locally built, emitted in the session, whose events
+/// the daemon routes to the `stow-cli` process this test drives.
 fn compiled_behind_local_dependency(stderr: &str, crate_name: &str) -> bool {
     let crate_name = format!("crate_name={crate_name} ");
     stderr.lines().any(|line| {
@@ -126,7 +126,7 @@ fn a_renamed_dependency_compiled_locally_sends_its_consumer_local() {
     let edge_url = refused_url();
     let registry_url = refused_url();
     let cache = support::tempdir().expect("cache dir");
-    // `stow_cli=debug` puts the supervisor's per-unit decisions on this
+    // `stow_cli=debug` puts the session's per-unit decisions on this
     // stderr, where the test can read which rule sent each unit local.
     let build = |target: &Path, label: &str| {
         let output = stow_build_in_with_env(

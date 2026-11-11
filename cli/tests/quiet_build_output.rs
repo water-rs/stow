@@ -2,7 +2,7 @@
 //! line, and nothing else (stow#633).
 //!
 //! Served units used to leak three raw rustc artifact-notification JSON
-//! lines each — written by the supervisor process, so cargo never saw
+//! lines each — written by stow itself, so cargo never saw
 //! them either — plus per-unit `INFO` lines and a per-attempt `WARN` for
 //! every retry of the unreachable registry. The notifications now travel
 //! with the serve decision to the facade cargo spawned, and the default

@@ -232,8 +232,9 @@ pub fn stow_build_command(
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_TARGET_DIR", target_dir)
         // The default filter, whatever the developer's shell exports: the
-        // supervisor runs in this process, so the warnings it logs are on
-        // this stderr, where a test can assert on them (stow#619).
+        // daemon routes a session's events to the driver, so the warnings
+        // it logs are on this stderr, where a test can assert on them
+        // (stow#619).
         .env_remove("RUST_LOG")
         // Level markers and cargo's status lines are asserted on as
         // plain text, whatever colour the environment asks for.

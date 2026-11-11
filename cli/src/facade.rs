@@ -6,7 +6,7 @@
 //! semver-compatible upgrade could serve when semantic fallback is on. The
 //! build's background analysis replaces it once the fresh index slice and
 //! the exact dependency graph land — work that runs while cargo builds
-//! (stow#347). The supervisor's plan path reads the current map: a
+//! (stow#347). The session's plan path reads the current map: a
 //! registry unit it does not cover compiles without a lookup.
 
 use std::sync::Arc;
@@ -123,7 +123,7 @@ impl ServeMapSignal {
         }
     }
 
-    /// A signal already final — the at-once answer a supervisor with no
+    /// A signal already final — the at-once answer a session with no
     /// pending map to wait on gives.
     #[must_use]
     pub fn settled() -> Self {

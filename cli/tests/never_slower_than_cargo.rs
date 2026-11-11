@@ -687,7 +687,7 @@ fn a_tripped_circuit_still_serves_local_entries() {
 /// which name no crate at all.
 #[cfg(unix)]
 #[derive(Debug, Default)]
-struct StubSupervision {
+struct StubCensus {
     plans: std::collections::BTreeMap<String, usize>,
     compiled: std::collections::BTreeMap<String, usize>,
     /// Connections accepted but not yet drained to their close — the
@@ -701,7 +701,7 @@ struct StubSupervision {
 #[cfg(unix)]
 #[derive(Debug, Default)]
 struct StubDaemon {
-    census: std::sync::Mutex<StubSupervision>,
+    census: std::sync::Mutex<StubCensus>,
     drained: std::sync::Condvar,
 }
 
@@ -727,7 +727,7 @@ fn frame_crate_name(request: &Request) -> String {
 #[cfg(unix)]
 fn serve_stub_connection(
     mut stream: std::os::unix::net::UnixStream,
-    counts: &std::sync::Mutex<StubSupervision>,
+    counts: &std::sync::Mutex<StubCensus>,
 ) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
     // The connection's first frame names its role; the stub serves

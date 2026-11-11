@@ -2,10 +2,10 @@
 //! exits (stow#618).
 //!
 //! An all-miss build used to lose its tail two ways: the last unit's
-//! store was cancelled when the runtime dropped the supervisor's
+//! store was cancelled when the runtime dropped the session's
 //! connection tasks, and a dependent whose bookkeeping ran before its
 //! dependency's skipped its store silently. Both are fixed — the
-//! supervisor drains its connections, and a post-compile waits for the
+//! session drains its connections, and a post-compile waits for the
 //! in-flight units its `--extern` set names — so the count is the whole
 //! set every time.
 

@@ -326,8 +326,8 @@ pub async fn plan_compile(
 }
 
 /// The standalone decision, made in the wrapper process itself: look the
-/// key up, record the hit and serve it. A supervised build never calls
-/// this — its daemon owns the lookup and the records.
+/// key up, record the hit and serve it. A session never calls this —
+/// its daemon owns the lookup and the records.
 pub async fn try_compile(
     config: &StowConfig,
     compiler: &ResolvedCompiler,
@@ -539,7 +539,7 @@ pub fn cached_object_path(config: &StowConfig, cache_key: &str) -> PathBuf {
     cc_cache_path(config, cache_key)
 }
 
-/// The records a supervised C compile leaves for the daemon to write once
+/// The records a session's C compile leaves for the daemon to write once
 /// the wrapper has its answer: they cost the wrapper — and the job slot
 /// cargo holds for it — nothing.
 pub enum CcRecord {
@@ -642,7 +642,7 @@ fn clone_or_copy_file(source: &std::fs::File, destination: &Path) -> std::io::Re
 /// descriptor's own real path must lie under one of `roots`, the build's
 /// target and build directories: a wrapper cannot name a file the sandbox
 /// keeps from it, or a link through those directories to one, and have
-/// the supervisor read it for the cache the sandbox can read.
+/// the session read it for the cache the sandbox can read.
 ///
 /// # Errors
 /// The reason the report is refused, naming the path.
@@ -692,7 +692,7 @@ pub fn open_reported_output(path: &Path, roots: &[PathBuf]) -> Result<std::fs::F
 #[cfg(unix)]
 fn open_without_following(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    // `O_NONBLOCK` keeps the open of a FIFO from hanging the supervisor;
+    // `O_NONBLOCK` keeps the open of a FIFO from hanging the session;
     // the regular-file check refuses it right after.
     std::fs::OpenOptions::new()
         .read(true)

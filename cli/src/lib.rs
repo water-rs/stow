@@ -209,7 +209,7 @@ fn run_command() -> stow_types::error::Result<std::process::ExitStatus> {
             // runtime instead waits for whatever is still running on it —
             // a build sat out a trust-store scan that way (stow#624) — so
             // what a command owes, its main future awaits, the way the
-            // supervisor's drain does (stow#618).
+            // session's drain does (stow#618).
             runtime.shutdown_background();
             result
         })
@@ -457,7 +457,7 @@ fn must_build_locally(
 /// facade has not exited and rustc has not run.
 ///
 /// Splitting the decision from its execution is what lets the same code
-/// answer a facade over the supervisor socket and run standalone under a
+/// answer a facade over its session's socket and run standalone under a
 /// plain `cargo build`.
 enum Outcome {
     /// The unit's outputs are in the target directory. The payload is
@@ -479,7 +479,7 @@ pub struct PostCompile {
     /// command line it does not understand. There is nothing to record.
     parsed: Option<rustc_args::ParsedRustcArgs>,
     /// The invocation's environment as the deciding process learned it —
-    /// the `Plan`/`Observed` frame's values under a supervised build, this
+    /// the `Plan`/`Observed` frame's values under a session, this
     /// process's own under a standalone one.
     env: daemon::wrapper::InvocationEnv,
     /// How long the real rustc ran, set once it has: the compile time a later
@@ -823,7 +823,7 @@ fn wrapped_crate_name(args: &[OsString]) -> Option<String> {
     None
 }
 
-/// The build-scoped facts a supervisor cannot read from its own
+/// The build-scoped facts a session cannot read from its own
 /// environment: every `STOW_*` variable `run_cargo` sets travels on
 /// cargo's environment to the facades, while the deciding process — the
 /// `stow` that spawned cargo — has only its own. The driver passes them
@@ -851,7 +851,7 @@ pub(crate) struct BuildContext {
     /// its own lookups and stores where they happen.
     pub(crate) cache: crate::config::CacheLayers,
     /// The facts the full graph analysis contributes once it lands. A
-    /// supervised build starts the cell empty — the driver's analysis
+    /// session starts the cell empty — the driver's analysis
     /// runs while cargo builds and commits it — while the standalone
     /// wrapper's cell is already filled from the environment that
     /// invoked it (stow#347). Until it is set, the plan path answers as
@@ -867,39 +867,39 @@ pub(crate) struct BuildContext {
     /// fetch has settled" signal the
     /// slice memo's missing-slice read (stow#735) and pending-slice
     /// miss retry (stow#797) wait on: `run_cargo` shares the
-    /// enrichment's with the supervisor and completes it itself when no
+    /// enrichment's with the session and completes it itself when no
     /// fetch is in flight; the standalone wrapper's settles by
     /// construction — a driver with no pending map answers at once
     /// (stow#347).
     pub(crate) serve_map_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
     /// The "the cache policy's allow set is committed" signal the plan
     /// path waits on when an invocation's marker is absent
-    /// (stow#788): armed pending only while a supervised build's
+    /// (stow#788): armed pending only while a session's
     /// deferred enrichment still owes the policy directory its coarse
     /// commit, released by the commit itself or by the guard that
     /// drops with a failed or aborted enrichment. The standalone
     /// wrapper's settles by construction — no commit is coming.
     pub(crate) policy_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
-    /// The build's in-flight local compiles, shared with the supervisor:
+    /// The build's in-flight local compiles, shared with the session:
     /// a post-compile waits on the ones its `--extern` set names before
     /// reading their `materialized_outputs` rows (stow#618). The
     /// standalone wrapper's is empty — its invocations have no other
     /// connections to order against.
     pub(crate) in_flight: crate::daemon::session::handler::InFlightUnits,
     /// How this build tells a crates.io package from another registry's —
-    /// the workspace's `Cargo.lock` for a supervised build, the cargo
+    /// the workspace's `Cargo.lock` for a session, the cargo
     /// config's source table for the standalone wrapper (stow#1006).
     /// Lazily resolved for the standalone wrapper: the cargo-config load
     /// only runs when a registry slot is actually classified, never for
-    /// a path or git unit. A supervised build seeds it with the
+    /// a path or git unit. A session seeds it with the
     /// lockfile's answer.
     pub(crate) registry_sources: std::sync::OnceLock<RegistrySources>,
 }
 
 impl BuildContext {
     /// The source map this build classifies registry slots against: the
-    /// map the cell was seeded with — the lockfile's for a supervised
-    /// build — else the cargo-config host rule the standalone wrapper
+    /// map the cell was seeded with — the lockfile's for a session —
+    /// else the cargo-config host rule the standalone wrapper
     /// lives on.
     ///
     /// # Errors
@@ -925,7 +925,7 @@ impl BuildContext {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) enum RegistrySources {
     /// The `(package, version)` → registry-source map `Cargo.lock`
-    /// records — a supervised build's authoritative answer, but read
+    /// records — a session's authoritative answer, but read
     /// before cargo runs: a build that rewrites the lockfile can leave
     /// it stale, so the extraction slot's index directory against
     /// `crates_io_hosts` is always checked too. A replaced crates.io
@@ -952,7 +952,7 @@ pub(crate) enum RegistrySources {
 }
 
 impl RegistrySources {
-    /// The map a supervised build's `Cargo.lock` at `workspace_root`
+    /// The map a session's `Cargo.lock` at `workspace_root`
     /// carries. A missing lockfile degrades to the cargo-config rule —
     /// cargo writes it during this very build, so absence is a defined
     /// state, same answer `lockfile_registry_packages` gives. A
@@ -1227,7 +1227,7 @@ impl Default for Latch {
 
 /// The build's "cargo's resolution is over" signal.
 ///
-/// The supervisor completes it on the first facade frame that
+/// The session completes it on the first facade frame that
 /// describes a real compile unit — by then cargo holds only the shared
 /// package-cache lock, so the in-build enrichment's own `--unit-graph`
 /// cargo may take the exclusive one without queuing the user's build
@@ -1307,7 +1307,7 @@ impl BuildContext {
             serve_map: crate::facade::ServeMapView::absent(),
             serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
             policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
-            // No supervisor shares a standalone invocation's registry —
+            // No session shares a standalone invocation's registry —
             // the wait finds nothing and returns at once.
             in_flight: crate::daemon::session::handler::InFlightUnits::default(),
             registry_sources: std::sync::OnceLock::new(),
@@ -1428,7 +1428,7 @@ async fn delegate_to_daemon(
 }
 
 /// Decide and execute in this process: the configuration that has no
-/// supervisor to ask.
+/// session to ask.
 async fn run_rustc_standalone(
     command: &WrapperCommandArgs,
     state_db: &StateDb,
@@ -1457,7 +1457,7 @@ async fn run_rustc_standalone(
             return run_passthrough_status(&command.executable, &[], &command.wrapped_args).await;
         }
     };
-    // No supervising stow owns this build's misses: the wrappers
+    // No session owns this build's misses: the wrappers
     // journal them, and the first invocation after the journaling cargo
     // exits kicks the detached drain (stow#317). Checked before the
     // decision so a fully-served build drains too. Misses exist only to
@@ -1527,7 +1527,7 @@ async fn run_rustc_standalone(
 /// Decide one rustc invocation: serve it from the cache, or say it has to
 /// be compiled.
 ///
-/// Runs in the supervisor when there is one, and in the wrapper process
+/// Runs in the session when there is one, and in the wrapper process
 /// itself under a plain `cargo build`. Nothing here exits the process or
 /// runs rustc.
 async fn decide_rustc_invocation(
@@ -1643,8 +1643,8 @@ async fn classify_unit_invocation(
     invocation_env: &daemon::wrapper::InvocationEnv,
 ) -> stow_types::error::Result<UnitClass> {
     // The invocation's own `CARGO_MANIFEST_DIR`, not this process's:
-    // under a supervised build the supervisor's environment is the
-    // driver's. A frame that cannot decode it is a wiring bug, not a
+    // under a session this process is the daemon, whose environment is
+    // not the build's. A frame that cannot decode it is a wiring bug, not a
     // missing value.
     let manifest_dir = invocation_env
         .manifest_dir()
@@ -1907,7 +1907,7 @@ impl SliceIndex {
 /// The pieces of a wrapper environment that cannot change inside one
 /// build — the loaded config (whose pooled state-db handle makes every
 /// later query cheap), the compiling rustc's own probes, and the lease
-/// keeping its local cache dir alive. The build's supervisor holds one
+/// keeping its local cache dir alive. The build's session holds one
 /// for the whole build instead of rediscovering it per rustc invocation.
 #[derive(Debug)]
 pub(crate) struct WrapperEnvBase {
@@ -1932,7 +1932,7 @@ impl WrapperEnvBase {
 }
 
 /// Build-scoped memo for the wrapper environment, over the build's one
-/// toolchain (stow#608). The supervisor owns one for the whole build; a
+/// toolchain (stow#608). The session owns one for the whole build; a
 /// standalone invocation builds a fresh one and gets exactly the one-shot
 /// behavior it always had.
 #[derive(Debug)]
@@ -2231,7 +2231,7 @@ impl WrapperEnvCache {
     }
 
     /// The circuit's tripped state for this build, read once — the
-    /// per-invocation state-db query was the supervisor's busiest query,
+    /// per-invocation state-db query was the session's busiest query,
     /// and the breaker guards transport that has already been decided
     /// once the driver laid the build's coverage down (stow#347).
     async fn circuit_tripped(&self, config: &StowConfig) -> stow_types::error::Result<bool> {
@@ -3154,7 +3154,7 @@ async fn run_cc_wrapper(
     match daemon::client::SessionLink::from_env()
         .map_err(|error| stow_types::stow_error!("{error}"))?
     {
-        Some(link) => run_cc_supervised(&link, &compiler, &command.wrapped_args).await,
+        Some(link) => run_cc_session(&link, &compiler, &command.wrapped_args).await,
         None => run_cc_standalone(&compiler, &command.wrapped_args, state_db).await,
     }
 }
@@ -3164,7 +3164,7 @@ async fn run_cc_wrapper(
 /// the compile itself. The cache lookup, the store, the LRU stamp and the
 /// statistics are the daemon's, against its own state database — this
 /// process never opens one.
-async fn run_cc_supervised(
+async fn run_cc_session(
     link: &daemon::client::SessionLink,
     compiler: &cc::ResolvedCompiler,
     compiler_args: &[OsString],
@@ -3241,7 +3241,7 @@ async fn run_cc_supervised(
 }
 
 /// Decide and execute in this process: the configuration that has no
-/// supervisor to ask.
+/// session to ask.
 async fn run_cc_standalone(
     compiler: &cc::ResolvedCompiler,
     compiler_args: &[OsString],
@@ -5561,7 +5561,7 @@ fn cached_rustc_artifact_notifications(
 
 /// Write the artifact notifications a served decision carried to this
 /// process's own stderr, each line `\n`-terminated and flushed — this is
-/// the process cargo spawned, and the supervisor's notifications travel
+/// the process cargo spawned, and the session's notifications travel
 /// here in the answer because cargo reads them from its child, not from
 /// the build's terminal (stow#633).
 ///
@@ -6108,7 +6108,7 @@ mod tests {
         ));
     }
 
-    /// Cargo's probes reach the supervisor as `Plan` frames — `rustc -vV`
+    /// Cargo's probes reach the session as `Plan` frames — `rustc -vV`
     /// and the `--crate-name ___ --print=file-names` target-info query —
     /// but they run before resolution and must not complete
     /// `ResolutionDone`; only a real compile unit's frame may (stow#608).
@@ -6200,7 +6200,7 @@ mod tests {
         assert!(end.refusals[0].contains("executable"), "{:?}", end.refusals);
     }
 
-    /// Compiling uncached, the supervisor records no refusal, so the
+    /// Compiling uncached, the session records no refusal, so the
     /// build is not failed, and the pending its refused plan carries has
     /// no unit to do bookkeeping for.
     #[tokio::test]
@@ -7488,7 +7488,7 @@ mod tests {
             .expect("list stored crates")
         }
 
-        /// The `BuildContext` a deferred build hands its supervisor when
+        /// The `BuildContext` a deferred build hands its session when
         /// the policy directory is seeded empty and the enrichment still
         /// owes it the coarse allow commit (stow#788).
         fn pending_policy_ctx(
@@ -7659,7 +7659,7 @@ mod tests {
             );
         }
 
-        /// A dependent whose report the supervisor handles while its
+        /// A dependent whose report the session handles while its
         /// dependency is still in flight is stored only once the
         /// dependency's bookkeeping has landed (stow#618).
         #[tokio::test]

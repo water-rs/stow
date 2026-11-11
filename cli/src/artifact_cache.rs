@@ -141,7 +141,7 @@ pub fn outputs_instance_digest<'a>(sha256s: impl IntoIterator<Item = &'a str>) -
 /// resolved to `(crate_name, c_metadata)` pairs. Misses mint only from
 /// the observations of the build that just ran, so an observed unit's
 /// edges name the dep's own identity (stow#317). Observations live in
-/// the build supervisor's memory, or one line per unit in the build's
+/// the build session's memory, or one line per unit in the build's
 /// miss journal — they are never persisted to the state db.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ObservedUnit {

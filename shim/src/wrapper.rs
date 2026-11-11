@@ -290,9 +290,8 @@ fn materialize_in(
 /// Put `executable` at `<base>/<name>.exe`, leaving an identical file alone.
 /// `source_bytes` caches the source read across placements of one executable.
 /// A byte copy is stamped with the source's modification time before it is
-/// renamed into place: the identity a wrapper compares against its
-/// supervisor's is the source's `(len, modified)` — a hard link shares it,
-/// a copy must be given it (stow#645).
+/// renamed into place: the source's `(len, modified)` is the stamp a hard
+/// link shares with it, so a copy must be given it (stow#645).
 #[cfg(windows)]
 fn place_executable(
     base: &Path,

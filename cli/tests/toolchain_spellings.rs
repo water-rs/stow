@@ -1,4 +1,4 @@
-//! The supervisor takes every rustc fact from the build's own resolved
+//! The session takes every rustc fact from the build's own resolved
 //! toolchain and only checks that a request names the build's rustc.
 //!
 //! A refusal fails the build, so a build that succeeds under each way a
@@ -23,7 +23,7 @@ fn rustc_output(args: &[&str]) -> String {
 }
 
 /// Build the fixture once with `args` and `env` and assert it succeeded
-/// without the supervisor refusing anything.
+/// without the session refusing anything.
 fn build_without_refusals(args: &[&str], env: &[(&str, &str)]) {
     let dir = support::tempdir().expect("temp dir");
     let cargo_home = support::tempdir().expect("cargo home");

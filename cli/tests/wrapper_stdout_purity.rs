@@ -35,7 +35,7 @@ fn wrapper_version_output(env: &[(&str, &str)]) -> Vec<u8> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     command.arg("rustc").arg(rustc_path()).arg("-vV");
     // A wrapper invocation reads the stow config and the ambient
-    // supervisor variables — the sealed home and cleared `STOW_*` keep
+    // session variables — the sealed home and cleared `STOW_*` keep
     // the developer's `~/.stow` and shell exports out of it (stow#800).
     let home = support::tempdir().expect("home");
     hermetic_stow_env(

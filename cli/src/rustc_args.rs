@@ -61,7 +61,7 @@ pub async fn rustc_host_target(rustc: &std::ffi::OsStr) -> Result<String, String
 
 /// The raw stdout of one `rustc -vV` — the one probe every rustc-facts
 /// consumer shares (stow#608): the host probe, the version probe and the
-/// supervisor base's facts all come out of this output, so pre-cargo
+/// session base's facts all come out of this output, so pre-cargo
 /// rustc spawns about rustc itself are exactly `-vV` and `--print
 /// sysroot`, run concurrently.
 pub async fn rustc_vv(rustc: &std::ffi::OsStr) -> Result<String, String> {
@@ -175,7 +175,7 @@ async fn sysroot_rustc_executable(rustc: &OsStr) -> Result<OsString, String> {
 }
 
 /// One `rustc -vV` shared by every consumer — the project context's
-/// target and version facts, the supervisor base's facts, and the link
+/// target and version facts, the session base's facts, and the link
 /// resolution's key — so the probe spawns once.
 pub type SharedRustcVv = Shared<BoxFuture<'static, Result<std::sync::Arc<String>, String>>>;
 

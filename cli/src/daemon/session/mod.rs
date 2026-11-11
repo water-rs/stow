@@ -338,7 +338,7 @@ impl Session {
             key: &key_inputs,
         };
         let observations = self.observations();
-        miss_journal::journal_supervised(
+        miss_journal::journal_session(
             &self.facts.build_rustc,
             &consumer,
             &observations,

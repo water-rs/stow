@@ -469,7 +469,7 @@ async fn warn_when_no_index_covers_the_toolchain(config: &StowConfig, project: &
 /// No-slowdown floor, part 2: with no cached coverage for this graph,
 /// every per-rustc wrapper call would look up the same crates and miss,
 /// so behave exactly like cargo — no wrapper, no per-invocation latency.
-/// The exception is a configured build: the supervisor's compile
+/// The exception is a configured build: the session's compile
 /// observations are the build's miss list, minted after cargo finishes
 /// (stow#317), so the wrapper rides even when nothing is servable.
 ///
@@ -490,8 +490,8 @@ async fn run_uncovered_passthrough(
         || analysis.is_some_and(|analysis| !analysis.prefetch_artifacts.is_empty())
         || config.is_some()
     {
-        // With a config the build runs under the supervisor even when
-        // nothing is servable: the supervisor's compile observations are
+        // With a config the build runs as a session even when
+        // nothing is servable: the session's compile observations are
         // the build's miss list, posted once cargo finishes (stow#317).
         return Ok(None);
     }
@@ -853,7 +853,7 @@ pub struct ProjectContext {
     /// probe names (stow#608).
     pub(crate) build_rustc: rustc_args::BuildRustc,
     /// The toolchain of that rustc, resolved once for the build: the
-    /// supervisor takes every rustc fact from it.
+    /// session takes every rustc fact from it.
     pub(crate) toolchain: SharedToolchain,
     /// The hold keeping miss drains' derivation cargo off the
     /// package-cache lock while this command's cargo may need it —
@@ -902,8 +902,8 @@ fn shared_toolchain(
     .shared()
 }
 
-/// A toolchain that never resolves — for a test context no supervisor
-/// is built from, so nothing awaits it.
+/// A toolchain that never resolves — for a test context no session
+/// is opened from, so nothing awaits it.
 #[cfg(test)]
 pub fn pending_toolchain() -> SharedToolchain {
     futures_util::future::pending().boxed().shared()
@@ -940,14 +940,14 @@ struct PendingProjectContext {
     /// `None` for a native (host-triple) build.
     resolved_target: Option<String>,
     /// The one `rustc -vV` every rustc-facts consumer shares — the
-    /// host-triple answer, the release version, the supervisor
+    /// host-triple answer, the release version, the session
     /// base's facts and the link-resolution key — so pre-cargo rustc
     /// spawns about rustc itself are exactly `-vV` and `--print
     /// sysroot`, and they probe the build's rustc (stow#608).
     rustc_vv: crate::rustc_args::SharedRustcVv,
     rustc_version: Shared<BoxFuture<'static, Result<String, String>>>,
     /// The cargo config chain, loaded once here: the link resolution,
-    /// the target chain and the supervisor base all read this one
+    /// the target chain and the session base all read this one
     /// answer rather than re-parsing the same documents (stow#608).
     cargo_config: cargo_config2::Config,
     /// The build's rustc as cargo resolves it — `RUSTC`/`build.rustc`
@@ -992,7 +992,7 @@ impl ProjectContext {
             .map_err(|error| stow_types::stow_error!("resolve cargo build target: {error}"))?;
         let resolved_target = resolved_targets.first().cloned();
         // One `rustc -vV`, shared by every consumer of rustc facts —
-        // the host triple below, the release version, the supervisor
+        // the host triple below, the release version, the session
         // base and the link-resolution key (stow#608).
         let rustc_vv = crate::rustc_args::shared_rustc_vv(build_rustc.executable().to_os_string());
         let target: SharedTargetProbe = resolved_targets.into_iter().next().map_or_else(
@@ -1928,7 +1928,7 @@ async fn cached_consumer_slices(
 /// used — the argv `--cfg` feature set, the real platform (the host
 /// triple for host units, to which cargo passes no `--target`), and
 /// the `--extern` deps as each dep's own recorded identity (stow#317).
-/// The caller owns failure handling: a supervised run leaves the
+/// The caller owns failure handling: a session leaves the
 /// observations in the journal so a later drain retries them; a drain
 /// restores the journal on error.
 /// Mint this build's locally-compiled units as misses: resolve each
@@ -3124,7 +3124,7 @@ async fn prepare_build_cache_plan(
 /// The allow entries a deferred-analysis build starts cargo with: none
 /// yet. They come from the graph analysis, which now runs while cargo
 /// builds and commits them through the enrichment's
-/// `write_policy_entries`; the supervisor and the facades read the
+/// `write_policy_entries`; the session and the facades read the
 /// directory per plan call, so markers land mid-build and gate the units
 /// they name from the write onward (stow#347).
 ///
@@ -3734,7 +3734,7 @@ async fn run_cargo_passthrough(
 }
 
 /// The passthrough's sandboxed form (stow#779): no `RUSTC_WRAPPER`, no
-/// supervisor — the sandbox alone enforces the boundary. At `strict` and
+/// session — the sandbox alone enforces the boundary. At `strict` and
 /// `offline` the dependencies are fetched on the host first and cargo
 /// runs `--offline` inside; at `protect` cargo fetches for itself through
 /// the sandbox's proxy. With no facades there is no IPC router either: an
@@ -4070,8 +4070,8 @@ async fn admit_build_misses(plan: &CargoRunPlan<'_>, config: &StowConfig) {
     } else {
         crate::miss_journal::spawn_drain(&target_dir);
     }
-    // One supervised run is one build the install ran — counted here rather
-    // than by the journal, whose supervised files the drain skips to keep
+    // One session is one build the install ran — counted here rather
+    // than by the journal, whose session files the drain skips to keep
     // the count single.
     crate::report::bump_build(config).await;
 }
@@ -4398,7 +4398,7 @@ fn export_wrapper_env(
 
 /// What the in-build enrichment needs: the project and config the full
 /// analysis resolves, and the three places its answer lands — the
-/// supervisor's fact cell, the serve map its plans read, and the
+/// session's fact cell, the serve map its plans read, and the
 /// policy directory the allow markers gate (stow#347).
 pub struct BuildEnrichment {
     pub(crate) project: ProjectFacts,
@@ -4421,7 +4421,7 @@ pub struct BuildEnrichment {
     /// early return — so a denied unit waits out the commit once, never
     /// the task's whole lifetime (stow#788).
     pub(crate) policy_ready: Option<crate::facade::ServeMapWaiters>,
-    /// Held until the supervisor's first compile-unit frame says
+    /// Held until the session's first compile-unit frame says
     /// cargo's resolution is over: only then may this task's own
     /// `--unit-graph` cargo take the package-cache lock — before that
     /// it would queue the user's real build behind a whole second
@@ -5026,7 +5026,7 @@ mod tests {
             facts: project_facts(),
             env: SessionEnv::of_this_process().expect("the test process's environment"),
             mold: MoldSelection::resolved(Vec::new()),
-            // These tests assemble no supervisor, so nothing awaits it.
+            // These tests open no session, so nothing awaits it.
             toolchain: super::pending_toolchain(),
             build_rustc: crate::rustc_args::BuildRustc::ToolchainDefault,
             foreground: crate::derive_gate::ForegroundHold::detached(),
@@ -5282,11 +5282,11 @@ mod tests {
         );
     }
 
-    /// stow#653: the supervised path's cargo command waits on the same
+    /// stow#653: the session path's cargo command waits on the same
     /// selection — `cargo_command` reads it at assembly like the
     /// passthrough does.
     #[tokio::test]
-    async fn a_supervised_cargo_command_waits_for_the_mold_selection() {
+    async fn a_session_cargo_command_waits_for_the_mold_selection() {
         let (release, mold) = hand_completed_selection();
         let project = ProjectContext {
             mold,
