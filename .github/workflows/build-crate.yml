@@ -14,7 +14,8 @@ run-name: ${{ inputs.repack_rustc != '' && format('{0}-repack', inputs.repack_ru
 #   build   — compiles third-party code. Read-only token, no secrets,
 #             no OIDC. Everything it produces is handed over as a workflow
 #             artifact.
-#   verify-failure — failure path only, under read-only permissions. A fresh
+#   verify-failure — only after a failed build that handed over a candidate
+#             source failure, under read-only permissions. A fresh
 #             sandbox replays the same task and frozen lockfile without cached
 #             artifacts. A successful job certifies matching source diagnostics;
 #             the original build and the workflow still fail.
@@ -88,6 +89,9 @@ jobs:
     name: build ${{ fromJSON(inputs.task).crate_name }} ${{ fromJSON(inputs.task).version }} (${{ fromJSON(inputs.task).target }})
     outputs:
       records-exist: ${{ steps.records-exist.outputs.found }}
+      # Empty unless the failed build stage left a candidate source failure:
+      # the upload sets no artifact id when it finds no file.
+      failure-candidate: ${{ steps.failure-candidate.outputs.artifact-id }}
     runs-on: ${{ fromJSON('{"aarch64-apple-darwin":"macos-26","aarch64-apple-ios":"macos-26","aarch64-apple-ios-sim":"macos-26","aarch64-linux-android":"ubuntu-26.04","x86_64-unknown-linux-gnu":"ubuntu-26.04","aarch64-unknown-linux-gnu":"ubuntu-26.04","x86_64-pc-windows-msvc":"windows-latest","aarch64-pc-windows-msvc":"windows-latest","wasm32-unknown-unknown":"ubuntu-26.04"}')[fromJSON(inputs.task).target] }}
     permissions:
       contents: read
@@ -133,6 +137,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: failure-candidate
         if: failure() && steps.compile.outcome == 'failure'
         with:
           name: failure-candidate-${{ github.run_attempt }}
@@ -177,7 +182,9 @@ jobs:
   verify-failure:
     name: verify source failure
     needs: build
-    if: always() && inputs.repack_rustc == '' && needs.build.result == 'failure'
+    # A build that failed for any other reason has nothing to replay, and a
+    # job that could only fail would hold a runner and keep the run open.
+    if: always() && inputs.repack_rustc == '' && needs.build.result == 'failure' && needs.build.outputs.failure-candidate != ''
     runs-on: ${{ fromJSON('{"aarch64-apple-darwin":"macos-26","aarch64-apple-ios":"macos-26","aarch64-apple-ios-sim":"macos-26","aarch64-linux-android":"ubuntu-26.04","x86_64-unknown-linux-gnu":"ubuntu-26.04","aarch64-unknown-linux-gnu":"ubuntu-26.04","x86_64-pc-windows-msvc":"windows-latest","aarch64-pc-windows-msvc":"windows-latest","wasm32-unknown-unknown":"ubuntu-26.04"}')[fromJSON(inputs.task).target] }}
     permissions:
       contents: read
