@@ -37,8 +37,7 @@ fn build_crate_run_timeout_matches_the_jobs() {
             .and_then(serde_yml::Value::as_i64)
             .expect("every build-crate.yml job sets integer timeout-minutes");
         if condition.starts_with("inputs.repack_rustc == ''")
-            || condition
-                == "always() && inputs.repack_rustc == '' && needs.build.result == 'failure'"
+            || condition.starts_with("always() && inputs.repack_rustc == ''")
         {
             let needs = match job.get("needs") {
                 None => Vec::new(),

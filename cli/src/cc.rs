@@ -281,14 +281,29 @@ pub struct ParsedCcInvocation {
     pub records_working_dir: bool,
 }
 
-pub async fn try_compile(
-    config: &StowConfig,
+/// What a compiler invocation asks of the object cache.
+#[derive(Debug, Clone)]
+pub enum CcPlan {
+    /// Nothing cacheable: a probe, or a mode that yields no object.
+    Passthrough,
+    /// An object keyed by everything that shapes it.
+    Keyed {
+        cache_key: String,
+        output_path: PathBuf,
+    },
+}
+
+/// Parse the invocation and compute its cache key: the compiler runs
+/// twice (`--version`, the preprocessor) and nothing touches the state
+/// database or the cache directory — this is the part of a C compile the
+/// wrapper process owns in every configuration.
+pub async fn plan_compile(
     compiler: &ResolvedCompiler,
     compiler_args: &[OsString],
-) -> stow_types::error::Result<CcOutcome> {
+) -> stow_types::error::Result<CcPlan> {
     let expanded_args = expand_response_args(compiler_args)?;
     let Some(parsed) = ParsedCcInvocation::parse(&expanded_args)? else {
-        return Ok(CcOutcome::Passthrough);
+        return Ok(CcPlan::Passthrough);
     };
     let compiler_fingerprint = compiler_fingerprint(compiler).await?;
     if let Some(depfile) = parsed.depfile.as_ref()
@@ -304,37 +319,75 @@ pub async fn try_compile(
     let preprocessed = preprocess_source(compiler, &parsed).await?;
     let working_dir = std::env::current_dir().wrap_err("read the compiler working directory")?;
     let cache_key = cache_key(&compiler_fingerprint, &parsed, &working_dir, &preprocessed);
-    let cache_path = cc_cache_path(config, &cache_key);
+    Ok(CcPlan::Keyed {
+        cache_key,
+        output_path: parsed.output_path,
+    })
+}
 
+/// The standalone decision, made in the wrapper process itself: look the
+/// key up, record the hit and serve it. A supervised build never calls
+/// this — its daemon owns the lookup and the records.
+pub async fn try_compile(
+    config: &StowConfig,
+    compiler: &ResolvedCompiler,
+    compiler_args: &[OsString],
+) -> stow_types::error::Result<CcOutcome> {
+    let CcPlan::Keyed {
+        cache_key,
+        output_path,
+    } = plan_compile(compiler, compiler_args).await?
+    else {
+        return Ok(CcOutcome::Passthrough);
+    };
+    if let Some(cache_path) = locate_cached_object(config, &cache_key).await? {
+        record_cc_hit(config, &cache_key, &cache_path).await?;
+        serve_cached_object(&cache_path, &output_path).await?;
+        return Ok(CcOutcome::Hit {
+            cache_key,
+            output_path,
+        });
+    }
+    let cache_path = cc_cache_path(config, &cache_key);
+    Ok(CcOutcome::Miss {
+        cache_key,
+        cache_path,
+        output_path,
+    })
+}
+
+/// The stored object at `cache_key`, if there is one. Makes sure the
+/// object directory exists so a later store has somewhere to stage.
+pub async fn locate_cached_object(
+    config: &StowConfig,
+    cache_key: &str,
+) -> stow_types::error::Result<Option<PathBuf>> {
+    let cache_path = cc_cache_path(config, cache_key);
     if let Some(parent) = cache_path.parent() {
         async_fs::create_dir_all(parent)
             .await
             .wrap_err_with(|| format!("create C cache directory {}", parent.display()))?;
     }
+    Ok(cache_path.exists().then_some(cache_path))
+}
 
-    if cache_path.exists() {
-        record_cc_hit(config, &cache_key, &cache_path).await?;
-        if let Some(parent) = parsed.output_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            async_fs::create_dir_all(parent)
-                .await
-                .wrap_err_with(|| format!("create C output directory {}", parent.display()))?;
-        }
-        let source = cache_path.clone();
-        let output = parsed.output_path.clone();
-        smol::unblock(move || serve_cached_object_blocking(&source, &output)).await?;
-        return Ok(CcOutcome::Hit {
-            cache_key,
-            output_path: parsed.output_path,
-        });
+/// Place a stored object at the compiler's output path.
+pub async fn serve_cached_object(
+    cache_path: &Path,
+    output_path: &Path,
+) -> stow_types::error::Result<()> {
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        async_fs::create_dir_all(parent)
+            .await
+            .wrap_err_with(|| format!("create C output directory {}", parent.display()))?;
     }
-
-    Ok(CcOutcome::Miss {
-        cache_key,
-        cache_path,
-        output_path: parsed.output_path,
-    })
+    let source = cache_path.to_path_buf();
+    let output = output_path.to_path_buf();
+    smol::unblock(move || serve_cached_object_blocking(&source, &output))
+        .await
+        .map(|_| ())
 }
 
 fn expand_response_args(args: &[OsString]) -> stow_types::error::Result<Vec<OsString>> {
@@ -394,6 +447,28 @@ pub async fn store_compiled_object(
     cache_path: &Path,
     output_path: &Path,
 ) -> stow_types::error::Result<()> {
+    let staged = stage_compiled_object(cache_path, output_path).await?;
+    publish_staged_object(config, staged).await
+}
+
+/// A compiled object cloned into the C object cache directory, not yet
+/// visible at its cache key: the snapshot a store takes while the
+/// compiler's output is still in place, so the publish and its
+/// bookkeeping can run after the compiler's wrapper has exited.
+pub struct StagedCcObject {
+    cache_key: String,
+    staged: StagedObject,
+}
+
+/// Clone the compiled object at `output_path` beside the key `cache_path`
+/// names.
+///
+/// # Errors
+/// A cache path with no key file name, or a clone that fails.
+pub async fn stage_compiled_object(
+    cache_path: &Path,
+    output_path: &Path,
+) -> stow_types::error::Result<StagedCcObject> {
     let cache_key = cache_path
         .file_stem()
         .and_then(OsStr::to_str)
@@ -406,9 +481,50 @@ pub async fn store_compiled_object(
         .to_owned();
     let cache_path = cache_path.to_path_buf();
     let output_path = output_path.to_path_buf();
-    let staged_path = cache_path.clone();
-    smol::unblock(move || stage_compiled_object_blocking(&staged_path, &output_path)?.publish())
-        .await?;
+    let staged =
+        smol::unblock(move || stage_compiled_object_blocking(&cache_path, &output_path)).await?;
+    Ok(StagedCcObject { cache_key, staged })
+}
+
+/// [`stage_compiled_object`] from a file already opened and checked by
+/// [`open_reported_output`]: the staged bytes are that descriptor's.
+///
+/// # Errors
+/// A cache path with no key file name, or a clone that fails.
+pub async fn stage_opened_object(
+    cache_path: &Path,
+    source: std::fs::File,
+    label: &Path,
+) -> stow_types::error::Result<StagedCcObject> {
+    let cache_key = cache_path
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "C object cache path {} has no cache-key file name",
+                cache_path.display()
+            )
+        })?
+        .to_owned();
+    let cache_path = cache_path.to_path_buf();
+    let label = label.to_path_buf();
+    let staged =
+        smol::unblock(move || stage_open_object_blocking(&cache_path, &source, &label)).await?;
+    Ok(StagedCcObject { cache_key, staged })
+}
+
+/// Publish a staged object at its key, add it to the shared LRU and run
+/// the post-store eviction pass.
+///
+/// # Errors
+/// A rename that fails, or the state database.
+pub async fn publish_staged_object(
+    config: &StowConfig,
+    staged: StagedCcObject,
+) -> stow_types::error::Result<()> {
+    let StagedCcObject { cache_key, staged } = staged;
+    let cache_path = staged.cache_path.clone();
+    smol::unblock(move || staged.publish()).await?;
     let size_bytes = async_fs::metadata(&cache_path)
         .await
         .wrap_err_with(|| format!("stat stored C/C++ object {}", cache_path.display()))?
@@ -416,6 +532,77 @@ pub async fn store_compiled_object(
     let connection = config.state_db_pool().await?;
     upsert_cc_cache_entry(&connection, &cache_key, size_bytes, now_millis()).await?;
     crate::artifact_cache::evict_after_cc_store(config, &connection, &cache_key).await
+}
+
+/// The cache path `cache_key` is stored at under `config`.
+pub fn cached_object_path(config: &StowConfig, cache_key: &str) -> PathBuf {
+    cc_cache_path(config, cache_key)
+}
+
+/// The records a supervised C compile leaves for the daemon to write once
+/// the wrapper has its answer: they cost the wrapper — and the job slot
+/// cargo holds for it — nothing.
+pub enum CcRecord {
+    /// A cache hit the wrapper is serving.
+    Hit { cache_key: String },
+    /// A compile that failed.
+    Failed { cache_key: String },
+    /// A compile that succeeded and was staged, or whose staging failed.
+    Compiled {
+        cache_key: String,
+        staged: Option<StagedCcObject>,
+    },
+}
+
+/// Write a [`CcRecord`] against the daemon's own state database: the LRU
+/// row and the hit, miss or error statistic, each as the standalone
+/// wrapper writes them.
+pub async fn write_record(config: &StowConfig, record: CcRecord) {
+    match record {
+        CcRecord::Hit { cache_key } => {
+            let cache_path = cc_cache_path(config, &cache_key);
+            crate::log_nonfatal_result(
+                "failed to record C/C++ cache hit",
+                record_cc_hit(config, &cache_key, &cache_path).await,
+            );
+            crate::log_nonfatal_result(
+                "failed to record C/C++ cache hit stats",
+                crate::stats::record_hit(config, &format!("cc:{cache_key}")).await,
+            );
+            tracing::info!(cache_key = %cache_key, "served C/C++ compilation from local stow cache");
+        }
+        CcRecord::Failed { cache_key } => {
+            crate::log_nonfatal_result(
+                "failed to record C/C++ cache error stats",
+                crate::stats::record_error(config, &format!("cc:{cache_key}")).await,
+            );
+        }
+        CcRecord::Compiled { cache_key, staged } => {
+            let stored = match staged {
+                Some(staged) => publish_staged_object(config, staged).await,
+                None => Err(stow_types::stow_error!(
+                    "the compiled object could not be staged"
+                )),
+            };
+            if let Err(error) = stored {
+                tracing::warn!(
+                    error = %error,
+                    cache_key = %cache_key,
+                    "failed to store C/C++ compilation in local stow cache"
+                );
+                crate::log_nonfatal_result(
+                    "failed to record C/C++ cache error stats",
+                    crate::stats::record_error(config, &format!("cc:{cache_key}")).await,
+                );
+                return;
+            }
+            crate::log_nonfatal_result(
+                "failed to record C/C++ cache miss stats",
+                crate::stats::record_miss(config, &format!("cc:{cache_key}")).await,
+            );
+            tracing::info!(cache_key = %cache_key, "stored C/C++ compilation in local stow cache");
+        }
+    }
 }
 
 /// How a file reached its destination: a copy-on-write clone sharing the
@@ -426,22 +613,161 @@ enum Placement {
     Copied,
 }
 
-/// Clone `source` to the not-yet-existing `destination` (APFS
-/// `clonefile`, Linux `FICLONE`), copying only where the filesystem cannot
-/// clone.
-fn clone_or_copy(source: &Path, destination: &Path) -> std::io::Result<Placement> {
-    let placement = match reflink_copy::reflink_or_copy(source, destination)? {
-        None => Placement::Cloned,
-        Some(_) => Placement::Copied,
-    };
-    if placement == Placement::Copied {
-        tracing::debug!(
-            source = %source.display(),
-            destination = %destination.display(),
-            "filesystem cannot clone; copied C/C++ object bytes"
-        );
+/// Clone an open file to the not-yet-existing `destination` (APFS
+/// `clonefile`, Linux `FICLONE`): the clone is taken from the descriptor,
+/// and a filesystem that cannot clone gets a byte copy of the same
+/// descriptor.
+fn clone_or_copy_file(source: &std::fs::File, destination: &Path) -> std::io::Result<Placement> {
+    if reflink_copy::reflink_file_to_path(source, destination).is_ok() {
+        return Ok(Placement::Cloned);
     }
-    Ok(placement)
+    let mut destination_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    std::io::copy(&mut &*source, &mut destination_file)?;
+    tracing::debug!(
+        destination = %destination.display(),
+        "filesystem cannot clone; copied C/C++ object bytes"
+    );
+    Ok(Placement::Copied)
+}
+
+/// Open a compiler output a wrapper reported, on the wrapper's word and
+/// outside its sandbox, and decide from the open descriptor — nothing is
+/// checked by path and then used by path.
+///
+/// The final component is not followed (`O_NOFOLLOW`, or the reparse
+/// point itself on Windows), the file must be a regular one, and the
+/// descriptor's own real path must lie under `root`, the build's target
+/// directory: a wrapper cannot name a file the sandbox keeps from it, or
+/// a link through the target directory to one, and have the supervisor
+/// read it for the cache the sandbox can read.
+///
+/// # Errors
+/// The reason the report is refused, naming the path.
+pub fn open_reported_output(path: &Path, root: &Path) -> Result<std::fs::File, String> {
+    let file = open_without_following(path).map_err(|error| {
+        format!(
+            "cannot open reported C/C++ output {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "cannot stat reported C/C++ output {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "reported C/C++ output {} is not a regular file",
+            path.display()
+        ));
+    }
+    let real = file_real_path(&file).map_err(|error| {
+        format!(
+            "cannot resolve reported C/C++ output {}: {error}",
+            path.display()
+        )
+    })?;
+    let root = std::fs::canonicalize(root).map_err(|error| {
+        format!(
+            "cannot resolve the build's target directory {}: {error}",
+            root.display()
+        )
+    })?;
+    if !real.starts_with(&root) {
+        return Err(format!(
+            "reported C/C++ output {} is outside the build's target directory {}",
+            path.display(),
+            root.display()
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_without_following(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // `O_NONBLOCK` keeps the open of a FIFO from hanging the supervisor;
+    // the regular-file check refuses it right after.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_without_following(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+/// The real path the open descriptor refers to, from the descriptor.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn file_real_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// The real path the open descriptor refers to, from the descriptor.
+#[cfg(target_os = "macos")]
+fn file_real_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buffer = [0_u8; libc::PATH_MAX as usize];
+    // SAFETY: `F_GETPATH` writes a NUL-terminated path of at most
+    // `PATH_MAX` bytes into the buffer it is given.
+    let code = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) };
+    if code == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let length = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(
+        &buffer[..length],
+    )))
+}
+
+/// The real path the open handle refers to, from the handle.
+#[cfg(windows)]
+fn file_real_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let handle = file.as_raw_handle();
+    let mut buffer = vec![0_u16; 1024];
+    loop {
+        let capacity = u32::try_from(buffer.len()).expect("the path buffer fits u32");
+        // SAFETY: `handle` is the live handle of `file`, and the buffer
+        // holds `capacity` UTF-16 units.
+        let length =
+            unsafe { GetFinalPathNameByHandleW(handle.cast(), buffer.as_mut_ptr(), capacity, 0) };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let length = length as usize;
+        if length < buffer.len() {
+            return Ok(PathBuf::from(OsString::from_wide(&buffer[..length])));
+        }
+        buffer.resize(length + 1, 0);
+    }
+}
+
+/// Whether `key` is a C/C++ cache key as [`cache_key`] makes it: the hex
+/// of a SHA-256 digest. A key from a wrapper names a file in the cache
+/// directory, so nothing else — a separator, `..` — reaches a path.
+pub fn is_cache_key(key: &str) -> bool {
+    key.len() == 64
+        && key
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// A compiled object cloned into the cache directory under a temporary
@@ -472,17 +798,30 @@ fn stage_compiled_object_blocking(
     cache_path: &Path,
     output_path: &Path,
 ) -> stow_types::error::Result<StagedObject> {
+    let source = std::fs::File::open(output_path)
+        .wrap_err_with(|| format!("open compiled object {}", output_path.display()))?;
+    stage_open_object_blocking(cache_path, &source, output_path)
+}
+
+/// Clone the open `source` — `label` names it in errors — to a temporary
+/// file beside `cache_path`. The bytes come from the descriptor, never
+/// from a path looked up again, so what was checked is what is staged.
+fn stage_open_object_blocking(
+    cache_path: &Path,
+    source: &std::fs::File,
+    label: &Path,
+) -> stow_types::error::Result<StagedObject> {
     let cache_dir = cache_path.parent().ok_or_else(|| {
         stow_types::stow_error!("C object cache path {} has no parent", cache_path.display())
     })?;
     let staged = tempfile::Builder::new()
         .prefix(".stage-")
         .suffix(".o")
-        .make_in(cache_dir, |staged| clone_or_copy(output_path, staged))
+        .make_in(cache_dir, |staged| clone_or_copy_file(source, staged))
         .wrap_err_with(|| {
             format!(
                 "stage compiled object {} in C object cache {}",
-                output_path.display(),
+                label.display(),
                 cache_dir.display()
             )
         })?;
@@ -492,27 +831,81 @@ fn stage_compiled_object_blocking(
     })
 }
 
-/// Serve a cached object: replace whatever sits at `output_path` with a
-/// clone of the cache entry.
+/// Serve a cached object at `output_path` through
+/// [`crate::inject::serve_output`]: an output that already holds the
+/// cache entry's bytes is left in place, and any other gets a clone of
+/// the entry staged beside it, so concurrent serves of one output all
+/// succeed and none replaces an object another already placed
+/// (stow#1444). `None` when the output already held the bytes.
 fn serve_cached_object_blocking(
     cache_path: &Path,
     output_path: &Path,
-) -> stow_types::error::Result<Placement> {
-    match std::fs::remove_file(output_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(stow_types::error::Error::from(error)
-                .wrap_err(format!("remove stale object {}", output_path.display())));
-        }
-    }
-    clone_or_copy(cache_path, output_path).wrap_err_with(|| {
+) -> stow_types::error::Result<Option<Placement>> {
+    let cached_len = std::fs::metadata(cache_path)
+        .wrap_err_with(|| format!("stat cached object {}", cache_path.display()))?
+        .len();
+    let served = crate::inject::serve_output(
+        output_path,
+        |found| output_holds_cached_object(found, cache_path, output_path, cached_len),
+        || {
+            let staged =
+                crate::inject::stage_clone(cache_path, output_path).wrap_err_with(|| {
+                    format!(
+                        "clone or copy cached object {} into {}",
+                        cache_path.display(),
+                        output_path.display()
+                    )
+                })?;
+            let (copied, path) = staged.into_parts();
+            let placement = if copied.is_some() {
+                Placement::Copied
+            } else {
+                Placement::Cloned
+            };
+            Ok(tempfile::NamedTempFile::from_parts(placement, path))
+        },
+    )
+    .wrap_err_with(|| {
         format!(
-            "serve cached object {} into {}",
+            "serve cached object {} at {}",
             cache_path.display(),
             output_path.display()
         )
-    })
+    })?;
+    let crate::inject::Served::Placed(placement) = served else {
+        return Ok(None);
+    };
+    if placement == Placement::Copied {
+        tracing::debug!(
+            source = %cache_path.display(),
+            destination = %output_path.display(),
+            "filesystem cannot clone; copied C/C++ object bytes"
+        );
+    }
+    Ok(Some(placement))
+}
+
+/// Whether `found`, the file open at `output_path`, already holds the
+/// bytes of the cached object at `cache_path`, `cached_len` long.
+fn output_holds_cached_object(
+    mut found: &std::fs::File,
+    cache_path: &Path,
+    output_path: &Path,
+    cached_len: u64,
+) -> stow_types::error::Result<bool> {
+    let found_len = found
+        .metadata()
+        .wrap_err_with(|| format!("stat served object {}", output_path.display()))?
+        .len();
+    if found_len != cached_len {
+        return Ok(false);
+    }
+    let mut found_bytes = Vec::new();
+    std::io::Read::read_to_end(&mut found, &mut found_bytes)
+        .wrap_err_with(|| format!("read served object {}", output_path.display()))?;
+    let cached_bytes = std::fs::read(cache_path)
+        .wrap_err_with(|| format!("read cached object {}", cache_path.display()))?;
+    Ok(found_bytes == cached_bytes)
 }
 
 fn cc_cache_path(config: &StowConfig, cache_key: &str) -> PathBuf {
@@ -1235,11 +1628,45 @@ mod tests {
 
         let placement =
             super::serve_cached_object_blocking(&cache_path, &served).expect("serve object");
-        assert_eq!(placement, super::Placement::Cloned);
+        assert_eq!(placement, Some(super::Placement::Cloned));
         assert_eq!(
             std::fs::read(&served).expect("read served"),
             b"object bytes"
         );
+    }
+
+    /// Serving one cached object to one output from many threads at once
+    /// never fails and leaves the object whole (stow#1444).
+    #[test]
+    fn concurrent_serves_of_one_object_all_succeed() {
+        const THREADS: usize = 32;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = dir.path().join("key.o");
+        std::fs::write(&cache_path, vec![0x5a_u8; 64 * 1024]).expect("write cached object");
+        for round in 0..20 {
+            let served = dir.path().join(format!("served-{round}.o"));
+            let barrier = std::sync::Barrier::new(THREADS);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            super::serve_cached_object_blocking(&cache_path, &served)
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle
+                        .join()
+                        .expect("serve thread")
+                        .expect("every concurrent serve succeeds");
+                }
+            });
+            assert_eq!(
+                std::fs::read(&served).expect("read served"),
+                vec![0x5a_u8; 64 * 1024]
+            );
+        }
     }
 
     /// Two sources whose preprocessed text is identical but that sit at

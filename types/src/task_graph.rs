@@ -49,6 +49,31 @@ pub struct TaskNodeIdentity {
 }
 
 impl TaskNodeIdentity {
+    /// The identity of the node that published a row of a signed index
+    /// slice: the row's own fields, the slice's target and rustc, and the
+    /// node's side as the row's unit shape records it. Every reader that
+    /// joins rows to nodes derives the identity here.
+    #[must_use]
+    pub fn of_published_row(
+        crate_name: &CrateName,
+        version: &CrateVersion,
+        features_json: &FeaturesJson,
+        slice_target: &TargetTriple,
+        slice_rustc_version: &WireRustcVersion,
+        side: crate::public_cache::UnitSide,
+        profile: NodeProfile,
+    ) -> Self {
+        Self {
+            crate_name: crate_name.clone(),
+            version: version.clone(),
+            features_json: features_json.clone(),
+            target: slice_target.clone(),
+            rustc_version: slice_rustc_version.clone(),
+            host_side: side == crate::public_cache::UnitSide::Host,
+            profile,
+        }
+    }
+
     /// The canonical scheduler task id: the shared tuple prefix, then
     /// `-d<dependency digest>` committing to the node's whole dependency
     /// subgraph, then `-host` for host-side nodes and the profile's

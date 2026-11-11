@@ -286,13 +286,42 @@ impl LocalServerState {
 
     /// The `built-<rustc>-<task_id hash>` marker the publish stage
     /// writes — a run whose task already holds one exits without
-    /// building, exactly as `build-crate.yml` short-circuits (stow#877).
-    fn records_exist(&self, task: &BuildTaskPayload) -> bool {
-        self.manifest_path(
+    /// building, exactly as `build-crate.yml` short-circuits (stow#877) —
+    /// and only when the records it names hold the whole node, by the same
+    /// rule production applies (`shapes::published_records_gap`).
+    async fn records_exist(&self, task: &BuildTaskPayload) -> stow_types::error::Result<bool> {
+        let marker = self.manifest_path(
             &task.rustc_version,
             &stow_types::records::published_tag(task.rustc_version.as_str(), &task.task_id),
-        )
-        .exists()
+        );
+        let manifest = match async_fs::read(&marker).await {
+            Ok(manifest) => manifest,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(stow_types::stow_error!(
+                    "read built- marker {}: {error}",
+                    marker.display()
+                ));
+            }
+        };
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest)?;
+        let digest = manifest["layers"][0]["digest"].as_str().ok_or_else(|| {
+            stow_types::stow_error!("built- marker {} names no records layer", marker.display())
+        })?;
+        let layer = std::path::Path::new(&self.mock_registry_root)
+            .join("blobs")
+            .join(digest.replace(':', "_"));
+        let records: stow_types::records::BuildRecords =
+            serde_json::from_slice(&async_fs::read(&layer).await?)?;
+        let gap = crate::shapes::published_records_gap(task, &records)?;
+        if let Some(gap) = &gap {
+            tracing::warn!(
+                task_id = %task.task_id,
+                "published records are no proof the node is built: {}",
+                gap.refusal(task, "the published records")
+            );
+        }
+        Ok(gap.is_none())
     }
 
     /// Seed the dispatched run's task — `run_task` flips the row
@@ -1311,13 +1340,17 @@ async fn drive_task(state: LocalServerState, task: BuildTaskPayload, workflow_ru
     // building — `build-crate.yml`'s early-exit check, mirrored: the
     // superseding or following run re-tags the manifest that proves the
     // task built and never compiles (stow#877).
-    if state.records_exist(&task) {
-        early_exit(state, task, workflow_run_id).await;
-        return;
-    }
+    let outcome = match state.records_exist(&task).await {
+        Ok(true) => {
+            early_exit(state, task, workflow_run_id).await;
+            return;
+        }
+        Ok(false) => run_task(&state, &task, workflow_run_id).await,
+        Err(error) => Err(error),
+    };
     // `failure` is the run's conclusion cause; `run_error` is only the
     // failure no stage owns.
-    let (failure, run_error) = match run_task(&state, &task, workflow_run_id).await {
+    let (failure, run_error) = match outcome {
         Ok((root, failure)) => {
             if failure.is_none() {
                 // The runner a dispatch stands in for is ephemeral: a
@@ -2793,6 +2826,57 @@ mod tests {
         assert_eq!(
             records.local_programs,
             [] as [stow_types::records::LocalProcMacro; 0]
+        );
+    }
+
+    /// The early exit the mock mirrors production's: a `built-` marker
+    /// over a record set short of a shape the node owes — the build
+    /// script's explicit spelling — is no proof, so the run builds; over
+    /// a complete set it exits; with no marker it builds.
+    #[tokio::test]
+    async fn a_marker_over_a_short_record_set_does_not_exit_early() {
+        use crate::validate::tests::{
+            EXPLICIT_SCRIPT, NATIVE_SCRIPT, nix_task, own_libraries, records_for, script,
+        };
+        use stow_types::public_cache::{ExplicitSpelling, UnitInvocation};
+        let root = tempfile::tempdir().expect("registry root");
+        let mut state = state();
+        state.mock_registry_root = root.path().to_string_lossy().into_owned();
+        let task = nix_task(ExplicitSpelling::KeysAsNative);
+        assert!(
+            !state.records_exist(&task).await.expect("no marker"),
+            "no marker, no early exit"
+        );
+        let mut plan = own_libraries(&task);
+        plan.push(script(&task, UnitInvocation::Native, NATIVE_SCRIPT));
+        let marker = |plan: &[stow_types::upload_plan::PlannedArtifact]| {
+            let bytes = serde_json::to_vec(&records_for(plan)).expect("records");
+            let digest = stow_types::registry::sha256_digest(&bytes);
+            let blobs = root.path().join("blobs");
+            std::fs::create_dir_all(&blobs).expect("blobs dir");
+            std::fs::write(blobs.join(digest.replace(':', "_")), bytes).expect("layer");
+            let path = state.manifest_path(
+                &task.rustc_version,
+                &stow_types::records::published_tag(task.rustc_version.as_str(), &task.task_id),
+            );
+            std::fs::create_dir_all(path.parent().expect("manifest dir")).expect("manifests dir");
+            std::fs::write(
+                path,
+                serde_json::to_vec(&serde_json::json!({ "layers": [{ "digest": digest }] }))
+                    .expect("manifest"),
+            )
+            .expect("marker");
+        };
+        marker(&plan);
+        assert!(
+            !state.records_exist(&task).await.expect("short marker"),
+            "a marker over the native script alone builds"
+        );
+        plan.push(script(&task, UnitInvocation::Target, EXPLICIT_SCRIPT));
+        marker(&plan);
+        assert!(
+            state.records_exist(&task).await.expect("complete marker"),
+            "a marker over both scripts exits early"
         );
     }
 

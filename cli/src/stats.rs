@@ -40,12 +40,24 @@ fn stats_file_path(config: &StowConfig) -> PathBuf {
     config.cache_dir.join("stats.json")
 }
 
-/// Read `stats.json`, treating a missing file as zeroed counters. A
-/// corrupt file is an error — silently resetting it would erase the
-/// user's record without a trace.
+/// Read `stats.json` under its lock, treating a missing file as zeroed
+/// counters. A corrupt file is an error — silently resetting it would
+/// erase the user's record without a trace.
+///
+/// The lock is the writers' own ([`record_served_bundle`]): each update
+/// replaces the file by rename, and on Windows a read racing that rename
+/// can find the path absent, which would read as zeroed counters.
 pub async fn read_local_stats(config: &StowConfig) -> stow_types::error::Result<LocalStats> {
     let path = stats_file_path(config);
-    match async_fs::read(&path).await {
+    let Some(_guard) = lock_local_stats_shared(&path).await? else {
+        return Ok(LocalStats::default());
+    };
+    read_stats_file(&path).await
+}
+
+/// Read `stats.json` at `path`; the caller holds its lock.
+async fn read_stats_file(path: &std::path::Path) -> stow_types::error::Result<LocalStats> {
+    match async_fs::read(path).await {
         Ok(bytes) => {
             serde_json::from_slice(&bytes).wrap_err_with(|| format!("parse {}", path.display()))
         }
@@ -77,7 +89,7 @@ pub async fn record_served_bundle(
             .wrap_err_with(|| format!("create {}", parent.display()))?;
     }
     let _guard = lock_local_stats(&path).await?;
-    let mut stats = read_local_stats(config).await?;
+    let mut stats = read_stats_file(&path).await?;
     stats.hits = stats.hits.saturating_add(1);
     stats.cpu_millis_saved = stats.cpu_millis_saved.saturating_add(compile_millis);
     stats.bytes_served = stats.bytes_served.saturating_add(bytes);
@@ -118,6 +130,34 @@ async fn lock_local_stats(
     .wrap_err("join the local stats lock task")?
 }
 
+/// Hold `stats.json.lock` shared for one read, so no update's rename
+/// lands during it. `None` when the cache directory does not exist:
+/// nothing was ever recorded, and a read never creates the directory.
+async fn lock_local_stats_shared(
+    path: &std::path::Path,
+) -> stow_types::error::Result<Option<crate::file_lock::FileLock>> {
+    let lock_path = path.with_extension("json.lock");
+    smol::unblock(move || {
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).wrap_err_with(|| format!("open {}", lock_path.display()));
+            }
+        };
+        crate::file_lock::FileLock::shared(file)
+            .map(Some)
+            .wrap_err_with(|| format!("lock {} shared", lock_path.display()))
+    })
+    .await
+}
+
 pub async fn record_hit(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
     update_stats(config, crate_name, StatsField::Hits).await
 }
@@ -150,6 +190,154 @@ pub async fn record_local_dependency_build(
 
 pub async fn record_error(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
     update_stats(config, crate_name, StatsField::Errors).await
+}
+
+/// Where in the serve path a unit's serve was attempted from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeSource {
+    /// The local artifact cache entry under the unit's exact key.
+    LocalEntry,
+    /// A local entry found through the semantic lookup.
+    LocalSemanticEntry,
+    /// The bundle of the unit's exact index row, fetched from the registry.
+    ExactDownload,
+    /// The bundle of a semantic index row, fetched from the registry.
+    SemanticDownload,
+    /// A bundle already fetched, through either row.
+    DownloadedBundle,
+}
+
+impl ServeSource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::LocalEntry => "local cache entry",
+            Self::LocalSemanticEntry => "local semantic cache entry",
+            Self::ExactDownload => "exact bundle",
+            Self::SemanticDownload => "semantic bundle",
+            Self::DownloadedBundle => "downloaded bundle",
+        }
+    }
+}
+
+/// The stage of serving a unit that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeStage {
+    /// Fetching the bundle from the registry.
+    Fetch,
+    /// Reading the local cache entry.
+    Read,
+    /// The entry's identity does not describe the unit asked for.
+    Identity,
+    /// Verifying the entry's signature.
+    Verify,
+    /// Storing the downloaded bundle in the local cache.
+    Store,
+    /// Materializing the dependency closure aliases.
+    ClosureAliases,
+    /// Writing the artifacts into the target directory.
+    Materialize,
+    /// Recording the materialized outputs.
+    RecordOutputs,
+    /// Computing the artifact notifications the unit owes cargo.
+    Notifications,
+}
+
+impl ServeStage {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::Read => "read",
+            Self::Identity => "identity check",
+            Self::Verify => "signature verification",
+            Self::Store => "store",
+            Self::ClosureAliases => "dependency closure aliases",
+            Self::Materialize => "materialize",
+            Self::RecordOutputs => "record outputs",
+            Self::Notifications => "artifact notifications",
+        }
+    }
+}
+
+/// One stage of one unit's serve that failed, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeFailure {
+    source: ServeSource,
+    stage: ServeStage,
+    reason: String,
+}
+
+impl ServeFailure {
+    pub fn new(source: ServeSource, stage: ServeStage, reason: impl std::fmt::Display) -> Self {
+        Self {
+            source,
+            stage,
+            reason: reason.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for ServeFailure {
+    /// One line, whatever the reason's own formatting.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} {} failed: ",
+            self.source.label(),
+            self.stage.label()
+        )?;
+        for (index, line) in self.reason.lines().enumerate() {
+            if index > 0 {
+                formatter.write_str(" ")?;
+            }
+            formatter.write_str(line.trim())?;
+        }
+        Ok(())
+    }
+}
+
+/// Count an errored unit and keep why it errored: the failures the serve
+/// chain saw, in order, as the line the build summary prints.
+pub async fn record_unit_error(
+    config: &StowConfig,
+    crate_name: &str,
+    failures: &[ServeFailure],
+) -> stow_types::error::Result<()> {
+    let failure = failures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let connection = config.state_db_pool().await?;
+    let keep = async {
+        sqlx::query(
+            "INSERT INTO metadata_values (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(format!("{SERVE_FAILURE_KEY_PREFIX}{crate_name}"))
+        .bind(failure)
+        .execute(&connection)
+        .await?;
+        Ok(())
+    };
+    tokio::try_join!(update_stats(config, crate_name, StatsField::Errors), keep)?;
+    Ok(())
+}
+
+/// The prefix of the `metadata_values` keys that hold, per crate name, the
+/// line for its latest errored unit.
+const SERVE_FAILURE_KEY_PREFIX: &str = "serve_failure:";
+
+/// One line per crate that errored during the build, naming the stage that
+/// failed and why. A crate with no recorded failure gets none.
+#[must_use]
+pub fn failure_lines(errored_crates: &[String], failures: &BTreeMap<String, String>) -> String {
+    let mut lines = String::new();
+    for crate_name in errored_crates {
+        if let Some(failure) = failures.get(crate_name) {
+            let _ = writeln!(lines, "stow: {crate_name}: {failure}");
+        }
+    }
+    lines
 }
 
 /// The key `metadata_values` holds the last profile divergence under.
@@ -260,16 +448,27 @@ pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<Stat
 pub struct CrateCounters {
     pub summary: StatsSummary,
     pub errors: BTreeMap<String, u64>,
+    /// The last failure each errored crate recorded, as a line.
+    pub failures: BTreeMap<String, String>,
 }
 
 pub async fn read_counters(config: &StowConfig) -> stow_types::error::Result<CrateCounters> {
     let connection = config.state_db_pool().await?;
-    let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64)>(
-        "SELECT crate_name, hits, misses, errors, glibc_refusals, local_dependency_builds \
-         FROM crate_stats",
-    )
-    .fetch_all(&connection)
-    .await?;
+    let (rows, failure_rows) = tokio::try_join!(
+        sqlx::query_as::<_, (String, i64, i64, i64, i64, i64)>(
+            "SELECT crate_name, hits, misses, errors, glibc_refusals, local_dependency_builds \
+             FROM crate_stats",
+        )
+        .fetch_all(&connection),
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT substr(key, ?), value FROM metadata_values WHERE substr(key, 1, ?) = ?",
+        )
+        .bind(i64::try_from(SERVE_FAILURE_KEY_PREFIX.len() + 1).expect("prefix length"))
+        .bind(i64::try_from(SERVE_FAILURE_KEY_PREFIX.len()).expect("prefix length"))
+        .bind(SERVE_FAILURE_KEY_PREFIX)
+        .fetch_all(&connection),
+    )?;
+    let failures: BTreeMap<String, String> = failure_rows.into_iter().collect();
 
     let mut summary = StatsSummary::default();
     let mut error_counts = BTreeMap::new();
@@ -303,6 +502,7 @@ pub async fn read_counters(config: &StowConfig) -> stow_types::error::Result<Cra
     Ok(CrateCounters {
         summary,
         errors: error_counts,
+        failures,
     })
 }
 
@@ -545,6 +745,39 @@ mod tests {
             counters.summary
         );
         pool.close().await;
+    }
+
+    /// An errored unit's stages and reasons come back from the counter read
+    /// as the one line the build prints, whatever the reason's own layout.
+    #[tokio::test]
+    async fn an_errored_unit_keeps_its_stage_and_reason() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        let config = test_config(directory.path().to_path_buf());
+        super::record_unit_error(
+            &config,
+            "serde",
+            &[
+                super::ServeFailure::new(
+                    super::ServeSource::ExactDownload,
+                    super::ServeStage::Fetch,
+                    "connection reset\n  while reading the body",
+                ),
+                super::ServeFailure::new(
+                    super::ServeSource::LocalEntry,
+                    super::ServeStage::Verify,
+                    "bad signature",
+                ),
+            ],
+        )
+        .await
+        .expect("record the errored unit");
+        let counters = super::read_counters(&config).await.expect("counters");
+        assert_eq!(counters.summary.rust_errors, 1);
+        assert_eq!(
+            super::failure_lines(&["serde".to_owned(), "syn".to_owned()], &counters.failures),
+            "stow: serde: exact bundle fetch failed: connection reset while reading the body; \
+             local cache entry signature verification failed: bad signature\n"
+        );
     }
 
     #[tokio::test]

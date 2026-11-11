@@ -1,3 +1,16 @@
+# A test that stops making progress is terminated and reported as TIMEOUT
+# with its captured output, instead of holding the run until someone
+# cancels it (stow#1458). The bound is 15 periods of 60s = 900s; 60s is
+# nextest's default period, so the slow notices read as before. The
+# slowest legitimate tests are the `stow-build` `context_tests` on the
+# Windows runner, which queue behind one shared `cargo build` and take up
+# to 377.3s (`differing_build_dep_features_change_the_compile_key`, runs
+# 42994479443, 42999472899 and 43004601589 measured 354.4s to 377.3s for
+# the same set); the slowest on macOS is 85.4s and on Linux 58.9s, so
+# 900s is 2.4x the slowest and ten times the slowest non-Windows test.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 15, grace-period = "10s" }
+
 # The pre-cargo window gate compares two wall clocks to within a few
 # milliseconds: time until cargo's first `Compiling` line under cargo and
 # under stow. Work stow overlaps with cargo's startup is free only while

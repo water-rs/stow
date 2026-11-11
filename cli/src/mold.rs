@@ -1523,16 +1523,8 @@ async fn ensure_mold_install(tools_dir: &Path) -> stow_types::error::Result<Path
 }
 
 /// What one download attempt produced: the archive bytes, or a failure
-/// classified the way the shared retry policy classifies it — retried
-/// with any `Retry-After` hint it carried, or returned to the caller.
-enum DownloadOutcome {
-    Bytes(Vec<u8>),
-    Retryable {
-        error: stow_types::error::Error,
-        retry_after: Option<std::time::Duration>,
-    },
-    Fatal(stow_types::error::Error),
-}
+/// classified the way the shared retry policy classifies it.
+type DownloadOutcome = crate::retry::Attempt<Vec<u8>, stow_types::error::Error>;
 
 /// Download `url`, following redirects, into memory — the pinned sha256 is
 /// checked before a byte reaches disk. A transient failure — a request
@@ -1542,23 +1534,7 @@ enum DownloadOutcome {
 /// release-assets CDN), and one transport error failing a user's `stow
 /// setup` is the failure this retry exists to prevent.
 async fn download(url: &str) -> stow_types::error::Result<Vec<u8>> {
-    let mut backoff = stow_types::transient::Backoff::new();
-    loop {
-        let wait = match download_once(url).await {
-            DownloadOutcome::Bytes(bytes) => return Ok(bytes),
-            DownloadOutcome::Retryable { error, retry_after } => {
-                let Some(wait) = backoff.next_wait(retry_after) else {
-                    return Err(error);
-                };
-                // Per attempt: the exhausted retry's error is what the
-                // caller surfaces (stow#633).
-                tracing::debug!(url, %error, "mold download failed; retrying");
-                wait
-            }
-            DownloadOutcome::Fatal(error) => return Err(error),
-        };
-        tokio::time::sleep(wait).await;
-    }
+    crate::retry::with_backoff(url, || download_once(url)).await
 }
 
 /// One attempt at [`download`]: build the request, send it, and read the
@@ -1574,7 +1550,7 @@ async fn download_once(url: &str) -> DownloadOutcome {
     let request = match client.get(url) {
         Ok(request) => request,
         Err(error) => {
-            return DownloadOutcome::Fatal(stow_types::stow_error!(
+            return DownloadOutcome::Final(stow_types::stow_error!(
                 "build mold download request: {error}"
             ));
         }
@@ -1591,7 +1567,7 @@ async fn download_once(url: &str) -> DownloadOutcome {
     {
         Ok(Err(error)) => {
             let Some(response) = error.response() else {
-                return DownloadOutcome::Retryable {
+                return DownloadOutcome::Transient {
                     error: stow_types::stow_error!("download {url}: {error}"),
                     retry_after: None,
                 };
@@ -1604,8 +1580,8 @@ async fn download_once(url: &str) -> DownloadOutcome {
         }
         Ok(Ok(response)) if response.status().is_success() => {
             return match response.into_body().into_bytes().await {
-                Ok(bytes) => DownloadOutcome::Bytes(bytes.to_vec()),
-                Err(error) => DownloadOutcome::Retryable {
+                Ok(bytes) => DownloadOutcome::Done(bytes.to_vec()),
+                Err(error) => DownloadOutcome::Transient {
                     error: stow_types::stow_error!("read {url} body: {error}"),
                     retry_after: None,
                 },
@@ -1617,16 +1593,16 @@ async fn download_once(url: &str) -> DownloadOutcome {
             stow_types::stow_error!("download {url}: HTTP {}", response.status()),
         ),
         Err(_) => {
-            return DownloadOutcome::Retryable {
+            return DownloadOutcome::Transient {
                 error: stow_types::stow_error!("download {url}: timed out"),
                 retry_after: None,
             };
         }
     };
     if stow_types::transient::is_transient_status(status) {
-        DownloadOutcome::Retryable { error, retry_after }
+        DownloadOutcome::Transient { error, retry_after }
     } else {
-        DownloadOutcome::Fatal(error)
+        DownloadOutcome::Final(error)
     }
 }
 
@@ -2262,8 +2238,8 @@ mod tests {
             )
             .await
             .expect("the download completes within the deadline");
-            let DownloadOutcome::Retryable { retry_after, .. } = outcome else {
-                panic!("429 must be Retryable");
+            let DownloadOutcome::Transient { retry_after, .. } = outcome else {
+                panic!("429 must be Transient");
             };
             assert_eq!(retry_after, Some(std::time::Duration::from_secs(7)));
             assert_eq!(server.request_count(), 1);
@@ -2288,8 +2264,8 @@ mod tests {
             .await
             .expect("the download completes within the deadline");
             assert!(
-                matches!(outcome, DownloadOutcome::Retryable { .. }),
-                "500 must be Retryable"
+                matches!(outcome, DownloadOutcome::Transient { .. }),
+                "500 must be Transient"
             );
             assert_eq!(server.request_count(), 1);
             server.join();

@@ -130,8 +130,9 @@ pub enum FastPath {
 
 /// The uncovered-unit fast path: when the build's serve map is present
 /// and does not cover this invocation, the plan's answer was already
-/// "compile". The facade marks the unit, runs rustc, reports the outcome
-/// over two one-way frames, and exits — no runtime, no plan round trip.
+/// "compile". The facade marks the unit with a one-way frame, runs rustc,
+/// reports the outcome for a receipt, and exits — no runtime, no plan
+/// round trip.
 ///
 /// Anything the map cannot answer for — a unit stow might serve, an argv
 /// stow cannot model, a supervisor that is not there — takes the plan
@@ -246,7 +247,11 @@ fn run_uncovered(
         .wrap_err("failed to spawn wrapped compiler")?;
     let compile_time = started.elapsed();
     let success = status.success();
-    send(
+    // The report is answered with a receipt that precedes the
+    // supervisor's bookkeeping, so the wait is a round trip and not the
+    // bookkeeping; a dependent cargo starts after this exit always finds
+    // the unit's rustc recorded as exited (stow#1431).
+    match send(
         &mut wire,
         &Request::Observed(Observed::new(
             token.to_owned(),
@@ -257,7 +262,20 @@ fn run_uncovered(
             crate::supervisor::protocol::InvocationEnv::current(),
         )),
     )
-    .map_err(|error| stow_types::stow_error!("{error}"))?;
+    .map_err(|error| stow_types::stow_error!("{error}"))?
+    {
+        Some(Answer::Received) => {}
+        Some(Answer::Failed { message }) => {
+            return Err(stow_types::stow_error!(
+                "the supervisor refused the compile's report: {message}"
+            ));
+        }
+        other => {
+            return Err(stow_types::stow_error!(
+                "the supervisor answered the compile's report with {other:?}"
+            ));
+        }
+    }
     close_wire(&mut wire).map_err(|error| stow_types::stow_error!("{error}"))?;
     Ok(status.code().unwrap_or(1))
 }
@@ -498,8 +516,8 @@ fn connect(endpoint: &Endpoint) -> std::io::Result<FacadeStream> {
 }
 
 /// Send one `Request` and collect its `Answer` — over the socket that is
-/// a frame write plus a frame read, over IPC one call; `Observed`, the
-/// protocol's one-way frame, carries `Ok(None)` on either.
+/// a frame write plus a frame read, over IPC one call; the `Observed`
+/// mark, the protocol's one-way frame, carries `Ok(None)` on either.
 fn send(wire: &mut FacadeStream, request: &Request) -> Result<Option<Answer>, FrameError> {
     if let FacadeStream::Ipc { client, connection } = wire {
         return client
@@ -514,7 +532,7 @@ fn send(wire: &mut FacadeStream, request: &Request) -> Result<Option<Answer>, Fr
     }
     write_request(wire, request).map_err(FrameError::Io)?;
     match request {
-        Request::Observed(_) => Ok(None),
+        Request::Observed(observed) if observed.success.is_none() => Ok(None),
         _ => read_answer(wire),
     }
 }

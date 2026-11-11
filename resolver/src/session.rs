@@ -318,13 +318,31 @@ impl Resolver {
             host.replace('/', "_"),
             std::env::consts::EXE_SUFFIX
         ));
-        // Temp-file + rename: a lazy shim copy for a non-CI host can
-        // race a sibling resolve — rename keeps the visible file whole.
-        let tmp = path.with_extension("tmp");
-        std::fs::copy(&self.shim_source, &tmp)
-            .with_context(|| format!("copy {} to {}", self.shim_source.display(), tmp.display()))?;
-        std::fs::rename(&tmp, &path).with_context(|| format!("rename to {}", path.display()))?;
-        Ok(path)
+        // A lazy shim copy for a non-CI host can race a sibling resolve's.
+        // Each copy is staged under a name of its own and placed by a
+        // no-replace rename, so the path only ever holds one whole copy of
+        // `shim_source`: the first one placed, which is never replaced
+        // under a cargo that may be executing it. A copy that finds the
+        // path taken has nothing left to do.
+        let staged = tempfile::Builder::new()
+            .prefix(".rustc-shim-")
+            .make_in(self.dir.path(), |staged| {
+                std::fs::copy(&self.shim_source, staged)
+            })
+            .with_context(|| {
+                format!(
+                    "copy {} into {}",
+                    self.shim_source.display(),
+                    self.dir.path().display()
+                )
+            })?;
+        match staged.persist_noclobber(&path) {
+            Ok(_) => Ok(path),
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(path),
+            Err(error) => {
+                Err(error.error).with_context(|| format!("place shim at {}", path.display()))
+            }
+        }
     }
 
     /// A `GlobalContext` for a resolve rooted at `cwd`, probing rustc

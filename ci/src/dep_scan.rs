@@ -6,7 +6,7 @@ use async_process::Command;
 use cargo_metadata::{Metadata, Package, Target, TargetKind};
 use futures_util::StreamExt;
 use sha2::Digest as _;
-use stow_types::api::{BuildTaskPayload, ResolvedDependencyGraphEntry};
+use stow_types::api::BuildTaskPayload;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
 use stow_types::unit_graph::{TaskUnitKind, TaskUnitSide};
@@ -43,6 +43,24 @@ pub struct ProgramClaims {
     pub completed: Vec<stow_types::records::LocalProcMacro>,
     /// Dependency units compiled under a signed local-program declaration.
     pub compiled: Vec<stow_types::records::LocalProcMacro>,
+    /// This task's own manifest-relative build scripts, one per spelling
+    /// that compiled one.
+    pub local_scripts: Vec<LocalScript>,
+}
+
+/// A build script of the task's own crate that was compiled here and is
+/// published nowhere: it reads `CARGO_MANIFEST_DIR`, so its executable is
+/// tied to the builder's checkout and every consumer compiles its own.
+///
+/// The claim is the build job's. A script claimed local that is not leaves
+/// its dependents compiling it, which their own scan refuses — the claim
+/// can drop a cache entry, never serve a wrong one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocalScript {
+    /// The spelling whose phase compiled it.
+    pub invocation: stow_types::public_cache::UnitInvocation,
+    /// The script unit's stable `c_metadata`.
+    pub c_metadata: String,
 }
 
 /// A verified published artifact the build served instead of compiling the
@@ -71,6 +89,11 @@ pub struct ConsumedArtifact {
     /// closure's library-package coverage rule exactly like a planned
     /// build-phase artifact.
     pub emit: Vec<String>,
+    /// The invocation spellings whose phases were served this unit. For a
+    /// build script of the task's own crate these are the shapes the claim
+    /// covers: the row that vouches for it may carry any label, since a
+    /// script is looked up by its key alone.
+    pub invocations: std::collections::BTreeSet<stow_types::public_cache::UnitInvocation>,
 }
 
 /// A [`ConsumedArtifact`] plus every record that claimed it — one per
@@ -96,11 +119,58 @@ enum OutputOwner {
 fn scannable_captures(captures: &[CapturedRustcArtifact]) -> Vec<CapturedRustcArtifact> {
     captures
         .iter()
-        .filter(|captured| {
-            !(captured.restorable && captured.is_build_script() && captured.reads_manifest_dir)
-        })
+        .filter(|captured| !is_manifest_relative_script(captured))
         .cloned()
         .collect()
+}
+
+/// A compiled build script whose executable carries the builder's checkout
+/// path.
+fn is_manifest_relative_script(captured: &CapturedRustcArtifact) -> bool {
+    captured.restorable && captured.is_build_script() && captured.reads_manifest_dir
+}
+
+/// The manifest-relative build scripts among `captures` that belong to the
+/// task's own crate. They are planned nowhere, so this is the only record
+/// that the node's script was compiled under each spelling that owes it.
+fn own_local_scripts(
+    package_index: &PackageIndex,
+    captures: &[CapturedRustcArtifact],
+    task: &BuildTaskPayload,
+) -> stow_types::error::Result<Vec<LocalScript>> {
+    let mut scripts = Vec::new();
+    for captured in captures
+        .iter()
+        .filter(|captured| is_manifest_relative_script(captured))
+    {
+        let package = package_for_capture(package_index, captured).ok_or_else(|| {
+            stow_types::stow_error!(
+                "dep_scan could not attribute manifest-relative build script {} {} (c_metadata {}) to any package in cargo metadata",
+                captured.package.as_deref().unwrap_or("<unknown>"),
+                captured.crate_version.as_deref().unwrap_or("<unknown>"),
+                captured.c_metadata
+            )
+        })?;
+        if package.name != task.crate_name.as_str() || package.version != *task.version.as_semver()
+        {
+            continue;
+        }
+        scripts.push(LocalScript {
+            invocation: captured.invocation.ok_or_else(|| {
+                stow_types::stow_error!(
+                    "manifest-relative build script of {} (compile_key {}) carries no invocation stamp — the collector never saw it drain",
+                    package.name,
+                    captured.compile_key
+                )
+            })?,
+            c_metadata: captured.c_metadata.clone(),
+        });
+    }
+    scripts.sort_by(|left, right| {
+        (left.invocation, &left.c_metadata).cmp(&(right.invocation, &right.c_metadata))
+    });
+    scripts.dedup();
+    Ok(scripts)
 }
 
 pub async fn scan_artifacts(
@@ -173,7 +243,7 @@ pub async fn scan_artifacts(
         visiting: &mut visiting,
     };
 
-    let (mut artifacts, programs) = plan_selected(
+    let (mut artifacts, mut programs) = plan_selected(
         task,
         &rustc_version,
         &host_target,
@@ -181,6 +251,7 @@ pub async fn scan_artifacts(
         built.local_programs(),
     )
     .await?;
+    programs.local_scripts = own_local_scripts(&package_index, built.captures(), task)?;
     // One artifact per restorable record is the completeness invariant the
     // whole scan exists to keep: every path that could drop one is an error
     // above, so reaching a different count is a bug in this file, not data.
@@ -280,52 +351,11 @@ async fn plan_selected(
     Ok((artifacts, programs))
 }
 
-/// The consumable set: every registry unit this build's own cargo unit
-/// graph compiles, at the per-side feature set cargo activated for it —
-/// the same identities a consumer's build computes, so a dep the build
-/// can compile is always staged and one it cannot is never fetched
-/// (stow#589). The task crate itself is excluded: a re-run after a
-/// successful publish must never consume the artifact the task exists
-/// to produce.
-pub fn consumable_packages(
-    task: &BuildTaskPayload,
-    entries: &[ResolvedDependencyGraphEntry],
-) -> Vec<ConsumablePackage> {
-    entries
-        .iter()
-        // Only the task's own node is never consumable — it is the one
-        // unit the task exists to produce. An outcome-3 host task
-        // legitimately serves its crate's target-side twin: same name,
-        // version and features, the other side (stow#723).
-        .filter(|entry| {
-            entry.crate_name.as_str() != task.crate_name.as_str()
-                || &entry.version != task.version.as_semver()
-                || entry.host_side != task.host_side
-                || entry.features.iter().cloned().collect::<BTreeSet<_>>()
-                    != task
-                        .features_json
-                        .features()
-                        .iter()
-                        .cloned()
-                        .collect::<BTreeSet<_>>()
-        })
-        .map(|entry| ConsumablePackage {
-            crate_name: entry.crate_name.as_str().to_owned(),
-            version: entry.version.clone(),
-            features: entry.features.iter().cloned().collect(),
-            host_side: entry.host_side,
-        })
-        .collect()
-}
-
-/// The library nodes and build-script outputs this task may consume.
-pub struct ConsumablePackages {
-    pub libraries: Vec<ConsumablePackage>,
-    pub scripts: Vec<ConsumablePackage>,
-}
-
-/// One unit of the build workspace's own unit graph — a
-/// consumption-prefetch candidate.
+/// One build script of the build workspace's own unit graph — a
+/// consumption-prefetch candidate (stow#589). A script's row records the
+/// host shape whichever side its crate's node is on, so the unit graph is
+/// what names it; library rows are named by the pinned subtree's nodes
+/// instead (#1415).
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ConsumablePackage {
     /// Canonical package name.
@@ -335,9 +365,6 @@ pub struct ConsumablePackage {
     /// The feature set cargo activated for this unit — the identity the
     /// dep's own task published it under.
     pub(crate) features: BTreeSet<String>,
-    /// Which half of the unit graph the unit compiles on: proc-macros,
-    /// build dependencies and their subtree are host-side.
-    pub(crate) host_side: bool,
 }
 
 /// Re-hash every output of every selected capture — the snapshot when the
@@ -817,57 +844,14 @@ pub fn phase_own_units(
     graphs: &[crate::task::PhaseUnitGraph],
     run_dir: &Path,
 ) -> stow_types::error::Result<BTreeMap<PathBuf, PhaseOwnUnit>> {
-    use stow_types::unit_graph::{TaskUnitKind, TaskUnitSide};
+    use stow_types::unit_graph::TaskUnitKind;
     let host_triple = crate::task::runner_host_triple(task)?;
-    let (own_side, declaring_kind) = if task.host_side {
-        (TaskUnitSide::Host, TaskUnitKind::BuildScript)
-    } else {
-        (TaskUnitSide::Target, TaskUnitKind::Lib)
-    };
     let mut phases = BTreeMap::new();
     for graph in graphs {
         let units = graph.task_units(host_triple).map_err(|error| {
             stow_types::stow_error!("{} unit graph does not convert: {error}", graph.label())
         })?;
-        // The wrapper is the graph's only non-registry package, and it
-        // has one unit of each kind.
-        let mut declaring = units
-            .iter()
-            .filter(|unit| unit.key.kind == declaring_kind && !unit.is_crates_io);
-        let wrapper = declaring.next().ok_or_else(|| {
-            stow_types::stow_error!(
-                "{} unit graph has no wrapper {declaring_kind:?} unit",
-                graph.label()
-            )
-        })?;
-        if let Some(other) = declaring.next() {
-            return Err(stow_types::stow_error!(
-                "{} unit graph has two non-registry {declaring_kind:?} units, {} and {}",
-                graph.label(),
-                wrapper.key.pkg,
-                other.key.pkg,
-            ));
-        }
-        let own = wrapper
-            .deps
-            .iter()
-            .find(|dep| {
-                dep.key.kind == TaskUnitKind::Lib
-                    && dep.key.side == own_side
-                    && dep.name == task.crate_name.as_str()
-                    && dep.version == task.version.as_semver().to_string()
-            })
-            .and_then(|dep| units.iter().find(|unit| unit.key == dep.key))
-            .ok_or_else(|| {
-                stow_types::stow_error!(
-                    "{} unit graph's wrapper names no {}-side unit of the task crate {} {}",
-                    graph.label(),
-                    if task.host_side { "host" } else { "target" },
-                    task.crate_name.as_str(),
-                    task.version.as_semver(),
-                )
-            })?;
-        let own_deps = own
+        let own_deps = own_lib_unit(task, &graph.label(), &units)?
             .deps
             .iter()
             .filter(|dep| dep.key.kind == TaskUnitKind::Lib)
@@ -876,6 +860,55 @@ pub fn phase_own_units(
         phases.insert(graph.target_dir(run_dir), PhaseOwnUnit { units, own_deps });
     }
     Ok(phases)
+}
+
+/// The task's own library unit in one phase×invocation graph's `units`:
+/// the one the generated wrapper's own-crate dep edge names on the task's
+/// side (see [`phase_own_units`]). `label` names the graph in errors.
+pub fn own_lib_unit<'u>(
+    task: &BuildTaskPayload,
+    label: &str,
+    units: &'u [stow_types::unit_graph::TaskUnit],
+) -> stow_types::error::Result<&'u stow_types::unit_graph::TaskUnit> {
+    use stow_types::unit_graph::{TaskUnitKind, TaskUnitSide};
+    let (own_side, declaring_kind) = if task.host_side {
+        (TaskUnitSide::Host, TaskUnitKind::BuildScript)
+    } else {
+        (TaskUnitSide::Target, TaskUnitKind::Lib)
+    };
+    // The wrapper is the graph's only non-registry package, and it
+    // has one unit of each kind.
+    let mut declaring = units
+        .iter()
+        .filter(|unit| unit.key.kind == declaring_kind && !unit.is_crates_io);
+    let wrapper = declaring.next().ok_or_else(|| {
+        stow_types::stow_error!("{label} unit graph has no wrapper {declaring_kind:?} unit")
+    })?;
+    if let Some(other) = declaring.next() {
+        return Err(stow_types::stow_error!(
+            "{label} unit graph has two non-registry {declaring_kind:?} units, {} and {}",
+            wrapper.key.pkg,
+            other.key.pkg,
+        ));
+    }
+    wrapper
+        .deps
+        .iter()
+        .find(|dep| {
+            dep.key.kind == TaskUnitKind::Lib
+                && dep.key.side == own_side
+                && dep.name == task.crate_name.as_str()
+                && dep.version == task.version.as_semver().to_string()
+        })
+        .and_then(|dep| units.iter().find(|unit| unit.key == dep.key))
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "{label} unit graph's wrapper names no {}-side unit of the task crate {} {}",
+                if task.host_side { "host" } else { "target" },
+                task.crate_name.as_str(),
+                task.version.as_semver(),
+            )
+        })
 }
 
 /// Whether `artifact` is a capture of the task's own unit — the lib
@@ -1155,12 +1188,21 @@ fn collect_consumed_captures(
                     })?,
                     rustc_version: rustc_version.to_owned(),
                     emit: captured.emit.clone(),
+                    invocations: std::collections::BTreeSet::new(),
                 },
                 records: Vec::new(),
             });
             by_compile_key.insert(captured.compile_key.clone(), index);
             index
         };
+        let invocation = captured.invocation.ok_or_else(|| {
+            stow_types::stow_error!(
+                "consumed capture {} (compile_key {}) carries no invocation stamp — the collector never saw it drain",
+                captured.crate_name,
+                captured.compile_key
+            )
+        })?;
+        captures[index].artifact.invocations.insert(invocation);
         captures[index].records.push(captured.clone());
     }
     Ok(captures)
@@ -1249,29 +1291,47 @@ async fn build_scanned_artifact(
             artifact.package.crate_types.clone()
         },
         outputs,
-        // The shape the edge's gate checks: the task's own side, the
+        // The shape the publisher's gate checks: the task's own side, the
         // invocation spelling the collector stamped on the capture, and
         // the emit set's link membership.
         unit_shape: unit_shape(task, artifact)?,
-        shared_invocations: !build_script && artifact.shared_invocations,
+        shared_invocations: artifact.shared_invocations,
         build_script_out_dir: artifact.captured.build_script_out_dir.clone(),
         native: None,
     })
 }
 
-/// The shape the edge's gate checks: the task's own side, the invocation
-/// spelling the collector stamped on the capture, and the emit set's link
-/// membership. A build script is keyed by the host it runs on, whichever
-/// spelling compiled it.
+/// The shape the publisher's gate checks: the task's own side, the
+/// invocation spelling the collector stamped on the capture, and the emit
+/// set's link membership. A build script runs on the host and always
+/// links, whichever side its crate's node is on; the spelling that
+/// compiled it is still recorded, because the two spellings key one
+/// script apart whenever a build dependency does.
 fn unit_shape(
     task: &BuildTaskPayload,
     artifact: &SelectedCapturedArtifact,
 ) -> stow_types::error::Result<stow_types::public_cache::UnitShape> {
-    use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
-    if artifact.artifact_kind == ArtifactKind::BuildScript {
+    capture_unit_shape(task, &artifact.artifact_kind, &artifact.captured)
+}
+
+/// [`unit_shape`] of one capture of a unit of `kind`.
+pub fn capture_unit_shape(
+    task: &BuildTaskPayload,
+    kind: &ArtifactKind,
+    captured: &CapturedRustcArtifact,
+) -> stow_types::error::Result<stow_types::public_cache::UnitShape> {
+    use stow_types::public_cache::{UnitKind, UnitShape, UnitSide};
+    let invocation = captured.invocation.ok_or_else(|| {
+        stow_types::stow_error!(
+            "capture for {} {} carries no invocation stamp — the collector never saw it drain",
+            captured.crate_name,
+            captured.compile_key
+        )
+    })?;
+    if *kind == ArtifactKind::BuildScript {
         return Ok(UnitShape {
             side: UnitSide::Host,
-            invocation: UnitInvocation::Native,
+            invocation,
             kind: UnitKind::Linked,
         });
     }
@@ -1286,14 +1346,8 @@ fn unit_shape(
         } else {
             UnitSide::Target
         },
-        invocation: artifact.captured.invocation.ok_or_else(|| {
-            stow_types::stow_error!(
-                "capture for {} {} carries no invocation stamp — the collector never saw it drain",
-                artifact.captured.crate_name,
-                artifact.captured.compile_key
-            )
-        })?,
-        kind: UnitKind::from_emit(&artifact.captured.emit),
+        invocation,
+        kind: UnitKind::from_emit(&captured.emit),
     })
 }
 
@@ -2792,6 +2846,78 @@ mod tests {
         let artifact = &selected.artifacts[0];
         assert_eq!(artifact.artifact_kind, ArtifactKind::BuildScript);
         assert_eq!(artifact.package.name, "serde_json");
+        // One key, both spellings compiled it: one artifact marked shared,
+        // labelled by the spelling that was captured first, which
+        // publishes the host/linked shape under both spellings.
+        assert!(artifact.shared_invocations);
+        let shape = super::unit_shape(&consumer_task(), artifact).expect("shape");
+        assert_eq!(shape, script_shape(UnitInvocation::Native));
+        assert_eq!(
+            shape
+                .invocation_shapes(artifact.shared_invocations)
+                .collect::<Vec<_>>(),
+            [
+                script_shape(UnitInvocation::Native),
+                script_shape(UnitInvocation::Target)
+            ]
+        );
+    }
+
+    /// A build script's shape: a linked host executable, labelled with
+    /// the spelling that compiled it.
+    fn script_shape(invocation: UnitInvocation) -> stow_types::public_cache::UnitShape {
+        stow_types::public_cache::UnitShape {
+            side: stow_types::public_cache::UnitSide::Host,
+            invocation,
+            kind: stow_types::public_cache::UnitKind::Linked,
+        }
+    }
+
+    /// The same script at two keys — a build dependency keys apart per
+    /// spelling — is two artifacts, each labelled with its own spelling
+    /// and neither shared.
+    #[test]
+    fn a_build_script_at_two_keys_is_two_artifacts_labelled_by_spelling() {
+        let mut index = super::PackageIndex::new();
+        index
+            .entry("serde_json".to_owned())
+            .or_default()
+            .insert("1.0.149".to_owned(), indexed("serde_json", "1.0.149"));
+        let native = build_script_capture(
+            "serde_json",
+            "1.0.149",
+            "/tmp/w/target-native",
+            UnitInvocation::Native,
+        );
+        let mut targeted = build_script_capture(
+            "serde_json",
+            "1.0.149",
+            "/tmp/w/target-target",
+            UnitInvocation::Target,
+        );
+        targeted.compile_key = "dd".repeat(32);
+        let selected =
+            select_captured_artifacts(&index, &[native, targeted], "aarch64-apple-darwin")
+                .expect("two keys select");
+        assert_eq!(selected.artifacts.len(), 2);
+        assert_eq!(selected.absorbed_duplicates, 0);
+        let task = consumer_task();
+        let mut labelled = selected
+            .artifacts
+            .iter()
+            .map(|artifact| {
+                assert!(!artifact.shared_invocations);
+                super::unit_shape(&task, artifact).expect("shape")
+            })
+            .collect::<Vec<_>>();
+        labelled.sort();
+        assert_eq!(
+            labelled,
+            [
+                script_shape(UnitInvocation::Native),
+                script_shape(UnitInvocation::Target)
+            ]
+        );
     }
 
     /// Relocatable foreign scripts must reach the own-node check too.
@@ -2816,6 +2942,53 @@ mod tests {
             library.clone(),
         ]);
         assert_eq!(kept, vec![own, foreign, library]);
+    }
+
+    /// The task's own manifest-relative scripts are claimed once per
+    /// spelling that compiled one; a dependency's are its consumer's
+    /// business, and a relocatable script is planned, not claimed.
+    #[test]
+    fn own_manifest_relative_scripts_are_claimed_by_spelling() {
+        let mut index = super::PackageIndex::new();
+        for (name, version) in [("serde_json", "1.0.149"), ("libc", "0.2.180")] {
+            index
+                .entry(name.to_owned())
+                .or_default()
+                .insert(version.to_owned(), indexed(name, version));
+        }
+        let local = |package: &str, version: &str, invocation| {
+            let mut capture = build_script_capture(package, version, "/tmp/w/target", invocation);
+            capture.reads_manifest_dir = true;
+            capture
+        };
+        let relocatable = build_script_capture(
+            "serde_json",
+            "1.0.149",
+            "/tmp/w/target",
+            UnitInvocation::Native,
+        );
+        let claimed = super::own_local_scripts(
+            &index,
+            &[
+                local("serde_json", "1.0.149", UnitInvocation::Target),
+                local("serde_json", "1.0.149", UnitInvocation::Native),
+                local("serde_json", "1.0.149", UnitInvocation::Native),
+                local("libc", "0.2.180", UnitInvocation::Native),
+                relocatable,
+            ],
+            &consumer_task(),
+        )
+        .expect("own local scripts");
+        assert_eq!(
+            claimed
+                .iter()
+                .map(|script| (script.invocation, script.c_metadata.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (UnitInvocation::Native, "aaaaaaaaaaaaaaaa"),
+                (UnitInvocation::Target, "aaaaaaaaaaaaaaaa"),
+            ]
+        );
     }
 
     #[test]
@@ -3212,6 +3385,7 @@ mod tests {
                 target: "aarch64-apple-darwin".to_owned(),
                 rustc_version: "1.91.1".to_owned(),
                 emit: vec!["dep-info".to_owned(), "link".to_owned()],
+                invocations: [stow_types::public_cache::UnitInvocation::Native].into(),
             },
             records: vec![record],
         }
@@ -3890,172 +4064,6 @@ mod tests {
         });
     }
 
-    /// stow#589: the consumable set is the build workspace's own cargo
-    /// unit graph — a build-script dep lands host-side and a transitive
-    /// dep of a pinned crate lands target-side, each at the feature set
-    /// cargo activated — while the task crate itself never becomes
-    /// consumable. The fixture is the graph `cargo --unit-graph` emits
-    /// for a native spelling of a target-side task whose manifest pins
-    /// `direct-dep` and build-dep `host-dep`.
-    #[test]
-    fn consumable_packages_follow_the_builds_unit_graph() {
-        // `path+` units' manifests are hashed at parse — the wrapper's
-        // pkg id must name a real manifest, and a spaced directory
-        // exercises the file-URL percent-encoding `path_pkg_root`
-        // decodes.
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let project = tempdir.path().join("wrapper workspace");
-        std::fs::create_dir(&project).expect("wrapper dir");
-        std::fs::write(
-            project.join("Cargo.toml"),
-            "[package]\nname = \"stow-ci-wrapper\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
-        )
-        .expect("write wrapper manifest");
-        let wrapper_url = url::Url::from_directory_path(&project).expect("dir url");
-        let wrapper_pkg = format!("path+{wrapper_url}#stow-ci-wrapper@0.0.0");
-        let mut graph_json: serde_json::Value =
-            serde_json::from_str(UNIT_GRAPH_JSON).expect("fixture parses");
-        for index in [0usize, 1] {
-            graph_json["units"][index]["pkg_id"] = serde_json::Value::String(wrapper_pkg.clone());
-        }
-        let graph_json = serde_json::to_vec(&graph_json).expect("serialize fixture");
-        let graph = stow_cli::expanded_dependency_graph(
-            &graph_json,
-            None,
-            "x86_64-unknown-linux-gnu",
-            &stow_types::identity::WireRustcVersion::parse("1.99.0").unwrap(),
-        )
-        .expect("unit graph parses");
-
-        let task = BuildTaskPayload {
-            task_id: "task-crate-1.2.3".to_owned(),
-            attempt: 1,
-            crate_name: stow_types::identity::CrateName::parse("task-crate").unwrap(),
-            version: stow_types::identity::CrateVersion::new(semver::Version::new(1, 2, 3)),
-            features_json: stow_types::identity::FeaturesJson::default(),
-            target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
-            rustc_version: stow_types::identity::WireRustcVersion::parse("1.99.0").unwrap(),
-            preserve_lockfile: false,
-            host_side: false,
-            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
-            dependency_subgraph: stow_types::api::TaskSubgraph {
-                root_deps: Vec::new(),
-                nodes: Vec::new(),
-            },
-            profile: stow_types::node_profile::NodeProfile::Dev,
-        };
-        let packages = super::consumable_packages(&task, &graph.entries);
-        let found = packages
-            .iter()
-            .map(|package| {
-                (
-                    package.crate_name.as_str(),
-                    package.version.to_string(),
-                    package.features.iter().cloned().collect::<Vec<_>>(),
-                    package.host_side,
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            found,
-            BTreeSet::from([
-                (
-                    "direct-dep",
-                    "2.0.0".to_owned(),
-                    vec!["compress".to_owned()],
-                    false
-                ),
-                ("host-dep", "3.1.0".to_owned(), vec![], true),
-                ("transitive-dep", "0.4.0".to_owned(), vec![], false),
-                // stow#723: only the task's own *node* — name, version,
-                // side and feature set — is never consumable. The
-                // task's package at another feature set is a different
-                // node and is served like any other.
-                (
-                    "task-crate",
-                    "1.2.3".to_owned(),
-                    vec!["std".to_owned()],
-                    false
-                ),
-            ]),
-            "the whole closure — build-script deps host-side, transitives target-side — is consumable at activated features"
-        );
-    }
-
-    /// The `cargo --unit-graph` shape a native-spelling phase emits for a
-    /// target-side task: the generated wrapper's lib unit (root) spells
-    /// the task crate as a normal dep and hangs `[build-dependencies]`
-    /// under its own custom-build unit. `@WRAPPER@` fills in the path pkg
-    /// id, which must name a real manifest.
-    const UNIT_GRAPH_JSON: &str = r#"{
-        "version": 1,
-        "units": [
-            {
-                "pkg_id": "@WRAPPER@",
-                "target": {"kind": ["lib"]},
-                "platform": "aarch64-apple-darwin",
-                "mode": "build",
-                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
-                "features": [],
-                "dependencies": [
-                    {"index": 1, "extern_crate_name": "stow_ci_wrapper"},
-                    {"index": 2, "extern_crate_name": "task_crate"}
-                ]
-            },
-            {
-                "pkg_id": "@WRAPPER@",
-                "target": {"kind": ["custom-build"]},
-                "platform": "aarch64-apple-darwin",
-                "mode": "build",
-                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
-                "features": [],
-                "dependencies": [
-                    {"index": 4, "extern_crate_name": "host_dep"}
-                ]
-            },
-            {
-                "pkg_id": "registry+https://github.com/rust-lang/crates.io-index#task-crate@1.2.3",
-                "target": {"kind": ["lib"]},
-                "platform": "aarch64-apple-darwin",
-                "mode": "build",
-                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
-                "features": ["std"],
-                "dependencies": [
-                    {"index": 3, "extern_crate_name": "direct_dep"}
-                ]
-            },
-            {
-                "pkg_id": "registry+https://github.com/rust-lang/crates.io-index#direct-dep@2.0.0",
-                "target": {"kind": ["lib"]},
-                "platform": "aarch64-apple-darwin",
-                "mode": "build",
-                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
-                "features": ["compress"],
-                "dependencies": [
-                    {"index": 5, "extern_crate_name": "transitive_dep"}
-                ]
-            },
-            {
-                "pkg_id": "registry+https://github.com/rust-lang/crates.io-index#host-dep@3.1.0",
-                "target": {"kind": ["lib"]},
-                "platform": "aarch64-apple-darwin",
-                "mode": "build",
-                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
-                "features": [],
-                "dependencies": []
-            },
-            {
-                "pkg_id": "registry+https://github.com/rust-lang/crates.io-index#transitive-dep@0.4.0",
-                "target": {"kind": ["lib"]},
-                "platform": "aarch64-apple-darwin",
-                "mode": "build",
-                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
-                "features": [],
-                "dependencies": []
-            }
-        ],
-        "roots": [0]
-    }"#;
     /// stow#736: a `KeysAsNative` contract is wrong when the task's own
     /// unit's `--extern` set holds a proc-macro — the flag the
     /// resolution handed down and the compiled graph disagree, and
@@ -4106,6 +4114,7 @@ mod tests {
                 target: "x86_64-unknown-linux-gnu".to_owned(),
                 rustc_version: "1.91.1".to_owned(),
                 emit: vec!["link".to_owned()],
+                invocations: [stow_types::public_cache::UnitInvocation::Native].into(),
             },
             records: vec![served],
         }];

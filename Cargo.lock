@@ -3822,9 +3822,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heel"
-version = "0.7.1"
+version = "0.9.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a32e54ee9f12bbd273678a32c5f5c4ecfb6fbb5a5d98d259f7aa5283300ffdf"
+checksum = "3382c961fce64e256877b45b8022ef9b035dd4a6558f2b61c5b103783a91e3c8"
 dependencies = [
  "askama 0.12.1",
  "async-channel",
@@ -6563,9 +6563,9 @@ dependencies = [
 
 [[package]]
 name = "reflink-copy"
-version = "0.1.30"
+version = "0.1.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9dd7ab4af0363d5ccfd2838d782a28196cf32a5cc2e4fe3c5dc83f2be588b8b"
+checksum = "1ad64f61357bcf16105a0f353f9783733409c8bd889bc326ad857959605ea927"
 dependencies = [
  "cfg-if",
  "libc",
@@ -8108,7 +8108,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stow-admin"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "apple-native-keyring-store",
  "askama 0.14.0",
@@ -8158,7 +8158,7 @@ dependencies = [
 
 [[package]]
 name = "stow-build"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "async-fs",
  "async-net",
@@ -8206,8 +8206,9 @@ dependencies = [
 
 [[package]]
 name = "stow-cli"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
+ "askama 0.14.0",
  "async-fs",
  "async-process",
  "axoupdater",
@@ -8268,7 +8269,7 @@ dependencies = [
 
 [[package]]
 name = "stow-edge"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "askama 0.14.0",
@@ -8315,7 +8316,7 @@ dependencies = [
 
 [[package]]
 name = "stow-mock-registry"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "async-fs",
  "axum",
@@ -8347,7 +8348,7 @@ dependencies = [
 
 [[package]]
 name = "stow-oci"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "async-fs",
  "base64 0.23.1",
@@ -8409,7 +8410,7 @@ dependencies = [
 
 [[package]]
 name = "stow-shim"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "dirs 7.0.0",
  "hex",
@@ -8417,12 +8418,13 @@ dependencies = [
  "sha2 0.11.0",
  "stow-types",
  "tar",
+ "tempfile",
  "zstd",
 ]
 
 [[package]]
 name = "stow-types"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "blake3",
  "cap-fs-ext",

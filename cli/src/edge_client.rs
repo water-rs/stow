@@ -29,10 +29,27 @@ const CI_HEADER: &str = "x-stow-ci";
 /// [`EdgeHeaders`] middleware that stamps identity and opt-out headers on
 /// every request. Refuses a cache mode that does not reach the network.
 pub fn client(config: &StowConfig) -> stow_types::error::Result<impl Client> {
+    Ok(untimed_client(config)?.timeout(config.request_timeout))
+}
+
+/// What [`untimed_client`] requests fail with: the transport's own
+/// [`zenwave::Error`], response attached, with [`EdgeHeaders`]' error
+/// (it has none) around it.
+pub type EdgeError = MiddlewareError<zenwave::Error, Infallible>;
+
+/// [`client`] without the request timeout, for a caller that bounds the
+/// request itself and needs the concrete [`EdgeError`] — an answer's
+/// headers, such as `Retry-After`, are readable only through it.
+pub fn untimed_client(
+    config: &StowConfig,
+) -> stow_types::error::Result<impl Client<Error = EdgeError>> {
     config.require_network("an edge request")?;
-    Ok(zenwave::client()
-        .timeout(config.request_timeout)
-        .with(EdgeHeaders::new()))
+    // Built through `WithMiddleware` rather than `Client::with`, whose
+    // opaque return would hide the error type.
+    Ok(zenwave::endpoint::WithMiddleware::new(
+        zenwave::client(),
+        EdgeHeaders::new(),
+    ))
 }
 
 /// Whether `STOW_NO_ANALYTICS` is set to `1`.

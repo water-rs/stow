@@ -2,13 +2,19 @@
 //! (stow#773). `scripts/preheat-cost.sh` drives a preheat wave through
 //! the mock stack and calls `ledger` at every boundary it measures;
 //! `report` reads what the run left in the work directory, runs
-//! [`stow_types::preheat_cost::analyse`] and writes
+//! [`report::analyse`] and writes
 //! `preheat-cost-report.json`. `production` is the other job's half:
 //! `scripts/production-wave.sh` plans the production lanes without an
 //! edge and it counts their distinct nodes into `production-wave.json`.
 //!
 //! The work directory's layout is this module's contract with the
-//! script, per phase (`wave`, then `resubmit`):
+//! script, per phase. The phases are `wave`, then the resubmit passes
+//! `resubmit/001`, `resubmit/002`, … (the script repeats the resubmit
+//! until a pass inserts nothing, because the lanes resolve online and a
+//! release published since the last phase gives a pass nodes the earlier
+//! ones never planned): `<phase>` below is `wave` or `resubmit/<NNN>`.
+//! The last pass is the measured resubmit; each earlier one is a drift
+//! pass.
 //!
 //! ```text
 //! <phase>/start.json                    ledger when the phase began
@@ -22,7 +28,7 @@
 //! <phase>/end.json                      ledger when the phase ended
 //! ```
 //!
-//! and, across both phases, every restart of the dev edge (the probe
+//! and, across every phase, every restart of the dev edge (the probe
 //! ledger lives in the edge's memory past its last snapshot, so the
 //! report carries every later read across each restart):
 //!
@@ -49,11 +55,6 @@ use keyring_core::api::CredentialStoreApi;
 use stow_types::api::{ArtifactRecord, SchedulerLedger};
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::local_ci::LocalCiTasks;
-use stow_types::preheat_cost::{
-    EdgeRestart, LaneRun, LedgerSnapshot, Node, PhaseObservations, PreheatCostReport,
-    ProductionLane, ProductionTask, ProductionWave, Round, WaveObservations, analyse,
-    count_production,
-};
 use stow_types::public_cache::UnitSide;
 use stow_types::stow_error;
 use stow_types::task_graph::TaskNodeIdentity;
@@ -63,6 +64,13 @@ use crate::projects::{ProjectsPlan, SubmitOutcome};
 use crate::render::{self, Output, Planned, Table};
 
 pub mod cpu;
+pub mod report;
+
+use report::{
+    EdgeRestart, LaneRun, LedgerSnapshot, Node, PhaseObservations, PreheatCostReport,
+    ProductionLane, ProductionTask, ProductionWave, ResubmitPass, Round, WaveObservations, analyse,
+    count_production,
+};
 
 /// Scheduler costs plus complete CPU captures for both measured phases.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -322,19 +330,26 @@ async fn production_lanes(lanes_dir: &Path) -> stow_types::error::Result<Vec<Pro
     Ok(lanes)
 }
 
+/// What one phase directory held.
+struct PhaseRead {
+    observations: PhaseObservations,
+    /// Every tree its lanes planned.
+    trees: Vec<stow_types::api::SubmissionTree>,
+    /// Its first-seen tasks by task id, each with its `crate_name version`.
+    inserted: BTreeMap<String, String>,
+}
+
 /// A phase's observations plus every task its lanes planned.
 ///
 /// `seen` holds the task ids the queue already carries: a first-seen task
 /// is an inserted row, and its direct dependencies are the edges the
 /// submit wrote for it. The wave phase seeds it empty — the harness
-/// resets the store first — and the resubmit keeps accumulating, so each
-/// phase's dedup set is exactly what its submits saw.
-async fn phase(
-    dir: &Path,
-    seen: &mut BTreeSet<String>,
-) -> stow_types::error::Result<(PhaseObservations, Vec<stow_types::api::SubmissionTree>)> {
+/// resets the store first — and every resubmit pass keeps accumulating,
+/// so each phase's dedup set is exactly what its submits saw.
+async fn phase(dir: &Path, seen: &mut BTreeSet<String>) -> stow_types::error::Result<PhaseRead> {
     let mut lanes = Vec::new();
     let mut tasks = Vec::new();
+    let mut first_seen = BTreeMap::new();
     for (name, lane_dir) in lane_dirs(&dir.join("lanes")).await? {
         let plan = lane_plan(&name, &lane_dir).await?;
         let mut inserted = 0_u64;
@@ -344,6 +359,10 @@ async fn phase(
             // is a row it inserted and a dedup anchor for the next lane.
             for node in plan.tasks.iter().flat_map(|tree| &tree.nodes) {
                 if seen.insert(node.task_id.clone()) {
+                    first_seen.insert(
+                        node.task_id.clone(),
+                        format!("{} {}", node.crate_name, node.version),
+                    );
                     inserted += 1;
                     inserted_edges += node.deps.len() as u64;
                 }
@@ -381,15 +400,40 @@ async fn phase(
             published: published_task_ids(&records)?,
         });
     }
-    Ok((
-        PhaseObservations {
+    Ok(PhaseRead {
+        observations: PhaseObservations {
             start: read_json(&dir.join("start.json")).await?,
             rounds,
             lanes,
             end: read_json(&dir.join("end.json")).await?,
         },
-        tasks,
-    ))
+        trees: tasks,
+        inserted: first_seen,
+    })
+}
+
+/// The resubmit pass directories under `<work-dir>/resubmit`, in pass
+/// order. The script numbers them `001`, `002`, … without a gap; a run
+/// that left none, or a gap, is not a run this report can read.
+async fn resubmit_pass_dirs(work_dir: &Path) -> stow_types::error::Result<Vec<PathBuf>> {
+    let dirs = sorted_entries(&work_dir.join("resubmit")).await?;
+    if dirs.is_empty() {
+        return Err(stow_error!(
+            "no resubmit pass directory under {}/resubmit",
+            work_dir.display()
+        ));
+    }
+    for (index, dir) in dirs.iter().enumerate() {
+        let name = dir.file_name().and_then(|name| name.to_str());
+        let expected = format!("{:03}", index + 1);
+        if name != Some(expected.as_str()) {
+            return Err(stow_error!(
+                "resubmit pass directory {} should be named {expected}",
+                dir.display()
+            ));
+        }
+    }
+    Ok(dirs)
 }
 
 /// The run's edge restarts, in the order the script numbered them.
@@ -425,8 +469,26 @@ async fn report(args: &ReportArgs, output: Output) -> stow_types::error::Result<
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("--rustc-version: {error}"))?;
     let mut seen = BTreeSet::new();
-    let (wave, wave_tasks) = phase(&args.work_dir.join("wave"), &mut seen).await?;
-    let (resubmit, _) = phase(&args.work_dir.join("resubmit"), &mut seen).await?;
+    let PhaseRead {
+        observations: wave,
+        trees: wave_tasks,
+        inserted: wave_inserted,
+    } = phase(&args.work_dir.join("wave"), &mut seen).await?;
+    // The releases some earlier phase planned, as `crate_name version`.
+    let mut releases: BTreeSet<String> = wave_inserted.into_values().collect();
+    let mut resubmit = Vec::new();
+    for dir in resubmit_pass_dirs(&args.work_dir).await? {
+        let known = seen.clone();
+        let known_releases = releases.clone();
+        let read = phase(&dir, &mut seen).await?;
+        releases.extend(read.inserted.values().cloned());
+        resubmit.push(ResubmitPass {
+            phase: read.observations,
+            known,
+            known_releases,
+            inserted: read.inserted,
+        });
+    }
 
     let mut nodes = BTreeMap::new();
     let mut spellings = BTreeMap::new();
@@ -580,8 +642,31 @@ fn render_report(measured: &MeasuredReport) -> String {
             check.detail.clone(),
         ]);
     }
+    let mut drift = Table::new(&[
+        "resubmit pass",
+        "inserted tasks",
+        "build runs",
+        "new releases",
+    ]);
+    for pass in &report.drift_passes {
+        drift.push([
+            format!("{} of {}", pass.pass, report.resubmit_passes),
+            pass.inserted.to_string(),
+            pass.tasks.to_string(),
+            pass.releases_summary(),
+        ]);
+    }
+    let drift = if report.drift_passes.is_empty() {
+        format!("{} resubmit pass, no drift", report.resubmit_passes)
+    } else {
+        format!(
+            "{} resubmit passes, the last one measured; drift passes:\n{}",
+            report.resubmit_passes,
+            drift.render()
+        )
+    };
     format!(
-        "{} nodes ({}) on rustc {}\n\n{}\n\n{}\n\n{}",
+        "{} nodes ({}) on rustc {}\n\n{}\n\n{}\n\n{}\n\n{}",
         report.nodes,
         report
             .nodes_per_target
@@ -591,6 +676,7 @@ fn render_report(measured: &MeasuredReport) -> String {
             .join(", "),
         report.rustc_version,
         phases.render(),
+        drift,
         layers.render(),
         checks.render()
     )

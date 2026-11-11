@@ -561,8 +561,9 @@ mod tests {
         assert_eq!(super::ledger_op("POST", "/requests"), "POST /requests");
     }
 
-    /// Every batch's completion books under the one op the Preheat cost
-    /// report reads as its `Completion` kind; nothing else under
+    /// Every batch's completion books under the one shared completion
+    /// op, which the Preheat cost report reads as its `Completion`
+    /// kind; nothing else under
     /// `/batches/` collapses into it.
     #[test]
     fn a_batch_completion_collapses_to_the_shared_ledger_op() {
@@ -574,10 +575,6 @@ mod tests {
         assert_eq!(
             super::ledger_op("POST", "/batches/a/complete"),
             super::ledger_op("POST", "/batches/b/complete")
-        );
-        assert_eq!(
-            stow_types::preheat_cost::EventKind::Completion.ledger_op(),
-            completion
         );
         assert_ne!(super::ledger_op("GET", "/batches/a/complete"), completion);
         assert_ne!(super::ledger_op("POST", "/batches//complete"), completion);

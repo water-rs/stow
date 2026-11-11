@@ -136,8 +136,41 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
             path.display()
         ))?;
     }
+    // The login trigger of the per-user daemon; `setup` is the only thing
+    // that installs it (stow#1435).
+    #[cfg(target_os = "macos")]
+    {
+        let installed = install_launch_agent(&wrappers.runtime_executable).await?;
+        write_stdout(&format!("launch agent: {}\n", installed.plist.display()))?;
+    }
 
     Ok(())
+}
+
+/// Write the daemon's `LaunchAgent` under the user's `~/Library` and load
+/// it into their GUI domain.
+#[cfg(target_os = "macos")]
+async fn install_launch_agent(
+    runtime_executable: &Path,
+) -> stow_types::error::Result<crate::daemon::launch_agent::Installed> {
+    use crate::daemon::launch_agent::{SystemLaunchctl, install};
+    let agents_dir = dirs::home_dir()
+        .ok_or_else(|| stow_types::stow_error!("resolve home directory"))?
+        .join("Library")
+        .join("LaunchAgents");
+    let runtime_executable = runtime_executable.to_owned();
+    tokio::task::spawn_blocking(move || {
+        // SAFETY: `getuid` has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        install(
+            &agents_dir,
+            &runtime_executable,
+            uid,
+            &SystemLaunchctl::from_env(),
+        )
+    })
+    .await
+    .wrap_err("install the launch agent")?
 }
 
 /// Write `cargo_dir/config.toml` pointing cargo at `wrappers` and — when

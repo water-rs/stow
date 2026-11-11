@@ -76,10 +76,10 @@ olpc-cjson = "0.1.4"
 const-oid = { version = "0.10", features = ["db"] }
 cargo-lock = "11"
 glob = "0.3"
-reflink-copy = { version = "0.1.30", default-features = false }
+reflink-copy = { version = "0.1.32", default-features = false }
 walkdir = "2"
 shell-words = "1.1"
-heel = { version = "0.7.1", default-features = false }
+heel = { version = "0.9.7", default-features = false }
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "tls-rustls", "macros"] }
 axoupdater = "0.10"
 which = "8"
@@ -92,12 +92,22 @@ time = { version = "0.3.55", default-features = false, features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The launch agent plist (`cli/templates/launch_agent.xml`): XML-escaped by
+# a template, never concatenated. Already in the lockfile for the edge and
+# the admin.
+askama = { version = "0.14", default-features = false, features = ["derive", "std"] }
+
 [target.'cfg(windows)'.dependencies]
 # Parent-pid and process-liveness lookups for the miss journal.
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
+    # The daemon's named pipe is restricted to the current user's SID.
+    "Win32_Security",
+    "Win32_Security_Authorization",
 ] }
 
 [dev-dependencies]

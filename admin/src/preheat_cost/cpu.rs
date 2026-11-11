@@ -12,7 +12,10 @@ use super::{read_json, sorted_entries};
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PreheatCpu {
     pub wave: PhaseCpu,
+    /// The measured resubmit: the last pass, the one that inserted nothing.
     pub resubmit: PhaseCpu,
+    /// The passes before it, in order; the projection never reads them.
+    pub drift: Vec<PhaseCpu>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -105,16 +108,27 @@ async fn phase(dir: &Path, next: &mut usize) -> stow_types::error::Result<PhaseC
 pub(super) async fn read(dir: &Path) -> stow_types::error::Result<PreheatCpu> {
     let mut next = 1;
     let wave = phase(&dir.join("wave"), &mut next).await?;
-    let resubmit = phase(&dir.join("resubmit"), &mut next).await?;
+    let mut passes = Vec::new();
+    for pass in super::resubmit_pass_dirs(dir).await? {
+        passes.push(phase(&pass, &mut next).await?);
+    }
     let restarts = sorted_entries(&dir.join("restarts")).await?.len();
-    let captured = wave.segment_count() + resubmit.segment_count();
-    let expected = restarts + 2;
+    // One segment per phase plus one per restart: a restart resumes the
+    // capture of the phase it happened in.
+    let phases = passes.len() + 1;
+    let captured = wave.segment_count() + passes.iter().map(PhaseCpu::segment_count).sum::<usize>();
+    let expected = restarts + phases;
     if captured != expected {
         return Err(stow_error!(
-            "preheat CPU needs {expected} segments for two phases and {restarts} restarts, found {captured}"
+            "preheat CPU needs {expected} segments for {phases} phases and {restarts} restarts, found {captured}"
         ));
     }
-    Ok(PreheatCpu { wave, resubmit })
+    let resubmit = passes.pop().expect("resubmit_pass_dirs is never empty");
+    Ok(PreheatCpu {
+        wave,
+        resubmit,
+        drift: passes,
+    })
 }
 
 #[cfg(test)]
@@ -148,6 +162,7 @@ pub fn test_cpu(wave_ms: f64, resubmit_ms: f64) -> PreheatCpu {
     PreheatCpu {
         wave: phase(1, wave_ms),
         resubmit: phase(2, resubmit_ms),
+        drift: Vec::new(),
     }
 }
 
@@ -186,7 +201,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         capture(root.path(), "wave", 1, 100.0).await;
         capture(root.path(), "wave", 2, 50.0).await;
-        capture(root.path(), "resubmit", 3, 7.0).await;
+        capture(root.path(), "resubmit/001", 3, 7.0).await;
         tokio::fs::create_dir_all(root.path().join("restarts/001"))
             .await
             .expect("restart");
@@ -194,6 +209,7 @@ mod tests {
         assert_eq!(cpu.wave.total_ms(), 150.0);
         assert_eq!(cpu.wave.segment_count(), 2);
         assert_eq!(cpu.resubmit.total_ms(), 7.0);
+        assert!(cpu.drift.is_empty());
         assert_eq!(
             cpu.wave.resumed[0].reference.rounds_after,
             super::reference_rounds(&[22.0, 21.0, 20.0])
@@ -205,7 +221,7 @@ mod tests {
         for missing in ["profile.json", "ready", "stop"] {
             let root = tempfile::tempdir().expect("tempdir");
             capture(root.path(), "wave", 1, 100.0).await;
-            capture(root.path(), "resubmit", 2, 7.0).await;
+            capture(root.path(), "resubmit/001", 2, 7.0).await;
             tokio::fs::remove_file(root.path().join("wave/cpu/001").join(missing))
                 .await
                 .expect("remove");
@@ -217,7 +233,7 @@ mod tests {
     async fn preheat_cpu_rejects_missing_segment_directories() {
         let root = tempfile::tempdir().expect("tempdir");
         capture(root.path(), "wave", 1, 100.0).await;
-        capture(root.path(), "resubmit", 3, 7.0).await;
+        capture(root.path(), "resubmit/001", 3, 7.0).await;
         let error = read(root.path())
             .await
             .expect_err("segment 2 missing")
@@ -229,7 +245,7 @@ mod tests {
     async fn preheat_cpu_rejects_a_restart_with_no_new_segment() {
         let root = tempfile::tempdir().expect("tempdir");
         capture(root.path(), "wave", 1, 100.0).await;
-        capture(root.path(), "resubmit", 2, 7.0).await;
+        capture(root.path(), "resubmit/001", 2, 7.0).await;
         tokio::fs::create_dir_all(root.path().join("restarts/001"))
             .await
             .expect("restart");
@@ -248,6 +264,36 @@ mod tests {
             .await
             .expect_err("resubmit absent")
             .to_string();
-        assert!(error.contains("no preheat CPU segments"), "{error}");
+        assert!(error.contains("no resubmit pass directory"), "{error}");
+    }
+
+    /// A restart inside a drift pass resumes that pass's capture; the last
+    /// pass is the measured resubmit and the earlier ones are kept apart.
+    #[tokio::test]
+    async fn preheat_cpu_keeps_the_last_pass_as_the_resubmit() {
+        let root = tempfile::tempdir().expect("tempdir");
+        capture(root.path(), "wave", 1, 100.0).await;
+        capture(root.path(), "resubmit/001", 2, 30.0).await;
+        capture(root.path(), "resubmit/001", 3, 5.0).await;
+        capture(root.path(), "resubmit/002", 4, 7.0).await;
+        tokio::fs::create_dir_all(root.path().join("restarts/001"))
+            .await
+            .expect("restart");
+        let cpu = read(root.path()).await.expect("complete CPU");
+        assert_eq!(cpu.resubmit.total_ms(), 7.0);
+        assert_eq!(cpu.drift.len(), 1);
+        assert_eq!(cpu.drift[0].total_ms(), 35.0);
+    }
+
+    #[tokio::test]
+    async fn preheat_cpu_rejects_a_gap_in_the_pass_numbers() {
+        let root = tempfile::tempdir().expect("tempdir");
+        capture(root.path(), "wave", 1, 100.0).await;
+        capture(root.path(), "resubmit/002", 2, 7.0).await;
+        let error = read(root.path())
+            .await
+            .expect_err("pass 001 missing")
+            .to_string();
+        assert!(error.contains("should be named 001"), "{error}");
     }
 }

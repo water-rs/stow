@@ -35,7 +35,6 @@ pub mod node_profile;
 pub mod periodic;
 pub mod platform;
 pub mod pow;
-pub mod preheat_cost;
 pub mod public_cache;
 pub mod records;
 pub mod registry;

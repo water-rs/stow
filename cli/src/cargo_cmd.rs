@@ -222,6 +222,12 @@ async fn begin_project(
         .in_scope(|| ProjectContext::begin(invocation))?;
     let mold = spawn_mold_provision(&pending, config);
     let env_base = spawn_env_base(config, &pending);
+    // Start the toolchain's probes beside mold's and the base's even
+    // when no base is built, so `run_cargo` finds them answered.
+    let toolchain = pending.toolchain.clone();
+    tokio::spawn(async move {
+        let _ = toolchain.await;
+    });
     let mut project = pending.finish(mold, enter_foreground_hold()).await?;
     project.env_base = env_base;
     Ok(project)
@@ -673,6 +679,7 @@ fn build_mirror_project_context(
         mold: project.mold.clone(),
         env_base: project.env_base.clone(),
         build_rustc: project.build_rustc.clone(),
+        toolchain: project.toolchain.clone(),
         foreground: project.foreground.clone(),
     })
 }
@@ -802,6 +809,9 @@ pub struct ProjectContext {
     /// set, else the toolchain's — the executable every driver-side
     /// probe names (stow#608).
     pub(crate) build_rustc: rustc_args::BuildRustc,
+    /// The toolchain of that rustc, resolved once for the build: the
+    /// supervisor takes every rustc fact from it.
+    pub(crate) toolchain: SharedToolchain,
     /// The hold keeping miss drains' derivation cargo off the
     /// package-cache lock while this command's cargo may need it —
     /// taken where the context is begun, released once cargo's
@@ -827,25 +837,72 @@ type SharedEnvBase = Shared<
     >,
 >;
 
+/// The build's toolchain while its probes are still answering: `Shared`
+/// so the supervisor's base task and `run_cargo` await the one
+/// resolution. A failed probe is an `Err`: the build fails with the
+/// probe's own error, as plain cargo fails there.
+type SharedToolchain = Shared<
+    BoxFuture<
+        'static,
+        Result<std::sync::Arc<crate::toolchain::BuildToolchain>, std::sync::Arc<String>>,
+    >,
+>;
+
+/// The build's toolchain, resolved lazily from the shared `rustc -vV`,
+/// the configured workspace wrapper and the build's rustc spelling.
+fn shared_toolchain(
+    build_rustc: &rustc_args::BuildRustc,
+    workspace_wrapper: Option<PathBuf>,
+    shared_vv: crate::rustc_args::SharedRustcVv,
+) -> SharedToolchain {
+    let build_rustc = build_rustc.clone();
+    async move {
+        crate::toolchain::BuildToolchain::for_build(&build_rustc, workspace_wrapper, &shared_vv)
+            .await
+            .map(std::sync::Arc::new)
+            .map_err(std::sync::Arc::new)
+    }
+    .boxed()
+    .shared()
+}
+
+/// A toolchain that never resolves — for a test context no supervisor
+/// is built from, so nothing awaits it.
+#[cfg(test)]
+pub fn pending_toolchain() -> SharedToolchain {
+    futures_util::future::pending().boxed().shared()
+}
+
+/// The build's toolchain, joined: a failed probe is the build's own
+/// error.
+async fn join_toolchain(
+    shared: &SharedToolchain,
+) -> stow_types::error::Result<std::sync::Arc<crate::toolchain::BuildToolchain>> {
+    shared
+        .clone()
+        .await
+        .map_err(|error| stow_types::stow_error!("resolve the build's rustc toolchain: {error}"))
+}
+
 /// Spawn the supervisor's base build on the driver's own timeline —
-/// the shared `rustc -vV` fact probe, the `rustc --print sysroot`
-/// executable probe and `prepare_local_cache` overlap the context's
-/// remaining work and mold's provisioning, so `run_cargo` finds them
-/// already answered (stow#608). No `StowConfig` means nothing to build
-/// and no task to await.
+/// the toolchain's probes and `prepare_local_cache` overlap the
+/// context's remaining work and mold's provisioning, so `run_cargo` finds
+/// them already answered (stow#608). No `StowConfig` means nothing to
+/// build and no task to await.
 fn spawn_env_base(
     config: Option<&StowConfig>,
     pending: &PendingProjectContext,
 ) -> Option<SharedEnvBase> {
     let config = config.cloned()?;
-    let shared_vv = pending.rustc_vv.clone();
-    let build_rustc = pending.build_rustc.clone();
+    let toolchain = pending.toolchain.clone();
     let task = tokio::spawn(
         async move {
-            crate::supervisor_env_base(&config, &shared_vv, &build_rustc)
+            let toolchain = join_toolchain(&toolchain)
                 .await
-                .map(|base| base.map(std::sync::Arc::new))
-                .map_err(|error| std::sync::Arc::new(error.to_string()))
+                .map_err(|error| std::sync::Arc::new(error.to_string()))?;
+            Ok(crate::load_wrapper_env_base(config, &toolchain)
+                .await
+                .map(std::sync::Arc::new))
         }
         .instrument(tracing::debug_span!("stow.precargo.env_base")),
     );
@@ -909,6 +966,9 @@ struct PendingProjectContext {
     /// when configured, else the toolchain's `rustc`: the executable
     /// the shared `-vV`, the sysroot probe and the link key all name.
     build_rustc: rustc_args::BuildRustc,
+    /// The build's toolchain over that rustc, resolved by whoever awaits
+    /// it first.
+    toolchain: SharedToolchain,
 }
 
 impl ProjectContext {
@@ -983,6 +1043,14 @@ impl ProjectContext {
         let manifest_path = layout.manifest_path;
         let current_dir_relative =
             pathdiff::diff_paths(&current_dir, &workspace_root).unwrap_or_else(PathBuf::new);
+        // The configured `RUSTC_WORKSPACE_WRAPPER` — the one program other
+        // than the rustc a facade may be handed — comes from the same
+        // config chain cargo reads it from.
+        let toolchain = shared_toolchain(
+            &build_rustc,
+            cargo_config.build.rustc_workspace_wrapper.clone(),
+            rustc_vv.clone(),
+        );
         Ok(PendingProjectContext {
             action: invocation.action.clone(),
             cargo_args: invocation.cargo_args.clone(),
@@ -997,6 +1065,7 @@ impl ProjectContext {
             rustc_version,
             cargo_config,
             build_rustc,
+            toolchain,
         })
     }
 
@@ -1055,6 +1124,7 @@ impl PendingProjectContext {
             mold,
             env_base: None,
             build_rustc: self.build_rustc,
+            toolchain: self.toolchain,
             foreground,
         })
     }
@@ -3907,28 +3977,39 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     // The driver-built wrapper base lands here: the task spawned in
     // `run_inner` has been running beside mold's provisioning and the
     // analysis, so this await is almost always an immediate take (stow#608).
+    let toolchain = join_toolchain(&project.toolchain).await?;
     let env_base = join_env_base(project.env_base.as_ref()).await?;
     let (resolution_done, release_hold) = spawn_resolution_lease(project);
     // The supervisor and the handler share the build's in-flight unit
     // registry: the server marks and completes flights, the post-compiles
     // wait on them before resolving dependency identities (stow#618).
     let in_flight = crate::supervisor::server::InFlightUnits::default();
-    let handler = std::sync::Arc::new(crate::BuildSupervisor::new(
-        crate::BuildContext {
-            policy_dir: cache_policy_path.clone(),
-            public_cache_target: Some(project.target.clone()),
-            public_cache_disabled: !public_cache_mode.is_enabled(),
-            cache: config.map_or_else(crate::config::CacheLayers::default, |config| config.cache),
-            analysis: std::sync::Arc::clone(&analysis_cell),
-            serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
-            policy_ready: std::sync::Arc::clone(&policy_ready),
-            in_flight: in_flight.clone(),
-            registry_sources: std::sync::OnceLock::from(registry_sources),
-        },
-        config.cloned(),
-        env_base,
-        resolution_done.clone(),
-    ));
+    let handler = std::sync::Arc::new(
+        crate::BuildSupervisor::new(
+            crate::BuildContext {
+                policy_dir: cache_policy_path.clone(),
+                public_cache_target: Some(project.target.clone()),
+                public_cache_disabled: !public_cache_mode.is_enabled(),
+                cache: config
+                    .map_or_else(crate::config::CacheLayers::default, |config| config.cache),
+                analysis: std::sync::Arc::clone(&analysis_cell),
+                serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
+                policy_ready: std::sync::Arc::clone(&policy_ready),
+                in_flight: in_flight.clone(),
+                registry_sources: std::sync::OnceLock::from(registry_sources),
+            },
+            config.cloned(),
+            toolchain,
+            env_base,
+            resolution_done.clone(),
+            crate::supervisor::invocation::RefusalPolicy::of_this_build(),
+        )
+        .with_target_dir(resolved_target_dir(
+            project,
+            plan.cargo_args,
+            plan.current_dir,
+        )),
+    );
     let (mut cargo_run, mut supervisor) =
         spawn_cargo_run(plan, &handler, in_flight, &wrappers, launch, scratch.path()).await?;
 
@@ -4037,6 +4118,10 @@ async fn finish_cargo_run(
     if let Err(error) = cleanup.scratch.close() {
         tracing::warn!(%error, "could not remove the build scratch directory");
     }
+    // A request the supervisor refused fails the build, whatever cargo
+    // made of it: a one-way report has no answer to carry the refusal, so
+    // it is raised here, naming the field of each.
+    handler.ensure_no_refusals()?;
     Ok(status)
 }
 
@@ -4164,7 +4249,7 @@ impl SupervisorHandle {
             Self::Socket(supervisor) => {
                 supervisor.shutdown().await;
             }
-            Self::Ipc(supervisor) => supervisor.shutdown(),
+            Self::Ipc(supervisor) => supervisor.shutdown().await,
         }
     }
 }
@@ -5089,6 +5174,10 @@ async fn report_cache_coverage(
         "failed to print stow cache coverage",
         write_stdout(&delta.summary_line(covered_units, &errored_crates)),
     );
+    log_nonfatal_result(
+        "failed to print why units errored",
+        write_stdout(&stats::failure_lines(&errored_crates, &after.failures)),
+    );
     let divergence_after = stats::read_profile_divergence(config)
         .await
         .unwrap_or_default();
@@ -5300,6 +5389,8 @@ mod tests {
             rustc_version: "1.91.1".to_owned(),
             mold: MoldSelection::resolved(Vec::new()),
             env_base: None,
+            // These tests assemble no supervisor, so nothing awaits it.
+            toolchain: super::pending_toolchain(),
             build_rustc: crate::rustc_args::BuildRustc::ToolchainDefault,
             foreground: crate::derive_gate::ForegroundHold::detached(),
         }

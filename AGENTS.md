@@ -33,9 +33,12 @@ The single source of repository instructions; `CLAUDE.md` is a symlink to it.
 - GitHub-hosted CI is the only builder and crates.io the only metadata source. The build path never calls the edge.
 - GHCR records signed by the pinned builder identity are the only record store; every other store is a mirror of them, and every reader verifies the signature before trusting a row.
 - The edge is untrusted serving infrastructure.
+- Build isolation is best effort, not an absolute guarantee; the developer's experience comes first.
+- The known isolation weakness is artifact poisoning of the local cache; it may be closed later. Documents state the limits of isolation honestly.
 
 ## Rules
 
+- A wrapper is a thin client, without exception: it asks the daemon, runs its compiler and exits with it. Every decision, lookup, store and record lives in the daemon, and no wrapper works without one. This rule is never broken.
 - Every residual cost is the product: remove a cost before presenting it as a trade-off, and never narrow a feature to avoid one.
 - Durable Object requests stay under 90% of their monthly Workers Paid allowance; every other metered Cloudflare resource stays under 80%.
 - Fail fast on inconsistent identity or schema; no fallbacks.

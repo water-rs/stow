@@ -62,11 +62,50 @@ impl Drop for StubEdge {
     }
 }
 
+/// One answer a scripted stub gives to one request.
+pub struct Reply {
+    /// The status line's tail after `HTTP/1.1 `, e.g. `"200 OK"`.
+    pub status: &'static str,
+    /// Extra header lines, each ending in `\r\n`.
+    pub headers: &'static str,
+    /// Response body bytes.
+    pub body: Vec<u8>,
+    /// Write only this many body bytes, then close the connection — the
+    /// head still promises the whole body, so the client sees it cut off.
+    pub cut_body_at: Option<usize>,
+}
+
+impl Reply {
+    /// A complete answer.
+    pub fn new(status: &'static str, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            headers: "",
+            body,
+            cut_body_at: None,
+        }
+    }
+}
+
 /// Serve `routes` on a loopback port. A request no route matches is
 /// answered `404 Not Found`; the accept loop stops when the returned
 /// [`StubEdge`] drops, or at a deadline so a leaked stub cannot hold the
 /// test process open.
 pub fn serve(routes: Vec<Route>) -> StubEdge {
+    serve_with(move |request_line, _| {
+        routes
+            .iter()
+            .find(|route| request_line.contains(route.path))
+            .map_or_else(
+                || Reply::new("404 Not Found", Vec::new()),
+                |route| Reply::new(route.status, route.body.clone()),
+            )
+    })
+}
+
+/// [`serve`] with the answer chosen per request: `respond` gets the
+/// request line and how many requests the stub answered before it.
+pub fn serve_with(mut respond: impl FnMut(&str, usize) -> Reply + Send + 'static) -> StubEdge {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub edge");
     listener.set_nonblocking(true).expect("nonblocking");
     let url = format!("http://{}", listener.local_addr().expect("local addr"));
@@ -116,22 +155,23 @@ pub fn serve(routes: Vec<Route>) -> StubEdge {
                 // over unread request bytes can RST the response before
                 // the client reads it.
                 let _ = std::io::copy(&mut reader.take(content_length), &mut std::io::sink());
-                requests
-                    .lock()
-                    .expect("requests lock")
-                    .push(request_line.clone());
-                let (status, body) = routes
-                    .iter()
-                    .find(|route| request_line.contains(route.path))
-                    .map_or(("404 Not Found", &[][..]), |route| {
-                        (route.status, route.body.as_slice())
-                    });
+                let answered = {
+                    let mut requests = requests.lock().expect("requests lock");
+                    requests.push(request_line.clone());
+                    requests.len() - 1
+                };
+                let reply = respond(&request_line, answered);
                 let head = format!(
-                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    body.len()
+                    "HTTP/1.1 {}\r\n{}content-length: {}\r\nconnection: close\r\n\r\n",
+                    reply.status,
+                    reply.headers,
+                    reply.body.len()
                 );
+                let sent = reply.cut_body_at.map_or(&reply.body[..], |cut| {
+                    &reply.body[..cut.min(reply.body.len())]
+                });
                 let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(body);
+                let _ = stream.write_all(sent);
                 let _ = stream.flush();
             }
         });

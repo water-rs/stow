@@ -105,6 +105,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
+          targets: ${{ matrix.os == 'windows-latest' && 'aarch64-pc-windows-msvc' || '' }}
       # Linux artifacts link with mold, the linker the project recommends.
       - uses: ./.github/actions/link-with-mold
         if: matrix.os == 'ubuntu-latest'

@@ -42,8 +42,8 @@ use std::path::{Path, PathBuf};
 use futures_util::StreamExt;
 use heel::{
     Access, AllowAll, Audited, DenyAll, Grant, Identity, IpcRouter, IpcUnconfigured,
-    NetworkAuditLog, NetworkPolicy, ReadDenylist, Sandbox, SandboxConfig, SandboxConfigBuilder,
-    SecurityConfig, SecurityConfigBuilder, WriteDenylist,
+    NetworkAuditLog, NetworkPolicy, PathRequest, ReadDenylist, Sandbox, SandboxConfig,
+    SandboxConfigBuilder, SecurityConfig, SecurityConfigBuilder, WriteDenylist,
 };
 use stow_types::env_name;
 use stow_types::error::Context;
@@ -171,10 +171,10 @@ impl BuildSandbox {
     ///
     /// A sandbox that cannot be set up is an error here — there is no
     /// unsandboxed fallback and no weaker level (stow#779, stow#1000).
-    /// `runtime_executable` doubles as the `heel` binary the IPC layout
-    /// bakes into its launcher shims and so gets the execute grant the
-    /// shims and the facades both need, the same trick `stow-build` plays
-    /// in CI.
+    /// `runtime_executable` is the stow binary the wrapper shims and the
+    /// facades resolve to; it reaches the supervisor through
+    /// `heel::IpcClient`, so the sandbox serves the router directly and
+    /// needs no `heel` binary.
     ///
     /// # Errors
     ///
@@ -271,7 +271,8 @@ impl BuildSandbox {
             })?;
             self.audit.record(&denials)?;
         }
-        status
+        let status = status?;
+        unexecutable_cargo(command, status).map_or(Ok(status), Err)
     }
 }
 
@@ -395,10 +396,9 @@ impl DeniedAccessLog {
 /// network policy: the level's file and environment policy, the grants and
 /// the stable identity.
 async fn confined_builder<N: NetworkPolicy>(
-    builder: SandboxConfigBuilder<N, IpcUnconfigured>,
+    mut builder: SandboxConfigBuilder<N, IpcUnconfigured>,
     request: &SandboxRequest<'_>,
 ) -> stow_types::error::Result<SandboxConfigBuilder<N, IpcUnconfigured>> {
-    let mut builder = builder.heel_binary(request.runtime_executable);
     let (env_names, grants): (Vec<String>, Vec<(PathBuf, Access, &'static str)>) = match request
         .confinement
     {
@@ -476,15 +476,23 @@ async fn confined_builder<N: NetworkPolicy>(
         }
     };
     builder = builder.env_passthroughs(env_names);
-    for (path, access, reason) in grants {
-        // The kernel resolves paths through `/var` → `/private/var`
-        // and friends; a grant spelled through a symlink does not
-        // cover the resolved path, so every grant is canonicalized
-        // before heel writes the rule.
-        let path = path.canonicalize().map_err(|error| {
-            stow_types::stow_error!("canonicalize sandbox grant {}: {error}", path.display())
-        })?;
-        tracing::debug!(path = %path.display(), ?access, reason, "sandbox grant");
+    // The kernel resolves paths through `/var` → `/private/var` and
+    // friends; a grant spelled through a symlink does not cover the
+    // resolved path, so heel resolves every grant before it writes the
+    // rule, refusing a link a sandbox could have planted inside a
+    // writable grant.
+    let requests = grants.into_iter().map(|(path, access, reason)| {
+        let request = if access.can_write() {
+            PathRequest::writable(path)
+        } else {
+            PathRequest::readable(path)
+        };
+        (request, (access, reason))
+    });
+    for (path, (access, reason)) in heel::resolve_paths(requests)
+        .map_err(|error| stow_types::stow_error!("resolve the sandbox grants: {error}"))?
+    {
+        tracing::debug!(path = %path.as_path().display(), ?access, reason, "sandbox grant");
         builder = builder.grant(path, access);
     }
     Ok(builder)
@@ -567,7 +575,7 @@ async fn run<N: heel::NetworkPolicy>(
 /// unresolvable cargo home.
 pub fn stow_identity() -> stow_types::error::Result<Identity> {
     let mut persistent: Vec<(PathBuf, Access)> = Vec::new();
-    if let Some(home) = rustup_home().filter(|home| home.is_dir()) {
+    if let Some(home) = rustup_home() {
         persistent.push((home, Access::READ | Access::EXEC));
     }
     let cargo_home = crate::config::require_cargo_home()?;
@@ -582,24 +590,28 @@ pub fn stow_identity() -> stow_types::error::Result<Identity> {
         }
     }
     #[cfg(windows)]
-    for root in msvc_identity_roots() {
+    for root in crate::msvc::identity_roots() {
         if root.is_dir() {
             persistent.push((root, Access::READ | Access::EXEC));
         }
     }
     let mut identity = Identity::named("stow")
         .map_err(|error| stow_types::stow_error!("the stow sandbox identity name: {error}"))?;
-    for (path, access) in persistent {
-        // Canonicalized like the per-build grants: heel's record and the
-        // reconcile compare spellings, so a symlinked home or a stray
-        // `..` must not give `setup` and a build different spellings of
-        // the same root — the revoke/re-grant churn this exists to remove.
-        let path = path.canonicalize().map_err(|error| {
-            stow_types::stow_error!(
-                "canonicalize the persistent sandbox grant {}: {error}",
-                path.display()
-            )
-        })?;
+    // Resolved like the per-build grants: heel's record and the
+    // reconcile compare spellings, so a symlinked home or a stray
+    // `..` must not give `setup` and a build different spellings of
+    // the same root — the revoke/re-grant churn this exists to remove.
+    let requests = persistent.into_iter().map(|(path, access)| {
+        let request = if access.can_write() {
+            PathRequest::writable(path)
+        } else {
+            PathRequest::readable(path)
+        };
+        (request, access)
+    });
+    for (path, access) in heel::resolve_paths(requests).map_err(|error| {
+        stow_types::stow_error!("resolve the persistent sandbox grants: {error}")
+    })? {
         identity = identity.persistent_grant(Grant::new(path, access));
     }
     Ok(identity)
@@ -692,9 +704,7 @@ async fn toolchain_grants(
             "the rustup proxy shims `cargo`/`rustc` when PATH leads there",
         ));
     }
-    if let Some(home) = rustup_home
-        && home.exists()
-    {
+    if let Some(home) = rustup_home {
         grants.push((
             home.to_path_buf(),
             Access::READ | Access::EXEC,
@@ -998,7 +1008,7 @@ async fn discovered_toolchain_grants(
         .await;
     grants.extend(driver_probe_grants(&drivers, &results));
     #[cfg(windows)]
-    grants.extend(msvc_toolchain_grants(&targets));
+    grants.extend(crate::msvc::toolchain_grants(&targets));
     Ok(grants)
 }
 
@@ -1069,7 +1079,7 @@ fn driver_probe_grants(
 const PROBE_CONCURRENCY: usize = 8;
 
 /// Seal a configured builder, applying the supervisor's IPC router
-/// when one is registered — `ipc` moves the builder into the
+/// when one is registered — `direct_ipc` moves the builder into the
 /// `IpcConfigured` typestate (heel#59), so the optional router can only
 /// be applied where `build` erases the difference.
 fn build_config<N: heel::NetworkPolicy>(
@@ -1077,7 +1087,7 @@ fn build_config<N: heel::NetworkPolicy>(
     ipc: Option<IpcRouter>,
 ) -> SandboxConfig<N> {
     match ipc {
-        Some(router) => builder.ipc(router).build(),
+        Some(router) => builder.direct_ipc(router).build(),
         None => builder.build(),
     }
 }
@@ -1227,84 +1237,6 @@ fn parse_search_dirs(output: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
         }
     }
     (exec_dirs, read_dirs)
-}
-
-/// The MSVC toolchain and Windows SDK a `*-msvc` build's `cl.exe` and
-/// `link.exe` live in — located the way rustc and the `cc` crate
-/// locate them, so the usual Visual Studio install that is not on
-/// `PATH` is still found. `find_tool` answers `None` for non-msvc
-/// targets, so each build target is simply asked.
-#[cfg(windows)]
-fn msvc_toolchain_grants(targets: &[String]) -> Vec<(PathBuf, Access, &'static str)> {
-    let mut grants = Vec::new();
-    for target in targets {
-        for name in ["cl.exe", "link.exe"] {
-            let Some(tool) = find_msvc_tools::find_tool(target.as_str(), name) else {
-                continue;
-            };
-            if let Some(dir) = tool.path().parent() {
-                grants.push((
-                    dir.to_path_buf(),
-                    Access::READ | Access::EXEC,
-                    "the MSVC tool's own directory",
-                ));
-            }
-            for (key, value) in tool.env() {
-                let host = std::env::var_os(key);
-                let access = if env_name::eq(key, "PATH") {
-                    Access::READ | Access::EXEC
-                } else {
-                    Access::READ
-                };
-                for dir in added_entries(value, host.as_deref()) {
-                    if dir.is_dir() {
-                        grants.push((
-                            dir,
-                            access,
-                            "a directory the MSVC toolchain's environment names",
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    if let Some(sdk) = find_msvc_tools::find_windows_sdk(std::env::consts::ARCH) {
-        for dir in sdk.path() {
-            if dir.is_dir() {
-                grants.push((
-                    dir.to_path_buf(),
-                    Access::READ | Access::EXEC,
-                    "a Windows SDK binary directory",
-                ));
-            }
-        }
-        for dir in sdk.libs().chain(sdk.include()) {
-            if dir.is_dir() {
-                grants.push((
-                    dir.to_path_buf(),
-                    Access::READ,
-                    "a Windows SDK library or include directory",
-                ));
-            }
-        }
-    }
-    grants
-}
-
-/// Returns only entries `find_msvc_tools` prepended to the host's value.
-/// Host PATH/LIB/INCLUDE entries are not toolchain entries to grant.
-#[cfg(windows)]
-fn added_entries(composed: &OsStr, host: Option<&OsStr>) -> Vec<PathBuf> {
-    let host_entries = host
-        .map(|host| std::env::split_paths(host).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let mut added = Vec::new();
-    for entry in std::env::split_paths(composed) {
-        if !host_entries.contains(&entry) && !added.contains(&entry) {
-            added.push(entry);
-        }
-    }
-    added
 }
 
 /// The environment allowlist: the names a build legitimately reads —
@@ -1491,192 +1423,45 @@ fn fetch_args(cargo_args: &[OsString]) -> Vec<OsString> {
 }
 
 /// The rustup home as cargo's toolchain resolution sees it:
-/// `RUSTUP_HOME` when set, else `~/.rustup`.
+/// `RUSTUP_HOME` when set, else `~/.rustup`. A directory that does not
+/// exist is `None`: neither a grant nor an exported variable may name a
+/// rustup home the host does not have, because an exported one overrides
+/// the default a launcher script sets for itself.
 fn rustup_home() -> Option<PathBuf> {
     std::env::var_os("RUSTUP_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".rustup")))
+        .filter(|home| home.is_dir())
 }
 
-#[cfg(windows)]
-/// Spells the host's MSVC lookup as the variables a developer prompt sets.
-/// An existing host prompt passes through; no host match yields an empty list.
-fn msvc_developer_environment() -> stow_types::error::Result<Vec<(OsString, OsString)>> {
-    if std::env::var_os("VCINSTALLDIR").is_some() {
-        return Ok(Vec::new());
-    }
-    let Some(tool) = find_msvc_tools::find_tool(std::env::consts::ARCH, "link.exe") else {
-        tracing::warn!(
-            arch = std::env::consts::ARCH,
-            "no MSVC installation found for the host; a sandboxed build that links will fail"
-        );
-        return Ok(Vec::new());
-    };
-    let mut envs = tool.env().into_iter().cloned().collect::<Vec<_>>();
-    envs.extend(developer_prompt_vars(tool.path())?);
-    Ok(envs)
-}
+/// The exit status a shell gives a program it found but could not execute.
+const CANNOT_EXECUTE: i32 = 126;
 
-/// The installation roots the MSVC discovery locates for the host —
-/// the Visual Studio root a `link.exe` in the VS 2017+ layout implies
-/// and the Windows kit roots the discovered SDK dirs sit under —
-/// persisted READ|EXEC on the identity so the toolchain ACL is written
-/// once, not per build (stow#815). A `link.exe` outside the VS layout —
-/// an SDK or LLVM linker — names no Visual Studio installation, so it
-/// adds no root; the per-build grants still cover its directory.
-#[cfg(windows)]
-fn msvc_identity_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(tool) = find_msvc_tools::find_tool(std::env::consts::ARCH, "link.exe")
-        && let Ok(layout) = visual_studio_layout(tool.path())
+/// The error for a sandboxed cargo that ended with [`CANNOT_EXECUTE`]:
+/// the `cargo` on `PATH` is found, so what it executes — a launcher
+/// script's rustup proxy, a toolchain outside the granted trees — is what
+/// the sandbox refused. stow does not discover what a launcher executes;
+/// the user names the real toolchain. `None` for any other status, and
+/// for `cargo run`, which ends with the program's own status — any number.
+/// Read once cargo has ended, so a build that starts normally pays nothing.
+fn unexecutable_cargo(
+    command: &SandboxedCommand,
+    status: std::process::ExitStatus,
+) -> Option<stow_types::error::Error> {
+    if status.code() != Some(CANNOT_EXECUTE)
+        || command.args.first().is_some_and(|action| action == "run")
     {
-        roots.push(layout.visual_studio_dir);
+        return None;
     }
-    if let Some(sdk) = find_msvc_tools::find_windows_sdk(std::env::consts::ARCH) {
-        for dir in sdk.path().chain(sdk.libs()).chain(sdk.include()) {
-            if let Some(root) = windows_kit_root(dir)
-                && !roots.contains(&root)
-            {
-                roots.push(root);
-            }
-        }
-    }
-    roots
-}
-
-/// The kit installation root a discovered Windows SDK directory lives
-/// under: every dir the discovery reports sits in the kit's `bin`, `lib`
-/// or `include` tree, so the root is the ancestor above that component —
-/// whatever `KitsRoot10` or `InstallationFolder` the registry named,
-/// never a hardcoded drive. A `bin`/`lib`/`include` at a drive root names
-/// no installation, and a dir with none of those components is not an
-/// SDK dir; both yield `None`.
-#[cfg(windows)]
-fn windows_kit_root(dir: &Path) -> Option<PathBuf> {
-    let mut root = PathBuf::new();
-    for component in dir.components() {
-        if component.as_os_str().to_str().is_some_and(|name| {
-            ["bin", "lib", "include"]
-                .iter()
-                .any(|tree| name.eq_ignore_ascii_case(tree))
-        }) {
-            return root
-                .components()
-                .any(|part| matches!(part, std::path::Component::Normal(_)))
-                .then_some(root);
-        }
-        root.push(component.as_os_str());
-    }
-    None
-}
-
-/// The directories the Visual Studio 2017+ layout a `link.exe` path
-/// implies — `VC\Tools\MSVC\<version>\bin\Host<arch>\<arch>\link.exe`
-/// under the installation root — validated component by component so a
-/// linker outside that layout cannot masquerade as an installation
-/// root.
-#[cfg(windows)]
-struct VsLayout {
-    /// `VSCMD_ARG_TGT_ARCH` — the `<arch>` leaf the linker serves.
-    target_arch: OsString,
-    /// `VCToolsInstallDir` — the `MSVC\<version>` directory.
-    version_dir: PathBuf,
-    /// `VCINSTALLDIR` — the `VC` directory.
-    vc_dir: PathBuf,
-    /// `VSINSTALLDIR` — the Visual Studio installation root.
-    visual_studio_dir: PathBuf,
-}
-
-#[cfg(windows)]
-/// Reads the [`VsLayout`] a Visual Studio 2017+ linker path spells.
-/// Paths outside that layout return an error.
-fn visual_studio_layout(link: &Path) -> stow_types::error::Result<VsLayout> {
-    let invalid_layout = || {
-        stow_types::stow_error!(
-            "the linker at {} is not in the Visual Studio 2017+ layout, so the sandbox cannot spell out its developer environment",
-            link.display()
-        )
-    };
-    let mut up = link.ancestors().skip(1);
-    let (
-        Some(target_dir),
-        Some(host_dir),
-        Some(bin_dir),
-        Some(version_dir),
-        Some(msvc_dir),
-        Some(tools_dir),
-        Some(vc_dir),
-        Some(visual_studio_dir),
-    ) = (
-        up.next(),
-        up.next(),
-        up.next(),
-        up.next(),
-        up.next(),
-        up.next(),
-        up.next(),
-        up.next(),
-    )
-    else {
-        return Err(invalid_layout());
-    };
-    let Some(target_arch) = target_dir.file_name() else {
-        return Err(invalid_layout());
-    };
-    let Some(host_name) = host_dir.file_name().and_then(OsStr::to_str) else {
-        return Err(invalid_layout());
-    };
-    let is_host_dir = host_name
-        .get(..4)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Host"))
-        && host_name.len() > 4;
-    let is_component = |path: &Path, expected: &str| {
-        path.file_name()
-            .and_then(OsStr::to_str)
-            .is_some_and(|name| name.eq_ignore_ascii_case(expected))
-    };
-    if !is_component(link, "link.exe")
-        || !is_host_dir
-        || !is_component(bin_dir, "bin")
-        || !is_component(msvc_dir, "MSVC")
-        || !is_component(tools_dir, "Tools")
-        || !is_component(vc_dir, "VC")
-    {
-        return Err(invalid_layout());
-    }
-    Ok(VsLayout {
-        target_arch: target_arch.to_os_string(),
-        version_dir: version_dir.to_path_buf(),
-        vc_dir: vc_dir.to_path_buf(),
-        visual_studio_dir: visual_studio_dir.to_path_buf(),
-    })
-}
-
-#[cfg(windows)]
-/// Derives developer-prompt variables from a Visual Studio 2017+ linker path.
-/// Paths outside that layout return an error.
-fn developer_prompt_vars(link: &Path) -> stow_types::error::Result<Vec<(OsString, OsString)>> {
-    let layout = visual_studio_layout(link)?;
-    let with_trailing_backslash = |path: &Path| {
-        let mut value = path.as_os_str().to_os_string();
-        value.push("\\");
-        value
-    };
-    Ok(vec![
-        (
-            OsString::from("VSINSTALLDIR"),
-            with_trailing_backslash(&layout.visual_studio_dir),
-        ),
-        (
-            OsString::from("VCINSTALLDIR"),
-            with_trailing_backslash(&layout.vc_dir),
-        ),
-        (
-            OsString::from("VCToolsInstallDir"),
-            with_trailing_backslash(&layout.version_dir),
-        ),
-        (OsString::from("VSCMD_ARG_TGT_ARCH"), layout.target_arch),
-    ])
+    let cargo = resolve_executable(OsStr::new("cargo"))
+        .map_or_else(|| "cargo".to_owned(), |path| path.display().to_string());
+    Some(stow_types::stow_error!(
+        "the sandbox refused what `{cargo}` executes: the sandboxed cargo exited {CANNOT_EXECUTE}, \
+         the status of a program that was found but could not be run. `{cargo}` is the cargo PATH \
+         resolves; if it is a launcher script or a proxy, the toolchain it runs lies outside the \
+         paths the sandbox grants. Name the real toolchain with `RUSTUP_HOME` and `PATH` \
+         (`PATH=<toolchain bin>:$PATH RUSTUP_HOME=<rustup home>`)"
+    ))
 }
 
 /// The variables the sandboxed toolchain needs spelled out, not passed
@@ -1697,11 +1482,11 @@ pub fn toolchain_envs() -> stow_types::error::Result<Vec<(OsString, OsString)>> 
         OsString::from("CARGO_HOME"),
         crate::config::require_cargo_home()?.into_os_string(),
     )];
-    if let Some(home) = rustup_home().filter(|home| home.is_dir()) {
+    if let Some(home) = rustup_home() {
         envs.push((OsString::from("RUSTUP_HOME"), home.into_os_string()));
     }
     #[cfg(windows)]
-    envs.extend(msvc_developer_environment()?);
+    envs.extend(crate::msvc::developer_environment()?);
     Ok(envs)
 }
 
@@ -1776,65 +1561,6 @@ mod tests {
                 Vec::<String>::new()
             );
         }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn added_entries_keeps_only_composed_paths_not_in_the_host() {
-        let composed = std::env::join_paths([
-            PathBuf::from("a"),
-            PathBuf::from("b"),
-            PathBuf::from("h1"),
-            PathBuf::from("h2"),
-        ])
-        .unwrap();
-        let host = std::env::join_paths([PathBuf::from("h1"), PathBuf::from("h2")]).unwrap();
-        assert_eq!(
-            added_entries(&composed, Some(&host)),
-            vec![PathBuf::from("a"), PathBuf::from("b")]
-        );
-        assert_eq!(
-            added_entries(&composed, None),
-            vec![
-                PathBuf::from("a"),
-                PathBuf::from("b"),
-                PathBuf::from("h1"),
-                PathBuf::from("h2"),
-            ]
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn developer_prompt_vars_spells_the_visual_studio_layout() {
-        let link =
-            Path::new(r"C:\VS\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\link.exe");
-        assert_eq!(
-            developer_prompt_vars(link).unwrap(),
-            vec![
-                (
-                    OsString::from("VSINSTALLDIR"),
-                    OsString::from(r"C:\VS\2022\BuildTools\"),
-                ),
-                (
-                    OsString::from("VCINSTALLDIR"),
-                    OsString::from(r"C:\VS\2022\BuildTools\VC\"),
-                ),
-                (
-                    OsString::from("VCToolsInstallDir"),
-                    OsString::from(r"C:\VS\2022\BuildTools\VC\Tools\MSVC\14.44.35207\"),
-                ),
-                (OsString::from("VSCMD_ARG_TGT_ARCH"), OsString::from("x64")),
-            ]
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn developer_prompt_vars_rejects_paths_outside_the_visual_studio_layout() {
-        assert!(
-            developer_prompt_vars(Path::new(r"C:\Program Files\Git\usr\bin\link.exe")).is_err()
-        );
     }
 
     #[test]
@@ -2069,26 +1795,5 @@ mod tests {
                 grant.path().display(),
             );
         }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_kit_root_reads_the_kit_tree_boundary() {
-        assert_eq!(
-            windows_kit_root(Path::new(r"C:\Windows Kits\10\bin\10.0.26100.0\x64")),
-            Some(PathBuf::from(r"C:\Windows Kits\10"))
-        );
-        assert_eq!(
-            windows_kit_root(Path::new(r"D:\SDKs\8.1\Lib\winv6.3\um\x64")),
-            Some(PathBuf::from(r"D:\SDKs\8.1"))
-        );
-        assert_eq!(
-            windows_kit_root(Path::new(r"C:\Windows Kits\10\Include\10.0.26100.0\ucrt")),
-            Some(PathBuf::from(r"C:\Windows Kits\10"))
-        );
-        // A kit tree directly at a drive root names no installation.
-        assert_eq!(windows_kit_root(Path::new(r"C:\bin\x64")), None);
-        // A dir outside the kit layout derives no root.
-        assert_eq!(windows_kit_root(Path::new(r"C:\tools\rust")), None);
     }
 }

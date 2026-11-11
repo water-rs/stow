@@ -43,11 +43,11 @@
 #   STOW_RESOLVE_CARGO_HOME        the root every lane's resolve
 #                                  CARGO_HOMEs live under — lane <NN>-<name>
 #                                  resolves against <root>/<NN>-<name>, so
-#                                  the lanes stay parallel while a CI
-#                                  cache restoring the root keeps the
-#                                  index and .crate bodies warm across
-#                                  runs (default: $WORK_DIR/resolve-cargo,
-#                                  per-run scratch)
+#                                  the lanes stay parallel; a root kept
+#                                  between runs keeps the index and
+#                                  .crate bodies (default:
+#                                  $WORK_DIR/resolve-cargo, per-run
+#                                  scratch)
 #   STOW_E2E_TOOLCHAIN             rustup toolchain for the run (default:
 #                                  stable)
 set -euo pipefail
@@ -75,9 +75,9 @@ else
 fi
 LOG_DIR="$WORK_DIR/logs"
 LANES_DIR="$WORK_DIR/lanes"
-# The resolve root sits beside the lane scratch, never inside it: the
-# gate restores it from `actions/cache`, and a restored tree must not
-# trip the empty-WORK_DIR check above. Each lane gets its own
+# The resolve root is created after the empty-WORK_DIR check above;
+# STOW_RESOLVE_CARGO_HOME may point it at a directory kept between runs
+# instead. Each lane gets its own
 # subdirectory — the lanes run concurrently and a worker's resolve holds
 # cargo's exclusive package-cache lock, so lanes sharing one home would
 # serialize against each other.
@@ -153,13 +153,8 @@ require_command rustc
 require_command rustup
 require_command timeout
 require_command yq
-require_command python3
 
-disk_usage before-materialize
-# Native cache restoration preserves packed hardlinks. Mutable Cargo
-# files must be independently writable before any worker is started.
-python3 "$REPO_ROOT/scripts/compact-resolver-cache.py" materialize "$RESOLVE_ROOT"
-disk_usage after-materialize
+disk_usage start
 
 # The production wave is the one preheat-admin.yml runs, so its defaults
 # come from that file rather than a copy here. preheat-cron.yml

@@ -29,9 +29,9 @@
 //! measured here; the projection reports its monthly billing ceiling.
 
 use crate::preheat_cost::MeasuredReport;
+use crate::preheat_cost::report::{EventKind, PhaseCost, ProductionWave};
 use stow_types::forwards::RunForwards;
 use stow_types::launch_model::LaunchModel;
-use stow_types::preheat_cost::{EventKind, PhaseCost, ProductionWave};
 
 use super::cpu::WorkerCpuReport;
 
@@ -318,7 +318,7 @@ pub(super) const fn test_production(nodes: u64) -> ProductionWave {
 pub(super) fn test_report(nodes: u64) -> MeasuredReport {
     use std::collections::BTreeMap;
 
-    use stow_types::preheat_cost::{EventKind, KindCost, PreheatCostReport};
+    use crate::preheat_cost::report::{EventKind, KindCost, PreheatCostReport};
 
     let phase = PhaseCost {
         active_ms: 0,
@@ -341,6 +341,8 @@ pub(super) fn test_report(nodes: u64) -> MeasuredReport {
             nodes_per_target: BTreeMap::new(),
             wave: phase.clone(),
             resubmit: phase,
+            resubmit_passes: 1,
+            drift_passes: Vec::new(),
             layers: Vec::new(),
             lanes: Vec::new(),
             checks: Vec::new(),
@@ -366,7 +368,7 @@ mod tests {
 
     #[test]
     fn missing_lifecycle_cpu_prices_only_deliveries_absent_from_the_phase() {
-        use stow_types::preheat_cost::{EventKind, KindCost};
+        use crate::preheat_cost::report::{EventKind, KindCost};
 
         let mut report = test_report(10);
         report.report.wave.kinds = [
@@ -553,7 +555,7 @@ mod tests {
 
     #[test]
     fn worker_requests_follow_production_lifecycles() {
-        use stow_types::preheat_cost::{EventKind, KindCost};
+        use crate::preheat_cost::report::{EventKind, KindCost};
 
         let mut report = test_report(10);
         report.report.wave.kinds = [

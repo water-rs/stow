@@ -83,36 +83,35 @@ async fn write_artifact_file(
         &source_path,
         output_path,
         Some(file.sha256.as_str()),
+        is_build_script(file),
         writers,
     )
-    .await?;
-    mark_executable_if_build_script(output_path, file).await
+    .await
 }
 
 /// A build script is run by cargo, so its served file carries the
 /// executable mode rustc would have given it: a bundle's pack records no
 /// modes, and the cache entry it unpacked into holds a plain file.
-async fn mark_executable_if_build_script(
-    output_path: &std::path::Path,
-    file: &ArtifactBundleFile,
+fn is_build_script(file: &ArtifactBundleFile) -> bool {
+    file.media_type == stow_types::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE
+}
+
+/// Give `file`, open at `path`, the executable mode a build script
+/// needs ([`is_build_script`]) when `executable`; the mode goes on the
+/// handle, never on the path a concurrent serve may be placing.
+fn set_served_mode(
+    file: &std::fs::File,
+    path: &std::path::Path,
+    executable: bool,
 ) -> stow_types::error::Result<()> {
-    if file.media_type != stow_types::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE {
-        return Ok(());
-    }
     #[cfg(unix)]
-    {
+    if executable {
         use std::os::unix::fs::PermissionsExt as _;
-        async_fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755))
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "mark served build script {} executable",
-                    output_path.display()
-                )
-            })?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))
+            .wrap_err_with(|| format!("mark served build script {} executable", path.display()))?;
     }
     #[cfg(not(unix))]
-    let _ = output_path;
+    let _ = (file, path, executable);
     Ok(())
 }
 
@@ -135,10 +134,10 @@ pub async fn materialize_original_outputs(
             &original_path,
             None,
             file.sha256.as_str(),
+            is_build_script(file),
             writers,
         )
         .await?;
-        mark_executable_if_build_script(&original_path, file).await?;
     }
     Ok(())
 }
@@ -237,7 +236,8 @@ async fn materialize_optional_local_alias(
     if !source_path.exists() {
         return Ok(());
     }
-    write_cached_output(&source_path, &alias_path, None, writers).await
+    // The alias is a clone of this build's own output and keeps its mode.
+    write_cached_output(&source_path, &alias_path, None, false, writers).await
 }
 
 pub fn expected_output_path(
@@ -299,6 +299,7 @@ pub async fn write_cached_output(
     source_path: &std::path::Path,
     output_path: &std::path::Path,
     expected_sha256: Option<&str>,
+    executable: bool,
     writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     if let Some(parent) = output_path.parent()
@@ -319,6 +320,7 @@ pub async fn write_cached_output(
             &source_for_copy,
             &output_for_copy,
             expected_sha256.as_deref(),
+            executable,
             writers,
         )
     })
@@ -343,9 +345,17 @@ async fn materialize_bundle_output_paths(
     output_path: &std::path::Path,
     additional_output_path: Option<&std::path::Path>,
     expected_sha256: &str,
+    executable: bool,
     writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
-    write_cached_output(source_path, output_path, Some(expected_sha256), writers).await?;
+    write_cached_output(
+        source_path,
+        output_path,
+        Some(expected_sha256),
+        executable,
+        writers,
+    )
+    .await?;
     if let Some(additional_output_path) = additional_output_path
         && additional_output_path != output_path
     {
@@ -353,6 +363,7 @@ async fn materialize_bundle_output_paths(
             source_path,
             additional_output_path,
             Some(expected_sha256),
+            executable,
             writers,
         )
         .await?;
@@ -421,44 +432,254 @@ fn materialize_cached_file_blocking(
     source_path: &std::path::Path,
     output_path: &std::path::Path,
     expected_sha256: Option<&str>,
+    executable: bool,
     writers: OutputDirWriters,
 ) -> stow_types::error::Result<bool> {
-    let source_metadata = std::fs::metadata(source_path)
-        .wrap_err_with(|| format!("stat cached artifact source {}", source_path.display()))?;
-    // A marker is a claim about bytes someone else may have replaced, so
-    // it is only evidence where nobody else writes. `target_matches_cached_file`
-    // below hashes the output either way, which is what makes ignoring the
-    // marker safe rather than merely slower.
-    if writers.trusts_markers()
-        && materialized_marker_matches(output_path, source_metadata.len(), expected_sha256)?
-    {
-        stamp_materialized_mtime(output_path)?;
-        write_materialized_marker(output_path, expected_sha256)?;
-        return Ok(false);
-    }
-    if target_matches_cached_file(
-        source_path,
+    let source_len = std::fs::metadata(source_path)
+        .wrap_err_with(|| format!("stat cached artifact source {}", source_path.display()))?
+        .len();
+    let served = serve_output(
         output_path,
-        expected_sha256,
-        source_metadata.len(),
-    )? {
-        stamp_materialized_mtime(output_path)?;
-        write_materialized_marker(output_path, expected_sha256)?;
+        |found| {
+            output_holds_cached_file(
+                found,
+                source_path,
+                output_path,
+                source_len,
+                expected_sha256,
+                writers,
+            )
+        },
+        || {
+            let staged = stage_clone(source_path, output_path).wrap_err_with(|| {
+                format!(
+                    "clone or copy cached artifact {} into {}",
+                    source_path.display(),
+                    output_path.display()
+                )
+            })?;
+            // The stamp and the mode go on the staged file: a rename keeps
+            // the file, its mtime and its mode, so the final path never
+            // holds an unstamped output or a build script cargo cannot
+            // run. The handle stays open so the marker reads the placed
+            // file's metadata from it, not from a path.
+            let (_, path) = staged.into_parts();
+            let file = open_to_read_and_stamp(&path)
+                .wrap_err_with(|| format!("open staged artifact {}", path.display()))?;
+            set_served_mode(&file, &path, executable)?;
+            stamp_materialized_mtime(&file, &path)?;
+            Ok(tempfile::NamedTempFile::from_parts(file, path))
+        },
+    )
+    .wrap_err_with(|| {
+        format!(
+            "materialize cached artifact {} at {}",
+            source_path.display(),
+            output_path.display()
+        )
+    })?;
+    let (file, placed) = match served {
+        Served::Kept(found) => {
+            set_served_mode(&found, output_path, executable)?;
+            stamp_materialized_mtime(&found, output_path)?;
+            (found, false)
+        }
+        Served::Placed(staged) => (staged, true),
+    };
+    let output_metadata = file
+        .metadata()
+        .wrap_err_with(|| format!("stat cached artifact target {}", output_path.display()))?;
+    write_materialized_marker(output_path, &output_metadata, expected_sha256)?;
+    Ok(placed)
+}
+
+/// Whether `found`, the file open at `output_path`, already holds the
+/// cached file's bytes. Every check reads the open file, never the path
+/// again, so what is judged is what is left in place.
+fn output_holds_cached_file(
+    found: &std::fs::File,
+    source_path: &std::path::Path,
+    output_path: &std::path::Path,
+    source_len: u64,
+    expected_sha256: Option<&str>,
+    writers: OutputDirWriters,
+) -> stow_types::error::Result<bool> {
+    let output_metadata = found
+        .metadata()
+        .wrap_err_with(|| format!("stat cached artifact target {}", output_path.display()))?;
+    if output_metadata.len() != source_len {
         return Ok(false);
     }
-    remove_existing_output(output_path)?;
-    reflink_copy::reflink_or_copy(source_path, output_path)
-        .map(|_| ())
-        .wrap_err_with(|| {
-            format!(
-                "clone or copy cached artifact {} into {}",
-                source_path.display(),
-                output_path.display()
-            )
-        })?;
-    stamp_materialized_mtime(output_path)?;
-    write_materialized_marker(output_path, expected_sha256)?;
-    Ok(true)
+    // A marker is a claim about bytes someone else may have replaced, so
+    // it is only evidence where nobody else writes. The bytes are hashed
+    // otherwise, which is what makes ignoring the marker safe rather than
+    // merely slower.
+    if writers.trusts_markers()
+        && materialized_marker_matches(output_path, &output_metadata, source_len, expected_sha256)?
+    {
+        return Ok(true);
+    }
+    let output_hash = sha256_open_file(found, output_path)?;
+    if let Some(expected_sha256) = expected_sha256 {
+        return Ok(output_hash == expected_sha256);
+    }
+    Ok(output_hash == sha256_file(source_path)?)
+}
+
+/// What [`serve_output`] left at its destination.
+pub enum Served<F> {
+    /// The destination already held the served bytes and was left in
+    /// place; the handle is open on that file.
+    Kept(std::fs::File),
+    /// A staged file was placed at the destination; `F` is what staging
+    /// produced alongside it.
+    Placed(F),
+}
+
+/// Put the bytes `stage` produces at `destination`, one of several serves
+/// that may be placing the same bytes there at once (stow#1444).
+///
+/// A destination that already holds them — `holds_served_bytes` judges
+/// the open file — is never replaced: once any serve has placed the
+/// bytes, the path keeps that file, and no reader, in stow or outside it,
+/// can find the path absent or half-written. An absent destination is
+/// filled by a no-replace rename of a whole staged file, so of the serves
+/// that found it absent the first one's file is placed and the others
+/// find it there. Only a destination holding other bytes is replaced by
+/// a rename over it, which is the one step whose replace a concurrent
+/// lookup can observe: on Windows `std::fs::rename` is `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING`, which does not keep the name resolvable
+/// to an opener throughout. Every serve looks the destination up by name
+/// at most twice and handles absence as absence, so no serve fails on
+/// another's replace.
+///
+/// # Errors
+/// The destination cannot be opened, judged, staged or placed.
+pub fn serve_output<F>(
+    destination: &std::path::Path,
+    holds_served_bytes: impl Fn(&std::fs::File) -> stow_types::error::Result<bool>,
+    stage: impl Fn() -> stow_types::error::Result<tempfile::NamedTempFile<F>>,
+) -> stow_types::error::Result<Served<F>> {
+    let found_other_bytes = match open_served_output(destination)? {
+        Some(found) if holds_served_bytes(&found)? => return Ok(Served::Kept(found)),
+        Some(_) => true,
+        None => false,
+    };
+    if found_other_bytes {
+        return replace_output(stage()?, destination).map(Served::Placed);
+    }
+    match stage()?.persist_noclobber(destination) {
+        Ok(placed) => Ok(Served::Placed(placed)),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another serve placed a file after this one found the path
+            // empty. Its file is kept when it holds the bytes; otherwise
+            // the bytes are placed over it. This staged file is dropped
+            // either way — tempfile marks a staged file it failed to
+            // persist as temporary on Windows, which no served output
+            // may carry — and a replacement is staged afresh.
+            drop(error);
+            match open_served_output(destination)? {
+                Some(found) if holds_served_bytes(&found)? => Ok(Served::Kept(found)),
+                Some(_) | None => replace_output(stage()?, destination).map(Served::Placed),
+            }
+        }
+        Err(error) => Err(error.error)
+            .wrap_err_with(|| format!("place staged output at {}", destination.display())),
+    }
+}
+
+/// The file at `destination` opened for [`serve_output`]'s judgment, or
+/// `None` when nothing is there.
+fn open_served_output(
+    destination: &std::path::Path,
+) -> stow_types::error::Result<Option<std::fs::File>> {
+    match open_to_read_and_stamp(destination) {
+        Ok(found) => Ok(Some(found)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).wrap_err_with(|| format!("open {}", destination.display())),
+    }
+}
+
+/// Open `path` to read it and to restamp its modification time through
+/// the same handle.
+///
+/// Windows checks a handle's access on `SetFileInformationByHandle`, and
+/// a timestamp needs `FILE_WRITE_ATTRIBUTES`, which read access does not
+/// carry; it is asked for without write access to the data, which a
+/// running executable refuses. Unix checks the caller's ownership of the
+/// file, not the descriptor's mode, for an explicit `futimens`.
+fn open_to_read_and_stamp(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_WRITE_ATTRIBUTES};
+        options.access_mode(FILE_GENERIC_READ | FILE_WRITE_ATTRIBUTES);
+    }
+    options.open(path)
+}
+
+/// Rename `staged` over `destination`, which holds other bytes, returning
+/// what staging produced.
+fn replace_output<F>(
+    staged: tempfile::NamedTempFile<F>,
+    destination: &std::path::Path,
+) -> stow_types::error::Result<F> {
+    let (file, mut path) = staged.into_parts();
+    std::fs::rename(&path, destination).wrap_err_with(|| {
+        format!(
+            "replace {} with staged {}",
+            destination.display(),
+            path.display()
+        )
+    })?;
+    path.disable_cleanup(true);
+    Ok(file)
+}
+
+/// Clone `source` (APFS `clonefile`, Linux `FICLONE`, else a byte copy) to a
+/// uniquely named file beside `destination`, not yet visible at it, for
+/// [`serve_output`] to place. The staged file is removed on drop if it is
+/// never placed.
+pub fn stage_clone(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<tempfile::NamedTempFile<Option<u64>>> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    tempfile::Builder::new()
+        .prefix(".stow-stage-")
+        .make_in(parent, |staged| {
+            reflink_copy::reflink_or_copy(source, staged)
+        })
+}
+
+/// Rename `staged` over `destination`, whose contents change from one
+/// write to the next.
+///
+/// The rename is `std::fs::rename`: `rename(2)`, and on Windows
+/// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, retried as a
+/// POSIX-semantics `FileRenameInfoEx` only when that is refused with
+/// `ERROR_ACCESS_DENIED` — which a destination another handle holds open,
+/// or another replace of it in flight, causes. Neither path keeps the
+/// name resolvable to a concurrent opener on Windows, so a destination
+/// placed here is read only under a lock that excludes the replace, or
+/// by a reader that takes its absence for what it is. A destination that
+/// every writer fills with the same bytes goes through [`serve_output`]
+/// instead, which never replaces it once it holds them.
+pub fn place_staged<F>(
+    staged: tempfile::NamedTempFile<F>,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    // Closing the staged file first: the rename moves a path, and the
+    // staged file is removed with it if the rename fails.
+    let mut staged = staged.into_temp_path();
+    std::fs::rename(&staged, destination)?;
+    staged.disable_cleanup(true);
+    Ok(())
 }
 
 /// Stamp a materialized output with the mtime rustc's own write would
@@ -468,74 +689,45 @@ fn materialize_cached_file_blocking(
 /// files cargo's other units wrote this build, which cargo's
 /// dependency-mtime check reads as "a dependency was rebuilt" and
 /// rebuilds the unit forever (stow#634).
-fn stamp_materialized_mtime(output_path: &std::path::Path) -> stow_types::error::Result<()> {
-    std::fs::File::options()
-        .write(true)
-        .open(output_path)
-        .and_then(|file| file.set_modified(std::time::SystemTime::now()))
-        .wrap_err_with(|| format!("stamp mtime on {}", output_path.display()))
+fn stamp_materialized_mtime(
+    file: &std::fs::File,
+    path: &std::path::Path,
+) -> stow_types::error::Result<()> {
+    file.set_modified(std::time::SystemTime::now())
+        .wrap_err_with(|| format!("stamp mtime on {}", path.display()))
 }
 
-fn remove_existing_output(output_path: &std::path::Path) -> stow_types::error::Result<()> {
-    match std::fs::symlink_metadata(output_path) {
-        Ok(_) => std::fs::remove_file(output_path)
-            .wrap_err_with(|| format!("remove existing cached artifact {}", output_path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(stow_types::error::Error::from(error).wrap_err(format!(
-            "stat existing cached artifact {}",
-            output_path.display()
-        ))),
-    }
-}
-
-fn target_matches_cached_file(
-    source_path: &std::path::Path,
-    output_path: &std::path::Path,
-    expected_sha256: Option<&str>,
-    source_len: u64,
-) -> stow_types::error::Result<bool> {
-    if !output_path.exists() {
-        return Ok(false);
-    }
-    let output_metadata = std::fs::metadata(output_path)
-        .wrap_err_with(|| format!("stat cached artifact target {}", output_path.display()))?;
-    if source_len != output_metadata.len() {
-        return Ok(false);
-    }
-    let output_hash = sha256_file(output_path)?;
-    if let Some(expected_sha256) = expected_sha256 {
-        return Ok(output_hash == expected_sha256);
-    }
-    Ok(output_hash == sha256_file(source_path)?)
-}
-
+/// Whether the marker beside `output_path` records the output whose
+/// metadata is `output_metadata` as holding `expected_sha256`.
 fn materialized_marker_matches(
     output_path: &std::path::Path,
+    output_metadata: &std::fs::Metadata,
     expected_len: u64,
     expected_sha256: Option<&str>,
 ) -> stow_types::error::Result<bool> {
     let Some(expected_sha256) = expected_sha256 else {
         return Ok(false);
     };
-    if !output_path.exists() {
-        return Ok(false);
-    }
-    let marker_path = materialized_marker_path(output_path)?;
-    if !marker_path.exists() {
-        return Ok(false);
-    }
-    let output_metadata = std::fs::metadata(output_path)
-        .wrap_err_with(|| format!("stat cached artifact target {}", output_path.display()))?;
     if output_metadata.len() != expected_len {
         return Ok(false);
     }
-    let (modified_secs, modified_nanos) = file_modified_time(&output_metadata, output_path)?;
-    let contents = std::fs::read_to_string(&marker_path).wrap_err_with(|| {
-        format!(
-            "read materialized artifact marker {}",
-            marker_path.display()
-        )
-    })?;
+    let marker_path = materialized_marker_path(output_path)?;
+    // Every serve rewrites the marker by renaming over it, which a read
+    // racing it can find absent on Windows (`place_staged`). An absent
+    // marker is no evidence, and the caller hashes the bytes instead.
+    let contents = match std::fs::read_to_string(&marker_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).wrap_err_with(|| {
+                format!(
+                    "read materialized artifact marker {}",
+                    marker_path.display()
+                )
+            });
+        }
+    };
+    let (modified_secs, modified_nanos) = file_modified_time(output_metadata, output_path)?;
     let mut fields = contents.split_whitespace();
     let version = fields.next();
     let len = fields.next().and_then(|value| value.parse::<u64>().ok());
@@ -552,16 +744,17 @@ fn materialized_marker_matches(
         && sha256 == Some(expected_sha256))
 }
 
+/// Record that `output_path`, whose metadata — read from the handle the
+/// serve placed or kept — is `output_metadata`, holds `expected_sha256`.
 fn write_materialized_marker(
     output_path: &std::path::Path,
+    output_metadata: &std::fs::Metadata,
     expected_sha256: Option<&str>,
 ) -> stow_types::error::Result<()> {
     let Some(expected_sha256) = expected_sha256 else {
         return Ok(());
     };
-    let output_metadata = std::fs::metadata(output_path)
-        .wrap_err_with(|| format!("stat cached artifact target {}", output_path.display()))?;
-    let (modified_secs, modified_nanos) = file_modified_time(&output_metadata, output_path)?;
+    let (modified_secs, modified_nanos) = file_modified_time(output_metadata, output_path)?;
     let marker_path = materialized_marker_path(output_path)?;
     let marker_dir = marker_path.parent().ok_or_else(|| {
         stow_types::stow_error!(
@@ -575,8 +768,25 @@ fn write_materialized_marker(
             marker_dir.display()
         )
     })?;
-    std::fs::write(
-        &marker_path,
+    // Two materializers of one output both write this marker. Each writes
+    // its own staged file and renames it over the marker, so the marker is
+    // always one writer's whole line, never an interleaving of two.
+    let mut staged = tempfile::Builder::new()
+        .prefix(".stow-marker-")
+        .make_in(marker_dir, |staged| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(staged)
+        })
+        .wrap_err_with(|| {
+            format!(
+                "stage materialized artifact marker for {}",
+                marker_path.display()
+            )
+        })?;
+    std::io::Write::write_all(
+        &mut staged,
         format!(
             "{} {} {} {} {}\n",
             MATERIALIZED_MARKER_VERSION,
@@ -584,9 +794,16 @@ fn write_materialized_marker(
             modified_secs,
             modified_nanos,
             expected_sha256
-        ),
+        )
+        .as_bytes(),
     )
     .wrap_err_with(|| {
+        format!(
+            "write materialized artifact marker {}",
+            marker_path.display()
+        )
+    })?;
+    place_staged(staged, &marker_path).wrap_err_with(|| {
         format!(
             "write materialized artifact marker {}",
             marker_path.display()
@@ -635,6 +852,17 @@ fn materialized_marker_path(
 fn sha256_file(path: &std::path::Path) -> stow_types::error::Result<String> {
     let bytes =
         std::fs::read(path).wrap_err_with(|| format!("read artifact file {}", path.display()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+/// The hash of the bytes `file`, freshly opened at `path`, holds.
+fn sha256_open_file(
+    mut file: &std::fs::File,
+    path: &std::path::Path,
+) -> stow_types::error::Result<String> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)
+        .wrap_err_with(|| format!("read artifact file {}", path.display()))?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
@@ -903,6 +1131,7 @@ mod tests {
                 &source,
                 &output,
                 Some(&sha256),
+                false,
                 OutputDirWriters::StowOnly,
             )
             .expect("first materialization")
@@ -914,6 +1143,7 @@ mod tests {
                 &source,
                 &output,
                 Some(&sha256),
+                false,
                 OutputDirWriters::StowOnly,
             )
             .expect("marker hit avoids copy")
@@ -943,10 +1173,12 @@ mod tests {
             std::fs::metadata(&source).expect("source metadata").len(),
             "the plant has to match the declared length or nothing is being tested"
         );
-        write_materialized_marker(&output, Some(&sha256)).expect("forged marker");
+        let plant_metadata = std::fs::metadata(&output).expect("plant metadata");
+        write_materialized_marker(&output, &plant_metadata, Some(&sha256)).expect("forged marker");
         assert!(
             materialized_marker_matches(
                 &output,
+                &plant_metadata,
                 std::fs::metadata(&source).expect("source metadata").len(),
                 Some(&sha256),
             )
@@ -959,6 +1191,7 @@ mod tests {
                 &source,
                 &output,
                 Some(&sha256),
+                false,
                 OutputDirWriters::UntrustedCodeToo,
             )
             .expect("materialization"),
@@ -985,6 +1218,7 @@ mod tests {
             &source,
             &output,
             Some(&sha256),
+            false,
             OutputDirWriters::StowOnly,
         )
         .expect("first materialization");
@@ -1009,6 +1243,7 @@ mod tests {
                 &source,
                 &output,
                 Some(&sha256),
+                false,
                 OutputDirWriters::StowOnly,
             )
             .expect("stale marker is rejected")
@@ -1034,6 +1269,7 @@ mod tests {
             &source,
             &output,
             Some(&sha256),
+            false,
             OutputDirWriters::StowOnly,
         )
         .expect("materialize cached file");
@@ -1044,6 +1280,75 @@ mod tests {
             b"artifact",
             "a rewrite of the cache entry reached the materialized output"
         );
+    }
+
+    /// Two serves of one build can need the same dependency output at
+    /// once. Every one of them must succeed and the output must be the
+    /// cached bytes whole, whichever placement wins — from an empty path,
+    /// and from a path holding other bytes of the same length, which every
+    /// serve that finds them replaces while the others look the path up.
+    #[test]
+    fn concurrent_materializations_of_one_output_all_succeed() {
+        const THREADS: usize = 32;
+        const ROUNDS: usize = 20;
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let source = tempdir.path().join("cache").join("lib.rlib");
+        let output_dir = tempdir.path().join("target").join("deps");
+        std::fs::create_dir_all(source.parent().unwrap()).expect("source parent");
+        std::fs::create_dir_all(&output_dir).expect("output parent");
+        let contents = vec![0x5a_u8; 256 * 1024];
+        std::fs::write(&source, &contents).expect("source");
+        let sha256 = hex::encode(sha2::Sha256::digest(&contents));
+
+        for writers in [
+            OutputDirWriters::StowOnly,
+            OutputDirWriters::UntrustedCodeToo,
+        ] {
+            for round in 0..ROUNDS {
+                let output = output_dir.join(format!("lib-{writers:?}-{round}.rlib"));
+                if round % 2 == 1 {
+                    std::fs::write(&output, vec![0xa5_u8; contents.len()]).expect("stale output");
+                }
+                let barrier = std::sync::Barrier::new(THREADS);
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = (0..THREADS)
+                        .map(|_| {
+                            scope.spawn(|| {
+                                barrier.wait();
+                                materialize_cached_file_blocking(
+                                    &source,
+                                    &output,
+                                    Some(&sha256),
+                                    false,
+                                    writers,
+                                )
+                            })
+                        })
+                        .collect();
+                    for handle in handles {
+                        handle
+                            .join()
+                            .expect("materializer thread")
+                            .expect("every concurrent materialization succeeds");
+                    }
+                });
+                assert_eq!(std::fs::read(&output).expect("output"), contents);
+            }
+        }
+        for dir in [
+            output_dir.clone(),
+            output_dir.join(super::MATERIALIZED_MARKERS_DIR),
+        ] {
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .expect("read dir")
+                .map(|entry| entry.expect("entry").file_name())
+                .filter(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with(".stow-stage-") || name.starts_with(".stow-marker-")
+                })
+                .collect();
+            assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+        }
     }
 
     #[test]

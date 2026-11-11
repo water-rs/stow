@@ -152,7 +152,88 @@ pub fn validate_plan(
         }
     }
 
-    validate_coverage(task, plan, closure, consumed, programs)
+    validate_coverage(task, plan, closure, consumed, programs)?;
+    validate_own_shapes(task, plan, closure, consumed, programs)
+}
+
+/// The task's own node must be published whole: every shape the
+/// scheduler's rule and the publisher's own phase graphs name for it.
+/// [`validate_coverage`] only asks for one linked library artifact per
+/// package, which a node short of a library shape or of its build script's
+/// other spelling still satisfies — and a node counted complete short of
+/// either fails every consumer that asks for the missing key.
+///
+/// What covers a shape: the own artifacts of the plan (each at its
+/// invocation spellings), the task's completed local programs, and — for
+/// the build script, which a consumption prefetch may serve instead of
+/// compiling — the shapes the signed index records for the vouched own
+/// script claims.
+fn validate_own_shapes(
+    task: &BuildTaskPayload,
+    plan: &[PlannedArtifact],
+    closure: &DependencyClosure,
+    consumed: &[ConsumedArtifact],
+    programs: &crate::dep_scan::ProgramClaims,
+) -> stow_types::error::Result<()> {
+    use crate::shapes::Evidence;
+    let mut evidence = Vec::new();
+    let dispatched_version = task.version.as_semver();
+    for artifact in plan.iter().filter(|artifact| {
+        artifact.crate_name == task.crate_name
+            && artifact.crate_version.as_semver() == dispatched_version
+    }) {
+        let script = artifact.kind == stow_types::artifact::ArtifactKind::BuildScript;
+        evidence.extend(
+            artifact
+                .unit_shape
+                .invocation_shapes(artifact.shared_invocations)
+                .map(|shape| Evidence {
+                    script,
+                    shape,
+                    c_metadata: artifact.c_metadata.to_string(),
+                }),
+        );
+    }
+    evidence.extend(programs.completed.iter().map(|program| Evidence {
+        script: false,
+        shape: program.unit_shape,
+        c_metadata: program.c_metadata.to_string(),
+    }));
+    // A script that reads its manifest directory is compiled and never
+    // planned: the build's statement that it compiled one is what covers
+    // the spelling.
+    evidence.extend(programs.local_scripts.iter().map(|script| Evidence {
+        script: true,
+        shape: stow_types::public_cache::UnitShape {
+            side: stow_types::public_cache::UnitSide::Host,
+            invocation: script.invocation,
+            kind: stow_types::public_cache::UnitKind::Linked,
+        },
+        c_metadata: script.c_metadata.clone(),
+    }));
+    for claim in consumed.iter().filter(|claim| {
+        claim.kind == stow_types::artifact::ArtifactKind::BuildScript
+            && canonical_crate_name(claim.crate_name.as_str())
+                == canonical_crate_name(task.crate_name.as_str())
+            && claim.crate_version == task.version.to_string()
+    }) {
+        // The claim covers the spellings whose phases were served it. The
+        // vouching row's own label says nothing here: a script is looked up
+        // by its key alone, so a row published under either spelling serves
+        // both when their keys agree.
+        evidence.extend(claim.invocations.iter().map(|&invocation| Evidence {
+            script: true,
+            shape: stow_types::public_cache::UnitShape {
+                side: stow_types::public_cache::UnitSide::Host,
+                invocation,
+                kind: stow_types::public_cache::UnitKind::Linked,
+            },
+            c_metadata: claim.c_metadata.clone(),
+        }));
+    }
+    closure.own_shapes().gap(&evidence).map_or(Ok(()), |gap| {
+        Err(stow_types::stow_error!("{}", gap.refusal(task, "the plan")))
+    })
 }
 
 fn validate_coverage(
@@ -294,6 +375,43 @@ fn validate_own_node_features(
     Ok(())
 }
 
+/// The signed index rows that vouch for `claim`: the same crate, version,
+/// compile key and `c_metadata` on the claim's target, at the claim's emit
+/// set and kind.
+fn vouching_rows<'a>(
+    claim: &ConsumedArtifact,
+    claim_version: &semver::Version,
+    index_slices: &'a [IndexSlice],
+) -> Vec<(&'a IndexSlice, &'a stow_types::index::ArtifactIndexRow)> {
+    index_slices
+        .iter()
+        .filter(|slice| slice.index.header.target.as_str() == claim.target)
+        .flat_map(|slice| {
+            slice
+                .index
+                .rows
+                .iter()
+                .chain(&slice.index.build_scripts)
+                .map(move |row| (slice, row))
+        })
+        .filter(|(_, row)| {
+            canonical_crate_name(row.crate_name.as_str())
+                == canonical_crate_name(claim.crate_name.as_str())
+                && row.version.as_semver() == claim_version
+                && row.compile_key == claim.compile_key
+                && row.c_metadata.as_str() == claim.c_metadata
+                // The claim's emit set is untrusted text and it is
+                // what the completeness rule below reads, so it has to
+                // be the published artifact's own. Without this a
+                // claim could name a metadata-only row's compile key
+                // and present it as `link` coverage for a crate whose
+                // rlib the index does not have.
+                && row.emit == claim.emit
+                && row.artifact_kind == claim.kind
+        })
+        .collect()
+}
+
 /// The publisher-side proof behind every `consumed` claim: each claim
 /// names a crate inside the task's resolved closure — containment does not
 /// weaken — and matches a row of the signed index the publisher pulled
@@ -308,6 +426,14 @@ fn validate_consumed_claims(
     index_slices: &[IndexSlice],
 ) -> stow_types::error::Result<()> {
     let mut seen_compile_keys = BTreeSet::<&str>::new();
+    let pinned = if consumed
+        .iter()
+        .any(|claim| claim.kind != stow_types::artifact::ArtifactKind::BuildScript)
+    {
+        crate::consume::pinned_dependency_ids(task)?
+    } else {
+        BTreeSet::new()
+    };
     for claim in consumed {
         if !seen_compile_keys.insert(claim.compile_key.as_str()) {
             return Err(stow_types::stow_error!(
@@ -340,26 +466,7 @@ fn validate_consumed_claims(
                 closure.package_count()
             ));
         }
-        let vouching: Vec<&stow_types::index::ArtifactIndexRow> = index_slices
-            .iter()
-            .filter(|slice| slice.index.header.target.as_str() == claim.target)
-            .flat_map(|slice| slice.index.rows.iter().chain(&slice.index.build_scripts))
-            .filter(|row| {
-                canonical_crate_name(row.crate_name.as_str())
-                    == canonical_crate_name(claim.crate_name.as_str())
-                    && row.version.as_semver() == &claim_version
-                    && row.compile_key == claim.compile_key
-                    && row.c_metadata.as_str() == claim.c_metadata
-                    // The claim's emit set is untrusted text and it is
-                    // what the completeness rule below reads, so it has to
-                    // be the published artifact's own. Without this a
-                    // claim could name a metadata-only row's compile key
-                    // and present it as `link` coverage for a crate whose
-                    // rlib the index does not have.
-                    && row.emit == claim.emit
-                    && row.artifact_kind == claim.kind
-            })
-            .collect();
+        let vouching = vouching_rows(claim, &claim_version, index_slices);
         if vouching.is_empty() {
             return Err(stow_types::stow_error!(
                 "consumed artifact {} {} (compile_key {}, c_metadata {}, target {}) matches no row of the signed index — a cache hit the index does not vouch for is a dropped compile",
@@ -370,31 +477,37 @@ fn validate_consumed_claims(
                 claim.target
             ));
         }
-        // A claim may name the task's package only when the vouched row
-        // is the other side's — the outcome-3 twin is a served
-        // dependency like any other (stow#723). A claim for the task's
-        // own unit means its artifact never compiled, so the plan has
-        // nothing to publish.
-        if claim.kind != stow_types::artifact::ArtifactKind::BuildScript
-            && canonical_crate_name(claim.crate_name.as_str())
-                == canonical_crate_name(task.crate_name.as_str())
-            && claim.crate_version == task.version.to_string()
-            && vouching.iter().any(|row| {
-                (row.unit_shape.side == stow_types::public_cache::UnitSide::Host) == task.host_side
-            })
-        {
-            return Err(stow_types::stow_error!(
-                "consumed artifact claims the task's own unit {} {} — each build must compile its own unit",
-                claim.crate_name,
-                claim.crate_version
-            ));
+        // A library is served only from a node of the task's pinned
+        // subtree (#1415). A compile key records no side, so another
+        // node of the same crate can publish the claimed key; the
+        // outcome-3 twin is a subtree node like any other (stow#723),
+        // and the task's own node never is one — a claim on its own
+        // unit means its artifact never compiled, so the plan has
+        // nothing to publish. A build script's row names no node side
+        // to derive an identity from, so it is vouched by the match
+        // alone.
+        if claim.kind != stow_types::artifact::ArtifactKind::BuildScript {
+            let mut vouched = false;
+            for (slice, row) in &vouching {
+                vouched |= crate::consume::published_by_pinned_node(&pinned, slice, row)?;
+            }
+            if !vouched {
+                return Err(stow_types::stow_error!(
+                    "consumed artifact {} {} (compile_key {}, target {}) is vouched only by rows of nodes outside the pinned dependency subtree of task {} — a unit is served only from a node the task pins, and never from its own",
+                    claim.crate_name,
+                    claim.crate_version,
+                    claim.compile_key,
+                    claim.target,
+                    task.task_id
+                ));
+            }
         }
     }
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::collections::BTreeSet;
 
     use stow_types::api::BuildTaskPayload;
@@ -461,6 +574,7 @@ mod tests {
                 unit_shape: planned("demo", "1.0.0").unit_shape,
             }],
             compiled: Vec::new(),
+            local_scripts: Vec::new(),
         };
         let error = validate_plan(
             &task,
@@ -503,6 +617,7 @@ mod tests {
                 unit_shape: shape,
             }],
             compiled: Vec::new(),
+            local_scripts: Vec::new(),
         };
         validate_plan(&task, &task, &[], &closure, &[], &[], &programs)
             .expect("completed host macro needs no downloadable bundle");
@@ -558,6 +673,7 @@ mod tests {
             target: task.target.to_string(),
             rustc_version: task.rustc_version.to_string(),
             emit: row.emit.clone(),
+            invocations: [stow_types::public_cache::UnitInvocation::Native].into(),
         };
         let slices = [stow_cli::build_consume::IndexSlice {
             manifest_digest: Some(format!("sha256:{}", "1".repeat(64))),
@@ -575,7 +691,16 @@ mod tests {
                 local_programs: Vec::new(),
             },
         }];
-        let closure = closure(&[("demo", "1.0.0")]);
+        // The claim covers the spelling whose phase was served the script:
+        // the node owes it under the native spelling alone here.
+        let closure =
+            closure(&[("demo", "1.0.0")]).with_own_shapes(crate::shapes::OwnNodeShapes::new(
+                vec![library.unit_shape],
+                &[(
+                    stow_types::public_cache::UnitInvocation::Native,
+                    "check native",
+                )],
+            ));
         let programs = crate::dep_scan::ProgramClaims::default();
         let claims = [claim];
         validate_plan(
@@ -593,6 +718,471 @@ mod tests {
         assert!(
             error.to_string().contains("no build-phase artifact"),
             "{error}"
+        );
+    }
+
+    /// The claim a build makes for having been served `row`.
+    fn claim_for(row: &stow_types::index::ArtifactIndexRow) -> crate::dep_scan::ConsumedArtifact {
+        crate::dep_scan::ConsumedArtifact {
+            kind: row.artifact_kind.clone(),
+            crate_name: row.crate_name.to_string(),
+            crate_version: row.version.to_string(),
+            compile_key: row.compile_key.clone(),
+            c_metadata: row.c_metadata.to_string(),
+            target: crate::consume::test_support::SLICE_TARGET.to_owned(),
+            rustc_version: "1.99.0".to_owned(),
+            emit: row.emit.clone(),
+            invocations: [row.unit_shape.invocation].into(),
+        }
+    }
+
+    /// #1415 result A: the pinned twin's unit is claimed and the twin's own
+    /// row vouches for it, although unrelated host and target nodes of the
+    /// same crate published the same compile key.
+    #[test]
+    fn a_pinned_twins_claim_stands_beside_other_nodes_rows_at_its_key() {
+        use crate::consume::test_support::{
+            index_slice, itoa_row, serde_row, twin_row, twinned_host_task,
+        };
+        use stow_types::public_cache::UnitSide;
+        let task = twinned_host_task();
+        let slices = [index_slice(vec![
+            itoa_row(),
+            twin_row(),
+            serde_row(UnitSide::Host, vec!["itoa-1.0.17-unpinned".to_owned()]),
+            serde_row(UnitSide::Target, vec!["bytes-1.11.0-unpinned".to_owned()]),
+        ])];
+        let closure = closure(&[("serde", "1.0.229"), ("itoa", "1.0.18")]);
+        super::validate_consumed_claims(
+            &task,
+            &closure,
+            &[claim_for(&twin_row()), claim_for(&itoa_row())],
+            &slices,
+        )
+        .expect("a claim vouched by a node of the pinned subtree stands");
+    }
+
+    /// #1415 result B: the task's own unit's key, published by a target
+    /// node the task does not pin, vouches for nothing — and the task's
+    /// own published row cannot be claimed either.
+    #[test]
+    fn a_claim_vouched_only_by_nodes_outside_the_subtree_is_rejected() {
+        use crate::consume::test_support::{
+            index_slice, itoa_row, own_row, serde_row, twinned_host_task,
+        };
+        use stow_types::public_cache::UnitSide;
+        let task = twinned_host_task();
+        let closure = closure(&[("serde", "1.0.229"), ("itoa", "1.0.18")]);
+
+        let unpinned = serde_row(UnitSide::Target, vec!["bytes-1.11.0-unpinned".to_owned()]);
+        let slices = [index_slice(vec![itoa_row(), unpinned.clone()])];
+        let error =
+            super::validate_consumed_claims(&task, &closure, &[claim_for(&unpinned)], &slices)
+                .expect_err("a row of a node the task does not pin cannot vouch");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the pinned dependency subtree"),
+            "{error}"
+        );
+
+        let own = own_row();
+        let slices = [index_slice(vec![itoa_row(), own.clone()])];
+        let error = super::validate_consumed_claims(&task, &closure, &[claim_for(&own)], &slices)
+            .expect_err("the task's own unit is never served to it");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the pinned dependency subtree"),
+            "{error}"
+        );
+    }
+
+    /// `nix 0.31.3 ["fs"]` on the darwin runner's own triple: a native
+    /// target-side node whose crate owns a build script.
+    pub fn nix_task(
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling,
+    ) -> BuildTaskPayload {
+        BuildTaskPayload {
+            task_id: "nix-0.31.3-fs".to_owned(),
+            crate_name: CrateName::parse("nix").unwrap(),
+            version: CrateVersion::new(semver::Version::new(0, 31, 3)),
+            features_json: FeaturesJson::canonicalize(vec!["fs".to_owned()]).unwrap(),
+            target: TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+            explicit_spelling,
+            ..task()
+        }
+    }
+
+    /// The same node built for iOS from the darwin runner: a cross triple.
+    pub fn nix_cross_task() -> BuildTaskPayload {
+        BuildTaskPayload {
+            target: TargetTriple::parse("aarch64-apple-ios").unwrap(),
+            ..nix_task(stow_types::public_cache::ExplicitSpelling::KeysAsNative)
+        }
+    }
+
+    /// Everything `task`'s node owes: the scheduler's library rule and a
+    /// build script under each of `script_spellings`.
+    fn owed(
+        task: &BuildTaskPayload,
+        script_spellings: &[stow_types::public_cache::UnitInvocation],
+    ) -> crate::shapes::OwnNodeShapes {
+        let library = stow_types::public_cache::required_unit_shapes(
+            task.host_side,
+            stow_types::public_cache::UnitInvocation::for_task(
+                task.target.as_str(),
+                stow_types::api::runner_family(task.target.as_str())
+                    .expect("a CI target")
+                    .host_triple(),
+            ),
+            task.explicit_spelling,
+        );
+        let cross = stow_types::api::runner_family(task.target.as_str())
+            .expect("a CI target")
+            .host_triple()
+            != task.target.as_str();
+        let scripts = script_spellings
+            .iter()
+            .map(|&invocation| {
+                use stow_types::public_cache::UnitInvocation::{Native, Target};
+                let phase = match (invocation, cross) {
+                    (Native, _) => "check native",
+                    (Target, false) => "check explicit --target compile-time dependencies",
+                    (Target, true) => "check task-spelled",
+                };
+                (invocation, phase)
+            })
+            .collect::<Vec<_>>();
+        crate::shapes::OwnNodeShapes::new(library, &scripts)
+    }
+
+    /// An own artifact of `task` at `shape`; a script when `script`.
+    /// `c_metadata` tells two scripts apart.
+    fn own_artifact(
+        task: &BuildTaskPayload,
+        shape: stow_types::public_cache::UnitShape,
+        script: bool,
+        c_metadata: &str,
+    ) -> PlannedArtifact {
+        let mut artifact = planned(task.crate_name.as_str(), &task.version.to_string());
+        artifact.features_json = task.features_json.clone();
+        artifact.rustc_version = task.rustc_version.clone();
+        artifact.target = if script {
+            TargetTriple::parse("aarch64-apple-darwin").unwrap()
+        } else {
+            task.target.clone()
+        };
+        artifact.c_metadata = CMetadata::parse(c_metadata).unwrap();
+        artifact.unit_shape = shape;
+        artifact.emit = if shape.kind == stow_types::public_cache::UnitKind::Linked {
+            vec!["link".to_owned()]
+        } else {
+            vec!["dep-info".to_owned(), "metadata".to_owned()]
+        };
+        if script {
+            artifact.kind = ArtifactKind::BuildScript;
+            artifact.crate_types = vec![RustCrateType::Bin];
+        }
+        artifact.oci_reference = oci_reference(
+            &planned_artifact_key(&artifact).unwrap(),
+            artifact.c_metadata.as_str(),
+        );
+        artifact
+    }
+
+    /// The own library artifacts the scheduler's rule asks of `task`.
+    pub fn own_libraries(task: &BuildTaskPayload) -> Vec<PlannedArtifact> {
+        owed(task, &[])
+            .library()
+            .iter()
+            .enumerate()
+            .map(|(index, &shape)| own_artifact(task, shape, false, &format!("1{index:015x}")))
+            .collect()
+    }
+
+    pub fn script(
+        task: &BuildTaskPayload,
+        invocation: stow_types::public_cache::UnitInvocation,
+        c_metadata: &str,
+    ) -> PlannedArtifact {
+        own_artifact(
+            task,
+            stow_types::public_cache::UnitShape {
+                side: stow_types::public_cache::UnitSide::Host,
+                invocation,
+                kind: stow_types::public_cache::UnitKind::Linked,
+            },
+            true,
+            c_metadata,
+        )
+    }
+
+    fn validate_with(
+        task: &BuildTaskPayload,
+        plan: &[PlannedArtifact],
+        owed: crate::shapes::OwnNodeShapes,
+    ) -> stow_types::error::Result<()> {
+        let closure = closure(&[("nix", "0.31.3")]).with_own_shapes(owed);
+        validate_plan(
+            task,
+            task,
+            plan,
+            &closure,
+            &[],
+            &[],
+            &crate::dep_scan::ProgramClaims::default(),
+        )
+    }
+
+    pub const NATIVE_SCRIPT: &str = "22aac6cb837ae789";
+    pub const EXPLICIT_SCRIPT: &str = "1db9eff5aaaaaaaa";
+
+    /// The defect: a native node published its native script alone, and
+    /// the explicit `--target` spelling's script — keyed apart through the
+    /// build dependency `cfg_aliases` — was never published.
+    #[test]
+    fn a_native_node_with_only_its_native_script_is_refused() {
+        use stow_types::public_cache::{ExplicitSpelling, UnitInvocation};
+        let task = nix_task(ExplicitSpelling::KeysAsNative);
+        let mut plan = own_libraries(&task);
+        plan.push(script(&task, UnitInvocation::Native, NATIVE_SCRIPT));
+        let owed = || owed(&task, &[UnitInvocation::Native, UnitInvocation::Target]);
+        let error = validate_with(&task, &plan, owed()).expect_err("the explicit script is owed");
+        assert_eq!(
+            error.to_string(),
+            "task nix-0.31.3-fs (nix 0.31.3 [\"fs\"], target side of aarch64-apple-darwin) \
+             lacks build-script shape host/target/linked: the publisher's \"check explicit \
+             --target compile-time dependencies\" unit graph compiles its build script, but \
+             the plan's build scripts cover only host/native/linked (c_metadata 22aac6cb837ae789)"
+        );
+        // Publishing the explicit script completes the node.
+        plan.push(script(&task, UnitInvocation::Target, EXPLICIT_SCRIPT));
+        validate_with(&task, &plan, owed()).expect("both scripts published");
+    }
+
+    /// Both spellings keyed one script alike: one artifact marked shared
+    /// covers both.
+    #[test]
+    fn one_shared_script_artifact_covers_both_spellings() {
+        use stow_types::public_cache::{ExplicitSpelling, UnitInvocation};
+        let task = nix_task(ExplicitSpelling::KeysAsNative);
+        let mut plan = own_libraries(&task);
+        let mut shared = script(&task, UnitInvocation::Native, NATIVE_SCRIPT);
+        shared.shared_invocations = true;
+        plan.push(shared);
+        validate_with(
+            &task,
+            &plan,
+            owed(&task, &[UnitInvocation::Native, UnitInvocation::Target]),
+        )
+        .expect("one key under both spellings");
+    }
+
+    /// A cross triple runs the explicit spelling alone: its script is
+    /// labelled target, and a native label is the old builder's.
+    #[test]
+    fn a_cross_node_owes_its_script_under_the_target_spelling_only() {
+        use stow_types::public_cache::UnitInvocation;
+        let task = nix_cross_task();
+        let owed = || owed(&task, &[UnitInvocation::Target]);
+        let mut plan = own_libraries(&task);
+        plan.push(script(&task, UnitInvocation::Target, NATIVE_SCRIPT));
+        validate_with(&task, &plan, owed()).expect("a target-labelled script");
+        plan.pop();
+        plan.push(script(&task, UnitInvocation::Native, NATIVE_SCRIPT));
+        let error = validate_with(&task, &plan, owed()).expect_err("a native label is short");
+        assert!(
+            error
+                .to_string()
+                .contains("lacks build-script shape host/target/linked"),
+            "{error}"
+        );
+    }
+
+    /// A crate without a build script is not asked for one.
+    #[test]
+    fn a_crate_without_a_script_is_not_asked_for_one() {
+        use stow_types::public_cache::ExplicitSpelling;
+        let task = nix_task(ExplicitSpelling::KeysAsNative);
+        validate_with(&task, &own_libraries(&task), owed(&task, &[]))
+            .expect("a script-less node needs libraries alone");
+    }
+
+    /// An own script the publisher's graphs never compile is a claim the
+    /// publisher cannot tie to anything.
+    #[test]
+    fn an_own_script_the_graphs_lack_is_refused() {
+        use stow_types::public_cache::{ExplicitSpelling, UnitInvocation};
+        let task = nix_task(ExplicitSpelling::KeysAsNative);
+        let mut plan = own_libraries(&task);
+        plan.push(script(&task, UnitInvocation::Native, NATIVE_SCRIPT));
+        let error =
+            validate_with(&task, &plan, owed(&task, &[])).expect_err("no phase compiles a script");
+        assert!(
+            error
+                .to_string()
+                .contains("no phase of the task compiles (c_metadata 22aac6cb837ae789)"),
+            "{error}"
+        );
+    }
+
+    /// A script that reads its manifest directory is compiled and never
+    /// planned: the build's claim covers each spelling it names, and a
+    /// spelling it does not name is still owed.
+    #[test]
+    fn a_manifest_relative_script_covers_the_spellings_it_was_compiled_under() {
+        use stow_types::public_cache::{ExplicitSpelling, UnitInvocation};
+        let task = nix_task(ExplicitSpelling::KeysAsNative);
+        let plan = own_libraries(&task);
+        let validate = |spellings: &[(UnitInvocation, &str)]| {
+            let closure = closure(&[("nix", "0.31.3")]).with_own_shapes(owed(
+                &task,
+                &[UnitInvocation::Native, UnitInvocation::Target],
+            ));
+            validate_plan(
+                &task,
+                &task,
+                &plan,
+                &closure,
+                &[],
+                &[],
+                &crate::dep_scan::ProgramClaims {
+                    local_scripts: spellings
+                        .iter()
+                        .map(|&(invocation, c_metadata)| crate::dep_scan::LocalScript {
+                            invocation,
+                            c_metadata: c_metadata.to_owned(),
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+            )
+        };
+        validate(&[
+            (UnitInvocation::Native, NATIVE_SCRIPT),
+            (UnitInvocation::Target, EXPLICIT_SCRIPT),
+        ])
+        .expect("both spellings compiled a local script");
+        let error = validate(&[(UnitInvocation::Native, NATIVE_SCRIPT)])
+            .expect_err("the explicit spelling compiled none");
+        assert!(
+            error
+                .to_string()
+                .contains("lacks build-script shape host/target/linked"),
+            "{error}"
+        );
+    }
+
+    /// A keys-apart node owes the library shapes of both spellings; one
+    /// missing is a node the scheduler would never have counted complete.
+    #[test]
+    fn a_keys_apart_node_missing_a_library_shape_is_refused() {
+        use stow_types::public_cache::ExplicitSpelling;
+        let task = nix_task(ExplicitSpelling::KeysApart);
+        let mut plan = own_libraries(&task);
+        assert_eq!(plan.len(), 4);
+        validate_with(&task, &plan, owed(&task, &[])).expect("all four library shapes");
+        let dropped = plan.remove(3);
+        let error = validate_with(&task, &plan, owed(&task, &[]))
+            .expect_err("the explicit linked shape is owed");
+        assert!(
+            error.to_string().contains(&format!(
+                "lacks library shape {}/{}/{}",
+                "target", "target", "linked"
+            )),
+            "{error}"
+        );
+        assert_eq!(
+            dropped.unit_shape.invocation,
+            stow_types::public_cache::UnitInvocation::Target
+        );
+    }
+
+    /// The records artifact a publish of `plan` writes.
+    pub fn records_for(plan: &[PlannedArtifact]) -> stow_types::records::BuildRecords {
+        let published = stow_types::upload_plan::PublishedArtifact {
+            oci_digest: format!("sha256:{}", "a".repeat(64)),
+            bundle_digest: format!("sha256:{}", "b".repeat(64)),
+            bundle_size: 123,
+        };
+        let coordinates = plan
+            .iter()
+            .map(|artifact| (artifact.oci_reference.clone(), published.clone()))
+            .collect();
+        let floors = plan
+            .iter()
+            .map(|artifact| (artifact.oci_reference.clone(), None))
+            .collect();
+        stow_types::records::BuildRecords {
+            artifacts: stow_types::upload_plan::build_artifact_records(plan, &coordinates, &floors)
+                .expect("records"),
+            local_programs: Vec::new(),
+        }
+    }
+
+    /// A `built-` marker over a record set short of a shape the node owes
+    /// is no proof it is published — the run builds instead of re-tagging
+    /// — and over a complete set it is. Records written before the build
+    /// script's spelling was recorded label it native alone.
+    #[test]
+    fn a_marker_over_a_short_record_set_is_treated_as_absent() {
+        use stow_types::public_cache::{ExplicitSpelling, UnitInvocation};
+        let task = nix_task(ExplicitSpelling::KeysAsNative);
+        let mut plan = own_libraries(&task);
+        plan.push(script(&task, UnitInvocation::Native, NATIVE_SCRIPT));
+        let gap = crate::shapes::published_records_gap(&task, &records_for(&plan))
+            .expect("a CI target")
+            .expect("the explicit script is owed");
+        assert_eq!(
+            gap.refusal(&task, "the published records"),
+            "task nix-0.31.3-fs (nix 0.31.3 [\"fs\"], target side of aarch64-apple-darwin) \
+             lacks build-script shape host/target/linked: the task's phases compile its build \
+             script, but the published records' build scripts cover only host/native/linked \
+             (c_metadata 22aac6cb837ae789)"
+        );
+        // One shared script covers both spellings, and two scripts at two keys do.
+        let mut shared = plan.clone();
+        shared.last_mut().expect("script").shared_invocations = true;
+        assert!(
+            crate::shapes::published_records_gap(&task, &records_for(&shared))
+                .expect("a CI target")
+                .is_none()
+        );
+        plan.push(script(&task, UnitInvocation::Target, EXPLICIT_SCRIPT));
+        assert!(
+            crate::shapes::published_records_gap(&task, &records_for(&plan))
+                .expect("a CI target")
+                .is_none()
+        );
+        // A crate without a script is complete on its libraries alone, and
+        // a library shape missing is as short as a script spelling.
+        let libraries = own_libraries(&task);
+        assert!(
+            crate::shapes::published_records_gap(&task, &records_for(&libraries))
+                .expect("a CI target")
+                .is_none()
+        );
+        assert!(matches!(
+            crate::shapes::published_records_gap(&task, &records_for(&libraries[1..]))
+                .expect("a CI target"),
+            Some(crate::shapes::ShapeGap::Library { .. })
+        ));
+        // A cross node's script is the target spelling's alone.
+        let cross = nix_cross_task();
+        let mut plan = own_libraries(&cross);
+        plan.push(script(&cross, UnitInvocation::Native, NATIVE_SCRIPT));
+        assert!(
+            crate::shapes::published_records_gap(&cross, &records_for(&plan))
+                .expect("a CI target")
+                .is_some()
+        );
+        plan.pop();
+        plan.push(script(&cross, UnitInvocation::Target, NATIVE_SCRIPT));
+        assert!(
+            crate::shapes::published_records_gap(&cross, &records_for(&plan))
+                .expect("a CI target")
+                .is_none()
         );
     }
 
