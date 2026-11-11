@@ -101,11 +101,14 @@ libc = "0.2"
 askama = { version = "0.14", default-features = false, features = ["derive", "std"] }
 
 [target.'cfg(windows)'.dependencies]
-# Parent-pid and process-liveness lookups for the miss journal.
+# Parent-pid and process-liveness lookups for the miss journal, and the
+# daemon's process table and exit watch.
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
+    # The daemon reads a connecting wrapper's process id from its pipe.
+    "Win32_System_Pipes",
     "Win32_System_Threading",
     # The daemon's named pipe is restricted to the current user's SID.
     "Win32_Security",

@@ -34,6 +34,7 @@ pub mod events;
 pub mod launch_agent;
 mod log;
 mod notify;
+pub mod owner;
 pub mod protocol;
 pub mod relay;
 mod serve;
