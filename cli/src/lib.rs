@@ -3681,8 +3681,12 @@ async fn run_cc_supervised(
         supervisor::client::CcDecision::Miss => {
             let status =
                 run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await?;
+            // The compiler resolved its output against this process's
+            // working directory, which is not the supervisor's.
+            let reported = std::path::absolute(&output_path)
+                .wrap_err_with(|| format!("resolve C output path {}", output_path.display()))?;
             if let Some(reason) = connection
-                .cc_report(&cache_key, &output_path, status.success())
+                .cc_report(&cache_key, &reported, status.success())
                 .await
                 .map_err(|error| stow_types::stow_error!("{error}"))?
             {
