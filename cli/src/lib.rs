@@ -30,6 +30,7 @@ mod circuit;
 mod cli_args;
 mod commands;
 mod config;
+mod daemon;
 mod derive_gate;
 mod edge_client;
 mod facade;
@@ -137,6 +138,11 @@ struct TracingGuard {
 /// Returns an error when the selected subcommand fails before it can
 /// produce an exit status.
 pub fn run() -> stow_types::error::Result<()> {
+    // The daemon drops what it inherited before anything of its own is
+    // opened, so this runs first.
+    if daemon::is_serving(&process_args()) {
+        daemon::prepare_process()?;
+    }
     if let Some(status) = delegate_to_capture()? {
         std::process::exit(status);
     }
@@ -315,6 +321,11 @@ fn should_install_tracing_for_args(
     rust_log: Option<&OsStr>,
     trace_wrapped_compilers: Option<OsString>,
 ) -> bool {
+    // The daemon logs to its own file, installed once its runtime
+    // directory is known.
+    if daemon::is_serving(args) {
+        return false;
+    }
     let is_wrapper_subcommand = matches!(
         args.get(1).map(OsString::as_os_str),
         Some(command) if command == "rustc" || command == "cc"
@@ -361,6 +372,7 @@ async fn run_cli(
         CliCommand::Test(command) => {
             return Box::pin(cargo_cmd::run("test", command, state_db)).await;
         }
+        CliCommand::Daemon(args) => daemon::run(args).await,
         CliCommand::Rustc(command) => return run_rustc_wrapper(command, state_db).await,
         CliCommand::Cc(command) => return run_cc_wrapper(command, state_db).await,
         CliCommand::Predict(command) => Box::pin(cargo_cmd::predict(command, state_db)).await,
@@ -397,6 +409,7 @@ const fn subcommand_name(command: &CliCommand) -> &'static str {
         CliCommand::Index(_) => "index",
         CliCommand::Rustc(_) => "rustc",
         CliCommand::Cc(_) => "cc",
+        CliCommand::Daemon(_) => "daemon",
         CliCommand::PurgeCacheDir(_) => "purge-cache-dir",
         CliCommand::DrainMisses(_) => "drain-misses",
     }
@@ -6312,6 +6325,22 @@ mod tests {
         assert!(should_install_tracing_for_args(
             &args(&["stow", "check"]),
             env_value(Some("debug")).as_deref(),
+            env_value(None),
+        ));
+    }
+
+    #[test]
+    fn the_serving_daemon_installs_its_own_log_not_the_terminal_one() {
+        for rust_log in [None, Some("debug")] {
+            assert!(!should_install_tracing_for_args(
+                &args(&["stow", "daemon", "--ready", "x"]),
+                env_value(rust_log).as_deref(),
+                env_value(None),
+            ));
+        }
+        assert!(should_install_tracing_for_args(
+            &args(&["stow", "daemon", "status"]),
+            env_value(None).as_deref(),
             env_value(None),
         ));
     }
