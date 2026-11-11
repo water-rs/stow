@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use stow_types::rustc::ParsedRustcArgs;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use super::invocation::{Refusal, RefusalPolicy, VerifiedInvocation};
 use super::protocol::{
@@ -34,8 +34,7 @@ use crate::toolchain::BuildToolchain;
 /// slice, the local cache and the one edge connection the whole build
 /// shares.
 pub trait Handler: Send + Sync + 'static {
-    /// Decide one invocation. `Answer::Compile`'s ticket is allocated by
-    /// the server, so the handler returns the decision without one.
+    /// Decide one invocation.
     fn plan(
         self: &Arc<Self>,
         invocation: VerifiedInvocation,
@@ -208,12 +207,6 @@ impl Drop for Supervisor {
     }
 }
 
-/// Messages the ticket task owns the state for.
-pub enum Ticket<P> {
-    Allocate(P, oneshot::Sender<u64>),
-    Take(u64, oneshot::Sender<Option<P>>),
-}
-
 /// Bind a supervisor for this build and start serving `handler`.
 ///
 /// `in_flight` is the build's registry of locally compiling units — the
@@ -237,8 +230,6 @@ where
     let binary = BinaryIdentity::of(runtime_executable)
         .map_err(|error| format!("identity of {}: {error}", runtime_executable.display()))?;
     let token = mint_token();
-    let (tickets, ticket_rx) = mpsc::unbounded_channel::<Ticket<H::Pending>>();
-    tokio::spawn(run_tickets(ticket_rx));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let connections = Arc::new(Connections::default());
     let listener = local_socket::bind("stow-supervisor-")?;
@@ -253,7 +244,6 @@ where
         let accept_task = tokio::spawn(accept_unix(
             listener,
             handler,
-            tickets,
             token.clone(),
             shutdown_rx,
             in_flight,
@@ -277,7 +267,6 @@ where
         let accept_task = tokio::spawn(accept_loopback(
             listener,
             handler,
-            tickets,
             token.clone(),
             shutdown_rx,
             in_flight,
@@ -318,28 +307,6 @@ fn getrandom(bytes: &mut [u8; 16]) {
         std::time::Instant::now()
     );
     bytes.copy_from_slice(&blake3::hash(seed.as_bytes()).as_bytes()[..16]);
-}
-
-pub async fn run_tickets<P>(mut messages: mpsc::UnboundedReceiver<Ticket<P>>) {
-    let mut next = 1u64;
-    let mut pending = std::collections::HashMap::<u64, P>::new();
-    while let Some(message) = messages.recv().await {
-        match message {
-            Ticket::Allocate(value, reply) => {
-                let ticket = next;
-                next = next.wrapping_add(1);
-                pending.insert(ticket, value);
-                if reply.send(ticket).is_err() {
-                    // The facade disconnected before it heard the answer,
-                    // so nothing will ever report this compile.
-                    pending.remove(&ticket);
-                }
-            }
-            Ticket::Take(ticket, reply) => {
-                let _ = reply.send(pending.remove(&ticket));
-            }
-        }
-    }
 }
 
 /// The locally-compiled units of this build whose post-compile
@@ -516,8 +483,8 @@ impl InFlightUnit {
 
 /// The guard a connection holds on one registered flight. Dropping it —
 /// at the end of the report's bookkeeping, on an early return or an error
-/// inside it, or with the rest of a connection's marks when the facade
-/// goes away mid-flight — completes the unit (stow#618).
+/// inside it, or with the connection's flight when the facade goes away
+/// mid-flight — completes the unit (stow#618).
 struct Completion {
     registry: InFlightUnits,
     unit: Arc<InFlightUnit>,
@@ -537,11 +504,16 @@ impl Drop for Completion {
     }
 }
 
-/// A flight one connection started and has not yet reported: the plan
-/// path's `Compile` answer pairs with the report's ticket.
-pub struct ConnectionMark {
-    ticket: u64,
-    completion: Completion,
+/// The compile one connection was told to run and has not yet reported:
+/// what the handler remembered for the report, and the guard that keeps
+/// the unit in flight until the report's bookkeeping ends. A connection
+/// that ends first drops it, completing the unit, so no dependent waits
+/// on bookkeeping that will never run (stow#618).
+pub struct Flight<P> {
+    pending: P,
+    /// `None` for a compile that records nothing — a refused request
+    /// compiled uncached, or an invocation whose outputs cannot be named.
+    completion: Option<Completion>,
 }
 
 /// The output paths a locally-compiled unit's bookkeeping records in
@@ -587,7 +559,6 @@ impl Drop for ConnectionGuard {
 async fn accept_unix<H: Handler>(
     listener: tokio::net::UnixListener,
     handler: Arc<H>,
-    tickets: mpsc::UnboundedSender<Ticket<H::Pending>>,
     token: String,
     mut shutdown: oneshot::Receiver<()>,
     in_flight: InFlightUnits,
@@ -605,7 +576,6 @@ async fn accept_unix<H: Handler>(
                 tasks.spawn(serve_connection(
                     stream,
                     Arc::clone(&handler),
-                    tickets.clone(),
                     token.clone(),
                     in_flight.clone(),
                     Arc::clone(&connections),
@@ -624,7 +594,6 @@ async fn accept_unix<H: Handler>(
 async fn accept_loopback<H: Handler>(
     listener: tokio::net::TcpListener,
     handler: Arc<H>,
-    tickets: mpsc::UnboundedSender<Ticket<H::Pending>>,
     token: String,
     mut shutdown: oneshot::Receiver<()>,
     in_flight: InFlightUnits,
@@ -642,7 +611,6 @@ async fn accept_loopback<H: Handler>(
                 tasks.spawn(serve_connection(
                     stream,
                     Arc::clone(&handler),
-                    tickets.clone(),
                     token.clone(),
                     in_flight.clone(),
                     Arc::clone(&connections),
@@ -684,7 +652,6 @@ async fn drain_connections(
 async fn serve_connection<S, H>(
     mut stream: S,
     handler: Arc<H>,
-    tickets: mpsc::UnboundedSender<Ticket<H::Pending>>,
     token: String,
     in_flight: InFlightUnits,
     connections: Arc<Connections>,
@@ -693,11 +660,12 @@ async fn serve_connection<S, H>(
     H: Handler,
 {
     let _guard = ConnectionGuard(connections);
-    // Flights this connection started and has not yet reported: the vec
-    // itself is the abandonment path — a connection that ends mid-flight
-    // drops it here and completes every unit whose report never came, so
-    // no dependent waits on bookkeeping that will never run (stow#618).
-    let mut marks: Vec<ConnectionMark> = Vec::new();
+    // The compile this connection was told to run and has not yet
+    // reported: the variable itself is the abandonment path — a
+    // connection that ends mid-flight drops it here and completes the
+    // unit whose report never came, so no dependent waits on
+    // bookkeeping that will never run (stow#618).
+    let mut flight: Option<Flight<H::Pending>> = None;
     loop {
         let request: Request = match read_frame(&mut stream).await {
             Ok(Some(request)) => request,
@@ -707,8 +675,7 @@ async fn serve_connection<S, H>(
                 break;
             }
         };
-        let reply =
-            answer_request(&handler, &tickets, &token, &in_flight, &mut marks, request).await;
+        let reply = answer_request(&handler, &token, &in_flight, &mut flight, request).await;
         let answered = write_frame(&mut stream, &reply.answer).await;
         // The receipt is out: the bookkeeping runs now, whether or not
         // the facade is still there to hear anything more (stow#1431).
@@ -758,7 +725,7 @@ pub struct ReportWork<P> {
 }
 
 enum ReportKind<P> {
-    /// A `Compiled` report with its restored ticket.
+    /// A `Compiled` report with the pending its plan left.
     Compiled {
         pending: P,
         success: bool,
@@ -790,20 +757,20 @@ pub async fn finish_report<H: Handler>(handler: &Arc<H>, work: ReportWork<H::Pen
 /// Answer the request. A report is answered with a receipt as soon as the
 /// unit's `exited` latch has fired — before any bookkeeping is awaited,
 /// which the reply carries for the transport to run after the answer is
-/// out (stow#1431). A mark is one-way: the facade reads nothing for it.
+/// out (stow#1431). `flight` is the connection's own: a plan answered
+/// with a compile fills it and the report empties it.
 pub async fn answer_request<H: Handler>(
     handler: &Arc<H>,
-    tickets: &mpsc::UnboundedSender<Ticket<H::Pending>>,
     token: &str,
     in_flight: &InFlightUnits,
-    marks: &mut Vec<ConnectionMark>,
+    flight: &mut Option<Flight<H::Pending>>,
     request: Request,
 ) -> Reply<H::Pending> {
     match request {
         Request::Plan(plan) => {
-            Reply::answer(answer_plan(handler, tickets, token, in_flight, marks, plan).await)
+            Reply::answer(answer_plan(handler, token, in_flight, flight, plan).await)
         }
-        Request::Compiled(report) => accept_report(tickets, token, marks, report).await,
+        Request::Compiled(report) => accept_report(token, flight, &report),
         Request::CcLookup(lookup) => answer_cc_lookup(handler, token, lookup).await,
         Request::CcCompiled(report) => answer_cc_compiled(handler, token, report).await,
     }
@@ -929,15 +896,22 @@ fn refuse_cc_output<P>(output_path: &std::path::Path, message: &str) -> Reply<P>
 
 async fn answer_plan<H: Handler>(
     handler: &Arc<H>,
-    tickets: &mpsc::UnboundedSender<Ticket<H::Pending>>,
     token: &str,
     in_flight: &InFlightUnits,
-    marks: &mut Vec<ConnectionMark>,
+    flight: &mut Option<Flight<H::Pending>>,
     plan: Plan,
 ) -> Answer {
     if plan.token != token {
         return Answer::Failed {
             message: "supervisor token mismatch".to_owned(),
+        };
+    }
+    // A facade plans once and reports once per connection: a second plan
+    // while the first compile is unreported is a wiring defect, refused
+    // rather than left to overwrite the flight the report belongs to.
+    if flight.is_some() {
+        return Answer::Failed {
+            message: "a plan arrived on a connection whose compile is unreported".to_owned(),
         };
     }
     let (executable, args) = match (plan.executable(), plan.args()) {
@@ -960,13 +934,14 @@ async fn answer_plan<H: Handler>(
             return match settle_refusal(handler, refusal, "plan request") {
                 Settled::Fail(message) => Answer::Failed { message },
                 // The facade compiles and reports back: the report finds
-                // a pending that does no bookkeeping, and no mark is
-                // registered for a unit nothing recorded.
+                // a pending that does no bookkeeping, and no unit is
+                // registered for a compile nothing recorded.
                 Settled::CompileUncached => {
-                    match allocate_ticket(tickets, H::Pending::default()).await {
-                        Ok(ticket) => Answer::Compile { ticket },
-                        Err(failed) => failed,
-                    }
+                    *flight = Some(Flight {
+                        pending: H::Pending::default(),
+                        completion: None,
+                    });
+                    Answer::Compile
                 }
             };
         }
@@ -978,21 +953,16 @@ async fn answer_plan<H: Handler>(
         .and_then(|parsed| recordable_output_paths(&parsed, handler.toolchain().host_target()));
     match handler.plan(invocation, plan.env).await {
         Decision::Served(notifications) => Answer::Served(notifications),
-        Decision::Compile(pending) => match allocate_ticket(tickets, pending).await {
-            Ok(ticket) => {
-                // The facade was told to compile: the unit is in
-                // flight until the `Compiled` report's bookkeeping —
-                // or this connection's end — completes it (stow#618).
-                if let Some(paths) = recordable_paths {
-                    marks.push(ConnectionMark {
-                        ticket,
-                        completion: in_flight.register(paths),
-                    });
-                }
-                Answer::Compile { ticket }
-            }
-            Err(failed) => failed,
-        },
+        Decision::Compile(pending) => {
+            // The facade was told to compile: the unit is in flight
+            // until the `Compiled` report's bookkeeping — or this
+            // connection's end — completes it (stow#618).
+            *flight = Some(Flight {
+                pending,
+                completion: recordable_paths.map(|paths| in_flight.register(paths)),
+            });
+            Answer::Compile
+        }
     }
 }
 
@@ -1020,66 +990,35 @@ fn settle_refusal<H: Handler>(handler: &Arc<H>, refusal: Refusal, request: &str)
     }
 }
 
-/// Hand `pending` to the ticket task and return the ticket the facade's
-/// report carries back, or the failure answer when the task is gone.
-async fn allocate_ticket<P>(
-    tickets: &mpsc::UnboundedSender<Ticket<P>>,
-    pending: P,
-) -> Result<u64, Answer> {
-    let (sender, allocated) = oneshot::channel();
-    if tickets.send(Ticket::Allocate(pending, sender)).is_err() {
-        return Err(Answer::Failed {
-            message: "supervisor ticket task is gone".to_owned(),
-        });
-    }
-    allocated.await.map_err(|_| Answer::Failed {
-        message: "supervisor ticket task dropped the allocation".to_owned(),
-    })
-}
-
-/// Accept the report of a compile the supervisor asked for: fire the
-/// unit's `exited` latch and answer with a receipt, carrying the
+/// Accept the report of the compile the connection was told to run: fire
+/// the unit's `exited` latch and answer with a receipt, carrying the
 /// bookkeeping for the transport to run after it (stow#1431). A report
 /// the supervisor cannot use is refused — the facade is listening for
 /// the receipt.
-async fn accept_report<P>(
-    tickets: &mpsc::UnboundedSender<Ticket<P>>,
-    token: &str,
-    marks: &mut Vec<ConnectionMark>,
-    report: Compiled,
-) -> Reply<P> {
+fn accept_report<P>(token: &str, flight: &mut Option<Flight<P>>, report: &Compiled) -> Reply<P> {
     if report.token != token {
         return Reply::failed("supervisor token mismatch");
     }
-    // The mark's guard is taken before anything awaits: a refusal below
-    // drops it and ends the flight, and an accepted report hands it to
-    // the bookkeeping (stow#618).
-    let completion = marks
-        .iter()
-        .position(|mark| mark.ticket == report.ticket)
-        .map(|index| marks.remove(index).completion)
-        .inspect(Completion::rustc_exited);
-    let (sender, restored) = oneshot::channel();
-    if tickets.send(Ticket::Take(report.ticket, sender)).is_err() {
-        return Reply::failed("supervisor ticket task is gone");
+    let Some(Flight {
+        pending,
+        completion,
+    }) = flight.take()
+    else {
+        return Reply::failed("the connection has no compile awaiting a report");
+    };
+    if let Some(completion) = &completion {
+        completion.rustc_exited();
     }
-    match restored.await {
-        Ok(Some(pending)) => Reply {
-            answer: Answer::Received,
-            work: Some(ReportWork {
-                completion,
-                kind: ReportKind::Compiled {
-                    pending,
-                    success: report.success,
-                    compile_time: Duration::from_millis(report.compile_millis),
-                },
-            }),
-        },
-        Ok(None) => Reply::failed(format!(
-            "supervisor has no record of compile {}",
-            report.ticket
-        )),
-        Err(_) => Reply::failed("supervisor ticket task dropped the lookup"),
+    Reply {
+        answer: Answer::Received,
+        work: Some(ReportWork {
+            completion,
+            kind: ReportKind::Compiled {
+                pending,
+                success: report.success,
+                compile_time: Duration::from_millis(report.compile_millis),
+            },
+        }),
     }
 }
 
@@ -1217,11 +1156,12 @@ mod tests {
             )
             .await
             .expect("plan");
-        let ClientDecision::Compile(ticket) = decision else {
-            panic!("the stub asks for a compile");
-        };
+        assert!(
+            matches!(decision, ClientDecision::Compile),
+            "the stub asks for a compile"
+        );
         connection
-            .report(&ticket, true, Duration::ZERO)
+            .report(true, Duration::ZERO)
             .await
             .expect("report");
         connection.close().await.expect("close");
@@ -1364,11 +1304,12 @@ mod tests {
             .plan(other.as_os_str(), &[])
             .await
             .expect("a refused plan is answered with a compile");
-        let ClientDecision::Compile(ticket) = decision else {
-            panic!("a refused plan is answered with a compile, never served");
-        };
+        assert!(
+            matches!(decision, ClientDecision::Compile),
+            "a refused plan is answered with a compile, never served"
+        );
         connection
-            .report(&ticket, true, Duration::ZERO)
+            .report(true, Duration::ZERO)
             .await
             .expect("the compile's report is received");
         connection.close().await.expect("close");
@@ -1518,15 +1459,16 @@ mod tests {
         write_frame(&mut *stream, &Request::Plan(plan))
             .await
             .expect("write the plan frame");
-        let Some(Answer::Compile { ticket }) = read_frame(&mut *stream)
+        let answer: Option<Answer> = read_frame(&mut *stream)
             .await
-            .expect("read the plan's answer")
-        else {
-            panic!("the handler asks for a compile");
-        };
+            .expect("read the plan's answer");
+        assert_eq!(
+            answer,
+            Some(Answer::Compile),
+            "the handler asks for a compile"
+        );
         let report = Compiled {
             token: token.to_owned(),
-            ticket,
             success: true,
             compile_millis: 0,
         };
@@ -1751,13 +1693,14 @@ mod tests {
         let mut connection = Connection::open(&endpoint, token)
             .await
             .expect("connect to the supervisor");
-        let ClientDecision::Compile(ticket) = connection
+        let decision = connection
             .plan(std::ffi::OsStr::new("rustc"), &dep_args)
             .await
-            .expect("plan")
-        else {
-            panic!("the handler asks for a compile");
-        };
+            .expect("plan");
+        assert!(
+            matches!(decision, ClientDecision::Compile),
+            "the handler asks for a compile"
+        );
         let dependent =
             crate::rustc_args::ParsedRustcArgs::parse(&unit_args("consumer", &[&dep_rlib]))
                 .expect("parse the dependent");
@@ -1772,7 +1715,7 @@ mod tests {
 
         // The facade reports and leaves; the bookkeeping is still held.
         connection
-            .report(&ticket, true, Duration::ZERO)
+            .report(true, Duration::ZERO)
             .await
             .expect("the report returns without the bookkeeping");
         connection.close().await.expect("the connection ends");
@@ -1825,16 +1768,17 @@ mod tests {
         let mut connection = Connection::open(&endpoint, token)
             .await
             .expect("connect to the supervisor");
-        let ClientDecision::Compile(ticket) = connection
+        let decision = connection
             .plan(std::ffi::OsStr::new("rustc"), &dep_args)
             .await
-            .expect("plan")
-        else {
-            panic!("the handler asks for a compile");
-        };
+            .expect("plan");
+        assert!(
+            matches!(decision, ClientDecision::Compile),
+            "the handler asks for a compile"
+        );
         let flight = in_flight.flight(&dep_rlib);
         connection
-            .report(&ticket, true, Duration::ZERO)
+            .report(true, Duration::ZERO)
             .await
             .expect("the report returns");
         assert!(
@@ -1862,7 +1806,11 @@ mod tests {
     /// facade is listening for a receipt — and the unit's flight ends
     /// with the facade's connection (stow#1431).
     #[tokio::test]
-    async fn a_report_with_an_unknown_ticket_is_refused() {
+    async fn a_report_without_a_plan_is_refused() {
+        use crate::supervisor::protocol::{
+            Answer, Compiled, InvocationEnv, Plan, Request, read_frame, write_frame,
+        };
+
         let handler = Bookkeeping::held().await;
         let in_flight = super::InFlightUnits::default();
         let mut supervisor = start(Arc::clone(&handler), in_flight.clone(), &test_executable())
@@ -1871,55 +1819,85 @@ mod tests {
         let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
 
         let dep_args = unit_args("dep", &[]);
-        let mut stream = connect_raw(&endpoint).await;
-        let flight = {
-            use crate::supervisor::protocol::{
-                Answer, Compiled, InvocationEnv, Plan, Request, read_frame, write_frame,
-            };
-            let plan = Plan::new(
-                token.clone(),
-                std::ffi::OsStr::new("rustc"),
-                &dep_args,
-                InvocationEnv::for_tests(),
-            );
-            write_frame(&mut stream, &Request::Plan(plan))
-                .await
-                .expect("write the plan");
-            let Some(Answer::Compile { ticket }) =
-                read_frame(&mut stream).await.expect("read the answer")
-            else {
-                panic!("the handler asks for a compile");
-            };
-            // Another ticket than the one the plan was given.
-            let report = Compiled {
-                token,
-                ticket: ticket + 1,
-                success: true,
-                compile_millis: 0,
-            };
-            // The plan's answer came after the flight registered.
-            let flight = in_flight.flight(&rlib_path(&dep_args));
-            write_frame(&mut stream, &Request::Compiled(report))
-                .await
-                .expect("write the report");
-            let refusal: Option<Answer> = read_frame(&mut stream)
-                .await
-                .expect("read the report's answer");
-            assert!(
-                matches!(&refusal, Some(Answer::Failed { message }) if message.contains("no record")),
-                "{refusal:?}"
-            );
-            flight
+        let mut planned = connect_raw(&endpoint).await;
+        let plan = Plan::new(
+            token.clone(),
+            std::ffi::OsStr::new("rustc"),
+            &dep_args,
+            InvocationEnv::for_tests(),
+        );
+        write_frame(&mut planned, &Request::Plan(plan))
+            .await
+            .expect("write the plan");
+        let answer: Option<Answer> = read_frame(&mut planned).await.expect("read the answer");
+        assert_eq!(
+            answer,
+            Some(Answer::Compile),
+            "the handler asks for a compile"
+        );
+        // The plan's answer came after the flight registered.
+        let flight = in_flight.flight(&rlib_path(&dep_args));
+
+        // Another connection reports without having planned: its report
+        // belongs to no flight, so it is refused and ends none.
+        let mut stranger = connect_raw(&endpoint).await;
+        let report = Compiled {
+            token,
+            success: true,
+            compile_millis: 0,
         };
-        // The report matches no flight, so it ends none: the unit stays
-        // in flight until its facade's connection ends, as for a facade
-        // that dies without reporting. The bookkeeping never runs.
-        drop(stream);
+        write_frame(&mut stranger, &Request::Compiled(report))
+            .await
+            .expect("write the report");
+        let refusal: Option<Answer> = read_frame(&mut stranger)
+            .await
+            .expect("read the report's answer");
+        assert!(
+            matches!(&refusal, Some(Answer::Failed { message }) if message.contains("no compile awaiting")),
+            "{refusal:?}"
+        );
+        drop(stranger);
+
+        // The unit stays in flight until its facade's connection ends, as
+        // for a facade that dies without reporting. The bookkeeping never
+        // runs.
+        drop(planned);
         tokio::time::timeout(Duration::from_secs(5), flight.wait())
             .await
             .expect("the connection's end releases the flight");
         assert_eq!(supervisor.shutdown().await, 0);
         assert_eq!(handler.started.borrow().to_owned(), 0);
+    }
+
+    /// A connection plans once per compile: a second plan before the
+    /// first compile is reported is refused rather than overwriting the
+    /// flight the report belongs to.
+    #[tokio::test]
+    async fn a_second_plan_before_the_report_is_refused() {
+        let handler = Bookkeeping::held().await;
+        let supervisor = start(
+            Arc::clone(&handler),
+            super::InFlightUnits::default(),
+            &test_executable(),
+        )
+        .expect("start the supervisor");
+        let [(_, endpoint), (_, token), _] = supervisor.env();
+        let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
+
+        let mut connection = Connection::open(&endpoint, token)
+            .await
+            .expect("connect to the supervisor");
+        let args = unit_args("dep", &[]);
+        let decision = connection
+            .plan(std::ffi::OsStr::new("rustc"), &args)
+            .await
+            .expect("the first plan");
+        assert!(matches!(decision, ClientDecision::Compile));
+        let error = connection
+            .plan(std::ffi::OsStr::new("rustc"), &args)
+            .await
+            .expect_err("a second plan on the connection is refused");
+        assert!(error.contains("unreported"), "{error}");
     }
 
     /// The first leg of a flight is rustc running: a plan does not wait

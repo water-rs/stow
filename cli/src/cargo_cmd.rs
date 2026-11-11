@@ -4353,7 +4353,11 @@ enum SupervisorHandle {
     /// The unix/loopback supervisor.
     Socket(crate::supervisor::server::Supervisor),
     /// The supervisor served over heel's IPC socket inside the sandbox.
-    Ipc(crate::supervisor::ipc::SandboxedSupervisor),
+    Ipc(
+        crate::supervisor::ipc::SandboxedSupervisor<
+            <crate::BuildSupervisor as crate::supervisor::server::Handler>::Pending,
+        >,
+    ),
 }
 
 impl SupervisorHandle {

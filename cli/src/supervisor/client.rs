@@ -32,14 +32,9 @@ pub enum Decision {
     /// artifact-notification lines cargo is owed to this process's
     /// stderr (stow#633).
     Served(ArtifactNotifications),
-    /// Run the real rustc, then call [`report`] with its outcome.
-    Compile(Ticket),
-}
-
-/// The supervisor's handle on a compile it asked the facade to run.
-#[derive(Debug)]
-pub struct Ticket {
-    ticket: u64,
+    /// Run the real rustc, then call [`Connection::report`] with its
+    /// outcome on this connection.
+    Compile,
 }
 
 /// The transport a [`Connection`] speaks: the build's own socket, or a
@@ -113,7 +108,7 @@ impl Connection {
         );
         match self.exchange(&Request::Plan(plan)).await? {
             Answer::Served(notifications) => Ok(Decision::Served(notifications)),
-            Answer::Compile { ticket } => Ok(Decision::Compile(Ticket { ticket })),
+            Answer::Compile => Ok(Decision::Compile),
             Answer::Received | Answer::CcHit { .. } | Answer::CcMiss => {
                 Err("supervisor answered a plan with an answer that is not a decision".to_owned())
             }
@@ -141,7 +136,7 @@ impl Connection {
                 .map_err(|error| format!("supervisor named an undecodable object path: {error}")),
             Answer::CcMiss => Ok(CcDecision::Miss),
             Answer::Failed { message } => Ok(CcDecision::Bypass(message)),
-            Answer::Served(..) | Answer::Compile { .. } | Answer::Received => Err(
+            Answer::Served(..) | Answer::Compile | Answer::Received => Err(
                 "supervisor answered a C/C++ lookup with an answer that is not a cache decision"
                     .to_owned(),
             ),
@@ -173,7 +168,7 @@ impl Connection {
         match self.exchange(&Request::CcCompiled(report)).await? {
             Answer::Received => Ok(None),
             Answer::Failed { message } => Ok(Some(message)),
-            Answer::Served(..) | Answer::Compile { .. } | Answer::CcHit { .. } | Answer::CcMiss => {
+            Answer::Served(..) | Answer::Compile | Answer::CcHit { .. } | Answer::CcMiss => {
                 Err("supervisor answered a C/C++ report with a lookup answer".to_owned())
             }
         }
@@ -189,20 +184,18 @@ impl Connection {
     /// Transport failures, and a supervisor that refuses the report.
     pub async fn report(
         &mut self,
-        ticket: &Ticket,
         success: bool,
         compile_time: std::time::Duration,
     ) -> Result<(), String> {
         let report = Compiled {
             token: self.token.clone(),
-            ticket: ticket.ticket,
             success,
             compile_millis: crate::duration_millis(compile_time),
         };
         match self.exchange(&Request::Compiled(report)).await? {
             Answer::Received => Ok(()),
             Answer::Failed { message } => Err(message),
-            Answer::Served(..) | Answer::Compile { .. } | Answer::CcHit { .. } | Answer::CcMiss => {
+            Answer::Served(..) | Answer::Compile | Answer::CcHit { .. } | Answer::CcMiss => {
                 Err("supervisor answered a report with a plan answer".to_owned())
             }
         }

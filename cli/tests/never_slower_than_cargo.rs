@@ -725,7 +725,6 @@ fn serve_stub_connection(
     counts: &std::sync::Mutex<StubSupervision>,
 ) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
-    let mut ticket = 0u64;
     loop {
         let mut length = [0u8; 4];
         if stream.read_exact(&mut length).is_err() {
@@ -748,8 +747,7 @@ fn serve_stub_connection(
                     .entry(crate_name)
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
-                ticket += 1;
-                Answer::Compile { ticket }
+                Answer::Compile
             }
             Request::Compiled(_) => {
                 counts
@@ -859,7 +857,7 @@ fn drain_stub(endpoint: &str, stub: &StubSupervisor) {
     probe.read_exact(&mut body).expect("read answer body");
     let answer: Answer = serde_json::from_slice(&body).expect("decode probe answer");
     assert!(
-        matches!(answer, Answer::Compile { .. }),
+        matches!(answer, Answer::Compile),
         "the probe must be answered: {answer:?}"
     );
     drop(probe);

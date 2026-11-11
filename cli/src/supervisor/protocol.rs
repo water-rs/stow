@@ -173,8 +173,6 @@ pub struct Plan {
 pub struct Compiled {
     /// Proves the sender is part of this build; checked on every frame.
     pub token: String,
-    /// The ticket the [`Answer::Compile`] carried.
-    pub ticket: u64,
     /// Whether rustc exited successfully.
     pub success: bool,
     /// How long rustc ran, in milliseconds: the compile time a later local
@@ -264,11 +262,9 @@ pub enum Answer {
     /// lines the facade owes cargo's stderr first (stow#633).
     Served(ArtifactNotifications),
     /// Nothing serves this unit. The facade runs the real rustc and then
-    /// sends [`Compiled`] carrying `ticket`.
-    Compile {
-        /// The ticket the [`Compiled`] report carries back.
-        ticket: u64,
-    },
+    /// sends [`Compiled`] on the same connection, which holds the compile
+    /// until it does.
+    Compile,
     /// The report arrived and the unit's rustc is recorded as exited; the
     /// supervisor's bookkeeping runs after this answer and the facade
     /// exits with the compile's own status without waiting for it

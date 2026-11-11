@@ -1755,22 +1755,19 @@ async fn delegate_to_supervisor(
         served = matches!(decision, supervisor::client::Decision::Served(_)),
         "the build supervisor answered this invocation"
     );
-    let ticket = match decision {
-        supervisor::client::Decision::Served(notifications) => {
-            connection
-                .close()
-                .await
-                .map_err(|error| stow_types::stow_error!("{error}"))?;
-            write_served_artifact_notifications(&notifications)?;
-            return Ok(std::process::ExitStatus::default());
-        }
-        supervisor::client::Decision::Compile(ticket) => ticket,
-    };
+    if let supervisor::client::Decision::Served(notifications) = decision {
+        connection
+            .close()
+            .await
+            .map_err(|error| stow_types::stow_error!("{error}"))?;
+        write_served_artifact_notifications(&notifications)?;
+        return Ok(std::process::ExitStatus::default());
+    }
     let started = std::time::Instant::now();
     let status = run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
     let compile_time = started.elapsed();
     connection
-        .report(&ticket, status.success(), compile_time)
+        .report(status.success(), compile_time)
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
     connection
@@ -7843,8 +7840,8 @@ mod tests {
 
         /// Write one `Plan` frame and read the supervisor's answer, which
         /// the fixtures' serve maps make a compile: the unit is in flight
-        /// from here. The ticket names the flight for its report.
-        async fn send_plan<S>(stream: &mut S, token: &str, args: &[OsString]) -> u64
+        /// from here, until the connection reports it or ends.
+        async fn send_plan<S>(stream: &mut S, token: &str, args: &[OsString])
         where
             S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
         {
@@ -7861,22 +7858,22 @@ mod tests {
                 crate::supervisor::protocol::read_frame(&mut *stream)
                     .await
                     .expect("read the plan's answer");
-            let Some(crate::supervisor::protocol::Answer::Compile { ticket }) = answer else {
-                panic!("a unit the serve map rules out is told to compile: {answer:?}");
-            };
-            ticket
+            assert_eq!(
+                answer,
+                Some(crate::supervisor::protocol::Answer::Compile),
+                "a unit the serve map rules out is told to compile"
+            );
         }
 
-        /// Report the compile `ticket` named and read the receipt — the
-        /// receipt precedes the report's bookkeeping, so it returns while
-        /// the bookkeeping may still be running.
-        async fn send_compiled<S>(stream: &mut S, token: &str, ticket: u64, success: bool)
+        /// Report the compile the plan asked for and read the receipt —
+        /// the receipt precedes the report's bookkeeping, so it returns
+        /// while the bookkeeping may still be running.
+        async fn send_compiled<S>(stream: &mut S, token: &str, success: bool)
         where
             S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
         {
             let report = Compiled {
                 token: token.to_owned(),
-                ticket,
                 success,
                 compile_millis: 0,
             };
@@ -8139,11 +8136,11 @@ mod tests {
             // The dependency's plan is answered first: the unit is in
             // flight before the dependent's frames are written.
             let mut dep_conn = connect_raw(&endpoint).await;
-            let dep_ticket = send_plan(&mut dep_conn, &token, &dep_args).await;
+            send_plan(&mut dep_conn, &token, &dep_args).await;
 
             let mut consumer_conn = connect_raw(&endpoint).await;
-            let consumer_ticket = send_plan(&mut consumer_conn, &token, &consumer_args).await;
-            send_compiled(&mut consumer_conn, &token, consumer_ticket, true).await;
+            send_plan(&mut consumer_conn, &token, &consumer_args).await;
+            send_compiled(&mut consumer_conn, &token, true).await;
 
             // No flush here — the report's bookkeeping is what waits, so
             // the connection's next frame cannot be answered yet. The
@@ -8158,7 +8155,7 @@ mod tests {
                 "nothing may be stored while the dependency is in flight"
             );
 
-            send_compiled(&mut dep_conn, &token, dep_ticket, true).await;
+            send_compiled(&mut dep_conn, &token, true).await;
             // The flush answers only after the dependency's bookkeeping —
             // store included — has run to its end.
             flush_frames(&mut dep_conn).await;
@@ -8192,8 +8189,8 @@ mod tests {
             let args = unit_args(&registry_src, &out_dir, "solo", "1.0.0", "solometa", &[]);
             write_outputs(&out_dir, "solo", "solometa");
             let mut conn = connect_raw(&endpoint).await;
-            let ticket = send_plan(&mut conn, &token, &args).await;
-            send_compiled(&mut conn, &token, ticket, true).await;
+            send_plan(&mut conn, &token, &args).await;
+            send_compiled(&mut conn, &token, true).await;
             flush_frames(&mut conn).await;
 
             assert_eq!(stored_crates(&config).await, vec!["solo"]);
@@ -8307,8 +8304,8 @@ mod tests {
             drop(dep_conn);
 
             let mut consumer_conn = connect_raw(&endpoint).await;
-            let consumer_ticket = send_plan(&mut consumer_conn, &token, &consumer_args).await;
-            send_compiled(&mut consumer_conn, &token, consumer_ticket, true).await;
+            send_plan(&mut consumer_conn, &token, &consumer_args).await;
+            send_compiled(&mut consumer_conn, &token, true).await;
             // The dependent's bookkeeping waits only until the dead
             // connection's flight completes — then the flush answers, and
             // the bookkeeping that logs the skip has run to its end.
@@ -8393,7 +8390,7 @@ mod tests {
             let mut base_conn = connect_raw(&endpoint).await;
             send_plan(&mut base_conn, &token, &base_args).await;
             let mut mid_conn = connect_raw(&endpoint).await;
-            let mid_ticket = send_plan(&mut mid_conn, &token, &mid_args).await;
+            send_plan(&mut mid_conn, &token, &mid_args).await;
 
             // `mid` is still compiling: a plan against it is not held.
             let decision = tokio::time::timeout(Duration::from_secs(10), plan_top(&handler))
@@ -8404,7 +8401,7 @@ mod tests {
 
             // `mid`'s rustc exits. Its bookkeeping parks on `base`'s
             // flight, so its rows are pending while its facade is gone.
-            send_compiled(&mut mid_conn, &token, mid_ticket, true).await;
+            send_compiled(&mut mid_conn, &token, true).await;
             let base_rlib =
                 crate::artifact_cache::path_to_string(&base_rlib).expect("utf-8 extern path");
             in_flight.parked_on(&base_rlib, 1).await;
@@ -8492,8 +8489,8 @@ mod tests {
                 .expect("write build script binary");
 
             let mut script_conn = connect_raw(&endpoint).await;
-            let script_ticket = send_plan(&mut script_conn, &token, &build_script_args).await;
-            send_compiled(&mut script_conn, &token, script_ticket, true).await;
+            send_plan(&mut script_conn, &token, &build_script_args).await;
+            send_compiled(&mut script_conn, &token, true).await;
             // The post-compile holds while the extern is in flight, so
             // the flush stays unanswered until the flight ends.
             assert!(
