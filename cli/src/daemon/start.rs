@@ -12,14 +12,14 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use stow_types::error::{Context, Result};
 
 use super::notify::{Notification, ReadyListener};
-use super::protocol::{self, Hello, PROTOCOL, Request, Response};
+use super::protocol::{self, ControlRequest, Hello, PROTOCOL, PROTOCOL_FLOOR, Response, Role};
 use super::{RunDir, STOW_DAEMON_DIR_ENV, Settings};
 use crate::file_lock::FileLock;
 
@@ -50,6 +50,8 @@ pub struct StatusReply {
 pub struct Connection {
     stream: Stream,
     answer: Duration,
+    /// The daemon's log, which an error names with the daemon's pid.
+    log: PathBuf,
 }
 
 impl Connection {
@@ -61,30 +63,47 @@ impl Connection {
     /// something else, or refuses the connection.
     pub fn status(self) -> Result<StatusReply> {
         let answer = self.answer;
+        let log = self.log;
         #[cfg(unix)]
         let reply = exchange(self.stream);
         #[cfg(windows)]
         let reply = with_deadline(answer, move || exchange(self.stream));
         reply.wrap_err_with(|| {
             format!(
-                "the stow daemon did not complete a status exchange within {} s",
+                "the running stow daemon ({}) did not complete a status exchange within {} s",
+                describe_daemon(&log),
                 answer.as_secs()
             )
         })
     }
 }
 
+/// Which daemon a failure is about: its pid, from the line it logged when
+/// it bound the endpoint, and its log.
+#[must_use]
+pub fn describe_daemon(log: &Path) -> String {
+    let pid = std::fs::read_to_string(log).ok().and_then(|text| {
+        text.lines()
+            .rev()
+            .find(|line| line.contains("stow daemon serving"))
+            .and_then(|line| line.split("pid=").nth(1))
+            .and_then(|rest| rest.split_whitespace().next().map(str::to_owned))
+    });
+    let pid = pid.unwrap_or_else(|| "unknown".to_owned());
+    format!("pid {pid}, log {}", log.display())
+}
+
 fn exchange<S: Read + Write>(mut stream: S) -> Result<StatusReply> {
-    let mut request = protocol::encode(&Hello::current())?;
-    request.extend(protocol::encode(&Request::Status)?);
+    let mut request = protocol::encode(&Hello::new(Role::Control))?;
+    request.extend(protocol::encode(&ControlRequest::Status)?);
     stream
         .write_all(&request)
         .and_then(|()| stream.flush())
         .wrap_err("send Hello and Status to the daemon")?;
     let frame = protocol::read_frame(&mut stream)?;
-    if frame.protocol != PROTOCOL {
+    if !protocol::speaks(frame.protocol) {
         return Err(stow_types::stow_error!(
-            "the daemon speaks protocol {}, this stow speaks {PROTOCOL}",
+            "the daemon speaks protocol {}, this stow speaks {PROTOCOL_FLOOR} through {PROTOCOL}",
             frame.protocol
         ));
     }
@@ -98,6 +117,9 @@ fn exchange<S: Read + Write>(mut stream: S) -> Result<StatusReply> {
         }),
         Response::Rejected { reason } => Err(stow_types::stow_error!(
             "the daemon refused the connection: {reason}"
+        )),
+        other => Err(stow_types::stow_error!(
+            "the daemon answered a status request with {other:?}"
         )),
     }
 }
@@ -192,6 +214,7 @@ pub fn connect_or_start(exe: &Path, settings: Settings) -> Result<Connection> {
     let connected = |stream| Connection {
         stream,
         answer: settings.answer,
+        log: run_dir.log(),
     };
     if let Attempt::Connected(stream) = try_connect(&endpoint, settings.answer)? {
         return Ok(connected(stream));
@@ -316,6 +339,7 @@ fn spawn_daemon(exe: &Path, run_dir: &RunDir, notify: &Path) -> Result<Child> {
             "LOGNAME",
             "TMPDIR",
             super::STOW_DAEMON_LOG_BYTES_ENV,
+            super::STOW_DAEMON_ANSWER_SECS_ENV,
         ] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);

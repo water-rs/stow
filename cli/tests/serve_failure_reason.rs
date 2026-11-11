@@ -17,15 +17,15 @@ const FIXTURE_DEPENDENCIES: &str = "cfg-if = \"1\"\nitoa = \"1\"\n";
 /// exact key and rejects it: the unit errors at the identity check.
 #[test]
 fn an_errored_unit_names_its_stage_and_reason() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
+    let dir = support::tempdir().expect("temp dir");
+    let cargo_home = support::tempdir().expect("cargo home");
     write_fixture(dir.path(), cargo_home.path(), FIXTURE_DEPENDENCIES);
     stow_setup_in(dir.path(), cargo_home.path());
     let edge_url = refused_url();
     let registry_url = refused_url();
-    let cache = tempfile::tempdir().expect("cache dir");
+    let cache = support::tempdir().expect("cache dir");
 
-    let target_a = tempfile::tempdir().expect("target dir a");
+    let target_a = support::tempdir().expect("target dir a");
     let first = stow_build_in(
         dir.path(),
         &["build", "--offline"],
@@ -65,7 +65,7 @@ fn an_errored_unit_names_its_stage_and_reason() {
             pool.close().await;
         });
 
-    let target_b = tempfile::tempdir().expect("target dir b");
+    let target_b = support::tempdir().expect("target dir b");
     let second = stow_build_in(
         dir.path(),
         &["build", "--offline"],

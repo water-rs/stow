@@ -78,14 +78,16 @@ pub use workspace_deps::{
 /// runs in; [`resolve_exact_dependency_graph`] answers for it.
 pub use session_env::SessionEnv;
 
-/// What a supervisor exports beside its endpoint so a wrapper can tell
-/// it was started by its own build — the stub supervisors export it the
-/// way the real one does (stow#645).
-pub use supervisor::BinaryIdentity;
-/// The supervisor wire protocol, so a peer decoding frames — a stub
-/// supervisor standing in for the real one in integration tests — uses
-/// the product's own types instead of reimplementing the format.
-pub use supervisor::protocol;
+/// The variable a build's driver exports so its wrappers find the build's
+/// session, and the id it carries.
+pub use daemon::client::STOW_SESSION_ENV;
+/// The daemon's wire protocol, so a peer decoding frames — a stub daemon
+/// standing in for the real one in integration tests — uses the product's
+/// own types instead of reimplementing the format.
+pub use daemon::protocol;
+pub use daemon::session::SessionId;
+/// What a wrapper says and the daemon answers about one invocation.
+pub use supervisor::protocol as wrapper_protocol;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -246,11 +248,12 @@ fn expand_wrapper_role(args: Vec<OsString>) -> Vec<OsString> {
     // An internal `__`-namespaced subcommand is the runtime addressing
     // itself, not a wrapped compiler call — the detached miss drain
     // respawns current_exe, which is the shim's own name on platforms
-    // where current_exe does not resolve through the shim (stow#317).
+    // where current_exe does not resolve through the shim (stow#317). The
+    // daemon a wrapper starts is the same: it runs as itself.
     if wrapped
         .first()
         .and_then(|arg| arg.to_str())
-        .is_some_and(|arg| arg.starts_with("__"))
+        .is_some_and(|arg| arg.starts_with("__") || arg == "daemon")
     {
         return args;
     }
@@ -1410,9 +1413,9 @@ pub(crate) fn duration_millis(duration: std::time::Duration) -> u64 {
 
 /// The rustc facade.
 ///
-/// Parses the command line, asks the build's supervisor what to do with
-/// the invocation, and either answers success or runs the real rustc.
-/// When there is no supervisor — a plain `cargo build` through the
+/// Parses the command line, asks the build's session on the daemon what to
+/// do with the invocation, and either answers success or runs the real
+/// rustc. When there is no session — a plain `cargo build` through the
 /// `RUSTC_WRAPPER` that `stow setup` writes — it decides in this process
 /// instead. Returns the status this process owes cargo: a served unit's
 /// success, or the real rustc's own.
@@ -1421,19 +1424,18 @@ async fn run_rustc_wrapper(
     mut command: WrapperCommandArgs,
     state_db: &StateDb,
 ) -> stow_types::error::Result<std::process::ExitStatus> {
-    // An endpoint that is set but unusable fails the build. A wrapper that
-    // quietly compiled everything itself would leave a build that is
-    // merely slow, which is the failure mode that hides.
-    if let Some((endpoint, token)) =
-        supervisor::from_env().map_err(|error| stow_types::stow_error!("{error}"))?
+    // A session the environment names that cannot be reached fails the
+    // build. A wrapper that quietly compiled everything itself would leave
+    // a build that is merely slow, which is the failure mode that hides.
+    if let Some(link) = daemon::client::SessionLink::from_env()
+        .map_err(|error| stow_types::stow_error!("{error}"))?
     {
-        delegate_to_supervisor(&endpoint, token, &command).await
+        delegate_to_daemon(&link, &command).await
     } else {
-        // The supervising run's extra rustc arguments (workspace path
-        // remap and any flags it selected) arrive appended to the argv
-        // so the user's own rustflags sources — env or config — keep
-        // their cargo semantics. Under a supervisor the supervisor
-        // appends them itself.
+        // The extra rustc arguments (workspace path remap and any flags
+        // the build selected) arrive appended to the argv so the user's
+        // own rustflags sources — env or config — keep their cargo
+        // semantics. Under a session the daemon appends them itself.
         command
             .wrapped_args
             .extend(rustc_args::extra_args_from_env()?);
@@ -1445,13 +1447,12 @@ async fn run_rustc_wrapper(
     }
 }
 
-/// Ask the supervisor, then do what it says.
-async fn delegate_to_supervisor(
-    endpoint: &local_socket::Endpoint,
-    token: String,
+/// Ask the build's session, then do what it says.
+async fn delegate_to_daemon(
+    link: &daemon::client::SessionLink,
     command: &WrapperCommandArgs,
 ) -> stow_types::error::Result<std::process::ExitStatus> {
-    let mut connection = supervisor::client::Connection::open(endpoint, token)
+    let mut connection = daemon::client::WrapperConnection::open(link)
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
     let decision = connection
@@ -1459,11 +1460,11 @@ async fn delegate_to_supervisor(
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
     tracing::debug!(
-        served = matches!(decision, supervisor::client::Decision::Served(_)),
-        "the build supervisor answered this invocation"
+        served = matches!(decision, daemon::client::Decision::Served(_)),
+        "the build's session answered this invocation"
     );
     let (executable, args) = match decision {
-        supervisor::client::Decision::Served(notifications) => {
+        daemon::client::Decision::Served(notifications) => {
             connection
                 .close()
                 .await
@@ -1471,7 +1472,7 @@ async fn delegate_to_supervisor(
             write_served_artifact_notifications(&notifications)?;
             return Ok(std::process::ExitStatus::default());
         }
-        supervisor::client::Decision::Compile { executable, args } => (executable, args),
+        daemon::client::Decision::Compile { executable, args } => (executable, args),
     };
     let started = std::time::Instant::now();
     let status = run_passthrough_status(&executable, &[], &args).await?;
@@ -3197,10 +3198,10 @@ fn resolve_cc_compiler(executable: &OsString) -> cc::ResolvedCompiler {
 /// The C/C++ compiler facade. Returns the status this process owes its
 /// caller: success for a served object, else the real compiler's own.
 ///
-/// Under a supervised build the daemon owns the object cache and its
-/// records, and this process never opens the state database. Without a
-/// supervisor — a plain `cargo build` through the wrappers `stow setup`
-/// writes — it decides in this process instead.
+/// Under a session the daemon owns the object cache and its records, and
+/// this process never opens the state database. Without one — a plain
+/// `cargo build` through the wrappers `stow setup` writes — it decides in
+/// this process instead.
 #[tracing::instrument(name = "stow.wrapper.cc_invoke", skip_all)]
 async fn run_cc_wrapper(
     command: WrapperCommandArgs,
@@ -3210,38 +3211,40 @@ async fn run_cc_wrapper(
     let compiler = resolve_cc_compiler(&command.executable);
     #[cfg(windows)]
     let compiler = resolve_cc_compiler(&command.executable)?;
-    // An endpoint that is set but unusable fails the build, as it does
-    // for the rustc facade.
-    match supervisor::from_env().map_err(|error| stow_types::stow_error!("{error}"))? {
-        Some((endpoint, token)) => {
-            run_cc_supervised(&endpoint, token, &compiler, &command.wrapped_args).await
-        }
+    // A session the environment names that cannot be reached fails the
+    // build, as it does for the rustc facade.
+    match daemon::client::SessionLink::from_env()
+        .map_err(|error| stow_types::stow_error!("{error}"))?
+    {
+        Some(link) => run_cc_supervised(&link, &compiler, &command.wrapped_args).await,
         None => run_cc_standalone(&compiler, &command.wrapped_args, state_db).await,
     }
 }
 
-/// Ask the supervisor about the object, then do what it says. The only
-/// work here is the compiler's: the key, the clone of a hit onto the
-/// output and the compile itself. The cache lookup, the store, the LRU
-/// stamp and the statistics are the supervisor's, against its own state
-/// database — this process holds a closed handle, so nothing here could
-/// open one.
+/// Ask the session about the object, then do what it says. The only work
+/// here is the compiler's: the key, the clone of a hit onto the output and
+/// the compile itself. The cache lookup, the store, the LRU stamp and the
+/// statistics are the daemon's, against its own state database — this
+/// process never opens one.
 async fn run_cc_supervised(
-    endpoint: &local_socket::Endpoint,
-    token: String,
+    link: &daemon::client::SessionLink,
     compiler: &cc::ResolvedCompiler,
     compiler_args: &[OsString],
 ) -> stow_types::error::Result<std::process::ExitStatus> {
-    // The inherited config is read only to learn whether the C/C++ layer
-    // is on, before the compiler is spent on a key nothing would use.
-    let config = match StowConfig::load_local(StateDb::closed()) {
-        Ok(config) => config,
-        Err(error) => {
-            tracing::warn!(error = %error, "stow local config unavailable, bypassing C/C++ cache");
-            return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
-        }
-    };
-    if !config.cache.uses_cc_cache() {
+    let mut connection = daemon::client::WrapperConnection::open(link)
+        .await
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    // Whether the C/C++ layer is on is the session's answer, asked before
+    // the compiler is spent on a key nothing would use.
+    if !connection
+        .cc_enabled()
+        .await
+        .map_err(|error| stow_types::stow_error!("{error}"))?
+    {
+        connection
+            .close()
+            .await
+            .map_err(|error| stow_types::stow_error!("{error}"))?;
         return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
     }
     let (cache_key, output_path) = match cc::plan_compile(compiler, compiler_args).await {
@@ -3257,15 +3260,12 @@ async fn run_cc_supervised(
             return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
         }
     };
-    let mut connection = supervisor::client::Connection::open(endpoint, token)
-        .await
-        .map_err(|error| stow_types::stow_error!("{error}"))?;
     let decision = connection
         .cc_lookup(&cache_key)
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
     let status = match decision {
-        supervisor::client::CcDecision::Hit(object) => {
+        daemon::client::CcDecision::Hit(object) => {
             match cc::serve_cached_object(&object, &output_path).await {
                 Ok(()) => std::process::ExitStatus::default(),
                 Err(error) => {
@@ -3274,15 +3274,15 @@ async fn run_cc_supervised(
                 }
             }
         }
-        supervisor::client::CcDecision::Bypass(reason) => {
+        daemon::client::CcDecision::Bypass(reason) => {
             tracing::warn!(%reason, "stow C/C++ cache failed, bypassing cache");
             run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await?
         }
-        supervisor::client::CcDecision::Miss => {
+        daemon::client::CcDecision::Miss => {
             let status =
                 run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await?;
             // The compiler resolved its output against this process's
-            // working directory, which is not the supervisor's.
+            // working directory, which is not the daemon's.
             let reported = std::path::absolute(&output_path)
                 .wrap_err_with(|| format!("resolve C output path {}", output_path.display()))?;
             if let Some(reason) = connection
@@ -3290,7 +3290,7 @@ async fn run_cc_supervised(
                 .await
                 .map_err(|error| stow_types::stow_error!("{error}"))?
             {
-                tracing::warn!(%reason, "the build supervisor did not take the C/C++ object");
+                tracing::warn!(%reason, "the build's session did not take the C/C++ object");
             }
             status
         }
@@ -5693,6 +5693,19 @@ where
             let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
                 .file(path)
                 .include_args(true)
+                // The daemon's decision spans are opened here as their
+                // records arrive, from whichever task reads them and with
+                // no thread to enter them on: an async trace records a
+                // span from its creation to its close.
+                .trace_style(tracing_chrome::TraceStyle::Async)
+                // A mirrored span is named for the daemon span it copies.
+                .name_fn(Box::new(|event_or_span| match event_or_span {
+                    tracing_chrome::EventOrSpan::Span(span) => span
+                        .extensions()
+                        .get::<crate::daemon::events::MirroredName>()
+                        .map_or_else(|| span.metadata().name().to_owned(), |name| name.0.clone()),
+                    tracing_chrome::EventOrSpan::Event(event) => event.metadata().name().to_owned(),
+                }))
                 .build();
             (
                 Some(
@@ -5709,6 +5722,9 @@ where
     (
         tracing_subscriber::registry()
             .with(fmt_layer)
+            // Before the trace layer, which names a mirrored span from what
+            // this records.
+            .with(crate::daemon::events::MirroredNames)
             .with(chrome_layer),
         TracingGuard {
             _chrome: chrome_guard,
@@ -7244,9 +7260,10 @@ mod tests {
     /// stow#618: a dependent's post-compile bookkeeping must wait for the
     /// bookkeeping of the dependencies it was built against — an
     /// `--extern` whose rows are still being written is a pending write,
-    /// not a missing one. These tests drive the real supervisor over the
-    /// real socket with `Plan` and `Compiled` frames, a real
-    /// `Session`, and a temp-dir cache — cargo-free end to end.
+    /// not a missing one. These tests drive the daemon's request path —
+    /// the same `answer_and_book` every wrapper connection runs — with
+    /// `Plan` and `Compiled` requests, a real `Session`, and a temp-dir
+    /// cache: cargo-free end to end, one [`Conn`] per wrapper connection.
     mod in_flight_ordering {
         use std::ffi::{OsStr, OsString};
         use std::path::Path;
@@ -7254,8 +7271,7 @@ mod tests {
         use std::time::Duration;
 
         use crate::daemon::session::Session;
-        use crate::local_socket::Endpoint;
-        use crate::supervisor::protocol::{Compiled, Plan, Request, write_frame};
+        use crate::supervisor::protocol::{Compiled, Plan, Request};
         use crate::supervisor::{server, server::Handler as _};
         use crate::{AnalysisFacts, BuildContext};
 
@@ -7520,110 +7536,73 @@ mod tests {
             (config, in_flight, handler)
         }
 
-        /// The raw facade transport: the test writes the frames itself
-        /// rather than going through the client connection.
-        #[cfg(unix)]
-        async fn connect_raw(endpoint: &Endpoint) -> tokio::net::UnixStream {
-            let Endpoint::Unix(path) = endpoint else {
-                panic!("the unix transport is the only one this platform starts");
-            };
-            tokio::net::UnixStream::connect(path)
-                .await
-                .expect("connect to the supervisor")
+        /// One wrapper connection to the session: its requests go through
+        /// the daemon's own `answer_and_book`, and dropping it is the
+        /// connection ending — a compile it never reported completes its
+        /// flight.
+        struct Conn {
+            session: Arc<Session>,
+            flight: Option<server::Flight<<Session as server::Handler>::Pending>>,
         }
 
-        /// The raw facade transport on the loopback listener.
-        #[cfg(not(unix))]
-        async fn connect_raw(endpoint: &Endpoint) -> tokio::net::TcpStream {
-            let Endpoint::Loopback(port) = endpoint else {
-                panic!("the loopback transport is the only one this platform starts");
-            };
-            tokio::net::TcpStream::connect(("127.0.0.1", *port))
-                .await
-                .expect("connect to the supervisor")
-        }
+        impl Conn {
+            fn open(session: &Arc<Session>) -> Self {
+                Self {
+                    session: Arc::clone(session),
+                    flight: None,
+                }
+            }
 
-        /// Write one `Plan` frame and read the supervisor's answer, which
-        /// the fixtures' serve maps make a compile: the unit is in flight
-        /// from here, until the connection reports it or ends.
-        async fn send_plan<S>(stream: &mut S, token: &str, args: &[OsString])
-        where
-            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
-        {
-            let plan = Plan::new(
-                token.to_owned(),
-                OsStr::new("rustc"),
-                args,
-                crate::supervisor::protocol::InvocationEnv::for_tests(),
-            );
-            write_frame(&mut *stream, &Request::Plan(plan))
+            async fn ask(&mut self, request: Request) -> crate::supervisor::protocol::Answer {
+                server::answer_and_book(
+                    &self.session,
+                    self.session.in_flight(),
+                    self.session.reports(),
+                    &mut self.flight,
+                    request,
+                )
                 .await
-                .expect("write the plan frame");
-            let answer: Option<crate::supervisor::protocol::Answer> =
-                crate::supervisor::protocol::read_frame(&mut *stream)
-                    .await
-                    .expect("read the plan's answer");
-            assert!(
-                matches!(
+            }
+
+            /// Ask the session to plan one unit, which the fixtures' serve
+            /// maps make a compile: the unit is in flight from here,
+            /// until the connection reports it or ends.
+            async fn plan(&mut self, args: &[OsString]) {
+                let plan = Plan::new(
+                    OsStr::new("rustc"),
+                    args,
+                    crate::supervisor::protocol::InvocationEnv::for_tests(),
+                );
+                let answer = self.ask(Request::Plan(plan)).await;
+                assert!(
+                    matches!(answer, crate::supervisor::protocol::Answer::Compile(_)),
+                    "a unit the serve map rules out is told to compile: {answer:?}"
+                );
+            }
+
+            /// Report the compile the plan asked for and read the receipt —
+            /// the receipt precedes the report's bookkeeping, so it
+            /// returns while the bookkeeping may still be running.
+            async fn compiled(&mut self, success: bool) {
+                let answer = self
+                    .ask(Request::Compiled(Compiled {
+                        success,
+                        compile_millis: 0,
+                    }))
+                    .await;
+                assert_eq!(
                     answer,
-                    Some(crate::supervisor::protocol::Answer::Compile(_))
-                ),
-                "a unit the serve map rules out is told to compile"
-            );
+                    crate::supervisor::protocol::Answer::Received,
+                    "a report is answered with a receipt"
+                );
+            }
         }
 
-        /// Report the compile the plan asked for and read the receipt —
-        /// the receipt precedes the report's bookkeeping, so it returns
-        /// while the bookkeeping may still be running.
-        async fn send_compiled<S>(stream: &mut S, token: &str, success: bool)
-        where
-            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
-        {
-            let report = Compiled {
-                token: token.to_owned(),
-                success,
-                compile_millis: 0,
-            };
-            write_frame(&mut *stream, &Request::Compiled(report))
-                .await
-                .expect("write the report frame");
-            let answer: Option<crate::supervisor::protocol::Answer> =
-                crate::supervisor::protocol::read_frame(&mut *stream)
-                    .await
-                    .expect("read the report's receipt");
-            assert_eq!(
-                answer,
-                Some(crate::supervisor::protocol::Answer::Received),
-                "a report is answered with a receipt"
-            );
-        }
-
-        /// Guarantee the frames already written on `stream` have been
-        /// handled, bookkeeping included: a connection serves its frames
-        /// in sequence, so the answer to a frame that needs no work — a
-        /// lookup under a wrong token — proves everything before it ran.
-        async fn flush_frames<S>(stream: &mut S)
-        where
-            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
-        {
-            use crate::supervisor::protocol::{Answer, CcLookup, read_frame};
-            write_frame(
-                &mut *stream,
-                &Request::CcLookup(CcLookup {
-                    token: String::new(),
-                    cache_key: String::new(),
-                }),
-            )
-            .await
-            .expect("write the flush frame");
-            let answer: Answer = read_frame(&mut *stream)
-                .await
-                .expect("read the flush answer")
-                .expect("the supervisor answers the lookup");
-            assert!(
-                matches!(answer, Answer::Failed { .. }),
-                "the flush answered with {answer:?}"
-            );
+        /// Wait until every report's bookkeeping the session spawned has
+        /// run to its end, store included.
+        async fn flush(session: &Session) {
+            let abandoned = session.reports().drain(Duration::from_secs(30)).await;
+            assert_eq!(abandoned, 0, "bookkeeping hung past the drain budget");
         }
 
         async fn stored_crates(config: &crate::config::StowConfig) -> Vec<String> {
@@ -7818,14 +7797,6 @@ mod tests {
             let registry_src = tempdir.path().join("cargo_home/registry/src");
 
             let (config, in_flight, handler) = fixture(tempdir.path()).await;
-            let supervisor = server::start(
-                handler,
-                in_flight.clone(),
-                &std::env::current_exe().expect("current exe"),
-            )
-            .expect("start supervisor");
-            let [(_, endpoint), (_, token), _] = supervisor.env();
-            let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
 
             let dep_args = unit_args(&registry_src, &out_dir, "dep", "1.0.0", "depmeta", &[]);
             write_outputs(&out_dir, "dep", "depmeta");
@@ -7841,15 +7812,14 @@ mod tests {
 
             // The dependency's plan is answered first: the unit is in
             // flight before the dependent's frames are written.
-            let mut dep_conn = connect_raw(&endpoint).await;
-            send_plan(&mut dep_conn, &token, &dep_args).await;
+            let mut dep_conn = Conn::open(&handler);
+            dep_conn.plan(&dep_args).await;
 
-            let mut consumer_conn = connect_raw(&endpoint).await;
-            send_plan(&mut consumer_conn, &token, &consumer_args).await;
-            send_compiled(&mut consumer_conn, &token, true).await;
+            let mut consumer_conn = Conn::open(&handler);
+            consumer_conn.plan(&consumer_args).await;
+            consumer_conn.compiled(true).await;
 
-            // No flush here — the report's bookkeeping is what waits, so
-            // the connection's next frame cannot be answered yet. The
+            // No flush here — the report's bookkeeping is what waits. The
             // dependent's bookkeeping parks on the dependency's flight;
             // from there nothing may be stored while it is in flight.
             let dep_rlib =
@@ -7861,14 +7831,11 @@ mod tests {
                 "nothing may be stored while the dependency is in flight"
             );
 
-            send_compiled(&mut dep_conn, &token, true).await;
-            // The flush answers only after the dependency's bookkeeping —
-            // store included — has run to its end.
-            flush_frames(&mut dep_conn).await;
-
-            // The dependent's wait releases now; its connection's flush
-            // answers only once that bookkeeping — store included — ran.
-            flush_frames(&mut consumer_conn).await;
+            dep_conn.compiled(true).await;
+            // The flush returns only after every bookkeeping — the
+            // dependency's, then the dependent's released wait — has run
+            // to its end, store included.
+            flush(&handler).await;
             assert_eq!(stored_crates(&config).await, vec!["consumer", "dep"]);
         }
 
@@ -7882,22 +7849,14 @@ mod tests {
             std::fs::create_dir_all(&out_dir).expect("create deps dir");
             let registry_src = tempdir.path().join("cargo_home/registry/src");
 
-            let (config, in_flight, handler) = fixture(tempdir.path()).await;
-            let supervisor = server::start(
-                Arc::clone(&handler),
-                in_flight,
-                &std::env::current_exe().expect("current exe"),
-            )
-            .expect("start supervisor");
-            let [(_, endpoint), (_, token), _] = supervisor.env();
-            let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
+            let (config, _in_flight, handler) = fixture(tempdir.path()).await;
 
             let args = unit_args(&registry_src, &out_dir, "solo", "1.0.0", "solometa", &[]);
             write_outputs(&out_dir, "solo", "solometa");
-            let mut conn = connect_raw(&endpoint).await;
-            send_plan(&mut conn, &token, &args).await;
-            send_compiled(&mut conn, &token, true).await;
-            flush_frames(&mut conn).await;
+            let mut conn = Conn::open(&handler);
+            conn.plan(&args).await;
+            conn.compiled(true).await;
+            flush(&handler).await;
 
             assert_eq!(stored_crates(&config).await, vec!["solo"]);
             assert_eq!(handler.observations().len(), 1, "the compile is observed");
@@ -7980,15 +7939,7 @@ mod tests {
             std::fs::create_dir_all(&out_dir).expect("create deps dir");
             let registry_src = tempdir.path().join("cargo_home/registry/src");
 
-            let (config, in_flight, handler) = fixture(tempdir.path()).await;
-            let supervisor = server::start(
-                handler,
-                in_flight,
-                &std::env::current_exe().expect("current exe"),
-            )
-            .expect("start supervisor");
-            let [(_, endpoint), (_, token), _] = supervisor.env();
-            let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
+            let (config, _in_flight, handler) = fixture(tempdir.path()).await;
 
             let dep_args = unit_args(&registry_src, &out_dir, "dep2", "1.0.0", "dep2meta", &[]);
             write_outputs(&out_dir, "dep2", "dep2meta");
@@ -8005,17 +7956,17 @@ mod tests {
             // The dependency's plan is answered — the unit is in flight —
             // then the facade's connection dies with no report ever
             // coming.
-            let mut dep_conn = connect_raw(&endpoint).await;
-            send_plan(&mut dep_conn, &token, &dep_args).await;
+            let mut dep_conn = Conn::open(&handler);
+            dep_conn.plan(&dep_args).await;
             drop(dep_conn);
 
-            let mut consumer_conn = connect_raw(&endpoint).await;
-            send_plan(&mut consumer_conn, &token, &consumer_args).await;
-            send_compiled(&mut consumer_conn, &token, true).await;
+            let mut consumer_conn = Conn::open(&handler);
+            consumer_conn.plan(&consumer_args).await;
+            consumer_conn.compiled(true).await;
             // The dependent's bookkeeping waits only until the dead
-            // connection's flight completes — then the flush answers, and
+            // connection's flight completes — then the flush returns, and
             // the bookkeeping that logs the skip has run to its end.
-            flush_frames(&mut consumer_conn).await;
+            flush(&handler).await;
 
             let captured = log.text();
             assert!(
@@ -8047,14 +7998,6 @@ mod tests {
             // decision — the one that waits on its externs' rows; `base`
             // and `mid` are ruled out and compile at once.
             let (_config, in_flight, handler) = fixture_covering(tempdir.path(), &["top"]).await;
-            let supervisor = server::start(
-                Arc::clone(&handler),
-                in_flight.clone(),
-                &std::env::current_exe().expect("current exe"),
-            )
-            .expect("start supervisor");
-            let [(_, endpoint), (_, token), _] = supervisor.env();
-            let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
 
             // `base` compiles; `mid` is compiled against it; `top` is
             // planned against `mid`.
@@ -8093,10 +8036,10 @@ mod tests {
 
             // `base` is compiling for the whole test until its connection
             // ends, and `mid`'s mark has landed: both are in flight.
-            let mut base_conn = connect_raw(&endpoint).await;
-            send_plan(&mut base_conn, &token, &base_args).await;
-            let mut mid_conn = connect_raw(&endpoint).await;
-            send_plan(&mut mid_conn, &token, &mid_args).await;
+            let mut base_conn = Conn::open(&handler);
+            base_conn.plan(&base_args).await;
+            let mut mid_conn = Conn::open(&handler);
+            mid_conn.plan(&mid_args).await;
 
             // `mid` is still compiling: a plan against it is not held.
             let decision = tokio::time::timeout(Duration::from_secs(10), plan_top(&handler))
@@ -8107,7 +8050,7 @@ mod tests {
 
             // `mid`'s rustc exits. Its bookkeeping parks on `base`'s
             // flight, so its rows are pending while its facade is gone.
-            send_compiled(&mut mid_conn, &token, true).await;
+            mid_conn.compiled(true).await;
             let base_rlib =
                 crate::artifact_cache::path_to_string(&base_rlib).expect("utf-8 extern path");
             in_flight.parked_on(&base_rlib, 1).await;
@@ -8146,22 +8089,14 @@ mod tests {
             let registry_src = tempdir.path().join("cargo_home/registry/src");
 
             let (config, in_flight, handler) = fixture(tempdir.path()).await;
-            let supervisor = server::start(
-                handler,
-                in_flight,
-                &std::env::current_exe().expect("current exe"),
-            )
-            .expect("start supervisor");
-            let [(_, endpoint), (_, token), _] = supervisor.env();
-            let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
 
             // The extern the build-script unit was compiled against is
             // in flight for the whole test: its plan is answered — the
             // registration — and its report never comes.
             let dep_args = unit_args(&registry_src, &out_dir, "dep3", "1.0.0", "dep3meta", &[]);
             write_outputs(&out_dir, "dep3", "dep3meta");
-            let mut dep_conn = connect_raw(&endpoint).await;
-            send_plan(&mut dep_conn, &token, &dep_args).await;
+            let mut dep_conn = Conn::open(&handler);
+            dep_conn.plan(&dep_args).await;
 
             // The invocation cargo runs for a registry crate's build
             // script: `--crate-type bin`, the `build.rs` source, the
@@ -8194,19 +8129,17 @@ mod tests {
             std::fs::write(out_dir.join("build_script_build-bsmeta"), b"bin-bytes")
                 .expect("write build script binary");
 
-            let mut script_conn = connect_raw(&endpoint).await;
-            send_plan(&mut script_conn, &token, &build_script_args).await;
-            send_compiled(&mut script_conn, &token, true).await;
-            // The post-compile holds while the extern is in flight, so
-            // the flush stays unanswered until the flight ends.
-            assert!(
-                tokio::time::timeout(Duration::from_millis(500), flush_frames(&mut script_conn))
-                    .await
-                    .is_err(),
-                "the build-script unit's post-compile must hold on its in-flight extern"
-            );
+            let mut script_conn = Conn::open(&handler);
+            script_conn.plan(&build_script_args).await;
+            script_conn.compiled(true).await;
+            // The post-compile holds while the extern is in flight: its
+            // bookkeeping parks on the extern's flight.
+            let dep_rlib =
+                crate::artifact_cache::path_to_string(&out_dir.join("libdep3-dep3meta.rlib"))
+                    .expect("utf-8 extern path");
+            in_flight.parked_on(&dep_rlib, 1).await;
             drop(dep_conn);
-            flush_frames(&mut script_conn).await;
+            flush(&handler).await;
 
             assert!(
                 stored_crates(&config).await.is_empty(),
@@ -8300,6 +8233,64 @@ mod tests {
             !terminal_text.contains("an info line"),
             "the terminal does not print info: {terminal_text}"
         );
+    }
+
+    /// The decision spans a session records in the daemon cross the control
+    /// connection as events, and the driver's trace file records them
+    /// under the daemon span's own name.
+    #[test]
+    fn a_sessions_decision_spans_reach_the_drivers_trace_file() {
+        use crate::daemon::events::{LogInterest, SESSION_SPAN, SessionLogs, SpanMirror};
+        use crate::daemon::protocol::Event;
+        use crate::daemon::session::SessionId;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        // The daemon's side: spans under the session's span.
+        let logs = SessionLogs::default();
+        let id = SessionId::mint();
+        let mut receiver = logs.register(id, LogInterest::new(None, true).expect("filter"));
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(logs.layer()),
+            || {
+                let session = tracing::info_span!(SESSION_SPAN, session = %id);
+                let _session = session.enter();
+                let decide = tracing::debug_span!(
+                    target: "stow_cli::daemon",
+                    "stow.session.decide",
+                    crate_name = "demo"
+                );
+                let _decide = decide.enter();
+                drop(
+                    tracing::debug_span!(target: "stow_cli::daemon", "stow.session.serve")
+                        .entered(),
+                );
+            },
+        );
+
+        // The driver's side: the events a control connection delivers.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace = dir.path().join("trace.json");
+        let (subscriber, guard) =
+            tracing_subscriber_for(None, Some(trace.clone()), Terminal::default());
+        tracing::subscriber::with_default(subscriber, || {
+            let mut mirror = SpanMirror::under(tracing::debug_span!("stow.cargo_cmd.run"));
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    Event::SpanOpened(record) => mirror.opened(&record),
+                    Event::SpanClosed { id } => mirror.closed(id),
+                    Event::Log(_) | Event::ResolutionDone => {}
+                }
+            }
+        });
+        drop(guard);
+
+        let trace_text = std::fs::read_to_string(&trace).expect("read the trace file");
+        for expected in ["stow.session.decide", "stow.session.serve", "demo"] {
+            assert!(
+                trace_text.contains(expected),
+                "the trace records the daemon's {expected}: {trace_text}"
+            );
+        }
     }
 
     /// `RUST_LOG` selects the terminal's level only — a restrictive

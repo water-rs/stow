@@ -86,17 +86,17 @@ fn packages(entries: &[StoredEntry]) -> Vec<String> {
 /// One project, one `CARGO_HOME`, one cache: the pieces every scenario
 /// shares.
 struct Project {
-    dir: tempfile::TempDir,
-    cargo_home: tempfile::TempDir,
-    cache: tempfile::TempDir,
+    dir: support::TempDir,
+    cargo_home: support::TempDir,
+    cache: support::TempDir,
 }
 
 impl Project {
     fn registry(config: &str) -> Self {
         let project = Self {
-            dir: tempfile::tempdir().expect("temp dir"),
-            cargo_home: tempfile::tempdir().expect("cargo home"),
-            cache: tempfile::tempdir().expect("cache dir"),
+            dir: support::tempdir().expect("temp dir"),
+            cargo_home: support::tempdir().expect("cargo home"),
+            cache: support::tempdir().expect("cache dir"),
         };
         write_fixture(
             project.dir.path(),
@@ -138,7 +138,7 @@ impl Project {
 
 struct Built {
     output: Output,
-    target: tempfile::TempDir,
+    target: support::TempDir,
 }
 
 fn build_in(
@@ -149,7 +149,7 @@ fn build_in(
     flags: &[&str],
     label: &str,
 ) -> Built {
-    let target = tempfile::tempdir().expect("target dir");
+    let target = support::tempdir().expect("target dir");
     let mut args = vec!["build"];
     args.extend_from_slice(flags);
     args.push("--offline");
@@ -394,7 +394,7 @@ fn crates_io_off_stores_and_serves_nothing(config: &str, flags: &[&str]) {
     );
 
     // And stores nothing: a fresh cache stays empty.
-    let empty = tempfile::tempdir().expect("empty cache");
+    let empty = support::tempdir().expect("empty cache");
     build_in(
         project.dir.path(),
         project.cargo_home.path(),
@@ -457,15 +457,15 @@ fn a_remote_off_build_still_stores_every_local_kind() {
 /// A scenario with a git dependency: `unicode-ident` patched to a
 /// `file://` repository, under `quote` and `proc-macro2`.
 struct GitProject {
-    root: tempfile::TempDir,
-    cargo_home: tempfile::TempDir,
+    root: support::TempDir,
+    cargo_home: support::TempDir,
     patch: String,
 }
 
 impl GitProject {
     fn new() -> Self {
-        let root = tempfile::tempdir().expect("root");
-        let cargo_home = tempfile::tempdir().expect("cargo home");
+        let root = support::tempdir().expect("root");
+        let cargo_home = support::tempdir().expect("cargo home");
         let home = root.path().join("git-home");
         std::fs::create_dir_all(&home).expect("create git home");
         // The registry copy of `unicode-ident` must be extracted before the
@@ -566,7 +566,7 @@ fn each_local_switch_gates_only_its_source_kind() {
     } in cases
     {
         let label = format!("config {config:?} flags {flags:?}");
-        let cache = tempfile::tempdir().expect("cache");
+        let cache = support::tempdir().expect("cache");
         let first = git.project("first", config);
         git.build(&first, cache.path(), flags, "first build");
         let entries = stored_entries(&cache.path().join("state-v3.sqlite3"));
@@ -590,7 +590,7 @@ fn each_local_switch_gates_only_its_source_kind() {
 #[test]
 fn a_layer_off_does_not_serve_entries_another_run_stored() {
     let git = GitProject::new();
-    let cache = tempfile::tempdir().expect("cache");
+    let cache = support::tempdir().expect("cache");
     let first = git.project("first", "");
     git.build(&first, cache.path(), &[], "fill build");
     assert_eq!(

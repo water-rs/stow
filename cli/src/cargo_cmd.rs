@@ -1284,7 +1284,9 @@ async fn analyze_workspace_prediction(
     // gate (stow#608).
     let (expanded, consumer_slices) = tokio::join!(
         expanded_graph(config, project, env, manifest_path, resolution_done),
-        ensure_consumer_slices(config, project, slices),
+        // Boxed: the slice fetch's future, with the held-slice lookup in
+        // it, is the largest part of this one.
+        Box::pin(ensure_consumer_slices(config, project, slices)),
     );
     let expanded = expanded?;
     let (slice, host_slice) = consumer_slices?;
@@ -3987,61 +3989,57 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     } = setup;
 
     // Every rustc invocation this cargo run spawns is a wrapper that asks
-    // the build's session what to do, so the whole build shares one
-    // transport — one pooled connection, one QUIC endpoint (stow#347).
-    // The driver-built wrapper base lands here: the task spawned in
-    // `run_inner` has been running beside mold's provisioning and the
-    // analysis, so this await is almost always an immediate take (stow#608).
+    // the build's session on the daemon what to do, so the whole build
+    // shares the daemon's one transport — one pooled connection, one QUIC
+    // endpoint (stow#347). The driver-built wrapper base lands here: the
+    // task spawned in `run_inner` has been running beside mold's
+    // provisioning and the analysis, so this await is almost always an
+    // immediate take (stow#608).
     let toolchain = join_toolchain(&project.toolchain).await?;
     let facts = session_facts(plan, &toolchain, registry_sources)?;
-    let session = open_session(facts, config).await?;
+    let exe = std::env::current_exe().wrap_err("resolve the current executable")?;
+    let settings = crate::daemon::Settings::from_env()?;
+    let session = crate::daemon::client::DaemonSession::open(exe.clone(), facts, settings).await?;
     // The release task rides the session's resolution signal: once cargo
     // holds the package-cache lock only shared, a drain's cargo can no
     // longer make this build wait (stow#667).
     let release_hold = spawn_hold_release(session.resolution_done(), project.foreground.clone());
-    let (mut cargo_run, mut supervisor) =
-        spawn_cargo_run(plan, &session, &wrappers, launch, scratch.path()).await?;
+    let mut cargo_run = spawn_cargo_run(
+        plan,
+        &session,
+        exe,
+        settings,
+        &wrappers,
+        launch,
+        scratch.path(),
+    )
+    .await?;
 
     let before = coverage_snapshot(config).await;
 
     tracing::debug!("stow.precargo.cargo_spawn");
-    let status = cargo_run.status().await;
-    // The session's analysis stops with cargo, whichever way cargo ended:
-    // its future is dropped here — and with it the `kill_on_drop` cargo
-    // children it may still be driving — before anything else runs
-    // (stow#624). The release task stops too — a hold released after
-    // this build ends would open the gate on a lie.
-    session.stop_enrichment().await;
+    // A daemon that dies or drops the session mid-build fails the build,
+    // naming it: nothing decides in this process in its place. Cargo's
+    // future is dropped with the select, and with it cargo.
+    let status = tokio::select! {
+        status = cargo_run.status() => {
+            status.wrap_err_with(|| format!("run cargo {action}"))
+        }
+        reason = session.lost() => Err(stow_types::stow_error!("{reason}")),
+    };
+    // The release task stops with cargo, whichever way cargo ended — a
+    // hold released after this build ends would open the gate on a lie.
     stop_build_task(release_hold).await;
-    let status = status.wrap_err_with(|| format!("run cargo {action}"))?;
+    let status = status?;
     finish_cargo_run(
         plan,
         CargoRunCleanup { cargo_run, scratch },
-        &mut supervisor,
+        session,
         status,
         before,
         covered_units,
-        &session,
     )
     .await
-}
-
-/// Open the build's session in this process, with the state database
-/// handle the config already holds: the driver keeps one pool for the
-/// whole command.
-async fn open_session(
-    facts: crate::daemon::session::SessionFacts,
-    config: Option<&StowConfig>,
-) -> stow_types::error::Result<std::sync::Arc<crate::daemon::session::Session>> {
-    let mut resources = config.map_or_else(
-        crate::daemon::session::Resources::default,
-        crate::daemon::session::Resources::adopting,
-    );
-    let handles = config.map_or_else(crate::daemon::session::CacheDirHandles::default, |config| {
-        resources.handles_for(&config.cache_dir)
-    });
-    let sessions = crate::daemon::RunDir::prepare(crate::daemon::RunDir::locate()?)?.sessions();
-    crate::daemon::session::Session::open(facts, &handles, &sessions).await
 }
 
 /// What `finish_cargo_run` releases, in order: the run — and with it a
@@ -4051,30 +4049,28 @@ struct CargoRunCleanup {
     scratch: tempfile::TempDir,
 }
 
-/// The build's tail once cargo has exited: the supervisor drains — the
-/// last unit's store and miss observation are inside it (stow#618) —
-/// then coverage reports, the miss journal and the scratch cleanup run
-/// in the same order on either transport (stow#317, stow#630, stow#667).
+/// The build's tail once cargo has exited: the session ends — its
+/// analysis stops and the last unit's store and miss observation drain
+/// (stow#618) — then coverage reports, the miss journal and the scratch
+/// cleanup run in the same order on either transport (stow#317,
+/// stow#630, stow#667).
 async fn finish_cargo_run(
     plan: &CargoRunPlan<'_>,
     cleanup: CargoRunCleanup,
-    supervisor: &mut SupervisorHandle,
+    session: crate::daemon::client::DaemonSession,
     status: ExitStatus,
     before: CoverageSnapshot,
     covered_units: usize,
-    session: &std::sync::Arc<crate::daemon::session::Session>,
 ) -> stow_types::error::Result<ExitStatus> {
-    // Cargo has exited, so every facade has: stop accepting and drain the
-    // last connections' post-compile bookkeeping before the runtime goes
-    // away — the last unit's store is inside that tail, and so is its
-    // miss observation (stow#618).
-    supervisor.shutdown().await;
     // The sandbox's grants name the scratch directory, and its drop revokes
-    // them, so it goes before the directory does.
+    // them, so it goes before the directory does. Cargo has exited, so
+    // every wrapper has, and the relay's connections close with the
+    // sandbox.
     drop(cleanup.cargo_run);
-    // The session writes the miss journal as it ends — the build's
-    // compile observations are its miss list (stow#317), a failed build's
-    // units included — and removes its directory.
+    // The session drains the last connections' post-compile bookkeeping
+    // and writes the miss journal as it ends — the build's compile
+    // observations are its miss list (stow#317), a failed build's units
+    // included — and removes its directory.
     let end = session.end().await?;
     if let Some(config) = plan.config {
         if status.success() {
@@ -4099,7 +4095,7 @@ async fn finish_cargo_run(
     // is raised here, naming the field of each.
     if !end.refusals.is_empty() {
         return Err(stow_types::stow_error!(
-            "the build supervisor refused {} request(s): {}",
+            "the stow daemon refused {} request(s) of this build: {}",
             end.refusals.len(),
             end.refusals.join("; ")
         ));
@@ -4130,26 +4126,6 @@ async fn admit_build_misses(plan: &CargoRunPlan<'_>, config: &StowConfig) {
     // than by the journal, whose supervised files the drain skips to keep
     // the count single.
     crate::report::bump_build(config).await;
-}
-
-/// The build's supervisor, bound beside the session it shares the
-/// in-flight registry with (stow#618). The runtime executable the shims
-/// resolve to is passed in — the supervisor exports its identity to
-/// cargo so a facade running a different build refuses before a frame is
-/// sent (stow#645).
-fn start_supervisor(
-    session: &std::sync::Arc<crate::daemon::session::Session>,
-    wrappers: &crate::commands::WrapperCommands,
-) -> stow_types::error::Result<crate::supervisor::server::Supervisor> {
-    tracing::debug_span!("stow.precargo.supervisor_start")
-        .in_scope(|| {
-            crate::supervisor::server::start(
-                std::sync::Arc::clone(session),
-                session.in_flight().clone(),
-                &wrappers.runtime_executable,
-            )
-        })
-        .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))
 }
 
 /// The cargo invocation the build runs: the action, the build's mold
@@ -4209,70 +4185,59 @@ impl CargoRun {
     }
 }
 
-/// The supervisor the build exports, by transport: the socket a plain
-/// build's facades dial, or the heel-IPC conversation a sandboxed
-/// build's facades get — the only outbound channel a `deny network*`
-/// profile leaves open (stow#779).
-enum SupervisorHandle {
-    /// The unix/loopback supervisor.
-    Socket(crate::supervisor::server::Supervisor),
-    /// The supervisor served over heel's IPC socket inside the sandbox.
-    Ipc(
-        crate::supervisor::ipc::SandboxedSupervisor<
-            <crate::daemon::session::Session as crate::supervisor::server::Handler>::Pending,
-        >,
-    ),
-}
-
-impl SupervisorHandle {
-    async fn shutdown(&mut self) {
-        match self {
-            Self::Socket(supervisor) => {
-                supervisor.shutdown().await;
-            }
-            Self::Ipc(supervisor) => supervisor.shutdown().await,
-        }
-    }
-}
-
-/// How `run_cargo` starts cargo: the supervisor on the transport the
-/// facades reach — the socket a plain build's facades dial, or heel's
-/// IPC socket inside the sandbox a sandboxed build's facades get —
-/// then the spawn on the matching command (stow#779).
-/// The argv and environment a build's cargo launches with — one value
-/// so the plain and sandboxed spawns stay identical below the transport.
+/// The argv and environment a build's cargo launches with — one value so
+/// the plain and sandboxed spawns stay identical below how the wrappers
+/// reach the daemon.
 struct CargoLaunch {
     argv: Vec<OsString>,
     envs: Vec<(OsString, OsString)>,
 }
 
+/// How `run_cargo` starts cargo: the plain spawn names the daemon's
+/// session and run directory for its wrappers to dial; the sandboxed one
+/// gives them the driver's relay, the only outbound channel a `deny
+/// network*` profile leaves open (stow#779).
 async fn spawn_cargo_run(
     plan: &CargoRunPlan<'_>,
-    session: &std::sync::Arc<crate::daemon::session::Session>,
+    session: &crate::daemon::client::DaemonSession,
+    exe: PathBuf,
+    settings: crate::daemon::Settings,
     wrappers: &crate::commands::WrapperCommands,
     mut launch: CargoLaunch,
     scratch: &Path,
-) -> stow_types::error::Result<(CargoRun, SupervisorHandle)> {
+) -> stow_types::error::Result<CargoRun> {
     match plan.isolation.level.confinement() {
         None => {
-            let supervisor = start_supervisor(session, wrappers)?;
-            launch.envs.extend(
-                supervisor
-                    .env()
-                    .map(|(key, value)| (OsString::from(key), OsString::from(value))),
-            );
+            launch.envs.push((
+                OsString::from(crate::daemon::client::STOW_SESSION_ENV),
+                crate::daemon::client::SessionLink::Direct(session.id()).encode(),
+            ));
+            // The wrappers dial the directory the driver resolved, whatever
+            // their own environment would resolve to.
+            launch.envs.push((
+                OsString::from(crate::daemon::STOW_DAEMON_DIR_ENV),
+                crate::daemon::RunDir::locate()?.into_os_string(),
+            ));
             let mut command = Command::new("cargo");
             command
                 .args(&launch.argv)
                 .current_dir(plan.current_dir)
-                .envs(launch.envs.iter().cloned());
-            Ok((
-                CargoRun::Plain(command),
-                SupervisorHandle::Socket(supervisor),
-            ))
+                .envs(launch.envs.iter().cloned())
+                // A daemon that dies mid-build drops the cargo run, which
+                // must take cargo with it.
+                .kill_on_drop(true);
+            Ok(CargoRun::Plain(command))
         }
         Some(confinement) => {
-            sandboxed_cargo_run(plan, confinement, session, wrappers, launch, scratch).await
+            sandboxed_cargo_run(
+                plan,
+                confinement,
+                (session.id(), exe, settings),
+                wrappers,
+                launch,
+                scratch,
+            )
+            .await
         }
     }
 }
@@ -4282,25 +4247,25 @@ async fn spawn_cargo_run(
 /// cargo-home writes the sandbox denies — and the sandboxed cargo runs
 /// `--offline`, so no cargo network call can even be attempted; `protect`
 /// leaves both to cargo, which has the network through the sandbox's proxy
-/// and a writable cargo home. The supervisor is served over heel's IPC
-/// socket either way, the one channel every level leaves open.
+/// and a writable cargo home. The wrappers reach the daemon through the
+/// driver's relay over heel's IPC socket, the one channel every level
+/// leaves open.
 async fn sandboxed_cargo_run(
     plan: &CargoRunPlan<'_>,
     confinement: crate::isolation::Confinement,
-    session: &std::sync::Arc<crate::daemon::session::Session>,
+    (session, exe, settings): (
+        crate::daemon::session::SessionId,
+        PathBuf,
+        crate::daemon::Settings,
+    ),
     wrappers: &crate::commands::WrapperCommands,
     mut launch: CargoLaunch,
     scratch: &Path,
-) -> stow_types::error::Result<(CargoRun, SupervisorHandle)> {
+) -> stow_types::error::Result<CargoRun> {
     if confinement.is_allowlist() {
         crate::sandbox::fetch_dependencies(plan.current_dir, plan.cargo_args).await?;
     }
-    let (pending, router) = crate::supervisor::ipc::start(
-        std::sync::Arc::clone(session),
-        session.in_flight().clone(),
-        &wrappers.runtime_executable,
-    )
-    .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
+    let router = crate::daemon::relay::router(session, exe, settings);
     if confinement.is_allowlist()
         && !launch
             .argv
@@ -4347,7 +4312,6 @@ async fn sandboxed_cargo_run(
     let endpoint = sandbox.ipc_endpoint().ok_or_else(|| {
         stow_types::stow_error!("the build sandbox's IPC server exposed no endpoint")
     })?;
-    let supervisor = pending.finish(endpoint);
     launch.envs.extend(crate::sandbox::toolchain_envs()?);
     // The env passthrough filters `CARGO_TARGET_DIR` — the target dir is
     // a grant the sandbox resolves itself, so it is spelled out here
@@ -4356,21 +4320,22 @@ async fn sandboxed_cargo_run(
         OsString::from("CARGO_TARGET_DIR"),
         target_dir.into_os_string(),
     ));
-    launch.envs.extend(
-        supervisor
-            .env()
-            .map(|(key, value)| (OsString::from(key), OsString::from(value))),
-    );
+    // A sandboxed wrapper holds neither the daemon's endpoint nor the
+    // session's id: it names the relay, which speaks for the session.
+    launch.envs.push((
+        OsString::from(crate::daemon::client::STOW_SESSION_ENV),
+        crate::daemon::client::SessionLink::Relay(endpoint.to_path_buf()).encode(),
+    ));
     let command = crate::sandbox::SandboxedCommand::new(
         "cargo",
         &launch.argv,
         &launch.envs,
         plan.current_dir,
     )?;
-    Ok((
-        CargoRun::Sandboxed(Box::new(SandboxedRun { sandbox, command })),
-        SupervisorHandle::Ipc(supervisor),
-    ))
+    Ok(CargoRun::Sandboxed(Box::new(SandboxedRun {
+        sandbox,
+        command,
+    })))
 }
 
 /// The build's pre-cargo coverage snapshot, instrumented as its own
@@ -4722,15 +4687,21 @@ async fn coarse_cache_policy_entries(
 /// proves. Failures degrade, never fail the build: the serve map keeps
 /// its filesystem-only answer, the policy directory keeps denying, and
 /// the plan path keeps its conservative defaults.
-pub fn spawn_build_enrichment(work: BuildEnrichment) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn(async move {
-        if let Err(error) = Box::pin(run_build_enrichment(work)).await {
-            tracing::warn!(
-                error = %error,
-                "background build analysis failed; the build keeps its filesystem-only plan"
-            );
+pub fn spawn_build_enrichment(
+    span: tracing::Span,
+    work: BuildEnrichment,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn(
+        async move {
+            if let Err(error) = Box::pin(run_build_enrichment(work)).await {
+                tracing::warn!(
+                    error = %error,
+                    "background build analysis failed; the build keeps its filesystem-only plan"
+                );
+            }
         }
-    })
+        .instrument(span),
+    )
 }
 
 async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::Result<()> {

@@ -91,9 +91,9 @@ fn write_project(dir: &Path, cargo_home: &Path, name: &str, dependencies: &str, 
 /// The shared environment of one scenario: one cache, one `CARGO_HOME`,
 /// one edge that records what the builds ask the remote for.
 struct Scenario {
-    root: tempfile::TempDir,
-    cargo_home: tempfile::TempDir,
-    cache: tempfile::TempDir,
+    root: support::TempDir,
+    cargo_home: support::TempDir,
+    cache: support::TempDir,
     edge_url: String,
     requests: RecordedRequests,
     /// How many builds ran, naming each one's target dir.
@@ -104,9 +104,9 @@ impl Scenario {
     fn new() -> Self {
         let (edge_url, requests) = recording_edge();
         Self {
-            root: tempfile::tempdir().expect("scenario root"),
-            cargo_home: tempfile::tempdir().expect("cargo home"),
-            cache: tempfile::tempdir().expect("cache dir"),
+            root: support::tempdir().expect("scenario root"),
+            cargo_home: support::tempdir().expect("cargo home"),
+            cache: support::tempdir().expect("cache dir"),
             edge_url,
             requests,
             builds: std::cell::Cell::new(0),
@@ -170,7 +170,7 @@ impl Scenario {
         entries: &[StoredEntry],
         env: &[(&str, &str)],
     ) -> (Output, PathBuf) {
-        let cache = tempfile::tempdir().expect("remote index cache");
+        let cache = support::tempdir().expect("remote index cache");
         let (host, release) = rustc_host_and_release();
         let resolved = resolved_packages(project, self.cargo_home.path());
         seed_index_slice(cache.path(), &host, &release, entries, &resolved);
@@ -532,7 +532,7 @@ fn path_members_and_primary_packages_are_never_stored() {
 
     // `-p cfg-if` makes the registry package the build's primary
     // package: a fresh cache holds nothing afterwards.
-    scenario.cache = tempfile::tempdir().expect("fresh cache dir");
+    scenario.cache = support::tempdir().expect("fresh cache dir");
     scenario.build(&project, &["build", "--offline", "-p", "cfg-if"], &[]);
     assert_eq!(
         scenario.entries(),
@@ -592,7 +592,7 @@ fn a_manifest_relative_proc_macro_is_cached_per_source_directory() {
         "{}",
         stderr_of(&repeat)
     );
-    scenario.cargo_home = tempfile::tempdir().unwrap();
+    scenario.cargo_home = support::tempdir().unwrap();
     prepare(&scenario);
     let (moved, target) = scenario.build(&project, &["build", "--offline"], &[]);
     assert!(!logged(

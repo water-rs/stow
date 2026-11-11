@@ -138,7 +138,7 @@ fn a_setup_free_build_keys_like_the_setup_path() {
     if !cfg!(target_os = "linux") {
         return;
     }
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir().expect("temp dir");
     let project = root.path().join("project");
     write_probe_project(&project, "");
     let edge_url = dead_edge_url();
@@ -208,7 +208,7 @@ fn a_passthrough_build_links_with_mold_without_setup() {
     if !cfg!(target_os = "linux") {
         return;
     }
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir().expect("temp dir");
     let project = root.path().join("project");
     write_probe_project(&project, "\n[profile.dev]\nlto = true\n");
     let edge_url = dead_edge_url();

@@ -65,16 +65,16 @@ fn stored_crate_names(db: &Path) -> std::collections::BTreeSet<String> {
 /// `proc-macro2`/`quote` race included (stow#618).
 #[test]
 fn every_compiled_unit_is_stored_before_the_build_exits() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
+    let dir = support::tempdir().expect("temp dir");
+    let cargo_home = support::tempdir().expect("cargo home");
     write_fixture(dir.path(), cargo_home.path(), FIXTURE_DEPENDENCIES);
     stow_setup_in(dir.path(), cargo_home.path());
     let edge_url = refused_url();
     let registry_url = refused_url();
 
     for run in 1..=3 {
-        let cache = tempfile::tempdir().expect("cache dir");
-        let target = tempfile::tempdir().expect("target dir");
+        let cache = support::tempdir().expect("cache dir");
+        let target = support::tempdir().expect("target dir");
         let output = stow_build_in(
             dir.path(),
             &["build", "--offline"],

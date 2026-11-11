@@ -3,7 +3,11 @@
 //!
 //! * [`serve`] is the daemon: it takes `daemon.lock` in the runtime
 //!   directory, binds its endpoint there, reports readiness and answers
-//!   [`protocol`] requests.
+//!   [`protocol`] requests. A build is a [`session`] of it: the driver
+//!   opens one over a control connection ([`client::DaemonSession`]) and
+//!   the build's wrappers name it by id ([`client::WrapperConnection`]);
+//!   a wrapper in a sandbox reaches the daemon through the driver's
+//!   [`relay`].
 //! * [`start`] is the one path every client uses to reach it: connect,
 //!   else take `start.lock`, spawn the daemon detached, wait for its
 //!   readiness notification, connect. It is synchronous and std-only —
@@ -21,23 +25,27 @@ use stow_types::error::{Context, Result};
 use crate::cli_args::{DaemonArgs, DaemonCommand};
 use crate::write_stdout;
 
+pub mod client;
 #[cfg(unix)]
 mod descriptors;
+pub mod events;
 #[cfg(target_os = "macos")]
 pub mod launch_agent;
 mod log;
 mod notify;
 pub mod protocol;
+pub mod relay;
 mod serve;
 pub mod session;
 mod start;
+mod table;
 #[cfg(windows)]
 mod windows;
 
 pub use start::connect_or_start;
 
 /// Overrides the runtime directory.
-const STOW_DAEMON_DIR_ENV: &str = "STOW_DAEMON_DIR";
+pub const STOW_DAEMON_DIR_ENV: &str = "STOW_DAEMON_DIR";
 /// How long a connected daemon may take to answer, in seconds.
 const STOW_DAEMON_ANSWER_SECS_ENV: &str = "STOW_DAEMON_ANSWER_SECS";
 /// How long a client waits for the daemon it started, in seconds.

@@ -10,6 +10,10 @@ use std::process::Command;
 /// fixture's crates an "all-miss" build is no longer one (stow#608) — an
 /// isolated cache dir, a `home` the child's home directories all point
 /// at, and loopback's proxy exclusions.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
 pub fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path, home: &Path) {
     sealed_home_env(command, home);
     command
@@ -33,9 +37,7 @@ pub fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path
         .env_remove("STOW_CACHE_POLICY_PATH")
         .env_remove("STOW_EXPANDED_GRAPH_PATH")
         .env_remove("STOW_PREFETCH_ARTIFACTS_PATH")
-        .env_remove("STOW_SUPERVISOR_ENDPOINT")
-        .env_remove("STOW_SUPERVISOR_TOKEN")
-        .env_remove("STOW_SUPERVISOR_BINARY")
+        .env_remove("STOW_SESSION")
         .env_remove("STOW_TRACE_FILE")
         .env_remove("STOW_TRACE_WRAPPED_COMPILERS")
         .env_remove("STOW_IDENTITY_TRACE")
@@ -127,6 +129,10 @@ pub fn denied_registry() -> String {
 /// Windows `dirs` resolves the config and local-data dirs through
 /// `SHGetKnownFolderPath` without `KF_FLAG_DONT_VERIFY`, which fails on a
 /// folder that does not exist, and stow then skips its config entirely.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
 pub fn sealed_home_env(command: &mut Command, home: &Path) {
     let dirs = [
         ("HOME", home.to_path_buf()),
@@ -143,6 +149,10 @@ pub fn sealed_home_env(command: &mut Command, home: &Path) {
         command.env(key, dir);
     }
     command
+        // Every build starts the user's daemon when none is running: this
+        // test's own runs under its home, where [`PrivateDaemon`] finds and
+        // stops it.
+        .env("STOW_DAEMON_DIR", PrivateDaemon::run_dir_of(home))
         // `stow setup` installs the daemon's login trigger through
         // `launchctl` on macOS (stow#1435); a test must never reach the
         // developer's launchd. `true` answers every query as "loaded", so
@@ -160,6 +170,10 @@ pub fn sealed_home_env(command: &mut Command, home: &Path) {
 /// The toolchain home the machine's rustup shims resolve: `RUSTUP_HOME`
 /// when the developer exports it, else `~/.rustup` under the real home —
 /// resolved before `sealed_home_env` redirects `HOME` on the child.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
 fn real_rustup_home() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("RUSTUP_HOME") {
         return Some(PathBuf::from(home));
@@ -190,6 +204,158 @@ pub fn write_global_config(homes: &[&Path], contents: &str) {
             std::fs::write(dir.join("config.toml"), contents).unwrap_or_else(|error| {
                 panic!("write the stow config in {}: {error}", dir.display())
             });
+        }
+    }
+}
+
+/// The daemon a test's `stow-cli` runs started under `home`
+/// ([`sealed_home_env`] points `STOW_DAEMON_DIR` there): found by the pids
+/// its own log names, and stopped when this drops, so a test never leaves
+/// a daemon behind and never touches one it did not start.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub struct PrivateDaemon {
+    run_dir: PathBuf,
+}
+
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+impl PrivateDaemon {
+    /// The runtime directory [`sealed_home_env`] names for `home`.
+    pub fn run_dir_of(home: &Path) -> PathBuf {
+        home.join("run")
+    }
+
+    /// The daemon of a child whose home is `home`.
+    pub fn in_home(home: &Path) -> Self {
+        Self {
+            run_dir: Self::run_dir_of(home),
+        }
+    }
+
+    pub fn run_dir(&self) -> &Path {
+        &self.run_dir
+    }
+
+    /// The daemon log's lines that contain `needle`.
+    pub fn log_lines(&self, needle: &str) -> Vec<String> {
+        std::fs::read_to_string(self.run_dir.join("daemon.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(needle))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The pids of the daemons that bound the endpoint, from their log.
+    pub fn serving_pids(&self) -> Vec<u32> {
+        self.log_lines("stow daemon serving")
+            .iter()
+            .filter_map(|line| {
+                let rest = line.split("pid=").nth(1)?;
+                rest.split_whitespace().next()?.parse().ok()
+            })
+            .collect()
+    }
+
+    /// Stop every daemon the log names and wait until they are gone.
+    pub fn stop(&self) {
+        for pid in self.serving_pids() {
+            terminate(pid);
+        }
+    }
+
+    /// End every daemon the log names with no chance to clean up, as a
+    /// crash would.
+    pub fn crash(&self) {
+        for pid in self.serving_pids() {
+            kill_hard(pid);
+        }
+    }
+}
+
+impl Drop for PrivateDaemon {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(unix)]
+fn terminate(pid: u32) {
+    let pid = libc::pid_t::try_from(pid).expect("a logged pid fits pid_t");
+    // SAFETY: signalling a pid this test's own daemon logged.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // SAFETY: signal 0 only probes.
+    while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn kill_hard(pid: u32) {
+    let pid = libc::pid_t::try_from(pid).expect("a logged pid fits pid_t");
+    // SAFETY: signalling a pid this test's own daemon logged.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+}
+
+#[cfg(windows)]
+fn terminate(pid: u32) {
+    kill_hard(pid);
+}
+
+/// Windows ends a process only by force.
+#[cfg(windows)]
+fn kill_hard(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .output();
+}
+
+/// A temporary directory a test's children use as (or under) their home:
+/// it stops the daemons they started before the directory goes, so no test
+/// leaves one running.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub struct TempDir(tempfile::TempDir);
+
+/// [`tempfile::tempdir`] with the daemon reaping of [`TempDir`].
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn tempdir() -> std::io::Result<TempDir> {
+    tempfile::tempdir().map(TempDir)
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = tempfile::TempDir;
+
+    fn deref(&self) -> &tempfile::TempDir {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // A test seals its child's home as the directory itself, as
+        // `stow-home` under it, or as `stow-home` under one of its project
+        // directories.
+        let root = self.0.path();
+        let mut homes = vec![root.to_path_buf(), root.join("stow-home")];
+        for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                homes.push(entry.path().join("stow-home"));
+            }
+        }
+        for home in homes {
+            drop(PrivateDaemon::in_home(&home));
         }
     }
 }

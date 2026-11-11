@@ -10,14 +10,8 @@
 use std::ffi::OsString;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::os_bytes;
-
-/// Largest frame either side accepts. A rustc command line is a few
-/// kilobytes; the cap exists so a confused peer cannot ask for an
-/// allocation.
-const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 
 /// What the facade sends.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -37,6 +31,10 @@ pub enum Request {
     /// sent it to run. Answered with [`Answer::Received`] once the object
     /// is snapshotted; the store and its records follow the answer.
     CcCompiled(CcCompiled),
+    /// Whether the build's C/C++ object cache is on. Asked before the
+    /// wrapper spends the compiler on a cache key. Answered with
+    /// [`Answer::CcPolicy`].
+    CcPolicy,
 }
 
 impl Request {
@@ -157,8 +155,6 @@ impl InvocationEnv {
 /// One rustc invocation as the facade received it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Plan {
-    /// Proves the sender is part of this build; checked on every frame.
-    pub token: String,
     /// The real rustc cargo asked for.
     pub executable: Vec<u8>,
     /// Everything after the executable, in order.
@@ -171,8 +167,6 @@ pub struct Plan {
 /// supervisor answers it with a receipt that precedes its bookkeeping.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Compiled {
-    /// Proves the sender is part of this build; checked on every frame.
-    pub token: String,
     /// Whether rustc exited successfully.
     pub success: bool,
     /// How long rustc ran, in milliseconds: the compile time a later local
@@ -185,8 +179,6 @@ pub struct Compiled {
 /// command line.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CcLookup {
-    /// Proves the sender is part of this build; checked on every frame.
-    pub token: String,
     /// The object's cache key.
     pub cache_key: String,
 }
@@ -194,8 +186,6 @@ pub struct CcLookup {
 /// The wrapper reporting the compile a [`CcLookup`] miss sent it to run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CcCompiled {
-    /// Proves the sender is part of this build; checked on every frame.
-    pub token: String,
     /// The key the miss was for.
     pub cache_key: String,
     /// The compiler's output file, OS-encoded like the argv: the object
@@ -208,14 +198,8 @@ pub struct CcCompiled {
 impl CcCompiled {
     /// Build a report for this compile.
     #[must_use]
-    pub fn new(
-        token: String,
-        cache_key: String,
-        output_path: &std::path::Path,
-        success: bool,
-    ) -> Self {
+    pub fn new(cache_key: String, output_path: &std::path::Path, success: bool) -> Self {
         Self {
-            token,
             cache_key,
             output_path: os_bytes::encode(output_path.as_os_str()),
             success,
@@ -319,6 +303,11 @@ pub enum Answer {
     /// The object cache does not hold it: the wrapper runs the real
     /// compiler and then sends [`CcCompiled`].
     CcMiss,
+    /// The answer to [`Request::CcPolicy`].
+    CcPolicy {
+        /// The build's C/C++ object cache is on.
+        enabled: bool,
+    },
     /// The supervisor could not answer. The facade fails the build with
     /// this message rather than quietly compiling without the cache.
     Failed {
@@ -330,14 +319,8 @@ pub enum Answer {
 impl Plan {
     /// Build a plan for this invocation.
     #[must_use]
-    pub fn new(
-        token: String,
-        executable: &std::ffi::OsStr,
-        args: &[OsString],
-        env: InvocationEnv,
-    ) -> Self {
+    pub fn new(executable: &std::ffi::OsStr, args: &[OsString], env: InvocationEnv) -> Self {
         Self {
-            token,
             executable: os_bytes::encode(executable),
             args: args.iter().map(|arg| os_bytes::encode(arg)).collect(),
             env,
@@ -363,141 +346,46 @@ impl Plan {
     }
 }
 
-/// Write one length-prefixed JSON frame.
-///
-/// # Errors
-///
-/// Serialization failures and the transport's own write errors.
-pub async fn write_frame<W, T>(writer: &mut W, message: &T) -> Result<(), String>
-where
-    W: AsyncWrite + Unpin + Send,
-    T: Serialize + Sync,
-{
-    let body = serde_json::to_vec(message).map_err(|error| format!("encode frame: {error}"))?;
-    let length = u32::try_from(body.len())
-        .map_err(|_| format!("frame of {} bytes exceeds the wire limit", body.len()))?;
-    if length > MAX_FRAME_BYTES {
-        return Err(format!("frame of {length} bytes exceeds the wire limit"));
-    }
-    writer
-        .write_all(&length.to_le_bytes())
-        .await
-        .map_err(|error| format!("write frame length: {error}"))?;
-    writer
-        .write_all(&body)
-        .await
-        .map_err(|error| format!("write frame body: {error}"))?;
-    writer
-        .flush()
-        .await
-        .map_err(|error| format!("flush frame: {error}"))
-}
-
-/// Read one length-prefixed JSON frame. `Ok(None)` is a clean end of
-/// stream — the peer closed between frames.
-///
-/// # Errors
-///
-/// A truncated frame, an over-long frame, and malformed JSON.
-pub async fn read_frame<R, T>(reader: &mut R) -> Result<Option<T>, String>
-where
-    R: AsyncRead + Unpin + Send,
-    T: serde::de::DeserializeOwned,
-{
-    let mut length_bytes = [0u8; 4];
-    match reader.read_exact(&mut length_bytes).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(format!("read frame length: {error}")),
-    }
-    let length = u32::from_le_bytes(length_bytes);
-    if length > MAX_FRAME_BYTES {
-        return Err(format!("peer announced a {length}-byte frame"));
-    }
-    let mut body = vec![0u8; length as usize];
-    reader
-        .read_exact(&mut body)
-        .await
-        .map_err(|error| format!("read frame body: {error}"))?;
-    serde_json::from_slice(&body)
-        .map(Some)
-        .map_err(|error| format!("decode frame: {error}"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
 
-    use super::{Answer, ArtifactNotifications, Plan, Request, read_frame, write_frame};
+    use super::{Answer, ArtifactNotifications, Plan, Request};
 
-    #[tokio::test]
-    async fn a_plan_round_trips_through_a_frame() {
+    /// The messages cross a process boundary as JSON.
+    fn round_trip<T: serde::Serialize + serde::de::DeserializeOwned>(message: &T) -> T {
+        serde_json::from_slice(&serde_json::to_vec(message).expect("encode")).expect("decode")
+    }
+
+    #[test]
+    fn a_plan_round_trips() {
         let plan = Plan::new(
-            "token".to_owned(),
             std::ffi::OsStr::new("/usr/bin/rustc"),
             &[OsString::from("--crate-name"), OsString::from("serde")],
             super::InvocationEnv::for_tests(),
         );
-        let mut buffer = Vec::new();
-        write_frame(&mut buffer, &Request::Plan(plan.clone()))
-            .await
-            .expect("write");
-        let decoded: Request = read_frame(&mut buffer.as_slice())
-            .await
-            .expect("read")
-            .expect("a frame");
-        assert_eq!(decoded, Request::Plan(plan.clone()));
+        let decoded = round_trip(&Request::Plan(plan.clone()));
+        assert_eq!(decoded, Request::Plan(plan));
         let Request::Plan(decoded) = decoded else {
-            panic!("a plan frame decodes as a plan");
+            panic!("a plan decodes as a plan");
         };
         assert_eq!(decoded.executable().expect("executable"), "/usr/bin/rustc");
         assert_eq!(decoded.args().expect("args"), vec!["--crate-name", "serde"]);
     }
 
-    /// A peer that closes between frames is not an error: that is how a
-    /// facade that got its answer disconnects.
-    #[tokio::test]
-    async fn an_empty_stream_is_a_clean_end() {
-        let decoded: Option<Answer> = read_frame(&mut [].as_slice()).await.expect("read");
-        assert!(decoded.is_none());
-    }
-
     /// The artifact-notification lines a served unit owes cargo ride the
     /// answer itself (stow#633).
-    #[tokio::test]
-    async fn a_served_answer_round_trips_its_notifications() {
+    #[test]
+    fn a_served_answer_round_trips_its_notifications() {
         let lines = ArtifactNotifications(vec![
             r#"{"$message_type":"artifact","artifact":"/tmp/out/libserde-abc.rmeta","emit":"metadata"}"#
                 .to_owned(),
             r#"{"$message_type":"artifact","artifact":"/tmp/out/libserde-abc.rlib","emit":"link"}"#
                 .to_owned(),
         ]);
-        let mut buffer = Vec::new();
-        write_frame(&mut buffer, &Answer::Served(lines.clone()))
-            .await
-            .expect("write");
-        let decoded: Answer = read_frame(&mut buffer.as_slice())
-            .await
-            .expect("read")
-            .expect("a frame");
-        assert_eq!(decoded, Answer::Served(lines));
-    }
-
-    /// A frame cut in half is an error, not a clean end — the difference
-    /// decides whether the build fails or silently loses the cache.
-    #[tokio::test]
-    async fn a_truncated_frame_is_an_error() {
-        let mut buffer = Vec::new();
-        write_frame(
-            &mut buffer,
-            &Answer::Served(ArtifactNotifications::default()),
-        )
-        .await
-        .expect("write");
-        buffer.truncate(buffer.len() - 1);
-        let error = read_frame::<_, Answer>(&mut buffer.as_slice())
-            .await
-            .expect_err("a truncated frame must not read as a clean end");
-        assert!(error.contains("read frame body"), "{error}");
+        assert_eq!(
+            round_trip(&Answer::Served(lines.clone())),
+            Answer::Served(lines)
+        );
     }
 }

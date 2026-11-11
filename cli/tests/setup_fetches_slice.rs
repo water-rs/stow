@@ -352,10 +352,10 @@ fn plain_build(
     reason = "one linear narrative: fill, sign, serve, setup, build"
 )]
 fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
-    let fill_cache = tempfile::tempdir().expect("fill cache");
-    let tools = tempfile::tempdir().expect("tools dir");
+    let dir = support::tempdir().expect("temp dir");
+    let cargo_home = support::tempdir().expect("cargo home");
+    let fill_cache = support::tempdir().expect("fill cache");
+    let tools = support::tempdir().expect("tools dir");
     write_fixture(dir.path(), cargo_home.path(), "cfg-if = \"1\"\n");
     let shim = wrapper_shim(tools.path());
 
@@ -590,7 +590,7 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
 
     // `stow setup` against the mock stack: writes the cargo wiring and
     // ends by fetching the host slice — the fetch must succeed.
-    let cache = tempfile::tempdir().expect("serving cache");
+    let cache = support::tempdir().expect("serving cache");
     let mut setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     setup
         .arg("setup")

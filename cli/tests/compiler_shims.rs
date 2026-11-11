@@ -95,7 +95,7 @@ fn resolved_cc(config: &toml::Value) -> String {
 /// shims and no second install re-points them (stow#645).
 #[test]
 fn the_shims_live_under_the_cargo_home() {
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = support::tempdir().expect("temp dir");
     let cargo_home = dir.path().join("cargo-home");
     let config = setup_in(dir.path());
     let rustc_wrapper = config
@@ -117,7 +117,7 @@ fn the_shims_live_under_the_cargo_home() {
 
 #[test]
 fn cc_is_invoked_with_compiler_arguments_only() {
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = support::tempdir().expect("temp dir");
     let config = setup_in(dir.path());
 
     let recorded = env_value(&config, "STOW_REAL_CC").map(str::to_owned);
@@ -182,7 +182,7 @@ fn cc_is_invoked_with_compiler_arguments_only() {
 
 #[test]
 fn the_launcher_and_the_compilers_are_three_different_shims() {
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = support::tempdir().expect("temp dir");
     let config = setup_in(dir.path());
 
     let cc = scoped_env_value(&config, "CC");
@@ -201,7 +201,7 @@ fn the_launcher_and_the_compilers_are_three_different_shims() {
 
 #[test]
 fn an_explicit_toolchain_survives_setup() {
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = support::tempdir().expect("temp dir");
     let cargo_home = dir.path().join("cargo-home");
     let mut setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     setup

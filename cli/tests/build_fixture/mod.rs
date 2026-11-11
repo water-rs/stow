@@ -179,6 +179,39 @@ fn run_stow_build(
     env: &[(&str, &str)],
     isolation_off: bool,
 ) -> Output {
+    stow_build_command(
+        dir,
+        args,
+        edge_url,
+        registry_url,
+        cache_dir,
+        cargo_home,
+        target_dir,
+        env,
+        isolation_off,
+    )
+    .output()
+    .expect("run stow-cli build")
+}
+
+/// The hermetic `stow build` command [`stow_build_in_with_env`] runs, for
+/// a test that spawns it and watches it while it runs.
+#[allow(
+    dead_code,
+    clippy::too_many_arguments,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn stow_build_command(
+    dir: &Path,
+    args: &[&str],
+    edge_url: &str,
+    registry_url: &str,
+    cache_dir: &Path,
+    cargo_home: &Path,
+    target_dir: &Path,
+    env: &[(&str, &str)],
+    isolation_off: bool,
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     hermetic_stow_env(&mut command, edge_url, cache_dir, &fixture_home(dir));
     // Isolation is not what these builds test, and the default level is
@@ -207,7 +240,7 @@ fn run_stow_build(
         .env("NO_COLOR", "1")
         .env("CARGO_TERM_COLOR", "never");
     command.envs(env.iter().copied());
-    command.output().expect("run stow-cli build")
+    command
 }
 
 /// Copy the directory tree at `from` into `to`.

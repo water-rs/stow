@@ -47,7 +47,7 @@ pub struct SessionFacts {
     /// What a refused request does to the build.
     pub refusal_policy: RefusalPolicy,
     /// How the build tells a crates.io package from another registry's.
-    pub registry_sources: crate::RegistrySources,
+    pub(crate) registry_sources: crate::RegistrySources,
     /// What the build's analysis knew before cargo started.
     pub seed: Seed,
     /// The extra rustc arguments appended to every unit — the workspace

@@ -19,6 +19,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use stow_types::error::{Context, Result};
+use tracing::Instrument as _;
 
 pub use facts::{Seed, SessionFacts};
 pub use id::{SessionDir, SessionId};
@@ -29,7 +30,9 @@ use crate::config::StowConfig;
 use crate::session_env::SessionEnv;
 use crate::supervisor::invocation::{Refusal, VerifiedInvocation};
 use crate::supervisor::protocol::InvocationEnv;
-use crate::supervisor::server::{Decision, Handler, InFlightUnits};
+use crate::supervisor::server::{
+    CONNECTION_DRAIN_BUDGET, Decision, Handler, InFlightUnits, Reports,
+};
 use crate::toolchain::BuildToolchain;
 use crate::{
     AnalysisFacts, BuildContext, Outcome, PostCompile, ResolutionDone, UnitOutcome,
@@ -40,7 +43,7 @@ use crate::{
 };
 
 /// What a session reports when its build ends.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionEnd {
     /// Every request the session refused under
     /// [`crate::supervisor::invocation::RefusalPolicy::FailBuild`], in the
@@ -53,8 +56,16 @@ pub struct SessionEnd {
 /// A build's session.
 #[derive(Debug)]
 pub struct Session {
+    id: SessionId,
+    /// Everything the session's tasks and requests record is recorded
+    /// under this span, which names the session: the daemon routes those
+    /// events to the driver that owns it.
+    span: tracing::Span,
     facts: Arc<SessionFacts>,
     dir: SessionDir,
+    /// The bookkeeping tasks the build's reports spawned, drained when the
+    /// session ends (stow#618, stow#1431).
+    reports: Reports,
     /// The build-scoped wrapper environment memo: one config, rustc probe
     /// pair and cache lease for the whole build.
     env_cache: WrapperEnvCache,
@@ -81,11 +92,12 @@ impl Session {
     /// The toolchain's files cannot be reopened, or the session directory
     /// cannot be created.
     pub(crate) async fn open(
+        id: SessionId,
         facts: SessionFacts,
         handles: &CacheDirHandles,
         sessions: &Path,
     ) -> Result<Arc<Self>> {
-        let id = SessionId::mint();
+        let span = tracing::info_span!(crate::daemon::events::SESSION_SPAN, session = %id);
         let env = SessionEnv::new(facts.environ.clone(), facts.cwd.clone());
         let toolchain = BuildToolchain::from_facts(facts.toolchain.clone(), &env)
             .await
@@ -148,6 +160,7 @@ impl Session {
             // is still running afterwards is warming a build that is
             // over; the plan path fetches on demand.
             Some(crate::cargo_cmd::spawn_build_enrichment(
+                span.clone(),
                 crate::cargo_cmd::BuildEnrichment {
                     project: facts.project.clone(),
                     env,
@@ -160,7 +173,7 @@ impl Session {
                     policy_ready: (!policy_ready.has_completed())
                         .then(|| crate::facade::ServeMapWaiters::new(Arc::clone(&policy_ready))),
                     resolution_done: resolution_done.clone(),
-                    slices: crate::index::SliceFetches::default(),
+                    slices: handles.slice_fetches(),
                 },
             ))
         } else {
@@ -171,8 +184,11 @@ impl Session {
             None
         };
         let session = Arc::new(Self {
+            id,
+            span: span.clone(),
             facts: Arc::new(facts),
             dir,
+            reports: Reports::default(),
             env_cache,
             ctx,
             resolution_done,
@@ -183,10 +199,31 @@ impl Session {
         // The probes and the cache lease overlap the build's start instead
         // of waiting for its first unit (stow#608).
         let warm = Arc::clone(&session);
-        tokio::spawn(async move {
-            warm.env_cache.base().await;
-        });
+        tokio::spawn(
+            async move {
+                warm.env_cache.base().await;
+            }
+            .instrument(span),
+        );
         Ok(session)
+    }
+
+    /// The session's id.
+    #[must_use]
+    pub const fn id(&self) -> SessionId {
+        self.id
+    }
+
+    /// The span everything done for this session is recorded under.
+    #[must_use]
+    pub const fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+
+    /// The bookkeeping tasks this session's reports spawn.
+    #[must_use]
+    pub const fn reports(&self) -> &Reports {
+        &self.reports
     }
 
     /// The signal that cargo's resolution is over: the first request that
@@ -206,16 +243,17 @@ impl Session {
         }
     }
 
-    /// End the build: stop the analysis, write the miss journal and remove
-    /// the session's directory. The caller drained the wrappers' own
-    /// bookkeeping first — the last unit's store and miss observation are
-    /// inside that tail (stow#618).
+    /// End the build: stop the analysis, drain the wrappers' bookkeeping —
+    /// the last unit's store and miss observation are inside that tail
+    /// (stow#618) — write the miss journal and remove the session's
+    /// directory.
     ///
     /// # Errors
     ///
     /// The session directory cannot be removed.
     pub(crate) async fn end(&self) -> Result<SessionEnd> {
         self.stop_enrichment().await;
+        self.reports.drain(CONNECTION_DRAIN_BUDGET).await;
         let journal_written = self.write_journal();
         let refusals = self
             .refusals
@@ -224,16 +262,33 @@ impl Session {
             .iter()
             .map(ToString::to_string)
             .collect();
+        self.remove_dir().await?;
+        Ok(SessionEnd {
+            refusals,
+            journal_written,
+        })
+    }
+
+    async fn remove_dir(&self) -> Result<()> {
         let dir = self.dir.path().to_owned();
         smol::unblock(move || {
             std::fs::remove_dir_all(&dir)
                 .wrap_err_with(|| format!("remove the session directory {}", dir.display()))
         })
-        .await?;
-        Ok(SessionEnd {
-            refusals,
-            journal_written,
-        })
+        .await
+    }
+
+    /// End a session whose driver went away: stop the analysis, let the
+    /// bookkeeping already running finish and remove the directory. No
+    /// journal is written — nothing is left to admit it.
+    ///
+    /// # Errors
+    ///
+    /// The session directory cannot be removed.
+    pub(crate) async fn abort(&self) -> Result<()> {
+        self.stop_enrichment().await;
+        self.reports.drain(CONNECTION_DRAIN_BUDGET).await;
+        self.remove_dir().await
     }
 
     /// The build's compile observations are its miss list (stow#317) — a
@@ -622,8 +677,11 @@ impl Session {
             parts.refusal_policy,
         );
         Arc::new(Self {
+            id,
+            span: tracing::Span::none(),
             facts: Arc::new(facts),
             dir: SessionDir::create(sessions, id).expect("create the session directory"),
+            reports: Reports::default(),
             env_cache: parts.env_cache,
             ctx: parts.ctx,
             resolution_done: parts.resolution_done,
@@ -767,10 +825,10 @@ mod tests {
                 .expect("decode the facts");
 
         let handles = CacheDirHandles::default();
-        let driver = Session::open(built, &handles, sessions.path())
+        let driver = Session::open(SessionId::mint(), built, &handles, sessions.path())
             .await
             .expect("open the driver-built session");
-        let remote = Session::open(received, &handles, sessions.path())
+        let remote = Session::open(SessionId::mint(), received, &handles, sessions.path())
             .await
             .expect("open the session from the received facts");
 
@@ -806,6 +864,7 @@ mod tests {
         for cache_dir in [first_dir.path(), second_dir.path()] {
             let handles = resources.handles_for(cache_dir);
             let session = Session::open(
+                SessionId::mint(),
                 facts(Some(config_in(cache_dir))).await,
                 &handles,
                 sessions.path(),

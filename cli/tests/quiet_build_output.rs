@@ -60,16 +60,16 @@ fn allowed_warn(line: &str) -> bool {
 /// artifact-notification JSON, no tracing below `warn`.
 #[test]
 fn a_served_build_prints_cargo_output_and_the_summary_only() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
+    let dir = support::tempdir().expect("temp dir");
+    let cargo_home = support::tempdir().expect("cargo home");
     write_fixture(dir.path(), cargo_home.path(), FIXTURE_DEPENDENCIES);
     stow_setup_in(dir.path(), cargo_home.path());
     let edge_url = refused_url();
     let registry_url = refused_url();
-    let cache = tempfile::tempdir().expect("cache dir");
+    let cache = support::tempdir().expect("cache dir");
 
     // First build: all misses, every unit stored locally.
-    let target_a = tempfile::tempdir().expect("target dir a");
+    let target_a = support::tempdir().expect("target dir a");
     let first = stow_build_in(
         dir.path(),
         &["build", "--offline"],
@@ -86,7 +86,7 @@ fn a_served_build_prints_cargo_output_and_the_summary_only() {
     );
 
     // Second build: the shared cache serves every dependency.
-    let target_b = tempfile::tempdir().expect("target dir b");
+    let target_b = support::tempdir().expect("target dir b");
     let second = stow_build_in(
         dir.path(),
         &["build", "--offline"],

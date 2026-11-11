@@ -1,10 +1,12 @@
-//! The handles sessions on one cache directory share.
+//! What sessions on one cache directory share, and what outlives a build.
 //!
 //! A config that crossed a process boundary carries none of the handles an
 //! opened one holds (they are not data), so the process that runs the
 //! session hands it its own. One set per cache directory: the state
 //! database is one pool per directory, and two sessions with different
-//! cache directories must never share a pool.
+//! cache directories must never share a pool. The verified index slices a
+//! session fetched are held here too, so the next build on the directory
+//! does not read them again.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,6 +15,7 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 
 use crate::config::StowConfig;
+use crate::index::{HeldSlices, SliceFetches};
 use crate::state_db::StateDb;
 
 /// The handles of one cache directory.
@@ -21,6 +24,7 @@ pub struct CacheDirHandles {
     state_db: StateDb,
     trust_material: Arc<OnceCell<Arc<crate::verify::TrustMaterial>>>,
     registry_http: Arc<OnceCell<stow_oci::RegistryHttp>>,
+    slices: HeldSlices,
 }
 
 impl CacheDirHandles {
@@ -29,6 +33,13 @@ impl CacheDirHandles {
         config.state_db = self.state_db.clone();
         config.trust_material = Arc::clone(&self.trust_material);
         config.registry_http = Arc::clone(&self.registry_http);
+    }
+
+    /// A slice memo for one build, backed by the slices this directory's
+    /// earlier builds fetched.
+    #[must_use]
+    pub fn slice_fetches(&self) -> SliceFetches {
+        SliceFetches::backed_by(self.slices.clone())
     }
 }
 
@@ -47,23 +58,6 @@ impl Resources {
             .entry(cache_dir.to_owned())
             .or_default()
             .clone()
-    }
-
-    /// A set whose handles for `config`'s cache directory are the ones
-    /// `config` already holds: a process that opened a state database for
-    /// its own use and now runs a session beside it keeps one pool.
-    #[must_use]
-    pub fn adopting(config: &StowConfig) -> Self {
-        let mut resources = Self::default();
-        resources.by_cache_dir.insert(
-            config.cache_dir.clone(),
-            CacheDirHandles {
-                state_db: config.state_db.clone(),
-                trust_material: Arc::clone(&config.trust_material),
-                registry_http: Arc::clone(&config.registry_http),
-            },
-        );
-        resources
     }
 }
 

@@ -366,11 +366,11 @@ fn spawn_pong_listener() -> (String, std::thread::JoinHandle<()>) {
 }
 
 struct ProbeEnv {
-    _dir: tempfile::TempDir,
-    _home: tempfile::TempDir,
-    _cargo_home: tempfile::TempDir,
-    _cache: tempfile::TempDir,
-    _target: tempfile::TempDir,
+    _dir: support::TempDir,
+    _home: support::TempDir,
+    _cargo_home: support::TempDir,
+    _cache: support::TempDir,
+    _target: support::TempDir,
     dir: PathBuf,
     home: PathBuf,
     cargo_home: PathBuf,
@@ -406,11 +406,11 @@ fn probe_env(with_macro: bool, net_target: &str) -> ProbeEnv {
 /// the fixture out in the workspace directory (given with the temporary
 /// HOME) before `stow setup` runs.
 fn sandbox_env(write: impl FnOnce(&Path, &Path)) -> ProbeEnv {
-    let dir = tempfile::tempdir().expect("workspace dir");
-    let home = tempfile::tempdir().expect("home dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
-    let cache = tempfile::tempdir().expect("cache dir");
-    let target = tempfile::tempdir().expect("target dir");
+    let dir = support::tempdir().expect("workspace dir");
+    let home = support::tempdir().expect("home dir");
+    let cargo_home = support::tempdir().expect("cargo home");
+    let cache = support::tempdir().expect("cache dir");
+    let target = support::tempdir().expect("target dir");
     std::fs::write(home.path().join("secret-token.txt"), "hunter2\n").expect("home secret");
     std::fs::create_dir_all(home.path().join(".ssh")).expect("ssh dir");
     std::fs::write(home.path().join(".ssh").join("id_ed25519"), "fake key\n")
@@ -950,7 +950,7 @@ fn write_c_fixture(dir: &Path, shm: &Path) {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_sandboxed_c_wrapper_never_opens_the_state_database() {
-    let cache = tempfile::tempdir().expect("cache dir");
+    let cache = support::tempdir().expect("cache dir");
     let shm = cache.path().join("state-v3.sqlite3-shm");
     let mut env = sandbox_env(|dir, _home| write_c_fixture(dir, &shm));
     // The fixture's cache is the one the shm path names.
@@ -982,8 +982,8 @@ fn a_sandboxed_c_wrapper_never_opens_the_state_database() {
 /// (stow#1441).
 #[cfg(target_os = "linux")]
 struct LauncherToolchain {
-    launcher_dir: tempfile::TempDir,
-    proxy_dir: tempfile::TempDir,
+    launcher_dir: support::TempDir,
+    proxy_dir: support::TempDir,
 }
 
 #[cfg(target_os = "linux")]
@@ -1003,11 +1003,11 @@ impl LauncherToolchain {
             "{} is not a native executable; run this test with the real cargo first on PATH",
             real_cargo.display()
         );
-        let proxy_dir = tempfile::tempdir().expect("proxy dir");
+        let proxy_dir = support::tempdir().expect("proxy dir");
         // A copy, not a link: the sandbox checks the path that is executed,
         // and a link would execute the real file in the user's toolchain.
         std::fs::copy(&real_cargo, proxy_dir.path().join("cargo")).expect("copy the cargo proxy");
-        let launcher_dir = tempfile::tempdir().expect("launcher dir");
+        let launcher_dir = support::tempdir().expect("launcher dir");
         let launcher = launcher_dir.path().join("cargo");
         std::fs::write(
             &launcher,

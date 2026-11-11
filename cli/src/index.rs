@@ -22,7 +22,7 @@ use std::io::Write as _;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_lite::StreamExt as _;
 use serde::{Deserialize, Serialize};
@@ -162,12 +162,60 @@ pub async fn ensure_slice(
 #[derive(Debug, Clone, Default)]
 pub struct SliceFetches {
     cells: Arc<std::sync::Mutex<BTreeMap<(String, String), SliceCell>>>,
+    /// The slices earlier builds on the same cache directory fetched, for a
+    /// process that outlives builds.
+    held: Option<HeldSlices>,
 }
 
 /// One slice's fetch, shared by every caller that asks for it.
 type SliceCell = Arc<tokio::sync::OnceCell<IndexSlice>>;
 
+/// The verified slices a long-lived process holds across builds of one
+/// cache directory, by `(target, rustc_version)`.
+///
+/// A held slice serves a later build for as long as the cached slice's
+/// pointer would have: inside `index_refresh_interval` of when this process
+/// obtained it, which is the rule [`ensure_slice`] serves a cached slice
+/// from disk by. Past that the next build asks the registry as it always
+/// did, and holds the answer.
+#[derive(Debug, Clone, Default)]
+pub struct HeldSlices {
+    slices: Arc<std::sync::Mutex<BTreeMap<(String, String), HeldSlice>>>,
+}
+
+/// A slice and when this process obtained it.
+type HeldSlice = (std::time::Instant, IndexSlice);
+
+impl HeldSlices {
+    fn fresh(&self, key: &(String, String), within: Duration) -> Option<IndexSlice> {
+        let slices = self
+            .slices
+            .lock()
+            .expect("the held slices' lock is never held across a panic");
+        slices
+            .get(key)
+            .filter(|(obtained, _)| obtained.elapsed() < within)
+            .map(|(_, slice)| slice.clone())
+    }
+
+    fn hold(&self, key: (String, String), slice: IndexSlice) {
+        self.slices
+            .lock()
+            .expect("the held slices' lock is never held across a panic")
+            .insert(key, (std::time::Instant::now(), slice));
+    }
+}
+
 impl SliceFetches {
+    /// A memo for one build whose fetches also read and fill `held`.
+    #[must_use]
+    pub fn backed_by(held: HeldSlices) -> Self {
+        Self {
+            held: Some(held),
+            ..Self::default()
+        }
+    }
+
     /// [`ensure_slice`], memoized: concurrent callers for one slice share
     /// the one fetch, and fetches of different slices run side by side.
     ///
@@ -180,20 +228,28 @@ impl SliceFetches {
         target: &str,
         rustc_version: &str,
     ) -> Result<IndexSlice, SliceFetchError> {
+        let key = (target.to_owned(), rustc_version.to_owned());
         let cell = {
             let mut cells = self
                 .cells
                 .lock()
                 .expect("the slice memo's lock is never held across a panic");
-            Arc::clone(
-                cells
-                    .entry((target.to_owned(), rustc_version.to_owned()))
-                    .or_default(),
-            )
+            Arc::clone(cells.entry(key.clone()).or_default())
         };
-        cell.get_or_try_init(|| ensure_slice(config, target, rustc_version))
-            .await
-            .cloned()
+        cell.get_or_try_init(|| async {
+            if let Some(held) = &self.held
+                && let Some(slice) = held.fresh(&key, config.index_refresh_interval)
+            {
+                return Ok(slice);
+            }
+            let slice = ensure_slice(config, target, rustc_version).await?;
+            if let Some(held) = &self.held {
+                held.hold(key.clone(), slice.clone());
+            }
+            Ok(slice)
+        })
+        .await
+        .cloned()
     }
 }
 
@@ -1277,6 +1333,65 @@ mod tests {
             refetched.manifest_digest.as_deref(),
             Some("sha256:bbbb"),
             "a second memo fetches for itself"
+        );
+    }
+
+    /// A process that outlives builds holds the slice one build fetched:
+    /// the next build's memo answers from it inside the refresh interval
+    /// without reading the cache again, and fetches for itself once the
+    /// interval has passed.
+    #[tokio::test]
+    async fn a_held_slice_serves_the_next_build_within_the_refresh_interval() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let dir = slice_dir(&config, TARGET, RUSTC);
+        let seed = |digest: &'static str, c_metadata: &'static str| {
+            let dir = dir.clone();
+            async move {
+                let blob = stow_shim::encode_index(&test_index(vec![test_row(c_metadata)]))
+                    .expect("encode");
+                commit_slice(&dir, digest, blob, 1).await.expect("commit");
+                write_test_pointer(
+                    &dir,
+                    SlicePointer {
+                        manifest_digest: digest.to_owned(),
+                        fetched_at: now_secs(),
+                        row_count: 1,
+                    },
+                )
+                .await;
+            }
+        };
+
+        let held = HeldSlices::default();
+        seed("sha256:aaaa", "aaaa").await;
+        let first = SliceFetches::backed_by(held.clone())
+            .ensure(&config, TARGET, RUSTC)
+            .await
+            .expect("fetch");
+        assert_eq!(first.manifest_digest.as_deref(), Some("sha256:aaaa"));
+
+        seed("sha256:bbbb", "bbbb").await;
+        let next_build = SliceFetches::backed_by(held.clone())
+            .ensure(&config, TARGET, RUSTC)
+            .await
+            .expect("held");
+        assert_eq!(
+            next_build.manifest_digest.as_deref(),
+            Some("sha256:aaaa"),
+            "the next build is answered from the slice the process holds"
+        );
+
+        let mut eager = test_config(tempdir.path());
+        eager.index_refresh_interval = Duration::ZERO;
+        let refetched = SliceFetches::backed_by(held)
+            .ensure(&eager, TARGET, RUSTC)
+            .await
+            .expect("refetch");
+        assert_eq!(
+            refetched.manifest_digest.as_deref(),
+            Some("sha256:bbbb"),
+            "a zero interval holds nothing past the build that fetched it"
         );
     }
 
