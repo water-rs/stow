@@ -3991,7 +3991,10 @@ struct CargoRunSetup {
     launch: CargoLaunch,
     cache_policy_path: Option<PathBuf>,
     serve_map_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
-    serve_map_path: Option<PathBuf>,
+    /// The side that replaces the build's serve map; `None` when the
+    /// build started without one.
+    serve_map_writer: Option<crate::facade::ServeMapWriter>,
+    serve_map: crate::facade::ServeMapView,
     serve_waiters: Option<crate::facade::ServeMapWaiters>,
 }
 
@@ -4013,23 +4016,24 @@ async fn prepare_cargo_run(plan: &CargoRunPlan<'_>) -> stow_types::error::Result
         .instrument(tracing::debug_span!("stow.precargo.policy_dir"))
         .await;
 
-    // The serve map lands as a file — small enough to write atomically
-    // and large enough that an env blob on every rustc process's
-    // environment was the wrong transport (stow#347). A map still
-    // `pending` arms the waiters' signal alongside: facades whose units
-    // it cannot cover ask the supervisor to hold them until the final
-    // write lands rather than compiling what the in-flight fetch may
-    // cover.
+    // The serve map lives in the supervisor's memory: the plan path reads
+    // it, and the enrichment replaces it (stow#347). A map still
+    // `pending` arms the waiters' signal alongside: plans for units it
+    // cannot cover hold until the final write lands rather than
+    // compiling what the in-flight fetch may cover.
     let serve_map_ready = std::sync::Arc::new(crate::facade::ServeMapSignal::pending());
-    let (serve_map_path, mut serve_waiters) =
-        write_initial_serve_map(scratch.path(), plan.servable_units, &serve_map_ready)
-            .instrument(tracing::debug_span!("stow.precargo.serve_map_write"))
-            .await?;
+    let mut serve_waiters = plan
+        .servable_units
+        .filter(|map| map.pending)
+        .map(|_| crate::facade::ServeMapWaiters::new(std::sync::Arc::clone(&serve_map_ready)));
+    let (serve_map_writer, serve_map) = {
+        let (writer, view) = crate::facade::serve_map_cell(plan.servable_units.cloned());
+        (plan.servable_units.map(|_| writer), view)
+    };
     arm_or_settle_serve_map_ready(plan, plan.config, &serve_map_ready, &mut serve_waiters);
     let envs = collect_wrapper_env(
         plan,
         &wrappers,
-        serve_map_path.as_deref(),
         cache_policy_path.as_deref(),
         scratch.path(),
     )
@@ -4041,7 +4045,8 @@ async fn prepare_cargo_run(plan: &CargoRunPlan<'_>) -> stow_types::error::Result
         launch: CargoLaunch { argv, envs },
         cache_policy_path,
         serve_map_ready,
-        serve_map_path,
+        serve_map_writer,
+        serve_map,
         serve_waiters,
     })
 }
@@ -4066,7 +4071,8 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         launch,
         cache_policy_path,
         serve_map_ready,
-        serve_map_path,
+        serve_map_writer,
+        serve_map,
         serve_waiters,
     } = setup;
 
@@ -4096,6 +4102,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
                 cache: config
                     .map_or_else(crate::config::CacheLayers::default, |config| config.cache),
                 analysis: std::sync::Arc::clone(&analysis_cell),
+                serve_map,
                 serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
                 policy_ready: std::sync::Arc::clone(&policy_ready),
                 in_flight: in_flight.clone(),
@@ -4121,8 +4128,8 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
 
     // The full graph analysis — the verified index fetch and the live
     // `--unit-graph` resolve — runs while cargo builds rather than in
-    // front of it: its answers land in the serve map file the facades
-    // read and the cell the supervisor's plan path reads, mid-build
+    // front of it: its answers land in the serve map and the cell the
+    // supervisor's plan path reads, mid-build
     // (stow#347).
     let enricher = if plan.deferred_analysis
         && let Some(config) = config
@@ -4138,7 +4145,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
             config: config.clone(),
             circuit: handler.circuit(),
             cell: analysis_cell,
-            map_path: serve_map_path.clone(),
+            map: serve_map_writer,
             policy_dir: cache_policy_path.clone(),
             readiness: serve_waiters,
             policy_ready: (!policy_ready.has_completed())
@@ -4618,8 +4625,8 @@ async fn stop_build_task(task: tokio::task::JoinHandle<()>) {
 }
 
 /// The `STOW_*` contract a cargo run's wrappers read: the toolchain
-/// shims, the resolved config blob, the graph-fact file paths, the
-/// serve map file path the facades answer from, and the cache policy —
+/// shims, the resolved config blob, the graph-fact file paths and the
+/// cache policy —
 /// everything a wrapper would otherwise load itself on every invocation
 /// (stow#347). Build-sized payloads travel as files: one environment
 /// string past Linux's `MAX_ARG_STRLEN` fails the whole `execve`, which
@@ -4630,20 +4637,11 @@ async fn stop_build_task(task: tokio::task::JoinHandle<()>) {
 async fn collect_wrapper_env(
     plan: &CargoRunPlan<'_>,
     wrappers: &crate::commands::WrapperCommands,
-    serve_map_path: Option<&Path>,
     cache_policy_path: Option<&Path>,
     scratch: &Path,
 ) -> stow_types::error::Result<Vec<(OsString, OsString)>> {
     let mut envs = Vec::new();
-    export_wrapper_env(
-        &mut envs,
-        plan,
-        wrappers,
-        serve_map_path,
-        cache_policy_path,
-        scratch,
-    )
-    .await?;
+    export_wrapper_env(&mut envs, plan, wrappers, cache_policy_path, scratch).await?;
     Ok(envs)
 }
 
@@ -4694,7 +4692,6 @@ async fn export_wrapper_env(
     envs: &mut Vec<(OsString, OsString)>,
     plan: &CargoRunPlan<'_>,
     wrappers: &crate::commands::WrapperCommands,
-    serve_map_path: Option<&Path>,
     cache_policy_path: Option<&Path>,
     scratch_dir: &Path,
 ) -> stow_types::error::Result<()> {
@@ -4763,12 +4760,6 @@ async fn export_wrapper_env(
             OsString::from(path.as_os_str()),
         ));
     }
-    if let Some(path) = serve_map_path {
-        envs.push((
-            OsString::from(crate::facade::STOW_SERVE_MAP_FILE_ENV),
-            OsString::from(path.as_os_str()),
-        ));
-    }
     if let Some(path) = cache_policy_path {
         let (key, value) = cache_policy::cache_policy_env(path);
         envs.push((OsString::from(key), value));
@@ -4783,7 +4774,7 @@ async fn export_wrapper_env(
 }
 
 /// A missing slice is final only once the build's fetch has settled —
-/// the same settling `AwaitServeMap` marks — so `serve_map_ready` must
+/// the same settling a pending serve map's plans wait on — so `serve_map_ready` must
 /// complete in lockstep with that fetch or a lookup waits forever
 /// (stow#735). When the lite pass produced no map the enrichment still
 /// fetches the consumer slices mid-build, so the guard rides with it;
@@ -4809,33 +4800,6 @@ fn arm_or_settle_serve_map_ready(
     } else {
         serve_map_ready.complete();
     }
-}
-
-/// The serve map a build starts cargo with, written atomically: the
-/// facades read this file on every rustc invocation, so it lands in the
-/// build's scratch directory complete or not at all. The build's
-/// enrichment rewrites the same path with the full analysis's map
-/// (stow#347).
-async fn write_initial_serve_map(
-    scratch_dir: &Path,
-    map: Option<&crate::facade::ServeMap>,
-    serve_map_ready: &std::sync::Arc<crate::facade::ServeMapSignal>,
-) -> stow_types::error::Result<(Option<PathBuf>, Option<crate::facade::ServeMapWaiters>)> {
-    let Some(map) = map else {
-        return Ok((None, None));
-    };
-    // Arm the waiters' guard before the map that announces it: a facade
-    // that reads `pending` asks the supervisor to hold it — the signal
-    // exists by construction, so there is no bind to fail here. The
-    // guard arms on `pending` alone: an empty map's facades wait on
-    // nothing (`map.names` is empty either way), but `pending` still
-    // means a slice fetch is in flight, and the slice memo's wait rides
-    // the same signal (stow#735).
-    let waiters = map
-        .pending
-        .then(|| crate::facade::ServeMapWaiters::new(std::sync::Arc::clone(serve_map_ready)));
-    let path = write_build_json_table(scratch_dir, "serve-map", map.clone()).await?;
-    Ok((Some(path), waiters))
 }
 
 /// One build-scoped JSON table, `{name}.json` in the build's scratch
@@ -4885,18 +4849,20 @@ async fn write_build_json_file(
 
 /// What the in-build enrichment needs: the project and config the full
 /// analysis resolves, and the three places its answer lands — the
-/// supervisor's fact cell, the serve map file the facades read, and the
+/// supervisor's fact cell, the serve map its plans read, and the
 /// policy directory the allow markers gate (stow#347).
 struct BuildEnrichment {
     project: ProjectFacts,
     env: SessionEnv,
     config: StowConfig,
     cell: std::sync::Arc<std::sync::OnceLock<crate::AnalysisFacts>>,
-    map_path: Option<PathBuf>,
+    /// Replaces the build's serve map; `None` for a build that started
+    /// without one.
+    map: Option<crate::facade::ServeMapWriter>,
     policy_dir: Option<PathBuf>,
     /// The build fetch's completion guard: held until the consumer
-    /// slices have settled — its drop releases the facades waiting on
-    /// `AwaitServeMap` and the slice memo's lookups, whichever way the
+    /// slices have settled — its drop releases the plans waiting on a
+    /// pending serve map and the slice memo's lookups, whichever way the
     /// analysis ends (stow#347, stow#735).
     readiness: Option<crate::facade::ServeMapWaiters>,
     /// The policy gate's completion guard: dropped right after the
@@ -5085,10 +5051,10 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     // (the cached slices now exist) and the guard's drop releases the
     // waiters; an early return releases them the same way (stow#347).
     if work.readiness.is_some() {
-        if let Some(map_path) = &work.map_path {
+        if let Some(map) = &work.map {
             let lite =
                 analyze_workspace_prediction_lite(&work.project, &work.env, &work.config).await?;
-            write_build_json_file(map_path, lite.servable_units.unwrap_or_default()).await?;
+            map.publish(lite.servable_units.unwrap_or_default());
         }
         drop(work.readiness.take());
     }
@@ -5104,9 +5070,8 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
         Some(&work.resolution_done),
     )
     .await?;
-    if let Some(map_path) = &work.map_path {
-        let map = analysis.servable_units.clone().unwrap_or_default();
-        write_build_json_file(map_path, map).await?;
+    if let Some(map) = &work.map {
+        map.publish(analysis.servable_units.clone().unwrap_or_default());
     }
     // The coarse commit stayed incomplete — no lockfile and no cached
     // graph to bound it — so the analysis's exact allow set is the
@@ -6547,7 +6512,6 @@ mod tests {
             &mut envs,
             &plan,
             &wrappers,
-            None,
             None,
             cache.path(),
         ))

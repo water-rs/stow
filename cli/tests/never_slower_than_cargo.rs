@@ -688,8 +688,6 @@ fn a_tripped_circuit_still_serves_local_entries() {
 struct StubSupervision {
     plans: std::collections::BTreeMap<String, usize>,
     compiled: std::collections::BTreeMap<String, usize>,
-    observed_marks: std::collections::BTreeMap<String, usize>,
-    observed_reports: std::collections::BTreeMap<String, usize>,
     /// Connections accepted but not yet drained to their close — the
     /// count [`drain_stub`] waits out before the census is read.
     open_connections: usize,
@@ -705,15 +703,14 @@ struct StubSupervisor {
 }
 
 /// The crate a supervisor frame compiled: `--crate-name`'s value in the
-/// decoded argv. Frames with no argv — `Compiled`, `AwaitServeMap` —
-/// name no crate.
+/// decoded argv. Frames with no argv — `Compiled` — name no crate.
 fn frame_crate_name(request: &Request) -> String {
-    let args = match request {
-        Request::Plan(plan) => plan.args(),
-        Request::Observed(observed) => observed.args(),
-        _ => return String::new(),
-    }
-    .expect("the facade's args decode on this platform");
+    let Request::Plan(plan) = request else {
+        return String::new();
+    };
+    let args = plan
+        .args()
+        .expect("the facade's args decode on this platform");
     args.iter()
         .position(|arg| arg == "--crate-name")
         .and_then(|index| args.get(index + 1))
@@ -721,8 +718,8 @@ fn frame_crate_name(request: &Request) -> String {
         .unwrap_or_default()
 }
 
-/// One stub-supervisor connection: plans are told to compile, reports
-/// get a receipt, marks need no answer. Every frame is counted.
+/// One stub-supervisor connection: plans are told to compile and reports
+/// get a receipt. Every frame is counted.
 fn serve_stub_connection(
     mut stream: std::net::TcpStream,
     counts: &std::sync::Mutex<StubSupervision>,
@@ -752,7 +749,7 @@ fn serve_stub_connection(
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
                 ticket += 1;
-                Some(Answer::Compile { ticket })
+                Answer::Compile { ticket }
             }
             Request::Compiled(_) => {
                 counts
@@ -762,29 +759,13 @@ fn serve_stub_connection(
                     .entry(crate_name)
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
-                Some(Answer::Received)
+                Answer::Received
             }
-            Request::Observed(observed) => {
-                let mut counts = counts.lock().expect("frame counts");
-                let bucket = if observed.success.is_some() {
-                    &mut counts.observed_reports
-                } else {
-                    &mut counts.observed_marks
-                };
-                bucket
-                    .entry(crate_name)
-                    .and_modify(|count| *count += 1)
-                    .or_insert(1);
-                // A report is answered with a receipt, a mark is not.
-                observed.success.map(|_| Answer::Received)
-            }
-            Request::AwaitServeMap(_) => None,
             // The counted fixture compiles no C: a C wrapper's frames get
             // the answer that costs the build nothing.
-            Request::CcLookup(_) => Some(Answer::CcMiss),
-            Request::CcCompiled(_) => Some(Answer::Received),
+            Request::CcLookup(_) => Answer::CcMiss,
+            Request::CcCompiled(_) => Answer::Received,
         };
-        let Some(answer) = answer else { continue };
         let body = serde_json::to_vec(&answer).expect("encode answer");
         let length = u32::try_from(body.len()).expect("frame body under the wire limit");
         if stream
@@ -917,14 +898,13 @@ fn unreachable_edge_url() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
-/// The all-miss case issue stow#347 measured: the serve map is present
-/// and covers nothing, so every registry compile still needs its mark and
-/// report — but none of them may wait on a plan round trip. The frame
-/// census is the regression signal a wall clock cannot catch: an
-/// uncovered unit planning again is the per-invocation overhead the issue
-/// traced, multiplied across every compile the build runs.
+/// Every rustc invocation is one plan frame and, once told to compile,
+/// one report: the frame census is the regression signal a wall clock
+/// cannot catch — a unit that sends more frames than that is the
+/// per-invocation overhead multiplied across every compile the build
+/// runs.
 #[test]
-fn an_all_miss_build_never_waits_on_the_supervisor() {
+fn every_unit_is_one_plan_and_one_report() {
     let dir = tempfile::tempdir().expect("temp dir");
     let cache = tempfile::tempdir().expect("cache dir");
     let cargo_home = tempfile::tempdir().expect("cargo home");
@@ -932,9 +912,6 @@ fn an_all_miss_build_never_waits_on_the_supervisor() {
     let wrapper = write_rustc_wrapper_shim(dir.path());
     let (endpoint, stub) = spawn_stub_supervisor();
     let supervisor_binary = supervisor_binary();
-    let map_path = dir.path().join("serve-map.json");
-    std::fs::write(&map_path, "{\"target\":[],\"host\":[]}").expect("write serve map");
-    let map_path = map_path.to_str().expect("utf8 path");
 
     let output = cargo_build_in(
         dir.path(),
@@ -946,7 +923,6 @@ fn an_all_miss_build_never_waits_on_the_supervisor() {
             ("STOW_SUPERVISOR_ENDPOINT", endpoint.as_str()),
             ("STOW_SUPERVISOR_TOKEN", "test-token"),
             ("STOW_SUPERVISOR_BINARY", supervisor_binary.as_str()),
-            ("STOW_SERVE_MAP_FILE", map_path),
         ],
         cargo_home.path(),
     );
@@ -964,83 +940,19 @@ fn an_all_miss_build_never_waits_on_the_supervisor() {
     // stream; the build's exit guarantees all frames were sent, and the
     // lock sees them once the stub has drained them.
     drain_stub(&endpoint, &stub);
-    let (cfg_if_plans, cfg_if_marks, cfg_if_reports, probe_plans, debug) = {
+    let (cfg_if_plans, probe_plans, plans, reports, debug) = {
         let counts = stub.census.lock().expect("frame counts");
         let values = (
             counts.plans.get("cfg_if").copied().unwrap_or(0),
-            counts.observed_marks.get("cfg_if").copied().unwrap_or(0),
-            counts.observed_reports.get("cfg_if").copied().unwrap_or(0),
             counts.plans.get("probe").copied().unwrap_or(0),
-            format!("{counts:?}"),
-        );
-        drop(counts);
-        values
-    };
-    assert_eq!(
-        cfg_if_plans, 0,
-        "an uncovered unit must never send a plan frame: {debug}"
-    );
-    assert_eq!(
-        cfg_if_marks, 1,
-        "the uncovered compile must still mark before rustc runs: {debug}"
-    );
-    assert_eq!(
-        cfg_if_reports, 1,
-        "the uncovered compile must still report afterwards: {debug}"
-    );
-    assert!(
-        probe_plans >= 1,
-        "the workspace crate, which the map cannot model, still plans: {debug}"
-    );
-}
-
-/// The serve map's other half: a unit it covers still takes the plan
-/// path, because only the supervisor can actually serve it. The map
-/// answers "could anything serve this", not "compile".
-#[test]
-fn a_covered_unit_still_takes_the_plan_path() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cache = tempfile::tempdir().expect("cache dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
-    write_crate(dir.path(), cargo_home.path());
-    let wrapper = write_rustc_wrapper_shim(dir.path());
-    let (endpoint, stub) = spawn_stub_supervisor();
-    let supervisor_binary = supervisor_binary();
-    // `cfg-if` compiles unspelled — no `--target` on a native build — so
-    // the host side carries it, at any version. Map entries are
-    // canonical crate names (underscores).
-    let map_path = dir.path().join("serve-map.json");
-    std::fs::write(&map_path, "{\"target\":[],\"host\":[[\"cfg_if\",\"*\"]]}")
-        .expect("write serve map");
-    let map_path = map_path.to_str().expect("utf8 path");
-
-    let output = cargo_build_in(
-        dir.path(),
-        &unreachable_edge_url(),
-        cache.path(),
-        &wrapper,
-        &dir.path().join("target"),
-        &[
-            ("STOW_SUPERVISOR_ENDPOINT", endpoint.as_str()),
-            ("STOW_SUPERVISOR_TOKEN", "test-token"),
-            ("STOW_SUPERVISOR_BINARY", supervisor_binary.as_str()),
-            ("STOW_SERVE_MAP_FILE", map_path),
-        ],
-        cargo_home.path(),
-    );
-    assert!(
-        output.status.success(),
-        "stow build failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    drain_stub(&endpoint, &stub);
-    let (cfg_if_plans, cfg_if_observed, debug) = {
-        let counts = stub.census.lock().expect("frame counts");
-        let values = (
-            counts.plans.get("cfg_if").copied().unwrap_or(0),
-            counts.observed_marks.get("cfg_if").copied().unwrap_or(0)
-                + counts.observed_reports.get("cfg_if").copied().unwrap_or(0),
+            // The test's own drain probe plans and never compiles.
+            counts
+                .plans
+                .iter()
+                .filter(|(name, _)| name.as_str() != "drain_probe")
+                .map(|(_, plans)| plans)
+                .sum::<usize>(),
+            counts.compiled.values().sum::<usize>(),
             format!("{counts:?}"),
         );
         drop(counts);
@@ -1048,11 +960,12 @@ fn a_covered_unit_still_takes_the_plan_path() {
     };
     assert_eq!(
         cfg_if_plans, 1,
-        "a covered unit must keep the plan round trip: {debug}"
+        "a registry unit sends exactly one plan frame: {debug}"
     );
+    assert!(probe_plans >= 1, "the workspace crate plans too: {debug}");
     assert_eq!(
-        cfg_if_observed, 0,
-        "a covered unit emits no observations: {debug}"
+        reports, plans,
+        "every plan the stub answered with a compile is reported once: {debug}"
     );
 }
 

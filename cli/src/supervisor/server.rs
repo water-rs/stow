@@ -21,8 +21,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::invocation::{Refusal, RefusalPolicy, VerifiedInvocation};
 use super::protocol::{
-    Answer, ArtifactNotifications, AwaitServeMap, CcCompiled, CcLookup, Compiled, Observed, Plan,
-    Request, read_frame, write_frame,
+    Answer, ArtifactNotifications, CcCompiled, CcLookup, Compiled, Plan, Request, read_frame,
+    write_frame,
 };
 use super::{BINARY_ENV, BinaryIdentity, ENDPOINT_ENV, TOKEN_ENV};
 use crate::local_socket::{self, Endpoint};
@@ -49,17 +49,6 @@ pub trait Handler: Send + Sync + 'static {
         success: bool,
         compile_time: Duration,
     ) -> impl Future<Output = ()> + Send;
-
-    /// The bookkeeping a facade-owned compile still needs: the mark before
-    /// rustc starts (`observation.success` is `None`) and the observation
-    /// after it ends (`Some`). One-way — nothing comes back.
-    fn observed(self: &Arc<Self>, observation: Observation) -> impl Future<Output = ()> + Send;
-
-    /// Answer `AwaitServeMap` on the build's schedule: resolve when the
-    /// build's serve map is final — the pending map's final write landed
-    /// — and immediately when it already is. Every platform speaks this
-    /// over the transport it already carries (stow#347).
-    fn await_serve_map(self: &Arc<Self>) -> impl Future<Output = ()> + Send;
 
     /// The toolchain this build compiles with, resolved by the driver
     /// before cargo started: the only source of every rustc fact the
@@ -98,22 +87,6 @@ pub trait Handler: Send + Sync + 'static {
     /// with no bookkeeping: what a refused plan is answered with under
     /// [`RefusalPolicy::CompileUncached`].
     type Pending: Default + Send + 'static;
-}
-
-/// A compile the facade already ran — or is about to — without a plan
-/// round trip: the mark and the report a unit the serve map ruled out
-/// still owes the build.
-#[derive(Debug)]
-pub struct Observation {
-    /// The invocation the facade ran, checked against the build.
-    pub invocation: VerifiedInvocation,
-    /// `None` marks the unit as compiling locally; `Some` reports how the
-    /// finished compile exited.
-    pub success: Option<bool>,
-    /// How long the finished compile ran; zero on the mark.
-    pub compile_time: Duration,
-    /// The invocation's environment the supervisor cannot see.
-    pub env: crate::supervisor::protocol::InvocationEnv,
 }
 
 /// A handler's decision about one invocation.
@@ -564,11 +537,10 @@ impl Drop for Completion {
     }
 }
 
-/// A flight one connection started and has not yet reported: the
-/// uncovered path's mark pairs with its report by position, the plan
+/// A flight one connection started and has not yet reported: the plan
 /// path's `Compile` answer pairs with the report's ticket.
 pub struct ConnectionMark {
-    ticket: Option<u64>,
+    ticket: u64,
     completion: Completion,
 }
 
@@ -737,10 +709,7 @@ async fn serve_connection<S, H>(
         };
         let reply =
             answer_request(&handler, &tickets, &token, &in_flight, &mut marks, request).await;
-        let answered = match reply.answer {
-            Some(answer) => write_frame(&mut stream, &answer).await,
-            None => Ok(()),
-        };
+        let answered = write_frame(&mut stream, &reply.answer).await;
         // The receipt is out: the bookkeeping runs now, whether or not
         // the facade is still there to hear anything more (stow#1431).
         if let Some(work) = reply.work {
@@ -753,10 +722,10 @@ async fn serve_connection<S, H>(
     }
 }
 
-/// What a request earns: the answer the facade reads, if it reads one,
-/// and the bookkeeping the answer precedes.
+/// What a request earns: the answer the facade reads and the
+/// bookkeeping the answer precedes.
 pub struct Reply<P> {
-    answer: Option<Answer>,
+    answer: Answer,
     /// The post-compile bookkeeping of a report, to run once the answer
     /// is out — the facade's wait ends at the receipt, never at this.
     work: Option<ReportWork<P>>,
@@ -764,10 +733,7 @@ pub struct Reply<P> {
 
 impl<P> Reply<P> {
     const fn answer(answer: Answer) -> Self {
-        Self {
-            answer: Some(answer),
-            work: None,
-        }
+        Self { answer, work: None }
     }
 
     fn failed(message: impl Into<String>) -> Self {
@@ -776,16 +742,9 @@ impl<P> Reply<P> {
         })
     }
 
-    const fn nothing() -> Self {
-        Self {
-            answer: None,
-            work: None,
-        }
-    }
-
     /// The answer to write and the bookkeeping to run after it, for a
     /// transport that schedules the two itself.
-    pub fn split(self) -> (Option<Answer>, Option<ReportWork<P>>) {
+    pub fn split(self) -> (Answer, Option<ReportWork<P>>) {
         (self.answer, self.work)
     }
 }
@@ -805,8 +764,6 @@ enum ReportKind<P> {
         success: bool,
         compile_time: Duration,
     },
-    /// An `Observed` report of the finished compile.
-    Observed(Observation),
     /// The records a C compiler wrapper's answer precedes.
     Cc(crate::cc::CcRecord),
 }
@@ -821,7 +778,6 @@ pub async fn finish_report<H: Handler>(handler: &Arc<H>, work: ReportWork<H::Pen
             success,
             compile_time,
         } => handler.compiled(pending, success, compile_time).await,
-        ReportKind::Observed(observation) => handler.observed(observation).await,
         ReportKind::Cc(record) => {
             if let Some(config) = handler.cc_config() {
                 crate::cc::write_record(config, record).await;
@@ -848,12 +804,6 @@ pub async fn answer_request<H: Handler>(
             Reply::answer(answer_plan(handler, tickets, token, in_flight, marks, plan).await)
         }
         Request::Compiled(report) => accept_report(tickets, token, marks, report).await,
-        Request::Observed(observed) => {
-            answer_observation(handler, token, in_flight, marks, observed).await
-        }
-        Request::AwaitServeMap(await_map) => {
-            Reply::answer(answer_await_serve_map(handler, token, await_map).await)
-        }
         Request::CcLookup(lookup) => answer_cc_lookup(handler, token, lookup).await,
         Request::CcCompiled(report) => answer_cc_compiled(handler, token, report).await,
     }
@@ -882,9 +832,9 @@ async fn answer_cc_lookup<H: Handler>(
     }
     match crate::cc::locate_cached_object(config, &lookup.cache_key).await {
         Ok(Some(object)) => Reply {
-            answer: Some(Answer::CcHit {
+            answer: Answer::CcHit {
                 object: super::os_bytes::encode(object.as_os_str()),
-            }),
+            },
             work: Some(ReportWork {
                 completion: None,
                 kind: ReportKind::Cc(crate::cc::CcRecord::Hit {
@@ -958,7 +908,7 @@ async fn answer_cc_compiled<H: Handler>(
         }
     };
     Reply {
-        answer: Some(Answer::Received),
+        answer: Answer::Received,
         work: Some(ReportWork {
             completion: None,
             kind: ReportKind::Cc(record),
@@ -975,23 +925,6 @@ fn refuse_cc_output<P>(output_path: &std::path::Path, message: &str) -> Reply<P>
         "refused the C/C++ output {}: {message}",
         output_path.display()
     ))
-}
-
-/// Hold the answer until the build's serve map is final. The handler's
-/// wait resolves on the driver's schedule, so this frame is how a
-/// `pending` map's facades hear the final write land (stow#347).
-async fn answer_await_serve_map<H: Handler>(
-    handler: &Arc<H>,
-    token: &str,
-    await_map: AwaitServeMap,
-) -> Answer {
-    if await_map.token != token {
-        return Answer::Failed {
-            message: "supervisor token mismatch".to_owned(),
-        };
-    }
-    handler.await_serve_map().await;
-    Answer::ServeMapReady
 }
 
 async fn answer_plan<H: Handler>(
@@ -1052,7 +985,7 @@ async fn answer_plan<H: Handler>(
                 // or this connection's end — completes it (stow#618).
                 if let Some(paths) = recordable_paths {
                     marks.push(ConnectionMark {
-                        ticket: Some(ticket),
+                        ticket,
                         completion: in_flight.register(paths),
                     });
                 }
@@ -1104,92 +1037,6 @@ async fn allocate_ticket<P>(
     })
 }
 
-async fn answer_observation<H: Handler>(
-    handler: &Arc<H>,
-    token: &str,
-    in_flight: &InFlightUnits,
-    marks: &mut Vec<ConnectionMark>,
-    observed: Observed,
-) -> Reply<H::Pending> {
-    // Only the report is answered, so only the report's refusal is: the
-    // mark's facade reads nothing, and its refusal is logged.
-    let is_report = observed.success.is_some();
-    if observed.token != token {
-        if is_report {
-            return Reply::failed("supervisor token mismatch");
-        }
-        tracing::warn!("supervisor observation with the wrong token dropped");
-        return Reply::nothing();
-    }
-    let (Ok(executable), Ok(args)) = (observed.executable(), observed.args()) else {
-        if is_report {
-            return Reply::failed("supervisor report could not be decoded");
-        }
-        tracing::warn!("supervisor observation could not be decoded; dropped");
-        return Reply::nothing();
-    };
-    let invocation = match VerifiedInvocation::verify(
-        handler.toolchain(),
-        handler.output_roots(),
-        executable,
-        args,
-        &observed.env,
-    )
-    .await
-    {
-        Ok(invocation) => invocation,
-        Err(refusal) => {
-            // A report is answered with the refusal and a mark has no
-            // answer, so the handler records it for the build to fail on
-            // after cargo exits. Compiling uncached, the report gets the
-            // receipt its facade waits for, with no bookkeeping behind
-            // it, and the mark is dropped. Neither touches `marks`: the
-            // refused request has no flight of its own.
-            return match settle_refusal(handler, refusal, "observation") {
-                Settled::Fail(message) if is_report => Reply::failed(message),
-                Settled::CompileUncached if is_report => Reply::answer(Answer::Received),
-                Settled::Fail(_) | Settled::CompileUncached => Reply::nothing(),
-            };
-        }
-    };
-    let observation = Observation {
-        invocation,
-        success: observed.success,
-        compile_time: Duration::from_millis(observed.compile_millis),
-        env: observed.env,
-    };
-    if is_report {
-        // The report frame ends the flight's first leg: rustc has exited.
-        // The mark's guard rides with the bookkeeping, so the unit's
-        // waiters release exactly when it has run, including every early
-        // return and error inside it (stow#618, stow#1431).
-        let completion = marks
-            .iter()
-            .position(|mark| mark.ticket.is_none())
-            .map(|index| marks.remove(index).completion)
-            .inspect(Completion::rustc_exited);
-        return Reply {
-            answer: Some(Answer::Received),
-            work: Some(ReportWork {
-                completion,
-                kind: ReportKind::Observed(observation),
-            }),
-        };
-    }
-    // The flight spans the mark frame's arrival to its report's
-    // bookkeeping: registered here, before rustc starts (stow#618).
-    if let Ok(parsed) = ParsedRustcArgs::parse(observation.invocation.args())
-        && let Some(paths) = recordable_output_paths(&parsed, handler.toolchain().host_target())
-    {
-        marks.push(ConnectionMark {
-            ticket: None,
-            completion: in_flight.register(paths),
-        });
-    }
-    handler.observed(observation).await;
-    Reply::nothing()
-}
-
 /// Accept the report of a compile the supervisor asked for: fire the
 /// unit's `exited` latch and answer with a receipt, carrying the
 /// bookkeeping for the transport to run after it (stow#1431). A report
@@ -1209,7 +1056,7 @@ async fn accept_report<P>(
     // the bookkeeping (stow#618).
     let completion = marks
         .iter()
-        .position(|mark| mark.ticket == Some(report.ticket))
+        .position(|mark| mark.ticket == report.ticket)
         .map(|index| marks.remove(index).completion)
         .inspect(Completion::rustc_exited);
     let (sender, restored) = oneshot::channel();
@@ -1218,7 +1065,7 @@ async fn accept_report<P>(
     }
     match restored.await {
         Ok(Some(pending)) => Reply {
-            answer: Some(Answer::Received),
+            answer: Answer::Received,
             work: Some(ReportWork {
                 completion,
                 kind: ReportKind::Compiled {
@@ -1272,7 +1119,6 @@ mod tests {
         /// Every call that reached the handler's own decision or
         /// bookkeeping: what a refused request must not add to.
         plans: AtomicUsize,
-        observations: AtomicUsize,
         policy: RefusalPolicy,
         toolchain: Arc<BuildToolchain>,
         refusals: std::sync::Mutex<Vec<String>>,
@@ -1288,7 +1134,6 @@ mod tests {
                 reports: AtomicUsize::new(0),
                 roots: everywhere(),
                 plans: AtomicUsize::new(0),
-                observations: AtomicUsize::new(0),
                 policy,
                 toolchain: BuildToolchain::for_tests().await,
                 refusals: std::sync::Mutex::default(),
@@ -1322,18 +1167,6 @@ mod tests {
             if success {
                 self.reports.fetch_add(1, Ordering::SeqCst);
             }
-            std::future::ready(())
-        }
-
-        fn observed(
-            self: &Arc<Self>,
-            _observation: super::Observation,
-        ) -> impl std::future::Future<Output = ()> + Send {
-            self.observations.fetch_add(1, Ordering::SeqCst);
-            std::future::ready(())
-        }
-
-        fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
             std::future::ready(())
         }
 
@@ -1396,164 +1229,6 @@ mod tests {
         assert_eq!(handler.reports.load(Ordering::SeqCst), 1);
     }
 
-    /// A blocking facade's `AwaitServeMap` exchange on the loopback
-    /// `port`: the answer it read, and the instant it read it.
-    fn await_serve_map_blocking(port: u16) -> (super::Answer, std::time::Instant) {
-        use std::io::{Read as _, Write as _};
-
-        let mut peer = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        let request = super::Request::AwaitServeMap(crate::supervisor::protocol::AwaitServeMap {
-            token: "the-token".to_owned(),
-        });
-        let body = serde_json::to_vec(&request).expect("request frame");
-        peer.write_all(
-            &u32::try_from(body.len())
-                .expect("frame length fits u32")
-                .to_le_bytes(),
-        )
-        .expect("write length");
-        peer.write_all(&body).expect("write body");
-        let mut length_bytes = [0_u8; 4];
-        peer.read_exact(&mut length_bytes).expect("read length");
-        let mut answer_body = vec![0_u8; u32::from_le_bytes(length_bytes) as usize];
-        peer.read_exact(&mut answer_body).expect("read body");
-        let answer = serde_json::from_slice(&answer_body).expect("answer frame");
-        (answer, std::time::Instant::now())
-    }
-
-    /// Answers the serve-map wait once `ready` turns true, and reports on
-    /// `parked` the moment a wait has subscribed to it — the point from
-    /// which the answer can only come from the release.
-    struct Gated {
-        ready: tokio::sync::watch::Receiver<bool>,
-        parked: tokio::sync::mpsc::UnboundedSender<()>,
-        toolchain: Arc<BuildToolchain>,
-        roots: crate::supervisor::invocation::OutputRoots,
-    }
-
-    impl Handler for Gated {
-        type Pending = OsString;
-
-        fn plan(
-            self: &Arc<Self>,
-            _invocation: VerifiedInvocation,
-            _env: crate::supervisor::protocol::InvocationEnv,
-        ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
-            std::future::ready(Decision::Served(ArtifactNotifications::default()))
-        }
-
-        fn compiled(
-            self: &Arc<Self>,
-            _pending: Self::Pending,
-            _success: bool,
-            _compile_time: Duration,
-        ) -> impl std::future::Future<Output = ()> + Send {
-            std::future::ready(())
-        }
-
-        fn observed(
-            self: &Arc<Self>,
-            _observation: super::Observation,
-        ) -> impl std::future::Future<Output = ()> + Send {
-            std::future::ready(())
-        }
-
-        fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
-            let mut ready = self.ready.clone();
-            let parked = self.parked.clone();
-            async move {
-                if !*ready.borrow() {
-                    parked.send(()).expect("report the park");
-                    let _ = ready.changed().await;
-                }
-            }
-        }
-
-        fn toolchain(self: &Arc<Self>) -> &Arc<BuildToolchain> {
-            &self.toolchain
-        }
-
-        fn refusal_policy(self: &Arc<Self>) -> RefusalPolicy {
-            RefusalPolicy::FailBuild
-        }
-
-        fn refused(self: &Arc<Self>, _refusal: Refusal) {}
-
-        fn output_roots(self: &Arc<Self>) -> Option<&crate::supervisor::invocation::OutputRoots> {
-            Some(&self.roots)
-        }
-    }
-
-    /// The serve-map wait rides the loopback transport the Windows
-    /// build uses: the handler's word releases the answer, so a facade
-    /// blocked on it hears the final map land and nothing else
-    /// (stow#347).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_serve_map_wait_answers_when_the_map_is_final() {
-        use std::time::Instant;
-
-        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
-        let (parked_tx, mut parked_rx) = tokio::sync::mpsc::unbounded_channel();
-        let handler = Arc::new(Gated {
-            ready: ready_rx,
-            parked: parked_tx,
-            toolchain: BuildToolchain::for_tests().await,
-            roots: everywhere(),
-        });
-        let (tickets, ticket_rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::task::spawn(super::run_tickets(ticket_rx));
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("bind loopback");
-        let port = listener.local_addr().expect("local addr").port();
-        let token = "the-token".to_owned();
-        tokio::task::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept the facade");
-            super::serve_connection(
-                stream,
-                handler,
-                tickets,
-                token,
-                super::InFlightUnits::default(),
-                Arc::new(super::Connections::default()),
-            )
-            .await;
-        });
-
-        let (answered_tx, mut answered_rx) = tokio::sync::oneshot::channel();
-        let facade = std::thread::spawn(move || {
-            answered_tx
-                .send(await_serve_map_blocking(port))
-                .expect("report answer");
-        });
-
-        // The wait reaches the handler and parks on the pending map;
-        // from here nothing but the release can answer it.
-        tokio::time::timeout(Duration::from_secs(5), parked_rx.recv())
-            .await
-            .expect("the wait must park on the pending map")
-            .expect("the handler reports its park");
-        assert!(
-            matches!(
-                answered_rx.try_recv(),
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-            ),
-            "the wait answered before the final map landed"
-        );
-        let released = Instant::now();
-        ready_tx.send(true).expect("release the map");
-        let (answer, answered) = tokio::time::timeout(Duration::from_secs(5), answered_rx)
-            .await
-            .expect("the wait must answer")
-            .expect("the facade reports its answer");
-        facade.join().expect("facade thread");
-        assert_eq!(answer, super::Answer::ServeMapReady);
-        assert!(
-            answered >= released,
-            "the wait's answer arrived before the map was released"
-        );
-    }
-
     /// A served unit never runs rustc, so it never reports.
     #[tokio::test]
     async fn a_served_unit_ends_the_exchange() {
@@ -1602,16 +1277,12 @@ mod tests {
     }
 
     /// A request naming a program that is not the build's rustc is
-    /// refused naming the field on every path that carries an
-    /// executable — the request/answer plan, and the one-way mark and
-    /// the answered report of an observation — and the program is never
-    /// started: the tripwire would leave its sentinel behind.
+    /// refused naming the field, and the program is never started: the
+    /// tripwire would leave its sentinel behind.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_request_naming_another_executable_is_refused_and_never_run() {
         use std::os::unix::fs::PermissionsExt as _;
-
-        use crate::supervisor::protocol::{Answer, InvocationEnv, Observed, Request};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let sentinel = dir.path().join("ran");
@@ -1643,54 +1314,25 @@ mod tests {
             .expect_err("a plan naming another executable is refused");
         assert!(error.contains("executable"), "{error}");
 
-        let mut stream = connect_raw(&endpoint).await;
-        let observed = |success| {
-            Request::Observed(Observed::new(
-                token.clone(),
-                other.as_os_str(),
-                &[],
-                success,
-                0,
-                InvocationEnv::for_tests(),
-            ))
-        };
-        super::write_frame(&mut stream, &observed(None))
-            .await
-            .expect("write the mark");
-        super::write_frame(&mut stream, &observed(Some(true)))
-            .await
-            .expect("write the report");
-        let Some(Answer::Failed { message }) = super::read_frame(&mut stream)
-            .await
-            .expect("read the report's answer")
-        else {
-            panic!("a report naming another executable is answered with a failure");
-        };
-        assert!(message.contains("executable"), "{message}");
-
         assert!(!sentinel.exists(), "the refused program was started");
         assert_eq!(
             handler.refusals.lock().expect("refusals mutex").len(),
-            3,
-            "the plan, the mark and the report are each recorded"
+            1,
+            "the plan's refusal is recorded"
         );
-        drop(stream);
         drop(connection);
         supervisor.shutdown().await;
     }
 
-    /// Under `CompileUncached` a refused request takes no cache action
-    /// on any path: the plan is answered with a compile whose report
-    /// carries no bookkeeping, the mark is dropped and the report is
-    /// received — and the program is never started, the handler never
+    /// Under `CompileUncached` a refused request takes no cache action:
+    /// the plan is answered with a compile whose report carries no
+    /// bookkeeping — and the program is never started, the handler never
     /// asked to decide or record, and no refusal is left to fail the
     /// build on.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_refused_request_compiles_uncached_and_takes_no_cache_action() {
         use std::os::unix::fs::PermissionsExt as _;
-
-        use crate::supervisor::protocol::{Answer, InvocationEnv, Observed, Request};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let sentinel = dir.path().join("ran");
@@ -1730,33 +1372,6 @@ mod tests {
             .await
             .expect("the compile's report is received");
         connection.close().await.expect("close");
-
-        // The one-way mark is dropped and the report is received.
-        let mut stream = connect_raw(&endpoint).await;
-        let observed = |success| {
-            Request::Observed(Observed::new(
-                token.clone(),
-                other.as_os_str(),
-                &[],
-                success,
-                0,
-                InvocationEnv::for_tests(),
-            ))
-        };
-        super::write_frame(&mut stream, &observed(None))
-            .await
-            .expect("write the mark");
-        super::write_frame(&mut stream, &observed(Some(true)))
-            .await
-            .expect("write the report");
-        let answer: Option<Answer> = super::read_frame(&mut stream)
-            .await
-            .expect("read the report's answer");
-        assert!(
-            matches!(answer, Some(Answer::Received)),
-            "a refused report is received: {answer:?}"
-        );
-        drop(stream);
         assert_eq!(supervisor.shutdown().await, 0, "the drain finishes cleanly");
 
         assert!(!sentinel.exists(), "the refused program was started");
@@ -1764,11 +1379,6 @@ mod tests {
             handler.plans.load(Ordering::SeqCst),
             0,
             "nothing was planned"
-        );
-        assert_eq!(
-            handler.observations.load(Ordering::SeqCst),
-            0,
-            "nothing was observed"
         );
         assert!(
             handler.refusals.lock().expect("refusals mutex").is_empty(),
@@ -1842,17 +1452,6 @@ mod tests {
                 }
                 this.finished.fetch_add(1, Ordering::SeqCst);
             }
-        }
-
-        fn observed(
-            self: &Arc<Self>,
-            _observation: super::Observation,
-        ) -> impl std::future::Future<Output = ()> + Send {
-            std::future::ready(())
-        }
-
-        fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
-            std::future::ready(())
         }
 
         fn toolchain(self: &Arc<Self>) -> &Arc<BuildToolchain> {
@@ -2392,17 +1991,6 @@ mod tests {
             _success: bool,
             _compile_time: Duration,
         ) -> impl std::future::Future<Output = ()> + Send {
-            std::future::ready(())
-        }
-
-        fn observed(
-            self: &Arc<Self>,
-            _observation: super::Observation,
-        ) -> impl std::future::Future<Output = ()> + Send {
-            std::future::ready(())
-        }
-
-        fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
             std::future::ready(())
         }
 

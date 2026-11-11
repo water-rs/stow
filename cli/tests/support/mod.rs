@@ -33,7 +33,6 @@ pub fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path
         .env_remove("STOW_CACHE_POLICY_PATH")
         .env_remove("STOW_EXPANDED_GRAPH_PATH")
         .env_remove("STOW_PREFETCH_ARTIFACTS_PATH")
-        .env_remove("STOW_SERVE_MAP_FILE")
         .env_remove("STOW_SUPERVISOR_ENDPOINT")
         .env_remove("STOW_SUPERVISOR_TOKEN")
         .env_remove("STOW_SUPERVISOR_BINARY")

@@ -149,14 +149,6 @@ pub fn run() -> stow_types::error::Result<()> {
     if let Some(status) = delegate_to_capture()? {
         std::process::exit(status);
     }
-    // An uncovered rustc invocation needs no runtime: the serve map the
-    // driver built answers the decision, and the compile's bookkeeping is
-    // a one-way mark and a report answered by a receipt. Everything the runtime would buy — the provider
-    // install, tracing, the tokio stack — is the per-invocation cost this
-    // build pays hundreds of times.
-    if let facade::FastPath::Handled(status) = facade::try_invocation()? {
-        std::process::exit(status);
-    }
     let status = run_command()?;
     // The one place a command's failure ends the process — `run_command`
     // has returned, so everything the command owned — its mirror, its
@@ -489,6 +481,10 @@ struct PostCompile {
     /// How long the real rustc ran, set once it has: the compile time a later
     /// local hit on the stored unit reports as saved.
     compile_time: std::time::Duration,
+    /// The serve map ruled the unit out before any lookup ran: its
+    /// compile still owes the miss outcome the lookup would have
+    /// recorded.
+    owes_miss: bool,
 }
 
 impl Default for PostCompile {
@@ -504,8 +500,27 @@ impl PostCompile {
             parsed: None,
             env: supervisor::protocol::InvocationEnv::default(),
             compile_time: std::time::Duration::ZERO,
+            owes_miss: false,
         }
     }
+}
+
+/// Record the marker that this unit compiles locally in this build.
+async fn record_local_build_mark(
+    parsed: &rustc_args::ParsedRustcArgs,
+    target: &str,
+    policy_dir: Option<&Path>,
+) {
+    log_nonfatal_result(
+        "failed to record a locally built crate for this build",
+        provenance::record_local_build(
+            policy_dir,
+            target,
+            &parsed.crate_name,
+            &parsed.extra_filename,
+        )
+        .await,
+    );
 }
 
 /// Decide to compile, recording the local-build marker first.
@@ -527,21 +542,13 @@ async fn compile(
     invocation_env: &supervisor::protocol::InvocationEnv,
 ) -> Outcome {
     if let Some(target) = mark_target {
-        log_nonfatal_result(
-            "failed to record a locally built crate for this build",
-            provenance::record_local_build(
-                policy_dir,
-                target,
-                &parsed.crate_name,
-                &parsed.extra_filename,
-            )
-            .await,
-        );
+        record_local_build_mark(parsed, target, policy_dir).await;
     }
     Outcome::Compile(Box::new(PostCompile {
         parsed: Some(parsed.clone()),
         env: invocation_env.clone(),
         compile_time: std::time::Duration::ZERO,
+        owes_miss: false,
     }))
 }
 
@@ -845,8 +852,13 @@ pub(crate) struct BuildContext {
     /// though the build carried no expanded graph and no prefetch
     /// ledger: semantic fallback off, no candidates.
     pub(crate) analysis: std::sync::Arc<std::sync::OnceLock<AnalysisFacts>>,
-    /// The "the serve map is final" signal `AwaitServeMap` frames wait
-    /// on — and the "the build's slice fetch has settled" signal the
+    /// The build's serve map: a registry unit it does not cover compiles
+    /// without a lookup. Absent for a build with none (the standalone
+    /// wrapper), which plans every unit through the lookup chain.
+    pub(crate) serve_map: crate::facade::ServeMapView,
+    /// The "the serve map is final" signal a plan for an uncovered unit
+    /// waits on while the map is pending — and the "the build's slice
+    /// fetch has settled" signal the
     /// slice memo's missing-slice read (stow#735) and pending-slice
     /// miss retry (stow#797) wait on: `run_cargo` shares the
     /// enrichment's with the supervisor and completes it itself when no
@@ -1271,6 +1283,7 @@ impl BuildContext {
                 unit_nodes,
                 prefetch_candidates,
             })),
+            serve_map: crate::facade::ServeMapView::absent(),
             serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
             policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
             // No supervisor shares a standalone invocation's registry —
@@ -1510,6 +1523,23 @@ impl supervisor::server::Handler for BuildSupervisor {
         let Some(parsed) = classify_or_log(classified, &args) else {
             return supervisor::server::Decision::Compile(Box::new(PostCompile::raw()));
         };
+        if self.serve_map_rules_out(&parsed).await {
+            // The map ruled the unit out: no lookup runs, so nothing
+            // before the compile waits on a dependency's records either.
+            // The marker is the one a `Compile` decision writes before
+            // rustc runs, for the reason `compile` states.
+            let target = parsed
+                .target
+                .clone()
+                .unwrap_or_else(|| self.env_cache.toolchain.host_target().to_owned());
+            record_local_build_mark(&parsed, &target, self.ctx.policy_dir.as_deref()).await;
+            return supervisor::server::Decision::Compile(Box::new(PostCompile {
+                parsed: Some(parsed),
+                env: invocation_env,
+                compile_time: std::time::Duration::ZERO,
+                owes_miss: true,
+            }));
+        }
         // Every lookup the decision makes reads the `--extern`
         // dependencies' `materialized_outputs` rows, and a facade exits
         // with its rustc: a dependency cargo finished before starting
@@ -1533,13 +1563,13 @@ impl supervisor::server::Handler for BuildSupervisor {
         compile_time: std::time::Duration,
     ) {
         pending.compile_time = compile_time;
+        if pending.owes_miss {
+            self.report_uncovered(pending, success).await;
+            return;
+        }
         let local_base = self.env_cache.base().await;
         self.finish_and_observe(&pending, success, local_base.as_deref())
             .await;
-    }
-
-    async fn await_serve_map(self: &std::sync::Arc<Self>) {
-        self.ctx.serve_map_ready.wait().await;
     }
 
     fn toolchain(self: &std::sync::Arc<Self>) -> &std::sync::Arc<toolchain::BuildToolchain> {
@@ -1553,21 +1583,77 @@ impl supervisor::server::Handler for BuildSupervisor {
     fn refused(self: &std::sync::Arc<Self>, refusal: supervisor::invocation::Refusal) {
         self.refusals.lock().expect("refusals mutex").push(refusal);
     }
+}
 
-    async fn observed(self: &std::sync::Arc<Self>, observation: supervisor::server::Observation) {
-        let args = observation.invocation.args();
-        let Ok(parsed) = classify_invocation(args) else {
-            // The facade only sends invocations it parsed — one that
-            // fails here is a wiring bug, not a compile.
-            tracing::warn!("supervisor observation carried an unparseable invocation; dropped");
+impl BuildSupervisor {
+    /// Whether the build's serve map rules `parsed` out before any lookup:
+    /// a registry unit nothing in the build could serve. A pending map's
+    /// "not covered" is provisional while the build's fetch is in flight,
+    /// so the plan holds, bounded, for the final map rather than compile a
+    /// unit the fetch is about to cover (stow#347, stow#788). A build with
+    /// no map, every cache layer off and the identity trace — which wants
+    /// the full decision's probes — never rule a unit out.
+    async fn serve_map_rules_out(&self, parsed: &rustc_args::ParsedRustcArgs) -> bool {
+        if self.ctx.cache.is_off()
+            || self
+                .env_cache
+                .config()
+                .is_some_and(|config| config.switches.identity_trace.is_some())
+        {
+            return false;
+        }
+        let Some(mut map) = self.ctx.serve_map.current() else {
+            return false;
+        };
+        let Some((crate_name, version)) = registry_unit_identity(parsed) else {
+            return false;
+        };
+        let Ok(version) = semver::Version::parse(&version) else {
+            return false;
+        };
+        let name = canonical_crate_name(&crate_name);
+        let version = version.to_string();
+        let covered =
+            |map: &crate::facade::ServeMap| map.covers(parsed.target.is_some(), &name, &version);
+        if covered(&map) {
+            return false;
+        }
+        if map.pending {
+            if tokio::time::timeout(
+                crate::facade::SERVE_MAP_WAIT_TIMEOUT,
+                self.ctx.serve_map_ready.wait(),
+            )
+            .await
+            .is_err()
+            {
+                // A driver that is alive but stuck: decide on the map in
+                // hand.
+                tracing::warn!(
+                    crate_name = %parsed.crate_name,
+                    "the pending serve map did not settle in time; deciding on the map in hand"
+                );
+            }
+            let Some(settled) = self.ctx.serve_map.current() else {
+                return false;
+            };
+            map = settled;
+            if covered(&map) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The bookkeeping of a compile the serve map ruled out: the miss
+    /// outcome a lookup would have recorded, then the same resolution of
+    /// the unit's own outputs every local compile gets.
+    async fn report_uncovered(&self, mut post: Box<PostCompile>, success: bool) {
+        let Some(local_base) = self.env_cache.base().await else {
             return;
         };
-        if is_compile_unit(&parsed) {
-            self.resolution_done.complete();
-        }
-        if self.ctx.cache.is_off() {
+        let Some(mut parsed) = post.parsed.take() else {
             return;
-        }
+        };
         // The mark's key is the target decide computes: the unit's own
         // spelled `--target`, else this build's rustc host triple — the
         // key a dependent's `must_build_locally` checks under.
@@ -1575,25 +1661,8 @@ impl supervisor::server::Handler for BuildSupervisor {
             .target
             .clone()
             .unwrap_or_else(|| self.env_cache.toolchain.host_target().to_owned());
-        let Some(success) = observation.success else {
-            log_nonfatal_result(
-                "failed to record a locally built crate for this build",
-                provenance::record_local_build(
-                    self.ctx.policy_dir.as_deref(),
-                    &target,
-                    &parsed.crate_name,
-                    &parsed.extra_filename,
-                )
-                .await,
-            );
-            return;
-        };
-        let Some(local_base) = self.env_cache.base().await else {
-            return;
-        };
-        let mut parsed = parsed;
         resolve_native_target_cpu(&mut parsed, &self.env_cache).await;
-        let source = match observation.env.manifest_dir() {
+        let source = match post.env.manifest_dir() {
             Ok(manifest_dir) => {
                 detect_unit_source(&parsed, manifest_dir.as_deref(), &self.env_cache, &self.ctx)
                     .await
@@ -1603,7 +1672,7 @@ impl supervisor::server::Handler for BuildSupervisor {
         };
         match source {
             Ok(source) => {
-                let class = parsed.unit_class(source, observation.env.primary_package, &target);
+                let class = parsed.unit_class(source, post.env.primary_package, &target);
                 // Only a publicly-missable unit counts: a git source or
                 // extra codegen could never have been served remotely,
                 // so its local compile is not a cache miss (stow#1006).
@@ -1621,15 +1690,11 @@ impl supervisor::server::Handler for BuildSupervisor {
                 tracing::warn!(
                     error = %error,
                     crate_name = %parsed.crate_name,
-                    "failed to detect an observed unit's source; miss outcome skipped"
+                    "failed to detect an uncovered unit's source; miss outcome skipped"
                 );
             }
         }
-        let post = PostCompile {
-            parsed: Some(parsed),
-            env: observation.env,
-            compile_time: observation.compile_time,
-        };
+        post.parsed = Some(parsed);
         self.finish_and_observe(&post, success, Some(&local_base))
             .await;
     }
@@ -6477,62 +6542,6 @@ mod tests {
         assert!(super::PostCompile::default().parsed.is_none());
     }
 
-    /// The uncovered fast path's `Observed` frames describe real compile
-    /// units by construction — the same signal fires on them, while a
-    /// probe that somehow arrived is dropped by the classifier before it
-    /// can complete the signal (stow#608).
-    #[tokio::test]
-    async fn resolution_done_fires_on_a_compile_unit_observed() {
-        let resolution_done = super::ResolutionDone::pending();
-        let handler = std::sync::Arc::new(super::BuildSupervisor::new(
-            super::BuildContext::default(),
-            None,
-            crate::toolchain::BuildToolchain::for_tests().await,
-            None,
-            resolution_done.clone(),
-            crate::supervisor::invocation::RefusalPolicy::FailBuild,
-        ));
-
-        crate::supervisor::server::Handler::observed(
-            &handler,
-            crate::supervisor::server::Observation {
-                invocation: verified_rustc(&handler, args(&["-vV"])).await,
-                success: None,
-                compile_time: std::time::Duration::ZERO,
-                env: crate::supervisor::protocol::InvocationEnv::for_tests(),
-            },
-        )
-        .await;
-        assert!(!resolution_done.has_completed());
-
-        crate::supervisor::server::Handler::observed(
-            &handler,
-            crate::supervisor::server::Observation {
-                invocation: verified_rustc(
-                    &handler,
-                    args(&[
-                        "--crate-name",
-                        "demo",
-                        "--crate-type",
-                        "lib",
-                        "--out-dir",
-                        "/tmp/out",
-                        "--emit",
-                        "metadata",
-                        "-C",
-                        "metadata=abc123",
-                    ]),
-                )
-                .await,
-                success: None,
-                compile_time: std::time::Duration::ZERO,
-                env: crate::supervisor::protocol::InvocationEnv::for_tests(),
-            },
-        )
-        .await;
-        assert!(resolution_done.has_completed());
-    }
-
     /// The line rustc prints for `file` under the fixtures' `/tmp/out`
     /// out-dir: the path is spelled the way this platform joins it and
     /// escaped as JSON, everything around it is the literal protocol.
@@ -7131,6 +7140,7 @@ mod tests {
                 unit_nodes: None,
                 prefetch_candidates: std::collections::BTreeMap::new(),
             })),
+            serve_map: crate::facade::ServeMapView::absent(),
             serve_map_ready: std::sync::Arc::clone(serve_map_ready),
             policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
             in_flight: crate::supervisor::server::InFlightUnits::default(),
@@ -7527,8 +7537,8 @@ mod tests {
     /// bookkeeping of the dependencies it was built against — an
     /// `--extern` whose rows are still being written is a pending write,
     /// not a missing one. These tests drive the real supervisor over the
-    /// real socket with `Observed` frames, a real `BuildSupervisor`, and
-    /// a temp-dir cache — cargo-free end to end.
+    /// real socket with `Plan` and `Compiled` frames, a real
+    /// `BuildSupervisor`, and a temp-dir cache — cargo-free end to end.
     mod in_flight_ordering {
         use std::ffi::{OsStr, OsString};
         use std::path::Path;
@@ -7536,7 +7546,7 @@ mod tests {
         use std::time::Duration;
 
         use crate::local_socket::Endpoint;
-        use crate::supervisor::protocol::{Observed, Request, write_frame};
+        use crate::supervisor::protocol::{Compiled, Plan, Request, write_frame};
         use crate::supervisor::{server, server::Handler as _};
         use crate::{AnalysisFacts, BuildContext, BuildSupervisor, WrapperEnvBase};
 
@@ -7707,8 +7717,50 @@ mod tests {
             server::InFlightUnits,
             Arc<BuildSupervisor>,
         ) {
-            fixture_ctx(root, |in_flight| BuildContext {
-                policy_dir: None,
+            fixture_covering(root, &[]).await
+        }
+
+        /// A serve map that covers exactly the target-side crates in
+        /// `names`, at any version: the plans of every other registry
+        /// unit compile without a lookup.
+        fn serve_map_covering(names: &[&str]) -> crate::facade::ServeMapView {
+            crate::facade::serve_map_cell(Some(crate::facade::ServeMap {
+                target: names
+                    .iter()
+                    .map(|name| ((*name).to_owned(), "*".to_owned()))
+                    .collect(),
+                host: Vec::new(),
+                pending: false,
+            }))
+            .1
+        }
+
+        /// [`fixture`] whose serve map covers the crates in `covered`.
+        async fn fixture_covering(
+            root: &Path,
+            covered: &[&str],
+        ) -> (
+            crate::config::StowConfig,
+            server::InFlightUnits,
+            Arc<BuildSupervisor>,
+        ) {
+            fixture_ctx(root, |in_flight| {
+                build_ctx(in_flight, serve_map_covering(covered), None)
+            })
+            .await
+        }
+
+        /// The fixtures' `BuildContext`: everything settled, the given
+        /// serve map, and the cache policy gate on `policy_dir` when
+        /// there is one.
+        fn build_ctx(
+            in_flight: &server::InFlightUnits,
+            serve_map: crate::facade::ServeMapView,
+            policy_dir: Option<std::path::PathBuf>,
+        ) -> BuildContext {
+            BuildContext {
+                serve_map,
+                policy_dir,
                 public_cache_target: Some(HOST_TARGET.to_owned()),
                 public_cache_disabled: false,
                 cache: crate::config::CacheLayers::default(),
@@ -7723,8 +7775,7 @@ mod tests {
                 registry_sources: std::sync::OnceLock::from(crate::RegistrySources::CargoConfig(
                     std::iter::once("index.crates.io".to_owned()).collect(),
                 )),
-            })
-            .await
+            }
         }
 
         /// [`fixture`] with the caller's `BuildContext` — the
@@ -7767,9 +7818,8 @@ mod tests {
             (config, in_flight, handler)
         }
 
-        /// The raw facade transport: the test writes the `Observed`
-        /// frames itself rather than going through the client
-        /// connection.
+        /// The raw facade transport: the test writes the frames itself
+        /// rather than going through the client connection.
         #[cfg(unix)]
         async fn connect_raw(endpoint: &Endpoint) -> tokio::net::UnixStream {
             let Endpoint::Unix(path) = endpoint else {
@@ -7791,64 +7841,83 @@ mod tests {
                 .expect("connect to the supervisor")
         }
 
-        /// Write one `Observed` frame. A mark (`success: None`) is
-        /// one-way; a report is answered with its receipt, which this
-        /// reads — the receipt precedes the report's bookkeeping, so it
-        /// returns while the bookkeeping may still be running.
-        async fn send_observed<S>(
-            stream: &mut S,
-            token: &str,
-            args: &[OsString],
-            success: Option<bool>,
-        ) where
-            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
-        {
-            let frame = Observed::new(
-                token.to_owned(),
-                OsStr::new("rustc"),
-                args,
-                success,
-                0,
-                crate::supervisor::protocol::InvocationEnv::for_tests(),
-            );
-            write_frame(&mut *stream, &Request::Observed(frame))
-                .await
-                .expect("write the observation frame");
-            if success.is_some() {
-                let answer: Option<crate::supervisor::protocol::Answer> =
-                    crate::supervisor::protocol::read_frame(&mut *stream)
-                        .await
-                        .expect("read the report's receipt");
-                assert_eq!(
-                    answer,
-                    Some(crate::supervisor::protocol::Answer::Received),
-                    "a report is answered with a receipt"
-                );
-            }
-        }
-
-        /// Guarantee the frames already written on `stream` have been
-        /// handled: the frames are sequential, so an answered
-        /// `AwaitServeMap` proves everything before it was processed.
-        async fn flush_frames<S>(stream: &mut S, token: &str)
+        /// Write one `Plan` frame and read the supervisor's answer, which
+        /// the fixtures' serve maps make a compile: the unit is in flight
+        /// from here. The ticket names the flight for its report.
+        async fn send_plan<S>(stream: &mut S, token: &str, args: &[OsString]) -> u64
         where
             S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
         {
-            use crate::supervisor::protocol::read_frame;
+            let plan = Plan::new(
+                token.to_owned(),
+                OsStr::new("rustc"),
+                args,
+                crate::supervisor::protocol::InvocationEnv::for_tests(),
+            );
+            write_frame(&mut *stream, &Request::Plan(plan))
+                .await
+                .expect("write the plan frame");
+            let answer: Option<crate::supervisor::protocol::Answer> =
+                crate::supervisor::protocol::read_frame(&mut *stream)
+                    .await
+                    .expect("read the plan's answer");
+            let Some(crate::supervisor::protocol::Answer::Compile { ticket }) = answer else {
+                panic!("a unit the serve map rules out is told to compile: {answer:?}");
+            };
+            ticket
+        }
+
+        /// Report the compile `ticket` named and read the receipt — the
+        /// receipt precedes the report's bookkeeping, so it returns while
+        /// the bookkeeping may still be running.
+        async fn send_compiled<S>(stream: &mut S, token: &str, ticket: u64, success: bool)
+        where
+            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+        {
+            let report = Compiled {
+                token: token.to_owned(),
+                ticket,
+                success,
+                compile_millis: 0,
+            };
+            write_frame(&mut *stream, &Request::Compiled(report))
+                .await
+                .expect("write the report frame");
+            let answer: Option<crate::supervisor::protocol::Answer> =
+                crate::supervisor::protocol::read_frame(&mut *stream)
+                    .await
+                    .expect("read the report's receipt");
+            assert_eq!(
+                answer,
+                Some(crate::supervisor::protocol::Answer::Received),
+                "a report is answered with a receipt"
+            );
+        }
+
+        /// Guarantee the frames already written on `stream` have been
+        /// handled, bookkeeping included: a connection serves its frames
+        /// in sequence, so the answer to a frame that needs no work — a
+        /// lookup under a wrong token — proves everything before it ran.
+        async fn flush_frames<S>(stream: &mut S)
+        where
+            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+        {
+            use crate::supervisor::protocol::{Answer, CcLookup, read_frame};
             write_frame(
                 &mut *stream,
-                &Request::AwaitServeMap(crate::supervisor::protocol::AwaitServeMap {
-                    token: token.to_owned(),
+                &Request::CcLookup(CcLookup {
+                    token: String::new(),
+                    cache_key: String::new(),
                 }),
             )
             .await
             .expect("write the flush frame");
-            let answer: crate::supervisor::protocol::Answer = read_frame(&mut *stream)
+            let answer: Answer = read_frame(&mut *stream)
                 .await
                 .expect("read the flush answer")
-                .expect("the supervisor answers the wait");
+                .expect("the supervisor answers the lookup");
             assert!(
-                matches!(answer, crate::supervisor::protocol::Answer::ServeMapReady),
+                matches!(answer, Answer::Failed { .. }),
                 "the flush answered with {answer:?}"
             );
         }
@@ -7872,21 +7941,12 @@ mod tests {
             in_flight: &server::InFlightUnits,
         ) -> BuildContext {
             BuildContext {
-                policy_dir: Some(policy_dir),
-                public_cache_target: Some(HOST_TARGET.to_owned()),
-                public_cache_disabled: false,
-                cache: crate::config::CacheLayers::default(),
-                analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
-                    semantic_fallback_enabled: false,
-                    unit_nodes: None,
-                    prefetch_candidates: std::collections::BTreeMap::new(),
-                })),
-                serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
                 policy_ready: std::sync::Arc::clone(ready),
-                in_flight: in_flight.clone(),
-                registry_sources: std::sync::OnceLock::from(crate::RegistrySources::CargoConfig(
-                    std::iter::once("index.crates.io".to_owned()).collect(),
-                )),
+                ..build_ctx(
+                    in_flight,
+                    crate::facade::ServeMapView::absent(),
+                    Some(policy_dir),
+                )
             }
         }
 
@@ -8076,15 +8136,14 @@ mod tests {
             );
             write_outputs(&out_dir, "consumer", "consmeta");
 
-            // The dependency's mark lands first: the flush guarantees the
-            // registration before the dependent's frames are written.
+            // The dependency's plan is answered first: the unit is in
+            // flight before the dependent's frames are written.
             let mut dep_conn = connect_raw(&endpoint).await;
-            send_observed(&mut dep_conn, &token, &dep_args, None).await;
-            flush_frames(&mut dep_conn, &token).await;
+            let dep_ticket = send_plan(&mut dep_conn, &token, &dep_args).await;
 
             let mut consumer_conn = connect_raw(&endpoint).await;
-            send_observed(&mut consumer_conn, &token, &consumer_args, None).await;
-            send_observed(&mut consumer_conn, &token, &consumer_args, Some(true)).await;
+            let consumer_ticket = send_plan(&mut consumer_conn, &token, &consumer_args).await;
+            send_compiled(&mut consumer_conn, &token, consumer_ticket, true).await;
 
             // No flush here — the report's bookkeeping is what waits, so
             // the connection's next frame cannot be answered yet. The
@@ -8099,15 +8158,110 @@ mod tests {
                 "nothing may be stored while the dependency is in flight"
             );
 
-            send_observed(&mut dep_conn, &token, &dep_args, Some(true)).await;
+            send_compiled(&mut dep_conn, &token, dep_ticket, true).await;
             // The flush answers only after the dependency's bookkeeping —
             // store included — has run to its end.
-            flush_frames(&mut dep_conn, &token).await;
+            flush_frames(&mut dep_conn).await;
 
             // The dependent's wait releases now; its connection's flush
             // answers only once that bookkeeping — store included — ran.
-            flush_frames(&mut consumer_conn, &token).await;
+            flush_frames(&mut consumer_conn).await;
             assert_eq!(stored_crates(&config).await, vec!["consumer", "dep"]);
+        }
+
+        /// A unit the serve map rules out compiles without a lookup, still
+        /// marks its flight, and owes the miss a lookup would have
+        /// recorded: its report counts one miss and stores the unit.
+        #[tokio::test]
+        async fn an_uncovered_unit_compiles_without_a_lookup_and_records_its_miss() {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("deps");
+            std::fs::create_dir_all(&out_dir).expect("create deps dir");
+            let registry_src = tempdir.path().join("cargo_home/registry/src");
+
+            let (config, in_flight, handler) = fixture(tempdir.path()).await;
+            let supervisor = server::start(
+                Arc::clone(&handler),
+                in_flight,
+                &std::env::current_exe().expect("current exe"),
+            )
+            .expect("start supervisor");
+            let [(_, endpoint), (_, token), _] = supervisor.env();
+            let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
+
+            let args = unit_args(&registry_src, &out_dir, "solo", "1.0.0", "solometa", &[]);
+            write_outputs(&out_dir, "solo", "solometa");
+            let mut conn = connect_raw(&endpoint).await;
+            let ticket = send_plan(&mut conn, &token, &args).await;
+            send_compiled(&mut conn, &token, ticket, true).await;
+            flush_frames(&mut conn).await;
+
+            assert_eq!(stored_crates(&config).await, vec!["solo"]);
+            assert_eq!(handler.observations().len(), 1, "the compile is observed");
+            let pool = config.state_db_pool().await.expect("state db pool");
+            let misses: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+                "SELECT misses FROM crate_stats WHERE crate_name = 'solo'".to_owned(),
+            ))
+            .fetch_one(&pool)
+            .await
+            .expect("the miss is recorded");
+            assert_eq!(misses, 1);
+        }
+
+        /// A pending serve map holds the plan of a unit it does not cover
+        /// until the map is final: the fetch it waits on may be about to
+        /// cover the unit (stow#347, stow#788).
+        #[tokio::test]
+        async fn a_pending_map_holds_an_uncovered_registry_unit_until_final() {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("deps");
+            std::fs::create_dir_all(&out_dir).expect("create deps dir");
+            let registry_src = tempdir.path().join("cargo_home/registry/src");
+
+            let ready = Arc::new(crate::facade::ServeMapSignal::pending());
+            let (writer, view) = crate::facade::serve_map_cell(Some(crate::facade::ServeMap {
+                pending: true,
+                ..crate::facade::ServeMap::default()
+            }));
+            let (_config, _in_flight, handler) = fixture_ctx(tempdir.path(), |in_flight| {
+                let mut ctx = build_ctx(in_flight, view, None);
+                ctx.serve_map_ready = Arc::clone(&ready);
+                ctx
+            })
+            .await;
+            let args = unit_args(&registry_src, &out_dir, "held", "1.0.0", "heldmeta", &[]);
+            let plan = {
+                let handler = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    handler
+                        .plan(
+                            super::verified_rustc(&handler, args).await,
+                            crate::supervisor::protocol::InvocationEnv::for_tests(),
+                        )
+                        .await
+                })
+            };
+            ready.parked(1).await;
+            assert!(!plan.is_finished(), "the plan ran before the map was final");
+
+            // The final map covers the unit: the plan leaves the shortcut
+            // for the full decision rather than compiling uncovered.
+            writer.publish(crate::facade::ServeMap {
+                target: vec![("held".to_owned(), "*".to_owned())],
+                ..crate::facade::ServeMap::default()
+            });
+            ready.complete();
+            let decision = tokio::time::timeout(Duration::from_secs(30), plan)
+                .await
+                .expect("the plan is released by the final map")
+                .expect("join the plan");
+            let server::Decision::Compile(post) = decision else {
+                panic!("a registry unit nothing serves compiles");
+            };
+            assert!(
+                !post.owes_miss,
+                "a covered unit takes the lookup chain, not the shortcut"
+            );
         }
 
         /// A facade whose connection ends between the mark and the report
@@ -8145,20 +8299,20 @@ mod tests {
             );
             write_outputs(&out_dir, "consumer2", "cons2meta");
 
-            // The dependency's mark lands — the flush proves it — then
-            // the facade's connection dies with no report ever coming.
+            // The dependency's plan is answered — the unit is in flight —
+            // then the facade's connection dies with no report ever
+            // coming.
             let mut dep_conn = connect_raw(&endpoint).await;
-            send_observed(&mut dep_conn, &token, &dep_args, None).await;
-            flush_frames(&mut dep_conn, &token).await;
+            send_plan(&mut dep_conn, &token, &dep_args).await;
             drop(dep_conn);
 
             let mut consumer_conn = connect_raw(&endpoint).await;
-            send_observed(&mut consumer_conn, &token, &consumer_args, None).await;
-            send_observed(&mut consumer_conn, &token, &consumer_args, Some(true)).await;
+            let consumer_ticket = send_plan(&mut consumer_conn, &token, &consumer_args).await;
+            send_compiled(&mut consumer_conn, &token, consumer_ticket, true).await;
             // The dependent's bookkeeping waits only until the dead
             // connection's flight completes — then the flush answers, and
             // the bookkeeping that logs the skip has run to its end.
-            flush_frames(&mut consumer_conn, &token).await;
+            flush_frames(&mut consumer_conn).await;
 
             let captured = log.text();
             assert!(
@@ -8186,7 +8340,10 @@ mod tests {
             std::fs::create_dir_all(&out_dir).expect("create deps dir");
             let registry_src = tempdir.path().join("cargo_home/registry/src");
 
-            let (_config, in_flight, handler) = fixture(tempdir.path()).await;
+            // `top` is covered by the serve map, so its plan runs the full
+            // decision — the one that waits on its externs' rows; `base`
+            // and `mid` are ruled out and compile at once.
+            let (_config, in_flight, handler) = fixture_covering(tempdir.path(), &["top"]).await;
             let supervisor = server::start(
                 Arc::clone(&handler),
                 in_flight.clone(),
@@ -8234,11 +8391,9 @@ mod tests {
             // `base` is compiling for the whole test until its connection
             // ends, and `mid`'s mark has landed: both are in flight.
             let mut base_conn = connect_raw(&endpoint).await;
-            send_observed(&mut base_conn, &token, &base_args, None).await;
-            flush_frames(&mut base_conn, &token).await;
+            send_plan(&mut base_conn, &token, &base_args).await;
             let mut mid_conn = connect_raw(&endpoint).await;
-            send_observed(&mut mid_conn, &token, &mid_args, None).await;
-            flush_frames(&mut mid_conn, &token).await;
+            let mid_ticket = send_plan(&mut mid_conn, &token, &mid_args).await;
 
             // `mid` is still compiling: a plan against it is not held.
             let decision = tokio::time::timeout(Duration::from_secs(10), plan_top(&handler))
@@ -8249,7 +8404,7 @@ mod tests {
 
             // `mid`'s rustc exits. Its bookkeeping parks on `base`'s
             // flight, so its rows are pending while its facade is gone.
-            send_observed(&mut mid_conn, &token, &mid_args, Some(true)).await;
+            send_compiled(&mut mid_conn, &token, mid_ticket, true).await;
             let base_rlib =
                 crate::artifact_cache::path_to_string(&base_rlib).expect("utf-8 extern path");
             in_flight.parked_on(&base_rlib, 1).await;
@@ -8298,13 +8453,12 @@ mod tests {
             let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
 
             // The extern the build-script unit was compiled against is
-            // in flight for the whole test: its mark lands — the flush
-            // proves the registration — and its report never does.
+            // in flight for the whole test: its plan is answered — the
+            // registration — and its report never comes.
             let dep_args = unit_args(&registry_src, &out_dir, "dep3", "1.0.0", "dep3meta", &[]);
             write_outputs(&out_dir, "dep3", "dep3meta");
             let mut dep_conn = connect_raw(&endpoint).await;
-            send_observed(&mut dep_conn, &token, &dep_args, None).await;
-            flush_frames(&mut dep_conn, &token).await;
+            send_plan(&mut dep_conn, &token, &dep_args).await;
 
             // The invocation cargo runs for a registry crate's build
             // script: `--crate-type bin`, the `build.rs` source, the
@@ -8338,21 +8492,18 @@ mod tests {
                 .expect("write build script binary");
 
             let mut script_conn = connect_raw(&endpoint).await;
-            send_observed(&mut script_conn, &token, &build_script_args, None).await;
-            send_observed(&mut script_conn, &token, &build_script_args, Some(true)).await;
+            let script_ticket = send_plan(&mut script_conn, &token, &build_script_args).await;
+            send_compiled(&mut script_conn, &token, script_ticket, true).await;
             // The post-compile holds while the extern is in flight, so
             // the flush stays unanswered until the flight ends.
             assert!(
-                tokio::time::timeout(
-                    Duration::from_millis(500),
-                    flush_frames(&mut script_conn, &token),
-                )
-                .await
-                .is_err(),
+                tokio::time::timeout(Duration::from_millis(500), flush_frames(&mut script_conn))
+                    .await
+                    .is_err(),
                 "the build-script unit's post-compile must hold on its in-flight extern"
             );
             drop(dep_conn);
-            flush_frames(&mut script_conn, &token).await;
+            flush_frames(&mut script_conn).await;
 
             assert!(
                 stored_crates(&config).await.is_empty(),

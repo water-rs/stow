@@ -114,7 +114,7 @@ impl Connection {
         match self.exchange(&Request::Plan(plan)).await? {
             Answer::Served(notifications) => Ok(Decision::Served(notifications)),
             Answer::Compile { ticket } => Ok(Decision::Compile(Ticket { ticket })),
-            Answer::Received | Answer::ServeMapReady | Answer::CcHit { .. } | Answer::CcMiss => {
+            Answer::Received | Answer::CcHit { .. } | Answer::CcMiss => {
                 Err("supervisor answered a plan with an answer that is not a decision".to_owned())
             }
             Answer::Failed { message } => Err(message),
@@ -141,10 +141,7 @@ impl Connection {
                 .map_err(|error| format!("supervisor named an undecodable object path: {error}")),
             Answer::CcMiss => Ok(CcDecision::Miss),
             Answer::Failed { message } => Ok(CcDecision::Bypass(message)),
-            Answer::Served(..)
-            | Answer::Compile { .. }
-            | Answer::Received
-            | Answer::ServeMapReady => Err(
+            Answer::Served(..) | Answer::Compile { .. } | Answer::Received => Err(
                 "supervisor answered a C/C++ lookup with an answer that is not a cache decision"
                     .to_owned(),
             ),
@@ -176,11 +173,7 @@ impl Connection {
         match self.exchange(&Request::CcCompiled(report)).await? {
             Answer::Received => Ok(None),
             Answer::Failed { message } => Ok(Some(message)),
-            Answer::Served(..)
-            | Answer::Compile { .. }
-            | Answer::ServeMapReady
-            | Answer::CcHit { .. }
-            | Answer::CcMiss => {
+            Answer::Served(..) | Answer::Compile { .. } | Answer::CcHit { .. } | Answer::CcMiss => {
                 Err("supervisor answered a C/C++ report with a lookup answer".to_owned())
             }
         }
@@ -209,11 +202,9 @@ impl Connection {
         match self.exchange(&Request::Compiled(report)).await? {
             Answer::Received => Ok(()),
             Answer::Failed { message } => Err(message),
-            Answer::Served(..)
-            | Answer::Compile { .. }
-            | Answer::ServeMapReady
-            | Answer::CcHit { .. }
-            | Answer::CcMiss => Err("supervisor answered a report with a plan answer".to_owned()),
+            Answer::Served(..) | Answer::Compile { .. } | Answer::CcHit { .. } | Answer::CcMiss => {
+                Err("supervisor answered a report with a plan answer".to_owned())
+            }
         }
     }
 

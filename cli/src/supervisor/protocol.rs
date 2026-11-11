@@ -28,17 +28,6 @@ pub enum Request {
     /// [`Answer::Received`] before the supervisor's bookkeeping, which the
     /// facade never waits for (stow#1431).
     Compiled(Compiled),
-    /// A compile the facade already decided on its own — the local-build
-    /// mark before rustc starts and the report after it ends. The mark is
-    /// one-way: the supervisor never answers it. The report is answered
-    /// with [`Answer::Received`], as [`Request::Compiled`] is.
-    Observed(Observed),
-    /// A facade whose unit a `pending` serve map does not cover asks the
-    /// supervisor to answer only once the build's final map has landed —
-    /// or at once when it already has. The wait moves off the file
-    /// system so every platform speaks it over the transport it already
-    /// carries (stow#347).
-    AwaitServeMap(AwaitServeMap),
     /// The C compiler wrapper asking whether the object cache holds the
     /// object a keyed invocation would produce. Answered with
     /// [`Answer::CcHit`] or [`Answer::CcMiss`]; a hit's records are
@@ -193,80 +182,6 @@ pub struct Compiled {
     pub compile_millis: u64,
 }
 
-/// The facade telling the supervisor about a compile it ran without
-/// asking first.
-///
-/// A unit the build's serve map already ruled out needs no plan round
-/// trip, but the build still has to mark it as locally built before
-/// rustc starts and observe how it ended afterwards.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Observed {
-    /// Proves the sender is part of this build; checked on every frame.
-    pub token: String,
-    /// The real rustc cargo asked for.
-    pub executable: Vec<u8>,
-    /// Everything after the executable, in order.
-    pub args: Vec<Vec<u8>>,
-    /// `None` marks the unit as compiling locally — the bookkeeping
-    /// [`crate::provenance::record_local_build`] does inside a `Compile`
-    /// decision, carried as a frame because this unit never asked for a
-    /// decision. `Some` reports the finished compile's exit status.
-    pub success: Option<bool>,
-    /// How long the finished compile ran, in milliseconds; `0` on the mark
-    /// frame, which precedes the compile.
-    pub compile_millis: u64,
-    /// The invocation's environment the supervisor cannot see.
-    pub env: InvocationEnv,
-}
-
-impl Observed {
-    /// Build an observation for this invocation.
-    #[must_use]
-    pub fn new(
-        token: String,
-        executable: &std::ffi::OsStr,
-        args: &[OsString],
-        success: Option<bool>,
-        compile_millis: u64,
-        env: InvocationEnv,
-    ) -> Self {
-        Self {
-            token,
-            executable: os_bytes::encode(executable),
-            args: args.iter().map(|arg| os_bytes::encode(arg)).collect(),
-            success,
-            compile_millis,
-            env,
-        }
-    }
-
-    /// The real rustc this invocation wrapped.
-    ///
-    /// # Errors
-    ///
-    /// When the peer's encoding is not decodable on this platform.
-    pub fn executable(&self) -> Result<OsString, String> {
-        os_bytes::decode(&self.executable)
-    }
-
-    /// The wrapped arguments, in order.
-    ///
-    /// # Errors
-    ///
-    /// When the peer's encoding is not decodable on this platform.
-    pub fn args(&self) -> Result<Vec<OsString>, String> {
-        self.args.iter().map(|arg| os_bytes::decode(arg)).collect()
-    }
-}
-
-/// The serve-map wait is the whole request — the token is its only
-/// payload, since the answer's timing, not its contents, is the signal.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AwaitServeMap {
-    /// Proves the sender is part of this build; checked on every frame.
-    pub token: String,
-}
-
 /// One keyed C/C++ compile as the wrapper computed it: the key covers
 /// everything that shapes the object, so the daemon never sees the
 /// command line.
@@ -359,9 +274,6 @@ pub enum Answer {
     /// exits with the compile's own status without waiting for it
     /// (stow#1431).
     Received,
-    /// The build's serve map is final: the facade re-reads the map file
-    /// and decides on what it finds (stow#347).
-    ServeMapReady,
     /// The object cache holds the object: the wrapper clones the file at
     /// `object` (OS-encoded) to the compiler's output path and exits 0.
     CcHit {

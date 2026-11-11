@@ -9,7 +9,7 @@
 //! answered with the `Answer` the socket transport would have written.
 //!
 //! The supervisor protocol is stateful per connection — a `Compile`
-//! ticket's flight and an `Observed` mark live between frames — so each
+//! ticket's flight lives between frames — so each
 //! facade mints a conversation id at connect and the calls below share a
 //! marks table keyed by it. `Close` drops the entry, which completes the
 //! conversation's flights exactly the way a socket teardown does. A
@@ -64,8 +64,7 @@ pub struct IpcCall {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum IpcCallBody {
     /// One `Request` frame; the call's response carries the `Answer`
-    /// the socket transport would have written, `None` for the one-way
-    /// `Observed` mark.
+    /// the socket transport would have written.
     Request(Request),
     /// The conversation is over: drop the marks it still holds, the
     /// teardown a socket close performs.
@@ -190,7 +189,7 @@ impl<H: Handler> heel::ipc::IpcCommand for SupervisorIpc<H> {
                             &rt,
                         );
                     }
-                    answer
+                    Some(answer)
                 }
             })
         }
