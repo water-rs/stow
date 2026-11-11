@@ -23,6 +23,12 @@ pub struct BuildToolchain {
     /// The rustc's file identity: what a request's executable is compared
     /// with.
     rustc_file: Handle,
+    /// The file the build's own rustc spelling resolves to — what the
+    /// driver itself runs. Under rustup with no `RUSTC` set that is the
+    /// `rustc` proxy on `PATH`, a different file from the toolchain's
+    /// `<sysroot>/bin/rustc`; cargo hands its wrapper one or the other
+    /// depending on whether it took its rustup bypass.
+    launcher_file: Handle,
     /// The configured `RUSTC_WORKSPACE_WRAPPER`, which cargo runs with the
     /// rustc as its first argument for workspace members.
     workspace_wrapper: Option<Handle>,
@@ -54,7 +60,13 @@ impl BuildToolchain {
     ) -> Result<Self, String> {
         let (spelling, vv) =
             tokio::join!(build_rustc.facade_spelling(), async { vv.clone().await });
-        Self::from_probe(spelling?, workspace_wrapper, &vv?).await
+        Self::from_probe(
+            spelling?,
+            build_rustc.executable().to_owned(),
+            workspace_wrapper,
+            &vv?,
+        )
+        .await
     }
 
     /// Resolve the toolchain of the rustc a standalone wrapper was invoked
@@ -65,11 +77,12 @@ impl BuildToolchain {
     /// As [`Self::for_build`].
     pub async fn for_executable(executable: &OsStr) -> Result<Self, String> {
         let vv = rustc_args::rustc_vv(executable).await?;
-        Self::from_probe(executable.to_owned(), None, &vv).await
+        Self::from_probe(executable.to_owned(), executable.to_owned(), None, &vv).await
     }
 
     async fn from_probe(
         spelling: OsString,
+        launcher: OsString,
         workspace_wrapper: Option<PathBuf>,
         vv: &str,
     ) -> Result<Self, String> {
@@ -80,19 +93,21 @@ impl BuildToolchain {
             let search_path = search_path.clone();
             tokio::task::spawn_blocking(move || {
                 let (rustc, rustc_file) = resolve_file(&spelling, &search_path)?;
+                let (_, launcher_file) = resolve_file(&launcher, &search_path)?;
                 let workspace_wrapper = workspace_wrapper
                     .map(|wrapper| resolve_file(wrapper.as_os_str(), &search_path))
                     .transpose()?
                     .map(|(_, file)| file);
-                Ok::<_, String>((rustc, rustc_file, workspace_wrapper))
+                Ok::<_, String>((rustc, rustc_file, launcher_file, workspace_wrapper))
             })
             .await
             .map_err(|error| format!("join the rustc resolution task: {error}"))??
         };
-        let (rustc, rustc_file, workspace_wrapper) = files;
+        let (rustc, rustc_file, launcher_file, workspace_wrapper) = files;
         Ok(Self {
             rustc,
             rustc_file,
+            launcher_file,
             workspace_wrapper,
             search_path,
             host_target,
@@ -140,13 +155,15 @@ impl BuildToolchain {
             .as_deref()
     }
 
-    /// Whether `spelling` names this toolchain's rustc file: a bare name
+    /// Whether `spelling` names this toolchain's rustc — the toolchain
+    /// file or the file the driver launches it through: a bare name
     /// resolves through the `PATH` the toolchain was resolved under, and
-    /// the two files are compared by identity, not by string (stow#608).
-    /// Stats the file system; callers run it off the runtime workers.
+    /// files are compared by identity, not by string (stow#608). Stats
+    /// the file system; callers run it off the runtime workers.
     #[must_use]
     pub fn is_rustc(&self, spelling: &OsStr) -> bool {
-        names_file(spelling, &self.search_path, &self.rustc_file)
+        resolve_file(spelling, &self.search_path)
+            .is_ok_and(|(_, file)| file == self.rustc_file || file == self.launcher_file)
     }
 
     /// Whether `spelling` names the configured workspace wrapper.
@@ -231,5 +248,37 @@ mod tests {
         let stdout = "Available CPUs for this target:\n    native          - Select the CPU of the current host (currently apple-m2).\n    generic\n";
         assert_eq!(parse_native_cpu(stdout).as_deref(), Some("apple-m2"));
         assert_eq!(parse_native_cpu("    generic\n"), None);
+    }
+
+    /// Cargo hands its wrapper the toolchain's own rustc or the spelling
+    /// the driver launched — under rustup two different files. Both are
+    /// the build's rustc; a third file is not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_launcher_and_the_toolchain_file_are_both_the_builds_rustc() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let launcher = dir.path().join("launcher");
+        let other = dir.path().join("other");
+        for program in [&launcher, &other] {
+            std::fs::write(program, b"#!/bin/sh\n").expect("write the program");
+            std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod the program");
+        }
+        let rustc = which::which("rustc").expect("the test machine has rustc on PATH");
+        let vv = crate::rustc_args::rustc_vv(rustc.as_os_str())
+            .await
+            .expect("rustc -vV");
+        let toolchain = super::BuildToolchain::from_probe(
+            rustc.clone().into_os_string(),
+            launcher.clone().into_os_string(),
+            None,
+            &vv,
+        )
+        .await
+        .expect("resolve the toolchain");
+        assert!(toolchain.is_rustc(rustc.as_os_str()));
+        assert!(toolchain.is_rustc(launcher.as_os_str()));
+        assert!(!toolchain.is_rustc(other.as_os_str()));
     }
 }
