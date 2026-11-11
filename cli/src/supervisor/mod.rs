@@ -17,6 +17,7 @@
 //! spans the build, so supervision costs no extra process.
 
 pub mod client;
+pub mod invocation;
 pub mod ipc;
 pub mod os_bytes;
 pub mod protocol;
