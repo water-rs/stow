@@ -57,9 +57,17 @@ pub struct DependencyClosure {
     packages: BTreeSet<(String, semver::Version)>,
     lib_packages: BTreeSet<(String, semver::Version)>,
     dependency_identity: stow_types::identity::DependencyIdentity,
+    own_shapes: crate::shapes::OwnNodeShapes,
 }
 
 impl DependencyClosure {
+    /// What the task's own node must publish, as the publisher's own unit
+    /// graphs and the scheduler's rule state it.
+    #[must_use]
+    pub const fn own_shapes(&self) -> &crate::shapes::OwnNodeShapes {
+        &self.own_shapes
+    }
+
     pub fn is_proc_macro(&self, name: &str, version: &semver::Version) -> bool {
         self.proc_macros
             .contains(&(name.to_owned(), version.clone()))
@@ -104,7 +112,16 @@ impl DependencyClosure {
             // in for the digest a real `resolve` would have verified.
             dependency_identity: stow_types::identity::DependencyIdentity::leaf()
                 .expect("leaf digest"),
+            // A test closure owes the node nothing until a test states it.
+            own_shapes: crate::shapes::OwnNodeShapes::new(Vec::new(), &[]),
         }
+    }
+
+    /// The closure with the shapes a test states the task's node owes.
+    #[cfg(test)]
+    pub(crate) fn with_own_shapes(mut self, own_shapes: crate::shapes::OwnNodeShapes) -> Self {
+        self.own_shapes = own_shapes;
+        self
     }
 }
 
@@ -146,6 +163,7 @@ pub async fn resolve(
         task::phase_unit_graphs(cargo_home, task, &workspace, task::cargo_subcommand()?).await?;
     task::verify_dependency_context(task, &unit_graphs)?;
     let (packages, lib_packages, proc_macros) = package_sets(task, &unit_graphs)?;
+    let own_shapes = crate::shapes::OwnNodeShapes::from_graphs(task, &unit_graphs)?;
     let dependency_identity = task
         .verified_dependency_graph()?
         .dependency_identity(0)
@@ -162,6 +180,7 @@ pub async fn resolve(
         packages,
         lib_packages,
         dependency_identity,
+        own_shapes,
     })
 }
 

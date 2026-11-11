@@ -36,6 +36,7 @@ mod plan;
 mod repack;
 mod rlib_members;
 mod runners;
+mod shapes;
 mod stage;
 mod task;
 mod validate;
@@ -321,6 +322,34 @@ async fn published_manifest(
     // pinned builder identity — an unverifiable marker means build
     // normally (stow#877).
     if !marker_signature_verified(session, trust, &reference, &manifest_digest).await? {
+        return Ok(None);
+    }
+    // A signed marker proves a build ran, not that it published the whole
+    // node: a record set short of a shape the node owes (an earlier builder
+    // never published the build script's explicit spelling) would complete
+    // the node for consumers that then fail on the missing key. Such a set
+    // is no proof — the task builds, and its publish refuses nothing short.
+    // The rows judged are the verified manifest's own: a tag that moved
+    // between the two reads names another artifact, and nothing here has
+    // checked that one's signature.
+    let published = stow_oci::pull_records_by_tag(
+        session,
+        &stow_types::records::published_tag(task.rustc_version.as_str(), &task.task_id),
+    )
+    .await
+    .map_err(|error| stow_types::stow_error!("pull published records {reference}: {error}"))?;
+    if published.manifest_digest != manifest_digest {
+        return Err(stow_types::stow_error!(
+            "published marker {reference} moved from {manifest_digest} to {} while it was read",
+            published.manifest_digest
+        ));
+    }
+    if let Some(gap) = shapes::published_records_gap(task, &published.records)? {
+        tracing::warn!(
+            task_id = %task.task_id,
+            "published records are no proof the node is built: {}",
+            gap.refusal(task, "the published records")
+        );
         return Ok(None);
     }
     Ok(Some(manifest))

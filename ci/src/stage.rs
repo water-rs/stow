@@ -227,6 +227,7 @@ mod tests {
         programs: crate::dep_scan::ProgramClaims {
             completed: Vec::new(),
             compiled: Vec::new(),
+            local_scripts: Vec::new(),
         },
         restorable_captures: 0,
         artifacts: Vec::new(),
@@ -330,6 +331,7 @@ mod tests {
             programs: crate::dep_scan::ProgramClaims {
                 completed: Vec::new(),
                 compiled: Vec::new(),
+                local_scripts: Vec::new(),
             },
             restorable_captures: 7,
             artifacts: Vec::new(),

@@ -1594,6 +1594,9 @@ impl heel::IpcCommand for StowCaptureCommand {
     fn handle(
         &self,
         record: CapturedRustcArtifact,
+        // A record names its own paths; the caller's working directory
+        // plays no part in it.
+        _context: heel::IpcContext,
     ) -> impl std::future::Future<Output = Result<(), heel::IpcError>> + Send {
         std::future::ready(self.sender.try_send(record).map_err(|error| {
             let record = error.into_inner();
@@ -2119,6 +2122,11 @@ mod tests {
         }
     }
 
+    /// The caller context heel hands a handler; the capture command ignores it.
+    fn context() -> heel::IpcContext {
+        heel::IpcContext::new(std::env::temp_dir())
+    }
+
     #[test]
     fn collector_rejects_a_duplicate_identity() {
         let (mut collector, command) = super::CaptureCollector::channel();
@@ -2126,10 +2134,16 @@ mod tests {
 
         smol::block_on(async {
             use heel::IpcCommand;
-            command.handle(record.clone()).await.expect("first record");
+            command
+                .handle(record.clone(), context())
+                .await
+                .expect("first record");
             // A forged second record under the same identity: accepted into
             // the channel like any caller, then fatal at drain.
-            command.handle(record).await.expect("second record");
+            command
+                .handle(record, context())
+                .await
+                .expect("second record");
         });
 
         let error = collector
@@ -2149,8 +2163,14 @@ mod tests {
 
         smol::block_on(async {
             use heel::IpcCommand;
-            command.handle(check).await.expect("check record");
-            command.handle(build).await.expect("build record");
+            command
+                .handle(check, context())
+                .await
+                .expect("check record");
+            command
+                .handle(build, context())
+                .await
+                .expect("build record");
         });
 
         collector
@@ -2165,10 +2185,10 @@ mod tests {
         smol::block_on(async {
             use heel::IpcCommand;
             command
-                .handle(sample_record(
-                    "0e63365407e7f07c",
-                    PathBuf::from("/tmp/target-check"),
-                ))
+                .handle(
+                    sample_record("0e63365407e7f07c", PathBuf::from("/tmp/target-check")),
+                    context(),
+                )
                 .await
                 .expect("check record");
         });
@@ -2188,13 +2208,13 @@ mod tests {
         smol::block_on(async {
             let working = tempdir().expect("working dir");
             let (mut collector, command) = super::CaptureCollector::channel();
-            let heel_binary = std::env::current_exe().expect("current exe");
             let mut sandbox = heel::Sandbox::with_config(
                 heel::SandboxConfigBuilder::default()
                     .network(heel::AllowAll)
-                    .working_dir(working.path())
-                    .heel_binary(&heel_binary)
-                    .ipc(heel::IpcRouter::new().register(command))
+                    // heel takes the working directory resolved: the
+                    // temp dir sits behind a link on macOS.
+                    .working_dir(working.path().canonicalize().expect("resolve working dir"))
+                    .direct_ipc(heel::IpcRouter::new().register(command))
                     .build(),
             )
             .await

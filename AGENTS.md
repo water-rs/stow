@@ -36,6 +36,7 @@ The single source of repository instructions; `CLAUDE.md` is a symlink to it.
 
 ## Rules
 
+- A wrapper is a thin client, without exception: it asks the daemon, runs its compiler and exits with it. Every decision, lookup, store and record lives in the daemon, and no wrapper works without one. This rule is never broken.
 - Every residual cost is the product: remove a cost before presenting it as a trade-off, and never narrow a feature to avoid one.
 - Durable Object requests stay under 90% of their monthly Workers Paid allowance; every other metered Cloudflare resource stays under 80%.
 - Fail fast on inconsistent identity or schema; no fallbacks.

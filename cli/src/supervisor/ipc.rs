@@ -117,6 +117,9 @@ impl<H: Handler> heel::ipc::IpcCommand for SupervisorIpc<H> {
     fn handle(
         &self,
         call: IpcCall,
+        // The supervisor protocol carries its own paths; the caller's
+        // working directory plays no part in it.
+        _context: heel::IpcContext,
     ) -> impl Future<Output = Result<Option<Answer>, heel::IpcError>> + Send {
         let conversations = Arc::clone(&self.conversations);
         let handler = Arc::clone(&self.handler);
