@@ -833,32 +833,50 @@ fn stage_open_object_blocking(
     })
 }
 
-/// Serve a cached object: replace whatever sits at `output_path` with a
-/// clone of the cache entry. The clone is staged beside the output and
-/// renamed over it, so two serves of one output both succeed (stow#1444).
+/// Serve a cached object at `output_path` through
+/// [`crate::inject::serve_output`]: an output that already holds the
+/// cache entry's bytes is left in place, and any other gets a clone of
+/// the entry staged beside it, so concurrent serves of one output all
+/// succeed and none replaces an object another already placed
+/// (stow#1444). `None` when the output already held the bytes.
 fn serve_cached_object_blocking(
     cache_path: &Path,
     output_path: &Path,
-) -> stow_types::error::Result<Placement> {
-    let staged = crate::inject::stage_clone(cache_path, output_path).wrap_err_with(|| {
+) -> stow_types::error::Result<Option<Placement>> {
+    let cached_len = std::fs::metadata(cache_path)
+        .wrap_err_with(|| format!("stat cached object {}", cache_path.display()))?
+        .len();
+    let served = crate::inject::serve_output(
+        output_path,
+        |found| output_holds_cached_object(found, cache_path, output_path, cached_len),
+        || {
+            let staged =
+                crate::inject::stage_clone(cache_path, output_path).wrap_err_with(|| {
+                    format!(
+                        "clone or copy cached object {} into {}",
+                        cache_path.display(),
+                        output_path.display()
+                    )
+                })?;
+            let (copied, path) = staged.into_parts();
+            let placement = if copied.is_some() {
+                Placement::Copied
+            } else {
+                Placement::Cloned
+            };
+            Ok(tempfile::NamedTempFile::from_parts(placement, path))
+        },
+    )
+    .wrap_err_with(|| {
         format!(
-            "serve cached object {} into {}",
+            "serve cached object {} at {}",
             cache_path.display(),
             output_path.display()
         )
     })?;
-    let placement = if staged.as_file().is_some() {
-        Placement::Copied
-    } else {
-        Placement::Cloned
+    let crate::inject::Served::Placed(placement) = served else {
+        return Ok(None);
     };
-    crate::inject::place_staged(staged, output_path).wrap_err_with(|| {
-        format!(
-            "move cached object {} into place at {}",
-            cache_path.display(),
-            output_path.display()
-        )
-    })?;
     if placement == Placement::Copied {
         tracing::debug!(
             source = %cache_path.display(),
@@ -866,7 +884,30 @@ fn serve_cached_object_blocking(
             "filesystem cannot clone; copied C/C++ object bytes"
         );
     }
-    Ok(placement)
+    Ok(Some(placement))
+}
+
+/// Whether `found`, the file open at `output_path`, already holds the
+/// bytes of the cached object at `cache_path`, `cached_len` long.
+fn output_holds_cached_object(
+    mut found: &std::fs::File,
+    cache_path: &Path,
+    output_path: &Path,
+    cached_len: u64,
+) -> stow_types::error::Result<bool> {
+    let found_len = found
+        .metadata()
+        .wrap_err_with(|| format!("stat served object {}", output_path.display()))?
+        .len();
+    if found_len != cached_len {
+        return Ok(false);
+    }
+    let mut found_bytes = Vec::new();
+    std::io::Read::read_to_end(&mut found, &mut found_bytes)
+        .wrap_err_with(|| format!("read served object {}", output_path.display()))?;
+    let cached_bytes = std::fs::read(cache_path)
+        .wrap_err_with(|| format!("read cached object {}", cache_path.display()))?;
+    Ok(found_bytes == cached_bytes)
 }
 
 fn cc_cache_path(config: &StowConfig, cache_key: &str) -> PathBuf {
@@ -1590,7 +1631,7 @@ mod tests {
 
         let placement =
             super::serve_cached_object_blocking(&cache_path, &served).expect("serve object");
-        assert_eq!(placement, super::Placement::Cloned);
+        assert_eq!(placement, Some(super::Placement::Cloned));
         assert_eq!(
             std::fs::read(&served).expect("read served"),
             b"object bytes"

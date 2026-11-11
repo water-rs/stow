@@ -40,12 +40,24 @@ fn stats_file_path(config: &StowConfig) -> PathBuf {
     config.cache_dir.join("stats.json")
 }
 
-/// Read `stats.json`, treating a missing file as zeroed counters. A
-/// corrupt file is an error — silently resetting it would erase the
-/// user's record without a trace.
+/// Read `stats.json` under its lock, treating a missing file as zeroed
+/// counters. A corrupt file is an error — silently resetting it would
+/// erase the user's record without a trace.
+///
+/// The lock is the writers' own ([`record_served_bundle`]): each update
+/// replaces the file by rename, and on Windows a read racing that rename
+/// can find the path absent, which would read as zeroed counters.
 pub async fn read_local_stats(config: &StowConfig) -> stow_types::error::Result<LocalStats> {
     let path = stats_file_path(config);
-    match async_fs::read(&path).await {
+    let Some(_guard) = lock_local_stats_shared(&path).await? else {
+        return Ok(LocalStats::default());
+    };
+    read_stats_file(&path).await
+}
+
+/// Read `stats.json` at `path`; the caller holds its lock.
+async fn read_stats_file(path: &std::path::Path) -> stow_types::error::Result<LocalStats> {
+    match async_fs::read(path).await {
         Ok(bytes) => {
             serde_json::from_slice(&bytes).wrap_err_with(|| format!("parse {}", path.display()))
         }
@@ -77,7 +89,7 @@ pub async fn record_served_bundle(
             .wrap_err_with(|| format!("create {}", parent.display()))?;
     }
     let _guard = lock_local_stats(&path).await?;
-    let mut stats = read_local_stats(config).await?;
+    let mut stats = read_stats_file(&path).await?;
     stats.hits = stats.hits.saturating_add(1);
     stats.cpu_millis_saved = stats.cpu_millis_saved.saturating_add(compile_millis);
     stats.bytes_served = stats.bytes_served.saturating_add(bytes);
@@ -116,6 +128,34 @@ async fn lock_local_stats(
     })
     .await
     .wrap_err("join the local stats lock task")?
+}
+
+/// Hold `stats.json.lock` shared for one read, so no update's rename
+/// lands during it. `None` when the cache directory does not exist:
+/// nothing was ever recorded, and a read never creates the directory.
+async fn lock_local_stats_shared(
+    path: &std::path::Path,
+) -> stow_types::error::Result<Option<crate::file_lock::FileLock>> {
+    let lock_path = path.with_extension("json.lock");
+    smol::unblock(move || {
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).wrap_err_with(|| format!("open {}", lock_path.display()));
+            }
+        };
+        crate::file_lock::FileLock::shared(file)
+            .map(Some)
+            .wrap_err_with(|| format!("lock {} shared", lock_path.display()))
+    })
+    .await
 }
 
 pub async fn record_hit(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {

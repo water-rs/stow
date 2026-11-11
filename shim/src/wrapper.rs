@@ -178,9 +178,12 @@ pub fn tools_dir_in(data_local_dir: &Path) -> PathBuf {
 /// home, binary) shim dir, the CI runner its runner-scoped
 /// [`tools_dir`].
 ///
-/// Every replacement is a temp-file-plus-rename, so a wrapper that cargo is
-/// executing concurrently resolves to either the old or the new runtime,
-/// never to a partially written one.
+/// A wrapper already resolving to its executable is left in place, and an
+/// absent one is created by a step that refuses an existing name, so
+/// concurrent runs never replace one another's wrappers under a cargo
+/// executing them. Only a wrapper resolving to something else is
+/// replaced, by a temp-file-plus-rename, so it resolves to either the old
+/// or the new runtime, never to a partially written one.
 ///
 /// # Errors
 /// Returns an error when the tool directory cannot be created, or a link or
@@ -213,12 +216,12 @@ fn materialize_in(
     runtime_executable: &Path,
     capture_executable: &Path,
 ) -> stow_types::error::Result<WrapperShimPaths> {
-    replace_link_atomic(&base.join(RUNTIME_LINK_PATH), runtime_executable)?;
-    replace_link_atomic(&base.join(CAPTURE_LINK_PATH), capture_executable)?;
+    place_link(&base.join(RUNTIME_LINK_PATH), runtime_executable)?;
+    place_link(&base.join(CAPTURE_LINK_PATH), capture_executable)?;
 
     let wrapper_link = |name: &str| -> stow_types::error::Result<PathBuf> {
         let path = base.join(name);
-        replace_link_atomic(&path, runtime_executable)?;
+        place_link(&path, runtime_executable)?;
         Ok(path)
     };
     Ok(WrapperShimPaths {
@@ -290,8 +293,16 @@ fn materialize_in(
 /// Put `executable` at `<base>/<name>.exe`, leaving an identical file alone.
 /// `source_bytes` caches the source read across placements of one executable.
 /// A byte copy is stamped with the source's modification time before it is
-/// renamed into place: the source's `(len, modified)` is the stamp a hard
-/// link shares with it, so a copy must be given it (stow#645).
+/// placed: the source's `(len, modified)` is the stamp a hard link shares
+/// with it, so a copy must be given it (stow#645).
+///
+/// Concurrent runs place the same wrappers while builds execute them, and
+/// a lookup racing a replace of the name can find it absent on Windows
+/// (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` is what
+/// `std::fs::rename` calls there). So an identical file is never
+/// replaced, an absent name is filled by a step that refuses an existing
+/// one — a hard link to the executable, or a no-replace rename of a staged
+/// copy — and only a name holding other bytes is replaced.
 #[cfg(windows)]
 fn place_executable(
     base: &Path,
@@ -300,21 +311,54 @@ fn place_executable(
     source_bytes: &mut Option<Vec<u8>>,
 ) -> stow_types::error::Result<PathBuf> {
     let destination = base.join(executable_file_name(name));
-    if same_contents(&destination, executable, source_bytes)? {
-        return Ok(destination);
+    match same_contents(&destination, executable, source_bytes)? {
+        Some(true) => return Ok(destination),
+        Some(false) => {
+            replace_executable(&destination, executable)?;
+            return Ok(destination);
+        }
+        None => {}
     }
-    let temp_path = staging_path(&destination)?;
+    let created = match fs::hard_link(executable, &destination) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(link_error) => {
+            let temp_path = staging_path(&destination)?;
+            copy_for_placement(executable, &temp_path, &link_error)?;
+            match tempfile::TempPath::from_path(temp_path).persist_noclobber(&destination) {
+                Ok(()) => true,
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(error) => {
+                    return Err(error.error).wrap_err_with(|| {
+                        format!("place wrapper executable {}", destination.display())
+                    });
+                }
+            }
+        }
+    };
+    // A name another run filled after this one found it empty is judged
+    // like any other; this run's staged copy, if any, is gone by now.
+    if !created && same_contents(&destination, executable, source_bytes)? != Some(true) {
+        replace_executable(&destination, executable)?;
+    }
+    Ok(destination)
+}
+
+/// Replace `destination`, which holds other bytes, with `executable` by a
+/// staged hard link or copy renamed over it.
+#[cfg(windows)]
+fn replace_executable(destination: &Path, executable: &Path) -> stow_types::error::Result<()> {
+    let temp_path = staging_path(destination)?;
     if let Err(link_error) = fs::hard_link(executable, &temp_path) {
         copy_for_placement(executable, &temp_path, &link_error)?;
     }
-    fs::rename(&temp_path, &destination).map_err(|error| {
+    fs::rename(&temp_path, destination).map_err(|error| {
         let _ = fs::remove_file(&temp_path);
         stow_types::stow_error!(
             "atomically replace wrapper executable {}: {error}",
             destination.display()
         )
-    })?;
-    Ok(destination)
+    })
 }
 
 /// The byte-copy half of a placement. `fs::copy` gives the staged file its
@@ -354,39 +398,49 @@ fn copy_for_placement(
         })
 }
 
-/// Whether `destination` already holds the bytes of `source`. A missing
-/// destination is simply not identical. A destination placed by hard link
-/// shares the source's file index — the same file by construction — so the
-/// byte-for-byte comparison (and its antivirus re-scan of both executables)
-/// only runs for a destination that is a real copy.
+/// Whether `destination` already holds the bytes of `source`; `None` when
+/// nothing is there. The destination is opened once and judged through
+/// that handle, never looked up by name again. A destination placed by
+/// hard link shares the source's file index — the same file by
+/// construction — so the byte-for-byte comparison (and its antivirus
+/// re-scan of both executables) only runs for a destination that is a
+/// real copy.
 #[cfg(windows)]
 fn same_contents(
     destination: &Path,
     source: &Path,
     source_bytes: &mut Option<Vec<u8>>,
-) -> stow_types::error::Result<bool> {
-    let Ok(destination_meta) = fs::metadata(destination) else {
-        return Ok(false);
+) -> stow_types::error::Result<Option<bool>> {
+    let destination_file = match fs::File::open(destination) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .wrap_err_with(|| format!("open wrapper executable {}", destination.display()));
+        }
     };
+    let destination_meta = destination_file
+        .metadata()
+        .wrap_err_with(|| format!("stat wrapper executable {}", destination.display()))?;
     let source_meta = fs::metadata(source)
         .wrap_err_with(|| format!("stat wrapper executable source {}", source.display()))?;
     if destination_meta.len() != source_meta.len() {
-        return Ok(false);
+        return Ok(Some(false));
     }
-    // A destination placed by hard link shares the source's volume and file
-    // index — the same file by construction — so the byte-for-byte
-    // comparison (and its antivirus re-scan of both executables) only runs
-    // for a destination that is a real copy.
-    if same_file::is_same_file(destination, source).wrap_err_with(|| {
+    let compare_error = || {
         format!(
             "compare wrapper executable {} with source {}",
             destination.display(),
             source.display()
         )
-    })? {
-        return Ok(true);
+    };
+    let destination_handle =
+        same_file::Handle::from_file(destination_file).wrap_err_with(compare_error)?;
+    if destination_handle == same_file::Handle::from_path(source).wrap_err_with(compare_error)? {
+        return Ok(Some(true));
     }
-    let destination_bytes = fs::read(destination)
+    let mut destination_bytes = Vec::new();
+    std::io::Read::read_to_end(&mut destination_handle.as_file(), &mut destination_bytes)
         .wrap_err_with(|| format!("read wrapper executable {}", destination.display()))?;
     let source_bytes = match source_bytes {
         Some(bytes) => bytes,
@@ -395,7 +449,57 @@ fn same_contents(
                 format!("read wrapper executable source {}", source.display())
             })?),
     };
-    Ok(destination_bytes == *source_bytes)
+    Ok(Some(destination_bytes == *source_bytes))
+}
+
+/// Point `link_path` at `target`, leaving a link that already does so in
+/// place.
+///
+/// Every stow run places the same links, often while another build is
+/// executing through them, so a link that already names `target` is
+/// never replaced. An absent one is created in one step — `symlink(2)`
+/// refuses an existing name — and a run that finds the name taken by
+/// another run's link judges that link the same way. Only a path holding
+/// anything else is replaced, by renaming a staged link over it.
+#[cfg(unix)]
+fn place_link(link_path: &Path, target: &Path) -> stow_types::error::Result<()> {
+    match link_names(link_path, target)? {
+        Some(true) => return Ok(()),
+        Some(false) => return replace_link_atomic(link_path, target),
+        None => {}
+    }
+    match std::os::unix::fs::symlink(target, link_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if link_names(link_path, target)? == Some(true) {
+                Ok(())
+            } else {
+                replace_link_atomic(link_path, target)
+            }
+        }
+        Err(error) => Err(error).wrap_err_with(|| {
+            format!(
+                "create wrapper tool link {} -> {}",
+                link_path.display(),
+                target.display()
+            )
+        }),
+    }
+}
+
+/// Whether `link_path` is a link naming `target`; `None` when nothing is
+/// there.
+#[cfg(unix)]
+fn link_names(link_path: &Path, target: &Path) -> stow_types::error::Result<Option<bool>> {
+    match fs::read_link(link_path) {
+        Ok(current) => Ok(Some(current == target)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // `EINVAL`: something other than a link holds the name.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(Some(false)),
+        Err(error) => {
+            Err(error).wrap_err_with(|| format!("read wrapper tool link {}", link_path.display()))
+        }
+    }
 }
 
 #[cfg(unix)]
