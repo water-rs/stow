@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use crate::artifact_cache::{LocalBuildArtifact, ObservedUnit};
 use crate::config::StowConfig;
+use crate::daemon::session::SessionId;
 use crate::rustc_args::ParsedRustcArgs;
 use crate::session_env::SessionEnv;
 use crate::state_db::StateDb;
@@ -281,9 +282,10 @@ fn parent_pid() -> u32 {
 
 /// The journal id for a session's build: the session writes the file
 /// complete when the build ends, so the `stow-` mark makes it drainable
-/// without a liveness check.
-fn session_journal_id() -> String {
-    format!("stow-{}", std::process::id())
+/// without a liveness check. The session's own id names it: one daemon
+/// serves many builds, so nothing about the writing process can.
+fn session_journal_id(session: SessionId) -> String {
+    format!("stow-{session}")
 }
 
 /// Whether a process id still names a live process. `EPERM` means the
@@ -545,6 +547,7 @@ pub struct JournalConsumer<'a> {
 /// node — journaled as one `inexact` line so the report's admission rides
 /// the same detached drain a miss does (stow#882).
 pub fn journal_session(
+    session: SessionId,
     rustc: &OsStr,
     consumer: &JournalConsumer<'_>,
     observations: &[ObservedUnit],
@@ -585,7 +588,7 @@ pub fn journal_session(
             entries: inexact_entries.to_vec(),
         }));
     }
-    let journal = journal_path(target_dir, &session_journal_id());
+    let journal = journal_path(target_dir, &session_journal_id(session));
     if let Err(error) = append_lines(&journal, &entries) {
         tracing::warn!(error = %error, journal = %journal.display(), "could not journal the build's compile observations");
     }
@@ -1601,6 +1604,47 @@ mod tests {
         assert!(lines[0].contains("\"fresh\""));
         assert!(lines[1].contains("\"serde\""));
         assert!(!work.exists());
+    }
+
+    /// Two builds of one daemon that share a target directory each keep
+    /// their own journal and context sidecar: the daemon's pid is the same
+    /// for both, so only the session's id can name them apart.
+    #[test]
+    fn two_sessions_in_one_target_dir_keep_their_own_journal_and_context() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).expect("target dir");
+        let mut sessions = Vec::new();
+        for name in ["first", "second"] {
+            let (project, key_inputs) = keyed_project(&dir.path().join(name));
+            let session = SessionId::mint();
+            journal_session(
+                session,
+                OsStr::new("rustc"),
+                &JournalConsumer {
+                    manifest_dir: &project,
+                    key: &key_inputs,
+                },
+                &[unit(&format!("only-{name}"), None)],
+                &target,
+                "",
+                &[],
+            );
+            sessions.push((session, name, project));
+        }
+        for (session, name, project) in &sessions {
+            let journal = journal_path(&target, &session_journal_id(*session));
+            let lines = std::fs::read_to_string(&journal).expect("the session's own journal");
+            assert_eq!(lines.lines().count(), 1, "{name}: {lines}");
+            assert!(lines.contains(&format!("only-{name}")), "{name}: {lines}");
+            assert_eq!(
+                read_context(&journal)
+                    .expect("the session's own context")
+                    .manifest_dir,
+                *project
+            );
+        }
+        assert_eq!(finished_journals(&target).len(), 2);
     }
 
     /// A minimal resolvable project plus the key inputs its build's

@@ -70,7 +70,9 @@ slowdown:
 `stow status` can show the index has rows for the build's dependencies
 without saying which unit failed to match them. Set `STOW_IDENTITY_TRACE`
 to a directory and re-run: every `stow rustc` wrapper process writes one
-`<crate>-<c_metadata>-<pid>.json` there per invocation, carrying the
+`<crate>-<c_metadata>-<pid>.json` per invocation — in a subdirectory
+named by the build's session id when the build runs as a session of the
+daemon — carrying the
 parsed inputs — target, rustc, emit, crate types, profile, features, and
 the resolved dependency `c_metadata` chain — plus the computed compile
 key and `c_metadata`. The diff between a missing unit's record and the

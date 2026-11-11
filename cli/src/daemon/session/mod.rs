@@ -109,6 +109,7 @@ impl Session {
         let mut config = facts.config.clone();
         if let Some(config) = &mut config {
             handles.install(config);
+            scope_identity_trace(config, id);
         }
         let seed = &facts.seed;
         let has_policy = seed.cache_policy_entries.is_some();
@@ -339,6 +340,7 @@ impl Session {
         };
         let observations = self.observations();
         miss_journal::journal_session(
+            self.id,
             &self.facts.build_rustc,
             &consumer,
             &observations,
@@ -653,6 +655,15 @@ fn arm_or_settle_serve_map_ready(
     }
 }
 
+/// Point `config`'s identity trace at a directory of session `id`'s own.
+/// One daemon serves many builds, so its pid cannot tell their identity
+/// records apart.
+fn scope_identity_trace(config: &mut StowConfig, id: SessionId) {
+    if let Some(trace) = &mut config.switches.identity_trace {
+        trace.push(id.to_string());
+    }
+}
+
 /// The policy gate's readiness latch for this build: pending only while a
 /// deferred build's enrichment still owes the allow set its coarse commit
 /// — released by the commit or by the guard dropping with the task; every
@@ -858,6 +869,38 @@ mod tests {
         assert_eq!(decide(&remote).await, driver_decision);
         driver.end().await.expect("end the driver-built session");
         remote.end().await.expect("end the received session");
+    }
+
+    /// The daemon's pid is every session's; each session writes its
+    /// identity records under a directory named by its own id.
+    #[tokio::test]
+    async fn two_sessions_write_identity_records_under_their_own_directories() {
+        let sessions = tempfile::tempdir().expect("sessions directory");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let target = tempfile::tempdir().expect("target directory");
+        let trace = std::path::PathBuf::from("/trace");
+        let handles = Resources::default().handles_for(cache.path());
+        let mut traces = Vec::new();
+        for _ in 0..2 {
+            let mut config = config_in(cache.path());
+            config.switches.identity_trace = Some(trace.clone());
+            let id = SessionId::mint();
+            let session = Session::open(
+                id,
+                facts(target.path(), Some(config)).await,
+                &handles,
+                sessions.path(),
+            )
+            .await
+            .expect("open the session");
+            let own = session
+                .env_cache
+                .config()
+                .and_then(|config| config.switches.identity_trace.clone());
+            assert_eq!(own, Some(trace.join(id.to_string())));
+            traces.push(own);
+        }
+        assert_ne!(traces[0], traces[1]);
     }
 
     /// Two sessions whose configs name different cache directories each
