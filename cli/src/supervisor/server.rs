@@ -20,8 +20,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 
 use super::protocol::{
-    Answer, ArtifactNotifications, AwaitServeMap, Compiled, Observed, Plan, Request, read_frame,
-    write_frame,
+    Answer, ArtifactNotifications, AwaitServeMap, CcCompiled, CcLookup, Compiled, Observed, Plan,
+    Request, read_frame, write_frame,
 };
 use super::{BINARY_ENV, BinaryIdentity, ENDPOINT_ENV, Endpoint, TOKEN_ENV};
 
@@ -69,6 +69,21 @@ pub trait Handler: Send + Sync + 'static {
         self: &Arc<Self>,
         executable: &std::ffi::OsStr,
     ) -> impl Future<Output = Result<String, String>> + Send;
+
+    /// The config whose C/C++ object cache and state database answer the
+    /// C compiler wrapper — the build's own, so the wrappers never open
+    /// the database themselves. `None` — the default — when the handler
+    /// has no C/C++ cache to answer from.
+    fn cc_config(self: &Arc<Self>) -> Option<&crate::config::StowConfig> {
+        None
+    }
+
+    /// The build's target directory: the only place a compiler output a
+    /// wrapper reports may live. `None` — the default — when the handler
+    /// does not know one, which refuses every report.
+    fn cc_target_dir(self: &Arc<Self>) -> Option<&std::path::Path> {
+        None
+    }
 
     /// What the handler needs to remember between asking for a compile and
     /// hearing that it finished.
@@ -784,6 +799,8 @@ enum ReportKind<P> {
     },
     /// An `Observed` report of the finished compile.
     Observed(Observation),
+    /// The records a C compiler wrapper's answer precedes.
+    Cc(crate::cc::CcRecord),
 }
 
 /// Run a report's bookkeeping; the flight ends when it does, succeeded
@@ -797,6 +814,11 @@ pub async fn finish_report<H: Handler>(handler: &Arc<H>, work: ReportWork<H::Pen
             compile_time,
         } => handler.compiled(pending, success, compile_time).await,
         ReportKind::Observed(observation) => handler.observed(observation).await,
+        ReportKind::Cc(record) => {
+            if let Some(config) = handler.cc_config() {
+                crate::cc::write_record(config, record).await;
+            }
+        }
     }
     drop(completion);
 }
@@ -824,7 +846,127 @@ pub async fn answer_request<H: Handler>(
         Request::AwaitServeMap(await_map) => {
             Reply::answer(answer_await_serve_map(handler, token, await_map).await)
         }
+        Request::CcLookup(lookup) => answer_cc_lookup(handler, token, lookup).await,
+        Request::CcCompiled(report) => answer_cc_compiled(handler, token, report).await,
     }
+}
+
+/// Look the object up in the build's C/C++ cache. A hit is answered at
+/// once — the wrapper clones the object while the LRU stamp and the hit
+/// statistic are written after the answer, like a rustc report's
+/// bookkeeping (stow#1431).
+async fn answer_cc_lookup<H: Handler>(
+    handler: &Arc<H>,
+    token: &str,
+    lookup: CcLookup,
+) -> Reply<H::Pending> {
+    if lookup.token != token {
+        return Reply::failed("supervisor token mismatch");
+    }
+    let Some(config) = handler.cc_config() else {
+        return Reply::failed("the build has no config for the C/C++ cache");
+    };
+    if !config.cache.uses_cc_cache() {
+        return Reply::failed("the C/C++ cache layer is off for this build");
+    }
+    if !crate::cc::is_cache_key(&lookup.cache_key) {
+        return Reply::failed("malformed C/C++ cache key");
+    }
+    match crate::cc::locate_cached_object(config, &lookup.cache_key).await {
+        Ok(Some(object)) => Reply {
+            answer: Some(Answer::CcHit {
+                object: super::os_bytes::encode(object.as_os_str()),
+            }),
+            work: Some(ReportWork {
+                completion: None,
+                kind: ReportKind::Cc(crate::cc::CcRecord::Hit {
+                    cache_key: lookup.cache_key,
+                }),
+            }),
+        },
+        Ok(None) => Reply::answer(Answer::CcMiss),
+        Err(error) => Reply::failed(format!("C/C++ cache lookup failed: {error}")),
+    }
+}
+
+/// Accept the report of a C compile a miss sent the wrapper to run. The
+/// object is snapshotted into the cache directory before the receipt —
+/// the wrapper's output file may be rewritten as soon as the compiler's
+/// caller moves on — and the publish, the LRU row, the eviction pass and
+/// the statistic follow it.
+async fn answer_cc_compiled<H: Handler>(
+    handler: &Arc<H>,
+    token: &str,
+    report: CcCompiled,
+) -> Reply<H::Pending> {
+    if report.token != token {
+        return Reply::failed("supervisor token mismatch");
+    }
+    let Some(config) = handler.cc_config() else {
+        return Reply::failed("the build has no config for the C/C++ cache");
+    };
+    if !crate::cc::is_cache_key(&report.cache_key) {
+        return Reply::failed("malformed C/C++ cache key");
+    }
+    let output_path = match report.output_path() {
+        Ok(path) => path,
+        Err(error) => return Reply::failed(error),
+    };
+    let record = if report.success {
+        // The path is the wrapper's word and this process is not
+        // sandboxed: the file is opened and checked as one descriptor,
+        // and staged from it, so a refused path is never read.
+        let Some(root) = handler.cc_target_dir().map(std::path::Path::to_path_buf) else {
+            return refuse_cc_output(&output_path, "the build's target directory is unknown");
+        };
+        let opened = {
+            let output_path = output_path.clone();
+            smol::unblock(move || crate::cc::open_reported_output(&output_path, &root)).await
+        };
+        let source = match opened {
+            Ok(source) => source,
+            Err(message) => return refuse_cc_output(&output_path, &message),
+        };
+        let cache_path = crate::cc::cached_object_path(config, &report.cache_key);
+        let staged = match crate::cc::stage_opened_object(&cache_path, source, &output_path).await {
+            Ok(staged) => Some(staged),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    cache_key = %report.cache_key,
+                    output_path = %output_path.display(),
+                    "failed to stage C/C++ compilation for the local stow cache"
+                );
+                None
+            }
+        };
+        crate::cc::CcRecord::Compiled {
+            cache_key: report.cache_key,
+            staged,
+        }
+    } else {
+        crate::cc::CcRecord::Failed {
+            cache_key: report.cache_key,
+        }
+    };
+    Reply {
+        answer: Some(Answer::Received),
+        work: Some(ReportWork {
+            completion: None,
+            kind: ReportKind::Cc(record),
+        }),
+    }
+}
+
+/// Refuse a reported C/C++ output: logged, answered `Failed`, nothing
+/// staged. `message` already names the path unless the refusal is about
+/// the build, so the path is named here too.
+fn refuse_cc_output<P>(output_path: &std::path::Path, message: &str) -> Reply<P> {
+    tracing::warn!(output_path = %output_path.display(), reason = %message, "refused a reported C/C++ output");
+    Reply::failed(format!(
+        "refused the C/C++ output {}: {message}",
+        output_path.display()
+    ))
 }
 
 /// Hold the answer until the build's serve map is final. The handler's
@@ -1907,5 +2049,237 @@ mod tests {
             .await
             .expect("the plan is released when the flight ends")
             .expect("join the plan");
+    }
+
+    /// A handler with a build config and no rustc work: the C object
+    /// cache is all it answers.
+    struct CcCache {
+        config: crate::config::StowConfig,
+        target_dir: std::path::PathBuf,
+    }
+
+    impl Handler for CcCache {
+        type Pending = OsString;
+
+        fn cc_config(self: &Arc<Self>) -> Option<&crate::config::StowConfig> {
+            Some(&self.config)
+        }
+
+        fn cc_target_dir(self: &Arc<Self>) -> Option<&std::path::Path> {
+            Some(&self.target_dir)
+        }
+
+        fn plan(
+            self: &Arc<Self>,
+            _executable: OsString,
+            _args: Vec<OsString>,
+            _env: crate::supervisor::protocol::InvocationEnv,
+        ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
+            std::future::ready(Decision::Compile(OsString::new()))
+        }
+
+        fn compiled(
+            self: &Arc<Self>,
+            _pending: Self::Pending,
+            _success: bool,
+            _compile_time: Duration,
+        ) -> impl std::future::Future<Output = ()> + Send {
+            std::future::ready(())
+        }
+
+        fn observed(
+            self: &Arc<Self>,
+            _observation: super::Observation,
+        ) -> impl std::future::Future<Output = ()> + Send {
+            std::future::ready(())
+        }
+
+        fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
+            std::future::ready(())
+        }
+
+        fn rustc_host_target(
+            self: &Arc<Self>,
+            _executable: &std::ffi::OsStr,
+        ) -> impl std::future::Future<Output = Result<String, String>> + Send {
+            std::future::ready(Ok("aarch64-apple-darwin".to_owned()))
+        }
+    }
+
+    /// The C wrapper's exchange with the daemon: a lookup that misses, a
+    /// report of the compile, then a later lookup that hits. The store,
+    /// the LRU row and the statistics land in the daemon's own state
+    /// database — the wrapper holds no handle on it — and the object
+    /// stays in the cache directory for the wrapper to clone.
+    #[tokio::test]
+    async fn a_c_wrapper_is_served_and_recorded_by_the_daemon() {
+        use crate::supervisor::client::CcDecision;
+
+        let cache = tempfile::tempdir().expect("cache dir");
+        let config = crate::config::StowConfig {
+            cache: crate::config::CacheLayers::default(),
+            edge_url: "http://127.0.0.1:8787".to_owned(),
+            registry_base_url: "http://127.0.0.1:8787".to_owned(),
+            cache_dir: cache.path().to_path_buf(),
+            request_timeout: Duration::from_secs(15),
+            negative_cache_ttl: Duration::from_mins(5),
+            circuit_reset_after: Duration::from_mins(1),
+            circuit_trip_threshold: 5,
+            artifact_cache_max_bytes: crate::config::DEFAULT_ARTIFACT_CACHE_MAX_BYTES,
+            index_refresh_interval: Duration::from_mins(1),
+            verify_mode: crate::config::VerifyMode::GithubCi,
+            state_db: crate::state_db::StateDb::default(),
+            trust_material: Arc::default(),
+            registry_http: Arc::default(),
+            artifact_cache_staging: Arc::default(),
+        };
+        let target = tempfile::tempdir().expect("target dir");
+        let handler = Arc::new(CcCache {
+            config: config.clone(),
+            target_dir: target.path().to_path_buf(),
+        });
+        let mut supervisor = start(
+            Arc::clone(&handler),
+            super::InFlightUnits::default(),
+            &test_executable(),
+        )
+        .expect("start the supervisor");
+        let [(_, endpoint), (_, token), _] = supervisor.env();
+        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let output = target.path().join("probe.o");
+        std::fs::write(&output, b"object bytes").expect("write the compiler's output");
+
+        let mut connection = Connection::open(&endpoint, token.clone())
+            .await
+            .expect("connect to the supervisor");
+        assert!(matches!(
+            connection.cc_lookup(CC_KEY).await.expect("first lookup"),
+            CcDecision::Miss
+        ));
+        assert_eq!(
+            connection
+                .cc_report(CC_KEY, &output, true)
+                .await
+                .expect("report the compile"),
+            None,
+            "an output inside the target directory is taken"
+        );
+        connection.close().await.expect("close");
+
+        let mut connection = Connection::open(&endpoint, token)
+            .await
+            .expect("connect to the supervisor");
+        // The store follows the receipt, so a lookup racing it may still
+        // miss; the shutdown drain is what makes the rest deterministic.
+        let first = connection.cc_lookup(CC_KEY).await.expect("second lookup");
+        connection.close().await.expect("close");
+        assert_eq!(supervisor.shutdown().await, 0, "the drain finishes cleanly");
+
+        let object = crate::cc::cached_object_path(&config, CC_KEY);
+        assert_eq!(
+            std::fs::read(&object).expect("the daemon stored the object"),
+            b"object bytes"
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM cc_cache_entries WHERE cache_key = ?")
+                .bind(CC_KEY)
+                .fetch_one(&config.state_db_pool().await.expect("state db"))
+                .await
+                .expect("count rows");
+        assert_eq!(rows, 1, "the daemon wrote the object's LRU row");
+        let summary = crate::stats::read_summary(&config).await.expect("stats");
+        assert_eq!(summary.cc_misses, 1, "the compile is recorded as a miss");
+        match first {
+            CcDecision::Hit(path) => {
+                assert_eq!(path, object);
+                assert_eq!(summary.cc_hits, 1, "the served hit is recorded");
+            }
+            CcDecision::Miss => assert_eq!(summary.cc_hits, 0),
+            CcDecision::Bypass(reason) => panic!("the cache was consulted: {reason}"),
+        }
+        config.state_db.close().await;
+    }
+
+    /// A C/C++ cache key: the hex of a SHA-256 digest, as the wrapper
+    /// computes it.
+    const CC_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// The supervisor is not sandboxed, so a report naming a file the
+    /// sandbox keeps from the wrapper must not make it read that file into
+    /// the cache the sandbox can read: an output outside the target
+    /// directory, a link inside it that points outside, and a file reached
+    /// through a directory link inside it, are refused, answered `Failed`
+    /// naming the path, and nothing reaches the cache directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_c_report_outside_the_target_directory_is_refused() {
+        let cache = tempfile::tempdir().expect("cache dir");
+        let target = tempfile::tempdir().expect("target dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        let secret = outside.path().join("id_ed25519");
+        std::fs::write(&secret, b"private key").expect("write the secret");
+        let link = target.path().join("probe.o");
+        std::os::unix::fs::symlink(&secret, &link).expect("link to the secret");
+        // A directory link is followed by the open; only the descriptor's
+        // real path tells it apart from a file in the target directory.
+        std::os::unix::fs::symlink(outside.path(), target.path().join("out"))
+            .expect("link to the secret's directory");
+        let through_directory = target.path().join("out").join("id_ed25519");
+        let config = crate::config::StowConfig {
+            cache: crate::config::CacheLayers::default(),
+            edge_url: "http://127.0.0.1:8787".to_owned(),
+            registry_base_url: "http://127.0.0.1:8787".to_owned(),
+            cache_dir: cache.path().to_path_buf(),
+            request_timeout: Duration::from_secs(15),
+            negative_cache_ttl: Duration::from_mins(5),
+            circuit_reset_after: Duration::from_mins(1),
+            circuit_trip_threshold: 5,
+            artifact_cache_max_bytes: crate::config::DEFAULT_ARTIFACT_CACHE_MAX_BYTES,
+            index_refresh_interval: Duration::from_mins(1),
+            verify_mode: crate::config::VerifyMode::GithubCi,
+            state_db: crate::state_db::StateDb::closed(),
+            trust_material: Arc::default(),
+            registry_http: Arc::default(),
+            artifact_cache_staging: Arc::default(),
+        };
+        let handler = Arc::new(CcCache {
+            config: config.clone(),
+            target_dir: target.path().to_path_buf(),
+        });
+        let mut supervisor = start(
+            Arc::clone(&handler),
+            super::InFlightUnits::default(),
+            &test_executable(),
+        )
+        .expect("start the supervisor");
+        let [(_, endpoint), (_, token), _] = supervisor.env();
+        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+
+        let mut connection = Connection::open(&endpoint, token)
+            .await
+            .expect("connect to the supervisor");
+        for reported in [&secret, &link, &through_directory] {
+            let refusal = connection
+                .cc_report(CC_KEY, reported, true)
+                .await
+                .expect("the refusal is an answer")
+                .expect("a report outside the target directory is refused");
+            assert!(
+                refusal.contains(&reported.display().to_string()),
+                "the refusal names the path: {refusal}"
+            );
+        }
+        connection.close().await.expect("close");
+        assert_eq!(supervisor.shutdown().await, 0, "the drain finishes cleanly");
+
+        let leftovers: Vec<_> = walkdir::WalkDir::new(cache.path())
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "nothing may be staged for a refused report: {leftovers:?}"
+        );
     }
 }

@@ -1366,9 +1366,20 @@ pub(crate) struct BuildSupervisor {
     /// cargo back (stow#608).
     resolution_done: ResolutionDone,
     observations: std::sync::Mutex<Vec<artifact_cache::ObservedUnit>>,
+    /// The target directory cargo builds into — where the C compiler
+    /// outputs the wrappers report must live. Unknown until the driver
+    /// tells it; an unknown one refuses every report.
+    target_dir: Option<PathBuf>,
 }
 
 impl BuildSupervisor {
+    /// The build's target directory, as cargo resolves it.
+    #[must_use]
+    pub(crate) fn with_target_dir(mut self, target_dir: PathBuf) -> Self {
+        self.target_dir = Some(target_dir);
+        self
+    }
+
     /// A supervisor that owns the build's resolved context rather than
     /// rediscovering it per invocation. `base` is the wrapper environment
     /// the driver computed before cargo spawned — the facts the lazy
@@ -1390,6 +1401,7 @@ impl BuildSupervisor {
             ctx,
             resolution_done,
             observations: std::sync::Mutex::default(),
+            target_dir: None,
         };
         if let Some(base) = base {
             supervisor.env_cache.seed(base);
@@ -1438,6 +1450,14 @@ impl BuildSupervisor {
 
 impl supervisor::server::Handler for BuildSupervisor {
     type Pending = Box<PostCompile>;
+
+    fn cc_config(self: &std::sync::Arc<Self>) -> Option<&StowConfig> {
+        self.env_cache.config()
+    }
+
+    fn cc_target_dir(self: &std::sync::Arc<Self>) -> Option<&Path> {
+        self.target_dir.as_deref()
+    }
 
     async fn plan(
         self: &std::sync::Arc<Self>,
@@ -3576,6 +3596,11 @@ fn resolve_cc_compiler(executable: &OsString) -> cc::ResolvedCompiler {
 
 /// The C/C++ compiler facade. Returns the status this process owes its
 /// caller: success for a served object, else the real compiler's own.
+///
+/// Under a supervised build the daemon owns the object cache and its
+/// records, and this process never opens the state database. Without a
+/// supervisor — a plain `cargo build` through the wrappers `stow setup`
+/// writes — it decides in this process instead.
 #[tracing::instrument(name = "stow.wrapper.cc_invoke", skip_all)]
 async fn run_cc_wrapper(
     command: WrapperCommandArgs,
@@ -3585,7 +3610,105 @@ async fn run_cc_wrapper(
     let compiler = resolve_cc_compiler(&command.executable);
     #[cfg(windows)]
     let compiler = resolve_cc_compiler(&command.executable)?;
-    let compiler_args = &command.wrapped_args;
+    // An endpoint that is set but unusable fails the build, as it does
+    // for the rustc facade.
+    match supervisor::from_env().map_err(|error| stow_types::stow_error!("{error}"))? {
+        Some((endpoint, token)) => {
+            run_cc_supervised(&endpoint, token, &compiler, &command.wrapped_args).await
+        }
+        None => run_cc_standalone(&compiler, &command.wrapped_args, state_db).await,
+    }
+}
+
+/// Ask the supervisor about the object, then do what it says. The only
+/// work here is the compiler's: the key, the clone of a hit onto the
+/// output and the compile itself. The cache lookup, the store, the LRU
+/// stamp and the statistics are the supervisor's, against its own state
+/// database — this process holds a closed handle, so nothing here could
+/// open one.
+async fn run_cc_supervised(
+    endpoint: &supervisor::Endpoint,
+    token: String,
+    compiler: &cc::ResolvedCompiler,
+    compiler_args: &[OsString],
+) -> stow_types::error::Result<std::process::ExitStatus> {
+    // The inherited config is read only to learn whether the C/C++ layer
+    // is on, before the compiler is spent on a key nothing would use.
+    let config = match StowConfig::load_local(StateDb::closed()) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(error = %error, "stow local config unavailable, bypassing C/C++ cache");
+            return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
+        }
+    };
+    if !config.cache.uses_cc_cache() {
+        return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
+    }
+    let (cache_key, output_path) = match cc::plan_compile(compiler, compiler_args).await {
+        Ok(cc::CcPlan::Keyed {
+            cache_key,
+            output_path,
+        }) => (cache_key, output_path),
+        Ok(cc::CcPlan::Passthrough) => {
+            return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "stow C/C++ cache failed, bypassing cache");
+            return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
+        }
+    };
+    let mut connection = supervisor::client::Connection::open(endpoint, token)
+        .await
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    let decision = connection
+        .cc_lookup(&cache_key)
+        .await
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    let status = match decision {
+        supervisor::client::CcDecision::Hit(object) => {
+            match cc::serve_cached_object(&object, &output_path).await {
+                Ok(()) => std::process::ExitStatus::default(),
+                Err(error) => {
+                    tracing::warn!(error = %error, "stow C/C++ cache failed, bypassing cache");
+                    run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await?
+                }
+            }
+        }
+        supervisor::client::CcDecision::Bypass(reason) => {
+            tracing::warn!(%reason, "stow C/C++ cache failed, bypassing cache");
+            run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await?
+        }
+        supervisor::client::CcDecision::Miss => {
+            let status =
+                run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await?;
+            // The compiler resolved its output against this process's
+            // working directory, which is not the supervisor's.
+            let reported = std::path::absolute(&output_path)
+                .wrap_err_with(|| format!("resolve C output path {}", output_path.display()))?;
+            if let Some(reason) = connection
+                .cc_report(&cache_key, &reported, status.success())
+                .await
+                .map_err(|error| stow_types::stow_error!("{error}"))?
+            {
+                tracing::warn!(%reason, "the build supervisor did not take the C/C++ object");
+            }
+            status
+        }
+    };
+    connection
+        .close()
+        .await
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    Ok(status)
+}
+
+/// Decide and execute in this process: the configuration that has no
+/// supervisor to ask.
+async fn run_cc_standalone(
+    compiler: &cc::ResolvedCompiler,
+    compiler_args: &[OsString],
+    state_db: &StateDb,
+) -> stow_types::error::Result<std::process::ExitStatus> {
     let config = match StowConfig::load_local(state_db.clone()) {
         Ok(config) => config,
         Err(error) => {
@@ -3601,7 +3724,7 @@ async fn run_cc_wrapper(
         return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
     }
 
-    let outcome = match cc::try_compile(&config, &compiler, compiler_args).await {
+    let outcome = match cc::try_compile(&config, compiler, compiler_args).await {
         Ok(outcome) => outcome,
         Err(error) => {
             tracing::warn!(error = %error, "stow C/C++ cache failed, bypassing cache");
@@ -7839,6 +7962,7 @@ mod tests {
                 ctx: ctx(&in_flight),
                 observations: std::sync::Mutex::new(Vec::new()),
                 resolution_done: crate::ResolutionDone::pending(),
+                target_dir: None,
             });
             (config, in_flight, handler)
         }
