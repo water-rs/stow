@@ -2222,6 +2222,53 @@ fn native_twin_contexts_preserve_each_profiles_host_settings() {
     });
 }
 
+/// What the scan and the publisher record of one script compiled under
+/// both spellings: each capture is a linked host executable labelled with
+/// the spelling that compiled it, and the publisher's own unit graphs owe
+/// the script under the native spelling and under the explicit
+/// compile-time phase.
+async fn assert_scripts_follow_their_spellings(
+    cargo_home: &Path,
+    owner: &BuildTaskPayload,
+    workspace: &BuildWorkspace,
+    native_script: &stow_types::capture::CapturedRustcArtifact,
+    explicit_script: &stow_types::capture::CapturedRustcArtifact,
+) {
+    use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+    for (record, invocation) in [
+        (native_script, UnitInvocation::Native),
+        (explicit_script, UnitInvocation::Target),
+    ] {
+        assert_eq!(
+            crate::dep_scan::capture_unit_shape(
+                owner,
+                &stow_types::artifact::ArtifactKind::BuildScript,
+                record
+            )
+            .expect("script shape"),
+            UnitShape {
+                side: UnitSide::Host,
+                invocation,
+                kind: UnitKind::Linked,
+            }
+        );
+    }
+    let graphs = task::phase_unit_graphs(cargo_home, owner, workspace, CargoSubcommand::Build)
+        .await
+        .expect("owner graphs");
+    let owed = crate::shapes::OwnNodeShapes::from_graphs(owner, &graphs).expect("owner shapes");
+    let spellings = owed.script_clauses();
+    assert_eq!(
+        spellings.keys().copied().collect::<Vec<_>>(),
+        [UnitInvocation::Native, UnitInvocation::Target]
+    );
+    assert!(
+        spellings[&UnitInvocation::Target]
+            .contains("check explicit --target compile-time dependencies"),
+        "{spellings:?}"
+    );
+}
+
 /// Library keys can agree while the native and explicit build-script keys differ.
 #[test]
 fn native_equivalent_library_produces_both_script_shapes_without_recompiling_its_library() {
@@ -2287,6 +2334,14 @@ fn native_equivalent_library_produces_both_script_shapes_without_recompiling_its
             .find(|r| r.crate_name == "build_script_build")
             .expect("explicit script");
         assert_ne!(native_script.compile_key, explicit_script.compile_key);
+        assert_scripts_follow_their_spellings(
+            cargo_home.path(),
+            &owner,
+            &workspace,
+            native_script,
+            explicit_script,
+        )
+        .await;
         assert!(
             explicit
                 .iter()
@@ -2299,5 +2354,14 @@ fn native_equivalent_library_produces_both_script_shapes_without_recompiling_its
             .await
             .expect("leaf context");
         assert_eq!(phases.len(), 2, "scriptless task adds no phase");
+        let graphs =
+            task::phase_unit_graphs(cargo_home.path(), &leaf, &workspace, CargoSubcommand::Build)
+                .await
+                .expect("leaf graphs");
+        let owed = crate::shapes::OwnNodeShapes::from_graphs(&leaf, &graphs).expect("leaf shapes");
+        assert!(
+            owed.script_clauses().is_empty(),
+            "a crate without a build script owes none"
+        );
     });
 }

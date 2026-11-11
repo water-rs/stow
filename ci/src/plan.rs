@@ -976,6 +976,7 @@ mod tests {
             target: "aarch64-apple-darwin".to_owned(),
             rustc_version: "1.91.1".to_owned(),
             emit: vec!["link".to_owned()],
+            invocations: [stow_types::public_cache::UnitInvocation::Native].into(),
         }];
         build_upload_plan(
             &scanned,
