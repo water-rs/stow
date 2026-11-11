@@ -52,6 +52,7 @@ mod profile_guard;
 mod provenance;
 mod report;
 mod resolve;
+mod retry;
 mod rustc_args;
 mod sandbox;
 mod state_db;
@@ -7411,6 +7412,105 @@ mod tests {
                 .await
                 .expect("read the circuit"),
             "a local materialization failure opened the circuit"
+        );
+    }
+
+    /// The exact-serve lookup of the sample bundle's row against `edge`,
+    /// in a build whose circuit trips only at five failures: the lookup's
+    /// tally and the failures the circuit counted afterwards.
+    async fn exact_serve_against(
+        edge: &crate::test_edge::StubEdge,
+        row_digest: String,
+    ) -> (super::LookupTally, i64) {
+        const TARGET: &str = "aarch64-apple-darwin";
+        const RUSTC: &str = "1.91.1";
+        const C_METADATA: &str = "aabbccddeeff0011";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = env_base_test_config(&dir);
+        edge.configure(&mut config);
+        config.circuit_trip_threshold = 5;
+        let mut index = empty_test_index(TARGET, RUSTC);
+        let mut row = crate::index::index_test_row(C_METADATA);
+        row.bundle_digest = row_digest;
+        index.rows.push(row);
+        index.header.row_count = 1;
+        crate::index::write_cached_test_slice(&config, TARGET, RUSTC, &index)
+            .await
+            .expect("write the slice");
+        let signal = std::sync::Arc::new(crate::facade::ServeMapSignal::settled());
+        let env_cache = test_cache(std::ffi::OsStr::new(""));
+        let env = serve_env(&config, &env_cache, TARGET, RUSTC, C_METADATA).await;
+        let ctx = serve_ctx(&signal);
+        let parsed =
+            ParsedRustcArgs::parse(&serve_args(TARGET, C_METADATA)).expect("parse the unit args");
+        let request = crate::fetch::FetchRequest {
+            target: TARGET,
+            rustc_version: RUSTC,
+            c_metadata: C_METADATA,
+        };
+        let mut tally = super::LookupTally::default();
+        super::try_remote_serves(&env, &parsed, &request, &ctx, true, &mut tally).await;
+        let pool = config.state_db_pool().await.expect("state db");
+        let failures = sqlx::query_scalar::<_, i64>(
+            "SELECT consecutive_failures FROM circuit_state WHERE singleton = 1",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("read the circuit row")
+        .unwrap_or(0);
+        (tally, failures)
+    }
+
+    /// stow#1455: a download that fails on every attempt counts against
+    /// the circuit once — after its retries — not once per attempt.
+    #[tokio::test]
+    async fn an_exhausted_download_charges_the_circuit_once() {
+        let digest = format!("sha256:{:0>64}", "ab");
+        let edge = crate::test_edge::serve(vec![crate::test_edge::Route {
+            path: "",
+            status: "503 Service Unavailable",
+            body: Vec::new(),
+        }]);
+        let (tally, failures) = exact_serve_against(&edge, digest).await;
+        assert_eq!(edge.requests().len(), 4, "the first try and three retries");
+        assert_eq!(failures, 1, "the circuit counted each attempt");
+        assert_eq!(tally.failures.len(), 1, "{:?}", tally.failures);
+        assert!(
+            tally.failures[0]
+                .to_string()
+                .starts_with("exact bundle fetch failed: "),
+            "{:?}",
+            tally.failures
+        );
+    }
+
+    /// stow#1455: a download whose first answer is cut off mid-body and
+    /// whose retry succeeds is a transport success — nothing counts
+    /// against the circuit and no fetch failure is reported.
+    #[tokio::test]
+    async fn a_download_that_recovers_leaves_the_circuit_untouched() {
+        let tar = crate::fetch::tests::sample_bundle_tar();
+        let digest = format!(
+            "sha256:{}",
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&tar))
+        );
+        let edge = crate::test_edge::serve_with(move |_, answered| {
+            let mut reply = crate::test_edge::Reply::new("200 OK", tar.clone());
+            if answered == 0 {
+                reply.cut_body_at = Some(tar.len() / 2);
+            }
+            reply
+        });
+        let (tally, failures) = exact_serve_against(&edge, digest).await;
+        assert_eq!(edge.requests().len(), 2, "one cut-off answer, one retry");
+        assert_eq!(failures, 0, "a recovered download charged the circuit");
+        assert!(
+            tally
+                .failures
+                .iter()
+                .all(|failure| !failure.to_string().starts_with("exact bundle fetch failed")),
+            "{:?}",
+            tally.failures
         );
     }
 

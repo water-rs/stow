@@ -165,6 +165,13 @@ fn artifact_url(bundle: &BundleRef<'_>, edge_url: &str) -> String {
 /// Cache copy it serves from) is untrusted, so the index is what vouches
 /// for the bytes before the cosign verification inside them even runs.
 ///
+/// A transient failure of a reachable edge — see
+/// [`FetchError::is_transient`] — is retried under the shared
+/// [`stow_types::transient::Backoff`] budget before it is returned, so a
+/// caller that counts failures counts a download that outlived its
+/// retries, not each attempt. The GET is a plain read of a
+/// content-addressed blob, so replaying it is safe.
+///
 /// # Errors
 ///
 /// `NotFound` when the registry holds no blob under the digest (the index
@@ -175,19 +182,42 @@ pub async fn download_bundle_bytes(
     config: &StowConfig,
     bundle: &BundleRef<'_>,
 ) -> Result<Vec<u8>, FetchError> {
+    crate::retry::with_backoff(bundle.bundle_digest, || async {
+        match download_bundle_bytes_once(config, bundle).await {
+            Ok(bytes) => crate::retry::Attempt::Done(bytes),
+            Err(error) if error.is_transient() => {
+                let retry_after = error.retry_after();
+                crate::retry::Attempt::Transient { error, retry_after }
+            }
+            Err(error) => crate::retry::Attempt::Final(error),
+        }
+    })
+    .await
+}
+
+/// One attempt at [`download_bundle_bytes`].
+async fn download_bundle_bytes_once(
+    config: &StowConfig,
+    bundle: &BundleRef<'_>,
+) -> Result<Vec<u8>, FetchError> {
     let url = artifact_url(bundle, &config.edge_url);
-    let mut client =
-        crate::edge_client::client(config).map_err(|error| FetchError::Other(error.to_string()))?;
-    let response = client
-        .get(&url)
-        .map_err(classify_transport_error)?
+    let mut client = crate::edge_client::untimed_client(config)
+        .map_err(|error| FetchError::Other(error.to_string()))?;
+    let request = client.get(&url).map_err(classify_transport_error)?;
+    // The request bound is a tokio timeout so the awaited error stays the
+    // concrete `zenwave::Error` — the timeout middleware's wrapper would
+    // hide the response, and with it the `Retry-After` hint.
+    let response = tokio::time::timeout(config.request_timeout, async move { request.await })
         .await
-        .map_err(|error| classify_client_error(&error))?;
+        .map_err(|_| FetchError::Timeout)?
+        .map_err(classify_client_error)?;
+    // The edge answered, so a body cut off mid-stream is worth another
+    // GET.
     let bytes = response
         .into_body()
         .into_bytes()
         .await
-        .map_err(|error| FetchError::Other(format!("read artifact response body: {error}")))?
+        .map_err(|error| FetchError::Interrupted(format!("read artifact response body: {error}")))?
         .to_vec();
     // One pass over the whole bundle — megabytes for a large crate — so
     // the hash runs on a blocking thread like the parse behind it
@@ -224,23 +254,47 @@ fn classify_transport_error(error: zenwave::Error) -> FetchError {
     match error {
         zenwave::Error::Http { status, .. } if status.as_u16() == 404 => FetchError::NotFound,
         zenwave::Error::Timeout => FetchError::Timeout,
-        zenwave::Error::Http { status, .. } => FetchError::Http(status.as_u16()),
+        zenwave::Error::Http { status, .. } => FetchError::Http {
+            status: status.as_u16(),
+            retry_after: None,
+        },
         other if other.is_network_error() => FetchError::Network(other.to_string()),
         other => FetchError::Other(other.to_string()),
     }
 }
 
-fn classify_client_error(error: &impl zenwave::HttpError) -> FetchError {
-    let status = error.status();
-    if status.as_u16() == 404 {
-        return FetchError::NotFound;
+/// Classify a failed request. zenwave lifts 4xx/5xx answers into `Err`
+/// with the response attached, so the status and the `Retry-After` hint
+/// come from it; any other failure after the request was built — a
+/// refused or reset connection, a TLS or protocol error — never produced
+/// an answer and is a network failure.
+fn classify_client_error(error: crate::edge_client::EdgeError) -> FetchError {
+    let error = match error {
+        zenwave::middleware::MiddlewareError::Endpoint(error) => error,
+        // The header middleware's error type is `Infallible`.
+        zenwave::middleware::MiddlewareError::Middleware(never) => match never {},
+    };
+    match error {
+        zenwave::Error::Http {
+            status, response, ..
+        } => {
+            let status = status.as_u16();
+            if status == 404 {
+                FetchError::NotFound
+            } else if status == 408 || status == 504 {
+                FetchError::Timeout
+            } else {
+                FetchError::Http {
+                    status,
+                    retry_after: stow_types::transient::retry_after_hint(
+                        response.response.headers(),
+                    ),
+                }
+            }
+        }
+        zenwave::Error::Timeout => FetchError::Timeout,
+        other => FetchError::Network(other.to_string()),
     }
-    if status == zenwave::StatusCode::REQUEST_TIMEOUT
-        || status == zenwave::StatusCode::GATEWAY_TIMEOUT
-    {
-        return FetchError::Timeout;
-    }
-    FetchError::Http(status.as_u16())
 }
 
 /// Why a byte-path pull produced no usable bundle. `NotFound` is the one
@@ -254,8 +308,18 @@ pub enum FetchError {
     /// rather than ridden out to `request_timeout` (stow#977).
     CircuitOpen,
     Timeout,
-    Http(u16),
+    /// The edge answered with a status other than success or not-found;
+    /// `retry_after` is the answer's `Retry-After` hint, when it carried
+    /// one.
+    Http {
+        status: u16,
+        retry_after: Option<std::time::Duration>,
+    },
+    /// The request never got an answer: a refused, reset or unreachable
+    /// connection.
     Network(String),
+    /// The edge answered and the body was cut off mid-stream.
+    Interrupted(String),
     /// The streamed body does not hash to the digest the signed index pins.
     Digest {
         expected: String,
@@ -265,14 +329,49 @@ pub enum FetchError {
     Other(String),
 }
 
+impl FetchError {
+    /// Whether another attempt is worth its wait: the edge answered and
+    /// the answer can change — a body cut off mid-stream, and the
+    /// statuses [`stow_types::transient::is_transient_status`] names
+    /// (408, 429, 5xx). A request that got no answer at all is not
+    /// retried: an unreachable edge is the build circuit's to carry, and
+    /// retrying each unit against it would hold the build (stow#977). A
+    /// missing blob, a digest or bundle that does not verify, and every
+    /// other 4xx are final.
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        match self {
+            Self::Interrupted(_) => true,
+            Self::Http { status, .. } => stow_types::transient::is_transient_status(*status),
+            Self::Timeout
+            | Self::Network(_)
+            | Self::NotFound
+            | Self::CircuitOpen
+            | Self::Digest { .. }
+            | Self::Bundle(_)
+            | Self::Other(_) => false,
+        }
+    }
+
+    /// The server's `Retry-After` hint, when the failed answer carried one.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Http { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => write!(f, "artifact not found"),
             Self::CircuitOpen => write!(f, "artifact fetch abandoned: circuit opened"),
             Self::Timeout => write!(f, "artifact fetch timed out"),
-            Self::Http(status) => write!(f, "artifact fetch returned HTTP {status}"),
+            Self::Http { status, .. } => write!(f, "artifact fetch returned HTTP {status}"),
             Self::Network(message) => write!(f, "artifact fetch network error: {message}"),
+            Self::Interrupted(message) => write!(f, "artifact fetch interrupted: {message}"),
             Self::Digest { expected, actual } => write!(
                 f,
                 "artifact bundle digest mismatch: index pins {expected}, body hashes to {actual}"
@@ -743,7 +842,7 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::collections::BTreeMap;
 
     use sha2::{Digest as _, Sha256};
@@ -898,6 +997,131 @@ mod tests {
             .expect_err("a missing blob is a miss");
             assert!(matches!(error, super::FetchError::NotFound), "{error}");
         });
+    }
+
+    /// A well-formed bundle as the edge serves it: the manifest and the
+    /// declared entries in one tar.
+    pub fn sample_bundle_tar() -> Vec<u8> {
+        let (manifest, files) = declared_bundle_parts();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut append = |path: &str, bytes: &[u8]| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, bytes)
+                .expect("append a bundle entry");
+        };
+        append(
+            super::STOW_BUNDLE_MANIFEST_PATH,
+            &serde_json::to_vec(&manifest).expect("serialize the manifest"),
+        );
+        for (path, bytes) in &files {
+            append(path, bytes);
+        }
+        builder.into_inner().expect("finish the bundle tar")
+    }
+
+    /// stow#1455: a body cut off mid-stream fails the read, not the
+    /// bundle — the same GET is sent again and the second answer serves.
+    #[tokio::test]
+    async fn a_body_cut_off_mid_stream_is_fetched_again() {
+        let tar = sample_bundle_tar();
+        let digest = sha256_prefixed(&tar);
+        let served = tar.clone();
+        let edge = crate::test_edge::serve_with(move |_, answered| {
+            let mut reply = crate::test_edge::Reply::new("200 OK", served.clone());
+            if answered == 0 {
+                reply.cut_body_at = Some(served.len() / 2);
+            }
+            reply
+        });
+        let bundle = super::download_bundle(
+            &stub_config(edge.url().to_owned()),
+            &test_bundle_ref(&digest),
+        )
+        .await
+        .expect("the second answer serves the bundle");
+        assert_eq!(bundle.manifest.config.crate_name.as_str(), "demo");
+        assert_eq!(edge.requests().len(), 2, "one cut-off answer, one retry");
+    }
+
+    /// stow#1455: an answer no retry changes — a missing blob, any 4xx
+    /// but 429, a body that does not hash to the pinned digest — is
+    /// asked for once.
+    #[tokio::test]
+    async fn a_final_failure_is_not_retried() {
+        let digest = sha256_prefixed(b"the promised bytes");
+        for status in ["404 Not Found", "400 Bad Request", "403 Forbidden"] {
+            let edge = serve_once(status, b"");
+            super::download_bundle_bytes(
+                &stub_config(edge.url().to_owned()),
+                &test_bundle_ref(&digest),
+            )
+            .await
+            .expect_err("a final status fails");
+            assert_eq!(edge.requests().len(), 1, "{status} was retried");
+        }
+        let edge = serve_once("200 OK", b"other bytes");
+        let error = super::download_bundle_bytes(
+            &stub_config(edge.url().to_owned()),
+            &test_bundle_ref(&digest),
+        )
+        .await
+        .expect_err("a digest mismatch fails");
+        assert!(matches!(error, super::FetchError::Digest { .. }), "{error}");
+        assert_eq!(edge.requests().len(), 1, "a digest mismatch was retried");
+    }
+
+    /// stow#1455: a 429 is retried and its `Retry-After` hint sets the
+    /// wait — longer than the backoff's own first delay.
+    #[tokio::test]
+    async fn a_rate_limited_answer_waits_out_its_retry_after() {
+        let body = b"the bundle bytes the stub edge serves".to_vec();
+        let digest = sha256_prefixed(&body);
+        let edge = crate::test_edge::serve_with(move |_, answered| {
+            if answered == 0 {
+                let mut reply = crate::test_edge::Reply::new("429 Too Many Requests", Vec::new());
+                reply.headers = "retry-after: 1\r\n";
+                reply
+            } else {
+                crate::test_edge::Reply::new("200 OK", body.clone())
+            }
+        });
+        let started = std::time::Instant::now();
+        super::download_bundle_bytes(
+            &stub_config(edge.url().to_owned()),
+            &test_bundle_ref(&digest),
+        )
+        .await
+        .expect("the retry after the hint serves");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(1),
+            "the retry came before the Retry-After hint: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(edge.requests().len(), 2);
+    }
+
+    /// stow#1455: a transient failure that outlives the shared backoff
+    /// budget — the first try plus three retries — is returned as the
+    /// last answer's error.
+    #[tokio::test]
+    async fn a_failure_that_outlives_the_backoff_is_returned() {
+        let digest = sha256_prefixed(b"the promised bytes");
+        let edge = serve_once("503 Service Unavailable", b"");
+        let error = super::download_bundle_bytes(
+            &stub_config(edge.url().to_owned()),
+            &test_bundle_ref(&digest),
+        )
+        .await
+        .expect_err("a persistent 503 fails");
+        assert!(
+            matches!(error, super::FetchError::Http { status: 503, .. }),
+            "{error}"
+        );
+        assert_eq!(edge.requests().len(), 4);
     }
 
     #[test]
