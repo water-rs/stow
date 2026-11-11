@@ -690,7 +690,6 @@ impl PhaseUnitGraph {
     }
 
     /// The target spelling cargo was given (`None` native).
-    #[cfg(test)]
     pub(crate) fn target(&self) -> Option<&str> {
         self.target.as_deref()
     }
