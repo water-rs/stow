@@ -3787,6 +3787,7 @@ async fn run_cargo_passthrough_sandboxed(
     if !source_roots.contains(&manifest_root) {
         source_roots.push(manifest_root);
     }
+    let run_dir = crate::daemon::RunDir::locate_resolved()?;
     let request = crate::sandbox::SandboxRequest {
         confinement,
         isolation,
@@ -3794,6 +3795,7 @@ async fn run_cargo_passthrough_sandboxed(
         source_roots: &source_roots,
         target_dir: &target_dir,
         scratch_dir: None,
+        run_dir: &run_dir,
         shims_dir: None,
         runtime_executable: &runtime,
         rustc_executable: Path::new(project.build_rustc.executable()),
@@ -3954,7 +3956,7 @@ fn session_facts(
             plan.cargo_args,
             plan.current_dir,
         )?,
-        refusal_policy: crate::supervisor::invocation::RefusalPolicy::of_this_build(),
+        refusal_policy: crate::daemon::session::invocation::RefusalPolicy::of_this_build(),
         registry_sources,
         seed: crate::daemon::session::Seed {
             serve_map: plan.servable_units.cloned(),
@@ -4293,6 +4295,7 @@ async fn sandboxed_cargo_run(
             plan.project.facts.workspace_root.clone(),
         ]
     };
+    let run_dir = crate::daemon::RunDir::locate_resolved()?;
     let request = crate::sandbox::SandboxRequest {
         confinement,
         isolation: plan.isolation,
@@ -4300,6 +4303,7 @@ async fn sandboxed_cargo_run(
         source_roots: &source_roots,
         target_dir: &target_dir,
         scratch_dir: Some(scratch),
+        run_dir: &run_dir,
         shims_dir: Some(shims_dir),
         runtime_executable: &wrappers.runtime_executable,
         rustc_executable: Path::new(plan.project.build_rustc.executable()),
@@ -4977,8 +4981,8 @@ fn resolved_output_roots(
     env: &SessionEnv,
     cargo_args: &[OsString],
     current_dir: &Path,
-) -> stow_types::error::Result<crate::supervisor::invocation::OutputRoots> {
-    Ok(crate::supervisor::invocation::OutputRoots::new(
+) -> stow_types::error::Result<crate::daemon::session::invocation::OutputRoots> {
+    Ok(crate::daemon::session::invocation::OutputRoots::new(
         resolved_target_dir(project, env, cargo_args, current_dir),
         resolved_build_dir(project, env, cargo_args, current_dir)?,
     ))
@@ -6393,10 +6397,10 @@ mod tests {
             let mut named = 0;
             for (out_dir, cwd, args) in records {
                 named += args.iter().filter(|arg| *arg == "--out-dir").count();
-                let mut env = crate::supervisor::protocol::InvocationEnv::in_dir(&cwd);
-                env.out_dir =
-                    (!out_dir.is_empty()).then(|| crate::supervisor::os_bytes::encode(&out_dir));
-                crate::supervisor::invocation::VerifiedInvocation::verify(
+                let mut env = crate::daemon::wrapper::InvocationEnv::in_dir(&cwd);
+                env.out_dir = (!out_dir.is_empty())
+                    .then(|| crate::daemon::session::os_bytes::encode(&out_dir));
+                crate::daemon::session::invocation::VerifiedInvocation::verify(
                     &toolchain,
                     Some(&roots),
                     OsString::from("rustc"),

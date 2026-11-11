@@ -1,4 +1,4 @@
-//! The one door a request passes before the supervisor acts on it.
+//! The one door a request passes before the daemon acts on it.
 //!
 //! A frame's contents are the sender's word. [`VerifiedInvocation`] can
 //! only be obtained from [`VerifiedInvocation::verify`], so every handler
@@ -9,7 +9,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::protocol::InvocationEnv;
+use crate::daemon::wrapper::InvocationEnv;
 use crate::toolchain::BuildToolchain;
 
 /// The request field a [`Refusal`] is about.
@@ -286,7 +286,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{OutputRoots, VerifiedInvocation};
-    use crate::supervisor::protocol::InvocationEnv;
+    use crate::daemon::wrapper::InvocationEnv;
     use crate::toolchain::BuildToolchain;
 
     /// A request running in the test's own working directory.
@@ -496,7 +496,9 @@ mod tests {
                 "the variable",
                 Vec::new(),
                 InvocationEnv {
-                    out_dir: Some(super::super::os_bytes::encode(outside.path().as_os_str())),
+                    out_dir: Some(crate::daemon::session::os_bytes::encode(
+                        outside.path().as_os_str(),
+                    )),
                     ..here()
                 },
             ),

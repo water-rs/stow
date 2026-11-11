@@ -15,9 +15,9 @@ use stow_types::api::DependencyGraphEntry;
 use crate::cache_policy::CachePolicyEntry;
 use crate::cargo_cmd::ProjectFacts;
 use crate::config::StowConfig;
+use crate::daemon::session::invocation::{OutputRoots, RefusalPolicy};
 use crate::facade::ServeMap;
 use crate::prefetch::PrefetchArtifact;
-use crate::supervisor::invocation::{OutputRoots, RefusalPolicy};
 use crate::toolchain::ToolchainFacts;
 use crate::unit_node::UnitNodeTable;
 

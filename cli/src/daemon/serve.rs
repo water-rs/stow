@@ -37,9 +37,9 @@ use super::protocol::{
 use super::session::{CacheDirHandles, Session, SessionFacts, SessionId};
 use super::table::SessionTable;
 use super::{RunDir, Settings};
+use crate::daemon::session::handler::{Flight, Handler, InFlightUnits, Reports, answer_and_book};
+use crate::daemon::wrapper::Answer;
 use crate::file_lock::FileLock;
-use crate::supervisor::protocol::Answer;
-use crate::supervisor::server::{Flight, Handler, InFlightUnits, Reports, answer_and_book};
 
 #[cfg(unix)]
 type Listener = tokio::net::UnixListener;
@@ -611,11 +611,11 @@ mod tests {
         ControlRequest, Hello, PROTOCOL, Response, Role, SessionRef, WrapperRequest, encode,
         read_frame_async,
     };
+    use crate::daemon::session::handler::{Decision, Flight, Handler, InFlightUnits, Reports};
+    use crate::daemon::session::invocation::{OutputRoots, RefusalPolicy};
     use crate::daemon::session::{SessionFacts, SessionId};
     use crate::daemon::table::SessionTable;
-    use crate::supervisor::invocation::{OutputRoots, RefusalPolicy};
-    use crate::supervisor::protocol::{Answer, InvocationEnv, Plan};
-    use crate::supervisor::server::{Decision, Flight, Handler, InFlightUnits, Reports};
+    use crate::daemon::wrapper::{Answer, InvocationEnv, Plan};
     use crate::toolchain::BuildToolchain;
 
     fn daemon(sessions: &std::path::Path) -> Daemon {
@@ -821,7 +821,7 @@ mod tests {
 
         async fn plan(
             self: &Arc<Self>,
-            _invocation: crate::supervisor::invocation::VerifiedInvocation,
+            _invocation: crate::daemon::session::invocation::VerifiedInvocation,
             _env: InvocationEnv,
         ) -> Decision<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -838,7 +838,7 @@ mod tests {
             RefusalPolicy::FailBuild
         }
 
-        fn refused(self: &Arc<Self>, _refusal: crate::supervisor::invocation::Refusal) {}
+        fn refused(self: &Arc<Self>, _refusal: crate::daemon::session::invocation::Refusal) {}
     }
 
     #[tokio::test]

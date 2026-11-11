@@ -22,7 +22,7 @@ use super::Settings;
 use super::client::{Stream, WrapperStream, connect};
 use super::protocol::{SessionRef, WrapperRequest};
 use super::session::SessionId;
-use crate::supervisor::protocol::Answer;
+use crate::daemon::wrapper::Answer;
 
 /// The method name the IPC router registers the relay under —
 /// `[A-Za-z][A-Za-z0-9_-]*`, since heel also spells it as a shim's file

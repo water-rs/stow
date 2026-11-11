@@ -41,6 +41,7 @@ mod start;
 mod table;
 #[cfg(windows)]
 mod windows;
+pub mod wrapper;
 
 pub use start::connect_or_start;
 
@@ -200,6 +201,35 @@ impl RunDir {
             })?;
         }
         Ok(Self(path))
+    }
+
+    /// The prepared runtime directory spelled as the kernel resolves it, for
+    /// a sandbox profile that must name the directory and the daemon's
+    /// socket in it: a rule written through a symlink does not cover the
+    /// resolved path. Windows has no such rule, so the path stays as
+    /// located.
+    ///
+    /// # Errors
+    ///
+    /// [`RunDir::locate`] or [`RunDir::prepare`] fails, or the directory
+    /// cannot be resolved.
+    pub fn locate_resolved() -> Result<Self> {
+        let dir = Self::prepare(Self::locate()?)?;
+        #[cfg(unix)]
+        {
+            std::fs::canonicalize(dir.path())
+                .map(Self)
+                .wrap_err_with(|| {
+                    format!(
+                        "resolve the daemon runtime directory {}",
+                        dir.path().display()
+                    )
+                })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(dir)
+        }
     }
 
     /// The directory itself.

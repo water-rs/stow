@@ -21,11 +21,9 @@ use super::relay::{RELAY_METHOD, RelayBody, RelayCall, mint_connection_id};
 use super::session::{SessionEnd, SessionFacts, SessionId};
 use super::start::{connect_or_start, describe_daemon};
 use super::{RunDir, Settings};
-use crate::supervisor::os_bytes;
-use crate::supervisor::protocol::{
-    Answer, ArtifactNotifications, CcCompiled, CcLookup, Compiled, Plan,
-};
-use crate::supervisor::server::CONNECTION_DRAIN_BUDGET;
+use crate::daemon::session::handler::CONNECTION_DRAIN_BUDGET;
+use crate::daemon::session::os_bytes;
+use crate::daemon::wrapper::{Answer, ArtifactNotifications, CcCompiled, CcLookup, Compiled, Plan};
 
 /// The variable a build's driver exports so its wrappers find the build's
 /// session.
@@ -382,7 +380,7 @@ impl WrapperConnection {
         let plan = Plan::new(
             executable,
             args,
-            crate::supervisor::protocol::InvocationEnv::current(),
+            crate::daemon::wrapper::InvocationEnv::current(),
         );
         match self
             .exchange(&WrapperRequest::Plan(plan))

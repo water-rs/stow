@@ -4,8 +4,8 @@
 //!
 //! Transports are not here. A wrapper's conversation reaches a session
 //! over the daemon's socket (see [`crate::daemon`]), directly or, for a
-//! sandboxed build, through the driver's relay. The server owns two pieces
-//! of mutable state: the
+//! sandboxed build, through the driver's relay. The handler owns two
+//! pieces of mutable state: the
 //! units whose post-compile bookkeeping is still running — the in-flight
 //! registry a dependent's bookkeeping waits on (stow#618) — and the
 //! bookkeeping tasks themselves ([`Reports`]).
@@ -19,7 +19,7 @@ use stow_types::rustc::ParsedRustcArgs;
 use tracing::Instrument as _;
 
 use super::invocation::{Refusal, RefusalPolicy, VerifiedInvocation};
-use super::protocol::{
+use crate::daemon::wrapper::{
     Answer, ArtifactNotifications, CcCompiled, CcLookup, CompileCommand, Compiled, Plan, Request,
 };
 use crate::toolchain::BuildToolchain;
@@ -34,7 +34,7 @@ pub trait Handler: Send + Sync + 'static {
     fn plan(
         self: &Arc<Self>,
         invocation: VerifiedInvocation,
-        env: crate::supervisor::protocol::InvocationEnv,
+        env: crate::daemon::wrapper::InvocationEnv,
     ) -> impl Future<Output = Decision<Self::Pending>> + Send;
 
     /// Finish the work that only exists after a real compile.
@@ -86,7 +86,7 @@ pub trait Handler: Send + Sync + 'static {
     fn plan_args(
         self: &Arc<Self>,
         args: Vec<std::ffi::OsString>,
-        _env: &crate::supervisor::protocol::InvocationEnv,
+        _env: &crate::daemon::wrapper::InvocationEnv,
     ) -> Result<Vec<std::ffi::OsString>, String> {
         Ok(args)
     }

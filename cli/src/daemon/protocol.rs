@@ -107,7 +107,7 @@ pub enum ControlRequest {
 }
 
 /// What a wrapper asks of its session.
-pub use crate::supervisor::protocol::Request as WrapperRequest;
+pub use crate::daemon::wrapper::Request as WrapperRequest;
 
 /// What the daemon pushes to the driver that owns a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,7 +159,7 @@ pub enum Response {
     /// daemon.
     Working,
     /// The answer to a [`WrapperRequest`].
-    Answer(crate::supervisor::protocol::Answer),
+    Answer(crate::daemon::wrapper::Answer),
 }
 
 /// One frame as it came off the wire: the protocol number the sender
@@ -336,7 +336,7 @@ mod tests {
     async fn open_session_round_trips_through_a_frame() {
         use std::ffi::OsString;
 
-        use crate::supervisor::invocation::{OutputRoots, RefusalPolicy};
+        use crate::daemon::session::invocation::{OutputRoots, RefusalPolicy};
         use crate::toolchain::BuildToolchain;
 
         let mut facts = SessionFacts::for_tests(

@@ -12,7 +12,10 @@
 //! state is written only by the session's tasks.
 
 mod facts;
+pub mod handler;
 mod id;
+pub mod invocation;
+pub mod os_bytes;
 mod resources;
 
 use std::path::Path;
@@ -27,12 +30,8 @@ pub use resources::{CacheDirHandles, Resources};
 
 use crate::cache_policy;
 use crate::config::StowConfig;
+use crate::daemon::wrapper::InvocationEnv;
 use crate::session_env::SessionEnv;
-use crate::supervisor::invocation::{Refusal, VerifiedInvocation};
-use crate::supervisor::protocol::InvocationEnv;
-use crate::supervisor::server::{
-    CONNECTION_DRAIN_BUDGET, Decision, Handler, InFlightUnits, Reports,
-};
 use crate::toolchain::BuildToolchain;
 use crate::{
     AnalysisFacts, BuildContext, Outcome, PostCompile, ResolutionDone, UnitOutcome,
@@ -41,12 +40,14 @@ use crate::{
     record_local_build_mark, record_unit_outcome, registry_unit_identity,
     resolve_native_target_cpu, rustc_args,
 };
+use handler::{CONNECTION_DRAIN_BUDGET, Decision, Handler, InFlightUnits, Reports};
+use invocation::{Refusal, VerifiedInvocation};
 
 /// What a session reports when its build ends.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionEnd {
     /// Every request the session refused under
-    /// [`crate::supervisor::invocation::RefusalPolicy::FailBuild`], in the
+    /// [`crate::daemon::session::invocation::RefusalPolicy::FailBuild`], in the
     /// order they arrived. The driver fails the build on any.
     pub refusals: Vec<String>,
     /// The build's miss journal was written.
@@ -505,7 +506,7 @@ impl Handler for Session {
         self.env_cache.config()
     }
 
-    fn output_roots(self: &Arc<Self>) -> Option<&crate::supervisor::invocation::OutputRoots> {
+    fn output_roots(self: &Arc<Self>) -> Option<&crate::daemon::session::invocation::OutputRoots> {
         Some(&self.facts.roots)
     }
 
@@ -594,7 +595,7 @@ impl Handler for Session {
         &self.env_cache.toolchain
     }
 
-    fn refusal_policy(self: &Arc<Self>) -> crate::supervisor::invocation::RefusalPolicy {
+    fn refusal_policy(self: &Arc<Self>) -> crate::daemon::session::invocation::RefusalPolicy {
         self.facts.refusal_policy
     }
 
@@ -697,8 +698,8 @@ impl Session {
 pub struct TestParts {
     pub(crate) ctx: BuildContext,
     pub(crate) env_cache: WrapperEnvCache,
-    pub(crate) roots: crate::supervisor::invocation::OutputRoots,
-    pub(crate) refusal_policy: crate::supervisor::invocation::RefusalPolicy,
+    pub(crate) roots: crate::daemon::session::invocation::OutputRoots,
+    pub(crate) refusal_policy: crate::daemon::session::invocation::RefusalPolicy,
     pub(crate) resolution_done: ResolutionDone,
 }
 
@@ -709,7 +710,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::supervisor::invocation::{OutputRoots, RefusalPolicy};
+    use crate::daemon::session::invocation::{OutputRoots, RefusalPolicy};
 
     const HOST_TARGET: &str = "aarch64-apple-darwin";
 

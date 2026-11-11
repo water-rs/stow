@@ -58,7 +58,6 @@ mod sandbox;
 mod session_env;
 mod state_db;
 mod stats;
-mod supervisor;
 #[cfg(test)]
 mod test_edge;
 mod toolchain;
@@ -87,7 +86,7 @@ pub use daemon::client::STOW_SESSION_ENV;
 pub use daemon::protocol;
 pub use daemon::session::SessionId;
 /// What a wrapper says and the daemon answers about one invocation.
-pub use supervisor::protocol as wrapper_protocol;
+pub use daemon::wrapper as wrapper_protocol;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -116,10 +115,10 @@ use crate::artifact_cache::{
 };
 use crate::cli_args::{Cli, Command as CliCommand, WrapperCommandArgs};
 use crate::config::StowConfig;
+use crate::daemon::wrapper::ArtifactNotifications;
 use crate::fetch::FetchRequest;
 use crate::state_db::StateDb;
 use crate::stats::{ServeSource, ServeStage};
-use crate::supervisor::protocol::ArtifactNotifications;
 
 const STOW_EXPANDED_GRAPH_PATH_ENV: &str = "STOW_EXPANDED_GRAPH_PATH";
 pub(crate) const STOW_PREFETCH_ARTIFACTS_PATH_ENV: &str = "STOW_PREFETCH_ARTIFACTS_PATH";
@@ -468,7 +467,7 @@ enum Outcome {
     /// the artifact-notification lines the deciding process computed —
     /// written to stderr only by the process cargo spawned, at the
     /// `exit(0)` it earns (stow#633).
-    Served(supervisor::protocol::ArtifactNotifications),
+    Served(daemon::wrapper::ArtifactNotifications),
     /// Nothing serves this unit; the real rustc has to run, and
     /// [`finish_rustc_compile`] finishes the work afterwards.
     Compile(Box<PostCompile>),
@@ -485,7 +484,7 @@ pub struct PostCompile {
     /// The invocation's environment as the deciding process learned it —
     /// the `Plan`/`Observed` frame's values under a supervised build, this
     /// process's own under a standalone one.
-    env: supervisor::protocol::InvocationEnv,
+    env: daemon::wrapper::InvocationEnv,
     /// How long the real rustc ran, set once it has: the compile time a later
     /// local hit on the stored unit reports as saved.
     compile_time: std::time::Duration,
@@ -506,7 +505,7 @@ impl PostCompile {
     fn raw() -> Self {
         Self {
             parsed: None,
-            env: supervisor::protocol::InvocationEnv::default(),
+            env: daemon::wrapper::InvocationEnv::default(),
             compile_time: std::time::Duration::ZERO,
             owes_miss: false,
         }
@@ -547,7 +546,7 @@ async fn compile(
     parsed: &rustc_args::ParsedRustcArgs,
     mark_target: Option<&str>,
     policy_dir: Option<&Path>,
-    invocation_env: &supervisor::protocol::InvocationEnv,
+    invocation_env: &daemon::wrapper::InvocationEnv,
 ) -> Outcome {
     if let Some(target) = mark_target {
         record_local_build_mark(parsed, target, policy_dir).await;
@@ -677,7 +676,7 @@ async fn store_local_build(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
     build: &artifact_cache::LocalBuildArtifact,
-    env: &supervisor::protocol::InvocationEnv,
+    env: &daemon::wrapper::InvocationEnv,
     host: &str,
 ) -> stow_types::error::Result<()> {
     let c_metadata = build.identity.c_metadata.as_str();
@@ -693,9 +692,7 @@ async fn store_local_build(
 
 /// The invocation's `CARGO_MANIFEST_DIR`, which cargo sets on every rustc
 /// call; its absence is a broken invocation, not a case to default.
-fn manifest_dir_bytes(
-    env: &supervisor::protocol::InvocationEnv,
-) -> stow_types::error::Result<&[u8]> {
+fn manifest_dir_bytes(env: &daemon::wrapper::InvocationEnv) -> stow_types::error::Result<&[u8]> {
     env.manifest_dir
         .as_deref()
         .ok_or_else(|| stow_types::stow_error!("the invocation carries no CARGO_MANIFEST_DIR"))
@@ -891,7 +888,7 @@ pub(crate) struct BuildContext {
     /// reading their `materialized_outputs` rows (stow#618). The
     /// standalone wrapper's is empty — its invocations have no other
     /// connections to order against.
-    pub(crate) in_flight: crate::supervisor::server::InFlightUnits,
+    pub(crate) in_flight: crate::daemon::session::handler::InFlightUnits,
     /// How this build tells a crates.io package from another registry's —
     /// the workspace's `Cargo.lock` for a supervised build, the cargo
     /// config's source table for the standalone wrapper (stow#1006).
@@ -1331,7 +1328,7 @@ impl BuildContext {
             policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
             // No supervisor shares a standalone invocation's registry —
             // the wait finds nothing and returns at once.
-            in_flight: crate::supervisor::server::InFlightUnits::default(),
+            in_flight: crate::daemon::session::handler::InFlightUnits::default(),
             registry_sources: std::sync::OnceLock::new(),
         })
     }
@@ -1548,7 +1545,7 @@ async fn run_rustc_standalone(
         parsed,
         &env_cache,
         &ctx,
-        &supervisor::protocol::InvocationEnv::current(),
+        &daemon::wrapper::InvocationEnv::current(),
     )
     .await
     {
@@ -1595,7 +1592,7 @@ async fn decide_rustc_invocation(
     mut parsed: rustc_args::ParsedRustcArgs,
     env_cache: &WrapperEnvCache,
     ctx: &BuildContext,
-    invocation_env: &supervisor::protocol::InvocationEnv,
+    invocation_env: &daemon::wrapper::InvocationEnv,
 ) -> Outcome {
     if ctx.cache.is_off() {
         // Every cache layer is off: nothing is looked up, recorded or stored, so
@@ -1701,7 +1698,7 @@ async fn classify_unit_invocation(
     parsed: &mut rustc_args::ParsedRustcArgs,
     env_cache: &WrapperEnvCache,
     ctx: &BuildContext,
-    invocation_env: &supervisor::protocol::InvocationEnv,
+    invocation_env: &daemon::wrapper::InvocationEnv,
 ) -> stow_types::error::Result<UnitClass> {
     // The invocation's own `CARGO_MANIFEST_DIR`, not this process's:
     // under a supervised build the supervisor's environment is the
@@ -1787,7 +1784,7 @@ async fn serve_or_compile(
     env: &WrapperEnvironment<'_>,
     ctx: &BuildContext,
     exact_public_cache_allowed: bool,
-    invocation_env: &supervisor::protocol::InvocationEnv,
+    invocation_env: &daemon::wrapper::InvocationEnv,
 ) -> Outcome {
     // The stages only note what they saw; the one outcome the invocation
     // contributes is recorded here, where the chain ends (stow#696).
@@ -1837,7 +1834,7 @@ async fn lookup_chain(
     env: &WrapperEnvironment<'_>,
     ctx: &BuildContext,
     exact_public_cache_allowed: bool,
-    invocation_env: &supervisor::protocol::InvocationEnv,
+    invocation_env: &daemon::wrapper::InvocationEnv,
     tally: &mut LookupTally,
 ) -> RemoteServe {
     let request = FetchRequest {
@@ -2348,7 +2345,7 @@ enum RemoteServe {
     /// An artifact was written into the target dir; the wrapper exits 0
     /// after writing the artifact notifications the serve computed
     /// (stow#633).
-    Served(supervisor::protocol::ArtifactNotifications),
+    Served(daemon::wrapper::ArtifactNotifications),
     /// No remote artifact applies; fall through to the miss path.
     Miss,
     /// The cache path failed or the artifact could not be used; run the
@@ -3067,7 +3064,7 @@ async fn decide_local_only(
     class: &UnitClass,
     prep: LocalOnlyPreparation,
     ctx: &BuildContext,
-    invocation_env: &supervisor::protocol::InvocationEnv,
+    invocation_env: &daemon::wrapper::InvocationEnv,
 ) -> Outcome {
     let UnitClass::Keyed { source, .. } = class else {
         unreachable!("decide_local_only only runs for a keyed unit");
@@ -3405,7 +3402,7 @@ async fn try_serve_local_invocation(
     parsed: &rustc_args::ParsedRustcArgs,
     source: &UnitSource,
     request: &FetchRequest<'_>,
-    invocation_env: &supervisor::protocol::InvocationEnv,
+    invocation_env: &daemon::wrapper::InvocationEnv,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     if let Some(notifications) =
@@ -5045,11 +5042,11 @@ enum LocalBuildResolution {
 async fn resolve_local_build_artifact(
     base: &WrapperEnvBase,
     parsed: &rustc_args::ParsedRustcArgs,
-    in_flight: &crate::supervisor::server::InFlightUnits,
+    in_flight: &crate::daemon::session::handler::InFlightUnits,
     unit_nodes: Option<&unit_node::UnitNodeTable>,
     env_cache: &WrapperEnvCache,
     ctx: &BuildContext,
-    invocation_env: &supervisor::protocol::InvocationEnv,
+    invocation_env: &daemon::wrapper::InvocationEnv,
 ) -> stow_types::error::Result<LocalBuildResolution> {
     // Whether the cache can hold this unit at all — the same predicate
     // `artifact_cache::materialized_output_paths` gates on — comes first:
@@ -5761,16 +5758,16 @@ mod tests {
     }
 
     /// A request running in the test's own working directory.
-    fn here() -> crate::supervisor::protocol::InvocationEnv {
-        crate::supervisor::protocol::InvocationEnv::in_dir(
+    fn here() -> crate::daemon::wrapper::InvocationEnv {
+        crate::daemon::wrapper::InvocationEnv::in_dir(
             &std::env::current_dir().expect("the test's working directory"),
         )
     }
 
     /// Output roots that contain every path: the fixtures name an
     /// `--out-dir` that is no real build's.
-    fn everywhere() -> crate::supervisor::invocation::OutputRoots {
-        crate::supervisor::invocation::OutputRoots::new(
+    fn everywhere() -> crate::daemon::session::invocation::OutputRoots {
+        crate::daemon::session::invocation::OutputRoots::new(
             PathBuf::from(std::path::MAIN_SEPARATOR_STR),
             None,
         )
@@ -5780,7 +5777,7 @@ mod tests {
     /// `BuildContext`, its directory in the returned tempdir.
     async fn test_session(
         resolution_done: super::ResolutionDone,
-        refusal_policy: crate::supervisor::invocation::RefusalPolicy,
+        refusal_policy: crate::daemon::session::invocation::RefusalPolicy,
     ) -> (
         tempfile::TempDir,
         std::sync::Arc<crate::daemon::session::Session>,
@@ -5807,9 +5804,9 @@ mod tests {
     async fn verified_rustc(
         handler: &std::sync::Arc<crate::daemon::session::Session>,
         args: Vec<OsString>,
-    ) -> crate::supervisor::invocation::VerifiedInvocation {
-        let toolchain = crate::supervisor::server::Handler::toolchain(handler);
-        crate::supervisor::invocation::VerifiedInvocation::verify(
+    ) -> crate::daemon::session::invocation::VerifiedInvocation {
+        let toolchain = crate::daemon::session::handler::Handler::toolchain(handler);
+        crate::daemon::session::invocation::VerifiedInvocation::verify(
             toolchain,
             Some(&everywhere()),
             OsString::from("rustc"),
@@ -6179,19 +6176,19 @@ mod tests {
         let resolution_done = super::ResolutionDone::pending();
         let (_sessions, handler) = test_session(
             resolution_done.clone(),
-            crate::supervisor::invocation::RefusalPolicy::FailBuild,
+            crate::daemon::session::invocation::RefusalPolicy::FailBuild,
         )
         .await;
 
-        let _ = crate::supervisor::server::Handler::plan(
+        let _ = crate::daemon::session::handler::Handler::plan(
             &handler,
             verified_rustc(&handler, args(&["-vV"])).await,
-            crate::supervisor::protocol::InvocationEnv::for_tests(),
+            crate::daemon::wrapper::InvocationEnv::for_tests(),
         )
         .await;
         assert!(!resolution_done.has_completed());
 
-        let _ = crate::supervisor::server::Handler::plan(
+        let _ = crate::daemon::session::handler::Handler::plan(
             &handler,
             verified_rustc(
                 &handler,
@@ -6205,12 +6202,12 @@ mod tests {
                 ]),
             )
             .await,
-            crate::supervisor::protocol::InvocationEnv::for_tests(),
+            crate::daemon::wrapper::InvocationEnv::for_tests(),
         )
         .await;
         assert!(!resolution_done.has_completed());
 
-        let _ = crate::supervisor::server::Handler::plan(
+        let _ = crate::daemon::session::handler::Handler::plan(
             &handler,
             verified_rustc(
                 &handler,
@@ -6228,7 +6225,7 @@ mod tests {
                 ]),
             )
             .await,
-            crate::supervisor::protocol::InvocationEnv::for_tests(),
+            crate::daemon::wrapper::InvocationEnv::for_tests(),
         )
         .await;
         assert!(resolution_done.has_completed());
@@ -6242,12 +6239,12 @@ mod tests {
     async fn a_recorded_refusal_is_reported_naming_the_field() {
         let (_sessions, handler) = test_session(
             super::ResolutionDone::pending(),
-            crate::supervisor::invocation::RefusalPolicy::FailBuild,
+            crate::daemon::session::invocation::RefusalPolicy::FailBuild,
         )
         .await;
 
-        let toolchain = crate::supervisor::server::Handler::toolchain(&handler);
-        let refusal = crate::supervisor::invocation::VerifiedInvocation::verify(
+        let toolchain = crate::daemon::session::handler::Handler::toolchain(&handler);
+        let refusal = crate::daemon::session::invocation::VerifiedInvocation::verify(
             toolchain,
             None,
             OsString::from("/nonexistent/not-rustc"),
@@ -6256,7 +6253,7 @@ mod tests {
         )
         .await
         .expect_err("another executable is refused");
-        crate::supervisor::server::Handler::refused(&handler, refusal);
+        crate::daemon::session::handler::Handler::refused(&handler, refusal);
         let end = handler.end().await.expect("end the session");
         assert_eq!(end.refusals.len(), 1, "{:?}", end.refusals);
         assert!(end.refusals[0].contains("executable"), "{:?}", end.refusals);
@@ -6269,12 +6266,12 @@ mod tests {
     async fn a_build_compiling_uncached_has_no_refusal_to_fail_on() {
         let (_sessions, handler) = test_session(
             super::ResolutionDone::pending(),
-            crate::supervisor::invocation::RefusalPolicy::CompileUncached,
+            crate::daemon::session::invocation::RefusalPolicy::CompileUncached,
         )
         .await;
         assert_eq!(
-            crate::supervisor::server::Handler::refusal_policy(&handler),
-            crate::supervisor::invocation::RefusalPolicy::CompileUncached
+            crate::daemon::session::handler::Handler::refusal_policy(&handler),
+            crate::daemon::session::invocation::RefusalPolicy::CompileUncached
         );
         let end = handler.end().await.expect("end the session");
         assert!(end.refusals.is_empty(), "nothing was recorded");
@@ -6317,7 +6314,7 @@ mod tests {
         // and the `$message_type` tag included (stow#633).
         assert_eq!(
             notifications,
-            crate::supervisor::protocol::ArtifactNotifications(vec![
+            crate::daemon::wrapper::ArtifactNotifications(vec![
                 notification_line("autocfg-xyz789.d", "dep-info"),
                 notification_line("libautocfg-xyz789.rmeta", "metadata"),
                 notification_line("libautocfg-xyz789.rlib", "link"),
@@ -6353,7 +6350,7 @@ mod tests {
 
         assert_eq!(
             notifications,
-            crate::supervisor::protocol::ArtifactNotifications(vec![
+            crate::daemon::wrapper::ArtifactNotifications(vec![
                 notification_line("serde_derive-xyz789.d", "dep-info"),
                 notification_line("libserde_derive-xyz789.dylib", "link"),
             ])
@@ -6386,7 +6383,7 @@ mod tests {
 
         assert_eq!(
             notifications,
-            crate::supervisor::protocol::ArtifactNotifications::default()
+            crate::daemon::wrapper::ArtifactNotifications::default()
         );
     }
 
@@ -6867,7 +6864,7 @@ mod tests {
             serve_map: crate::facade::ServeMapView::absent(),
             serve_map_ready: std::sync::Arc::clone(serve_map_ready),
             policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
-            in_flight: crate::supervisor::server::InFlightUnits::default(),
+            in_flight: crate::daemon::session::handler::InFlightUnits::default(),
             registry_sources: std::sync::OnceLock::from(crate::RegistrySources::CargoConfig(
                 std::iter::once("index.crates.io".to_owned()).collect(),
             )),
@@ -7271,8 +7268,8 @@ mod tests {
         use std::time::Duration;
 
         use crate::daemon::session::Session;
-        use crate::supervisor::protocol::{Compiled, Plan, Request};
-        use crate::supervisor::{server, server::Handler as _};
+        use crate::daemon::session::handler::{self as server, Handler as _};
+        use crate::daemon::wrapper::{Compiled, Plan, Request};
         use crate::{AnalysisFacts, BuildContext};
 
         /// A `tracing` writer whose buffer the test can inspect — the
@@ -7529,7 +7526,7 @@ mod tests {
                     ctx: ctx(&in_flight),
                     resolution_done: crate::ResolutionDone::pending(),
                     roots: super::everywhere(),
-                    refusal_policy: crate::supervisor::invocation::RefusalPolicy::FailBuild,
+                    refusal_policy: crate::daemon::session::invocation::RefusalPolicy::FailBuild,
                 },
                 &root.join("sessions"),
             );
@@ -7553,7 +7550,7 @@ mod tests {
                 }
             }
 
-            async fn ask(&mut self, request: Request) -> crate::supervisor::protocol::Answer {
+            async fn ask(&mut self, request: Request) -> crate::daemon::wrapper::Answer {
                 server::answer_and_book(
                     &self.session,
                     self.session.in_flight(),
@@ -7571,11 +7568,11 @@ mod tests {
                 let plan = Plan::new(
                     OsStr::new("rustc"),
                     args,
-                    crate::supervisor::protocol::InvocationEnv::for_tests(),
+                    crate::daemon::wrapper::InvocationEnv::for_tests(),
                 );
                 let answer = self.ask(Request::Plan(plan)).await;
                 assert!(
-                    matches!(answer, crate::supervisor::protocol::Answer::Compile(_)),
+                    matches!(answer, crate::daemon::wrapper::Answer::Compile(_)),
                     "a unit the serve map rules out is told to compile: {answer:?}"
                 );
             }
@@ -7592,7 +7589,7 @@ mod tests {
                     .await;
                 assert_eq!(
                     answer,
-                    crate::supervisor::protocol::Answer::Received,
+                    crate::daemon::wrapper::Answer::Received,
                     "a report is answered with a receipt"
                 );
             }
@@ -7676,7 +7673,7 @@ mod tests {
                     handler
                         .plan(
                             super::verified_rustc(&handler, args).await,
-                            crate::supervisor::protocol::InvocationEnv::for_tests(),
+                            crate::daemon::wrapper::InvocationEnv::for_tests(),
                         )
                         .await
                 })
@@ -7753,7 +7750,7 @@ mod tests {
                     handler
                         .plan(
                             super::verified_rustc(&handler, args).await,
-                            crate::supervisor::protocol::InvocationEnv::for_tests(),
+                            crate::daemon::wrapper::InvocationEnv::for_tests(),
                         )
                         .await
                 })
@@ -7772,7 +7769,7 @@ mod tests {
             let decision = handler
                 .plan(
                     super::verified_rustc(&handler, args).await,
-                    crate::supervisor::protocol::InvocationEnv::for_tests(),
+                    crate::daemon::wrapper::InvocationEnv::for_tests(),
                 )
                 .await;
             assert!(
@@ -7898,7 +7895,7 @@ mod tests {
                     handler
                         .plan(
                             super::verified_rustc(&handler, args).await,
-                            crate::supervisor::protocol::InvocationEnv::for_tests(),
+                            crate::daemon::wrapper::InvocationEnv::for_tests(),
                         )
                         .await
                 })
@@ -8028,7 +8025,7 @@ mod tests {
                     handler
                         .plan(
                             super::verified_rustc(&handler, args).await,
-                            crate::supervisor::protocol::InvocationEnv::for_tests(),
+                            crate::daemon::wrapper::InvocationEnv::for_tests(),
                         )
                         .await
                 })

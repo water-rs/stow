@@ -1,17 +1,17 @@
-//! The wire between the rustc facade and the build supervisor.
+//! The wire between the rustc facade and the build's session.
 //!
 //! One length-prefixed JSON frame per message, both directions. The
 //! wrapper asks what to do with one rustc invocation and, when it is told
-//! to compile, reports the result so the supervisor can finish the work
+//! to compile, reports the result so the session can finish the work
 //! that only exists after a real compile (stable aliases, output
-//! bookkeeping). The supervisor answers the report with a receipt that
+//! bookkeeping). The session answers the report with a receipt that
 //! precedes that work, so the facade exits with rustc.
 
 use std::ffi::OsString;
 
 use serde::{Deserialize, Serialize};
 
-use super::os_bytes;
+use super::session::os_bytes;
 
 /// What the facade sends.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,8 +53,7 @@ impl Request {
 /// The per-invocation environment the deciding process cannot read for
 /// itself.
 ///
-/// Under a supervised build the supervisor's environment is the driver's,
-/// not the invocation's, so the facade carries the values the
+/// The daemon's environment is not the invocation's, so the facade carries the values the
 /// classification needs (stow#1006).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InvocationEnv {

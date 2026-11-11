@@ -16,12 +16,6 @@ pub enum Endpoint {
     Unix(PathBuf),
     /// A loopback TCP listener on this port — the Windows transport.
     Loopback(u16),
-    /// heel's IPC socket — a Unix socket on Unix, a named pipe on
-    /// Windows — the only transport a `deny network*` profile leaves
-    /// open (stow#779). The path is heel's, spelled for
-    /// `heel::IpcClient::connect`; the frames inside it are this
-    /// crate's, tunneled one supervisor exchange per IPC call.
-    Ipc(PathBuf),
 }
 
 impl Endpoint {
@@ -32,7 +26,6 @@ impl Endpoint {
             #[cfg(unix)]
             Self::Unix(path) => format!("unix:{}", path.display()),
             Self::Loopback(port) => format!("tcp:{port}"),
-            Self::Ipc(path) => format!("ipc:{}", path.display()),
         }
     }
 
@@ -51,9 +44,6 @@ impl Endpoint {
         #[cfg(unix)]
         if let Some(path) = raw.strip_prefix("unix:") {
             return Ok(Self::Unix(PathBuf::from(path)));
-        }
-        if let Some(path) = raw.strip_prefix("ipc:") {
-            return Ok(Self::Ipc(PathBuf::from(path)));
         }
         Err(format!("unrecognised endpoint {raw:?}"))
     }
@@ -207,9 +197,6 @@ pub async fn connect(endpoint: &Endpoint) -> Result<Stream, String> {
             .await
             .map(Stream::Loopback)
             .map_err(|error| format!("connect to port {port}: {error}")),
-        Endpoint::Ipc(_) => {
-            Err("an IPC endpoint is not a stream transport: client::Connection opens it".to_owned())
-        }
     }
 }
 

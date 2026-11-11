@@ -71,6 +71,11 @@ pub struct SandboxRequest<'a> {
     /// The build's scratch directory — serve map, cache policy and the
     /// graph tables facades read. `None` for a wrapperless cargo.
     pub scratch_dir: Option<&'a Path>,
+    /// The daemon's runtime directory, resolved. The sandbox can neither
+    /// connect to the daemon's socket nor read or write the directory at
+    /// any level: a sandboxed wrapper reaches the daemon only through the
+    /// driver's relay.
+    pub run_dir: &'a crate::daemon::RunDir,
     /// The directory the `RUSTC_WRAPPER` and `cc` shims live in.
     pub shims_dir: Option<&'a Path>,
     /// The stow executable the shims resolve to — also the binary heel
@@ -416,12 +421,16 @@ async fn confined_builder<N: NetworkPolicy>(
                         .build(),
                 )
                 .writable_file_system(true)
-                .read_denylist(ReadDenylist::credentials())
-                .write_denylist(WriteDenylist::persistence().except(
-                    // Cargo's private git clones: their hooks are never run
-                    // by a user, and cargo creates and removes them itself.
-                    crate::config::require_cargo_home()?.join("git"),
-                ));
+                .read_denylist(read_denylist(request))
+                .write_denylist(
+                    WriteDenylist::persistence()
+                        .deny(request.run_dir.path())
+                        .except(
+                            // Cargo's private git clones: their hooks are never run
+                            // by a user, and cargo creates and removes them itself.
+                            crate::config::require_cargo_home()?.join("git"),
+                        ),
+                );
             let env_names = protect_env_names(
                 std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
             );
@@ -450,6 +459,12 @@ async fn confined_builder<N: NetworkPolicy>(
                 .filesystem_strict(true)
                 .security(SecurityConfig::strict())
                 .identity(stow_identity()?);
+            // heel refuses a denylist on Windows, where the daemon's pipe
+            // admits only its owner's SID and the sandbox's `AppContainer`
+            // token is not that SID.
+            if !cfg!(windows) {
+                builder = builder.read_denylist(read_denylist(request));
+            }
             let mut env_names = sandbox_env_names(
                 std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
             );
@@ -496,6 +511,14 @@ async fn confined_builder<N: NetworkPolicy>(
         builder = builder.grant(path, access);
     }
     Ok(builder)
+}
+
+/// The credential table plus the daemon: its socket cannot be connected to
+/// and its runtime directory cannot be read.
+fn read_denylist(request: &SandboxRequest<'_>) -> ReadDenylist {
+    ReadDenylist::credentials()
+        .socket(request.run_dir.endpoint())
+        .deny(request.run_dir.path())
 }
 
 /// What `protect` grants for stow's own paths. The machine is otherwise
@@ -1684,6 +1707,9 @@ mod tests {
         // runner-family mapping of the consumer target.
         let dummy = PathBuf::from("/usr/bin/true");
         let isolation = Isolation::off();
+        let run_dir_parent = tempfile::tempdir().expect("a temporary directory");
+        let run_dir = crate::daemon::RunDir::prepare(run_dir_parent.path().join("run"))
+            .expect("a prepared run directory");
         let args = vec![
             OsString::from("--target"),
             OsString::from("wasm32-unknown-unknown"),
@@ -1695,6 +1721,7 @@ mod tests {
             source_roots: &[],
             target_dir: Path::new("/tmp"),
             scratch_dir: None,
+            run_dir: &run_dir,
             shims_dir: None,
             runtime_executable: &dummy,
             rustc_executable: &dummy,
@@ -1724,6 +1751,9 @@ mod tests {
         // for the builds.
         let dummy = PathBuf::from("/usr/bin/true");
         let isolation = Isolation::off();
+        let run_dir_parent = tempfile::tempdir().expect("a temporary directory");
+        let run_dir = crate::daemon::RunDir::prepare(run_dir_parent.path().join("run"))
+            .expect("a prepared run directory");
         let host_args = vec![OsString::from("--release")];
         let cross_args = vec![
             OsString::from("--target"),
@@ -1736,6 +1766,7 @@ mod tests {
             source_roots: &[],
             target_dir: Path::new("/tmp/host-target"),
             scratch_dir: None,
+            run_dir: &run_dir,
             shims_dir: None,
             runtime_executable: &dummy,
             rustc_executable: &dummy,
@@ -1751,6 +1782,7 @@ mod tests {
             source_roots: &[],
             target_dir: Path::new("/tmp/cross-target"),
             scratch_dir: None,
+            run_dir: &run_dir,
             shims_dir: None,
             runtime_executable: &dummy,
             rustc_executable: &dummy,
