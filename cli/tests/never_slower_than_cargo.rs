@@ -779,6 +779,10 @@ fn serve_stub_connection(
                 observed.success.map(|_| Answer::Received)
             }
             Request::AwaitServeMap(_) => None,
+            // The counted fixture compiles no C: a C wrapper's frames get
+            // the answer that costs the build nothing.
+            Request::CcLookup(_) => Some(Answer::CcMiss),
+            Request::CcCompiled(_) => Some(Answer::Received),
         };
         let Some(answer) = answer else { continue };
         let body = serde_json::to_vec(&answer).expect("encode answer");

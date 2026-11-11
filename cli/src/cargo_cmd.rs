@@ -3913,22 +3913,30 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     // registry: the server marks and completes flights, the post-compiles
     // wait on them before resolving dependency identities (stow#618).
     let in_flight = crate::supervisor::server::InFlightUnits::default();
-    let handler = std::sync::Arc::new(crate::BuildSupervisor::new(
-        crate::BuildContext {
-            policy_dir: cache_policy_path.clone(),
-            public_cache_target: Some(project.target.clone()),
-            public_cache_disabled: !public_cache_mode.is_enabled(),
-            cache: config.map_or_else(crate::config::CacheLayers::default, |config| config.cache),
-            analysis: std::sync::Arc::clone(&analysis_cell),
-            serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
-            policy_ready: std::sync::Arc::clone(&policy_ready),
-            in_flight: in_flight.clone(),
-            registry_sources: std::sync::OnceLock::from(registry_sources),
-        },
-        config.cloned(),
-        env_base,
-        resolution_done.clone(),
-    ));
+    let handler = std::sync::Arc::new(
+        crate::BuildSupervisor::new(
+            crate::BuildContext {
+                policy_dir: cache_policy_path.clone(),
+                public_cache_target: Some(project.target.clone()),
+                public_cache_disabled: !public_cache_mode.is_enabled(),
+                cache: config
+                    .map_or_else(crate::config::CacheLayers::default, |config| config.cache),
+                analysis: std::sync::Arc::clone(&analysis_cell),
+                serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
+                policy_ready: std::sync::Arc::clone(&policy_ready),
+                in_flight: in_flight.clone(),
+                registry_sources: std::sync::OnceLock::from(registry_sources),
+            },
+            config.cloned(),
+            env_base,
+            resolution_done.clone(),
+        )
+        .with_target_dir(resolved_target_dir(
+            project,
+            plan.cargo_args,
+            plan.current_dir,
+        )),
+    );
     let (mut cargo_run, mut supervisor) =
         spawn_cargo_run(plan, &handler, in_flight, &wrappers, launch, scratch.path()).await?;
 
