@@ -281,6 +281,9 @@ async fn run_inner(
         tracing::debug_span!("stow.precargo.config_load").in_scope(|| load_stow_config(state_db));
     let cache_layers = settle_cache_layers(config.as_mut(), cache_switches);
     let project = begin_project(config.as_ref(), &invocation).await?;
+    // The one slice memo of this build: the driver's analyses and the
+    // in-build enrichment fetch through it, so a slice is verified once.
+    let slices = index::SliceFetches::default();
     let mut public_cache_mode = PublicCacheMode::for_build(&project.rustc_version, cache_layers);
     if let PublicCacheMode::Disabled {
         message: Some(message),
@@ -320,6 +323,7 @@ async fn run_inner(
         &project,
         &invocation,
         &public_cache_mode,
+        &slices,
     ))
     .instrument(tracing::debug_span!("stow.precargo.resolver_fast_path"))
     .await
@@ -363,6 +367,7 @@ async fn run_inner(
             &invocation,
             &public_cache_mode,
             maybe_analysis,
+            &slices,
         )
         .await
     } else {
@@ -373,6 +378,7 @@ async fn run_inner(
             &public_cache_mode,
             &budget,
             &selected,
+            &slices,
         ))
         .await
     }
@@ -391,6 +397,7 @@ async fn try_resolver_fast_path(
     project: &ProjectContext,
     invocation: &CargoInvocation,
     public_cache_mode: &PublicCacheMode,
+    slices: &index::SliceFetches,
 ) -> Option<ExitStatus> {
     // The resolver path exists only where a `StowConfig` gives it a
     // cached slice to pin against, and only while the user has not opted
@@ -399,7 +406,7 @@ async fn try_resolver_fast_path(
         return None;
     }
     let config = config?;
-    match Box::pin(try_stow_resolver(config, project, invocation)).await {
+    match Box::pin(try_stow_resolver(config, project, invocation, slices)).await {
         Ok(served) => {
             if served.is_none() {
                 tracing::info!(
@@ -516,6 +523,7 @@ async fn run_original_workspace_build(
     invocation: &CargoInvocation,
     public_cache_mode: &PublicCacheMode,
     analysis: Option<WorkspacePrediction>,
+    slices: &index::SliceFetches,
 ) -> stow_types::error::Result<ExitStatus> {
     let unit_nodes = analysis
         .as_ref()
@@ -553,6 +561,7 @@ async fn run_original_workspace_build(
         semantic_fallback_enabled,
         covered_units,
         isolation: &invocation.isolation,
+        slices,
     })
     .await
 }
@@ -567,6 +576,7 @@ async fn run_mirrored_upgrade_build(
     public_cache_mode: &PublicCacheMode,
     budget: &CacheBudget,
     selected: &[CompatibleUpgrade],
+    slices: &index::SliceFetches,
 ) -> stow_types::error::Result<ExitStatus> {
     let mirror = create_workspace_mirror(project, &project.workspace_root).await?;
     apply_selected_upgrades(project, &mirror, selected).await?;
@@ -586,6 +596,7 @@ async fn run_mirrored_upgrade_build(
             &mirror_project.manifest_path,
             config,
             None,
+            slices,
         )
         .await
         {
@@ -624,6 +635,7 @@ async fn run_mirrored_upgrade_build(
         public_cache_mode,
         mirror_analysis,
         budget,
+        slices,
     ))
     .await?;
 
@@ -645,6 +657,7 @@ async fn run_mirrored_upgrade_build(
         semantic_fallback_enabled: mirror_semantic_fallback,
         covered_units: mirror_prefetch.as_ref().map_or(0, Vec::len),
         isolation: &invocation.isolation,
+        slices,
     })
     .await
 }
@@ -731,6 +744,7 @@ async fn analyze_for_prediction(
         &project.manifest_path,
         &config,
         None,
+        &index::SliceFetches::default(),
     )
     .await
     .map(Some)
@@ -1278,18 +1292,19 @@ async fn analyze_workspace_prediction(
     manifest_path: &Path,
     config: &StowConfig,
     resolution_done: Option<&crate::ResolutionDone>,
+    slices: &index::SliceFetches,
 ) -> stow_types::error::Result<WorkspacePrediction> {
     // Resolution never leaves the machine: the verified index slice is
     // the only catalog consulted, and the graph walk runs in-process.
     // The resolve and the slice fetch are independent — the slice
     // fetch's registry round trip does not wait on cargo's resolution
     // gate (stow#608).
-    let (expanded, slices) = tokio::join!(
+    let (expanded, consumer_slices) = tokio::join!(
         expanded_graph(config, project, manifest_path, resolution_done),
-        ensure_consumer_slices(config, project),
+        ensure_consumer_slices(config, project, slices),
     );
     let expanded = expanded?;
-    let (slice, host_slice) = slices?;
+    let (slice, host_slice) = consumer_slices?;
     analyze_workspace_prediction_from(
         project,
         config,
@@ -1840,20 +1855,22 @@ fn prefetch_servable_wildcards(
 async fn ensure_consumer_slices(
     config: &StowConfig,
     project: &ProjectContext,
+    slices: &index::SliceFetches,
 ) -> Result<(index::IndexSlice, Option<index::IndexSlice>), index::SliceFetchError> {
     let host_target = stow_types::api::runner_family(&project.target)
         .map(|family| family.host_triple().to_owned())
         .filter(|host| *host != project.target);
     let host_fetch = async {
         match host_target.as_deref() {
-            Some(target) => index::ensure_slice(config, target, &project.rustc_version)
+            Some(target) => slices
+                .ensure(config, target, &project.rustc_version)
                 .await
                 .map(Some),
             None => Ok(None),
         }
     };
     let (slice, host) = tokio::join!(
-        index::ensure_slice(config, &project.target, &project.rustc_version),
+        slices.ensure(config, &project.target, &project.rustc_version),
         host_fetch,
     );
     let host_slice = match host {
@@ -2443,6 +2460,7 @@ async fn try_stow_resolver(
     config: &StowConfig,
     project: &ProjectContext,
     invocation: &CargoInvocation,
+    slices: &index::SliceFetches,
 ) -> stow_types::error::Result<Option<ExitStatus>> {
     let Some(stow_lockfile_toml) = synthesize_lockfile(config, project).await? else {
         return Ok(None);
@@ -2453,7 +2471,7 @@ async fn try_stow_resolver(
     else {
         return Ok(None);
     };
-    let Some(mirror_analysis) = analyze_pinned_mirror(config, &pinned.project).await else {
+    let Some(mirror_analysis) = analyze_pinned_mirror(config, &pinned.project, slices).await else {
         return Ok(None);
     };
 
@@ -2464,6 +2482,7 @@ async fn try_stow_resolver(
         &pinned,
         &public_cache_mode,
         mirror_analysis,
+        slices,
     ))
     .await
     .map(Some)
@@ -2596,6 +2615,7 @@ async fn prepare_pinned_mirror(
 async fn analyze_pinned_mirror(
     config: &StowConfig,
     mirror_project: &ProjectContext,
+    slices: &index::SliceFetches,
 ) -> Option<WorkspacePrediction> {
     match analyze_workspace_prediction(
         mirror_project,
@@ -2603,6 +2623,7 @@ async fn analyze_pinned_mirror(
         &mirror_project.manifest_path,
         config,
         None,
+        slices,
     )
     .await
     {
@@ -2635,6 +2656,7 @@ async fn run_pinned_mirror_build(
     pinned: &PinnedMirror,
     public_cache_mode: &PublicCacheMode,
     mirror_analysis: WorkspacePrediction,
+    slices: &index::SliceFetches,
 ) -> stow_types::error::Result<ExitStatus> {
     let mirror_unit_nodes = mirror_analysis.unit_nodes.clone();
     let mirror_prefetch = mirror_analysis.prefetch_artifacts.clone();
@@ -2656,6 +2678,7 @@ async fn run_pinned_mirror_build(
         public_cache_mode,
         Some(mirror_analysis),
         &budget,
+        slices,
     ))
     .await?;
 
@@ -2677,6 +2700,7 @@ async fn run_pinned_mirror_build(
         semantic_fallback_enabled: mirror_semantic_fallback,
         covered_units: mirror_prefetch.len(),
         isolation: &invocation.isolation,
+        slices,
     })
     .await
 }
@@ -3052,6 +3076,7 @@ async fn prepare_build_cache_plan(
     public_cache_mode: &PublicCacheMode,
     precomputed_analysis: Option<WorkspacePrediction>,
     budget: &CacheBudget,
+    slices: &index::SliceFetches,
 ) -> stow_types::error::Result<Option<Vec<CachePolicyEntry>>> {
     let Some(config) = config else {
         return Ok(None);
@@ -3063,8 +3088,15 @@ async fn prepare_build_cache_plan(
     let analysis = match precomputed_analysis {
         Some(analysis) => analysis,
         None => {
-            match analyze_workspace_prediction(project, current_dir, manifest_path, config, None)
-                .await
+            match analyze_workspace_prediction(
+                project,
+                current_dir,
+                manifest_path,
+                config,
+                None,
+                slices,
+            )
+            .await
             {
                 Ok(analysis) => analysis,
                 Err(error) => {
@@ -3871,6 +3903,9 @@ struct CargoRunPlan<'a> {
     /// The level the build's cargo, build scripts and proc macros run at
     /// (stow#1000).
     isolation: &'a crate::isolation::Isolation,
+    /// The build's slice memo, shared with the driver's analyses so the
+    /// in-build enrichment reuses what they fetched.
+    slices: &'a index::SliceFetches,
 }
 
 /// The build's cargo run under the wrapper. Returns cargo's own exit
@@ -4039,6 +4074,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
             policy_ready: (!policy_ready.has_completed())
                 .then(|| crate::facade::ServeMapWaiters::new(std::sync::Arc::clone(&policy_ready))),
             resolution_done,
+            slices: plan.slices.clone(),
         }))
     } else {
         // No enrichment, so no fetch will ever land a slice: release
@@ -4801,6 +4837,9 @@ struct BuildEnrichment {
     /// the registry unreachable, releasing the plan path and in-flight
     /// downloads to local compile at once (stow#977).
     circuit: crate::circuit::BuildCircuit,
+    /// The build's slice memo: the driver's analyses fetched through the
+    /// same value, so the enrichment never re-reads a verified slice.
+    slices: index::SliceFetches,
 }
 
 /// The policy gate's readiness latch for this build: pending only while
@@ -4916,27 +4955,28 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     // Everything the build consults downstream reads the fetched
     // generation, so the consumer slices are fetched first — the coarse
     // allow commit and the serve map's final write both follow it
-    // (stow#788). `ensure_slice` memoizes, so the analysis below reuses
-    // this pair.
-    let (slice, host_slice) = match ensure_consumer_slices(&work.config, &work.project).await {
-        Ok(slices) => slices,
-        Err(error) if error.is_transport() => {
-            // The registry answered nothing — one diagnostic, not a
-            // stall the build re-pays per unit: trip the breaker so the
-            // plan path stops offering remote serves and in-flight
-            // downloads abandon, then end the enrichment. The guards'
-            // drop settles `serve_map_ready` and the policy latch, so
-            // every waiter releases at once to local compile (stow#977).
-            work.circuit.trip(&work.config).await;
-            tracing::warn!(
-                registry = %work.config.registry_base_url,
-                error = %error,
-                "stow index registry is unreachable; this build runs local-only"
-            );
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
-    };
+    // (stow#788). The build's slice memo holds this pair, so the analysis
+    // below reuses it.
+    let (slice, host_slice) =
+        match ensure_consumer_slices(&work.config, &work.project, &work.slices).await {
+            Ok(slices) => slices,
+            Err(error) if error.is_transport() => {
+                // The registry answered nothing — one diagnostic, not a
+                // stall the build re-pays per unit: trip the breaker so the
+                // plan path stops offering remote serves and in-flight
+                // downloads abandon, then end the enrichment. The guards'
+                // drop settles `serve_map_ready` and the policy latch, so
+                // every waiter releases at once to local compile (stow#977).
+                work.circuit.trip(&work.config).await;
+                tracing::warn!(
+                    registry = %work.config.registry_base_url,
+                    error = %error,
+                    "stow index registry is unreachable; this build runs local-only"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
     // The policy gate commits as soon as the rows exist — before the
     // `resolution_done` gate and the second resolve. The marker is
     // name-keyed, so "the crate has any row the fetched slices carry"
@@ -4974,6 +5014,7 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
         &work.project.manifest_path,
         &work.config,
         Some(&work.resolution_done),
+        &work.slices,
     )
     .await?;
     if let Some(map_path) = &work.map_path {
@@ -5673,6 +5714,7 @@ mod tests {
                 semantic_fallback_enabled: false,
                 covered_units: 0,
                 isolation: &crate::isolation::Isolation::off(),
+                slices: &crate::index::SliceFetches::default(),
             };
             super::cargo_command(&plan).await
         });
@@ -6312,6 +6354,7 @@ mod tests {
             deferred_analysis: false,
             covered_units: ledger.len(),
             isolation: &crate::isolation::Isolation::off(),
+            slices: &crate::index::SliceFetches::default(),
         };
         let mut envs = Vec::new();
         smol::block_on(super::export_wrapper_env(

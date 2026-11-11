@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_lite::StreamExt as _;
@@ -131,10 +132,9 @@ pub struct CachedSliceStatus {
 /// cached slice, a registry failure is the error the caller surfaces — the
 /// resolver never runs against unsigned or absent data.
 ///
-/// The fetch itself runs once per process — a build holds one index, and
-/// every caller after the first consumes the memoized rows rather than
-/// paying the pull and the signature verification again (stow#347). A
-/// failure is not memoized: the next caller retries the fetch.
+/// A build's one-shot callers (`stow setup`, `check-artifact`, …) fetch
+/// once and keep nothing; a build that asks for the same slice from
+/// several places holds a [`SliceFetches`] instead.
 ///
 /// # Errors
 ///
@@ -146,21 +146,53 @@ pub async fn ensure_slice(
     target: &str,
     rustc_version: &str,
 ) -> Result<IndexSlice, SliceFetchError> {
-    static SLICES: tokio::sync::OnceCell<
-        tokio::sync::Mutex<std::collections::BTreeMap<(String, String), IndexSlice>>,
-    > = tokio::sync::OnceCell::const_new();
-    let key = (target.to_owned(), rustc_version.to_owned());
-    let slices = SLICES
-        .get_or_init(|| async { tokio::sync::Mutex::new(BTreeMap::new()) })
-        .await;
-    let mut slices = slices.lock().await;
-    if let Some(slice) = slices.get(&key) {
-        return Ok(slice.clone());
+    fetch_slice(config, target, rustc_version, Revalidation::PastInterval).await
+}
+
+/// The slices one build has fetched, by `(target, rustc_version)`: a
+/// build holds one index, and every caller after the first consumes the
+/// memoized rows rather than paying the pull and the signature
+/// verification again (stow#347). One value is created per build and
+/// handed to every analysis that build runs, so a slice the driver's
+/// analysis fetched is not read from disk again by the in-build
+/// enrichment. Clones share the memo. The memo belongs to one
+/// configuration: its key names the slice, not the registry it came from.
+///
+/// A failed fetch is not memoized: the next caller retries it.
+#[derive(Debug, Clone, Default)]
+pub struct SliceFetches {
+    cells:
+        Arc<std::sync::Mutex<BTreeMap<(String, String), Arc<tokio::sync::OnceCell<IndexSlice>>>>>,
+}
+
+impl SliceFetches {
+    /// [`ensure_slice`], memoized: concurrent callers for one slice share
+    /// the one fetch, and fetches of different slices run side by side.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`ensure_slice`] returns.
+    pub async fn ensure(
+        &self,
+        config: &StowConfig,
+        target: &str,
+        rustc_version: &str,
+    ) -> Result<IndexSlice, SliceFetchError> {
+        let cell = {
+            let mut cells = self
+                .cells
+                .lock()
+                .expect("the slice memo's lock is never held across a panic");
+            Arc::clone(
+                cells
+                    .entry((target.to_owned(), rustc_version.to_owned()))
+                    .or_default(),
+            )
+        };
+        cell.get_or_try_init(|| ensure_slice(config, target, rustc_version))
+            .await
+            .cloned()
     }
-    let slice = fetch_slice(config, target, rustc_version, Revalidation::PastInterval).await?;
-    slices.insert(key, slice.clone());
-    drop(slices);
-    Ok(slice)
 }
 
 /// The wrapper's slice source: the verified cache only, never the network.
@@ -1185,6 +1217,60 @@ mod tests {
         assert!(
             pending(&eager).await,
             "a zero interval revalidates every call"
+        );
+    }
+
+    /// A memo fetches a slice once and answers every later call and every
+    /// clone from it; a second memo is a second build and fetches again,
+    /// so one build's answer never outlives it.
+    #[tokio::test]
+    async fn two_slice_memos_each_fetch_once() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let dir = slice_dir(&config, TARGET, RUSTC);
+        let seed = |digest: &'static str, c_metadata: &'static str| {
+            let dir = dir.clone();
+            async move {
+                let blob = stow_shim::encode_index(&test_index(vec![test_row(c_metadata)]))
+                    .expect("encode");
+                commit_slice(&dir, digest, blob, 1).await.expect("commit");
+                // A pointer inside the refresh interval serves from disk
+                // without asking the registry.
+                write_test_pointer(
+                    &dir,
+                    SlicePointer {
+                        manifest_digest: digest.to_owned(),
+                        fetched_at: now_secs(),
+                        row_count: 1,
+                    },
+                )
+                .await;
+            }
+        };
+
+        seed("sha256:aaaa", "aaaa").await;
+        let first = SliceFetches::default();
+        let fetched = first.ensure(&config, TARGET, RUSTC).await.expect("fetch");
+        assert_eq!(fetched.manifest_digest.as_deref(), Some("sha256:aaaa"));
+
+        seed("sha256:bbbb", "bbbb").await;
+        let memoized = first
+            .clone()
+            .ensure(&config, TARGET, RUSTC)
+            .await
+            .expect("memoized");
+        assert_eq!(
+            memoized.manifest_digest.as_deref(),
+            Some("sha256:aaaa"),
+            "the first memo answers from what it fetched, through a clone too"
+        );
+
+        let second = SliceFetches::default();
+        let refetched = second.ensure(&config, TARGET, RUSTC).await.expect("fetch");
+        assert_eq!(
+            refetched.manifest_digest.as_deref(),
+            Some("sha256:bbbb"),
+            "a second memo fetches for itself"
         );
     }
 
