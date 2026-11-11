@@ -1904,14 +1904,11 @@ pub async fn phase_sandbox(
     let mut builder = SandboxConfigBuilder::default()
         .network(heel::Audited::new(heel::AllowAll, (*audit_log).clone()))
         .filesystem_strict(true)
-        .working_dir(workspace.workspace_root())
         // The IPC router is what the sandboxed rustc wrapper streams capture
-        // records through; the generated `heel ipc` launcher shims are inert
-        // here because the wrapper links `heel::IpcClient` directly, but heel
-        // still needs a binary path to bake into them — `stow-build` doubles
-        // as that binary and gets the EXEC grant the capture shim needs.
-        .heel_binary(*capture_wrapper)
-        .ipc(heel::IpcRouter::new().register((*capture_command).clone()))
+        // records through. The wrapper links `heel::IpcClient` and connects
+        // itself, so the router is served directly: no shims, no `heel`
+        // binary.
+        .direct_ipc(heel::IpcRouter::new().register((*capture_command).clone()))
         // `cargo`/`rustc` resolve through the host PATH (and through it the
         // rustup proxies under CARGO_HOME/bin).
         .env_passthrough("PATH")
@@ -1930,17 +1927,42 @@ pub async fn phase_sandbox(
             std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
         ));
 
-    for (path, access, reason) in sandbox_grants(
+    // heel takes resolved paths only: it resolves each grant here, refusing a
+    // link a build script could have planted inside a writable grant.
+    let requests = sandbox_grants(
         setup.cargo_home,
         workspace,
         run_dir,
         wrappers,
         runtime_wrapper,
+        capture_wrapper,
         msvc,
         *consume_store,
         target,
-    )? {
-        tracing::debug!(path = %path.display(), ?access, reason, "sandbox grant");
+    )?
+    .into_iter()
+    .map(|(path, access, reason)| {
+        let request = if access.can_write() {
+            heel::PathRequest::writable(path)
+        } else {
+            heel::PathRequest::readable(path)
+        };
+        (request, Some((access, reason)))
+    });
+    // The working directory is resolved in the same pass, so the writable
+    // grants and it all count as places a link could be planted.
+    let working_dir = (
+        heel::PathRequest::writable(workspace.workspace_root()),
+        None,
+    );
+    for (path, grant) in heel::resolve_paths(std::iter::once(working_dir).chain(requests))
+        .map_err(|error| stow_types::stow_error!("resolve the phase sandbox paths: {error}"))?
+    {
+        let Some((access, reason)) = grant else {
+            builder = builder.working_dir(path.as_path());
+            continue;
+        };
+        tracing::debug!(path = %path.as_path().display(), ?access, reason, "sandbox grant");
         builder = builder.grant(path, access);
     }
 
@@ -1963,6 +1985,7 @@ fn sandbox_grants(
     run_dir: &Path,
     wrappers: &wrapper_shim::WrapperShimPaths,
     runtime_wrapper: &Path,
+    capture_wrapper: &Path,
     msvc: &MsvcToolchain,
     consume_store: Option<&Path>,
     target: &str,
@@ -2001,6 +2024,11 @@ fn sandbox_grants(
             runtime_wrapper.to_path_buf(),
             Access::READ | Access::EXEC,
             "the rustc/cc shims resolve to the runtime wrapper binary",
+        ),
+        (
+            capture_wrapper.to_path_buf(),
+            Access::READ | Access::EXEC,
+            "the capture shim resolves to this binary, which streams records over IPC",
         ),
         (
             run_dir.to_path_buf(),
@@ -3307,7 +3335,6 @@ mod tests {
 
     /// The `host:` triple the ambient toolchain compiles for — the same
     /// `rustc -vV` probe `active_release` reads its release from.
-    #[cfg(not(windows))]
     fn host_triple() -> String {
         let output = std::process::Command::new("rustc")
             .arg("-vV")
@@ -4108,6 +4135,88 @@ checksum = "33"
         });
     }
 
+    /// `std::fs::canonicalize` must work inside the phase sandbox on every
+    /// platform: `aws-lc-sys`'s build script canonicalizes its working
+    /// directory and panics when it cannot (stow#1419). On Windows the call
+    /// ends in `GetFinalPathNameByHandleW`, which queries the mount manager
+    /// device an `AppContainer` token is refused unless the sandbox opens it
+    /// to the container.
+    ///
+    /// The build script canonicalizes the three kinds of path a real build
+    /// script reaches: the crate's manifest directory, its `OUT_DIR`, and a
+    /// source directory under the cargo registry, and reports every failure
+    /// with its path and OS error.
+    #[test]
+    fn a_build_script_canonicalizes_its_paths_inside_the_phase_sandbox() {
+        smol::block_on(async {
+            let cargo_home = cargo_home().expect("cargo home");
+            // Any unpacked registry crate stands for a dependency's source:
+            // the sandbox grants the registry read-only, and the paths a
+            // dependency's build script canonicalizes sit under it.
+            let registry_source = registry_source_dir(&cargo_home);
+
+            let workspace_root = TempDir::new().expect("workspace root");
+            let root = workspace_root.path();
+            std::fs::create_dir_all(root.join("src")).expect("src dir");
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname = \"stow-canonicalize-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+            )
+            .expect("write manifest");
+            std::fs::write(root.join("src/lib.rs"), "pub fn probe() {}\n").expect("write lib");
+            std::fs::write(
+                root.join("build.rs"),
+                r#"fn main() {
+    let mut failures = Vec::new();
+    for name in ["CARGO_MANIFEST_DIR", "OUT_DIR", "STOW_PROBE_REGISTRY_SOURCE"] {
+        let path = std::env::var(name).unwrap_or_else(|error| panic!("{name}: {error}"));
+        if let Err(error) = std::fs::canonicalize(&path) {
+            failures.push(format!("{name} ({path}): {error}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "std::fs::canonicalize failed inside the sandbox:\n{}",
+        failures.join("\n"),
+    );
+}
+"#,
+            )
+            .expect("write build script");
+
+            let target_dir = TempDir::new().expect("target dir");
+            let host = host_triple();
+            let msvc = super::MsvcToolchain::resolve(&host).expect("MSVC toolchain");
+            cargo_build_probe(
+                root,
+                target_dir.path(),
+                &msvc,
+                &host,
+                &[],
+                &[(
+                    "STOW_PROBE_REGISTRY_SOURCE".to_owned(),
+                    super::path_arg(&registry_source).expect("utf8 registry source path"),
+                )],
+                &cargo_home,
+            )
+            .await;
+        });
+    }
+
+    /// An unpacked crate under `$CARGO_HOME/registry/src`, which the host's
+    /// own build of this test binary has left there.
+    fn registry_source_dir(cargo_home: &Path) -> PathBuf {
+        let sources = cargo_home.join("registry").join("src");
+        std::fs::read_dir(&sources)
+            .unwrap_or_else(|error| panic!("read {}: {error}", sources.display()))
+            .flatten()
+            .filter_map(|index| std::fs::read_dir(index.path()).ok())
+            .flat_map(std::iter::Iterator::flatten)
+            .map(|entry| entry.path())
+            .find(|path| path.is_dir())
+            .unwrap_or_else(|| panic!("no unpacked crate under {}", sources.display()))
+    }
+
     /// `Machine` field of the COFF file header: `IMAGE_FILE_MACHINE_AMD64`.
     #[cfg(all(windows, target_arch = "x86_64"))]
     const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
@@ -4406,6 +4515,7 @@ checksum = "33"
                 &workspace,
                 target_dir.path(),
                 &wrappers,
+                &wrapper,
                 &wrapper,
                 &msvc,
                 None,

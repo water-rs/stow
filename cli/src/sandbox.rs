@@ -42,8 +42,8 @@ use std::path::{Path, PathBuf};
 use futures_util::StreamExt;
 use heel::{
     Access, AllowAll, Audited, DenyAll, Grant, Identity, IpcRouter, IpcUnconfigured,
-    NetworkAuditLog, NetworkPolicy, ReadDenylist, Sandbox, SandboxConfig, SandboxConfigBuilder,
-    SecurityConfig, SecurityConfigBuilder, WriteDenylist,
+    NetworkAuditLog, NetworkPolicy, PathRequest, ReadDenylist, Sandbox, SandboxConfig,
+    SandboxConfigBuilder, SecurityConfig, SecurityConfigBuilder, WriteDenylist,
 };
 use stow_types::env_name;
 use stow_types::error::Context;
@@ -171,10 +171,10 @@ impl BuildSandbox {
     ///
     /// A sandbox that cannot be set up is an error here — there is no
     /// unsandboxed fallback and no weaker level (stow#779, stow#1000).
-    /// `runtime_executable` doubles as the `heel` binary the IPC layout
-    /// bakes into its launcher shims and so gets the execute grant the
-    /// shims and the facades both need, the same trick `stow-build` plays
-    /// in CI.
+    /// `runtime_executable` is the stow binary the wrapper shims and the
+    /// facades resolve to; it reaches the supervisor through
+    /// `heel::IpcClient`, so the sandbox serves the router directly and
+    /// needs no `heel` binary.
     ///
     /// # Errors
     ///
@@ -395,10 +395,9 @@ impl DeniedAccessLog {
 /// network policy: the level's file and environment policy, the grants and
 /// the stable identity.
 async fn confined_builder<N: NetworkPolicy>(
-    builder: SandboxConfigBuilder<N, IpcUnconfigured>,
+    mut builder: SandboxConfigBuilder<N, IpcUnconfigured>,
     request: &SandboxRequest<'_>,
 ) -> stow_types::error::Result<SandboxConfigBuilder<N, IpcUnconfigured>> {
-    let mut builder = builder.heel_binary(request.runtime_executable);
     let (env_names, grants): (Vec<String>, Vec<(PathBuf, Access, &'static str)>) = match request
         .confinement
     {
@@ -476,15 +475,23 @@ async fn confined_builder<N: NetworkPolicy>(
         }
     };
     builder = builder.env_passthroughs(env_names);
-    for (path, access, reason) in grants {
-        // The kernel resolves paths through `/var` → `/private/var`
-        // and friends; a grant spelled through a symlink does not
-        // cover the resolved path, so every grant is canonicalized
-        // before heel writes the rule.
-        let path = path.canonicalize().map_err(|error| {
-            stow_types::stow_error!("canonicalize sandbox grant {}: {error}", path.display())
-        })?;
-        tracing::debug!(path = %path.display(), ?access, reason, "sandbox grant");
+    // The kernel resolves paths through `/var` → `/private/var` and
+    // friends; a grant spelled through a symlink does not cover the
+    // resolved path, so heel resolves every grant before it writes the
+    // rule, refusing a link a sandbox could have planted inside a
+    // writable grant.
+    let requests = grants.into_iter().map(|(path, access, reason)| {
+        let request = if access.can_write() {
+            PathRequest::writable(path)
+        } else {
+            PathRequest::readable(path)
+        };
+        (request, (access, reason))
+    });
+    for (path, (access, reason)) in heel::resolve_paths(requests)
+        .map_err(|error| stow_types::stow_error!("resolve the sandbox grants: {error}"))?
+    {
+        tracing::debug!(path = %path.as_path().display(), ?access, reason, "sandbox grant");
         builder = builder.grant(path, access);
     }
     Ok(builder)
@@ -589,17 +596,21 @@ pub fn stow_identity() -> stow_types::error::Result<Identity> {
     }
     let mut identity = Identity::named("stow")
         .map_err(|error| stow_types::stow_error!("the stow sandbox identity name: {error}"))?;
-    for (path, access) in persistent {
-        // Canonicalized like the per-build grants: heel's record and the
-        // reconcile compare spellings, so a symlinked home or a stray
-        // `..` must not give `setup` and a build different spellings of
-        // the same root — the revoke/re-grant churn this exists to remove.
-        let path = path.canonicalize().map_err(|error| {
-            stow_types::stow_error!(
-                "canonicalize the persistent sandbox grant {}: {error}",
-                path.display()
-            )
-        })?;
+    // Resolved like the per-build grants: heel's record and the
+    // reconcile compare spellings, so a symlinked home or a stray
+    // `..` must not give `setup` and a build different spellings of
+    // the same root — the revoke/re-grant churn this exists to remove.
+    let requests = persistent.into_iter().map(|(path, access)| {
+        let request = if access.can_write() {
+            PathRequest::writable(path)
+        } else {
+            PathRequest::readable(path)
+        };
+        (request, access)
+    });
+    for (path, access) in heel::resolve_paths(requests).map_err(|error| {
+        stow_types::stow_error!("resolve the persistent sandbox grants: {error}")
+    })? {
         identity = identity.persistent_grant(Grant::new(path, access));
     }
     Ok(identity)
@@ -1069,7 +1080,7 @@ fn driver_probe_grants(
 const PROBE_CONCURRENCY: usize = 8;
 
 /// Seal a configured builder, applying the supervisor's IPC router
-/// when one is registered — `ipc` moves the builder into the
+/// when one is registered — `direct_ipc` moves the builder into the
 /// `IpcConfigured` typestate (heel#59), so the optional router can only
 /// be applied where `build` erases the difference.
 fn build_config<N: heel::NetworkPolicy>(
@@ -1077,7 +1088,7 @@ fn build_config<N: heel::NetworkPolicy>(
     ipc: Option<IpcRouter>,
 ) -> SandboxConfig<N> {
     match ipc {
-        Some(router) => builder.ipc(router).build(),
+        Some(router) => builder.direct_ipc(router).build(),
         None => builder.build(),
     }
 }
