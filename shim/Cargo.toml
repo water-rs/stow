@@ -28,6 +28,9 @@ dirs = "7"
 # is_same_file: hard-linked wrapper shims skip the byte-for-byte
 # comparison against the runtime executable.
 same-file = "1"
+# `TempPath::persist_noclobber`: a byte-copied wrapper is placed at an
+# empty name by a rename that refuses an existing one.
+tempfile = { workspace = true }
 
 [features]
 default = []
