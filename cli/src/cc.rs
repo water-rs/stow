@@ -613,27 +613,10 @@ enum Placement {
     Copied,
 }
 
-/// Clone `source` to the not-yet-existing `destination` (APFS
-/// `clonefile`, Linux `FICLONE`), copying only where the filesystem cannot
-/// clone.
-fn clone_or_copy(source: &Path, destination: &Path) -> std::io::Result<Placement> {
-    let placement = match reflink_copy::reflink_or_copy(source, destination)? {
-        None => Placement::Cloned,
-        Some(_) => Placement::Copied,
-    };
-    if placement == Placement::Copied {
-        tracing::debug!(
-            source = %source.display(),
-            destination = %destination.display(),
-            "filesystem cannot clone; copied C/C++ object bytes"
-        );
-    }
-    Ok(placement)
-}
-
-/// [`clone_or_copy`] from an open file: the clone is taken from the
-/// descriptor, and a filesystem that cannot clone gets a byte copy of the
-/// same descriptor.
+/// Clone an open file to the not-yet-existing `destination` (APFS
+/// `clonefile`, Linux `FICLONE`): the clone is taken from the descriptor,
+/// and a filesystem that cannot clone gets a byte copy of the same
+/// descriptor.
 fn clone_or_copy_file(source: &std::fs::File, destination: &Path) -> std::io::Result<Placement> {
     if reflink_copy::reflink_file_to_path(source, destination).is_ok() {
         return Ok(Placement::Cloned);
@@ -867,16 +850,19 @@ fn serve_cached_object_blocking(
     } else {
         Placement::Cloned
     };
-    staged
-        .persist(output_path)
-        .map_err(|error| error.error)
-        .wrap_err_with(|| {
-            format!(
-                "move cached object {} into place at {}",
-                cache_path.display(),
-                output_path.display()
-            )
-        })?;
+    crate::inject::place_staged(staged, output_path, || {
+        matches!(
+            (std::fs::read(cache_path), std::fs::read(output_path)),
+            (Ok(cached), Ok(served)) if cached == served
+        )
+    })
+    .wrap_err_with(|| {
+        format!(
+            "move cached object {} into place at {}",
+            cache_path.display(),
+            output_path.display()
+        )
+    })?;
     if placement == Placement::Copied {
         tracing::debug!(
             source = %cache_path.display(),
