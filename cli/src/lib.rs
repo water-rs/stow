@@ -42,6 +42,8 @@ mod lockfile_graph_cache;
 mod lockfile_resolver;
 mod miss_journal;
 mod mold;
+#[cfg(windows)]
+pub mod msvc;
 #[cfg(test)]
 mod network_gate;
 mod prefetch;
