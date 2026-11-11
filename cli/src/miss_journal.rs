@@ -15,7 +15,6 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use crate::artifact_cache::{LocalBuildArtifact, ObservedUnit};
 use crate::config::StowConfig;
@@ -434,46 +433,25 @@ pub fn spawn_drain_unconditional(target_dir: &Path) {
         .append(true)
         .open(&log)
         .ok();
-    let stderr = log_file
-        .as_ref()
-        .and_then(|file| file.try_clone().ok())
-        .map_or_else(Stdio::null, Stdio::from);
-    let mut command = std::process::Command::new(&exe);
-    command
+    // Detached, so a `SIGINT`/`SIGTERM` or Ctrl-C aimed at the build's
+    // process group never kills the drain mid-claim, and it holds none of
+    // the build's descriptors or handles: a caller reading the build's
+    // output to its end never waits for the drain. The drain starts at the
+    // caller's own priority: its re-derivation cargo holds the
+    // package-cache lock the user's next command needs, so a niced cargo
+    // would hold it *longer* — the drain lowers itself before the part
+    // that only burns CPU instead (stow#667).
+    let mut command = crate::daemon::detached::Detached::new(&exe)
         .arg("__drain-misses")
         .arg(target_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr)
         // The chrome trace file is one process's: a second writer
         // truncates it on open and the parent's spans are lost.
-        .env_remove(crate::STOW_TRACE_FILE_ENV);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        // A session of its own: a `SIGINT`/`SIGTERM` aimed at the
-        // build's process group never kills the drain mid-claim. The
-        // drain starts at the caller's own priority: its re-derivation
-        // cargo holds the package-cache lock the user's next command
-        // needs, so a niced cargo would hold it *longer* — the drain
-        // lowers itself before the part that only burns CPU instead
-        // (stow#667).
-        unsafe {
-            command.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        // DETACHED_PROCESS | CREATE_NO_WINDOW: no console flashes open.
-        // The drain starts at the caller's priority for the same
-        // reason — its cargo holds the lock the user's next command
-        // needs; it lowers itself once only CPU-bound posting remains
-        // (stow#667).
-        command.creation_flags(0x0000_0008 | 0x0000_0200);
+        .envs(
+            std::env::vars_os()
+                .filter(|(name, _)| !stow_types::env_name::eq(name, crate::STOW_TRACE_FILE_ENV)),
+        );
+    if let Some(stderr) = log_file.as_ref().and_then(|file| file.try_clone().ok()) {
+        command = command.stderr(stderr);
     }
     if let Err(error) = command.spawn() {
         tracing::warn!(error = %error, "could not spawn the miss drain");

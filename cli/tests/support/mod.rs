@@ -1,7 +1,66 @@
 //! The environment every integration test's `stow-cli` invocation shares.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Output};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// How long a process's piped output may stay open once the process has
+/// exited. Only a process it started can hold the pipes then, and none of
+/// stow's may — a daemon or drain it starts detaches holding none of its
+/// descriptors or handles — so the bound only has to outlast the last
+/// bytes reaching the reader.
+const OUTPUT_AFTER_EXIT_BOUND: Duration = Duration::from_mins(1);
+
+/// Wait for `child`, whose stdout and stderr are piped, to exit, and
+/// collect its output. Output that stays open past
+/// [`OUTPUT_AFTER_EXIT_BOUND`] after the exit fails the test naming that,
+/// instead of waiting for whatever process holds it: `what` names the
+/// child.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn output_of(mut child: Child, what: &str) -> Output {
+    let stdout = read_on_a_thread(child.stdout.take());
+    let stderr = read_on_a_thread(child.stderr.take());
+    let status = child
+        .wait()
+        .unwrap_or_else(|error| panic!("wait for {what}: {error}"));
+    let deadline = Instant::now() + OUTPUT_AFTER_EXIT_BOUND;
+    let collect = |stream: mpsc::Receiver<Vec<u8>>, name: &str| {
+        stream
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{what} exited ({status}) but its {name} stayed open for {} s after: a process it started holds it",
+                    OUTPUT_AFTER_EXIT_BOUND.as_secs()
+                )
+            })
+    };
+    Output {
+        status,
+        stdout: collect(stdout, "stdout"),
+        stderr: collect(stderr, "stderr"),
+    }
+}
+
+/// Read `stream` to its end on a thread of its own; the bytes arrive on
+/// the returned channel once every writer has closed it.
+fn read_on_a_thread<R: Read + Send + 'static>(stream: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stream) = stream {
+            stream
+                .read_to_end(&mut bytes)
+                .expect("read the child's output");
+        }
+        let _ = sender.send(bytes);
+    });
+    receiver
+}
 
 /// The environment a hermetic `stow-cli` invocation needs: `edge_url` as
 /// both the edge and the OCI registry root (no path: the registry

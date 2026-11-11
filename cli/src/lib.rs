@@ -5706,17 +5706,9 @@ mod tests {
         )
     }
 
-    /// Output roots that contain every path: the fixtures name an
-    /// `--out-dir` that is no real build's.
-    fn everywhere() -> crate::daemon::session::invocation::OutputRoots {
-        crate::daemon::session::invocation::OutputRoots::new(
-            PathBuf::from(std::path::MAIN_SEPARATOR_STR),
-            None,
-        )
-    }
-
     /// A session over the test machine's own rustc with an empty
-    /// `BuildContext`, its directory in the returned tempdir.
+    /// `BuildContext`, its directory in the returned tempdir, which is
+    /// also its target directory: the fixtures' `--out-dir`s lie under it.
     async fn test_session(
         resolution_done: super::ResolutionDone,
         refusal_policy: crate::daemon::session::invocation::RefusalPolicy,
@@ -5732,7 +5724,10 @@ mod tests {
                     None,
                     crate::toolchain::BuildToolchain::for_tests().await,
                 ),
-                roots: everywhere(),
+                roots: crate::daemon::session::invocation::OutputRoots::new(
+                    sessions.path().to_path_buf(),
+                    None,
+                ),
                 refusal_policy,
                 resolution_done,
             },
@@ -5741,8 +5736,8 @@ mod tests {
         (sessions, session)
     }
 
-    /// An invocation of the build's own rustc, which the handler's
-    /// toolchain verifies.
+    /// An invocation of the build's own rustc, which the handler verifies
+    /// against its own toolchain and output roots, as a request is.
     async fn verified_rustc(
         handler: &std::sync::Arc<crate::daemon::session::Session>,
         args: Vec<OsString>,
@@ -5750,7 +5745,7 @@ mod tests {
         let toolchain = crate::daemon::session::handler::Handler::toolchain(handler);
         crate::daemon::session::invocation::VerifiedInvocation::verify(
             toolchain,
-            Some(&everywhere()),
+            crate::daemon::session::handler::Handler::output_roots(handler),
             OsString::from("rustc"),
             args,
             &here(),
@@ -6116,11 +6111,13 @@ mod tests {
     #[tokio::test]
     async fn resolution_done_fires_only_on_a_compile_unit_plan() {
         let resolution_done = super::ResolutionDone::pending();
-        let (_sessions, handler) = test_session(
+        let (sessions, handler) = test_session(
             resolution_done.clone(),
             crate::daemon::session::invocation::RefusalPolicy::FailBuild,
         )
         .await;
+        let out_dir = sessions.path().join("out");
+        let out_dir = out_dir.to_str().expect("a UTF-8 temporary directory");
 
         let _ = crate::daemon::session::handler::Handler::plan(
             &handler,
@@ -6159,7 +6156,7 @@ mod tests {
                     "--crate-type",
                     "lib",
                     "--out-dir",
-                    "/tmp/out",
+                    out_dir,
                     "--emit",
                     "metadata",
                     "-C",
@@ -7501,7 +7498,11 @@ mod tests {
                     env_cache,
                     ctx: ctx(&in_flight),
                     resolution_done: crate::ResolutionDone::pending(),
-                    roots: super::everywhere(),
+                    // The fixtures' units compile into `<root>/deps`.
+                    roots: crate::daemon::session::invocation::OutputRoots::new(
+                        root.to_path_buf(),
+                        None,
+                    ),
                     refusal_policy: crate::daemon::session::invocation::RefusalPolicy::FailBuild,
                 },
                 &root.join("sessions"),

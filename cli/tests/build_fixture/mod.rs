@@ -3,7 +3,7 @@
 
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use crate::support::{denied_registry, hermetic_stow_env, sealed_home_env};
 
@@ -179,7 +179,7 @@ fn run_stow_build(
     env: &[(&str, &str)],
     isolation_off: bool,
 ) -> Output {
-    stow_build_command(
+    let child = stow_build_command(
         dir,
         args,
         edge_url,
@@ -190,8 +190,14 @@ fn run_stow_build(
         env,
         isolation_off,
     )
-    .output()
-    .expect("run stow-cli build")
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("run stow-cli build");
+    // The build starts the daemon when none runs, and the daemon outlives
+    // it: the build's output must close when the build exits all the same.
+    crate::support::output_of(child, "stow build")
 }
 
 /// The hermetic `stow build` command [`stow_build_in_with_env`] runs, for

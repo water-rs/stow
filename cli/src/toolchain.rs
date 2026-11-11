@@ -174,8 +174,9 @@ impl BuildToolchain {
 
     /// Whether `spelling`, written in a process running in `cwd`, names
     /// this toolchain's rustc — the toolchain file or the file the driver
-    /// launches it through: a bare name resolves through the `PATH` the
-    /// toolchain was resolved under, a relative path against `cwd`, and
+    /// launches it through: a bare name resolves through the environment
+    /// the toolchain was resolved under ([`SessionEnv::resolve_program`]),
+    /// a relative path against `cwd`, and
     /// files are compared by identity, not by string (stow#608). Stats
     /// the file system; callers run it off the runtime workers.
     #[must_use]
@@ -316,14 +317,14 @@ fn parse_native_cpu(stdout: &str) -> Option<String> {
     })
 }
 
-/// The file `spelling` resolves to — through `env`'s `PATH`, from `cwd` —
-/// and its identity.
+/// The file `spelling` resolves to in `env`, from `cwd`, and its identity.
 fn resolve_file(
     spelling: &OsStr,
     env: &SessionEnv,
     cwd: &Path,
 ) -> Result<(PathBuf, Handle), String> {
-    let path = which::which_in(spelling, Some(env.search_path()), cwd)
+    let path = env
+        .resolve_program(spelling, cwd)
         .map_err(|error| format!("resolve {}: {error}", Path::new(spelling).display()))?;
     let file = Handle::from_path(&path)
         .map_err(|error| format!("identify {}: {error}", path.display()))?;

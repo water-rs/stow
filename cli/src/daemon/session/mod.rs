@@ -706,7 +706,7 @@ pub struct TestParts {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::time::Duration;
 
     use super::*;
@@ -741,13 +741,14 @@ mod tests {
         }
     }
 
-    /// Facts over the test machine's own rustc, with a serve map that
-    /// covers no crate the unit below names.
-    async fn facts(config: Option<StowConfig>) -> SessionFacts {
+    /// Facts over the test machine's own rustc whose outputs live under
+    /// `target`, with a serve map that covers no crate the unit below
+    /// names.
+    async fn facts(target: &Path, config: Option<StowConfig>) -> SessionFacts {
         let toolchain = BuildToolchain::for_tests().await.facts();
         let mut facts = SessionFacts::for_tests(
             toolchain,
-            OutputRoots::new(PathBuf::from(std::path::MAIN_SEPARATOR_STR), None),
+            OutputRoots::new(target.to_owned(), None),
             RefusalPolicy::FailBuild,
         );
         facts.config = config;
@@ -761,42 +762,48 @@ mod tests {
         facts
     }
 
-    /// One registry lib unit the serve map above does not cover.
-    fn uncovered_unit() -> Vec<OsString> {
-        [
-            "--crate-name",
-            "demo",
-            "--crate-type",
-            "lib",
-            "--emit",
-            "dep-info,metadata,link",
-            "--out-dir",
-            "/tmp/out",
-            "-C",
-            "metadata=abc123",
-            "-C",
-            "extra-filename=-abc123",
-            "--target",
-            HOST_TARGET,
-            "/cargo/registry/src/index.crates.io-0123abcd/demo-1.0.0/src/lib.rs",
-        ]
-        .map(OsString::from)
-        .to_vec()
+    /// One registry lib unit the serve map above does not cover, compiling
+    /// into `out_dir`.
+    fn uncovered_unit(out_dir: &Path) -> Vec<OsString> {
+        let mut unit = ["--crate-name", "demo", "--crate-type", "lib"]
+            .map(OsString::from)
+            .to_vec();
+        unit.extend([
+            OsString::from("--emit"),
+            OsString::from("dep-info,metadata,link"),
+            OsString::from("--out-dir"),
+            out_dir.as_os_str().to_owned(),
+        ]);
+        unit.extend(
+            [
+                "-C",
+                "metadata=abc123",
+                "-C",
+                "extra-filename=-abc123",
+                "--target",
+                HOST_TARGET,
+                "/cargo/registry/src/index.crates.io-0123abcd/demo-1.0.0/src/lib.rs",
+            ]
+            .map(OsString::from),
+        );
+        unit
     }
 
-    /// What a session decided about the unit: whether it compiles, the
-    /// crate it parsed and whether it owes a miss, plus the arguments the
-    /// wrapper would run rustc with.
+    /// What a session decided about the unit, compiling under the
+    /// session's target directory: whether it compiles, the crate it
+    /// parsed and whether it owes a miss, plus the arguments the wrapper
+    /// would run rustc with.
     async fn decide(session: &Arc<Session>) -> (Option<(String, bool)>, Vec<OsString>) {
         let env = InvocationEnv::for_tests();
+        let unit = uncovered_unit(&session.facts.roots.dirs()[0].join("deps"));
         let args = session
-            .plan_args(uncovered_unit(), &env)
+            .plan_args(unit.clone(), &env)
             .expect("plan the arguments");
         let verified = VerifiedInvocation::verify(
             &session.env_cache.toolchain,
             Some(&session.facts.roots),
             session.env_cache.toolchain.rustc().as_os_str().to_owned(),
-            uncovered_unit(),
+            unit,
             &env,
         )
         .await
@@ -820,7 +827,8 @@ mod tests {
     #[tokio::test]
     async fn a_session_from_round_tripped_facts_decides_like_the_driver_built_one() {
         let sessions = tempfile::tempdir().expect("sessions directory");
-        let built = facts(None).await;
+        let target = tempfile::tempdir().expect("target directory");
+        let built = facts(target.path(), None).await;
         let received: SessionFacts =
             serde_json::from_slice(&serde_json::to_vec(&built).expect("encode the facts"))
                 .expect("decode the facts");
@@ -859,6 +867,7 @@ mod tests {
         let sessions = tempfile::tempdir().expect("sessions directory");
         let first_dir = tempfile::tempdir().expect("first cache dir");
         let second_dir = tempfile::tempdir().expect("second cache dir");
+        let target = tempfile::tempdir().expect("target directory");
         let mut resources = Resources::default();
 
         let mut opened = Vec::new();
@@ -866,7 +875,7 @@ mod tests {
             let handles = resources.handles_for(cache_dir);
             let session = Session::open(
                 SessionId::mint(),
-                facts(Some(config_in(cache_dir))).await,
+                facts(target.path(), Some(config_in(cache_dir))).await,
                 &handles,
                 sessions.path(),
             )

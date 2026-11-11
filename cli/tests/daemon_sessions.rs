@@ -121,16 +121,15 @@ fn release(rendezvous: &Path) {
     std::fs::write(rendezvous.join("release"), b"").expect("release the builds");
 }
 
-/// Wait for `child` to exit, within [`BOUND`], and collect its output.
+/// Wait for `child` to exit, within [`BOUND`], and collect its output,
+/// which must close with it ([`support::output_of`]).
 fn finish(mut child: Child, what: &str) -> std::process::Output {
     let deadline = Instant::now() + BOUND;
     while child.try_wait().expect("poll the child").is_none() {
         assert!(Instant::now() < deadline, "{what} did not finish");
         std::thread::sleep(Duration::from_millis(20));
     }
-    child
-        .wait_with_output()
-        .expect("collect the child's output")
+    support::output_of(child, what)
 }
 
 fn stderr_of(output: &std::process::Output) -> String {
@@ -227,6 +226,52 @@ fn one_daemon_serves_two_concurrent_builds_and_neither_sees_the_others_session()
         daemon.log_lines("ended a session").len(),
         2,
         "every session ended with its build"
+    );
+}
+
+/// A build that finds no daemon starts one, and the daemon outlives the
+/// build. The build's output closes when the build exits all the same: the
+/// daemon holds none of the build's descriptors or handles, so a caller
+/// that reads the output to its end — `Command::output`, a pipe into
+/// `tee` — is not held until the daemon exits.
+#[test]
+fn a_build_that_starts_the_daemon_closes_its_output_when_it_exits() {
+    let home = support::tempdir().expect("daemon home");
+    let daemon = PrivateDaemon::in_home(home.path());
+    let rendezvous = support::tempdir().expect("rendezvous");
+    let project = Project::new("first", "cfg-if = \"1\"\n");
+    // The build script finds its release in place and passes through.
+    release(rendezvous.path());
+
+    let output = finish(
+        spawn(project.build(daemon.run_dir(), rendezvous.path())),
+        "the build that started the daemon",
+    );
+    assert!(
+        output.status.success(),
+        "the build failed:\n{}",
+        stderr_of(&output)
+    );
+    let pids = daemon.serving_pids();
+    assert_eq!(pids.len(), 1, "the build started one daemon");
+
+    // That daemon still serves: a status request reaches it and starts no
+    // other.
+    let mut status = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    status
+        .args(["daemon", "status"])
+        .env("STOW_DAEMON_DIR", daemon.run_dir())
+        .stdin(Stdio::null());
+    let status = finish(spawn(status), "stow daemon status");
+    assert!(
+        status.status.success(),
+        "the daemon the build started no longer answers:\n{}",
+        stderr_of(&status)
+    );
+    assert_eq!(
+        daemon.serving_pids(),
+        pids,
+        "the status request found no daemon running"
     );
 }
 

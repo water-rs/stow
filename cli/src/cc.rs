@@ -646,7 +646,10 @@ fn clone_or_copy_file(source: &std::fs::File, destination: &Path) -> std::io::Re
 ///
 /// # Errors
 /// The reason the report is refused, naming the path.
-pub fn open_reported_output(path: &Path, roots: &[PathBuf]) -> Result<std::fs::File, String> {
+pub fn open_reported_output(
+    path: &Path,
+    roots: &crate::daemon::session::invocation::OutputRoots,
+) -> Result<std::fs::File, String> {
     let file = open_without_following(path).map_err(|error| {
         format!(
             "cannot open reported C/C++ output {}: {error}",
@@ -671,21 +674,13 @@ pub fn open_reported_output(path: &Path, roots: &[PathBuf]) -> Result<std::fs::F
             path.display()
         )
     })?;
-    let under_a_root = roots
-        .iter()
-        .filter_map(|root| std::fs::canonicalize(root).ok())
-        .any(|root| real.starts_with(root));
-    if !under_a_root {
-        let roots = roots
-            .iter()
-            .map(|root| root.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "reported C/C++ output {} is outside the build's target directory ({roots})",
-            path.display()
-        ));
-    }
+    roots.admit(&real).map_err(|roots| {
+        format!(
+            "reported C/C++ output {} (resolved {}) is outside the build's target and build directories ({roots})",
+            path.display(),
+            real.display()
+        )
+    })?;
     Ok(file)
 }
 

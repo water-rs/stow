@@ -28,6 +28,7 @@ use crate::write_stdout;
 pub mod client;
 #[cfg(unix)]
 mod descriptors;
+pub mod detached;
 pub mod events;
 #[cfg(target_os = "macos")]
 pub mod launch_agent;

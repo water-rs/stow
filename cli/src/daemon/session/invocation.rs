@@ -67,23 +67,38 @@ impl OutputRoots {
     fn contain(&self, path: &Path, cwd: &Path) -> Result<(), String> {
         let real = resolve_lenient(&cwd.join(path))
             .map_err(|error| format!("cannot resolve {}: {error}", path.display()))?;
-        let under = self
-            .dirs
-            .iter()
-            .any(|dir| resolve_lenient(dir).is_ok_and(|root| real.starts_with(root)));
-        if under {
-            return Ok(());
+        self.admit(&real).map_err(|roots| {
+            format!(
+                "{} (resolved {}) is outside the build's target and build directories ({roots})",
+                path.display(),
+                real.display()
+            )
+        })
+    }
+
+    /// Whether `real` — a path already resolved through the file system,
+    /// as [`std::fs::canonicalize`] resolves one — lies under a root
+    /// resolved the same way, so two spellings of one directory compare
+    /// equal: a link and its target, a Windows short name and its long
+    /// name, a path with and without the `\\?\` prefix. Stats the file
+    /// system.
+    ///
+    /// # Errors
+    ///
+    /// The roots as resolved, for the refusal to name, each root that
+    /// cannot be resolved with its error.
+    pub fn admit(&self, real: &Path) -> Result<(), String> {
+        let mut resolved = Vec::with_capacity(self.dirs.len());
+        for dir in &self.dirs {
+            match resolve_lenient(dir) {
+                Ok(root) if real.starts_with(&root) => return Ok(()),
+                Ok(root) => resolved.push(root.display().to_string()),
+                Err(error) => {
+                    resolved.push(format!("{} (cannot resolve: {error})", dir.display()));
+                }
+            }
         }
-        let roots = self
-            .dirs
-            .iter()
-            .map(|dir| dir.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        Err(format!(
-            "{} is outside the build's target and build directories ({roots})",
-            path.display()
-        ))
+        Err(resolved.join(", "))
     }
 }
 
@@ -279,11 +294,12 @@ impl VerifiedInvocation {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::path::PathBuf;
 
     use super::{OutputRoots, VerifiedInvocation};
     use crate::daemon::wrapper::InvocationEnv;
@@ -296,7 +312,9 @@ mod tests {
 
     /// A program that records that it ran: `sentinel` exists afterwards
     /// only if something started it.
+    #[cfg(unix)]
     fn tripwire(dir: &Path, name: &str, sentinel: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
         let program = dir.join(name);
         std::fs::write(
             &program,
@@ -308,10 +326,12 @@ mod tests {
         program
     }
 
+    #[cfg(unix)]
     fn real_rustc() -> PathBuf {
         which::which("rustc").expect("the test machine has rustc on PATH")
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_builds_rustc_passes_under_any_spelling_of_the_same_file() {
         let toolchain = BuildToolchain::for_tests().await;
@@ -333,6 +353,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn another_executable_is_refused_naming_the_field_and_never_run() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -352,6 +373,7 @@ mod tests {
         assert!(!sentinel.exists(), "the refused program was started");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_workspace_wrapper_passes_only_with_the_builds_rustc_first() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -394,6 +416,7 @@ mod tests {
     /// A relative spelling is the request's own: `./rustc` names the
     /// build's rustc from the directory that holds a link to it, and
     /// names nothing from any other.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_relative_spelling_resolves_against_the_requests_cwd() {
         let toolchain = BuildToolchain::for_tests().await;
@@ -536,6 +559,74 @@ mod tests {
             )
             .await
             .unwrap_or_else(|refusal| panic!("{}: {refusal}", dir.display()));
+        }
+    }
+
+    /// A root and an out-dir that spell one directory differently — as a
+    /// caller was handed it and as the file system resolves it: a macOS
+    /// temporary directory under `/var` is `/private/var/…`, a Windows one
+    /// under an 8.3 short name such as `RUNNER~1` resolves to its long
+    /// name behind `\\?\` — are one directory, whichever side carries
+    /// which spelling.
+    #[tokio::test]
+    async fn a_root_and_an_out_dir_spelling_one_directory_differently_agree() {
+        let toolchain = BuildToolchain::for_tests().await;
+        let target = tempfile::tempdir().expect("target dir");
+        let spelled = target.path().to_path_buf();
+        let resolved = std::fs::canonicalize(&spelled).expect("resolve the target dir");
+        for (root, out_dir) in [(&spelled, &resolved), (&resolved, &spelled)] {
+            let roots = OutputRoots::new(root.clone(), None);
+            VerifiedInvocation::verify(
+                &toolchain,
+                Some(&roots),
+                OsString::from("rustc"),
+                vec![
+                    OsString::from("--out-dir"),
+                    out_dir.join("debug").join("deps").into_os_string(),
+                ],
+                &here(),
+            )
+            .await
+            .unwrap_or_else(|refusal| {
+                panic!(
+                    "root {} and out-dir {}: {refusal}",
+                    root.display(),
+                    out_dir.display()
+                )
+            });
+        }
+    }
+
+    /// A refusal names the out-dir and the roots as they resolve, which
+    /// is what the containment was decided on: a root spelled through
+    /// `..` is named by the directory it is.
+    #[tokio::test]
+    async fn a_refusal_names_the_path_and_the_roots_as_resolved() {
+        let toolchain = BuildToolchain::for_tests().await;
+        let target = tempfile::tempdir().expect("target dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        std::fs::create_dir(target.path().join("sub")).expect("create a subdirectory");
+        let roots = OutputRoots::new(target.path().join("sub").join(".."), None);
+        let refusal = VerifiedInvocation::verify(
+            &toolchain,
+            Some(&roots),
+            OsString::from("rustc"),
+            vec![
+                OsString::from("--out-dir"),
+                outside.path().as_os_str().to_owned(),
+            ],
+            &here(),
+        )
+        .await
+        .expect_err("an out-dir outside the target directory is refused")
+        .to_string();
+        for resolved in [target.path(), outside.path()] {
+            let resolved = std::fs::canonicalize(resolved).expect("resolve the directory");
+            assert!(
+                refusal.contains(&resolved.display().to_string()),
+                "the refusal does not name {}: {refusal}",
+                resolved.display()
+            );
         }
     }
 }

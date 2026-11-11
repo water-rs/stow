@@ -546,7 +546,7 @@ async fn answer_cc_compiled<H: Handler>(handler: &Arc<H>, report: CcCompiled) ->
         // The path is the wrapper's word and this process is not
         // sandboxed: the file is opened and checked as one descriptor,
         // and staged from it, so a refused path is never read.
-        let Some(roots) = handler.output_roots().map(|roots| roots.dirs().to_vec()) else {
+        let Some(roots) = handler.output_roots().cloned() else {
             return refuse_cc_output(&output_path, "the build's target directory is unknown");
         };
         let opened = {

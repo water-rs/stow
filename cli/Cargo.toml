@@ -122,5 +122,10 @@ process-wrap = { version = "10.0.1", default-features = false, features = ["std"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 stow-types.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+# The detached spawn's command-line test splits its line with the system's
+# own parser, `CommandLineToArgvW`.
+windows-sys = { version = "0.60", features = ["Win32_UI_Shell"] }
+
 [lints]
 workspace = true

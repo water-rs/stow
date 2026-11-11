@@ -571,11 +571,24 @@ pub fn require_cargo_home() -> stow_types::error::Result<PathBuf> {
 }
 
 /// [`cargo_home`] with the environment injected, so a caller — or a test —
-/// answers `CARGO_HOME` from its own lookup instead of the process's.
+/// answers `CARGO_HOME`, and the home directory it falls back to, from its
+/// own lookup instead of the process's.
 pub fn cargo_home_with(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
     env("CARGO_HOME")
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".cargo")))
+        .or_else(|| home_dir_with(env).map(|home| home.join(".cargo")))
+}
+
+/// The home directory the environment `env` reads names, as cargo's
+/// `home` crate resolves it: the variable it reads first (`HOME`, or
+/// `USERPROFILE` on Windows) when set and non-empty, else the account's
+/// own home directory.
+pub fn home_dir_with(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    env(variable)
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
 }
 
 fn resolve_cache_dir(file_config: Option<&StowUserConfig>) -> stow_types::error::Result<PathBuf> {
