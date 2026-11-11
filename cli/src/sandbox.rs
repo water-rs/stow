@@ -271,7 +271,8 @@ impl BuildSandbox {
             })?;
             self.audit.record(&denials)?;
         }
-        status
+        let status = status?;
+        unexecutable_cargo(command, status).map_or(Ok(status), Err)
     }
 }
 
@@ -574,7 +575,7 @@ async fn run<N: heel::NetworkPolicy>(
 /// unresolvable cargo home.
 pub fn stow_identity() -> stow_types::error::Result<Identity> {
     let mut persistent: Vec<(PathBuf, Access)> = Vec::new();
-    if let Some(home) = rustup_home().filter(|home| home.is_dir()) {
+    if let Some(home) = rustup_home() {
         persistent.push((home, Access::READ | Access::EXEC));
     }
     let cargo_home = crate::config::require_cargo_home()?;
@@ -703,9 +704,7 @@ async fn toolchain_grants(
             "the rustup proxy shims `cargo`/`rustc` when PATH leads there",
         ));
     }
-    if let Some(home) = rustup_home
-        && home.exists()
-    {
+    if let Some(home) = rustup_home {
         grants.push((
             home.to_path_buf(),
             Access::READ | Access::EXEC,
@@ -1424,11 +1423,45 @@ fn fetch_args(cargo_args: &[OsString]) -> Vec<OsString> {
 }
 
 /// The rustup home as cargo's toolchain resolution sees it:
-/// `RUSTUP_HOME` when set, else `~/.rustup`.
+/// `RUSTUP_HOME` when set, else `~/.rustup`. A directory that does not
+/// exist is `None`: neither a grant nor an exported variable may name a
+/// rustup home the host does not have, because an exported one overrides
+/// the default a launcher script sets for itself.
 fn rustup_home() -> Option<PathBuf> {
     std::env::var_os("RUSTUP_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".rustup")))
+        .filter(|home| home.is_dir())
+}
+
+/// The exit status a shell gives a program it found but could not execute.
+const CANNOT_EXECUTE: i32 = 126;
+
+/// The error for a sandboxed cargo that ended with [`CANNOT_EXECUTE`]:
+/// the `cargo` on `PATH` is found, so what it executes — a launcher
+/// script's rustup proxy, a toolchain outside the granted trees — is what
+/// the sandbox refused. stow does not discover what a launcher executes;
+/// the user names the real toolchain. `None` for any other status, and
+/// for `cargo run`, which ends with the program's own status — any number.
+/// Read once cargo has ended, so a build that starts normally pays nothing.
+fn unexecutable_cargo(
+    command: &SandboxedCommand,
+    status: std::process::ExitStatus,
+) -> Option<stow_types::error::Error> {
+    if status.code() != Some(CANNOT_EXECUTE)
+        || command.args.first().is_some_and(|action| action == "run")
+    {
+        return None;
+    }
+    let cargo = resolve_executable(OsStr::new("cargo"))
+        .map_or_else(|| "cargo".to_owned(), |path| path.display().to_string());
+    Some(stow_types::stow_error!(
+        "the sandbox refused what `{cargo}` executes: the sandboxed cargo exited {CANNOT_EXECUTE}, \
+         the status of a program that was found but could not be run. `{cargo}` is the cargo PATH \
+         resolves; if it is a launcher script or a proxy, the toolchain it runs lies outside the \
+         paths the sandbox grants. Name the real toolchain with `RUSTUP_HOME` and `PATH` \
+         (`PATH=<toolchain bin>:$PATH RUSTUP_HOME=<rustup home>`)"
+    ))
 }
 
 /// The variables the sandboxed toolchain needs spelled out, not passed
@@ -1449,7 +1482,7 @@ pub fn toolchain_envs() -> stow_types::error::Result<Vec<(OsString, OsString)>> 
         OsString::from("CARGO_HOME"),
         crate::config::require_cargo_home()?.into_os_string(),
     )];
-    if let Some(home) = rustup_home().filter(|home| home.is_dir()) {
+    if let Some(home) = rustup_home() {
         envs.push((OsString::from("RUSTUP_HOME"), home.into_os_string()));
     }
     #[cfg(windows)]

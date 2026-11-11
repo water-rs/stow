@@ -443,6 +443,11 @@ fn turn_cache_off(env: &ProbeEnv) {
 }
 
 fn run_build(env: &ProbeEnv, args: &[&str]) -> std::process::Output {
+    run_build_on_path(env, args, None)
+}
+
+/// [`run_build`] with `PATH` replaced by `path` when given.
+fn run_build_on_path(env: &ProbeEnv, args: &[&str], path: Option<&str>) -> std::process::Output {
     let rustup_home = std::env::var("RUSTUP_HOME")
         .ok()
         .or_else(|| {
@@ -457,6 +462,9 @@ fn run_build(env: &ProbeEnv, args: &[&str]) -> std::process::Output {
     ];
     if let Some(home) = rustup_home {
         extra.push(("RUSTUP_HOME", home));
+    }
+    if let Some(path) = path {
+        extra.push(("PATH", path.to_owned()));
     }
     let extra: Vec<(&str, &str)> = extra
         .iter()
@@ -831,5 +839,132 @@ fn an_unknown_level_fails() {
     assert!(
         stderr.contains("loose") && stderr.contains("protect"),
         "the error should name the bad value and the valid levels:\n{stderr}"
+    );
+}
+
+/// A `cargo` launcher script on `PATH`, in front of a copy of the real
+/// `cargo` proxy kept in a directory no sandbox grant covers: the layout
+/// of a host whose `/usr/local/bin/cargo` execs a rustup proxy elsewhere
+/// (stow#1441).
+#[cfg(target_os = "linux")]
+struct LauncherToolchain {
+    launcher_dir: tempfile::TempDir,
+    proxy_dir: tempfile::TempDir,
+}
+
+#[cfg(target_os = "linux")]
+impl LauncherToolchain {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = std::env::var_os("PATH").expect("PATH");
+        let real_cargo = std::env::split_paths(&path)
+            .map(|dir| dir.join("cargo"))
+            .find(|candidate| candidate.is_file())
+            .expect("a cargo on PATH");
+        // The copy has to be the toolchain's own entry point: a host whose
+        // `cargo` is already a launcher script would only copy the script.
+        let magic = std::fs::read(&real_cargo).expect("read the cargo on PATH");
+        assert!(
+            magic.starts_with(b"\x7fELF"),
+            "{} is not a native executable; run this test with the real cargo first on PATH",
+            real_cargo.display()
+        );
+        let proxy_dir = tempfile::tempdir().expect("proxy dir");
+        // A copy, not a link: the sandbox checks the path that is executed,
+        // and a link would execute the real file in the user's toolchain.
+        std::fs::copy(&real_cargo, proxy_dir.path().join("cargo")).expect("copy the cargo proxy");
+        let launcher_dir = tempfile::tempdir().expect("launcher dir");
+        let launcher = launcher_dir.path().join("cargo");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nexec {} \"$@\"\n",
+                proxy_dir.path().join("cargo").display()
+            ),
+        )
+        .expect("write the launcher");
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+            .expect("make the launcher executable");
+        Self {
+            launcher_dir,
+            proxy_dir,
+        }
+    }
+}
+
+/// The inherited `PATH` behind the given directories.
+#[cfg(target_os = "linux")]
+fn path_after(dirs: &[&Path]) -> String {
+    let inherited = std::env::var_os("PATH").expect("PATH");
+    std::env::join_paths(
+        dirs.iter()
+            .map(|dir| dir.to_path_buf())
+            .chain(std::env::split_paths(&inherited)),
+    )
+    .expect("join PATH")
+    .into_string()
+    .expect("UTF-8 PATH")
+}
+
+/// The default sandbox cannot execute what a launcher `cargo` runs when
+/// that lies outside the granted trees, and stow says so — naming the
+/// `cargo` it resolved and what to set — instead of leaving the shell's
+/// bare "Permission denied" (stow#1441).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launcher_cargo_the_sandbox_cannot_execute_is_reported() {
+    let env = probe_env(false, "127.0.0.1:9");
+    std::fs::write(
+        env.dir
+            .join("deps")
+            .join("sandbox-probe")
+            .join("probe.conf"),
+        "probes=\n",
+    )
+    .expect("inert probe conf");
+    let toolchain = LauncherToolchain::new();
+    let path = path_after(&[toolchain.launcher_dir.path()]);
+    let output = run_build_on_path(&env, &["build", "--offline"], Some(&path));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a build whose cargo the sandbox cannot execute succeeded:\n{stderr}"
+    );
+    let launcher = toolchain.launcher_dir.path().join("cargo");
+    for needle in [
+        "the sandbox refused what",
+        &launcher.display().to_string(),
+        "RUSTUP_HOME",
+        "PATH",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "`{needle}` missing from the failure:\n{stderr}"
+        );
+    }
+}
+
+/// Naming the real toolchain on `PATH` — the directory the launcher
+/// execs — makes the same build pass: the sandbox grants the directory
+/// `PATH` resolves `cargo` from (stow#1441).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_toolchain_named_on_path_builds_where_its_launcher_could_not() {
+    let env = probe_env(false, "127.0.0.1:9");
+    std::fs::write(
+        env.dir
+            .join("deps")
+            .join("sandbox-probe")
+            .join("probe.conf"),
+        "probes=\n",
+    )
+    .expect("inert probe conf");
+    let toolchain = LauncherToolchain::new();
+    let path = path_after(&[toolchain.proxy_dir.path(), toolchain.launcher_dir.path()]);
+    let output = run_build_on_path(&env, &["build", "--offline"], Some(&path));
+    assert!(
+        output.status.success(),
+        "the build with the toolchain named on PATH failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
