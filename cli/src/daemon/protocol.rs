@@ -344,7 +344,7 @@ mod tests {
             OutputRoots::new("/workspace/target".into(), None),
             RefusalPolicy::FailBuild,
         );
-        facts.environ = vec![
+        facts.build.environ = vec![
             (OsString::from("RUST_LOG"), OsString::from("stow_cli=debug")),
             #[cfg(unix)]
             (OsString::from("RAW"), {
@@ -352,7 +352,7 @@ mod tests {
                 OsString::from_vec(vec![b'a', 0xff, b'b'])
             }),
         ];
-        facts.rustc_extra_args = vec!["--remap-path-prefix=/workspace=.".to_owned()];
+        facts.build.rustc_extra_args = vec!["--remap-path-prefix=/workspace=.".to_owned()];
 
         let wire = encode(&ControlRequest::OpenSession(Box::new(facts.clone()))).expect("encode");
         let frame = read_frame(&mut wire.as_slice()).expect("frame");
@@ -366,8 +366,8 @@ mod tests {
             serde_json::to_value(&*decoded).expect("decoded facts"),
             serde_json::to_value(&facts).expect("original facts"),
         );
-        assert_eq!(decoded.environ, facts.environ);
-        assert_eq!(decoded.rustc_extra_args, facts.rustc_extra_args);
+        assert_eq!(decoded.build.environ, facts.build.environ);
+        assert_eq!(decoded.build.rustc_extra_args, facts.build.rustc_extra_args);
     }
 
     #[test]

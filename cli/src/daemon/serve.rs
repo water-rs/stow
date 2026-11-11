@@ -356,6 +356,7 @@ where
 fn interest_of(facts: &SessionFacts) -> LogInterest {
     let var = |name: &str| {
         facts
+            .build
             .environ
             .iter()
             .find(|(key, _)| stow_types::env_name::eq(key, name))
@@ -382,7 +383,7 @@ where
     // The route exists before the session's tasks do, so none of their
     // events is recorded without one.
     let mut events = daemon.logs.register(id, interest_of(&facts));
-    let handles = match &facts.config {
+    let handles = match &facts.build.config {
         Some(config) => daemon.table.handles_for(config.cache_dir.clone()).await,
         None => CacheDirHandles::default(),
     };

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use stow_types::error::{Context, Result};
 use tracing::Instrument as _;
 
-pub use facts::{Seed, SessionFacts};
+pub use facts::{BuildFacts, DriverFacts, Seed, SessionFacts};
 pub use id::{SessionDir, SessionId};
 pub use resources::{CacheDirHandles, Resources};
 
@@ -99,19 +99,16 @@ impl Session {
         sessions: &Path,
     ) -> Result<Arc<Self>> {
         let span = tracing::info_span!(crate::daemon::events::SESSION_SPAN, session = %id);
-        let env = SessionEnv::new(facts.environ.clone(), facts.cwd.clone());
-        let toolchain = BuildToolchain::from_facts(facts.toolchain.clone(), &env)
+        let build = &facts.build;
+        let env = SessionEnv::new(build.environ.clone(), build.cwd.clone());
+        let toolchain = BuildToolchain::from_facts(build.toolchain.clone(), &env)
             .await
             .map(Arc::new)
             .map_err(stow_types::error::Error::msg)
             .wrap_err("reopen the build's toolchain")?;
         let dir = SessionDir::create(sessions, id)?;
-        let mut config = facts.config.clone();
-        if let Some(config) = &mut config {
-            handles.install(config);
-            scope_identity_trace(config, id);
-        }
-        let seed = &facts.seed;
+        let config = session_config(build, handles, id);
+        let seed = &facts.driver.seed;
         let has_policy = seed.cache_policy_entries.is_some();
         let (allow_writer, allowed) = seed.cache_policy_entries.as_ref().map_or_else(
             || (None, None),
@@ -145,8 +142,8 @@ impl Session {
             // off the cache.
             marks_dir: Some(dir.path().to_owned()),
             allowed,
-            public_cache_target: Some(facts.project.target.clone()),
-            public_cache_disabled: facts.public_cache_disabled,
+            public_cache_target: build.public_cache_target.clone(),
+            public_cache_disabled: build.public_cache_disabled,
             cache: config
                 .as_ref()
                 .map_or_else(crate::config::CacheLayers::default, |config| config.cache),
@@ -155,7 +152,7 @@ impl Session {
             serve_map_ready: Arc::clone(&serve_map_ready),
             policy_ready: Arc::clone(&policy_ready),
             in_flight,
-            registry_sources: std::sync::OnceLock::from(facts.registry_sources.clone()),
+            registry_sources: std::sync::OnceLock::from(build.registry_sources.clone()),
         };
         let env_cache = WrapperEnvCache::for_session(config.clone(), toolchain);
         let enrichment = if seed.deferred
@@ -168,7 +165,7 @@ impl Session {
             Some(crate::cargo_cmd::spawn_build_enrichment(
                 span.clone(),
                 crate::cargo_cmd::BuildEnrichment {
-                    project: facts.project.clone(),
+                    project: facts.driver.project.clone(),
                     env,
                     config,
                     circuit: env_cache.circuit.clone(),
@@ -302,16 +299,20 @@ impl Session {
     /// did. They land in the same journal a plain-cargo wrapper writes;
     /// only a build that reaches the network has anything to admit.
     fn write_journal(&self) -> bool {
-        let Some(config) = &self.facts.config else {
+        let Some(config) = &self.facts.build.config else {
             return false;
         };
         if !config.cache.reaches_network() {
             return false;
         }
-        let facts = &self.facts.project;
-        let env = SessionEnv::new(self.facts.environ.clone(), self.facts.cwd.clone());
+        let facts = &self.facts.driver.project;
+        let env = SessionEnv::new(
+            self.facts.build.environ.clone(),
+            self.facts.build.cwd.clone(),
+        );
         let target_dir = self
             .facts
+            .build
             .roots
             .dirs()
             .first()
@@ -345,14 +346,14 @@ impl Session {
         let observations = self.observations();
         miss_journal::journal_session(
             self.id,
-            &self.facts.build_rustc,
+            &self.facts.driver.build_rustc,
             &consumer,
             &observations,
             target_dir,
             &expanded_cache_key,
-            &self.facts.seed.inexact_entries,
+            &self.facts.driver.seed.inexact_entries,
         );
-        !(observations.is_empty() && self.facts.seed.inexact_entries.is_empty())
+        !(observations.is_empty() && self.facts.driver.seed.inexact_entries.is_empty())
     }
 
     /// The build's registry of units whose bookkeeping has not finished.
@@ -513,7 +514,7 @@ impl Handler for Session {
     }
 
     fn output_roots(self: &Arc<Self>) -> Option<&crate::daemon::session::invocation::OutputRoots> {
-        Some(&self.facts.roots)
+        Some(&self.facts.build.roots)
     }
 
     fn plan_args(
@@ -526,6 +527,7 @@ impl Handler for Session {
         // sources — env or config — keep their cargo semantics.
         args.extend(
             self.facts
+                .build
                 .rustc_extra_args
                 .iter()
                 .map(std::ffi::OsString::from),
@@ -602,7 +604,7 @@ impl Handler for Session {
     }
 
     fn refusal_policy(self: &Arc<Self>) -> crate::daemon::session::invocation::RefusalPolicy {
-        self.facts.refusal_policy
+        self.facts.build.refusal_policy
     }
 
     fn refused(self: &Arc<Self>, refusal: Refusal) {
@@ -659,13 +661,21 @@ fn arm_or_settle_serve_map_ready(
     }
 }
 
-/// Point `config`'s identity trace at a directory of session `id`'s own.
-/// One daemon serves many builds, so its pid cannot tell their identity
-/// records apart.
-fn scope_identity_trace(config: &mut StowConfig, id: SessionId) {
+/// The build's config as session `id` runs it: on the cache directory's
+/// shared handles, and with its identity trace pointed at a directory of
+/// the session's own. One daemon serves many builds, so its pid cannot
+/// tell their identity records apart.
+fn session_config(
+    build: &BuildFacts,
+    handles: &CacheDirHandles,
+    id: SessionId,
+) -> Option<StowConfig> {
+    let mut config = build.config.clone()?;
+    handles.install(&mut config);
     if let Some(trace) = &mut config.switches.identity_trace {
         trace.push(id.to_string());
     }
+    Some(config)
 }
 
 /// The policy gate's readiness latch for this build: pending only while a
@@ -766,10 +776,10 @@ mod tests {
             OutputRoots::new(target.to_owned(), None),
             RefusalPolicy::FailBuild,
         );
-        facts.config = config;
-        facts.rustc_extra_args =
+        facts.build.config = config;
+        facts.build.rustc_extra_args =
             vec!["--remap-path-prefix=/workspace=stow-ci://workspace".to_owned()];
-        facts.seed.serve_map = Some(crate::facade::ServeMap {
+        facts.driver.seed.serve_map = Some(crate::facade::ServeMap {
             target: vec![("covered".to_owned(), "*".to_owned())],
             host: Vec::new(),
             pending: false,
@@ -821,7 +831,7 @@ mod tests {
         let target = tempfile::tempdir().expect("target directory");
         let built = facts(target.path(), None).await;
         assert!(
-            built.seed.cache_policy_entries.is_none(),
+            built.driver.seed.cache_policy_entries.is_none(),
             "the session has no cache policy"
         );
         let session = Session::open(
@@ -832,14 +842,14 @@ mod tests {
         )
         .await
         .expect("open the session");
-        let out_dir = session.facts.roots.dirs()[0].join("deps");
+        let out_dir = session.facts.build.roots.dirs()[0].join("deps");
 
         // The dependency: the serve map rules it out, so it compiles
         // locally and the session records it.
         let env = InvocationEnv::for_tests();
         let verified = VerifiedInvocation::verify(
             &session.env_cache.toolchain,
-            Some(&session.facts.roots),
+            Some(&session.facts.build.roots),
             session.env_cache.toolchain.rustc().as_os_str().to_owned(),
             uncovered_unit_hashed(&out_dir, HASH),
             &env,
@@ -877,13 +887,13 @@ mod tests {
     /// would run rustc with.
     async fn decide(session: &Arc<Session>) -> (Option<(String, bool)>, Vec<OsString>) {
         let env = InvocationEnv::for_tests();
-        let unit = uncovered_unit(&session.facts.roots.dirs()[0].join("deps"));
+        let unit = uncovered_unit(&session.facts.build.roots.dirs()[0].join("deps"));
         let args = session
             .plan_args(unit.clone(), &env)
             .expect("plan the arguments");
         let verified = VerifiedInvocation::verify(
             &session.env_cache.toolchain,
-            Some(&session.facts.roots),
+            Some(&session.facts.build.roots),
             session.env_cache.toolchain.rustc().as_os_str().to_owned(),
             unit,
             &env,

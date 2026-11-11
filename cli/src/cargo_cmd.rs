@@ -3929,31 +3929,36 @@ fn session_facts(
 ) -> stow_types::error::Result<crate::daemon::session::SessionFacts> {
     let project = plan.project;
     Ok(crate::daemon::session::SessionFacts {
-        environ: project.env.environ().to_vec(),
-        cwd: project.env.cwd().to_owned(),
-        project: project.facts.clone(),
-        toolchain: toolchain.facts(),
-        build_rustc: project.build_rustc.executable().to_owned(),
-        config: plan.config.cloned(),
-        public_cache_disabled: !plan.public_cache_mode.is_enabled(),
-        roots: resolved_output_roots(
-            &project.facts,
-            &project.env,
-            plan.cargo_args,
-            plan.current_dir,
-        )?,
-        refusal_policy: crate::daemon::session::invocation::RefusalPolicy::of_this_build(),
-        registry_sources,
-        seed: crate::daemon::session::Seed {
-            serve_map: plan.servable_units.cloned(),
-            cache_policy_entries: plan.cache_policy_entries.map(<[_]>::to_vec),
-            unit_nodes: plan.unit_nodes.cloned(),
-            prefetch_artifacts: plan.prefetch_artifacts.map(<[_]>::to_vec),
-            semantic_fallback_enabled: plan.semantic_fallback_enabled,
-            deferred: plan.deferred_analysis,
-            inexact_entries: plan.inexact_entries.unwrap_or(&[]).to_vec(),
+        build: crate::daemon::session::BuildFacts {
+            environ: project.env.environ().to_vec(),
+            cwd: project.env.cwd().to_owned(),
+            toolchain: toolchain.facts(),
+            config: plan.config.cloned(),
+            public_cache_disabled: !plan.public_cache_mode.is_enabled(),
+            public_cache_target: Some(project.facts.target.clone()),
+            roots: resolved_output_roots(
+                &project.facts,
+                &project.env,
+                plan.cargo_args,
+                plan.current_dir,
+            )?,
+            refusal_policy: crate::daemon::session::invocation::RefusalPolicy::of_this_build(),
+            registry_sources,
+            rustc_extra_args: rustc_wrapper_extra_args(plan.source_root)?,
         },
-        rustc_extra_args: rustc_wrapper_extra_args(plan.source_root)?,
+        driver: crate::daemon::session::DriverFacts {
+            project: project.facts.clone(),
+            build_rustc: project.build_rustc.executable().to_owned(),
+            seed: crate::daemon::session::Seed {
+                serve_map: plan.servable_units.cloned(),
+                cache_policy_entries: plan.cache_policy_entries.map(<[_]>::to_vec),
+                unit_nodes: plan.unit_nodes.cloned(),
+                prefetch_artifacts: plan.prefetch_artifacts.map(<[_]>::to_vec),
+                semantic_fallback_enabled: plan.semantic_fallback_enabled,
+                deferred: plan.deferred_analysis,
+                inexact_entries: plan.inexact_entries.unwrap_or(&[]).to_vec(),
+            },
+        },
     })
 }
 

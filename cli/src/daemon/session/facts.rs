@@ -1,4 +1,10 @@
-//! What a driver tells the process that decides its build's units.
+//! What a session is opened with, in two parts.
+//!
+//! [`BuildFacts`] are what any build's decisions read: its environment,
+//! toolchain, config, output roots and the rules for refusals. They hold
+//! for a session whatever opened it. [`DriverFacts`] are what a driver's
+//! own analysis settled before cargo started: the project's layout, the
+//! analysis seed and the rustc spelling the miss journal records.
 //!
 //! Plain data only: the process that runs a session has its own
 //! environment and working directory and none of the driver's handles, so
@@ -24,36 +30,53 @@ use crate::unit_node::UnitNodeTable;
 /// Everything one build's session is opened with.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionFacts {
-    /// The driver's full environment: what every process the session
+    /// What decides the build's units, whoever opened the session.
+    pub build: BuildFacts,
+    /// What the driver's own analysis settled.
+    pub driver: DriverFacts,
+}
+
+/// The facts the decisions of any build read.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BuildFacts {
+    /// The build's full environment: what every process the session
     /// starts runs with, and what bare spellings resolve through.
     pub environ: Vec<(OsString, OsString)>,
-    /// The driver's working directory.
+    /// The build's working directory.
     pub cwd: PathBuf,
-    /// The build's project: its layout, targets and rustc.
-    pub project: ProjectFacts,
     /// The build's rustc and the answers probed from it.
     pub toolchain: ToolchainFacts,
-    /// The rustc spelling the build's own cargo configuration names: what
-    /// the miss journal records for the drain to run.
-    pub build_rustc: OsString,
     /// The resolved config, run flags included. `None` for a build with no
     /// config: every unit compiles uncached.
     pub config: Option<StowConfig>,
     /// The public cache is off for this build (an unsupported toolchain, a
     /// profile the cache cannot key); local lookups still run.
     pub public_cache_disabled: bool,
+    /// The consumer target the build's wrappers fall back to for an
+    /// invocation that does not spell `--target`.
+    pub public_cache_target: Option<String>,
     /// The directories the build's compiler outputs live under.
     pub roots: OutputRoots,
     /// What a refused request does to the build.
     pub refusal_policy: RefusalPolicy,
     /// How the build tells a crates.io package from another registry's.
     pub(crate) registry_sources: crate::RegistrySources,
-    /// What the build's analysis knew before cargo started.
-    pub seed: Seed,
     /// The extra rustc arguments appended to every unit — the workspace
     /// path remap and any flags the driver selected — after the user's own
     /// rustflags sources keep their cargo semantics.
     pub rustc_extra_args: Vec<String>,
+}
+
+/// The facts only a driver has: what its pre-cargo analysis resolved.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DriverFacts {
+    /// The build's project: its layout, targets and rustc.
+    pub project: ProjectFacts,
+    /// The rustc spelling the build's own cargo configuration names: what
+    /// the miss journal records for the drain to run.
+    pub build_rustc: OsString,
+    /// What the build's analysis knew before cargo started.
+    pub seed: Seed,
 }
 
 /// The facts the driver's own analysis had settled when the session
@@ -89,33 +112,39 @@ impl SessionFacts {
         roots: OutputRoots,
         refusal_policy: RefusalPolicy,
     ) -> Self {
+        let project = ProjectFacts {
+            action: "check".to_owned(),
+            cargo_args: Vec::new(),
+            workspace_root: PathBuf::from("/workspace"),
+            current_dir: PathBuf::from("/workspace"),
+            current_dir_relative: PathBuf::new(),
+            manifest_path: PathBuf::from("/workspace/Cargo.toml"),
+            metadata_args: crate::cargo_cmd::MetadataArgs::default(),
+            target: toolchain.host_target.clone(),
+            target_given: false,
+            host_target: toolchain.host_target.clone(),
+            rustc_version: toolchain.release.clone(),
+        };
         Self {
-            environ: Vec::new(),
-            cwd: PathBuf::from("/workspace"),
-            project: ProjectFacts {
-                action: "check".to_owned(),
-                cargo_args: Vec::new(),
-                workspace_root: PathBuf::from("/workspace"),
-                current_dir: PathBuf::from("/workspace"),
-                current_dir_relative: PathBuf::new(),
-                manifest_path: PathBuf::from("/workspace/Cargo.toml"),
-                metadata_args: crate::cargo_cmd::MetadataArgs::default(),
-                target: toolchain.host_target.clone(),
-                target_given: false,
-                host_target: toolchain.host_target.clone(),
-                rustc_version: toolchain.release.clone(),
+            build: BuildFacts {
+                environ: Vec::new(),
+                cwd: PathBuf::from("/workspace"),
+                public_cache_target: Some(project.target.clone()),
+                toolchain,
+                config: None,
+                public_cache_disabled: false,
+                roots,
+                refusal_policy,
+                registry_sources: crate::RegistrySources::CargoConfig(
+                    std::iter::once("index.crates.io".to_owned()).collect(),
+                ),
+                rustc_extra_args: Vec::new(),
             },
-            toolchain,
-            build_rustc: OsString::from("rustc"),
-            config: None,
-            public_cache_disabled: false,
-            roots,
-            refusal_policy,
-            registry_sources: crate::RegistrySources::CargoConfig(
-                std::iter::once("index.crates.io".to_owned()).collect(),
-            ),
-            seed: Seed::default(),
-            rustc_extra_args: Vec::new(),
+            driver: DriverFacts {
+                project,
+                build_rustc: OsString::from("rustc"),
+                seed: Seed::default(),
+            },
         }
     }
 }
