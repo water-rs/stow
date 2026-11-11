@@ -20,9 +20,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::{SchedulerLedger, SchedulerLedgerOp};
-use crate::do_budgets::{DO_BUDGETS, LEDGER_OP_ALARM, LEDGER_OP_TASK_COMPLETE, grew};
-use crate::local_ci::LocalCiRun;
+use stow_types::api::{SchedulerLedger, SchedulerLedgerOp};
+use stow_types::do_budgets::{DO_BUDGETS, LEDGER_OP_ALARM, LEDGER_OP_TASK_COMPLETE, grew};
+use stow_types::local_ci::LocalCiRun;
 
 /// The event kinds a wave is made of, each one scheduler operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -244,9 +244,9 @@ impl ProductionWave {
     ///
     /// # Errors
     /// No lane ran, or a lane planned no task.
-    pub fn require_planned(&self) -> crate::error::Result<()> {
+    pub fn require_planned(&self) -> stow_types::error::Result<()> {
         if self.lanes.is_empty() {
-            return Err(crate::stow_error!("no production lane ran"));
+            return Err(stow_types::stow_error!("no production lane ran"));
         }
         let empty: Vec<&str> = self
             .lanes
@@ -257,7 +257,7 @@ impl ProductionWave {
         if empty.is_empty() {
             Ok(())
         } else {
-            Err(crate::stow_error!(
+            Err(stow_types::stow_error!(
                 "production lane(s) planned nothing: {}",
                 empty.join(", ")
             ))
@@ -507,9 +507,9 @@ impl PreheatCostReport {
 pub fn ledger_delta(
     earlier: &SchedulerLedger,
     later: &SchedulerLedger,
-) -> crate::error::Result<Vec<SchedulerLedgerOp>> {
+) -> stow_types::error::Result<Vec<SchedulerLedgerOp>> {
     if earlier.woken_at_ms != later.woken_at_ms {
-        return Err(crate::stow_error!(
+        return Err(stow_types::stow_error!(
             "probe ledger reloaded between two reads (graph woken at {} ms, then at {} ms) \
              with no edge restart recorded around it: every booking since its last snapshot \
              was dropped — the ledger was reset mid-run",
@@ -524,7 +524,7 @@ pub fn ledger_delta(
         .iter()
         .find(|op| op.events > 0 && !later.ops.iter().any(|later| later.op == op.op))
     {
-        return Err(crate::stow_error!(
+        return Err(stow_types::stow_error!(
             "probe ledger {} went from {} events to none: the ledger was reset mid-run",
             lost.op,
             lost.events
@@ -539,7 +539,7 @@ pub fn ledger_delta(
                 .map_or((0, 0, 0), |b| (b.events, b.rows_read, b.rows_written));
             let delta = |now: u64, then: u64, what: &str| {
                 now.checked_sub(then).ok_or_else(|| {
-                    crate::stow_error!(
+                    stow_types::stow_error!(
                         "probe ledger {} {what} went from {then} to {now}: the ledger was reset mid-run",
                         op.op
                     )
@@ -556,11 +556,14 @@ pub fn ledger_delta(
         .collect()
 }
 
-fn active_delta(earlier: &SchedulerLedger, later: &SchedulerLedger) -> crate::error::Result<u64> {
+fn active_delta(
+    earlier: &SchedulerLedger,
+    later: &SchedulerLedger,
+) -> stow_types::error::Result<u64> {
     later
         .active_ms
         .checked_sub(earlier.active_ms)
-        .ok_or_else(|| crate::stow_error!("probe activity counter moved backwards"))
+        .ok_or_else(|| stow_types::stow_error!("probe activity counter moved backwards"))
 }
 
 /// `base + delta`, per operation.
@@ -610,14 +613,14 @@ impl<'a> Timeline<'a> {
     /// # Errors
     /// The restarts are out of order or overlap, or a restart's `before`
     /// read went backwards against an earlier restart's `after`.
-    fn new(restarts: &'a [EdgeRestart]) -> crate::error::Result<Self> {
+    fn new(restarts: &'a [EdgeRestart]) -> stow_types::error::Result<Self> {
         let mut timeline = Self {
             restarts,
             carried: Vec::with_capacity(restarts.len()),
         };
         for (index, restart) in restarts.iter().enumerate() {
             if restart.after.taken_at_ms <= restart.before.taken_at_ms {
-                return Err(crate::stow_error!(
+                return Err(stow_types::stow_error!(
                     "edge restart {}: its after read ({} ms) does not follow its before read ({} ms)",
                     index + 1,
                     restart.after.taken_at_ms,
@@ -627,7 +630,7 @@ impl<'a> Timeline<'a> {
             if let Some(previous) = index.checked_sub(1).map(|previous| &restarts[previous])
                 && restart.before.taken_at_ms <= previous.after.taken_at_ms
             {
-                return Err(crate::stow_error!(
+                return Err(stow_types::stow_error!(
                     "edge restart {} began ({} ms) before restart {index} ended ({} ms)",
                     index + 1,
                     restart.before.taken_at_ms,
@@ -645,7 +648,7 @@ impl<'a> Timeline<'a> {
         &self,
         snapshot: &LedgerSnapshot,
         restarts: usize,
-    ) -> crate::error::Result<SchedulerLedger> {
+    ) -> stow_types::error::Result<SchedulerLedger> {
         let at = snapshot.taken_at_ms;
         let last = self.restarts[..restarts]
             .iter()
@@ -655,7 +658,7 @@ impl<'a> Timeline<'a> {
         };
         let restart = &self.restarts[last];
         if at < restart.after.taken_at_ms {
-            return Err(crate::stow_error!(
+            return Err(stow_types::stow_error!(
                 "a ledger read at {at} ms fell inside edge restart {} ({} → {} ms)",
                 last + 1,
                 restart.before.taken_at_ms,
@@ -672,7 +675,7 @@ impl<'a> Timeline<'a> {
     }
 
     /// `snapshot` on the continuous timeline.
-    fn snapshot(&self, snapshot: &LedgerSnapshot) -> crate::error::Result<LedgerSnapshot> {
+    fn snapshot(&self, snapshot: &LedgerSnapshot) -> stow_types::error::Result<LedgerSnapshot> {
         Ok(LedgerSnapshot {
             taken_at_ms: snapshot.taken_at_ms,
             ledger: self.carry(snapshot, self.restarts.len())?,
@@ -680,7 +683,7 @@ impl<'a> Timeline<'a> {
     }
 
     /// Every ledger read of `phase` on the continuous timeline.
-    fn phase(&self, phase: &PhaseObservations) -> crate::error::Result<PhaseObservations> {
+    fn phase(&self, phase: &PhaseObservations) -> stow_types::error::Result<PhaseObservations> {
         Ok(PhaseObservations {
             start: self.snapshot(&phase.start)?,
             rounds: phase
@@ -693,7 +696,7 @@ impl<'a> Timeline<'a> {
                         published: round.published.clone(),
                     })
                 })
-                .collect::<crate::error::Result<_>>()?,
+                .collect::<stow_types::error::Result<_>>()?,
             lanes: phase
                 .lanes
                 .iter()
@@ -704,7 +707,7 @@ impl<'a> Timeline<'a> {
                         ..lane.clone()
                     })
                 })
-                .collect::<crate::error::Result<_>>()?,
+                .collect::<stow_types::error::Result<_>>()?,
             end: self.snapshot(&phase.end)?,
         })
     }
@@ -768,7 +771,7 @@ fn kind(costs: &[KindCost], kind: EventKind) -> &KindCost {
 fn build_tasks_between(runs: &[LocalCiRun], from_ms: u64, to_ms: u64) -> u64 {
     let path = format!(
         ".github/workflows/{}",
-        crate::trusted_builder::WORKFLOW_FILE
+        stow_types::trusted_builder::WORKFLOW_FILE
     );
     runs.iter()
         .filter(|run| {
@@ -777,7 +780,10 @@ fn build_tasks_between(runs: &[LocalCiRun], from_ms: u64, to_ms: u64) -> u64 {
         .count() as u64
 }
 
-fn phase_cost(phase: &PhaseObservations, runs: &[LocalCiRun]) -> crate::error::Result<PhaseCost> {
+fn phase_cost(
+    phase: &PhaseObservations,
+    runs: &[LocalCiRun],
+) -> stow_types::error::Result<PhaseCost> {
     let ops = ledger_delta(&phase.start.ledger, &phase.end.ledger)?;
     let counted: Vec<&SchedulerLedgerOp> = ops
         .iter()
@@ -803,7 +809,10 @@ fn phase_cost(phase: &PhaseObservations, runs: &[LocalCiRun]) -> crate::error::R
     })
 }
 
-fn layers(phase: &PhaseObservations, runs: &[LocalCiRun]) -> crate::error::Result<Vec<LayerCost>> {
+fn layers(
+    phase: &PhaseObservations,
+    runs: &[LocalCiRun],
+) -> stow_types::error::Result<Vec<LayerCost>> {
     let mut previous = &phase.start;
     let mut out = Vec::with_capacity(phase.rounds.len());
     for (index, round) in phase.rounds.iter().enumerate() {
@@ -819,7 +828,10 @@ fn layers(phase: &PhaseObservations, runs: &[LocalCiRun]) -> crate::error::Resul
     Ok(out)
 }
 
-fn lane_costs(phase_name: &str, phase: &PhaseObservations) -> crate::error::Result<Vec<LaneCost>> {
+fn lane_costs(
+    phase_name: &str,
+    phase: &PhaseObservations,
+) -> stow_types::error::Result<Vec<LaneCost>> {
     phase
         .lanes
         .iter()
@@ -871,7 +883,7 @@ fn completions_check(name: &str, cost: &PhaseCost) -> Check {
 /// scheduler did not dispatch the run (stow#940): the phase's
 /// `POST /tasks/run-update` events are at most its external build runs
 /// — on the local CI, the runs seeded under
-/// [`crate::local_ci::SEEDED_RUN_OPERATOR_LOGIN`] rather than
+/// [`stow_types::local_ci::SEEDED_RUN_OPERATOR_LOGIN`] rather than
 /// dispatched through it. More means own runs' deliveries reach the
 /// scheduler again, a DO request per node the projection does not
 /// price.
@@ -884,13 +896,13 @@ fn external_run_updates_check(
     let updates = kind(&cost.kinds, EventKind::ExternalRunUpdate).events;
     let path = format!(
         ".github/workflows/{}",
-        crate::trusted_builder::WORKFLOW_FILE
+        stow_types::trusted_builder::WORKFLOW_FILE
     );
     let external = runs
         .iter()
         .filter(|run| {
             run.path == path
-                && run.triggering_actor_login == crate::local_ci::SEEDED_RUN_OPERATOR_LOGIN
+                && run.triggering_actor_login == stow_types::local_ci::SEEDED_RUN_OPERATOR_LOGIN
                 && run.dispatched_at_ms > phase.start.taken_at_ms
                 && run.dispatched_at_ms <= phase.end.taken_at_ms
         })
@@ -977,9 +989,14 @@ fn submit_growth_check(lanes: &[LaneCost]) -> Check {
     };
     let (r0, w0) = per_unit(first);
     let (r1, w1) = per_unit(last);
-    let slack = crate::do_budgets::GROWTH_TOLERANCE_ROWS * last.submit.events as f64 / units(last);
+    let slack =
+        stow_types::do_budgets::GROWTH_TOLERANCE_ROWS * last.submit.events as f64 / units(last);
     let over = |earlier: f64, later: f64| {
-        later > earlier.mul_add(1.0 + crate::do_budgets::GROWTH_TOLERANCE_FRACTION, slack)
+        later
+            > earlier.mul_add(
+                1.0 + stow_types::do_budgets::GROWTH_TOLERANCE_FRACTION,
+                slack,
+            )
     };
     check(
         name,
@@ -1241,7 +1258,7 @@ fn resubmit_clean_check(last: &ResubmitPass, passes: usize, cost: &PhaseCost) ->
 fn no_pass_rebuilt_check(observed: &WaveObservations) -> Check {
     let path = format!(
         ".github/workflows/{}",
-        crate::trusted_builder::WORKFLOW_FILE
+        stow_types::trusted_builder::WORKFLOW_FILE
     );
     let mut rebuilt = Vec::new();
     for (index, pass) in observed.resubmit.iter().enumerate() {
@@ -1275,18 +1292,18 @@ fn no_pass_rebuilt_check(observed: &WaveObservations) -> Check {
 /// # Errors
 /// A ledger snapshot went backwards between two reads, no resubmit pass
 /// was observed, or a pass that inserted nothing was followed by another.
-pub fn analyse(observed: &WaveObservations) -> crate::error::Result<PreheatCostReport> {
+pub fn analyse(observed: &WaveObservations) -> stow_types::error::Result<PreheatCostReport> {
     let nodes = observed.nodes.len() as u64;
     let mut nodes_per_target = BTreeMap::<String, u64>::new();
     for node in observed.nodes.values() {
         *nodes_per_target.entry(node.target.clone()).or_default() += 1;
     }
     let Some((last, drift)) = observed.resubmit.split_last() else {
-        return Err(crate::stow_error!("the run observed no resubmit pass"));
+        return Err(stow_types::stow_error!("the run observed no resubmit pass"));
     };
     // A pass is followed by another only because it inserted tasks.
     if let Some(index) = drift.iter().position(|pass| pass.inserted.is_empty()) {
-        return Err(crate::stow_error!(
+        return Err(stow_types::stow_error!(
             "resubmit pass {} inserted nothing but pass {} followed it",
             index + 1,
             index + 2
@@ -1317,7 +1334,7 @@ pub fn analyse(observed: &WaveObservations) -> crate::error::Result<PreheatCostR
                 tasks: phase_cost(&reads, &observed.runs)?.tasks,
             })
         })
-        .collect::<crate::error::Result<Vec<_>>>()?;
+        .collect::<stow_types::error::Result<Vec<_>>>()?;
 
     let mut checks = vec![
         resubmit_clean_check(last, observed.resubmit.len(), &resubmit),
@@ -1374,21 +1391,21 @@ mod tests {
         ProductionTask, ResubmitPass, Round, WaveObservations, analyse, count_production,
         ledger_delta,
     };
-    use crate::api::{SchedulerLedger, SchedulerLedgerOp};
-    use crate::local_ci::LocalCiRun;
+    use stow_types::api::{SchedulerLedger, SchedulerLedgerOp};
+    use stow_types::local_ci::LocalCiRun;
 
     #[test]
     fn activity_is_carried_across_restart_and_counter_regression_is_rejected() {
         let before = snapshot(
             100,
-            crate::api::SchedulerLedger {
+            stow_types::api::SchedulerLedger {
                 active_ms: 40,
                 ..Default::default()
             },
         );
         let after = snapshot(
             200,
-            crate::api::SchedulerLedger {
+            stow_types::api::SchedulerLedger {
                 active_ms: 5,
                 woken_at_ms: 200,
                 ..Default::default()
@@ -1398,7 +1415,7 @@ mod tests {
         let timeline = super::Timeline::new(&restarts).expect("restart");
         let later = snapshot(
             300,
-            crate::api::SchedulerLedger {
+            stow_types::api::SchedulerLedger {
                 active_ms: 25,
                 woken_at_ms: 200,
                 ..Default::default()
@@ -1408,7 +1425,7 @@ mod tests {
             timeline.snapshot(&later).expect("carried").ledger.active_ms,
             65
         );
-        let regressed = crate::api::SchedulerLedger {
+        let regressed = stow_types::api::SchedulerLedger {
             active_ms: 4,
             ..Default::default()
         };
@@ -2091,7 +2108,7 @@ mod tests {
     fn an_external_run_may_book_its_run_update() {
         let mut observed = with_run_updates(1);
         observed.runs[2].triggering_actor_login =
-            crate::local_ci::SEEDED_RUN_OPERATOR_LOGIN.to_owned();
+            stow_types::local_ci::SEEDED_RUN_OPERATOR_LOGIN.to_owned();
         let report = analyse(&observed).expect("analyse");
         assert!(
             !failed(&report).contains(&"Wave run updates come from external runs only"),

@@ -45,6 +45,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::preheat_cost::MeasuredReport;
+use crate::preheat_cost::report::ProductionWave;
 use clap::Args;
 use stow_types::api::SchedulerBudgetReport;
 use stow_types::do_budgets::{
@@ -54,7 +55,6 @@ use stow_types::do_budgets::{
 };
 use stow_types::forwards::{self, RunForwards};
 use stow_types::launch_model::{EventKind, LaunchModel};
-use stow_types::preheat_cost::ProductionWave;
 use stow_types::stow_error;
 
 use super::cpu::WorkerCpuReport;

@@ -2,7 +2,7 @@
 //! (stow#773). `scripts/preheat-cost.sh` drives a preheat wave through
 //! the mock stack and calls `ledger` at every boundary it measures;
 //! `report` reads what the run left in the work directory, runs
-//! [`stow_types::preheat_cost::analyse`] and writes
+//! [`report::analyse`] and writes
 //! `preheat-cost-report.json`. `production` is the other job's half:
 //! `scripts/production-wave.sh` plans the production lanes without an
 //! edge and it counts their distinct nodes into `production-wave.json`.
@@ -55,11 +55,6 @@ use keyring_core::api::CredentialStoreApi;
 use stow_types::api::{ArtifactRecord, SchedulerLedger};
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::local_ci::LocalCiTasks;
-use stow_types::preheat_cost::{
-    EdgeRestart, LaneRun, LedgerSnapshot, Node, PhaseObservations, PreheatCostReport,
-    ProductionLane, ProductionTask, ProductionWave, ResubmitPass, Round, WaveObservations, analyse,
-    count_production,
-};
 use stow_types::public_cache::UnitSide;
 use stow_types::stow_error;
 use stow_types::task_graph::TaskNodeIdentity;
@@ -69,6 +64,13 @@ use crate::projects::{ProjectsPlan, SubmitOutcome};
 use crate::render::{self, Output, Planned, Table};
 
 pub mod cpu;
+pub mod report;
+
+use report::{
+    EdgeRestart, LaneRun, LedgerSnapshot, Node, PhaseObservations, PreheatCostReport,
+    ProductionLane, ProductionTask, ProductionWave, ResubmitPass, Round, WaveObservations, analyse,
+    count_production,
+};
 
 /// Scheduler costs plus complete CPU captures for both measured phases.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
