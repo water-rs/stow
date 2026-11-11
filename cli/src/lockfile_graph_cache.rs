@@ -326,6 +326,7 @@ mod tests {
             rustc_version: "1.99.0".to_owned(),
             mold: MoldSelection::resolved(Vec::new()),
             env_base: None,
+            toolchain: crate::cargo_cmd::pending_toolchain(),
             build_rustc: crate::rustc_args::BuildRustc::ToolchainDefault,
             foreground: crate::derive_gate::ForegroundHold::detached(),
         }

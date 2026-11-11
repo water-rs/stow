@@ -19,11 +19,13 @@ use stow_types::rustc::ParsedRustcArgs;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 
+use super::invocation::{Refusal, RefusalPolicy, VerifiedInvocation};
 use super::protocol::{
     Answer, ArtifactNotifications, AwaitServeMap, CcCompiled, CcLookup, Compiled, Observed, Plan,
     Request, read_frame, write_frame,
 };
 use super::{BINARY_ENV, BinaryIdentity, ENDPOINT_ENV, Endpoint, TOKEN_ENV};
+use crate::toolchain::BuildToolchain;
 
 /// What a supervisor does with the invocations its facades send.
 ///
@@ -35,8 +37,7 @@ pub trait Handler: Send + Sync + 'static {
     /// the server, so the handler returns the decision without one.
     fn plan(
         self: &Arc<Self>,
-        executable: std::ffi::OsString,
-        args: Vec<std::ffi::OsString>,
+        invocation: VerifiedInvocation,
         env: crate::supervisor::protocol::InvocationEnv,
     ) -> impl Future<Output = Decision<Self::Pending>> + Send;
 
@@ -59,16 +60,21 @@ pub trait Handler: Send + Sync + 'static {
     /// over the transport it already carries (stow#347).
     fn await_serve_map(self: &Arc<Self>) -> impl Future<Output = ()> + Send;
 
-    /// The host triple `executable`'s rustc compiles target-less units
-    /// for — its `rustc -vV` `host:` line, probed once per executable and
-    /// memoized for the build. A locally compiling unit's recordable
-    /// outputs are named under it, so the lookup never comes back empty:
-    /// a probe that fails is an error the request reports, not a skipped
-    /// mark (stow#618).
-    fn rustc_host_target(
-        self: &Arc<Self>,
-        executable: &std::ffi::OsStr,
-    ) -> impl Future<Output = Result<String, String>> + Send;
+    /// The toolchain this build compiles with, resolved by the driver
+    /// before cargo started: the only source of every rustc fact the
+    /// supervisor uses, and what a request's executable is checked
+    /// against.
+    fn toolchain(self: &Arc<Self>) -> &Arc<BuildToolchain>;
+
+    /// What this build does with a refused request, fixed when the
+    /// handler was built.
+    fn refusal_policy(self: &Arc<Self>) -> RefusalPolicy;
+
+    /// Record a request the supervisor refused under
+    /// [`RefusalPolicy::FailBuild`], so the build fails naming the field
+    /// once cargo has exited — a one-way report has no answer to carry
+    /// the refusal. Never called under [`RefusalPolicy::CompileUncached`].
+    fn refused(self: &Arc<Self>, refusal: Refusal);
 
     /// The config whose C/C++ object cache and state database answer the
     /// C compiler wrapper — the build's own, so the wrappers never open
@@ -86,8 +92,10 @@ pub trait Handler: Send + Sync + 'static {
     }
 
     /// What the handler needs to remember between asking for a compile and
-    /// hearing that it finished.
-    type Pending: Send + 'static;
+    /// hearing that it finished. Its default is the pending of a compile
+    /// with no bookkeeping: what a refused plan is answered with under
+    /// [`RefusalPolicy::CompileUncached`].
+    type Pending: Default + Send + 'static;
 }
 
 /// A compile the facade already ran — or is about to — without a plan
@@ -95,10 +103,8 @@ pub trait Handler: Send + Sync + 'static {
 /// still owes the build.
 #[derive(Debug)]
 pub struct Observation {
-    /// The real rustc the facade ran.
-    pub executable: std::ffi::OsString,
-    /// Everything after the executable, in order.
-    pub args: Vec<std::ffi::OsString>,
+    /// The invocation the facade ran, checked against the build.
+    pub invocation: VerifiedInvocation,
     /// `None` marks the unit as compiling locally; `Some` reports how the
     /// finished compile exited.
     pub success: Option<bool>,
@@ -1005,49 +1011,87 @@ async fn answer_plan<H: Handler>(
             return Answer::Failed { message: error };
         }
     };
-    // The host names the unit's recordable outputs; an invocation the
-    // parser cannot model records nothing and never probes. A probe
-    // that fails fails the request — the mark a dependent blocks on is
-    // never skipped quietly (stow#618).
-    let recordable_paths = match ParsedRustcArgs::parse(&args) {
-        Ok(parsed) => match handler.rustc_host_target(&executable).await {
-            Ok(host) => recordable_output_paths(&parsed, &host),
-            Err(error) => {
-                return Answer::Failed {
-                    message: format!("could not probe the rustc host target: {error}"),
-                };
-            }
-        },
-        Err(_) => None,
-    };
-    match handler.plan(executable, args, plan.env).await {
-        Decision::Served(notifications) => Answer::Served(notifications),
-        Decision::Compile(pending) => {
-            let (sender, allocated) = oneshot::channel();
-            if tickets.send(Ticket::Allocate(pending, sender)).is_err() {
-                return Answer::Failed {
-                    message: "supervisor ticket task is gone".to_owned(),
-                };
-            }
-            allocated.await.map_or_else(
-                |_| Answer::Failed {
-                    message: "supervisor ticket task dropped the allocation".to_owned(),
-                },
-                |ticket| {
-                    // The facade was told to compile: the unit is in
-                    // flight until the `Compiled` report's bookkeeping —
-                    // or this connection's end — completes it (stow#618).
-                    if let Some(paths) = recordable_paths {
-                        marks.push(ConnectionMark {
-                            ticket: Some(ticket),
-                            completion: in_flight.register(paths),
-                        });
+    let invocation = match VerifiedInvocation::verify(handler.toolchain(), executable, args).await {
+        Ok(invocation) => invocation,
+        Err(refusal) => {
+            return match settle_refusal(handler, refusal, "plan request") {
+                Settled::Fail(message) => Answer::Failed { message },
+                // The facade compiles and reports back: the report finds
+                // a pending that does no bookkeeping, and no mark is
+                // registered for a unit nothing recorded.
+                Settled::CompileUncached => {
+                    match allocate_ticket(tickets, H::Pending::default()).await {
+                        Ok(ticket) => Answer::Compile { ticket },
+                        Err(failed) => failed,
                     }
-                    Answer::Compile { ticket }
-                },
-            )
+                }
+            };
         }
+    };
+    // The build's host names the unit's recordable outputs; an
+    // invocation the parser cannot model records nothing (stow#618).
+    let recordable_paths = ParsedRustcArgs::parse(invocation.args())
+        .ok()
+        .and_then(|parsed| recordable_output_paths(&parsed, handler.toolchain().host_target()));
+    match handler.plan(invocation, plan.env).await {
+        Decision::Served(notifications) => Answer::Served(notifications),
+        Decision::Compile(pending) => match allocate_ticket(tickets, pending).await {
+            Ok(ticket) => {
+                // The facade was told to compile: the unit is in
+                // flight until the `Compiled` report's bookkeeping —
+                // or this connection's end — completes it (stow#618).
+                if let Some(paths) = recordable_paths {
+                    marks.push(ConnectionMark {
+                        ticket: Some(ticket),
+                        completion: in_flight.register(paths),
+                    });
+                }
+                Answer::Compile { ticket }
+            }
+            Err(failed) => failed,
+        },
     }
+}
+
+/// What a refused request earns, decided in one place by the handler's
+/// [`RefusalPolicy`].
+enum Settled {
+    /// Answer the request with this failure.
+    Fail(String),
+    /// Take no cache action: compile uncached, or drop a one-way frame.
+    CompileUncached,
+}
+
+/// The one place a refusal is acted on: logged once at `warn` naming the
+/// field and reason, then either recorded for the build to fail on or
+/// left with no effect at all, per the handler's policy.
+fn settle_refusal<H: Handler>(handler: &Arc<H>, refusal: Refusal, request: &str) -> Settled {
+    let message = refusal.to_string();
+    tracing::warn!(%message, "refused a {request}");
+    match handler.refusal_policy() {
+        RefusalPolicy::FailBuild => {
+            handler.refused(refusal);
+            Settled::Fail(message)
+        }
+        RefusalPolicy::CompileUncached => Settled::CompileUncached,
+    }
+}
+
+/// Hand `pending` to the ticket task and return the ticket the facade's
+/// report carries back, or the failure answer when the task is gone.
+async fn allocate_ticket<P>(
+    tickets: &mpsc::UnboundedSender<Ticket<P>>,
+    pending: P,
+) -> Result<u64, Answer> {
+    let (sender, allocated) = oneshot::channel();
+    if tickets.send(Ticket::Allocate(pending, sender)).is_err() {
+        return Err(Answer::Failed {
+            message: "supervisor ticket task is gone".to_owned(),
+        });
+    }
+    allocated.await.map_err(|_| Answer::Failed {
+        message: "supervisor ticket task dropped the allocation".to_owned(),
+    })
 }
 
 async fn answer_observation<H: Handler>(
@@ -1074,9 +1118,24 @@ async fn answer_observation<H: Handler>(
         tracing::warn!("supervisor observation could not be decoded; dropped");
         return Reply::nothing();
     };
+    let invocation = match VerifiedInvocation::verify(handler.toolchain(), executable, args).await {
+        Ok(invocation) => invocation,
+        Err(refusal) => {
+            // A report is answered with the refusal and a mark has no
+            // answer, so the handler records it for the build to fail on
+            // after cargo exits. Compiling uncached, the report gets the
+            // receipt its facade waits for, with no bookkeeping behind
+            // it, and the mark is dropped. Neither touches `marks`: the
+            // refused request has no flight of its own.
+            return match settle_refusal(handler, refusal, "observation") {
+                Settled::Fail(message) if is_report => Reply::failed(message),
+                Settled::CompileUncached if is_report => Reply::answer(Answer::Received),
+                Settled::Fail(_) | Settled::CompileUncached => Reply::nothing(),
+            };
+        }
+    };
     let observation = Observation {
-        executable,
-        args,
+        invocation,
         success: observed.success,
         compile_time: Duration::from_millis(observed.compile_millis),
         env: observed.env,
@@ -1101,23 +1160,13 @@ async fn answer_observation<H: Handler>(
     }
     // The flight spans the mark frame's arrival to its report's
     // bookkeeping: registered here, before rustc starts (stow#618).
-    if let Ok(parsed) = ParsedRustcArgs::parse(&observation.args) {
-        match handler.rustc_host_target(&observation.executable).await {
-            Ok(host) => {
-                if let Some(paths) = recordable_output_paths(&parsed, &host) {
-                    marks.push(ConnectionMark {
-                        ticket: None,
-                        completion: in_flight.register(paths),
-                    });
-                }
-            }
-            // The frame is one-way, so the probe's failure is
-            // reported in the build's log rather than answered;
-            // the observation itself still reaches the handler.
-            Err(error) => {
-                tracing::warn!(%error, "supervisor could not probe the rustc host target, registering no in-flight mark");
-            }
-        }
+    if let Ok(parsed) = ParsedRustcArgs::parse(observation.invocation.args())
+        && let Some(paths) = recordable_output_paths(&parsed, handler.toolchain().host_target())
+    {
+        marks.push(ConnectionMark {
+            ticket: None,
+            completion: in_flight.register(paths),
+        });
     }
     handler.observed(observation).await;
     Reply::nothing()
@@ -1176,7 +1225,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use super::{Decision, Handler, start};
+    use super::{
+        BuildToolchain, Decision, Handler, Refusal, RefusalPolicy, VerifiedInvocation, start,
+    };
     use crate::supervisor::client::{Connection, Decision as ClientDecision};
     use crate::supervisor::protocol::ArtifactNotifications;
 
@@ -1190,6 +1241,30 @@ mod tests {
     /// compile otherwise, and counts the reports it receives.
     struct Stub {
         reports: AtomicUsize,
+        /// Every call that reached the handler's own decision or
+        /// bookkeeping: what a refused request must not add to.
+        plans: AtomicUsize,
+        observations: AtomicUsize,
+        policy: RefusalPolicy,
+        toolchain: Arc<BuildToolchain>,
+        refusals: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Stub {
+        async fn new() -> Arc<Self> {
+            Self::with_policy(RefusalPolicy::FailBuild).await
+        }
+
+        async fn with_policy(policy: RefusalPolicy) -> Arc<Self> {
+            Arc::new(Self {
+                reports: AtomicUsize::new(0),
+                plans: AtomicUsize::new(0),
+                observations: AtomicUsize::new(0),
+                policy,
+                toolchain: BuildToolchain::for_tests().await,
+                refusals: std::sync::Mutex::default(),
+            })
+        }
     }
 
     impl Handler for Stub {
@@ -1197,10 +1272,11 @@ mod tests {
 
         fn plan(
             self: &Arc<Self>,
-            _executable: OsString,
-            args: Vec<OsString>,
+            invocation: VerifiedInvocation,
             _env: crate::supervisor::protocol::InvocationEnv,
         ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
+            self.plans.fetch_add(1, Ordering::SeqCst);
+            let args = invocation.into_args();
             std::future::ready(if args.first().is_some_and(|arg| arg == "--serve-me") {
                 Decision::Served(ArtifactNotifications::default())
             } else {
@@ -1224,6 +1300,7 @@ mod tests {
             self: &Arc<Self>,
             _observation: super::Observation,
         ) -> impl std::future::Future<Output = ()> + Send {
+            self.observations.fetch_add(1, Ordering::SeqCst);
             std::future::ready(())
         }
 
@@ -1231,11 +1308,19 @@ mod tests {
             std::future::ready(())
         }
 
-        fn rustc_host_target(
-            self: &Arc<Self>,
-            _executable: &std::ffi::OsStr,
-        ) -> impl std::future::Future<Output = Result<String, String>> + Send {
-            std::future::ready(Ok("aarch64-apple-darwin".to_owned()))
+        fn toolchain(self: &Arc<Self>) -> &Arc<BuildToolchain> {
+            &self.toolchain
+        }
+
+        fn refusal_policy(self: &Arc<Self>) -> RefusalPolicy {
+            self.policy
+        }
+
+        fn refused(self: &Arc<Self>, refusal: Refusal) {
+            self.refusals
+                .lock()
+                .expect("refusals mutex")
+                .push(refusal.to_string());
         }
     }
 
@@ -1246,9 +1331,7 @@ mod tests {
     /// side of the wire changes without the other.
     #[tokio::test]
     async fn a_facade_plans_and_reports_over_the_wire() {
-        let handler = Arc::new(Stub {
-            reports: AtomicUsize::new(0),
-        });
+        let handler = Stub::new().await;
         let mut supervisor = start(
             Arc::clone(&handler),
             super::InFlightUnits::default(),
@@ -1263,7 +1346,7 @@ mod tests {
             .expect("connect to the supervisor");
         let decision = connection
             .plan(
-                std::ffi::OsStr::new("/usr/bin/rustc"),
+                std::ffi::OsStr::new("rustc"),
                 &[OsString::from("--crate-name"), OsString::from("serde")],
             )
             .await
@@ -1305,73 +1388,78 @@ mod tests {
         (answer, std::time::Instant::now())
     }
 
+    /// Answers the serve-map wait once `ready` turns true, and reports on
+    /// `parked` the moment a wait has subscribed to it — the point from
+    /// which the answer can only come from the release.
+    struct Gated {
+        ready: tokio::sync::watch::Receiver<bool>,
+        parked: tokio::sync::mpsc::UnboundedSender<()>,
+        toolchain: Arc<BuildToolchain>,
+    }
+
+    impl Handler for Gated {
+        type Pending = OsString;
+
+        fn plan(
+            self: &Arc<Self>,
+            _invocation: VerifiedInvocation,
+            _env: crate::supervisor::protocol::InvocationEnv,
+        ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
+            std::future::ready(Decision::Served(ArtifactNotifications::default()))
+        }
+
+        fn compiled(
+            self: &Arc<Self>,
+            _pending: Self::Pending,
+            _success: bool,
+            _compile_time: Duration,
+        ) -> impl std::future::Future<Output = ()> + Send {
+            std::future::ready(())
+        }
+
+        fn observed(
+            self: &Arc<Self>,
+            _observation: super::Observation,
+        ) -> impl std::future::Future<Output = ()> + Send {
+            std::future::ready(())
+        }
+
+        fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
+            let mut ready = self.ready.clone();
+            let parked = self.parked.clone();
+            async move {
+                if !*ready.borrow() {
+                    parked.send(()).expect("report the park");
+                    let _ = ready.changed().await;
+                }
+            }
+        }
+
+        fn toolchain(self: &Arc<Self>) -> &Arc<BuildToolchain> {
+            &self.toolchain
+        }
+
+        fn refusal_policy(self: &Arc<Self>) -> RefusalPolicy {
+            RefusalPolicy::FailBuild
+        }
+
+        fn refused(self: &Arc<Self>, _refusal: Refusal) {}
+    }
+
     /// The serve-map wait rides the loopback transport the Windows
     /// build uses: the handler's word releases the answer, so a facade
     /// blocked on it hears the final map land and nothing else
     /// (stow#347).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_serve_map_wait_answers_when_the_map_is_final() {
-        use std::time::{Duration, Instant};
-
-        /// Answers the wait once `ready` turns true, and reports on
-        /// `parked` the moment a wait has subscribed to it — the point
-        /// from which the answer can only come from the release.
-        struct Gated {
-            ready: tokio::sync::watch::Receiver<bool>,
-            parked: tokio::sync::mpsc::UnboundedSender<()>,
-        }
-        impl Handler for Gated {
-            type Pending = OsString;
-
-            fn plan(
-                self: &Arc<Self>,
-                _executable: OsString,
-                _args: Vec<OsString>,
-                _env: crate::supervisor::protocol::InvocationEnv,
-            ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
-                std::future::ready(Decision::Served(ArtifactNotifications::default()))
-            }
-
-            fn compiled(
-                self: &Arc<Self>,
-                _pending: Self::Pending,
-                _success: bool,
-                _compile_time: Duration,
-            ) -> impl std::future::Future<Output = ()> + Send {
-                std::future::ready(())
-            }
-
-            fn observed(
-                self: &Arc<Self>,
-                _observation: super::Observation,
-            ) -> impl std::future::Future<Output = ()> + Send {
-                std::future::ready(())
-            }
-
-            fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
-                let mut ready = self.ready.clone();
-                let parked = self.parked.clone();
-                async move {
-                    if !*ready.borrow() {
-                        parked.send(()).expect("report the park");
-                        let _ = ready.changed().await;
-                    }
-                }
-            }
-
-            fn rustc_host_target(
-                self: &Arc<Self>,
-                _executable: &std::ffi::OsStr,
-            ) -> impl std::future::Future<Output = Result<String, String>> + Send {
-                std::future::ready(Ok("aarch64-apple-darwin".to_owned()))
-            }
-        }
+        use std::time::Instant;
 
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
         let (parked_tx, mut parked_rx) = tokio::sync::mpsc::unbounded_channel();
         let handler = Arc::new(Gated {
             ready: ready_rx,
             parked: parked_tx,
+            toolchain: BuildToolchain::for_tests().await,
         });
         let (tickets, ticket_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::task::spawn(super::run_tickets(ticket_rx));
@@ -1430,9 +1518,7 @@ mod tests {
     /// A served unit never runs rustc, so it never reports.
     #[tokio::test]
     async fn a_served_unit_ends_the_exchange() {
-        let handler = Arc::new(Stub {
-            reports: AtomicUsize::new(0),
-        });
+        let handler = Stub::new().await;
         let supervisor = start(
             Arc::clone(&handler),
             super::InFlightUnits::default(),
@@ -1447,7 +1533,7 @@ mod tests {
             .expect("connect to the supervisor");
         let decision = connection
             .plan(
-                std::ffi::OsStr::new("/usr/bin/rustc"),
+                std::ffi::OsStr::new("rustc"),
                 &[OsString::from("--serve-me")],
             )
             .await
@@ -1460,9 +1546,7 @@ mod tests {
     /// frame carrying the wrong one is refused rather than answered.
     #[tokio::test]
     async fn a_wrong_token_is_refused() {
-        let handler = Arc::new(Stub {
-            reports: AtomicUsize::new(0),
-        });
+        let handler = Stub::new().await;
         let supervisor = start(handler, super::InFlightUnits::default(), &test_executable())
             .expect("start the supervisor");
         let [(_, endpoint), ..] = supervisor.env();
@@ -1472,10 +1556,185 @@ mod tests {
             .await
             .expect("connect to the supervisor");
         let error = connection
-            .plan(std::ffi::OsStr::new("/usr/bin/rustc"), &[])
+            .plan(std::ffi::OsStr::new("rustc"), &[])
             .await
             .expect_err("a wrong token must be refused");
         assert!(error.contains("token mismatch"), "{error}");
+    }
+
+    /// A request naming a program that is not the build's rustc is
+    /// refused naming the field on every path that carries an
+    /// executable — the request/answer plan, and the one-way mark and
+    /// the answered report of an observation — and the program is never
+    /// started: the tripwire would leave its sentinel behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_request_naming_another_executable_is_refused_and_never_run() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::supervisor::protocol::{Answer, InvocationEnv, Observed, Request};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sentinel = dir.path().join("ran");
+        let other = dir.path().join("rustc");
+        std::fs::write(
+            &other,
+            format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+        )
+        .expect("write the tripwire");
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod the tripwire");
+
+        let handler = Stub::new().await;
+        let mut supervisor = start(
+            Arc::clone(&handler),
+            super::InFlightUnits::default(),
+            &test_executable(),
+        )
+        .expect("start the supervisor");
+        let [(_, endpoint), (_, token), _] = supervisor.env();
+        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+
+        let mut connection = Connection::open(&endpoint, token.clone())
+            .await
+            .expect("connect to the supervisor");
+        let error = connection
+            .plan(other.as_os_str(), &[])
+            .await
+            .expect_err("a plan naming another executable is refused");
+        assert!(error.contains("executable"), "{error}");
+
+        let mut stream = connect_raw(&endpoint).await;
+        let observed = |success| {
+            Request::Observed(Observed::new(
+                token.clone(),
+                other.as_os_str(),
+                &[],
+                success,
+                0,
+                InvocationEnv::default(),
+            ))
+        };
+        super::write_frame(&mut stream, &observed(None))
+            .await
+            .expect("write the mark");
+        super::write_frame(&mut stream, &observed(Some(true)))
+            .await
+            .expect("write the report");
+        let Some(Answer::Failed { message }) = super::read_frame(&mut stream)
+            .await
+            .expect("read the report's answer")
+        else {
+            panic!("a report naming another executable is answered with a failure");
+        };
+        assert!(message.contains("executable"), "{message}");
+
+        assert!(!sentinel.exists(), "the refused program was started");
+        assert_eq!(
+            handler.refusals.lock().expect("refusals mutex").len(),
+            3,
+            "the plan, the mark and the report are each recorded"
+        );
+        drop(stream);
+        drop(connection);
+        supervisor.shutdown().await;
+    }
+
+    /// Under `CompileUncached` a refused request takes no cache action
+    /// on any path: the plan is answered with a compile whose report
+    /// carries no bookkeeping, the mark is dropped and the report is
+    /// received — and the program is never started, the handler never
+    /// asked to decide or record, and no refusal is left to fail the
+    /// build on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_request_compiles_uncached_and_takes_no_cache_action() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::supervisor::protocol::{Answer, InvocationEnv, Observed, Request};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sentinel = dir.path().join("ran");
+        let other = dir.path().join("rustc");
+        std::fs::write(
+            &other,
+            format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+        )
+        .expect("write the tripwire");
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod the tripwire");
+
+        let handler = Stub::with_policy(RefusalPolicy::CompileUncached).await;
+        let mut supervisor = start(
+            Arc::clone(&handler),
+            super::InFlightUnits::default(),
+            &test_executable(),
+        )
+        .expect("start the supervisor");
+        let [(_, endpoint), (_, token), _] = supervisor.env();
+        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+
+        // The plan: told to compile, and the report that follows is
+        // received.
+        let mut connection = Connection::open(&endpoint, token.clone())
+            .await
+            .expect("connect to the supervisor");
+        let decision = connection
+            .plan(other.as_os_str(), &[])
+            .await
+            .expect("a refused plan is answered with a compile");
+        let ClientDecision::Compile(ticket) = decision else {
+            panic!("a refused plan is answered with a compile, never served");
+        };
+        connection
+            .report(&ticket, true, Duration::ZERO)
+            .await
+            .expect("the compile's report is received");
+        connection.close().await.expect("close");
+
+        // The one-way mark is dropped and the report is received.
+        let mut stream = connect_raw(&endpoint).await;
+        let observed = |success| {
+            Request::Observed(Observed::new(
+                token.clone(),
+                other.as_os_str(),
+                &[],
+                success,
+                0,
+                InvocationEnv::default(),
+            ))
+        };
+        super::write_frame(&mut stream, &observed(None))
+            .await
+            .expect("write the mark");
+        super::write_frame(&mut stream, &observed(Some(true)))
+            .await
+            .expect("write the report");
+        let answer: Option<Answer> = super::read_frame(&mut stream)
+            .await
+            .expect("read the report's answer");
+        assert!(
+            matches!(answer, Some(Answer::Received)),
+            "a refused report is received: {answer:?}"
+        );
+        drop(stream);
+        assert_eq!(supervisor.shutdown().await, 0, "the drain finishes cleanly");
+
+        assert!(!sentinel.exists(), "the refused program was started");
+        assert_eq!(
+            handler.plans.load(Ordering::SeqCst),
+            0,
+            "nothing was planned"
+        );
+        assert_eq!(
+            handler.observations.load(Ordering::SeqCst),
+            0,
+            "nothing was observed"
+        );
+        assert!(
+            handler.refusals.lock().expect("refusals mutex").is_empty(),
+            "nothing is left to fail the build on"
+        );
     }
 
     /// A handler whose post-compile bookkeeping releases on a signal:
@@ -1487,15 +1746,17 @@ mod tests {
         release: tokio::sync::watch::Sender<bool>,
         started: tokio::sync::watch::Sender<usize>,
         finished: AtomicUsize,
+        toolchain: Arc<BuildToolchain>,
     }
 
     impl Bookkeeping {
         /// Bookkeeping held until the test releases it.
-        fn held() -> Arc<Self> {
+        async fn held() -> Arc<Self> {
             Arc::new(Self {
                 release: tokio::sync::watch::channel(false).0,
                 started: tokio::sync::watch::channel(0).0,
                 finished: AtomicUsize::new(0),
+                toolchain: BuildToolchain::for_tests().await,
             })
         }
 
@@ -1517,8 +1778,7 @@ mod tests {
 
         fn plan(
             self: &Arc<Self>,
-            _executable: OsString,
-            _args: Vec<OsString>,
+            _invocation: VerifiedInvocation,
             _env: crate::supervisor::protocol::InvocationEnv,
         ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
             std::future::ready(Decision::Compile(OsString::new()))
@@ -1554,12 +1814,15 @@ mod tests {
             std::future::ready(())
         }
 
-        fn rustc_host_target(
-            self: &Arc<Self>,
-            _executable: &std::ffi::OsStr,
-        ) -> impl std::future::Future<Output = Result<String, String>> + Send {
-            std::future::ready(Ok("aarch64-apple-darwin".to_owned()))
+        fn toolchain(self: &Arc<Self>) -> &Arc<BuildToolchain> {
+            &self.toolchain
         }
+
+        fn refusal_policy(self: &Arc<Self>) -> RefusalPolicy {
+            RefusalPolicy::FailBuild
+        }
+
+        fn refused(self: &Arc<Self>, _refusal: Refusal) {}
     }
 
     /// Open the raw transport to the supervisor — no client framing: the
@@ -1658,7 +1921,7 @@ mod tests {
     /// when the runtime dropped the task mid-store.
     #[tokio::test]
     async fn shutdown_drains_in_flight_connections() {
-        let handler = Bookkeeping::held();
+        let handler = Bookkeeping::held().await;
         let mut supervisor = start(
             Arc::clone(&handler),
             super::InFlightUnits::default(),
@@ -1686,7 +1949,7 @@ mod tests {
     /// the one still storing is behind them (stow#660).
     #[tokio::test]
     async fn shutdown_drains_past_connections_that_already_finished() {
-        let handler = Bookkeeping::held();
+        let handler = Bookkeeping::held().await;
         let mut supervisor = start(
             Arc::clone(&handler),
             super::InFlightUnits::default(),
@@ -1723,7 +1986,7 @@ mod tests {
     /// hang the build (stow#618).
     #[tokio::test]
     async fn shutdown_abandons_bookkeeping_past_the_budget() {
-        let handler = Bookkeeping::held();
+        let handler = Bookkeeping::held().await;
         let mut supervisor = start(
             Arc::clone(&handler),
             super::InFlightUnits::default(),
@@ -1832,7 +2095,7 @@ mod tests {
     /// has exited — until the bookkeeping ends (stow#1431).
     #[tokio::test]
     async fn a_report_returns_while_its_bookkeeping_is_held() {
-        let handler = Bookkeeping::held();
+        let handler = Bookkeeping::held().await;
         let in_flight = super::InFlightUnits::default();
         let mut supervisor = start(Arc::clone(&handler), in_flight.clone(), &test_executable())
             .expect("start the supervisor");
@@ -1903,7 +2166,7 @@ mod tests {
     /// (stow#1431).
     #[tokio::test]
     async fn a_plan_right_after_the_report_always_waits() {
-        let handler = Bookkeeping::held();
+        let handler = Bookkeeping::held().await;
         let in_flight = super::InFlightUnits::default();
         let mut supervisor = start(Arc::clone(&handler), in_flight.clone(), &test_executable())
             .expect("start the supervisor");
@@ -1956,7 +2219,7 @@ mod tests {
     /// with the facade's connection (stow#1431).
     #[tokio::test]
     async fn a_report_with_an_unknown_ticket_is_refused() {
-        let handler = Bookkeeping::held();
+        let handler = Bookkeeping::held().await;
         let in_flight = super::InFlightUnits::default();
         let mut supervisor = start(Arc::clone(&handler), in_flight.clone(), &test_executable())
             .expect("start the supervisor");
@@ -2056,6 +2319,7 @@ mod tests {
     struct CcCache {
         config: crate::config::StowConfig,
         target_dir: std::path::PathBuf,
+        toolchain: Arc<BuildToolchain>,
     }
 
     impl Handler for CcCache {
@@ -2071,8 +2335,7 @@ mod tests {
 
         fn plan(
             self: &Arc<Self>,
-            _executable: OsString,
-            _args: Vec<OsString>,
+            _invocation: VerifiedInvocation,
             _env: crate::supervisor::protocol::InvocationEnv,
         ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
             std::future::ready(Decision::Compile(OsString::new()))
@@ -2098,12 +2361,15 @@ mod tests {
             std::future::ready(())
         }
 
-        fn rustc_host_target(
-            self: &Arc<Self>,
-            _executable: &std::ffi::OsStr,
-        ) -> impl std::future::Future<Output = Result<String, String>> + Send {
-            std::future::ready(Ok("aarch64-apple-darwin".to_owned()))
+        fn toolchain(self: &Arc<Self>) -> &Arc<BuildToolchain> {
+            &self.toolchain
         }
+
+        fn refusal_policy(self: &Arc<Self>) -> RefusalPolicy {
+            RefusalPolicy::FailBuild
+        }
+
+        fn refused(self: &Arc<Self>, _refusal: Refusal) {}
     }
 
     /// The C wrapper's exchange with the daemon: a lookup that misses, a
@@ -2137,6 +2403,7 @@ mod tests {
         let handler = Arc::new(CcCache {
             config: config.clone(),
             target_dir: target.path().to_path_buf(),
+            toolchain: BuildToolchain::for_tests().await,
         });
         let mut supervisor = start(
             Arc::clone(&handler),
@@ -2245,6 +2512,7 @@ mod tests {
         let handler = Arc::new(CcCache {
             config: config.clone(),
             target_dir: target.path().to_path_buf(),
+            toolchain: BuildToolchain::for_tests().await,
         });
         let mut supervisor = start(
             Arc::clone(&handler),
