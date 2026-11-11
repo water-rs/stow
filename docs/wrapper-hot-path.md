@@ -22,25 +22,46 @@ Trace this with `STOW_TRACE_FILE=/tmp/stow.json stow check …` and look at the
    to a non-`0` value — `RUST_LOG` alone does not reach wrapped invocations,
    so hundreds of subscriber builds never run per `cargo build`. Non-wrapper
    commands always install it.
-4. **`StowConfig::load`** (`cli/src/config.rs`). Reads `STOW_CONFIG_BLOB` env
-   first; the parent `stow check` writes it once and every wrapper invocation
-   reads it instead of re-parsing `~/.config/stow/config.toml`.
-5. **`ParsedRustcArgs::parse`** (`types/src/rustc.rs`). In-memory arg walk; no
+4. **Session lookup** (`SessionLink::from_env` in `cli/src/daemon/client.rs`).
+   `STOW_SESSION` names the build's session on the per-user daemon: with it
+   set, the wrapper hands the invocation to the daemon (`delegate_to_daemon`
+   in `cli/src/lib.rs`, below) and loads no config, opens no state
+   database and reads no index. Unset, the wrapper runs standalone (the
+   second list).
+
+With a session, the wrapper:
+
+1. connects to the daemon — directly, or through the driver's relay from
+   inside a sandbox — and sends the invocation as one `Plan` request;
+2. exits successfully when the daemon served the unit from the cache, or
+   runs the real `rustc` the answer names and reports its result, which the
+   session records.
+
+Everything else — the build's config, toolchain, serve map, index slice,
+local cache, signature verification and the one connection to the edge —
+belongs to the daemon's session for the whole build.
+
+Standalone, with no `STOW_SESSION` (a plain `cargo build` through the
+`RUSTC_WRAPPER` that `stow setup` writes), the wrapper decides in its own
+process:
+
+1. **`StowConfig::load`** (`cli/src/config.rs`). Parses
+   `~/.config/stow/config.toml`.
+2. **`ParsedRustcArgs::parse`** (`types/src/rustc.rs`). In-memory arg walk; no
    I/O.
-6. **`prepare_local_cache`** (`cli/src/artifact_cache.rs`). Opens the local
+3. **`prepare_local_cache`** (`cli/src/artifact_cache.rs`). Opens the local
    SQLite pool and walks the artifact cache for the resolved rustc lease.
-7. **Cache lookup** (`load_cached_bundle`). One SQLite query against the
+4. **Cache lookup** (`load_cached_bundle`). One SQLite query against the
    exact-key index.
-8. **On exact-key hit:** `verify_cached_bundle_signature` runs once per unique
+5. **On exact-key hit:** `verify_cached_bundle_signature` runs once per unique
    bundle, then materializes outputs into the cargo target dir via
    `record_materialized_bundle_outputs` (reflink or copy).
-9. **On exact miss:** the wrapper resolves a candidate against the cached
-   index slice (`cli/src/index.rs` — read-only, no network; the parent
-   `stow check` already refreshed it), then `fetch::download_bundle`
-   streams the row's bundle through the edge byte path, requires the
-   bytes to hash to the row's `bundle_digest`, verifies the signature,
-   persists the bundle, then materializes.
-10. **Fall-through:** if no cache is available, exec the real `rustc`.
+6. **On exact miss:** the wrapper resolves a candidate against the cached
+   index slice (`cli/src/index.rs` — read-only, no network), then
+   `fetch::download_bundle` streams the row's bundle through the edge byte
+   path, requires the bytes to hash to the row's `bundle_digest`, verifies
+   the signature, persists the bundle, then materializes.
+7. **Fall-through:** if no cache is available, exec the real `rustc`.
 
 ## Things that must never run on this path
 
@@ -59,11 +80,10 @@ in `cargo check`/`cargo build`. Keep them at `stow check` startup, on
   but its column-parity pass should not run on every invocation.
 * **`cargo metadata`.** Already removed; do not re-add. Use lockfile parsing
   via `workspace_deps::lockfile_registry_packages` instead.
-* **`rustc -vV` / `rustc --version` probes.** The parent `stow check`
-  unconditionally sets `STOW_PUBLIC_CACHE_RUSTC_VERSION` /
-  `STOW_PUBLIC_CACHE_TARGET` so the wrapper short-circuits in
-  `rustc_args::detect_rustc_*`.
-* **Reading `~/.config/stow/config.toml`.** Pass via `STOW_CONFIG_BLOB`.
+* **`rustc -vV` / `rustc --version` probes.** The build's session carries the
+  toolchain's facts, so a wrapper under a session probes nothing.
+* **Reading `~/.config/stow/config.toml`.** The build's session carries the
+  resolved config; only the standalone wrapper reads the file.
 
 ## Measuring overhead
 

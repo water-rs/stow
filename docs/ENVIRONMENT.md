@@ -2,8 +2,7 @@
 
 Single source of truth for every env var a user or operator sets on stow.
 Variables a stow process wires for its own children appear where they
-explain the wrapper's behavior; the rest of the internal plumbing
-(`STOW_RUSTC_EXTRA_ARGS_FILE`) and the sandbox test hooks are omitted on
+explain the wrapper's behavior; the sandbox test hooks are omitted on
 purpose. Each row lists the component(s) that read the variable, the
 default, and the purpose.
 
@@ -19,17 +18,12 @@ default, and the purpose.
 | `STOW_MOCK_PUBLIC_KEY_PATH` | _required when `STOW_VERIFY_MODE=mock-key`_ | PEM path the wrapper trusts when verifying mock OCI bundles. |
 | `STOW_CACHE_DIR` | `~/.stow` | Where the local artifact cache + state SQLite live. |
 | `STOW_ARTIFACT_CACHE_MAX_BYTES` | `21474836480` (20 GiB) | Soft cap on the local artifact cache before stow purges old entries. |
-| `STOW_PUBLIC_CACHE_RUSTC_VERSION` | unset | Set by the parent `stow check` so the per-rustc wrapper does not reprobe `rustc -vV`. |
+| `STOW_PUBLIC_CACHE_RUSTC_VERSION` | unset | The rustc release `stow check`/`build`/`test`, `stow setup` and a wrapper with no `STOW_SESSION` use instead of probing `rustc -vV`. stow does not set it for its children: a build's session carries its toolchain. |
 | `STOW_PUBLIC_CACHE_TARGET` | unset | Same as above for the target triple. |
-| `STOW_CONFIG_BLOB` | unset | JSON-encoded resolved `StowConfig`. The parent `stow check` writes this so each rustc-wrapper child skips re-parsing the user config file. |
 | `STOW_TRACE_FILE` | unset | When set, stow writes a Chrome-format trace holding every span and event of stow's own crates whatever `RUST_LOG` is — that variable selects only what the terminal prints. Open in chrome://tracing or perfetto.dev. |
 | `STOW_TRACE_WRAPPED_COMPILERS` | unset | When set, the wrapper emits tracing for every wrapped `rustc` / `cc` invocation (verbose). |
 | `STOW_IDENTITY_TRACE` | unset | Directory the wrapper writes one JSON identity record per `rustc` invocation into (`IdentityTraceRecord`: the parsed inputs — target, rustc, emit, crate types, profile, features, dependency `c_metadata` chain — plus the computed compile key and `c_metadata`). The answer to "why did this unit miss" — diff the record for the missing unit against the index row it should have hit. Inert when unset. |
-| `STOW_ENABLE_SEMANTIC_FALLBACK` | wired by parent `stow check` | When `1`, the per-rustc wrapper falls back to a semver-relaxed lookup in the cached index slice after an exact-key miss. |
-| `STOW_EXPANDED_GRAPH_PATH` | wired by parent `stow build`/`check`/`test` | Path to the build's unit-graph file — a JSON `{"consumer_spelled_target": bool, "nodes": [{"crate_name", "version", "host_side", "features", "profile", "named"}]}` written atomically in the build's scratch directory (a `stow-build-*` directory under the system temp directory, removed when the build ends) — the build's unit graph as a per-side node table (each lib node's cargo-resolved feature set, plus whether the graph's cargo invocation spelled `--target`). The wrapper resolves each compiled unit's semantic identity against it; the argv `--cfg feature` scan is compile-key evidence only. A set path whose file is missing or malformed fails the invocation loudly; unset carries no table. |
 | `__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS` | `nightly`, set on unit-graph queries and supplemental compile-time-only build phases | Cargo's own channel override: makes the wrapped cargo accept `-Z unstable-options` on a stable toolchain while rustc — which never reads it — keeps answering probes as stable. Unit-graph queries set it only when the channel is stable and the user has no `RUSTC_BOOTSTRAP` of their own; sandboxed compile-time-only phases set it to enable Cargo’s `--compile-time-deps`. |
-| `STOW_PREFETCH_ARTIFACTS_PATH` | wired by parent `stow build`/`check`/`test` | Path to the build's prefetch ledger file — a JSON `Vec<PrefetchArtifactRow>` written atomically in the build's scratch directory: (crate, c_metadata, bundle_digest) triples to stream through the edge byte path — each checked against its `bundle_digest` — before any rustc invocation. A set path whose file is missing or malformed fails the invocation loudly; unset carries no ledger. |
-| `STOW_CACHE_POLICY_PATH` | wired by parent | Directory of `allow/<target>/<c_metadata>` marker files. The wrapper only consults the public cache for invocations with a marker; the parent `stow check` writes the markers from the local index analysis. |
 | `STOW_SESSION` | wired by parent `stow check`/`build`/`test` | The build's session on the per-user daemon, which the wrappers delegate each invocation to: 32 lowercase hex digits naming a session the daemon opened, or `relay:<path>` for a wrapper in a sandbox, which reaches the daemon through its parent's relay endpoint at that path. A session that is set but unreachable, or that the daemon does not know, fails the build; unset means standalone mode, where the wrapper decides in-process. |
 | `STOW_WRAPPER_PATH` | unset | Overrides the runtime wrapper binary `stow setup` points the cargo config at (defaults to the current executable). |
 | `STOW_DAEMON_DIR` | `<per-user cache dir>/stow/run` | Absolute path of the per-user daemon's runtime directory: it holds `daemon.lock`, `start.lock`, the daemon's endpoint (`daemon.sock`; on Windows the named pipe's name is derived from this path) and `daemon.log`. Created owner-only (mode `0700`); a directory that belongs to someone else or is open to group or others is an error. A client that starts the daemon hands it this path, resolved, whatever its own environment. |

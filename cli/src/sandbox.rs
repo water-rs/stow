@@ -4,8 +4,8 @@
 //! build script, every proc-macro expansion and every linker a build
 //! script selects runs as a descendant of the cargo stow starts, so they
 //! all inherit one sandbox. The stow process that starts cargo stays
-//! outside — it resolves, prefetches and supervises on the open side of
-//! the boundary. The isolation level decides what the sandbox is:
+//! outside — it resolves, prefetches and relays its wrappers to the daemon
+//! on the open side of the boundary. The isolation level decides what the sandbox is:
 //!
 //! - `protect` reads and writes the machine as usual except for heel's
 //!   fixed denylists — credential stores unreadable, persistence
@@ -68,9 +68,6 @@ pub struct SandboxRequest<'a> {
     /// The build's target directory: written and executed, since the
     /// build scripts cargo compiles run out of it.
     pub target_dir: &'a Path,
-    /// The build's scratch directory — serve map, cache policy and the
-    /// graph tables facades read. `None` for a wrapperless cargo.
-    pub scratch_dir: Option<&'a Path>,
     /// The daemon's runtime directory, resolved. The sandbox can neither
     /// connect to the daemon's socket nor read or write the directory at
     /// any level: a sandboxed wrapper reaches the daemon only through the
@@ -96,7 +93,7 @@ pub struct SandboxRequest<'a> {
     /// The build's own arguments after the action — a `--target` among
     /// them widens the toolchain discovery to that target's linker.
     pub cargo_args: &'a [OsString],
-    /// The supervisor's IPC router when the build is supervised; a
+    /// The driver's relay to the daemon when the build has a session; a
     /// passthrough cargo registers none and gets no IPC socket.
     pub ipc: Option<IpcRouter>,
 }
@@ -177,8 +174,8 @@ impl BuildSandbox {
     /// A sandbox that cannot be set up is an error here — there is no
     /// unsandboxed fallback and no weaker level (stow#779, stow#1000).
     /// `runtime_executable` is the stow binary the wrapper shims and the
-    /// facades resolve to; it reaches the supervisor through
-    /// `heel::IpcClient`, so the sandbox serves the router directly and
+    /// facades resolve to; it reaches the daemon through the driver's
+    /// relay over `heel::IpcClient`, so the sandbox serves the router directly and
     /// needs no `heel` binary.
     ///
     /// # Errors
@@ -218,7 +215,7 @@ impl BuildSandbox {
     }
 
     /// heel's IPC socket, when a router was configured — the endpoint
-    /// the facades inside reach the supervisor through.
+    /// the facades inside reach the relay through.
     pub fn ipc_endpoint(&self) -> Option<&Path> {
         match &self.network {
             Network::Allowed(sandbox) => sandbox.ipc_endpoint(),
@@ -525,8 +522,8 @@ fn read_denylist(request: &SandboxRequest<'_>) -> ReadDenylist {
 /// open and the registry needs no grant, but the toolchain does on Linux,
 /// where heel executes only under the system trees and the home directory:
 /// `toolchain_grants` adds it, read and execute. The target directory is
-/// written and executed, and the scratch, shim and stow binary paths may
-/// sit under a temporary directory heel does not let a process execute from.
+/// written and executed, and the shim and stow binary paths may sit under
+/// a temporary directory heel does not let a process execute from.
 fn protect_grants(request: &SandboxRequest<'_>) -> Vec<(PathBuf, Access, &'static str)> {
     let mut grants = vec![
         (
@@ -540,13 +537,6 @@ fn protect_grants(request: &SandboxRequest<'_>) -> Vec<(PathBuf, Access, &'stati
             "the stow binary the wrapper shims resolve to",
         ),
     ];
-    if let Some(dir) = request.scratch_dir {
-        grants.push((
-            dir.to_path_buf(),
-            Access::READ,
-            "the build's scratch tables — serve map, cache policy, expanded graph, extra args",
-        ));
-    }
     if let Some(dir) = request.shims_dir {
         grants.push((
             dir.to_path_buf(),
@@ -586,7 +576,7 @@ async fn run<N: heel::NetworkPolicy>(
 /// make concurrent builds revoke each other's grants and pay the
 /// toolchain ACL rewrite again, while a writable one would persist a
 /// hole the per-build boundary exists to close. Writable or
-/// build-shaped grants (sources, the target dir, scratch, shims, the
+/// build-shaped grants (sources, the target dir, shims, the
 /// package-cache lock, PATH tool dirs, env-named linkers, driver probe
 /// answers) stay in [`sandbox_grants`]; where one of those already sits
 /// under a persistent root heel skips it as open, so they are not
@@ -683,13 +673,6 @@ async fn sandbox_grants(
         Access::READ | Access::EXEC,
         "the stow binary the wrapper shims resolve to",
     ));
-    if let Some(dir) = request.scratch_dir {
-        grants.push((
-            dir.to_path_buf(),
-            Access::READ,
-            "the build's scratch tables — serve map, cache policy, expanded graph, extra args",
-        ));
-    }
     if let Some(dir) = request.shims_dir {
         grants.push((
             dir.to_path_buf(),
@@ -1101,7 +1084,7 @@ fn driver_probe_grants(
 /// set in a single wave.
 const PROBE_CONCURRENCY: usize = 8;
 
-/// Seal a configured builder, applying the supervisor's IPC router
+/// Seal a configured builder, applying the driver's relay router
 /// when one is registered — `direct_ipc` moves the builder into the
 /// `IpcConfigured` typestate (heel#59), so the optional router can only
 /// be applied where `build` erases the difference.
@@ -1335,8 +1318,8 @@ fn sandbox_env_names(names: impl Iterator<Item = String>) -> Vec<String> {
         "DYLD_LIBRARY_PATH",
         "DYLD_FALLBACK_LIBRARY_PATH",
         // Debugging knobs a user spelled for this build — stow's own
-        // wiring (`STOW_*` context, the config blob, the supervisor's
-        // endpoint) arrives through `.env` on the command instead.
+        // wiring (`STOW_SESSION`, the shims) arrives through `.env` on
+        // the command instead.
         "STOW_TRACE_WRAPPED_COMPILERS",
         "STOW_IDENTITY_TRACE",
         "STOW_TRACE_FILE",
@@ -1720,7 +1703,6 @@ mod tests {
             lockfile_root: Path::new("/tmp"),
             source_roots: &[],
             target_dir: Path::new("/tmp"),
-            scratch_dir: None,
             run_dir: &run_dir,
             shims_dir: None,
             runtime_executable: &dummy,
@@ -1765,7 +1747,6 @@ mod tests {
             lockfile_root: Path::new("/tmp"),
             source_roots: &[],
             target_dir: Path::new("/tmp/host-target"),
-            scratch_dir: None,
             run_dir: &run_dir,
             shims_dir: None,
             runtime_executable: &dummy,
@@ -1781,7 +1762,6 @@ mod tests {
             lockfile_root: Path::new("/tmp"),
             source_roots: &[],
             target_dir: Path::new("/tmp/cross-target"),
-            scratch_dir: None,
             run_dir: &run_dir,
             shims_dir: None,
             runtime_executable: &dummy,
@@ -1796,7 +1776,7 @@ mod tests {
             stow_identity().expect("the identity builds"),
         );
         // And no persistent grant may reach a directory a build owns —
-        // sources, target dir, scratch, the dir cargo runs in.
+        // sources, target dir, the dir cargo runs in.
         let identity = stow_identity().expect("the identity builds");
         for grant in identity.persistent_grants() {
             for build_dir in [

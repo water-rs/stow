@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -20,15 +20,11 @@ use crate::lockfile_resolver;
 use crate::log_nonfatal_result;
 use crate::prefetch::{self, PrefetchArtifact};
 use crate::resolve;
-use crate::rustc_args::{self, STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, STOW_PUBLIC_CACHE_TARGET_ENV};
+use crate::rustc_args;
 use crate::session_env::SessionEnv;
 use crate::state_db::StateDb;
 use crate::stats;
 use crate::workspace_deps::{self, ExpandedDependencyGraph, PackageKey};
-use crate::{
-    STOW_ENABLE_SEMANTIC_FALLBACK_ENV, STOW_EXPANDED_GRAPH_PATH_ENV,
-    STOW_PREFETCH_ARTIFACTS_PATH_ENV,
-};
 use crate::{detect_wrapper_commands, write_stdout};
 use stow_types::api::{
     AdmissionRequest, DependencyGraphEntry, EnqueueAdmission, ResolvedDependencyGraphEntry,
@@ -3794,7 +3790,6 @@ async fn run_cargo_passthrough_sandboxed(
         lockfile_root: &project.facts.workspace_root,
         source_roots: &source_roots,
         target_dir: &target_dir,
-        scratch_dir: None,
         run_dir: &run_dir,
         shims_dir: None,
         runtime_executable: &runtime,
@@ -3903,32 +3898,20 @@ struct CargoRunPlan<'a> {
 /// owns what the build leaves behind, and only the top of the command
 /// turns it into the process's exit (stow#652).
 /// The build's pre-cargo state — everything `run_cargo` lays out before
-/// the supervisor and cargo spawn: the scratch directory every generated
-/// file lives under (stow#630), the wrapper shims, the argv and `STOW_*`
-/// environment cargo reads.
+/// the build's session opens and cargo spawns: the wrapper shims, the argv
+/// and the environment cargo reads.
 struct CargoRunSetup {
-    scratch: tempfile::TempDir,
     wrappers: crate::commands::WrapperCommands,
     launch: CargoLaunch,
 }
 
 async fn prepare_cargo_run(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<CargoRunSetup> {
-    // Every file this build generates — the graph tables and the
-    // extra-args list — lives in one directory the build owns, in the
-    // system temp directory, and the build removes it when it ends
-    // (stow#630).
-    let scratch = tempfile::Builder::new()
-        .prefix("stow-build-")
-        .tempdir()
-        .wrap_err("create the build scratch directory")?;
     let wrappers =
         tracing::debug_span!("stow.precargo.detect_wrappers").in_scope(detect_wrapper_commands)?;
     let argv = cargo_argv(plan).await?;
-    let envs = collect_wrapper_env(plan, &wrappers, scratch.path())
-        .instrument(tracing::debug_span!("stow.precargo.export_env"))
-        .await?;
+    let envs = tracing::debug_span!("stow.precargo.export_env")
+        .in_scope(|| collect_wrapper_env(plan, &wrappers));
     Ok(CargoRunSetup {
-        scratch,
         wrappers,
         launch: CargoLaunch { argv, envs },
     })
@@ -3984,11 +3967,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         crate::RegistrySources::from_lockfile(&project.facts.workspace_root, &project.env)
             .instrument(tracing::debug_span!("stow.precargo.registry_sources")),
     )?;
-    let CargoRunSetup {
-        scratch,
-        wrappers,
-        launch,
-    } = setup;
+    let CargoRunSetup { wrappers, launch } = setup;
 
     // Every rustc invocation this cargo run spawns is a wrapper that asks
     // the build's session on the daemon what to do, so the whole build
@@ -4006,16 +3985,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     // holds the package-cache lock only shared, a drain's cargo can no
     // longer make this build wait (stow#667).
     let release_hold = spawn_hold_release(session.resolution_done(), project.foreground.clone());
-    let mut cargo_run = spawn_cargo_run(
-        plan,
-        &session,
-        exe,
-        settings,
-        &wrappers,
-        launch,
-        scratch.path(),
-    )
-    .await?;
+    let mut cargo_run = spawn_cargo_run(plan, &session, exe, settings, &wrappers, launch).await?;
 
     let before = coverage_snapshot(config).await;
 
@@ -4033,42 +4003,25 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     // hold released after this build ends would open the gate on a lie.
     stop_build_task(release_hold).await;
     let status = status?;
-    finish_cargo_run(
-        plan,
-        CargoRunCleanup { cargo_run, scratch },
-        session,
-        status,
-        before,
-        covered_units,
-    )
-    .await
+    finish_cargo_run(plan, cargo_run, session, status, before, covered_units).await
 }
 
-/// What `finish_cargo_run` releases, in order: the run — and with it a
-/// sandbox — then the scratch directory the sandbox's grants name.
-struct CargoRunCleanup {
-    cargo_run: CargoRun,
-    scratch: tempfile::TempDir,
-}
-
-/// The build's tail once cargo has exited: the session ends — its
-/// analysis stops and the last unit's store and miss observation drain
-/// (stow#618) — then coverage reports, the miss journal and the scratch
-/// cleanup run in the same order on either transport (stow#317,
-/// stow#630, stow#667).
+/// The build's tail once cargo has exited: the run — and with it a
+/// sandbox — is released, the session ends — its analysis stops and the
+/// last unit's store and miss observation drain (stow#618) — then
+/// coverage reports and the miss journal run in the same order on either
+/// transport (stow#317, stow#667).
 async fn finish_cargo_run(
     plan: &CargoRunPlan<'_>,
-    cleanup: CargoRunCleanup,
+    cargo_run: CargoRun,
     session: crate::daemon::client::DaemonSession,
     status: ExitStatus,
     before: CoverageSnapshot,
     covered_units: usize,
 ) -> stow_types::error::Result<ExitStatus> {
-    // The sandbox's grants name the scratch directory, and its drop revokes
-    // them, so it goes before the directory does. Cargo has exited, so
-    // every wrapper has, and the relay's connections close with the
-    // sandbox.
-    drop(cleanup.cargo_run);
+    // Cargo has exited, so every wrapper has, and the relay's connections
+    // close with the sandbox.
+    drop(cargo_run);
     // The session drains the last connections' post-compile bookkeeping
     // and writes the miss journal as it ends — the build's compile
     // observations are its miss list (stow#317), a failed build's units
@@ -4084,13 +4037,6 @@ async fn finish_cargo_run(
         if config.cache.reaches_network() {
             admit_build_misses(plan, config).await;
         }
-    }
-    // Nothing writes into the scratch directory any more — cargo has
-    // exited, the analysis is gone and the supervisor has drained — so
-    // it is removed here rather than at drop: `close` reports a removal
-    // failure a `TempDir` drop would swallow (stow#630).
-    if let Err(error) = cleanup.scratch.close() {
-        tracing::warn!(%error, "could not remove the build scratch directory");
     }
     // A request the session refused fails the build, whatever cargo made
     // of it: a one-way report has no answer to carry the refusal, so it
@@ -4206,7 +4152,6 @@ async fn spawn_cargo_run(
     settings: crate::daemon::Settings,
     wrappers: &crate::commands::WrapperCommands,
     mut launch: CargoLaunch,
-    scratch: &Path,
 ) -> stow_types::error::Result<CargoRun> {
     match plan.isolation.level.confinement() {
         None => {
@@ -4237,7 +4182,6 @@ async fn spawn_cargo_run(
                 (session.id(), exe, settings),
                 wrappers,
                 launch,
-                scratch,
             )
             .await
         }
@@ -4262,7 +4206,6 @@ async fn sandboxed_cargo_run(
     ),
     wrappers: &crate::commands::WrapperCommands,
     mut launch: CargoLaunch,
-    scratch: &Path,
 ) -> stow_types::error::Result<CargoRun> {
     if confinement.is_allowlist() {
         crate::sandbox::fetch_dependencies(plan.current_dir, plan.cargo_args).await?;
@@ -4302,7 +4245,6 @@ async fn sandboxed_cargo_run(
         lockfile_root: plan.source_root,
         source_roots: &source_roots,
         target_dir: &target_dir,
-        scratch_dir: Some(scratch),
         run_dir: &run_dir,
         shims_dir: Some(shims_dir),
         runtime_executable: &wrappers.runtime_executable,
@@ -4377,24 +4319,18 @@ pub async fn stop_build_task(task: tokio::task::JoinHandle<()>) {
     }
 }
 
-/// The `STOW_*` contract a cargo run's wrappers read: the toolchain
-/// shims, the resolved config blob, the graph-fact file paths and the
-/// cache policy —
-/// everything a wrapper would otherwise load itself on every invocation
-/// (stow#347). Build-sized payloads travel as files: one environment
-/// string past Linux's `MAX_ARG_STRLEN` fails the whole `execve`, which
-/// a workspace-sized graph or ledger clears (stow#625).
-/// The environment `run_cargo` exports to its cargo: collected once so
-/// the plain spawn's `Command` and the sandboxed `SandboxedCommand`
-/// both build on the same list (stow#779).
-async fn collect_wrapper_env(
+/// The environment `run_cargo` exports to its cargo: the toolchain shims
+/// and the target directory. Everything a wrapper decides with lives in the
+/// build's session on the daemon, so none of it travels on the
+/// environment. Collected once so the plain spawn's `Command` and the
+/// sandboxed `SandboxedCommand` both build on the same list (stow#779).
+fn collect_wrapper_env(
     plan: &CargoRunPlan<'_>,
     wrappers: &crate::commands::WrapperCommands,
-    scratch: &Path,
-) -> stow_types::error::Result<Vec<(OsString, OsString)>> {
+) -> Vec<(OsString, OsString)> {
     let mut envs = Vec::new();
-    export_wrapper_env(&mut envs, plan, wrappers, scratch).await?;
-    Ok(envs)
+    export_wrapper_env(&mut envs, plan, wrappers);
+    envs
 }
 
 /// The shim identity a build exports: `RUSTC_WRAPPER`, the `cc`-scoped
@@ -4440,129 +4376,24 @@ fn export_wrapper_shim_envs(
     ));
 }
 
-async fn export_wrapper_env(
+fn export_wrapper_env(
     envs: &mut Vec<(OsString, OsString)>,
     plan: &CargoRunPlan<'_>,
     wrappers: &crate::commands::WrapperCommands,
-    scratch_dir: &Path,
-) -> stow_types::error::Result<()> {
+) {
     let CargoRunPlan {
         project,
-        config,
         cargo_args,
-        source_root,
-        unit_nodes,
-        prefetch_artifacts,
-        semantic_fallback_enabled,
         ..
     } = *plan;
     let facts = &project.facts;
     export_wrapper_shim_envs(envs, wrappers, &facts.target);
-    // The extra rustc arguments ride a build file like the run's other
-    // generated tables (stow#625) — and a build with no stow config still
-    // writes this one.
-    let extra_args = rustc_wrapper_extra_args(source_root)?;
-    let extra_args_path =
-        write_build_json_table(scratch_dir, "rustc-extra-args", extra_args).await?;
-    envs.push((
-        OsString::from(rustc_args::STOW_RUSTC_EXTRA_ARGS_FILE_ENV),
-        OsString::from(extra_args_path.as_os_str()),
-    ));
-    envs.push((
-        OsString::from(STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV),
-        OsString::from(&facts.rustc_version),
-    ));
-    envs.push((
-        OsString::from(STOW_PUBLIC_CACHE_TARGET_ENV),
-        OsString::from(&facts.target),
-    ));
-    // Pass the parent's already-resolved StowConfig as a JSON env blob so the
-    // rustc wrapper does not re-read ~/.config/stow/config.toml on every
-    // invocation. See `StowConfig::from_env_blob`.
-    if let Some(cfg) = config {
-        envs.push((
-            OsString::from(crate::config::STOW_CONFIG_BLOB_ENV),
-            OsString::from(cfg.to_env_blob()?),
-        ));
-    }
-    envs.push((
-        OsString::from(STOW_ENABLE_SEMANTIC_FALLBACK_ENV),
-        OsString::from(if semantic_fallback_enabled { "1" } else { "0" }),
-    ));
-    // The per-side node table every wrapper invocation resolves its
-    // unit's cargo feature set and side against — the argv scan is
-    // compile-key evidence, never the semantic label (stow#615) — and
-    // the prefetch ledger. Both travel as files beside the serve map,
-    // inside the build's scratch directory; with nothing to write no
-    // variable is exported (stow#625).
-    if let Some(unit_nodes) = unit_nodes {
-        let path =
-            write_build_json_table(scratch_dir, "expanded-graph", unit_nodes.clone()).await?;
-        envs.push((
-            OsString::from(STOW_EXPANDED_GRAPH_PATH_ENV),
-            OsString::from(path.as_os_str()),
-        ));
-    }
-    if let Some(prefetch_artifacts) = prefetch_artifacts {
-        let rows = prefetch_artifact_rows(prefetch_artifacts)?;
-        let path = write_build_json_table(scratch_dir, "prefetch-artifacts", rows).await?;
-        envs.push((
-            OsString::from(STOW_PREFETCH_ARTIFACTS_PATH_ENV),
-            OsString::from(path.as_os_str()),
-        ));
-    }
     if project.env.var_os("CARGO_TARGET_DIR").is_none() && !has_explicit_target_dir(cargo_args) {
         envs.push((
             OsString::from("CARGO_TARGET_DIR"),
             facts.workspace_root.join("target").into_os_string(),
         ));
     }
-    Ok(())
-}
-
-/// One build-scoped JSON table, `{name}.json` in the build's scratch
-/// directory — the serve map, the expanded unit graph, the prefetch
-/// ledger and the rustc extra-args list share the directory and the
-/// write discipline; the graph tables joined the serve map when they
-/// outgrew the environment strings they rode on (stow#625). The
-/// directory is one build's, so the name needs nothing to tell builds
-/// apart (stow#630). Returns the path the caller exports on the
-/// environment.
-async fn write_build_json_table(
-    scratch_dir: &Path,
-    name: &str,
-    table: impl serde::Serialize + Send + 'static,
-) -> stow_types::error::Result<PathBuf> {
-    let path = scratch_dir.join(format!("{name}.json"));
-    write_build_json_file(&path, table).await?;
-    Ok(path)
-}
-
-/// Write `table` to `path` as JSON through a tmp file + rename — a
-/// reader catching the file mid-rewrite must never see a torn payload.
-///
-/// The payload grows with the workspace, so it is serialized on a
-/// blocking thread (stow#624). The install stays on the calling task —
-/// one write and one rename of the finished bytes: the in-build analysis
-/// rewrites the serve map through here, and aborting that task must
-/// leave no write in flight into a directory the build is about to
-/// remove (stow#630).
-async fn write_build_json_file(
-    path: &Path,
-    table: impl serde::Serialize + Send + 'static,
-) -> stow_types::error::Result<()> {
-    let json = smol::unblock(move || serde_json::to_vec(&table))
-        .await
-        .map_err(|error| stow_types::stow_error!("serialize {}: {error}", path.display()))?;
-    let tmp = path.with_file_name(format!(
-        ".{}.tmp-{}",
-        path.file_name().and_then(OsStr::to_str).unwrap_or_default(),
-        std::process::id()
-    ));
-    std::fs::write(&tmp, &json)
-        .map_err(|error| stow_types::stow_error!("write {}: {error}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|error| stow_types::stow_error!("install {}: {error}", path.display()))
 }
 
 /// What the in-build enrichment needs: the project and config the full
@@ -4826,37 +4657,6 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
         );
     }
     Ok(())
-}
-
-/// The `PrefetchArtifactRow`s `STOW_PREFETCH_ARTIFACTS_PATH`'s file
-/// carries to the rustc wrapper, validated into their newtypes.
-fn prefetch_artifact_rows(
-    prefetch_artifacts: &[PrefetchArtifact],
-) -> stow_types::error::Result<Vec<resolve::PrefetchArtifactRow>> {
-    prefetch_artifacts
-        .iter()
-        .map(|artifact| {
-            let crate_name = stow_types::identity::CrateName::parse(artifact.crate_name.as_str())
-                .map_err(|error| {
-                stow_types::stow_error!(
-                    "invalid prefetch crate_name `{}`: {error}",
-                    artifact.crate_name
-                )
-            })?;
-            let c_metadata = stow_types::identity::CMetadata::parse(artifact.c_metadata.as_str())
-                .map_err(|error| {
-                stow_types::stow_error!(
-                    "invalid prefetch c_metadata `{}`: {error}",
-                    artifact.c_metadata
-                )
-            })?;
-            Ok::<_, stow_types::error::Error>(resolve::PrefetchArtifactRow {
-                crate_name,
-                c_metadata,
-                bundle_digest: artifact.bundle_digest.clone(),
-            })
-        })
-        .collect()
 }
 
 /// What the cache counters held before cargo ran.
@@ -5142,12 +4942,10 @@ fn unsupported_public_cache_reason(rustc_version: &str) -> Option<&'static str> 
     }
 }
 
-/// The rustc argument a supervised run appends to every unit: the
-/// workspace path remap. It travels through the file
-/// [`rustc_args::STOW_RUSTC_EXTRA_ARGS_FILE_ENV`] names — which the rustc
-/// wrapper appends to each unit's argv — rather than `RUSTFLAGS`, where
-/// cargo's precedence rules would discard the user's `.cargo/config.toml`
-/// `target.*.rustflags` for the whole build.
+/// The rustc argument the session appends to every unit: the workspace
+/// path remap. It travels in the session's facts rather than `RUSTFLAGS`,
+/// where cargo's precedence rules would discard the user's
+/// `.cargo/config.toml` `target.*.rustflags` for the whole build.
 fn rustc_wrapper_extra_args(source_root: &Path) -> stow_types::error::Result<Vec<String>> {
     let source_root = source_root.to_str().ok_or_else(|| {
         stow_types::stow_error!("workspace root {} is not UTF-8", source_root.display())
@@ -6043,17 +5841,6 @@ mod tests {
         );
     }
 
-    /// stow#625: the tables a workspace-sized build carries — the unit
-    /// graph, the prefetch ledger, the extra rustc args — travel as
-    /// files, so every environment value `export_wrapper_env` sets must
-    /// stay a path or a flag, never the payload.
-    struct TableExport {
-        _cache: tempfile::TempDir,
-        env: Vec<(OsString, OsString)>,
-        table: crate::unit_node::UnitNodeTable,
-        ledger: Vec<PrefetchArtifact>,
-    }
-
     fn stow_config(cache_dir: &Path) -> crate::config::StowConfig {
         crate::config::StowConfig {
             cache: crate::config::CacheLayers::default(),
@@ -6109,18 +5896,10 @@ mod tests {
             .collect()
     }
 
-    fn row_identity(row: &crate::resolve::PrefetchArtifactRow) -> (&str, &str, &str) {
-        (
-            row.crate_name.as_str(),
-            row.c_metadata.as_str(),
-            row.bundle_digest.as_str(),
-        )
-    }
-
     /// Run `export_wrapper_env` against a `nodes`-entry unit table and a
     /// `ledger_rows`-entry prefetch ledger, collecting the environment
     /// it hands cargo.
-    fn exported_wrapper_env(nodes: usize, ledger_rows: usize) -> TableExport {
+    fn exported_wrapper_env(nodes: usize, ledger_rows: usize) -> Vec<(OsString, OsString)> {
         let cache = tempfile::tempdir().expect("cache dir");
         let workspace = cache.path().join("ws");
         let project = ProjectContext {
@@ -6160,86 +5939,34 @@ mod tests {
             covered_units: ledger.len(),
             isolation: &crate::isolation::Isolation::off(),
         };
-        let mut envs = Vec::new();
-        smol::block_on(super::export_wrapper_env(
-            &mut envs,
-            &plan,
-            &wrappers,
-            cache.path(),
-        ))
-        .expect("export wrapper env");
-        let env = envs;
-        TableExport {
-            _cache: cache,
-            env,
-            table,
-            ledger,
-        }
+        super::collect_wrapper_env(&plan, &wrappers)
     }
 
     #[test]
-    fn build_sized_tables_ride_files_not_environment_strings() {
-        let export = exported_wrapper_env(3_000, 3_000);
-        for (key, value) in &export.env {
+    fn a_workspace_sized_build_exports_nothing_build_sized_to_cargo() {
+        let env = exported_wrapper_env(3_000, 3_000);
+        for (key, value) in &env {
             assert!(
                 value.len() <= 4_096,
-                "{} holds {} bytes; a build-sized payload must travel as a file path",
+                "{} holds {} bytes; the session carries the build's tables, not the environment",
                 key.to_string_lossy(),
                 value.len()
             );
         }
-        let path_of = |name: &str| -> PathBuf {
-            PathBuf::from(
-                export
-                    .env
-                    .iter()
-                    .find(|(key, _)| key.as_os_str() == name)
-                    .unwrap_or_else(|| panic!("{name} was not exported"))
-                    .1
-                    .clone(),
-            )
-        };
-        let graph: crate::unit_node::UnitNodeTable = crate::read_build_json_table(
-            &path_of(crate::STOW_EXPANDED_GRAPH_PATH_ENV),
-            crate::STOW_EXPANDED_GRAPH_PATH_ENV,
-        )
-        .expect("read back the expanded graph file");
-        assert_eq!(
-            serde_json::to_vec(&graph).expect("encode read-back table"),
-            serde_json::to_vec(&export.table).expect("encode source table"),
-            "the file round-trips the unit table"
-        );
-        let read_rows: Vec<crate::resolve::PrefetchArtifactRow> = crate::read_build_json_table(
-            &path_of(crate::STOW_PREFETCH_ARTIFACTS_PATH_ENV),
-            crate::STOW_PREFETCH_ARTIFACTS_PATH_ENV,
-        )
-        .expect("read back the prefetch ledger file");
-        let read: Vec<_> = read_rows.iter().map(row_identity).collect();
-        let expected_rows = super::prefetch_artifact_rows(&export.ledger).expect("expected rows");
-        let expected: Vec<_> = expected_rows.iter().map(row_identity).collect();
-        assert_eq!(read, expected, "the file round-trips the prefetch ledger");
-    }
-
-    /// stow#625's control: a single environment value past Linux's
-    /// `MAX_ARG_STRLEN` fails `execve` outright — the failure mode the
-    /// file transport removes.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_exported_environment_survives_execve_where_an_inline_table_cannot() {
-        let export = exported_wrapper_env(3_000, 3_000);
-        let status = std::process::Command::new("/bin/true")
-            .env_clear()
-            .envs(export.env.iter().map(|(key, value)| (key, value)))
-            .status()
-            .expect("spawn /bin/true with the build's environment");
-        assert!(status.success());
-
-        let error = std::process::Command::new("/bin/true")
-            .env_clear()
-            .env("STOW_INLINE_TABLE", "x".repeat(200_000))
-            .spawn()
-            .expect_err("a 200,000-byte environment value cannot pass execve");
-        assert_eq!(error.raw_os_error(), Some(libc::E2BIG));
+        for key in [
+            "STOW_CONFIG_BLOB",
+            "STOW_EXPANDED_GRAPH_PATH",
+            "STOW_PREFETCH_ARTIFACTS_PATH",
+            "STOW_ENABLE_SEMANTIC_FALLBACK",
+            "STOW_RUSTC_EXTRA_ARGS_FILE",
+            "STOW_PUBLIC_CACHE_RUSTC_VERSION",
+            "STOW_PUBLIC_CACHE_TARGET",
+        ] {
+            assert!(
+                !env.iter().any(|(name, _)| name.as_os_str() == key),
+                "{key} is exported although no wrapper reads it from a driver any more"
+            );
+        }
     }
 
     /// How a build here places its build directory.

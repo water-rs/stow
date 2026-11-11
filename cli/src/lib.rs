@@ -120,9 +120,6 @@ use crate::fetch::FetchRequest;
 use crate::state_db::StateDb;
 use crate::stats::{ServeSource, ServeStage};
 
-const STOW_EXPANDED_GRAPH_PATH_ENV: &str = "STOW_EXPANDED_GRAPH_PATH";
-pub(crate) const STOW_PREFETCH_ARTIFACTS_PATH_ENV: &str = "STOW_PREFETCH_ARTIFACTS_PATH";
-pub(crate) const STOW_ENABLE_SEMANTIC_FALLBACK_ENV: &str = "STOW_ENABLE_SEMANTIC_FALLBACK";
 pub(crate) const STOW_TRACE_WRAPPED_COMPILERS_ENV: &str = "STOW_TRACE_WRAPPED_COMPILERS";
 /// When set to a path, stow writes a Chrome-trace JSON to that file describing
 /// every instrumented span (`stow.startup`, `stow.project.context`,
@@ -1272,43 +1269,28 @@ fn describes_compile_unit(
 #[derive(Debug)]
 pub(crate) struct AnalysisFacts {
     /// Whether the expanded graph found a semver-upgrade the plan path
-    /// may serve for — the `STOW_ENABLE_SEMANTIC_FALLBACK` fact.
+    /// may serve for.
     pub(crate) semantic_fallback_enabled: bool,
-    /// The `STOW_EXPANDED_GRAPH_PATH` file parsed: the build's unit
-    /// graph as a per-side node table — each lib node's `(crate,
-    /// version, side, cargo-resolved feature set)` plus whether the
-    /// graph's cargo invocation spelled `--target`. `None` means the
-    /// environment carried no graph at all — the distinction a semantic
-    /// gate needs between "unset" and "empty".
+    /// The build's unit graph as a per-side node table — each lib node's
+    /// `(crate, version, side, cargo-resolved feature set)` plus whether
+    /// the graph's cargo invocation spelled `--target`. `None` means the
+    /// build carried no graph at all — the distinction a semantic gate
+    /// needs between "unset" and "empty".
     pub(crate) unit_nodes: Option<unit_node::UnitNodeTable>,
-    /// The `STOW_PREFETCH_ARTIFACTS_PATH` file parsed and indexed:
-    /// canonical crate name to the `c_metadata` values the driver
-    /// already fetched.
+    /// The prefetch ledger indexed: canonical crate name to the
+    /// `c_metadata` values the driver already fetched.
     pub(crate) prefetch_candidates: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl BuildContext {
-    /// Rebuild the driver's view from this process's own environment —
-    /// the standalone wrapper's shape, where the caller that would set
-    /// the variables is also the process reading them.
+    /// The standalone wrapper's view: no driver told it anything, so it
+    /// holds no graph, no prefetch ledger and no semantic fallback.
     ///
     /// # Errors
     ///
-    /// A set-but-unreadable or malformed table file is a wiring bug and
-    /// fails loudly, as a malformed inline payload did.
+    /// The cache layers do not load.
     fn from_env() -> stow_types::error::Result<Self> {
         let cache = crate::config::load_cache_layers()?;
-        let unit_nodes =
-            read_build_json_table_env::<unit_node::UnitNodeTable>(STOW_EXPANDED_GRAPH_PATH_ENV)?;
-        let prefetch_candidates = read_build_json_table_env::<Vec<resolve::PrefetchArtifactRow>>(
-            STOW_PREFETCH_ARTIFACTS_PATH_ENV,
-        )?
-        .map_or_else(BTreeMap::new, |rows| {
-            prefetch_candidate_c_metadatas(
-                rows.into_iter()
-                    .map(|row| (row.crate_name.into_inner(), row.c_metadata.into_inner())),
-            )
-        });
         Ok(Self {
             marks_dir: None,
             allowed: None,
@@ -1318,10 +1300,9 @@ impl BuildContext {
             public_cache_disabled: !cache.reaches_network(),
             cache,
             analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
-                semantic_fallback_enabled: std::env::var_os(STOW_ENABLE_SEMANTIC_FALLBACK_ENV)
-                    .is_some_and(|value| value != "0"),
-                unit_nodes,
-                prefetch_candidates,
+                semantic_fallback_enabled: false,
+                unit_nodes: None,
+                prefetch_candidates: BTreeMap::new(),
             })),
             serve_map: crate::facade::ServeMapView::absent(),
             serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
@@ -1354,41 +1335,9 @@ impl BuildContext {
     }
 }
 
-/// One build-scoped JSON table the driver left behind `env` — a file
-/// path since stow#625, when the payloads outgrew what one environment
-/// string can carry past `execve` (Linux fails it at `MAX_ARG_STRLEN`,
-/// which a workspace-sized table clears). Unset reads as no table, as
-/// the inline payload did.
-///
-/// # Errors
-///
-/// A set variable whose file is missing or malformed is a wiring bug —
-/// the same loud failure a malformed inline payload was — naming the
-/// path.
-fn read_build_json_table_env<T: serde::de::DeserializeOwned>(
-    env: &str,
-) -> stow_types::error::Result<Option<T>> {
-    let Some(path) = std::env::var_os(env) else {
-        return Ok(None);
-    };
-    read_build_json_table(Path::new(&path), env).map(Some)
-}
-
-/// Read `path` as the JSON table `env` named; the variable names the
-/// wiring in the error.
-fn read_build_json_table<T: serde::de::DeserializeOwned>(
-    path: &Path,
-    env: &str,
-) -> stow_types::error::Result<T> {
-    let bytes = std::fs::read(path)
-        .map_err(|error| stow_types::stow_error!("read {env} {}: {error}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| stow_types::stow_error!("parse {env} {}: {error}", path.display()))
-}
-
-/// The `STOW_PREFETCH_ARTIFACTS_PATH` ledger, indexed once for the
-/// per-invocation candidate lookups: canonical crate name to the
-/// `c_metadata` values the driver prefetched.
+/// The build's prefetch ledger, indexed once for the per-invocation
+/// candidate lookups: canonical crate name to the `c_metadata` values the
+/// driver prefetched.
 pub(crate) fn prefetch_candidate_c_metadatas(
     rows: impl IntoIterator<Item = (String, String)>,
 ) -> BTreeMap<String, BTreeSet<String>> {
@@ -1429,13 +1378,6 @@ async fn run_rustc_wrapper(
     {
         delegate_to_daemon(&link, &command).await
     } else {
-        // The extra rustc arguments (workspace path remap and any flags
-        // the build selected) arrive appended to the argv so the user's
-        // own rustflags sources — env or config — keep their cargo
-        // semantics. Under a session the daemon appends them itself.
-        command
-            .wrapped_args
-            .extend(rustc_args::extra_args_from_env()?);
         stow_types::rustc::remap_build_output(
             &mut command.wrapped_args,
             std::env::var_os("OUT_DIR").as_deref(),
@@ -1917,8 +1859,8 @@ struct WrapperEnvironment<'a> {
     /// The `c_metadata` to query with: the stable identity's when the
     /// invocation's own was rewritten, else the raw cargo one.
     request_c_metadata: String,
-    /// Semantic fallback request, only built when
-    /// `STOW_ENABLE_SEMANTIC_FALLBACK` opts in.
+    /// Semantic fallback request, only built when the build's analysis
+    /// found a semver upgrade to serve for.
     semantic_request: Option<Box<fetch::SemanticFetchRequest>>,
     /// The host's glibc release, read once and passed to every lookup —
     /// no global. `None` on musl and non-Linux hosts, where the index
@@ -1997,11 +1939,10 @@ impl WrapperEnvBase {
 pub(crate) struct WrapperEnvCache {
     /// The build's rustc: the only source of toolchain facts.
     pub(crate) toolchain: std::sync::Arc<toolchain::BuildToolchain>,
-    /// The config the base carries. A build's supervisor sets it to the
+    /// The config the base carries. A build's session sets it to the
     /// driver's resolved config — the run's cache-layer flags included
-    /// (stow#1007); a standalone invocation loads it from its own
-    /// environment on first use, where the driver's `STOW_CONFIG_BLOB`
-    /// carries the same value. `None`: no config, and every invocation
+    /// (stow#1007); a standalone invocation loads it from the user's
+    /// config file on first use. `None`: no config, and every invocation
     /// bypasses.
     config: std::sync::OnceLock<Option<StowConfig>>,
     /// The base the driver prepared before cargo started — settled there,
@@ -7175,83 +7116,18 @@ mod tests {
         );
     }
 
-    /// The process environment is global and the harness runs tests on
-    /// several threads, so every test that touches the table variables
-    /// holds this for its whole body — one test's `set_var` must never
-    /// land inside another's assertion.
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        GUARD
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// stow#625: unset table variables read as no table, exactly as the
-    /// inline payloads did.
+    /// A wrapper with no session has no driver to tell it the build's
+    /// graph, ledger or fallback.
     #[test]
-    fn unset_table_variables_carry_no_table() {
-        let _guard = env_guard();
-        unsafe {
-            std::env::remove_var(super::STOW_EXPANDED_GRAPH_PATH_ENV);
-            std::env::remove_var(super::STOW_PREFETCH_ARTIFACTS_PATH_ENV);
-        }
-        let ctx = super::BuildContext::from_env().expect("unset reads as no table");
+    fn a_standalone_context_carries_no_graph_ledger_or_fallback() {
+        let ctx = super::BuildContext::from_env().expect("the standalone context builds");
         assert!(ctx.unit_nodes().is_none());
+        assert!(!ctx.semantic_fallback_enabled());
         assert!(
             ctx.prefetch_candidates()
                 .expect("the facts cell is filled")
                 .is_empty()
         );
-    }
-
-    /// stow#625: a set variable whose file is missing is a wiring bug —
-    /// the same loud failure a malformed inline payload was — naming the
-    /// path.
-    #[test]
-    fn a_missing_table_file_fails_loudly_naming_the_path() {
-        let _guard = env_guard();
-        let missing = PathBuf::from("/definitely/missing/table.json");
-        let missing_display = missing.display().to_string();
-        for env in [
-            super::STOW_EXPANDED_GRAPH_PATH_ENV,
-            super::STOW_PREFETCH_ARTIFACTS_PATH_ENV,
-        ] {
-            unsafe { std::env::set_var(env, &missing) };
-            let error = super::BuildContext::from_env()
-                .expect_err("a set variable whose file is missing fails loudly");
-            unsafe { std::env::remove_var(env) };
-            let message = error.to_string();
-            assert!(
-                message.contains(env) && message.contains(&missing_display),
-                "the error names the variable and the path: {message}"
-            );
-        }
-    }
-
-    /// stow#625: a set variable whose file is not the table's JSON is the
-    /// same wiring bug, naming the path.
-    #[test]
-    fn a_malformed_table_file_fails_loudly_naming_the_path() {
-        let _guard = env_guard();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let malformed = dir.path().join("malformed.json");
-        let malformed_display = malformed.display().to_string();
-        std::fs::write(&malformed, "not a json table").expect("write malformed file");
-        for env in [
-            super::STOW_EXPANDED_GRAPH_PATH_ENV,
-            super::STOW_PREFETCH_ARTIFACTS_PATH_ENV,
-        ] {
-            unsafe { std::env::set_var(env, &malformed) };
-            let error =
-                super::BuildContext::from_env().expect_err("a malformed table file fails loudly");
-            unsafe { std::env::remove_var(env) };
-            let message = error.to_string();
-            assert!(
-                message.contains(env) && message.contains(&malformed_display),
-                "the error names the variable and the path: {message}"
-            );
-        }
     }
 
     /// stow#618: a dependent's post-compile bookkeeping must wait for the

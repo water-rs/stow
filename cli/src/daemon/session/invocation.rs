@@ -128,7 +128,7 @@ fn out_dir_args(args: &[OsString]) -> Vec<&OsStr> {
     found
 }
 
-/// A request the supervisor refuses to act on.
+/// A request the session refuses to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     field: Field,
@@ -147,8 +147,8 @@ impl std::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-/// What the build does with a request the supervisor refused. A refusal
-/// is a contract violation between stow's own wrapper and supervisor, so
+/// What the build does with a request the session refused. A refusal
+/// is a contract violation between stow's own wrapper and the daemon, so
 /// it is surfaced where the build is developed and survived where it is
 /// used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -174,7 +174,7 @@ impl RefusalPolicy {
     }
 }
 
-/// An invocation whose fields the supervisor has checked against the
+/// An invocation whose fields the session has checked against the
 /// build's own facts.
 #[derive(Debug)]
 pub struct VerifiedInvocation {

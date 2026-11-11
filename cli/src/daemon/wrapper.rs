@@ -18,8 +18,8 @@ use super::session::os_bytes;
 pub enum Request {
     /// One rustc invocation, before anything has run.
     Plan(Plan),
-    /// The result of a compile the supervisor asked for. Answered with
-    /// [`Answer::Received`] before the supervisor's bookkeeping, which the
+    /// The result of a compile the session asked for. Answered with
+    /// [`Answer::Received`] before the session's bookkeeping, which the
     /// facade never waits for (stow#1431).
     Compiled(Compiled),
     /// The C compiler wrapper asking whether the object cache holds the
@@ -158,12 +158,12 @@ pub struct Plan {
     pub executable: Vec<u8>,
     /// Everything after the executable, in order.
     pub args: Vec<Vec<u8>>,
-    /// The invocation's environment the supervisor cannot see.
+    /// The invocation's environment the daemon cannot see.
     pub env: InvocationEnv,
 }
 
-/// The facade reporting the compile the supervisor asked for. The
-/// supervisor answers it with a receipt that precedes its bookkeeping.
+/// The facade reporting the compile the session asked for. The session
+/// answers it with a receipt that precedes its bookkeeping.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Compiled {
     /// Whether rustc exited successfully.
@@ -219,7 +219,7 @@ impl CcCompiled {
 ///
 /// Each entry is one complete `{"$message_type":"artifact",…}` line —
 /// the JSON message rustc itself would have printed under
-/// `--json=…artifacts…`. The supervisor computes them because it holds
+/// `--json=…artifacts…`. The session computes them because it holds
 /// the serve decision, but only the process cargo spawned may write
 /// them: cargo reads artifact notifications from its own child's stderr,
 /// so the lines travel with the `Served` answer and the facade prints
@@ -277,7 +277,7 @@ impl CompileCommand {
     }
 }
 
-/// What the supervisor answers.
+/// What the session answers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Answer {
     /// The unit's outputs are in the target directory; the facade exits 0
@@ -289,7 +289,7 @@ pub enum Answer {
     /// which holds the compile until it does.
     Compile(CompileCommand),
     /// The report arrived and the unit's rustc is recorded as exited; the
-    /// supervisor's bookkeeping runs after this answer and the facade
+    /// session's bookkeeping runs after this answer and the facade
     /// exits with the compile's own status without waiting for it
     /// (stow#1431).
     Received,
@@ -307,10 +307,10 @@ pub enum Answer {
         /// The build's C/C++ object cache is on.
         enabled: bool,
     },
-    /// The supervisor could not answer. The facade fails the build with
+    /// The session could not answer. The facade fails the build with
     /// this message rather than quietly compiling without the cache.
     Failed {
-        /// Why the supervisor could not answer.
+        /// Why the session could not answer.
         message: String,
     },
 }

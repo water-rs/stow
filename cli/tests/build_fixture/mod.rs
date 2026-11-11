@@ -465,8 +465,8 @@ pub fn resolved_packages(
 /// `c_metadata`, carrying the version and feature set `resolved` gives
 /// its package, and each `bundle_digest` carrying the stored
 /// `compile_key` so a bundle fetch it triggers has that key in the
-/// request line. A semantic lookup (`STOW_ENABLE_SEMANTIC_FALLBACK`)
-/// of a leaf crate finds its row by that identity.
+/// request line. A semantic lookup of a leaf crate finds its row by that
+/// identity.
 ///
 /// The file layout is the verified index cache's own
 /// (`index/<target>/<rustc>/current.json`, its digest-named blob and the

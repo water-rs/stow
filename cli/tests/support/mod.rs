@@ -21,22 +21,17 @@ pub fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path
         .env("STOW_REGISTRY_BASE_URL", edge_url)
         .env("STOW_CACHE_DIR", cache_dir)
         // Isolate from the developer's ambient stow config: a user-level
-        // `verify_mode = "mock-key"` (or an inherited `STOW_CONFIG_BLOB`)
-        // would make this binary reject the config and skip the cache.
+        // `verify_mode = "mock-key"` would make this binary reject the
+        // config and skip the cache.
         // Every other `STOW_*` knob `StowConfig::load` and the wrapper
         // environment read is removed for the same reason — the test's
         // own values go on the command after this call (stow#800).
         .env("STOW_VERIFY_MODE", "github-ci")
-        .env_remove("STOW_CONFIG_BLOB")
         .env_remove("STOW_INDEX_REFRESH_SECS")
         .env_remove("STOW_ARTIFACT_CACHE_MAX_BYTES")
         .env_remove("STOW_MOCK_PUBLIC_KEY_PATH")
-        .env_remove("STOW_ENABLE_SEMANTIC_FALLBACK")
         .env_remove("STOW_PUBLIC_CACHE_RUSTC_VERSION")
         .env_remove("STOW_PUBLIC_CACHE_TARGET")
-        .env_remove("STOW_CACHE_POLICY_PATH")
-        .env_remove("STOW_EXPANDED_GRAPH_PATH")
-        .env_remove("STOW_PREFETCH_ARTIFACTS_PATH")
         .env_remove("STOW_SESSION")
         .env_remove("STOW_TRACE_FILE")
         .env_remove("STOW_TRACE_WRAPPED_COMPILERS")

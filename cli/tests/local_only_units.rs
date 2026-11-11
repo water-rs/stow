@@ -174,9 +174,7 @@ impl Scenario {
         let (host, release) = rustc_host_and_release();
         let resolved = resolved_packages(project, self.cargo_home.path());
         seed_index_slice(cache.path(), &host, &release, entries, &resolved);
-        let mut env = env.to_vec();
-        env.push(("STOW_ENABLE_SEMANTIC_FALLBACK", "1"));
-        self.build_against(cache.path(), project, &["build", "--offline"], &env)
+        self.build_against(cache.path(), project, &["build", "--offline"], env)
     }
 
     fn entries(&self) -> Vec<StoredEntry> {

@@ -79,12 +79,10 @@ local_git = true
 
 The resolved `StowConfig` is the merge of, in order:
 
-1. The parent process's `STOW_CONFIG_BLOB` env var (set automatically by
-   `stow check` so children skip re-parsing the user config).
-2. Per-key environment variables (`STOW_EDGE_URL`, etc.).
-3. The TOML file at the OS config path.
+1. Per-key environment variables (`STOW_EDGE_URL`, etc.).
+2. The TOML file at the OS config path.
 
-When a value is missing from all three, the typed defaults above apply.
+When a value is missing from both, the typed defaults above apply.
 `verify_mode=mock-key`'s `mock_public_key_path` has no default — stow
 exits with an actionable error if it is unresolved.
 
