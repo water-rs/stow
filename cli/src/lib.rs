@@ -1291,13 +1291,12 @@ impl BuildContext {
     ///
     /// The cache layers do not load.
     fn from_env() -> stow_types::error::Result<Self> {
-        let cache = crate::config::load_cache_layers()?;
+        let env = session_env::SessionEnv::of_this_process()?;
+        let cache = crate::config::load_cache_layers(&env)?;
         Ok(Self {
             marks_dir: None,
             allowed: None,
-            public_cache_target: std::env::var(rustc_args::STOW_PUBLIC_CACHE_TARGET_ENV)
-                .ok()
-                .filter(|target| !target.trim().is_empty()),
+            public_cache_target: rustc_args::configured_public_cache_target(&env),
             public_cache_disabled: !cache.reaches_network(),
             cache,
             analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
@@ -2140,7 +2139,7 @@ impl WrapperEnvCache {
     /// process's own loaded once.
     fn config(&self) -> Option<&StowConfig> {
         self.config
-            .get_or_init(|| match StowConfig::load_local(self.state_db.clone()) {
+            .get_or_init(|| match StowConfig::load(self.state_db.clone()) {
                 Ok(config) => Some(config),
                 Err(error) => {
                     tracing::warn!(error = %error, "stow config unavailable, bypassing rust cache");
@@ -3248,7 +3247,7 @@ async fn run_cc_standalone(
     compiler_args: &[OsString],
     state_db: &StateDb,
 ) -> stow_types::error::Result<std::process::ExitStatus> {
-    let config = match StowConfig::load_local(state_db.clone()) {
+    let config = match StowConfig::load(state_db.clone()) {
         Ok(config) => config,
         Err(error) => {
             tracing::warn!(error = %error, "stow local config unavailable, bypassing C/C++ cache");
@@ -6539,7 +6538,11 @@ mod tests {
 
     /// The shared `rustc -vV` the driver hands these tests.
     fn test_shared_vv() -> crate::rustc_args::SharedRustcVv {
-        crate::rustc_args::shared_rustc_vv(std::ffi::OsString::from("rustc"))
+        crate::rustc_args::shared_rustc_vv(
+            std::ffi::OsString::from("rustc"),
+            crate::session_env::SessionEnv::of_this_process()
+                .expect("the test process's environment"),
+        )
     }
 
     /// A build's `WrapperEnvCache` over the test machine's own rustc,

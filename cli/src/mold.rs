@@ -335,9 +335,12 @@ pub async fn prepare_global() -> stow_types::error::Result<Option<PathBuf>> {
     // The host gate and the resolution both ask the build's rustc —
     // the configured `build.rustc` when one is set, the toolchain's
     // `rustc` otherwise (stow#608).
-    let host = detect_rustc_host_target(build_rustc.executable())
-        .await
-        .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
+    let host = detect_rustc_host_target(
+        build_rustc.executable(),
+        &crate::session_env::SessionEnv::of_this_process()?,
+    )
+    .await
+    .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
     let config = link_eval_config(&loaded, &build_rustc);
     let link = resolve_link_from(&config, &host, &process_env);
     if link.selects_mold && link.unavailable_reason(&process_env).await.is_none() {
@@ -381,7 +384,10 @@ pub async fn warm_global_link_cache(
         }
     };
     let env_map = link_env_vars(std::env::vars_os(), wraps_stow_rustc(&loaded));
-    let shared_vv = crate::rustc_args::shared_rustc_vv(build_rustc.executable().to_os_string());
+    let shared_vv = crate::rustc_args::shared_rustc_vv(
+        build_rustc.executable().to_os_string(),
+        crate::session_env::SessionEnv::of_this_process()?,
+    );
     // The resolution's target is the build rustc's own host triple —
     // read from the same `-vV` the key digests, not a probe of some
     // other `rustc` (stow#608).
@@ -2338,7 +2344,11 @@ mod tests {
         let build_rustc = BuildRustc::from_cargo_config(&loaded);
         let env_map = link_env_vars(vars, wraps_stow_rustc(&loaded));
         let env = fixture.env();
-        let shared_vv = crate::rustc_args::shared_rustc_vv(build_rustc.executable().to_os_string());
+        let shared_vv = crate::rustc_args::shared_rustc_vv(
+            build_rustc.executable().to_os_string(),
+            crate::session_env::SessionEnv::of_this_process()
+                .expect("the test process's environment"),
+        );
         let ctx = LinkResolutionContext {
             cargo_dir: &fixture.project,
             cargo_home: Some(&fixture.cargo_home),

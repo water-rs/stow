@@ -65,7 +65,7 @@ impl BuildToolchain {
         env: &SessionEnv,
     ) -> Result<Self, String> {
         let (spelling, vv) =
-            tokio::join!(build_rustc.facade_spelling(), async { vv.clone().await });
+            tokio::join!(build_rustc.facade_spelling(env), async { vv.clone().await });
         Self::from_probe(
             spelling?,
             build_rustc.executable().to_owned(),
@@ -84,7 +84,7 @@ impl BuildToolchain {
     ///
     /// As [`Self::for_build`].
     pub async fn for_executable(executable: &OsStr, env: &SessionEnv) -> Result<Self, String> {
-        let vv = rustc_args::rustc_vv(executable).await?;
+        let vv = rustc_args::rustc_vv(executable, env).await?;
         Self::from_probe(executable.to_owned(), executable.to_owned(), None, &vv, env).await
     }
 
@@ -362,7 +362,9 @@ mod tests {
                 .expect("chmod the program");
         }
         let rustc = which::which("rustc").expect("the test machine has rustc on PATH");
-        let vv = crate::rustc_args::rustc_vv(rustc.as_os_str())
+        let env = crate::session_env::SessionEnv::of_this_process()
+            .expect("the test process's environment");
+        let vv = crate::rustc_args::rustc_vv(rustc.as_os_str(), &env)
             .await
             .expect("rustc -vV");
         let toolchain = super::BuildToolchain::from_probe(
@@ -370,8 +372,7 @@ mod tests {
             launcher.clone().into_os_string(),
             None,
             &vv,
-            &crate::session_env::SessionEnv::of_this_process()
-                .expect("the test process's environment"),
+            &env,
         )
         .await
         .expect("resolve the toolchain");
@@ -397,11 +398,11 @@ mod tests {
                 .expect("chmod the program");
         }
         let rustc = which::which("rustc").expect("the test machine has rustc on PATH");
-        let vv = crate::rustc_args::rustc_vv(rustc.as_os_str())
-            .await
-            .expect("rustc -vV");
         let env = crate::session_env::SessionEnv::of_this_process()
             .expect("the test process's environment");
+        let vv = crate::rustc_args::rustc_vv(rustc.as_os_str(), &env)
+            .await
+            .expect("rustc -vV");
         let original = super::BuildToolchain::from_probe(
             rustc.clone().into_os_string(),
             launcher.clone().into_os_string(),

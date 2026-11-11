@@ -266,7 +266,7 @@ async fn run_inner(
     // lets a build start at some other level (stow#1000).
     let isolation = crate::isolation::Isolation::resolve(
         args.isolation.isolation,
-        crate::config::load_isolation_config()?,
+        crate::config::load_isolation_config(&SessionEnv::of_this_process()?)?,
     )?;
     let cache_switches = args.cache;
     let invocation = CargoInvocation::new(command, args, isolation);
@@ -994,10 +994,13 @@ impl ProjectContext {
         // One `rustc -vV`, shared by every consumer of rustc facts —
         // the host triple below, the release version, the session
         // base and the link-resolution key (stow#608).
-        let rustc_vv = crate::rustc_args::shared_rustc_vv(build_rustc.executable().to_os_string());
+        let rustc_vv = crate::rustc_args::shared_rustc_vv(
+            build_rustc.executable().to_os_string(),
+            env.clone(),
+        );
         let target: SharedTargetProbe = resolved_targets.into_iter().next().map_or_else(
             || {
-                if let Some(target) = crate::rustc_args::configured_public_cache_target() {
+                if let Some(target) = crate::rustc_args::configured_public_cache_target(&env) {
                     return futures_util::future::ready(Ok(target)).boxed().shared();
                 }
                 let vv = rustc_vv.clone();
@@ -1008,7 +1011,7 @@ impl ProjectContext {
             |target| futures_util::future::ready(Ok(target)).boxed().shared(),
         );
         let rustc_version: Shared<BoxFuture<'static, Result<String, String>>> =
-            crate::rustc_args::configured_public_cache_rustc_version().map_or_else(
+            crate::rustc_args::configured_public_cache_rustc_version(&env).map_or_else(
                 || {
                     let vv = rustc_vv.clone();
                     async move { vv.await.and_then(|vv| crate::rustc_args::vv_release(&vv)) }
