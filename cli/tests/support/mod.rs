@@ -144,6 +144,11 @@ pub fn sealed_home_env(command: &mut Command, home: &Path) {
         command.env(key, dir);
     }
     command
+        // `stow setup` installs the daemon's login trigger through
+        // `launchctl` on macOS (stow#1435); a test must never reach the
+        // developer's launchd. `true` answers every query as "loaded", so
+        // setup runs the code path and changes nothing.
+        .env("STOW_LAUNCHCTL", "/usr/bin/true")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("CC")
