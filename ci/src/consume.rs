@@ -104,14 +104,11 @@ pub async fn slices_for_task_with<'s>(
 }
 
 /// Fetch and stage the published artifacts this task's dependencies can be
-/// served from: every signed-index row matching a unit of the build
-/// workspace's own cargo unit graph — name, version, activated feature
-/// set and side — which the caller computed from the same cargo
-/// invocations the build phases run (stow#589).
-///
-/// Rows whose dep-identity does not match this build's resolution are not
-/// excluded here — the wrapper's compile-key lookup is what decides a hit;
-/// prefetching a row it never matches only wastes a download.
+/// served from: every signed-index row published by a node of the task's
+/// pinned dependency subtree, and the build scripts `scripts` names — the
+/// ones of the build workspace's own cargo unit graph, which the caller
+/// computed from the same cargo invocations the build phases run
+/// (stow#589). The wrapper's compile-key lookup then decides a hit.
 ///
 /// # Errors
 ///
@@ -122,7 +119,7 @@ pub async fn slices_for_task_with<'s>(
 /// is logged and skipped: it removes one candidate, never the task.
 pub async fn prefetch(
     task: &BuildTaskPayload,
-    packages: dep_scan::ConsumablePackages,
+    scripts: Vec<dep_scan::ConsumablePackage>,
     store_dir: &Path,
 ) -> stow_types::error::Result<Consumption> {
     // Everything past here is the CLI's verified-download chain, and that
@@ -133,7 +130,7 @@ pub async fn prefetch(
     // suit one step of it.
     let task = task.clone();
     let store_dir = store_dir.to_path_buf();
-    on_a_tokio_runtime(move || async move { stage_candidates(&task, &packages, &store_dir).await })
+    on_a_tokio_runtime(move || async move { stage_candidates(&task, &scripts, &store_dir).await })
         .await?
 }
 
@@ -172,7 +169,7 @@ where
 /// index vouches for did not verify.
 async fn stage_candidates(
     task: &BuildTaskPayload,
-    packages: &dep_scan::ConsumablePackages,
+    scripts: &[dep_scan::ConsumablePackage],
     store_dir: &Path,
 ) -> stow_types::error::Result<Consumption> {
     // Every slice named here holds a dependency the scheduler saw
@@ -180,18 +177,15 @@ async fn stage_candidates(
     // consumption up is not a cold cache: building on would compile what
     // the task was promised it would be served.
     let config = ConsumeConfig::load().wrap_err("load the cache-consumption config")?;
-    let slices = slices_for_task(&config, task, !packages.scripts.is_empty()).await?;
-    let graph = task.verified_dependency_graph()?;
-    let dependencies = (1..graph.nodes().len())
-        .filter_map(|index| graph.task_id(index))
-        .collect::<BTreeSet<_>>();
+    let slices = slices_for_task(&config, task, !scripts.is_empty()).await?;
+    let dependencies = pinned_dependency_ids(task)?;
     let mut local_programs = Vec::new();
     for program in slices.iter().flat_map(|slice| &slice.index.local_programs) {
         if dependencies.contains(program.task_id()?.as_str()) {
             local_programs.push(program.clone());
         }
     }
-    let candidates = candidates(&slices, &packages.libraries, &packages.scripts);
+    let candidates = candidates(&slices, &dependencies, scripts)?;
 
     // The prefetch pulls bundle blobs straight from GHCR by digest — the
     // offline-edge build never touches the byte path (stow#455). One
@@ -288,67 +282,91 @@ where
     Ok(staged)
 }
 
-/// The `(slice, row)` pairs a build may serve: rows matching a unit of
-/// the build's own unit graph by canonical name, exact version,
-/// activated feature set, and unit-graph side.
+/// The task ids of the nodes of the task's pinned dependency subtree —
+/// every node below the root, which is the task's own node and never
+/// served to it (#1415).
+///
+/// # Errors
+///
+/// Returns an error when the payload's subgraph does not verify.
+pub fn pinned_dependency_ids(
+    task: &BuildTaskPayload,
+) -> stow_types::error::Result<BTreeSet<String>> {
+    let graph = task.verified_dependency_graph()?;
+    Ok((1..graph.nodes().len())
+        .filter_map(|index| graph.task_id(index))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Whether the node that published `row` into `slice` is one of the
+/// `pinned` nodes. A compile key records no side, so on a native triple
+/// one key can sit on rows of several nodes of one crate; only the node
+/// identity says whose row it is (#1415).
+///
+/// # Errors
+///
+/// Returns an error when the row's dependency edges do not hash.
+pub fn published_by_pinned_node(
+    pinned: &BTreeSet<String>,
+    slice: &IndexSlice,
+    row: &ArtifactIndexRow,
+) -> stow_types::error::Result<bool> {
+    Ok(pinned.contains(&slice.index.row_task_id(row)?))
+}
+
+/// The `(slice, row)` pairs a build may serve: library rows published by
+/// a node of the task's pinned dependency subtree, and the build-script
+/// rows matching a build script of the build's own unit graph by
+/// canonical name, exact version and activated feature set.
+///
+/// A build script is an output of its crate's node whose row records the
+/// host shape whichever side the node is on, so its row names no node
+/// side to derive an identity from; the unit graph's script set is the
+/// only node-level evidence there is for it.
+///
+/// # Errors
+///
+/// Returns an error when a row's dependency edges do not hash.
 fn candidates<'a>(
     slices: &'a [IndexSlice],
-    packages: &[dep_scan::ConsumablePackage],
+    pinned: &BTreeSet<String>,
     scripts: &[dep_scan::ConsumablePackage],
-) -> Vec<(&'a IndexSlice, &'a ArtifactIndexRow)> {
-    let library_packages = packages_by_name(packages);
-    let scripts_by_name = packages_by_name(scripts);
+) -> stow_types::error::Result<Vec<(&'a IndexSlice, &'a ArtifactIndexRow)>> {
+    let mut scripts_by_name = BTreeMap::<_, Vec<_>>::new();
+    for script in scripts {
+        scripts_by_name
+            .entry(canonical_crate_name(&script.crate_name))
+            .or_default()
+            .push(script);
+    }
     let mut selected = Vec::new();
     for slice in slices {
         for row in slice.index.rows.iter().chain(&slice.index.build_scripts) {
-            let crate_name = canonical_crate_name(row.crate_name.as_str());
-            let pool = if row.artifact_kind == stow_types::artifact::ArtifactKind::BuildScript {
-                &scripts_by_name
+            let serves = if row.artifact_kind == stow_types::artifact::ArtifactKind::BuildScript {
+                scripts_by_name
+                    .get(&canonical_crate_name(row.crate_name.as_str()))
+                    .is_some_and(|candidates| {
+                        let features = row
+                            .features_json
+                            .features()
+                            .iter()
+                            .cloned()
+                            .collect::<BTreeSet<_>>();
+                        candidates.iter().any(|script| {
+                            script.version.to_string() == row.version.to_string()
+                                && script.features == features
+                        })
+                    })
             } else {
-                &library_packages
+                published_by_pinned_node(pinned, slice, row)?
             };
-            let Some(candidates) = pool.get(&crate_name) else {
-                continue;
-            };
-            let features = row
-                .features_json
-                .features()
-                .iter()
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            let matches_package = candidates.iter().any(|package| {
-                package.version.to_string() == row.version.to_string()
-                    && package.features == features
-                    && package_matches_side(package, row)
-            });
-            if !matches_package {
-                continue;
+            if serves {
+                selected.push((slice, row));
             }
-            selected.push((slice, row));
         }
     }
-    selected
-}
-
-fn packages_by_name(
-    packages: &[dep_scan::ConsumablePackage],
-) -> BTreeMap<String, Vec<&dep_scan::ConsumablePackage>> {
-    let mut map = BTreeMap::<_, Vec<_>>::new();
-    for package in packages {
-        map.entry(canonical_crate_name(&package.crate_name))
-            .or_default()
-            .push(package);
-    }
-    map
-}
-
-/// Whether the row's unit shape sits on the side the unit-graph entry
-/// needs — a host entry is served only by a host-side row (the
-/// proc-macro/build-dep shape), never by the same package's target-side
-/// row.
-fn package_matches_side(package: &dep_scan::ConsumablePackage, row: &ArtifactIndexRow) -> bool {
-    row.artifact_kind == stow_types::artifact::ArtifactKind::BuildScript
-        || (row.unit_shape.side == stow_types::public_cache::UnitSide::Host) == package.host_side
+    Ok(selected)
 }
 
 /// One row through the CLI's own verified-download chain: the bundle blob
@@ -398,6 +416,177 @@ async fn fetch_and_stage(
     build_consume::stage_bundle_bytes(config, slice, row, &entry_dir, bytes).await
 }
 
+/// Index and task fixtures the consumption and validation tests share.
+#[cfg(test)]
+pub mod test_support {
+    use stow_cli::build_consume::IndexSlice;
+    use stow_types::api::{BuildTaskPayload, SubgraphNode, TaskSubgraph};
+    use stow_types::artifact::{ArtifactKind, RustCrateType};
+    use stow_types::identity::{
+        CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
+        WireRustcVersion,
+    };
+    use stow_types::index::{ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow};
+    use stow_types::node_profile::NodeProfile;
+    use stow_types::platform::{PanicStrategy, Profile, StripLevel};
+    use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+
+    /// The slice every fixture row lives in: on a native triple host and
+    /// target units share it.
+    pub const SLICE_TARGET: &str = "x86_64-unknown-linux-gnu";
+
+    /// A one-slice fixture around `rows`.
+    pub fn index_slice(rows: Vec<ArtifactIndexRow>) -> IndexSlice {
+        IndexSlice {
+            manifest_digest: Some("sha256:".to_owned() + &"cd".repeat(32)),
+            index: ArtifactIndex {
+                header: ArtifactIndexHeader {
+                    format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
+                    target: TargetTriple::parse(SLICE_TARGET).unwrap(),
+                    rustc_version: WireRustcVersion::parse("1.99.0").unwrap(),
+                    generated_at: String::new(),
+                    generation: 1,
+                    row_count: rows.len() as u64,
+                },
+                rows,
+                build_scripts: Vec::new(),
+                local_programs: Vec::new(),
+            },
+        }
+    }
+
+    /// An index row fixture: `compile_key` hashes to `c_metadata`'s prefix
+    /// (canonical rows are keyed so); `side` sets the row's `unit_shape`.
+    pub fn index_row(
+        name: &str,
+        version: &str,
+        c_metadata: &str,
+        features: &[&str],
+        side: UnitSide,
+    ) -> ArtifactIndexRow {
+        ArtifactIndexRow {
+            dependency_task_ids: Vec::new(),
+            crate_name: CrateName::parse(name).unwrap(),
+            version: CrateVersion::new(semver::Version::parse(version).unwrap()),
+            features_json: FeaturesJson::canonicalize(
+                features.iter().map(|f| (*f).to_owned()).collect(),
+            )
+            .unwrap(),
+            dependency_c_metadata_json: DependencyCMetadataJson::canonicalize(vec![]).unwrap(),
+            c_metadata: CMetadata::parse(c_metadata).unwrap(),
+            compile_key: format!("{c_metadata}{c_metadata}{c_metadata}"),
+            bundle_digest: "sha256:".to_owned() + &"ab".repeat(32),
+            bundle_size: 1,
+            artifact_kind: ArtifactKind::Rlib,
+            crate_types: vec![RustCrateType::Lib],
+            profile: Profile {
+                opt_level: "0".to_owned(),
+                debuginfo: 1,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: PanicStrategy::Unwind,
+                strip: StripLevel::None,
+            },
+            emit: vec![],
+            unit_shape: shape(side),
+            min_glibc: None,
+            node_profile: NodeProfile::Dev,
+        }
+    }
+
+    fn shape(side: UnitSide) -> UnitShape {
+        UnitShape {
+            side,
+            invocation: UnitInvocation::Native,
+            kind: UnitKind::Linked,
+        }
+    }
+
+    /// The task id of the node that published `row` into [`SLICE_TARGET`]'s
+    /// slice.
+    pub fn published_task_id(row: &ArtifactIndexRow) -> String {
+        index_slice(Vec::new()).index.row_task_id(row).unwrap()
+    }
+
+    /// The `serde 1.0.229 [std]` rows of #1415 on a native triple, all
+    /// holding one compile key: a node's row differs from another's only
+    /// by its side and the dependencies it was built against.
+    pub fn serde_row(side: UnitSide, dependency_task_ids: Vec<String>) -> ArtifactIndexRow {
+        let mut row = index_row("serde", "1.0.229", "aaaaaaaaaaaaaaaa", &["std"], side);
+        row.dependency_task_ids = dependency_task_ids;
+        row
+    }
+
+    /// `itoa 1.0.18`, a leaf target-side node.
+    pub fn itoa_row() -> ArtifactIndexRow {
+        index_row("itoa", "1.0.18", "bbbbbbbbbbbbbbbb", &[], UnitSide::Target)
+    }
+
+    /// The row of the pinned twin of [`twinned_host_task`]: the
+    /// target-side `serde [std]` node built against `itoa`.
+    pub fn twin_row() -> ArtifactIndexRow {
+        serde_row(UnitSide::Target, vec![published_task_id(&itoa_row())])
+    }
+
+    /// An outcome-3 host task (#723): `serde 1.0.229 [std]` on the host
+    /// side of `x86_64-unknown-linux-gnu`, pinning its same-feature
+    /// target twin — which differs from it in its dependencies — and
+    /// `itoa`, the twin's one dependency.
+    pub fn twinned_host_task() -> BuildTaskPayload {
+        let serde = |host_side, deps| SubgraphNode {
+            crate_name: CrateName::parse("serde").unwrap(),
+            version: CrateVersion::new(semver::Version::new(1, 0, 229)),
+            features_json: FeaturesJson::canonicalize(vec!["std".to_owned()]).unwrap(),
+            host_side,
+            keys_apart: false,
+            deps,
+            profile: NodeProfile::Dev,
+        };
+        let mut task = BuildTaskPayload {
+            task_id: String::new(),
+            attempt: 1,
+            crate_name: CrateName::parse("serde").unwrap(),
+            version: CrateVersion::new(semver::Version::new(1, 0, 229)),
+            features_json: FeaturesJson::canonicalize(vec!["std".to_owned()]).unwrap(),
+            target: TargetTriple::parse(SLICE_TARGET).unwrap(),
+            rustc_version: WireRustcVersion::parse("1.99.0").unwrap(),
+            preserve_lockfile: false,
+            host_side: true,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+            dependency_subgraph: TaskSubgraph {
+                root_deps: vec![0],
+                nodes: vec![
+                    serde(false, vec![1]),
+                    SubgraphNode {
+                        crate_name: CrateName::parse("itoa").unwrap(),
+                        version: CrateVersion::new(semver::Version::new(1, 0, 18)),
+                        features_json: FeaturesJson::default(),
+                        host_side: false,
+                        keys_apart: false,
+                        deps: Vec::new(),
+                        profile: NodeProfile::Dev,
+                    },
+                ],
+            },
+            profile: NodeProfile::Dev,
+        };
+        task.task_id = task
+            .dependency_subgraph
+            .resolve(&task.task_node_identity(), task.explicit_spelling)
+            .expect("fixture subgraph resolves")
+            .task_id(0)
+            .expect("root node")
+            .to_owned();
+        task
+    }
+
+    /// The row of [`twinned_host_task`]'s own node, published by an
+    /// earlier run of the same task: host-side, built against its twin.
+    pub fn own_row() -> ArtifactIndexRow {
+        serde_row(UnitSide::Host, vec![published_task_id(&twin_row())])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -405,14 +594,12 @@ mod tests {
 
     use stow_cli::build_consume::StageFailure;
     use stow_types::artifact::{ArtifactKind, RustCrateType};
-    use stow_types::identity::{
-        CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
-        WireRustcVersion,
-    };
-    use stow_types::index::{ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow};
-    use stow_types::platform::{PanicStrategy, Profile, StripLevel};
-    use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+    use stow_types::public_cache::UnitSide;
 
+    use super::test_support::{
+        index_row, index_slice, itoa_row, own_row, published_task_id, serde_row, twin_row,
+        twinned_host_task,
+    };
     use crate::dep_scan;
 
     /// The chain this module reuses resolves DNS through a Tokio reactor
@@ -433,78 +620,58 @@ mod tests {
         assert!(has_reactor, "the network phase ran without a Tokio reactor");
     }
 
-    /// stow#589: a row is consumable only at the unit-graph identity —
-    /// canonical name, exact version, the activated feature set AND the
-    /// side. A host-side entry matches a host-shaped row and never the
-    /// same package's target shape; and a row still labelled with cargo
-    /// metadata's platform-agnostic resolve features (a feature this
-    /// target never compiles, stow#579) does not match the graph's
-    /// activated set.
+    /// #1415: a library row is a candidate only when the node that
+    /// published it is in the task's pinned subtree. Result A: the
+    /// pinned twin's row stages although two unrelated nodes published
+    /// the same compile key. Result B: the key of the task's own unit,
+    /// published by a target node the task does not pin, stages nothing —
+    /// and neither does the row of the task's own node.
     #[test]
-    fn candidates_match_the_unit_graphs_side_and_features() {
-        let packages = vec![
-            dep_scan::ConsumablePackage {
-                crate_name: "windows-link".to_owned(),
-                version: semver::Version::new(0, 2, 1),
-                features: BTreeSet::new(),
-                host_side: true,
-            },
-            dep_scan::ConsumablePackage {
-                crate_name: "tokio".to_owned(),
-                version: semver::Version::new(1, 53, 2),
-                features: BTreeSet::from(["fs".to_owned(), "net".to_owned()]),
-                host_side: false,
-            },
-        ];
+    fn candidates_are_the_rows_of_the_pinned_subtrees_nodes() {
+        let task = twinned_host_task();
+        let pinned = super::pinned_dependency_ids(&task).expect("pinned subtree");
 
+        let twin = twin_row();
+        let unpinned_host = serde_row(UnitSide::Host, vec!["itoa-1.0.17-unpinned".to_owned()]);
+        let unpinned_target = serde_row(UnitSide::Target, vec!["bytes-1.11.0-unpinned".to_owned()]);
         let slice = index_slice(vec![
-            index_row(
-                "windows-link",
-                "0.2.1",
-                "aaaaaaaaaaaaaaaa",
-                &[],
-                UnitSide::Host,
-            ),
-            index_row(
-                "windows-link",
-                "0.2.1",
-                "bbbbbbbbbbbbbbbb",
-                &[],
-                UnitSide::Target,
-            ),
-            index_row(
-                "windows-link",
-                "0.2.1",
-                "cccccccccccccccc",
-                &[],
-                UnitSide::Host,
-            ),
-            index_row(
-                "tokio",
-                "1.53.2",
-                "dddddddddddddddd",
-                &["fs", "net"],
-                UnitSide::Target,
-            ),
-            index_row(
-                "tokio",
-                "1.53.2",
-                "eeeeeeeeeeeeeeee",
-                &["fs", "net", "windows-sys"],
-                UnitSide::Target,
-            ),
+            itoa_row(),
+            twin.clone(),
+            unpinned_host,
+            unpinned_target,
+            own_row(),
         ]);
 
         let slices = [slice];
-        let hits = super::candidates(&slices, &packages, &[]);
+        let hits = super::candidates(&slices, &pinned, &[]).expect("candidates");
         let staged = hits
             .iter()
-            .map(|(_, row)| row.c_metadata.as_str())
+            .map(|(slice, row)| slice.index.row_task_id(row).expect("task id"))
             .collect::<BTreeSet<_>>();
         assert_eq!(
             staged,
-            BTreeSet::from(["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "dddddddddddddddd"]),
-            "the host-shaped windows-link rows and the exactly-labelled tokio row stage; the target shape and the metadata-labelled row do not"
+            BTreeSet::from([published_task_id(&itoa_row()), published_task_id(&twin)]),
+            "only the rows of the twin and its dependency stage; the unpinned nodes' rows holding the twin's key and the task's own row do not"
+        );
+    }
+
+    /// stow#579: a row still labelled with cargo metadata's
+    /// platform-agnostic resolve features is a different node from the
+    /// pinned one — its feature set is in its identity — and stages
+    /// nothing.
+    #[test]
+    fn a_row_at_another_feature_set_is_another_node() {
+        let task = twinned_host_task();
+        let pinned = super::pinned_dependency_ids(&task).expect("pinned subtree");
+        let mut mislabelled = twin_row();
+        mislabelled.features_json =
+            stow_types::identity::FeaturesJson::canonicalize(vec!["std".into(), "alloc".into()])
+                .unwrap();
+        let slices = [index_slice(vec![mislabelled])];
+        assert!(
+            super::candidates(&slices, &pinned, &[])
+                .expect("candidates")
+                .is_empty()
         );
     }
 
@@ -525,15 +692,19 @@ mod tests {
             crate_name: "demo".to_owned(),
             version: semver::Version::new(1, 0, 0),
             features: BTreeSet::from(["std".to_owned()]),
-            host_side: false,
         }];
         let slices = [slice];
-        let hits = super::candidates(&slices, &[], &packages);
+        let pinned = BTreeSet::new();
+        let hits = super::candidates(&slices, &pinned, &packages).expect("candidates");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].1.artifact_kind, ArtifactKind::BuildScript);
         let mut different_features = packages;
         different_features[0].features.clear();
-        assert!(super::candidates(&slices, &[], &different_features).is_empty());
+        assert!(
+            super::candidates(&slices, &pinned, &different_features)
+                .expect("candidates")
+                .is_empty()
+        );
     }
 
     /// stow#717: the candidates are independent round trips, so they
@@ -676,73 +847,5 @@ mod tests {
             assert!(text.contains("2.3.4"), "the row's version: {text}");
             assert!(text.contains("did not verify"), "the verdict: {text}");
         });
-    }
-
-    /// A one-slice fixture around `rows`: the target and rustc are the
-    /// ones the `candidates` matching tests exercise.
-    fn index_slice(rows: Vec<ArtifactIndexRow>) -> stow_cli::build_consume::IndexSlice {
-        stow_cli::build_consume::IndexSlice {
-            manifest_digest: Some("sha256:".to_owned() + &"cd".repeat(32)),
-            index: ArtifactIndex {
-                header: ArtifactIndexHeader {
-                    format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
-                    target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
-                    rustc_version: WireRustcVersion::parse("1.99.0").unwrap(),
-                    generated_at: String::new(),
-                    generation: 1,
-                    row_count: rows.len() as u64,
-                },
-                rows,
-                build_scripts: Vec::new(),
-                local_programs: Vec::new(),
-            },
-        }
-    }
-
-    /// An index row fixture: `compile_key` hashes to `c_metadata`'s prefix
-    /// (canonical rows are keyed so); `side` sets the row's `unit_shape`.
-    fn index_row(
-        name: &str,
-        version: &str,
-        c_metadata: &str,
-        features: &[&str],
-        side: UnitSide,
-    ) -> ArtifactIndexRow {
-        ArtifactIndexRow {
-            dependency_task_ids: Vec::new(),
-            crate_name: CrateName::parse(name).unwrap(),
-            version: CrateVersion::new(semver::Version::parse(version).unwrap()),
-            features_json: FeaturesJson::canonicalize(
-                features.iter().map(|f| (*f).to_owned()).collect(),
-            )
-            .unwrap(),
-            dependency_c_metadata_json: DependencyCMetadataJson::canonicalize(vec![]).unwrap(),
-            c_metadata: CMetadata::parse(c_metadata).unwrap(),
-            compile_key: format!("{c_metadata}{c_metadata}{c_metadata}"),
-            bundle_digest: "sha256:".to_owned() + &"ab".repeat(32),
-            bundle_size: 1,
-            artifact_kind: ArtifactKind::Rlib,
-            crate_types: vec![RustCrateType::Lib],
-            profile: Profile {
-                opt_level: "0".to_owned(),
-                debuginfo: 1,
-                debug_assertions: true,
-                overflow_checks: true,
-                panic: PanicStrategy::Unwind,
-                strip: StripLevel::None,
-            },
-            emit: vec![],
-            unit_shape: shape(side),
-            min_glibc: None,
-            node_profile: stow_types::node_profile::NodeProfile::Dev,
-        }
-    }
-
-    fn shape(side: UnitSide) -> UnitShape {
-        UnitShape {
-            side,
-            invocation: UnitInvocation::Native,
-            kind: UnitKind::Linked,
-        }
     }
 }

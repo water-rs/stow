@@ -5549,15 +5549,15 @@ fn substitution_row_key(
 /// A published row's task identity — same field split as
 /// [`substitution_row_key`].
 fn published_row_identity(slice: &PublishedNodeSlice, row: &PublishedNodeRow) -> TaskNodeIdentity {
-    TaskNodeIdentity {
-        crate_name: row.crate_name.clone(),
-        version: row.version.clone(),
-        features_json: row.features_json.clone(),
-        target: slice.target.clone(),
-        rustc_version: slice.rustc_version.clone(),
-        host_side: row.unit_shape.side == crate::public_cache::UnitSide::Host,
-        profile: row.node_profile,
-    }
+    TaskNodeIdentity::of_published_row(
+        &row.crate_name,
+        &row.version,
+        &row.features_json,
+        &slice.target,
+        &slice.rustc_version,
+        row.unit_shape.side,
+        row.node_profile,
+    )
 }
 
 /// The published side of the serving-pool pick (stow#881): among the
