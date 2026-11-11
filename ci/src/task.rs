@@ -3335,7 +3335,6 @@ mod tests {
 
     /// The `host:` triple the ambient toolchain compiles for — the same
     /// `rustc -vV` probe `active_release` reads its release from.
-    #[cfg(not(windows))]
     fn host_triple() -> String {
         let output = std::process::Command::new("rustc")
             .arg("-vV")
