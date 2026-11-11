@@ -308,6 +308,14 @@ fn validate_consumed_claims(
     index_slices: &[IndexSlice],
 ) -> stow_types::error::Result<()> {
     let mut seen_compile_keys = BTreeSet::<&str>::new();
+    let pinned = if consumed
+        .iter()
+        .any(|claim| claim.kind != stow_types::artifact::ArtifactKind::BuildScript)
+    {
+        crate::consume::pinned_dependency_ids(task)?
+    } else {
+        BTreeSet::new()
+    };
     for claim in consumed {
         if !seen_compile_keys.insert(claim.compile_key.as_str()) {
             return Err(stow_types::stow_error!(
@@ -340,11 +348,18 @@ fn validate_consumed_claims(
                 closure.package_count()
             ));
         }
-        let vouching: Vec<&stow_types::index::ArtifactIndexRow> = index_slices
+        let vouching: Vec<(&IndexSlice, &stow_types::index::ArtifactIndexRow)> = index_slices
             .iter()
             .filter(|slice| slice.index.header.target.as_str() == claim.target)
-            .flat_map(|slice| slice.index.rows.iter().chain(&slice.index.build_scripts))
-            .filter(|row| {
+            .flat_map(|slice| {
+                slice
+                    .index
+                    .rows
+                    .iter()
+                    .chain(&slice.index.build_scripts)
+                    .map(move |row| (slice, row))
+            })
+            .filter(|(_, row)| {
                 canonical_crate_name(row.crate_name.as_str())
                     == canonical_crate_name(claim.crate_name.as_str())
                     && row.version.as_semver() == &claim_version
@@ -370,24 +385,30 @@ fn validate_consumed_claims(
                 claim.target
             ));
         }
-        // A claim may name the task's package only when the vouched row
-        // is the other side's — the outcome-3 twin is a served
-        // dependency like any other (stow#723). A claim for the task's
-        // own unit means its artifact never compiled, so the plan has
-        // nothing to publish.
-        if claim.kind != stow_types::artifact::ArtifactKind::BuildScript
-            && canonical_crate_name(claim.crate_name.as_str())
-                == canonical_crate_name(task.crate_name.as_str())
-            && claim.crate_version == task.version.to_string()
-            && vouching.iter().any(|row| {
-                (row.unit_shape.side == stow_types::public_cache::UnitSide::Host) == task.host_side
-            })
-        {
-            return Err(stow_types::stow_error!(
-                "consumed artifact claims the task's own unit {} {} — each build must compile its own unit",
-                claim.crate_name,
-                claim.crate_version
-            ));
+        // A library is served only from a node of the task's pinned
+        // subtree (#1415). A compile key records no side, so another
+        // node of the same crate can publish the claimed key; the
+        // outcome-3 twin is a subtree node like any other (stow#723),
+        // and the task's own node never is one — a claim on its own
+        // unit means its artifact never compiled, so the plan has
+        // nothing to publish. A build script's row names no node side
+        // to derive an identity from, so it is vouched by the match
+        // alone.
+        if claim.kind != stow_types::artifact::ArtifactKind::BuildScript {
+            let mut vouched = false;
+            for (slice, row) in &vouching {
+                vouched |= crate::consume::published_by_pinned_node(&pinned, slice, row)?;
+            }
+            if !vouched {
+                return Err(stow_types::stow_error!(
+                    "consumed artifact {} {} (compile_key {}, target {}) is vouched only by rows of nodes outside the pinned dependency subtree of task {} — a unit is served only from a node the task pins, and never from its own",
+                    claim.crate_name,
+                    claim.crate_version,
+                    claim.compile_key,
+                    claim.target,
+                    task.task_id
+                ));
+            }
         }
     }
     Ok(())
@@ -592,6 +613,82 @@ mod tests {
             .expect_err("a script alone does not complete the library");
         assert!(
             error.to_string().contains("no build-phase artifact"),
+            "{error}"
+        );
+    }
+
+    /// The claim a build makes for having been served `row`.
+    fn claim_for(row: &stow_types::index::ArtifactIndexRow) -> crate::dep_scan::ConsumedArtifact {
+        crate::dep_scan::ConsumedArtifact {
+            kind: row.artifact_kind.clone(),
+            crate_name: row.crate_name.to_string(),
+            crate_version: row.version.to_string(),
+            compile_key: row.compile_key.clone(),
+            c_metadata: row.c_metadata.to_string(),
+            target: crate::consume::test_support::SLICE_TARGET.to_owned(),
+            rustc_version: "1.99.0".to_owned(),
+            emit: row.emit.clone(),
+        }
+    }
+
+    /// #1415 result A: the pinned twin's unit is claimed and the twin's own
+    /// row vouches for it, although unrelated host and target nodes of the
+    /// same crate published the same compile key.
+    #[test]
+    fn a_pinned_twins_claim_stands_beside_other_nodes_rows_at_its_key() {
+        use crate::consume::test_support::{
+            index_slice, itoa_row, serde_row, twin_row, twinned_host_task,
+        };
+        use stow_types::public_cache::UnitSide;
+        let task = twinned_host_task();
+        let slices = [index_slice(vec![
+            itoa_row(),
+            twin_row(),
+            serde_row(UnitSide::Host, vec!["itoa-1.0.17-unpinned".to_owned()]),
+            serde_row(UnitSide::Target, vec!["bytes-1.11.0-unpinned".to_owned()]),
+        ])];
+        let closure = closure(&[("serde", "1.0.229"), ("itoa", "1.0.18")]);
+        super::validate_consumed_claims(
+            &task,
+            &closure,
+            &[claim_for(&twin_row()), claim_for(&itoa_row())],
+            &slices,
+        )
+        .expect("a claim vouched by a node of the pinned subtree stands");
+    }
+
+    /// #1415 result B: the task's own unit's key, published by a target
+    /// node the task does not pin, vouches for nothing — and the task's
+    /// own published row cannot be claimed either.
+    #[test]
+    fn a_claim_vouched_only_by_nodes_outside_the_subtree_is_rejected() {
+        use crate::consume::test_support::{
+            index_slice, itoa_row, own_row, serde_row, twinned_host_task,
+        };
+        use stow_types::public_cache::UnitSide;
+        let task = twinned_host_task();
+        let closure = closure(&[("serde", "1.0.229"), ("itoa", "1.0.18")]);
+
+        let unpinned = serde_row(UnitSide::Target, vec!["bytes-1.11.0-unpinned".to_owned()]);
+        let slices = [index_slice(vec![itoa_row(), unpinned.clone()])];
+        let error =
+            super::validate_consumed_claims(&task, &closure, &[claim_for(&unpinned)], &slices)
+                .expect_err("a row of a node the task does not pin cannot vouch");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the pinned dependency subtree"),
+            "{error}"
+        );
+
+        let own = own_row();
+        let slices = [index_slice(vec![itoa_row(), own.clone()])];
+        let error = super::validate_consumed_claims(&task, &closure, &[claim_for(&own)], &slices)
+            .expect_err("the task's own unit is never served to it");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the pinned dependency subtree"),
             "{error}"
         );
     }
