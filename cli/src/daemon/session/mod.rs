@@ -139,7 +139,11 @@ impl Session {
         let in_flight = InFlightUnits::default();
         let resolution_done = ResolutionDone::pending();
         let ctx = BuildContext {
-            marks_dir: has_policy.then(|| dir.path().to_owned()),
+            // Every session records its locally built crates: a session
+            // with no cache policy still serves remote artifacts, so a
+            // dependent of a locally built crate must be found and kept
+            // off the cache.
+            marks_dir: Some(dir.path().to_owned()),
             allowed,
             public_cache_target: Some(facts.project.target.clone()),
             public_cache_disabled: facts.public_cache_disabled,
@@ -776,6 +780,12 @@ mod tests {
     /// One registry lib unit the serve map above does not cover, compiling
     /// into `out_dir`.
     fn uncovered_unit(out_dir: &Path) -> Vec<OsString> {
+        uncovered_unit_hashed(out_dir, "abc123")
+    }
+
+    /// [`uncovered_unit`] whose `-C metadata` and `-C extra-filename` carry
+    /// `hash`.
+    fn uncovered_unit_hashed(out_dir: &Path, hash: &str) -> Vec<OsString> {
         let mut unit = ["--crate-name", "demo", "--crate-type", "lib"]
             .map(OsString::from)
             .to_vec();
@@ -787,17 +797,78 @@ mod tests {
         ]);
         unit.extend(
             [
-                "-C",
-                "metadata=abc123",
-                "-C",
-                "extra-filename=-abc123",
-                "--target",
-                HOST_TARGET,
-                "/cargo/registry/src/index.crates.io-0123abcd/demo-1.0.0/src/lib.rs",
+                "-C".to_owned(),
+                format!("metadata={hash}"),
+                "-C".to_owned(),
+                format!("extra-filename=-{hash}"),
+                "--target".to_owned(),
+                HOST_TARGET.to_owned(),
+                "/cargo/registry/src/index.crates.io-0123abcd/demo-1.0.0/src/lib.rs".to_owned(),
             ]
             .map(OsString::from),
         );
         unit
+    }
+
+    /// A session with no cache policy still records the crates it
+    /// compiles locally, so a dependent of one is kept off the cache: it
+    /// would otherwise be served a CI copy built against another copy of
+    /// its dependency (E0460).
+    #[tokio::test]
+    async fn a_session_without_a_policy_keeps_a_locally_built_crates_dependents_local() {
+        const HASH: &str = "0123456789abcdef";
+        let sessions = tempfile::tempdir().expect("sessions directory");
+        let target = tempfile::tempdir().expect("target directory");
+        let built = facts(target.path(), None).await;
+        assert!(
+            built.seed.cache_policy_entries.is_none(),
+            "the session has no cache policy"
+        );
+        let session = Session::open(
+            SessionId::mint(),
+            built,
+            &CacheDirHandles::default(),
+            sessions.path(),
+        )
+        .await
+        .expect("open the session");
+        let out_dir = session.facts.roots.dirs()[0].join("deps");
+
+        // The dependency: the serve map rules it out, so it compiles
+        // locally and the session records it.
+        let env = InvocationEnv::for_tests();
+        let verified = VerifiedInvocation::verify(
+            &session.env_cache.toolchain,
+            Some(&session.facts.roots),
+            session.env_cache.toolchain.rustc().as_os_str().to_owned(),
+            uncovered_unit_hashed(&out_dir, HASH),
+            &env,
+        )
+        .await
+        .expect("the session's own rustc passes verification");
+        assert!(matches!(
+            session.plan(verified, env).await,
+            Decision::Compile(_)
+        ));
+
+        let mut dependent = uncovered_unit_hashed(&out_dir, "fedcba9876543210");
+        let source = dependent.len() - 1;
+        dependent.splice(
+            source..source,
+            [
+                OsString::from("--extern"),
+                OsString::from(format!(
+                    "demo={}",
+                    out_dir.join(format!("libdemo-{HASH}.rlib")).display()
+                )),
+            ],
+        );
+        let dependent = rustc_args::ParsedRustcArgs::parse(&dependent).expect("parse dependent");
+        assert!(
+            crate::must_build_locally(&dependent, HOST_TARGET, Some(session.dir.path())),
+            "a dependent of a locally built crate must build locally"
+        );
+        session.end().await.expect("end the session");
     }
 
     /// What a session decided about the unit, compiling under the
