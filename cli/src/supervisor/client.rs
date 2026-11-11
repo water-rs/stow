@@ -99,19 +99,21 @@ impl Connection {
         match self.exchange(&Request::Plan(plan)).await? {
             Answer::Served(notifications) => Ok(Decision::Served(notifications)),
             Answer::Compile { ticket } => Ok(Decision::Compile(Ticket { ticket })),
-            Answer::Recorded | Answer::ServeMapReady => {
+            Answer::Received | Answer::ServeMapReady => {
                 Err("supervisor answered a plan with an answer that is not a decision".to_owned())
             }
             Answer::Failed { message } => Err(message),
         }
     }
 
-    /// Report the compile the supervisor asked for.
+    /// Report the compile the supervisor asked for and wait for its
+    /// receipt. The receipt precedes the supervisor's bookkeeping, so the
+    /// facade exits as soon as rustc has and its unit is already recorded
+    /// as exited (stow#1431).
     ///
     /// # Errors
     ///
-    /// Transport failures, and a supervisor that answers with a failure of
-    /// its own.
+    /// Transport failures, and a supervisor that refuses the report.
     pub async fn report(
         &mut self,
         ticket: &Ticket,
@@ -125,7 +127,7 @@ impl Connection {
             compile_millis: crate::duration_millis(compile_time),
         };
         match self.exchange(&Request::Compiled(report)).await? {
-            Answer::Recorded => Ok(()),
+            Answer::Received => Ok(()),
             Answer::Failed { message } => Err(message),
             Answer::Served(..) | Answer::Compile { .. } | Answer::ServeMapReady => {
                 Err("supervisor answered a report with a plan answer".to_owned())
@@ -181,28 +183,36 @@ impl Connection {
                 Stream::Unix(stream) => exchange_on(stream, request).await,
                 Stream::Loopback(stream) => exchange_on(stream, request).await,
             },
-            ConnectionInner::Ipc { client, connection } => {
-                let mut ipc = client
-                    .take()
-                    .expect("the IPC client is restored after every call");
-                let call = IpcCall {
-                    connection: *connection,
-                    body: IpcCallBody::Request(request.clone()),
-                };
-                let (ipc, answer) = smol::unblock(move || {
-                    let answer = ipc
-                        .call::<_, Option<Answer>>(IPC_METHOD, &call)
-                        .map_err(|error| format!("supervisor IPC call: {error}"));
-                    (ipc, answer)
-                })
-                .await;
-                *client = Some(ipc);
-                answer?.ok_or_else(|| {
-                    "supervisor IPC answered a two-way request with nothing".to_owned()
-                })
-            }
+            ConnectionInner::Ipc { client, connection } => ipc_call(client, *connection, request)
+                .await?
+                .ok_or_else(|| "supervisor IPC answered a two-way request with nothing".to_owned()),
         }
     }
+}
+
+/// One IPC call carrying `request`, on the worker thread: the client
+/// leaves its slot for the call and is always put back.
+async fn ipc_call(
+    client: &mut Option<heel::IpcClient>,
+    connection: u64,
+    request: &Request,
+) -> Result<Option<Answer>, String> {
+    let mut ipc = client
+        .take()
+        .expect("the IPC client is restored after every call");
+    let call = IpcCall {
+        connection,
+        body: IpcCallBody::Request(request.clone()),
+    };
+    let (ipc, answer) = smol::unblock(move || {
+        let answer = ipc
+            .call::<_, Option<Answer>>(IPC_METHOD, &call)
+            .map_err(|error| format!("supervisor IPC call: {error}"));
+        (ipc, answer)
+    })
+    .await;
+    *client = Some(ipc);
+    answer
 }
 
 async fn exchange_on<S>(stream: &mut S, request: &Request) -> Result<Answer, String>

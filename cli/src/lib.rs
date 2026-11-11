@@ -141,7 +141,7 @@ pub fn run() -> stow_types::error::Result<()> {
     }
     // An uncovered rustc invocation needs no runtime: the serve map the
     // driver built answers the decision, and the compile's bookkeeping is
-    // two one-way frames. Everything the runtime would buy — the provider
+    // a one-way mark and a report answered by a receipt. Everything the runtime would buy — the provider
     // install, tracing, the tokio stack — is the per-invocation cost this
     // build pays hundreds of times.
     if let facade::FastPath::Handled(status) = facade::try_invocation()? {
@@ -1438,6 +1438,16 @@ impl supervisor::server::Handler for BuildSupervisor {
         let Some(parsed) = classify_or_log(classified, &args) else {
             return supervisor::server::Decision::Compile(Box::new(PostCompile::raw(&executable)));
         };
+        // Every lookup the decision makes reads the `--extern`
+        // dependencies' `materialized_outputs` rows, and a facade exits
+        // with its rustc: a dependency cargo finished before starting
+        // this unit may still be writing them. Wait for the ones whose
+        // rustc has exited — not for one still compiling, which a
+        // pipelined unit plans against unrecorded, as it always did
+        // (stow#1431). The dependency's flight also spans its store,
+        // which `load_cached_bundle_by_compile_key` in the serve binding
+        // reads from the dependent's plan.
+        self.ctx.in_flight.wait_for_exited_externs(&parsed).await;
         match decide_rustc_invocation(
             &executable,
             parsed,
@@ -7731,9 +7741,9 @@ mod tests {
             (config, in_flight, handler)
         }
 
-        /// The raw facade transport: `Observed` frames are one-way, so
-        /// the test writes them itself rather than going through the
-        /// client connection.
+        /// The raw facade transport: the test writes the `Observed`
+        /// frames itself rather than going through the client
+        /// connection.
         #[cfg(unix)]
         async fn connect_raw(endpoint: &Endpoint) -> tokio::net::UnixStream {
             let Endpoint::Unix(path) = endpoint else {
@@ -7755,13 +7765,17 @@ mod tests {
                 .expect("connect to the supervisor")
         }
 
+        /// Write one `Observed` frame. A mark (`success: None`) is
+        /// one-way; a report is answered with its receipt, which this
+        /// reads — the receipt precedes the report's bookkeeping, so it
+        /// returns while the bookkeeping may still be running.
         async fn send_observed<S>(
             stream: &mut S,
             token: &str,
             args: &[OsString],
             success: Option<bool>,
         ) where
-            S: tokio::io::AsyncWrite + Unpin + Send,
+            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
         {
             let frame = Observed::new(
                 token.to_owned(),
@@ -7774,6 +7788,17 @@ mod tests {
             write_frame(&mut *stream, &Request::Observed(frame))
                 .await
                 .expect("write the observation frame");
+            if success.is_some() {
+                let answer: Option<crate::supervisor::protocol::Answer> =
+                    crate::supervisor::protocol::read_frame(&mut *stream)
+                        .await
+                        .expect("read the report's receipt");
+                assert_eq!(
+                    answer,
+                    Some(crate::supervisor::protocol::Answer::Received),
+                    "a report is answered with a receipt"
+                );
+            }
         }
 
         /// Guarantee the frames already written on `stream` have been
@@ -8125,6 +8150,105 @@ mod tests {
                 stored_crates(&config).await.is_empty(),
                 "a dependent whose dependency never recorded is not stored"
             );
+        }
+
+        /// A facade exits with its rustc, so a dependent cargo starts
+        /// after a unit finished can plan before the unit's rows are
+        /// written: the plan waits for a unit whose rustc has exited, and
+        /// does not wait for one that is still compiling (stow#1431).
+        #[tokio::test]
+        async fn a_plan_waits_for_an_exited_dependencys_rows() {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("deps");
+            std::fs::create_dir_all(&out_dir).expect("create deps dir");
+            let registry_src = tempdir.path().join("cargo_home/registry/src");
+
+            let (_config, in_flight, handler) = fixture(tempdir.path()).await;
+            let supervisor = server::start(
+                Arc::clone(&handler),
+                in_flight.clone(),
+                &std::env::current_exe().expect("current exe"),
+            )
+            .expect("start supervisor");
+            let [(_, endpoint), (_, token), _] = supervisor.env();
+            let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
+
+            // `base` compiles; `mid` is compiled against it; `top` is
+            // planned against `mid`.
+            let base_args = unit_args(&registry_src, &out_dir, "base", "1.0.0", "basemeta", &[]);
+            let base_rlib = out_dir.join("libbase-basemeta.rlib");
+            let mid_args = unit_args(
+                &registry_src,
+                &out_dir,
+                "mid",
+                "1.0.0",
+                "midmeta",
+                &[("base", &base_rlib)],
+            );
+            write_outputs(&out_dir, "mid", "midmeta");
+            let mid_rlib = out_dir.join("libmid-midmeta.rlib");
+            let top_args = unit_args(
+                &registry_src,
+                &out_dir,
+                "top",
+                "1.0.0",
+                "topmeta",
+                &[("mid", &mid_rlib)],
+            );
+            let plan_top = |handler: &Arc<BuildSupervisor>| {
+                let handler = Arc::clone(handler);
+                let args = top_args.clone();
+                tokio::spawn(async move {
+                    handler
+                        .plan(
+                            OsString::from("rustc"),
+                            args,
+                            crate::supervisor::protocol::InvocationEnv::default(),
+                        )
+                        .await
+                })
+            };
+
+            // `base` is compiling for the whole test until its connection
+            // ends, and `mid`'s mark has landed: both are in flight.
+            let mut base_conn = connect_raw(&endpoint).await;
+            send_observed(&mut base_conn, &token, &base_args, None).await;
+            flush_frames(&mut base_conn, &token).await;
+            let mut mid_conn = connect_raw(&endpoint).await;
+            send_observed(&mut mid_conn, &token, &mid_args, None).await;
+            flush_frames(&mut mid_conn, &token).await;
+
+            // `mid` is still compiling: a plan against it is not held.
+            let decision = tokio::time::timeout(Duration::from_secs(10), plan_top(&handler))
+                .await
+                .expect("a plan against a unit still compiling is not held")
+                .expect("join the plan");
+            assert!(matches!(decision, server::Decision::Compile(_)));
+
+            // `mid`'s rustc exits. Its bookkeeping parks on `base`'s
+            // flight, so its rows are pending while its facade is gone.
+            send_observed(&mut mid_conn, &token, &mid_args, Some(true)).await;
+            let base_rlib =
+                crate::artifact_cache::path_to_string(&base_rlib).expect("utf-8 extern path");
+            in_flight.parked_on(&base_rlib, 1).await;
+
+            let mid_rlib =
+                crate::artifact_cache::path_to_string(&mid_rlib).expect("utf-8 extern path");
+            let planning = plan_top(&handler);
+            in_flight.parked_on(&mid_rlib, 1).await;
+            assert!(
+                !planning.is_finished(),
+                "the plan ran before the dependency's rows landed"
+            );
+
+            // `base`'s flight ends: `mid`'s bookkeeping runs to its end,
+            // and the plan is released.
+            drop(base_conn);
+            let decision = tokio::time::timeout(Duration::from_secs(10), planning)
+                .await
+                .expect("the plan is released once the rows' leg ends")
+                .expect("join the plan");
+            assert!(matches!(decision, server::Decision::Compile(_)));
         }
 
         /// A build script is an output of its crate's node, so its

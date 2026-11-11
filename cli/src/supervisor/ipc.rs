@@ -64,7 +64,7 @@ pub struct IpcCall {
 pub enum IpcCallBody {
     /// One `Request` frame; the call's response carries the `Answer`
     /// the socket transport would have written, `None` for the one-way
-    /// `Observed`.
+    /// `Observed` mark.
     Request(Request),
     /// The conversation is over: drop the marks it still holds, the
     /// teardown a socket close performs.
@@ -77,6 +77,12 @@ pub enum IpcCallBody {
 /// the flight the same way the socket teardown does (stow#618).
 type Conversations = Arc<Mutex<HashMap<u64, Vec<ConnectionMark>>>>;
 
+/// The running bookkeeping of the reports. A report's call returns its
+/// receipt at once — the facade must not wait for its bookkeeping, as it
+/// does not on the socket transport — so the bookkeeping outlives the
+/// call and the shutdown drain is what waits for it (stow#1431).
+type Reports = Arc<Mutex<tokio::task::JoinSet<()>>>;
+
 /// The `heel::IpcCommand` serving one build's supervisor requests.
 ///
 /// Every field names the same state the socket supervisor's accept task
@@ -88,6 +94,10 @@ struct SupervisorIpc<H: Handler> {
     token: String,
     in_flight: InFlightUnits,
     conversations: Conversations,
+    /// The bookkeeping tasks the reports spawned: the sandboxed
+    /// build's equivalent of the socket supervisor's connection set,
+    /// drained at shutdown (stow#1431).
+    reports: Reports,
     /// The build's tokio runtime. Heel serves IPC calls on its own
     /// executor, and the supervisor's work — `spawn_blocking` probes,
     /// `tokio` timers — wants a reactor: `handle` spawns each answer
@@ -113,6 +123,7 @@ impl<H: Handler> heel::ipc::IpcCommand for SupervisorIpc<H> {
         let tickets = self.tickets.clone();
         let token = self.token.clone();
         let in_flight = self.in_flight.clone();
+        let reports = Arc::clone(&self.reports);
         let rt = self.rt.clone();
         async move {
             Ok(match call.body {
@@ -140,15 +151,16 @@ impl<H: Handler> heel::ipc::IpcCommand for SupervisorIpc<H> {
                     // free to serve the next call — with owned inputs so
                     // the task is 'static; the marks ride in and back so
                     // they can be parked under the lock again.
-                    let (mut marks, answer) = rt
+                    let (mut marks, reply) = rt
                         .spawn({
+                            let handler = Arc::clone(&handler);
                             let mut marks = marks;
                             async move {
-                                let answer = server::answer_request(
+                                let reply = server::answer_request(
                                     &handler, &tickets, &token, &in_flight, &mut marks, request,
                                 )
                                 .await;
-                                (marks, answer)
+                                (marks, reply)
                             }
                         })
                         .await
@@ -159,6 +171,21 @@ impl<H: Handler> heel::ipc::IpcCommand for SupervisorIpc<H> {
                         .entry(call.connection)
                         .or_default()
                         .append(&mut marks);
+                    let (answer, work) = reply.split();
+                    // A report's receipt has fired the unit's `exited`
+                    // latch; its bookkeeping runs on its own task, the
+                    // call returns the receipt at once, and the shutdown
+                    // drain waits for the task (stow#1431).
+                    if let Some(work) = work {
+                        let mut reports = reports.lock().expect("supervisor reports mutex");
+                        // Reap the bookkeeping that already ended so the
+                        // set holds only what still runs.
+                        while reports.try_join_next().is_some() {}
+                        reports.spawn_on(
+                            async move { server::finish_report(&handler, work).await },
+                            &rt,
+                        );
+                    }
                     answer
                 }
             })
@@ -174,6 +201,7 @@ pub struct PendingSupervisor {
     token: String,
     binary: BinaryIdentity,
     conversations: Conversations,
+    reports: Reports,
     tickets_task: tokio::task::JoinHandle<()>,
 }
 
@@ -185,6 +213,7 @@ pub struct SandboxedSupervisor {
     token: String,
     binary: BinaryIdentity,
     conversations: Conversations,
+    reports: Reports,
     tickets_task: tokio::task::JoinHandle<()>,
 }
 
@@ -208,12 +237,14 @@ pub fn start<H: Handler>(
     let (tickets, ticket_rx) = mpsc::unbounded_channel::<Ticket<H::Pending>>();
     let tickets_task = tokio::spawn(server::run_tickets(ticket_rx));
     let conversations: Conversations = Arc::new(Mutex::new(HashMap::new()));
+    let reports: Reports = Arc::default();
     let command = SupervisorIpc {
         handler,
         tickets,
         token: token.clone(),
         in_flight,
         conversations: Arc::clone(&conversations),
+        reports: Arc::clone(&reports),
         rt: tokio::runtime::Handle::current(),
     };
     Ok((
@@ -221,6 +252,7 @@ pub fn start<H: Handler>(
             token,
             binary,
             conversations,
+            reports,
             tickets_task,
         },
         heel::IpcRouter::new().register(command),
@@ -236,6 +268,7 @@ impl PendingSupervisor {
             token: self.token,
             binary: self.binary,
             conversations: self.conversations,
+            reports: self.reports,
             tickets_task: self.tickets_task,
         }
     }
@@ -253,10 +286,28 @@ impl SandboxedSupervisor {
         ]
     }
 
-    /// The build is over: drop the conversations, which completes every
-    /// flight still marked the way the socket drain does, and stop the
-    /// ticket task — the router itself goes down with the sandbox.
-    pub fn shutdown(&self) {
+    /// The build is over: wait for the reports' bookkeeping still running
+    /// — bounded like the socket drain, for the same reason — then drop
+    /// the conversations, which completes every flight still marked the
+    /// way the socket drain does, and stop the ticket task — the router
+    /// itself goes down with the sandbox (stow#618, stow#1431).
+    pub async fn shutdown(&self) {
+        let mut reports =
+            std::mem::take(&mut *self.reports.lock().expect("supervisor reports mutex"));
+        let drained = tokio::time::timeout(server::CONNECTION_DRAIN_BUDGET, async {
+            while let Some(result) = reports.join_next().await {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "supervisor report task failed");
+                }
+            }
+        })
+        .await;
+        if drained.is_err() {
+            tracing::warn!(
+                abandoned = reports.len(),
+                "supervisor shutdown abandoned in-flight report bookkeeping"
+            );
+        }
         self.conversations
             .lock()
             .expect("supervisor conversations mutex")
