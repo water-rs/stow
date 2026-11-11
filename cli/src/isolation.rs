@@ -10,7 +10,7 @@
 //! |---|---|---|---|
 //! | `protect` (default except on Windows) | denylist: credential stores unreadable, persistence locations unwritable, everything else as usual | credential variables stripped | allowed through heel's proxy, destinations recorded |
 //! | `strict` (default on Windows) | allowlist: workspace, target dir, toolchain, cargo registry and stow's shims; home never granted | allowlist | allowed through the proxy, recorded |
-//! | `offline` | as `strict` | as `strict` | denied; the supervisor's IPC socket is the only channel |
+//! | `offline` | as `strict` | as `strict` | denied; the driver's relay socket is the only channel |
 //! | `off` | no isolation | untouched | unrestricted |
 //!
 //! The level is one option in the global config, `[isolation] level`, overridden

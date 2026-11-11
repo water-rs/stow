@@ -12,7 +12,10 @@
 //! stow spends more wall-clock warming a unit than compiling it would have
 //! cost, the trade is a loss no matter how the fetch goes.
 
+use std::ffi::OsStr;
 use std::time::{Duration, Instant};
+
+use crate::session_env::SessionEnv;
 
 /// Wall-clock stow is willing to spend warming one cached unit.
 ///
@@ -42,11 +45,13 @@ impl CacheBudget {
     /// Budget for a graph the edge says has `covered_units` cached artifacts.
     ///
     /// Zero coverage yields a zero budget: there is nothing to warm, so any
-    /// time spent is pure loss.
+    /// time spent is pure loss. The override is read from the build's own
+    /// environment `env`.
     #[must_use]
-    pub fn for_covered_units(covered_units: usize) -> Self {
-        let total = std::env::var(STOW_CACHE_BUDGET_SECS_ENV)
-            .ok()
+    pub fn for_covered_units(covered_units: usize, env: &SessionEnv) -> Self {
+        let total = env
+            .var_os(STOW_CACHE_BUDGET_SECS_ENV)
+            .and_then(OsStr::to_str)
             .and_then(|raw| raw.parse::<u64>().ok())
             .map_or_else(
                 || {
@@ -77,31 +82,46 @@ impl CacheBudget {
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheBudget, MAX_BUDGET, PER_UNIT_ALLOWANCE};
+    use std::ffi::OsStr;
+    use std::time::Duration;
+
+    use super::{CacheBudget, MAX_BUDGET, PER_UNIT_ALLOWANCE, STOW_CACHE_BUDGET_SECS_ENV};
+    use crate::session_env::SessionEnv;
 
     #[test]
     fn nothing_cached_earns_no_budget() {
-        let budget = CacheBudget::for_covered_units(0);
+        let budget = CacheBudget::for_covered_units(0, &SessionEnv::for_tests([]));
         assert!(budget.total().is_zero());
     }
 
     #[test]
     fn budget_scales_with_the_units_the_cache_can_serve() {
         assert_eq!(
-            CacheBudget::for_covered_units(20).total(),
+            CacheBudget::for_covered_units(20, &SessionEnv::for_tests([])).total(),
             PER_UNIT_ALLOWANCE * 20
         );
     }
 
     #[test]
     fn budget_is_capped_however_large_the_graph() {
+        let env = SessionEnv::for_tests([]);
         assert_eq!(
-            CacheBudget::for_covered_units(1_000_000).total(),
+            CacheBudget::for_covered_units(1_000_000, &env).total(),
             MAX_BUDGET
         );
         assert_eq!(
-            CacheBudget::for_covered_units(usize::MAX).total(),
+            CacheBudget::for_covered_units(usize::MAX, &env).total(),
             MAX_BUDGET
+        );
+    }
+
+    /// The override is the build's own variable, not the process's.
+    #[test]
+    fn the_override_is_read_from_the_given_environment() {
+        let env = SessionEnv::for_tests([(STOW_CACHE_BUDGET_SECS_ENV, OsStr::new("7"))]);
+        assert_eq!(
+            CacheBudget::for_covered_units(20, &env).total(),
+            Duration::from_secs(7)
         );
     }
 }

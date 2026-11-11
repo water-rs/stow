@@ -31,19 +31,18 @@
 //! `-C extra-filename`, and no consumer can link an output whose file name
 //! carries no hash.
 //!
-//! The markers live beside the cache-policy allow markers, in the
-//! per-build directory the driver hands its supervisor and wrappers as
-//! `STOW_CACHE_POLICY_PATH`. Cargo runs a unit only after its
-//! dependencies, so a dependency's marker is on disk before any consumer
-//! asks about it. Without that directory (a bare `stow rustc` outside
-//! `stow check`) there is no build to reason about and nothing is
+//! The markers live in the build's session directory, which only the
+//! process deciding the build's units writes. Cargo runs a unit only after
+//! its dependencies, so a dependency's marker is on disk before any
+//! consumer asks about it. Without that directory (a bare `stow rustc`
+//! outside `stow check`) there is no build to reason about and nothing is
 //! recorded or refused.
 
 use std::path::{Path, PathBuf};
 
 use stow_types::rustc::ParsedExternCrate;
 
-/// Subdirectory of the per-build policy directory holding one marker per
+/// Subdirectory of the build's session directory holding one marker per
 /// locally compiled artifact.
 const LOCAL_BUILD_DIR: &str = "local-build";
 
@@ -58,10 +57,10 @@ const LOCAL_BUILD_DIR: &str = "local-build";
 /// for a consumer to name — a build-script probe is exactly such a unit —
 /// so it records nothing.
 ///
-/// Silently does nothing when the invocation carries no per-build policy
-/// directory: there is no build-wide view to record into.
+/// Silently does nothing when the build has no session directory: there is
+/// no build-wide view to record into.
 pub async fn record_local_build(
-    policy_dir: Option<&Path>,
+    session_dir: Option<&Path>,
     target: &str,
     crate_name: &str,
     extra_filename: &str,
@@ -69,7 +68,7 @@ pub async fn record_local_build(
     if extra_filename.is_empty() {
         return Ok(());
     }
-    let Some(dir) = policy_dir.map(|policy_dir| marker_dir(policy_dir, target)) else {
+    let Some(dir) = session_dir.map(|session_dir| marker_dir(session_dir, target)) else {
         return Ok(());
     };
     async_fs::create_dir_all(&dir)
@@ -90,17 +89,17 @@ pub async fn record_local_build(
 /// cargo is about to hand this invocation.
 ///
 /// `None` when every dependency can still come from the cache, when the
-/// unit has no dependencies, and when the invocation has no per-build
-/// policy directory to consult.
+/// unit has no dependencies, and when the build has no session directory
+/// to consult.
 pub fn locally_built_dependency(
-    policy_dir: Option<&Path>,
+    session_dir: Option<&Path>,
     target: &str,
     extern_crates: &[ParsedExternCrate],
 ) -> Option<String> {
     if extern_crates.is_empty() {
         return None;
     }
-    let dir = marker_dir(policy_dir?, target);
+    let dir = marker_dir(session_dir?, target);
     locally_built_dependency_in(&dir, extern_crates)
 }
 
@@ -142,8 +141,8 @@ fn artifact_marker_name(path: &Path) -> Option<String> {
     Some(stem.to_owned())
 }
 
-fn marker_dir(policy_dir: &Path, target: &str) -> PathBuf {
-    policy_dir.join(LOCAL_BUILD_DIR).join(target)
+fn marker_dir(session_dir: &Path, target: &str) -> PathBuf {
+    session_dir.join(LOCAL_BUILD_DIR).join(target)
 }
 
 /// The marker one locally compiled artifact carries: the crate name in

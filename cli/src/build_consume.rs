@@ -17,8 +17,8 @@ use crate::verify;
 use crate::config::StowConfig;
 use crate::state_db::StateDb;
 
+pub use crate::daemon::wrapper::ArtifactNotifications;
 pub use crate::index::IndexSlice;
-pub use crate::supervisor::protocol::ArtifactNotifications;
 
 /// The `--json=…artifacts…` notification lines a served unit owes cargo.
 ///

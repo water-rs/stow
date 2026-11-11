@@ -10,10 +10,10 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-use async_process::Command;
 use same_file::Handle;
 
 use crate::rustc_args::{self, BuildRustc};
+use crate::session_env::SessionEnv;
 
 /// The build's rustc and the facts probed from it.
 #[derive(Debug)]
@@ -29,12 +29,16 @@ pub struct BuildToolchain {
     /// `<sysroot>/bin/rustc`; cargo hands its wrapper one or the other
     /// depending on whether it took its rustup bypass.
     launcher_file: Handle,
+    /// The path `launcher_file` was found at.
+    launcher: PathBuf,
     /// The configured `RUSTC_WORKSPACE_WRAPPER`, which cargo runs with the
-    /// rustc as its first argument for workspace members.
-    workspace_wrapper: Option<Handle>,
-    /// The `PATH` bare spellings resolve through, read when the toolchain
-    /// was resolved.
-    search_path: OsString,
+    /// rustc as its first argument for workspace members, and the path it
+    /// was found at.
+    workspace_wrapper: Option<(PathBuf, Handle)>,
+    /// The environment the toolchain was resolved in: its `PATH` and
+    /// working directory are what bare and relative spellings resolve
+    /// against, and the rustc probes run in it.
+    env: SessionEnv,
     /// The rustc's own `host:` triple — where a unit with no `--target`
     /// compiles, which is not the consumer target under a `--target` build.
     host_target: String,
@@ -47,7 +51,8 @@ pub struct BuildToolchain {
 impl BuildToolchain {
     /// Resolve the toolchain of the build's rustc from the driver's shared
     /// `rustc -vV`. `workspace_wrapper` is the configured
-    /// `RUSTC_WORKSPACE_WRAPPER`, when there is one.
+    /// `RUSTC_WORKSPACE_WRAPPER`, when there is one; `env` is the build's
+    /// environment, which bare spellings resolve in.
     ///
     /// # Errors
     ///
@@ -57,6 +62,7 @@ impl BuildToolchain {
         build_rustc: &BuildRustc,
         workspace_wrapper: Option<PathBuf>,
         vv: &rustc_args::SharedRustcVv,
+        env: &SessionEnv,
     ) -> Result<Self, String> {
         let (spelling, vv) =
             tokio::join!(build_rustc.facade_spelling(), async { vv.clone().await });
@@ -65,19 +71,21 @@ impl BuildToolchain {
             build_rustc.executable().to_owned(),
             workspace_wrapper,
             &vv?,
+            env,
         )
         .await
     }
 
     /// Resolve the toolchain of the rustc a standalone wrapper was invoked
-    /// for: the user's own process runs the user's own rustc.
+    /// for: the user's own process runs the user's own rustc, in the
+    /// environment `env` names — its own.
     ///
     /// # Errors
     ///
     /// As [`Self::for_build`].
-    pub async fn for_executable(executable: &OsStr) -> Result<Self, String> {
+    pub async fn for_executable(executable: &OsStr, env: &SessionEnv) -> Result<Self, String> {
         let vv = rustc_args::rustc_vv(executable).await?;
-        Self::from_probe(executable.to_owned(), executable.to_owned(), None, &vv).await
+        Self::from_probe(executable.to_owned(), executable.to_owned(), None, &vv, env).await
     }
 
     async fn from_probe(
@@ -85,31 +93,38 @@ impl BuildToolchain {
         launcher: OsString,
         workspace_wrapper: Option<PathBuf>,
         vv: &str,
+        env: &SessionEnv,
     ) -> Result<Self, String> {
         let host_target = rustc_args::vv_host(vv)?;
         let release = rustc_args::vv_release(vv)?;
-        let search_path = std::env::var_os("PATH").unwrap_or_default();
-        let files = {
-            let search_path = search_path.clone();
-            tokio::task::spawn_blocking(move || {
-                let (rustc, rustc_file) = resolve_file(&spelling, &search_path)?;
-                let (_, launcher_file) = resolve_file(&launcher, &search_path)?;
-                let workspace_wrapper = workspace_wrapper
-                    .map(|wrapper| resolve_file(wrapper.as_os_str(), &search_path))
-                    .transpose()?
-                    .map(|(_, file)| file);
-                Ok::<_, String>((rustc, rustc_file, launcher_file, workspace_wrapper))
-            })
-            .await
-            .map_err(|error| format!("join the rustc resolution task: {error}"))??
-        };
-        let (rustc, rustc_file, launcher_file, workspace_wrapper) = files;
+        let env = env.clone();
+        let (files, env) = tokio::task::spawn_blocking(move || {
+            let (rustc, rustc_file) = resolve_file(&spelling, &env, env.cwd())?;
+            let (launcher, launcher_file) = resolve_file(&launcher, &env, env.cwd())?;
+            let workspace_wrapper = workspace_wrapper
+                .map(|wrapper| resolve_file(wrapper.as_os_str(), &env, env.cwd()))
+                .transpose()?;
+            Ok::<_, String>((
+                (
+                    rustc,
+                    rustc_file,
+                    launcher,
+                    launcher_file,
+                    workspace_wrapper,
+                ),
+                env,
+            ))
+        })
+        .await
+        .map_err(|error| format!("join the rustc resolution task: {error}"))??;
+        let (rustc, rustc_file, launcher, launcher_file, workspace_wrapper) = files;
         Ok(Self {
             rustc,
             rustc_file,
             launcher_file,
+            launcher,
             workspace_wrapper,
-            search_path,
+            env,
             host_target,
             release,
             native_cpu: tokio::sync::OnceCell::new(),
@@ -141,7 +156,9 @@ impl BuildToolchain {
     pub async fn native_cpu(&self) -> Option<&str> {
         self.native_cpu
             .get_or_init(|| async {
-                Command::new(&self.rustc)
+                self.env
+                    .command(&self.rustc)
+                    .ok()?
                     .arg("--print")
                     .arg("target-cpus")
                     .output()
@@ -155,24 +172,99 @@ impl BuildToolchain {
             .as_deref()
     }
 
-    /// Whether `spelling` names this toolchain's rustc — the toolchain
-    /// file or the file the driver launches it through: a bare name
-    /// resolves through the `PATH` the toolchain was resolved under, and
+    /// Whether `spelling`, written in a process running in `cwd`, names
+    /// this toolchain's rustc — the toolchain file or the file the driver
+    /// launches it through: a bare name resolves through the environment
+    /// the toolchain was resolved under ([`SessionEnv::resolve_program`]),
+    /// a relative path against `cwd`, and
     /// files are compared by identity, not by string (stow#608). Stats
     /// the file system; callers run it off the runtime workers.
     #[must_use]
-    pub fn is_rustc(&self, spelling: &OsStr) -> bool {
-        resolve_file(spelling, &self.search_path)
+    pub fn is_rustc(&self, spelling: &OsStr, cwd: &Path) -> bool {
+        resolve_file(spelling, &self.env, cwd)
             .is_ok_and(|(_, file)| file == self.rustc_file || file == self.launcher_file)
     }
 
-    /// Whether `spelling` names the configured workspace wrapper.
+    /// Whether `spelling`, written in a process running in `cwd`, names
+    /// the configured workspace wrapper.
     #[must_use]
-    pub fn is_workspace_wrapper(&self, spelling: &OsStr) -> bool {
+    pub fn is_workspace_wrapper(&self, spelling: &OsStr, cwd: &Path) -> bool {
         self.workspace_wrapper
             .as_ref()
-            .is_some_and(|wrapper| names_file(spelling, &self.search_path, wrapper))
+            .is_some_and(|(_, wrapper)| names_file(spelling, &self.env, cwd, wrapper))
     }
+
+    /// The facts another process needs to rebuild this toolchain: paths
+    /// and probed answers, never file handles.
+    #[must_use]
+    pub fn facts(&self) -> ToolchainFacts {
+        ToolchainFacts {
+            rustc: self.rustc.clone(),
+            launcher: self.launcher.clone(),
+            workspace_wrapper: self
+                .workspace_wrapper
+                .as_ref()
+                .map(|(path, _)| path.clone()),
+            host_target: self.host_target.clone(),
+            release: self.release.clone(),
+        }
+    }
+
+    /// The toolchain `facts` describe, with every file reopened here: a
+    /// file handle is a fact of the process that opened it, so only the
+    /// paths travel. `env` is the build's environment, which relative and
+    /// bare spellings in later requests resolve in.
+    ///
+    /// # Errors
+    ///
+    /// A file the facts name cannot be opened: the toolchain changed
+    /// between the driver's resolution and this one.
+    pub async fn from_facts(facts: ToolchainFacts, env: &SessionEnv) -> Result<Self, String> {
+        let env = env.clone();
+        tokio::task::spawn_blocking(move || {
+            let identify = |path: &Path| {
+                Handle::from_path(path)
+                    .map_err(|error| format!("identify {}: {error}", path.display()))
+            };
+            let rustc_file = identify(&facts.rustc)?;
+            let launcher_file = identify(&facts.launcher)?;
+            let workspace_wrapper = facts
+                .workspace_wrapper
+                .map(|path| identify(&path).map(|file| (path, file)))
+                .transpose()?;
+            Ok(Self {
+                rustc: facts.rustc,
+                rustc_file,
+                launcher_file,
+                launcher: facts.launcher,
+                workspace_wrapper,
+                env,
+                host_target: facts.host_target,
+                release: facts.release,
+                native_cpu: tokio::sync::OnceCell::new(),
+            })
+        })
+        .await
+        .map_err(|error| format!("join the toolchain reopen task: {error}"))?
+    }
+}
+
+/// What a [`BuildToolchain`] is, as data: the resolved paths of the rustc,
+/// the file the driver launches it through and the workspace wrapper, and
+/// the answers probed from the rustc. The receiving process reopens the
+/// files itself.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolchainFacts {
+    /// The rustc file.
+    pub rustc: PathBuf,
+    /// The file the build's own rustc spelling resolves to.
+    pub launcher: PathBuf,
+    /// The configured `RUSTC_WORKSPACE_WRAPPER`, when there is one.
+    pub workspace_wrapper: Option<PathBuf>,
+    /// The rustc's `host:` triple.
+    pub host_target: String,
+    /// The rustc's `release:` version.
+    pub release: String,
 }
 
 #[cfg(test)]
@@ -180,30 +272,31 @@ impl BuildToolchain {
     /// The test environment's own `rustc`, resolved through `PATH` as a
     /// standalone wrapper resolves its.
     pub async fn for_tests() -> std::sync::Arc<Self> {
-        std::sync::Arc::new(
-            Self::for_executable(OsStr::new("rustc"))
-                .await
-                .expect("resolve the test environment's rustc"),
-        )
+        std::sync::Arc::new(Self::of_the_test_rustc().await)
+    }
+
+    async fn of_the_test_rustc() -> Self {
+        let env = SessionEnv::of_this_process().expect("the test process's environment");
+        Self::for_executable(OsStr::new("rustc"), &env)
+            .await
+            .expect("resolve the test environment's rustc")
     }
 
     /// [`Self::for_tests`] with `wrapper` as the configured workspace
     /// wrapper.
     pub async fn for_tests_with_workspace_wrapper(wrapper: &Path) -> std::sync::Arc<Self> {
-        let mut toolchain = Self::for_executable(OsStr::new("rustc"))
-            .await
-            .expect("resolve the test environment's rustc");
-        toolchain.workspace_wrapper =
-            Some(Handle::from_path(wrapper).expect("identify the workspace wrapper"));
+        let mut toolchain = Self::of_the_test_rustc().await;
+        toolchain.workspace_wrapper = Some((
+            wrapper.to_path_buf(),
+            Handle::from_path(wrapper).expect("identify the workspace wrapper"),
+        ));
         std::sync::Arc::new(toolchain)
     }
 
     /// [`Self::for_tests`] answering the host triple and release a test
     /// fixture names instead of the machine's own.
     pub async fn for_tests_with_facts(host_target: &str, release: &str) -> std::sync::Arc<Self> {
-        let mut toolchain = Self::for_executable(OsStr::new("rustc"))
-            .await
-            .expect("resolve the test environment's rustc");
+        let mut toolchain = Self::of_the_test_rustc().await;
         host_target.clone_into(&mut toolchain.host_target);
         release.clone_into(&mut toolchain.release);
         std::sync::Arc::new(toolchain)
@@ -224,19 +317,22 @@ fn parse_native_cpu(stdout: &str) -> Option<String> {
     })
 }
 
-/// The file `spelling` resolves to under `search_path`, and its identity.
-fn resolve_file(spelling: &OsStr, search_path: &OsStr) -> Result<(PathBuf, Handle), String> {
-    let cwd =
-        std::env::current_dir().map_err(|error| format!("resolve current directory: {error}"))?;
-    let path = which::which_in(spelling, Some(search_path), &cwd)
+/// The file `spelling` resolves to in `env`, from `cwd`, and its identity.
+fn resolve_file(
+    spelling: &OsStr,
+    env: &SessionEnv,
+    cwd: &Path,
+) -> Result<(PathBuf, Handle), String> {
+    let path = env
+        .resolve_program(spelling, cwd)
         .map_err(|error| format!("resolve {}: {error}", Path::new(spelling).display()))?;
     let file = Handle::from_path(&path)
         .map_err(|error| format!("identify {}: {error}", path.display()))?;
     Ok((path, file))
 }
 
-fn names_file(spelling: &OsStr, search_path: &OsStr, target: &Handle) -> bool {
-    resolve_file(spelling, search_path).is_ok_and(|(_, file)| file == *target)
+fn names_file(spelling: &OsStr, env: &SessionEnv, cwd: &Path, target: &Handle) -> bool {
+    resolve_file(spelling, env, cwd).is_ok_and(|(_, file)| file == *target)
 }
 
 #[cfg(test)]
@@ -274,11 +370,72 @@ mod tests {
             launcher.clone().into_os_string(),
             None,
             &vv,
+            &crate::session_env::SessionEnv::of_this_process()
+                .expect("the test process's environment"),
         )
         .await
         .expect("resolve the toolchain");
-        assert!(toolchain.is_rustc(rustc.as_os_str()));
-        assert!(toolchain.is_rustc(launcher.as_os_str()));
-        assert!(!toolchain.is_rustc(other.as_os_str()));
+        let cwd = dir.path();
+        assert!(toolchain.is_rustc(rustc.as_os_str(), cwd));
+        assert!(toolchain.is_rustc(launcher.as_os_str(), cwd));
+        assert!(!toolchain.is_rustc(other.as_os_str(), cwd));
+    }
+
+    /// A toolchain rebuilt from its facts — after they crossed a process
+    /// boundary as JSON — identifies the same files the original does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_toolchain_from_facts_identifies_the_same_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let launcher = dir.path().join("launcher");
+        let wrapper = dir.path().join("wrapper");
+        let other = dir.path().join("other");
+        for program in [&launcher, &wrapper, &other] {
+            std::fs::write(program, b"#!/bin/sh\n").expect("write the program");
+            std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod the program");
+        }
+        let rustc = which::which("rustc").expect("the test machine has rustc on PATH");
+        let vv = crate::rustc_args::rustc_vv(rustc.as_os_str())
+            .await
+            .expect("rustc -vV");
+        let env = crate::session_env::SessionEnv::of_this_process()
+            .expect("the test process's environment");
+        let original = super::BuildToolchain::from_probe(
+            rustc.clone().into_os_string(),
+            launcher.clone().into_os_string(),
+            Some(wrapper.clone()),
+            &vv,
+            &env,
+        )
+        .await
+        .expect("resolve the toolchain");
+        let facts: super::ToolchainFacts = serde_json::from_slice(
+            &serde_json::to_vec(&original.facts()).expect("serialize the facts"),
+        )
+        .expect("parse the facts");
+        let rebuilt = super::BuildToolchain::from_facts(facts, &env)
+            .await
+            .expect("rebuild the toolchain");
+        let cwd = dir.path();
+        for spelling in [&rustc, &launcher, &wrapper, &other] {
+            assert_eq!(
+                rebuilt.is_rustc(spelling.as_os_str(), cwd),
+                original.is_rustc(spelling.as_os_str(), cwd),
+                "{}",
+                spelling.display()
+            );
+            assert_eq!(
+                rebuilt.is_workspace_wrapper(spelling.as_os_str(), cwd),
+                original.is_workspace_wrapper(spelling.as_os_str(), cwd),
+                "{}",
+                spelling.display()
+            );
+        }
+        assert_eq!(rebuilt.host_target(), original.host_target());
+        assert_eq!(rebuilt.release(), original.release());
+        assert!(rebuilt.is_workspace_wrapper(wrapper.as_os_str(), cwd));
+        assert!(!rebuilt.is_workspace_wrapper(other.as_os_str(), cwd));
     }
 }

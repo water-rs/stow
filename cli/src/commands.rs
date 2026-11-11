@@ -840,9 +840,8 @@ pub struct WrapperCommands {
     /// Compiler-shaped, for C++.
     pub(crate) cxx_compiler: String,
     /// The executable the shims resolve to — the path
-    /// [`crate::config::shims_dir`] keyed on, and the binary whose
-    /// identity the supervisor exports so a wrapper can tell its own
-    /// build from a replacement (stow#645).
+    /// [`crate::config::shims_dir`] keyed on, and the binary the daemon's
+    /// launch agent runs (stow#645).
     pub(crate) runtime_executable: PathBuf,
 }
 
@@ -1241,6 +1240,7 @@ mod tests {
             artifact_cache_max_bytes: 1024,
             index_refresh_interval: Duration::from_mins(5),
             verify_mode,
+            switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),

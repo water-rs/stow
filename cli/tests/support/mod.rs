@@ -1,7 +1,66 @@
 //! The environment every integration test's `stow-cli` invocation shares.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Output};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// How long a process's piped output may stay open once the process has
+/// exited. Only a process it started can hold the pipes then, and none of
+/// stow's may — a daemon or drain it starts detaches holding none of its
+/// descriptors or handles — so the bound only has to outlast the last
+/// bytes reaching the reader.
+const OUTPUT_AFTER_EXIT_BOUND: Duration = Duration::from_mins(1);
+
+/// Wait for `child`, whose stdout and stderr are piped, to exit, and
+/// collect its output. Output that stays open past
+/// [`OUTPUT_AFTER_EXIT_BOUND`] after the exit fails the test naming that,
+/// instead of waiting for whatever process holds it: `what` names the
+/// child.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn output_of(mut child: Child, what: &str) -> Output {
+    let stdout = read_on_a_thread(child.stdout.take());
+    let stderr = read_on_a_thread(child.stderr.take());
+    let status = child
+        .wait()
+        .unwrap_or_else(|error| panic!("wait for {what}: {error}"));
+    let deadline = Instant::now() + OUTPUT_AFTER_EXIT_BOUND;
+    let collect = |stream: mpsc::Receiver<Vec<u8>>, name: &str| {
+        stream
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{what} exited ({status}) but its {name} stayed open for {} s after: a process it started holds it",
+                    OUTPUT_AFTER_EXIT_BOUND.as_secs()
+                )
+            })
+    };
+    Output {
+        status,
+        stdout: collect(stdout, "stdout"),
+        stderr: collect(stderr, "stderr"),
+    }
+}
+
+/// Read `stream` to its end on a thread of its own; the bytes arrive on
+/// the returned channel once every writer has closed it.
+fn read_on_a_thread<R: Read + Send + 'static>(stream: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stream) = stream {
+            stream
+                .read_to_end(&mut bytes)
+                .expect("read the child's output");
+        }
+        let _ = sender.send(bytes);
+    });
+    receiver
+}
 
 /// The environment a hermetic `stow-cli` invocation needs: `edge_url` as
 /// both the edge and the OCI registry root (no path: the registry
@@ -10,6 +69,10 @@ use std::process::Command;
 /// fixture's crates an "all-miss" build is no longer one (stow#608) — an
 /// isolated cache dir, a `home` the child's home directories all point
 /// at, and loopback's proxy exclusions.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
 pub fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path, home: &Path) {
     sealed_home_env(command, home);
     command
@@ -17,26 +80,18 @@ pub fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path
         .env("STOW_REGISTRY_BASE_URL", edge_url)
         .env("STOW_CACHE_DIR", cache_dir)
         // Isolate from the developer's ambient stow config: a user-level
-        // `verify_mode = "mock-key"` (or an inherited `STOW_CONFIG_BLOB`)
-        // would make this binary reject the config and skip the cache.
+        // `verify_mode = "mock-key"` would make this binary reject the
+        // config and skip the cache.
         // Every other `STOW_*` knob `StowConfig::load` and the wrapper
         // environment read is removed for the same reason — the test's
         // own values go on the command after this call (stow#800).
         .env("STOW_VERIFY_MODE", "github-ci")
-        .env_remove("STOW_CONFIG_BLOB")
         .env_remove("STOW_INDEX_REFRESH_SECS")
         .env_remove("STOW_ARTIFACT_CACHE_MAX_BYTES")
         .env_remove("STOW_MOCK_PUBLIC_KEY_PATH")
-        .env_remove("STOW_ENABLE_SEMANTIC_FALLBACK")
         .env_remove("STOW_PUBLIC_CACHE_RUSTC_VERSION")
         .env_remove("STOW_PUBLIC_CACHE_TARGET")
-        .env_remove("STOW_CACHE_POLICY_PATH")
-        .env_remove("STOW_EXPANDED_GRAPH_PATH")
-        .env_remove("STOW_PREFETCH_ARTIFACTS_PATH")
-        .env_remove("STOW_SERVE_MAP_FILE")
-        .env_remove("STOW_SUPERVISOR_ENDPOINT")
-        .env_remove("STOW_SUPERVISOR_TOKEN")
-        .env_remove("STOW_SUPERVISOR_BINARY")
+        .env_remove("STOW_SESSION")
         .env_remove("STOW_TRACE_FILE")
         .env_remove("STOW_TRACE_WRAPPED_COMPILERS")
         .env_remove("STOW_IDENTITY_TRACE")
@@ -128,6 +183,10 @@ pub fn denied_registry() -> String {
 /// Windows `dirs` resolves the config and local-data dirs through
 /// `SHGetKnownFolderPath` without `KF_FLAG_DONT_VERIFY`, which fails on a
 /// folder that does not exist, and stow then skips its config entirely.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
 pub fn sealed_home_env(command: &mut Command, home: &Path) {
     let dirs = [
         ("HOME", home.to_path_buf()),
@@ -144,6 +203,10 @@ pub fn sealed_home_env(command: &mut Command, home: &Path) {
         command.env(key, dir);
     }
     command
+        // Every build starts the user's daemon when none is running: this
+        // test's own runs under its home, where [`PrivateDaemon`] finds and
+        // stops it.
+        .env("STOW_DAEMON_DIR", PrivateDaemon::run_dir_of(home))
         // `stow setup` installs the daemon's login trigger through
         // `launchctl` on macOS (stow#1435); a test must never reach the
         // developer's launchd. `true` answers every query as "loaded", so
@@ -161,6 +224,10 @@ pub fn sealed_home_env(command: &mut Command, home: &Path) {
 /// The toolchain home the machine's rustup shims resolve: `RUSTUP_HOME`
 /// when the developer exports it, else `~/.rustup` under the real home —
 /// resolved before `sealed_home_env` redirects `HOME` on the child.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
 fn real_rustup_home() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("RUSTUP_HOME") {
         return Some(PathBuf::from(home));
@@ -191,6 +258,158 @@ pub fn write_global_config(homes: &[&Path], contents: &str) {
             std::fs::write(dir.join("config.toml"), contents).unwrap_or_else(|error| {
                 panic!("write the stow config in {}: {error}", dir.display())
             });
+        }
+    }
+}
+
+/// The daemon a test's `stow-cli` runs started under `home`
+/// ([`sealed_home_env`] points `STOW_DAEMON_DIR` there): found by the pids
+/// its own log names, and stopped when this drops, so a test never leaves
+/// a daemon behind and never touches one it did not start.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub struct PrivateDaemon {
+    run_dir: PathBuf,
+}
+
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+impl PrivateDaemon {
+    /// The runtime directory [`sealed_home_env`] names for `home`.
+    pub fn run_dir_of(home: &Path) -> PathBuf {
+        home.join("run")
+    }
+
+    /// The daemon of a child whose home is `home`.
+    pub fn in_home(home: &Path) -> Self {
+        Self {
+            run_dir: Self::run_dir_of(home),
+        }
+    }
+
+    pub fn run_dir(&self) -> &Path {
+        &self.run_dir
+    }
+
+    /// The daemon log's lines that contain `needle`.
+    pub fn log_lines(&self, needle: &str) -> Vec<String> {
+        std::fs::read_to_string(self.run_dir.join("daemon.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(needle))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The pids of the daemons that bound the endpoint, from their log.
+    pub fn serving_pids(&self) -> Vec<u32> {
+        self.log_lines("stow daemon serving")
+            .iter()
+            .filter_map(|line| {
+                let rest = line.split("pid=").nth(1)?;
+                rest.split_whitespace().next()?.parse().ok()
+            })
+            .collect()
+    }
+
+    /// Stop every daemon the log names and wait until they are gone.
+    pub fn stop(&self) {
+        for pid in self.serving_pids() {
+            terminate(pid);
+        }
+    }
+
+    /// End every daemon the log names with no chance to clean up, as a
+    /// crash would.
+    pub fn crash(&self) {
+        for pid in self.serving_pids() {
+            kill_hard(pid);
+        }
+    }
+}
+
+impl Drop for PrivateDaemon {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(unix)]
+fn terminate(pid: u32) {
+    let pid = libc::pid_t::try_from(pid).expect("a logged pid fits pid_t");
+    // SAFETY: signalling a pid this test's own daemon logged.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // SAFETY: signal 0 only probes.
+    while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn kill_hard(pid: u32) {
+    let pid = libc::pid_t::try_from(pid).expect("a logged pid fits pid_t");
+    // SAFETY: signalling a pid this test's own daemon logged.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+}
+
+#[cfg(windows)]
+fn terminate(pid: u32) {
+    kill_hard(pid);
+}
+
+/// Windows ends a process only by force.
+#[cfg(windows)]
+fn kill_hard(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .output();
+}
+
+/// A temporary directory a test's children use as (or under) their home:
+/// it stops the daemons they started before the directory goes, so no test
+/// leaves one running.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub struct TempDir(tempfile::TempDir);
+
+/// [`tempfile::tempdir`] with the daemon reaping of [`TempDir`].
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn tempdir() -> std::io::Result<TempDir> {
+    tempfile::tempdir().map(TempDir)
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = tempfile::TempDir;
+
+    fn deref(&self) -> &tempfile::TempDir {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // A test seals its child's home as the directory itself, as
+        // `stow-home` under it, or as `stow-home` under one of its project
+        // directories.
+        let root = self.0.path();
+        let mut homes = vec![root.to_path_buf(), root.join("stow-home")];
+        for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                homes.push(entry.path().join("stow-home"));
+            }
+        }
+        for home in homes {
+            drop(PrivateDaemon::in_home(&home));
         }
     }
 }

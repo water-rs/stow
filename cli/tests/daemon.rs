@@ -14,17 +14,27 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+mod support;
+
+use support::PrivateDaemon;
+
 /// How long a test waits for something a healthy daemon does at once.
 const BOUND: Duration = Duration::from_secs(60);
 
 struct Fixture {
+    /// The test's daemon: found by its log, stopped when the fixture
+    /// drops. Declared before `dir`, so it stops while its log still
+    /// exists.
+    daemon: PrivateDaemon,
     dir: tempfile::TempDir,
 }
 
 impl Fixture {
     fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
         Self {
-            dir: tempfile::tempdir().expect("tempdir"),
+            daemon: PrivateDaemon::in_home(dir.path()),
+            dir,
         }
     }
 
@@ -47,39 +57,16 @@ impl Fixture {
     }
 
     fn log_lines(&self, needle: &str) -> Vec<String> {
-        std::fs::read_to_string(self.run_dir().join("daemon.log"))
-            .unwrap_or_default()
-            .lines()
-            .filter(|line| line.contains(needle))
-            .map(str::to_owned)
-            .collect()
+        self.daemon.log_lines(needle)
     }
 
     /// The pids of the daemons that bound the endpoint, from their log.
     fn serving_pids(&self) -> Vec<libc::pid_t> {
-        self.log_lines("stow daemon serving")
-            .iter()
-            .filter_map(|line| {
-                let rest = line.split("pid=").nth(1)?;
-                rest.split_whitespace().next()?.parse().ok()
-            })
+        self.daemon
+            .serving_pids()
+            .into_iter()
+            .map(|pid| libc::pid_t::try_from(pid).expect("a logged pid fits pid_t"))
             .collect()
-    }
-}
-
-impl Drop for Fixture {
-    /// Stop every daemon this test started — only the pids its own log
-    /// names — and wait until they are gone.
-    fn drop(&mut self) {
-        for pid in self.serving_pids() {
-            // SAFETY: signalling a pid this test's daemon logged.
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            // SAFETY: signal 0 only probes.
-            while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
     }
 }
 
@@ -94,7 +81,7 @@ fn run_status(command: &mut Command) -> String {
 }
 
 fn expected_status() -> String {
-    format!("version: {}\nprotocol: 1\n", env!("CARGO_PKG_VERSION"))
+    format!("version: {}\nprotocol: 2\n", env!("CARGO_PKG_VERSION"))
 }
 
 /// Mode bits of `path`.

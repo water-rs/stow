@@ -11,33 +11,6 @@ pub use stow_types::rustc::ParsedRustcArgs;
 pub const STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV: &str = "STOW_PUBLIC_CACHE_RUSTC_VERSION";
 pub const STOW_PUBLIC_CACHE_TARGET_ENV: &str = "STOW_PUBLIC_CACHE_TARGET";
 
-/// Env channel carrying the rustc argument a `stow`-supervised cargo run
-/// appends to every unit — the workspace path remap. It names a JSON
-/// `Vec<String>` build file rather than carrying the list itself — the
-/// same file-table channel the build's other generated payloads use
-/// (stow#625). A private channel
-/// rather than `RUSTFLAGS`, because env rustflags replace the user's
-/// configured rustflags outright: assigning `RUSTFLAGS` would make cargo
-/// ignore `.cargo/config.toml` `target.*.rustflags` — the usual way
-/// `-C link-arg=-fuse-ld=mold` is enabled — for the whole build.
-pub const STOW_RUSTC_EXTRA_ARGS_FILE_ENV: &str = "STOW_RUSTC_EXTRA_ARGS_FILE";
-
-/// The extra rustc arguments the driver named on the environment —
-/// empty when the variable is unset.
-///
-/// # Errors
-///
-/// A set variable whose file is missing or malformed is a wiring bug and
-/// fails loudly, naming the path — the same contract the build's other
-/// table files follow (stow#625).
-pub fn extra_args_from_env() -> stow_types::error::Result<Vec<std::ffi::OsString>> {
-    let Some(path) = std::env::var_os(STOW_RUSTC_EXTRA_ARGS_FILE_ENV) else {
-        return Ok(Vec::new());
-    };
-    let path = std::path::PathBuf::from(path);
-    let args = crate::read_build_json_table::<Vec<String>>(&path, STOW_RUSTC_EXTRA_ARGS_FILE_ENV)?;
-    Ok(args.into_iter().map(std::ffi::OsString::from).collect())
-}
 #[tracing::instrument(name = "stow.rustc.probe.version", skip_all, fields(env_cache_hit))]
 pub async fn detect_rustc_version(rustc: &std::ffi::OsStr) -> Result<String, String> {
     if let Some(version) = configured_public_cache_rustc_version() {
@@ -88,7 +61,7 @@ pub async fn rustc_host_target(rustc: &std::ffi::OsStr) -> Result<String, String
 
 /// The raw stdout of one `rustc -vV` — the one probe every rustc-facts
 /// consumer shares (stow#608): the host probe, the version probe and the
-/// supervisor base's facts all come out of this output, so pre-cargo
+/// session base's facts all come out of this output, so pre-cargo
 /// rustc spawns about rustc itself are exactly `-vV` and `--print
 /// sysroot`, run concurrently.
 pub async fn rustc_vv(rustc: &std::ffi::OsStr) -> Result<String, String> {
@@ -202,7 +175,7 @@ async fn sysroot_rustc_executable(rustc: &OsStr) -> Result<OsString, String> {
 }
 
 /// One `rustc -vV` shared by every consumer — the project context's
-/// target and version facts, the supervisor base's facts, and the link
+/// target and version facts, the session base's facts, and the link
 /// resolution's key — so the probe spawns once.
 pub type SharedRustcVv = Shared<BoxFuture<'static, Result<std::sync::Arc<String>, String>>>;
 

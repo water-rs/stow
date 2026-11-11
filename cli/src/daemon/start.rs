@@ -10,16 +10,17 @@
 //! configuration load, because the clients that call it run once per
 //! compiled unit.
 
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use stow_types::error::{Context, Result};
 
+use super::detached::{self, Detached};
 use super::notify::{Notification, ReadyListener};
-use super::protocol::{self, Hello, PROTOCOL, Request, Response};
+use super::protocol::{self, ControlRequest, Hello, PROTOCOL, PROTOCOL_FLOOR, Response, Role};
 use super::{RunDir, STOW_DAEMON_DIR_ENV, Settings};
 use crate::file_lock::FileLock;
 
@@ -50,6 +51,8 @@ pub struct StatusReply {
 pub struct Connection {
     stream: Stream,
     answer: Duration,
+    /// The daemon's log, which an error names with the daemon's pid.
+    log: PathBuf,
 }
 
 impl Connection {
@@ -61,30 +64,47 @@ impl Connection {
     /// something else, or refuses the connection.
     pub fn status(self) -> Result<StatusReply> {
         let answer = self.answer;
+        let log = self.log;
         #[cfg(unix)]
         let reply = exchange(self.stream);
         #[cfg(windows)]
         let reply = with_deadline(answer, move || exchange(self.stream));
         reply.wrap_err_with(|| {
             format!(
-                "the stow daemon did not complete a status exchange within {} s",
+                "the running stow daemon ({}) did not complete a status exchange within {} s",
+                describe_daemon(&log),
                 answer.as_secs()
             )
         })
     }
 }
 
+/// Which daemon a failure is about: its pid, from the line it logged when
+/// it bound the endpoint, and its log.
+#[must_use]
+pub fn describe_daemon(log: &Path) -> String {
+    let pid = std::fs::read_to_string(log).ok().and_then(|text| {
+        text.lines()
+            .rev()
+            .find(|line| line.contains("stow daemon serving"))
+            .and_then(|line| line.split("pid=").nth(1))
+            .and_then(|rest| rest.split_whitespace().next().map(str::to_owned))
+    });
+    let pid = pid.unwrap_or_else(|| "unknown".to_owned());
+    format!("pid {pid}, log {}", log.display())
+}
+
 fn exchange<S: Read + Write>(mut stream: S) -> Result<StatusReply> {
-    let mut request = protocol::encode(&Hello::current())?;
-    request.extend(protocol::encode(&Request::Status)?);
+    let mut request = protocol::encode(&Hello::new(Role::Control))?;
+    request.extend(protocol::encode(&ControlRequest::Status)?);
     stream
         .write_all(&request)
         .and_then(|()| stream.flush())
         .wrap_err("send Hello and Status to the daemon")?;
     let frame = protocol::read_frame(&mut stream)?;
-    if frame.protocol != PROTOCOL {
+    if !protocol::speaks(frame.protocol) {
         return Err(stow_types::stow_error!(
-            "the daemon speaks protocol {}, this stow speaks {PROTOCOL}",
+            "the daemon speaks protocol {}, this stow speaks {PROTOCOL_FLOOR} through {PROTOCOL}",
             frame.protocol
         ));
     }
@@ -98,6 +118,9 @@ fn exchange<S: Read + Write>(mut stream: S) -> Result<StatusReply> {
         }),
         Response::Rejected { reason } => Err(stow_types::stow_error!(
             "the daemon refused the connection: {reason}"
+        )),
+        other => Err(stow_types::stow_error!(
+            "the daemon answered a status request with {other:?}"
         )),
     }
 }
@@ -192,6 +215,7 @@ pub fn connect_or_start(exe: &Path, settings: Settings) -> Result<Connection> {
     let connected = |stream| Connection {
         stream,
         answer: settings.answer,
+        log: run_dir.log(),
     };
     if let Attempt::Connected(stream) = try_connect(&endpoint, settings.answer)? {
         return Ok(connected(stream));
@@ -285,76 +309,37 @@ fn open_lock(path: &Path) -> Result<std::fs::File> {
         .wrap_err_with(|| format!("open {}", path.display()))
 }
 
-/// Spawn the daemon so that it keeps nothing of this process: its own
-/// session, a cleared environment, null stdio, no inherited descriptors,
-/// and the runtime directory as its working directory.
-fn spawn_daemon(exe: &Path, run_dir: &RunDir, notify: &Path) -> Result<Child> {
-    let mut command = Command::new(exe);
-    command
+/// What a daemon keeps of its starter's environment: what it needs to find
+/// the user's directories and nothing else of the starter's. Winsock
+/// refuses to start in a process whose environment lacks the system root,
+/// so on Windows that one variable, the system's own, is kept.
+#[cfg(unix)]
+const KEPT_ENVIRONMENT: [&str; 4] = ["HOME", "USER", "LOGNAME", "TMPDIR"];
+#[cfg(windows)]
+const KEPT_ENVIRONMENT: [&str; 1] = ["SystemRoot"];
+
+/// Spawn the daemon detached so that it keeps nothing of this process
+/// ([`super::detached`]): a cleared environment, null stdio, no inherited
+/// descriptor or handle, and the runtime directory as its working
+/// directory.
+fn spawn_daemon(exe: &Path, run_dir: &RunDir, notify: &Path) -> Result<detached::Child> {
+    let kept = KEPT_ENVIRONMENT
+        .into_iter()
+        // The settings the daemon itself reads.
+        .chain([
+            super::STOW_DAEMON_LOG_BYTES_ENV,
+            super::STOW_DAEMON_ANSWER_SECS_ENV,
+        ])
+        .filter_map(|key| std::env::var_os(key).map(|value| (OsString::from(key), value)));
+    Detached::new(exe)
         .arg("daemon")
         .arg("--ready")
         .arg(notify)
-        .env_clear()
+        .envs(kept)
         // The daemon is told where its directory is instead of deriving
         // it from an environment it no longer has (`XDG_CACHE_HOME`).
         .env(STOW_DAEMON_DIR_ENV, run_dir.path())
         .current_dir(run_dir.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-
-        use super::descriptors;
-        // What a daemon needs to find the user's directories and nothing
-        // else of the starter's.
-        // and the one setting the daemon itself reads.
-        for key in [
-            "HOME",
-            "USER",
-            "LOGNAME",
-            "TMPDIR",
-            super::STOW_DAEMON_LOG_BYTES_ENV,
-        ] {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
-            }
-        }
-        let inherited = descriptors::open_from(descriptors::FIRST_INHERITED)
-            .wrap_err("list the descriptors this process holds")?;
-        // SAFETY: the hook calls only `setsid` and `fcntl`, both
-        // async-signal-safe, and reads a list built before the fork.
-        unsafe {
-            command.pre_exec(move || {
-                // A session of its own: a signal aimed at the caller's
-                // process group never reaches the daemon.
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                descriptors::mark_close_on_exec(&inherited)
-            });
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        /// `DETACHED_PROCESS`: no console of the caller's.
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        /// `CREATE_NEW_PROCESS_GROUP`: a Ctrl-C aimed at the caller's
-        /// group never reaches the daemon.
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        /// `CREATE_NO_WINDOW`: no console window opens for it.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-        // Winsock refuses to start in a process whose environment lacks
-        // the system root, so that one variable is the system's own and
-        // is kept.
-        if let Some(root) = std::env::var_os("SystemRoot") {
-            command.env("SystemRoot", root);
-        }
-    }
-    command
         .spawn()
         .wrap_err_with(|| format!("spawn the stow daemon {}", exe.display()))
 }

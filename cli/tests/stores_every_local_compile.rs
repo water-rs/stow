@@ -2,10 +2,10 @@
 //! exits (stow#618).
 //!
 //! An all-miss build used to lose its tail two ways: the last unit's
-//! store was cancelled when the runtime dropped the supervisor's
+//! store was cancelled when the runtime dropped the session's
 //! connection tasks, and a dependent whose bookkeeping ran before its
 //! dependency's skipped its store silently. Both are fixed — the
-//! supervisor drains its connections, and a post-compile waits for the
+//! session drains its connections, and a post-compile waits for the
 //! in-flight units its `--extern` set names — so the count is the whole
 //! set every time.
 
@@ -65,16 +65,16 @@ fn stored_crate_names(db: &Path) -> std::collections::BTreeSet<String> {
 /// `proc-macro2`/`quote` race included (stow#618).
 #[test]
 fn every_compiled_unit_is_stored_before_the_build_exits() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
+    let dir = support::tempdir().expect("temp dir");
+    let cargo_home = support::tempdir().expect("cargo home");
     write_fixture(dir.path(), cargo_home.path(), FIXTURE_DEPENDENCIES);
     stow_setup_in(dir.path(), cargo_home.path());
     let edge_url = refused_url();
     let registry_url = refused_url();
 
     for run in 1..=3 {
-        let cache = tempfile::tempdir().expect("cache dir");
-        let target = tempfile::tempdir().expect("target dir");
+        let cache = support::tempdir().expect("cache dir");
+        let target = support::tempdir().expect("target dir");
         let output = stow_build_in(
             dir.path(),
             &["build", "--offline"],

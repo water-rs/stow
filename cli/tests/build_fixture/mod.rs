@@ -3,7 +3,7 @@
 
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use crate::support::{denied_registry, hermetic_stow_env, sealed_home_env};
 
@@ -179,6 +179,45 @@ fn run_stow_build(
     env: &[(&str, &str)],
     isolation_off: bool,
 ) -> Output {
+    let child = stow_build_command(
+        dir,
+        args,
+        edge_url,
+        registry_url,
+        cache_dir,
+        cargo_home,
+        target_dir,
+        env,
+        isolation_off,
+    )
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("run stow-cli build");
+    // The build starts the daemon when none runs, and the daemon outlives
+    // it: the build's output must close when the build exits all the same.
+    crate::support::output_of(child, "stow build")
+}
+
+/// The hermetic `stow build` command [`stow_build_in_with_env`] runs, for
+/// a test that spawns it and watches it while it runs.
+#[allow(
+    dead_code,
+    clippy::too_many_arguments,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn stow_build_command(
+    dir: &Path,
+    args: &[&str],
+    edge_url: &str,
+    registry_url: &str,
+    cache_dir: &Path,
+    cargo_home: &Path,
+    target_dir: &Path,
+    env: &[(&str, &str)],
+    isolation_off: bool,
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     hermetic_stow_env(&mut command, edge_url, cache_dir, &fixture_home(dir));
     // Isolation is not what these builds test, and the default level is
@@ -199,15 +238,16 @@ fn run_stow_build(
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_TARGET_DIR", target_dir)
         // The default filter, whatever the developer's shell exports: the
-        // supervisor runs in this process, so the warnings it logs are on
-        // this stderr, where a test can assert on them (stow#619).
+        // daemon routes a session's events to the driver, so the warnings
+        // it logs are on this stderr, where a test can assert on them
+        // (stow#619).
         .env_remove("RUST_LOG")
         // Level markers and cargo's status lines are asserted on as
         // plain text, whatever colour the environment asks for.
         .env("NO_COLOR", "1")
         .env("CARGO_TERM_COLOR", "never");
     command.envs(env.iter().copied());
-    command.output().expect("run stow-cli build")
+    command
 }
 
 /// Copy the directory tree at `from` into `to`.
@@ -432,8 +472,8 @@ pub fn resolved_packages(
 /// `c_metadata`, carrying the version and feature set `resolved` gives
 /// its package, and each `bundle_digest` carrying the stored
 /// `compile_key` so a bundle fetch it triggers has that key in the
-/// request line. A semantic lookup (`STOW_ENABLE_SEMANTIC_FALLBACK`)
-/// of a leaf crate finds its row by that identity.
+/// request line. A semantic lookup of a leaf crate finds its row by that
+/// identity.
 ///
 /// The file layout is the verified index cache's own
 /// (`index/<target>/<rustc>/current.json`, its digest-named blob and the

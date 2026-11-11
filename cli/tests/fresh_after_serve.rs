@@ -213,13 +213,13 @@ fn assert_same_output(
 
 #[test]
 fn a_served_build_stays_fresh_until_the_fixture_itself_changes() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
+    let dir = support::tempdir().expect("temp dir");
+    let cargo_home = support::tempdir().expect("cargo home");
     write_fixture(dir.path(), cargo_home.path(), FIXTURE_DEPENDENCIES);
     stow_setup_in(dir.path(), cargo_home.path());
     let edge_url = refused_url();
     let registry_url = refused_url();
-    let cache = tempfile::tempdir().expect("stow cache dir");
+    let cache = support::tempdir().expect("stow cache dir");
     let build = |args: &[&str], target: &Path, label: &str| {
         let output = stow_build_in(
             dir.path(),
@@ -240,13 +240,13 @@ fn a_served_build_stays_fresh_until_the_fixture_itself_changes() {
 
     // Build 1: fresh target, fresh cache — everything compiles and is
     // stored.
-    let target1 = tempfile::tempdir().expect("target dir 1");
+    let target1 = support::tempdir().expect("target dir 1");
     build(&["build", "--offline"], target1.path(), "build 1 (fill)");
 
     // Build 2: a second fresh target dir against the same cache serves
     // the stored units. The summary line must report served units so the
     // test cannot pass by not serving.
-    let target2 = tempfile::tempdir().expect("target dir 2");
+    let target2 = support::tempdir().expect("target dir 2");
     let output = build(&["build", "--offline"], target2.path(), "build 2 (serve)");
     assert!(served_count(&output) > 0, "build 2 served no units");
 
@@ -280,9 +280,9 @@ fn a_served_build_stays_fresh_until_the_fixture_itself_changes() {
     // dir must be what cargo's own build-script run produced — compare
     // against a plain `cargo build` in its own target dir with a
     // CARGO_HOME stow never configured.
-    let plain_home = tempfile::tempdir().expect("plain cargo home");
+    let plain_home = support::tempdir().expect("plain cargo home");
     clone_registry_into(cargo_home.path(), plain_home.path());
-    let plain_target = tempfile::tempdir().expect("plain target dir");
+    let plain_target = support::tempdir().expect("plain target dir");
     let output = plain_cargo_build(dir.path(), plain_home.path(), plain_target.path());
     assert!(
         output.status.success(),

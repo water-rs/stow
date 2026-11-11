@@ -326,8 +326,8 @@ pub async fn plan_compile(
 }
 
 /// The standalone decision, made in the wrapper process itself: look the
-/// key up, record the hit and serve it. A supervised build never calls
-/// this — its daemon owns the lookup and the records.
+/// key up, record the hit and serve it. A session never calls this —
+/// its daemon owns the lookup and the records.
 pub async fn try_compile(
     config: &StowConfig,
     compiler: &ResolvedCompiler,
@@ -539,7 +539,7 @@ pub fn cached_object_path(config: &StowConfig, cache_key: &str) -> PathBuf {
     cc_cache_path(config, cache_key)
 }
 
-/// The records a supervised C compile leaves for the daemon to write once
+/// The records a session's C compile leaves for the daemon to write once
 /// the wrapper has its answer: they cost the wrapper — and the job slot
 /// cargo holds for it — nothing.
 pub enum CcRecord {
@@ -639,14 +639,17 @@ fn clone_or_copy_file(source: &std::fs::File, destination: &Path) -> std::io::Re
 ///
 /// The final component is not followed (`O_NOFOLLOW`, or the reparse
 /// point itself on Windows), the file must be a regular one, and the
-/// descriptor's own real path must lie under `root`, the build's target
-/// directory: a wrapper cannot name a file the sandbox keeps from it, or
-/// a link through the target directory to one, and have the supervisor
-/// read it for the cache the sandbox can read.
+/// descriptor's own real path must lie under one of `roots`, the build's
+/// target and build directories: a wrapper cannot name a file the sandbox
+/// keeps from it, or a link through those directories to one, and have
+/// the session read it for the cache the sandbox can read.
 ///
 /// # Errors
 /// The reason the report is refused, naming the path.
-pub fn open_reported_output(path: &Path, root: &Path) -> Result<std::fs::File, String> {
+pub fn open_reported_output(
+    path: &Path,
+    roots: &crate::daemon::session::invocation::OutputRoots,
+) -> Result<std::fs::File, String> {
     let file = open_without_following(path).map_err(|error| {
         format!(
             "cannot open reported C/C++ output {}: {error}",
@@ -671,26 +674,20 @@ pub fn open_reported_output(path: &Path, root: &Path) -> Result<std::fs::File, S
             path.display()
         )
     })?;
-    let root = std::fs::canonicalize(root).map_err(|error| {
+    roots.admit(&real).map_err(|roots| {
         format!(
-            "cannot resolve the build's target directory {}: {error}",
-            root.display()
+            "reported C/C++ output {} (resolved {}) is outside the build's target and build directories ({roots})",
+            path.display(),
+            real.display()
         )
     })?;
-    if !real.starts_with(&root) {
-        return Err(format!(
-            "reported C/C++ output {} is outside the build's target directory {}",
-            path.display(),
-            root.display()
-        ));
-    }
     Ok(file)
 }
 
 #[cfg(unix)]
 fn open_without_following(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    // `O_NONBLOCK` keeps the open of a FIFO from hanging the supervisor;
+    // `O_NONBLOCK` keeps the open of a FIFO from hanging the session;
     // the regular-file check refuses it right after.
     std::fs::OpenOptions::new()
         .read(true)
@@ -1260,6 +1257,7 @@ mod tests {
             artifact_cache_max_bytes: crate::config::DEFAULT_ARTIFACT_CACHE_MAX_BYTES,
             index_refresh_interval: Duration::from_mins(1),
             verify_mode: VerifyMode::GithubCi,
+            switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),

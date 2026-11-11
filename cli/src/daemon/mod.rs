@@ -3,7 +3,11 @@
 //!
 //! * [`serve`] is the daemon: it takes `daemon.lock` in the runtime
 //!   directory, binds its endpoint there, reports readiness and answers
-//!   [`protocol`] requests.
+//!   [`protocol`] requests. A build is a [`session`] of it: the driver
+//!   opens one over a control connection ([`client::DaemonSession`]) and
+//!   the build's wrappers name it by id ([`client::WrapperConnection`]);
+//!   a wrapper in a sandbox reaches the daemon through the driver's
+//!   [`relay`].
 //! * [`start`] is the one path every client uses to reach it: connect,
 //!   else take `start.lock`, spawn the daemon detached, wait for its
 //!   readiness notification, connect. It is synchronous and std-only —
@@ -21,22 +25,29 @@ use stow_types::error::{Context, Result};
 use crate::cli_args::{DaemonArgs, DaemonCommand};
 use crate::write_stdout;
 
+pub mod client;
 #[cfg(unix)]
 mod descriptors;
+pub mod detached;
+pub mod events;
 #[cfg(target_os = "macos")]
 pub mod launch_agent;
 mod log;
 mod notify;
 pub mod protocol;
+pub mod relay;
 mod serve;
+pub mod session;
 mod start;
+mod table;
 #[cfg(windows)]
 mod windows;
+pub mod wrapper;
 
 pub use start::connect_or_start;
 
 /// Overrides the runtime directory.
-const STOW_DAEMON_DIR_ENV: &str = "STOW_DAEMON_DIR";
+pub const STOW_DAEMON_DIR_ENV: &str = "STOW_DAEMON_DIR";
 /// How long a connected daemon may take to answer, in seconds.
 const STOW_DAEMON_ANSWER_SECS_ENV: &str = "STOW_DAEMON_ANSWER_SECS";
 /// How long a client waits for the daemon it started, in seconds.
@@ -193,6 +204,35 @@ impl RunDir {
         Ok(Self(path))
     }
 
+    /// The prepared runtime directory spelled as the kernel resolves it, for
+    /// a sandbox profile that must name the directory and the daemon's
+    /// socket in it: a rule written through a symlink does not cover the
+    /// resolved path. Windows has no such rule, so the path stays as
+    /// located.
+    ///
+    /// # Errors
+    ///
+    /// [`RunDir::locate`] or [`RunDir::prepare`] fails, or the directory
+    /// cannot be resolved.
+    pub fn locate_resolved() -> Result<Self> {
+        let dir = Self::prepare(Self::locate()?)?;
+        #[cfg(unix)]
+        {
+            std::fs::canonicalize(dir.path())
+                .map(Self)
+                .wrap_err_with(|| {
+                    format!(
+                        "resolve the daemon runtime directory {}",
+                        dir.path().display()
+                    )
+                })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(dir)
+        }
+    }
+
     /// The directory itself.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -215,6 +255,12 @@ impl RunDir {
     #[must_use]
     pub fn log(&self) -> PathBuf {
         self.0.join("daemon.log")
+    }
+
+    /// The directory holding one subdirectory per open session.
+    #[must_use]
+    pub fn sessions(&self) -> PathBuf {
+        self.0.join("sessions")
     }
 
     /// Where clients reach the daemon: a Unix socket in the directory, or

@@ -154,17 +154,17 @@ fn stored_crate_names(db: &Path) -> std::collections::BTreeSet<String> {
 /// them from the local cache.
 #[test]
 fn refused_registry_and_edge_run_the_build_local_only() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
+    let dir = support::tempdir().expect("temp dir");
+    let cargo_home = support::tempdir().expect("cargo home");
     write_fixture(dir.path(), cargo_home.path(), FIXTURE_DEPENDENCIES);
     stow_setup_in(dir.path(), cargo_home.path());
     let edge_url = refused_url();
     let registry_url = refused_url();
-    let cache = tempfile::tempdir().expect("stow cache dir");
+    let cache = support::tempdir().expect("stow cache dir");
 
     // Fill: everything compiles and stores — remote was never asked
     // twice for the same outage.
-    let target = tempfile::tempdir().expect("target dir");
+    let target = support::tempdir().expect("target dir");
     let output = timed_build(
         dir.path(),
         &["build", "--offline"],
@@ -187,7 +187,7 @@ fn refused_registry_and_edge_run_the_build_local_only() {
 
     // Serve: a fresh target dir against the same cache answers the
     // stored units locally — the local listing needs no network.
-    let target = tempfile::tempdir().expect("target dir");
+    let target = support::tempdir().expect("target dir");
     let output = timed_build(
         dir.path(),
         &["build", "--offline"],
@@ -211,16 +211,16 @@ fn refused_registry_and_edge_run_the_build_local_only() {
 /// must still release every waiter to local compile.
 #[test]
 fn blackholed_registry_and_edge_run_the_build_local_only() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
+    let dir = support::tempdir().expect("temp dir");
+    let cargo_home = support::tempdir().expect("cargo home");
     write_fixture(dir.path(), cargo_home.path(), FIXTURE_DEPENDENCIES);
     stow_setup_in(dir.path(), cargo_home.path());
     let blackholed_url = "http://192.0.0.8:9".to_owned();
-    let cache = tempfile::tempdir().expect("stow cache dir");
+    let cache = support::tempdir().expect("stow cache dir");
 
     // Fill: the connect hangs, the bound fires, the circuit trips, and
     // the build compiles and stores everything locally.
-    let target = tempfile::tempdir().expect("target dir");
+    let target = support::tempdir().expect("target dir");
     let output = timed_build(
         dir.path(),
         &["build", "--offline"],
@@ -243,7 +243,7 @@ fn blackholed_registry_and_edge_run_the_build_local_only() {
 
     // Serve: the stored units answer locally; the hung connect is
     // bounded once, not once per miss.
-    let target = tempfile::tempdir().expect("target dir");
+    let target = support::tempdir().expect("target dir");
     let output = timed_build(
         dir.path(),
         &["build", "--offline"],

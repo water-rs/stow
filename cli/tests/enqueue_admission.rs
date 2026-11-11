@@ -217,9 +217,9 @@ fn write_crate(dir: &Path, cargo_home: &Path) {
 
 #[test]
 fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cache = tempfile::tempdir().expect("cache dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
+    let dir = support::tempdir().expect("temp dir");
+    let cache = support::tempdir().expect("cache dir");
+    let cargo_home = support::tempdir().expect("cargo home");
     write_crate(dir.path(), cargo_home.path());
     seed_empty_index_slice(cache.path());
 
@@ -337,9 +337,9 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
 /// must carry so the failure is never silent (stow#588).
 #[test]
 fn a_failed_admission_is_named_in_the_drain_log_and_the_journal_stays() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cache = tempfile::tempdir().expect("cache dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
+    let dir = support::tempdir().expect("temp dir");
+    let cache = support::tempdir().expect("cache dir");
+    let cargo_home = support::tempdir().expect("cargo home");
     write_crate(dir.path(), cargo_home.path());
     seed_empty_index_slice(cache.path());
 
@@ -495,10 +495,10 @@ fn install_wrapper_shim(tools: &Path) -> PathBuf {
 /// the minted admission redeems.
 #[test]
 fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cache = tempfile::tempdir().expect("cache dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
-    let tools = tempfile::tempdir().expect("tools dir");
+    let dir = support::tempdir().expect("temp dir");
+    let cache = support::tempdir().expect("cache dir");
+    let cargo_home = support::tempdir().expect("cargo home");
+    let tools = support::tempdir().expect("tools dir");
     write_crate(dir.path(), cargo_home.path());
     seed_empty_index_slice(cache.path());
     let (edge_url, captured, _edge) = spawn_test_edge();

@@ -84,6 +84,8 @@ sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runti
 axoupdater = "0.10"
 which = "8"
 same-file = "1"
+# A session id is 128 random bits from the operating system.
+getrandom = { version = "0.4", default-features = false }
 time = { version = "0.3.55", default-features = false, features = [
     "std",
     "formatting",
@@ -119,6 +121,11 @@ tokio = { version = "1", features = ["test-util"] }
 process-wrap = { version = "10.0.1", default-features = false, features = ["std", "process-group", "job-object"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 stow-types.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+# The detached spawn's command-line test splits its line with the system's
+# own parser, `CommandLineToArgvW`.
+windows-sys = { version = "0.60", features = ["Win32_UI_Shell"] }
 
 [lints]
 workspace = true

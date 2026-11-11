@@ -118,8 +118,29 @@ fn attempt(probe: &str, conf: &BTreeMap<String, String>) -> bool {
             std::fs::write(&conf["persistence_file"], "pwned\n"),
         ),
         "network" => network(&conf["net_target"]),
+        "reach-daemon" => report(
+            "reach-daemon",
+            reach_daemon(&conf["daemon_endpoint"], &conf["daemon_dir"]),
+        ),
         other => panic!("unknown probe {other}"),
     }
+}
+
+/// The daemon's two doors: its socket, and its runtime directory, where
+/// the session tables and the log live. Either one open is a way in.
+#[cfg(unix)]
+fn reach_daemon(endpoint: &str, dir: &str) -> Result<(), String> {
+    let connected = std::os::unix::net::UnixStream::connect(endpoint);
+    let written = std::fs::write(Path::new(dir).join("planted"), "pwned\n");
+    match (connected, written) {
+        (Err(connect), Err(write)) => Err(format!("connect: {connect}; write: {write}")),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+fn reach_daemon(_endpoint: &str, _dir: &str) -> Result<(), String> {
+    unreachable!("the reach-daemon probe is listed on Unix only")
 }
 
 fn report<E: std::fmt::Display>(probe: &str, result: Result<(), E>) -> bool {
@@ -315,8 +336,17 @@ fn conf_text(home: &Path, workspace: &Path, net_target: &str) -> String {
     if cfg!(target_os = "macos") {
         probes.push("clipboard");
     }
+    // The pipe a Windows daemon listens on is guarded by its DACL, which
+    // no probe here can exercise.
+    if cfg!(unix) {
+        probes.push("reach-daemon");
+    }
+    // The run directory the hermetic build gives its daemon.
+    let daemon_dir = workspace.join("stow-home").join("run");
     format!(
         "probes={}\n\
+         daemon_dir={}\n\
+         daemon_endpoint={}\n\
          home_file={}\n\
          home_write={}\n\
          workspace_write={}\n\
@@ -324,6 +354,8 @@ fn conf_text(home: &Path, workspace: &Path, net_target: &str) -> String {
          persistence_file={}\n\
          net_target={net_target}\n",
         probes.join(","),
+        daemon_dir.display(),
+        daemon_dir.join("daemon.sock").display(),
         home.join("secret-token.txt").display(),
         home.join("pwned.txt").display(),
         workspace.join("planted.txt").display(),
@@ -366,11 +398,11 @@ fn spawn_pong_listener() -> (String, std::thread::JoinHandle<()>) {
 }
 
 struct ProbeEnv {
-    _dir: tempfile::TempDir,
-    _home: tempfile::TempDir,
-    _cargo_home: tempfile::TempDir,
-    _cache: tempfile::TempDir,
-    _target: tempfile::TempDir,
+    _dir: support::TempDir,
+    _home: support::TempDir,
+    _cargo_home: support::TempDir,
+    _cache: support::TempDir,
+    _target: support::TempDir,
     dir: PathBuf,
     home: PathBuf,
     cargo_home: PathBuf,
@@ -406,11 +438,11 @@ fn probe_env(with_macro: bool, net_target: &str) -> ProbeEnv {
 /// the fixture out in the workspace directory (given with the temporary
 /// HOME) before `stow setup` runs.
 fn sandbox_env(write: impl FnOnce(&Path, &Path)) -> ProbeEnv {
-    let dir = tempfile::tempdir().expect("workspace dir");
-    let home = tempfile::tempdir().expect("home dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
-    let cache = tempfile::tempdir().expect("cache dir");
-    let target = tempfile::tempdir().expect("target dir");
+    let dir = support::tempdir().expect("workspace dir");
+    let home = support::tempdir().expect("home dir");
+    let cargo_home = support::tempdir().expect("cargo home");
+    let cache = support::tempdir().expect("cache dir");
+    let target = support::tempdir().expect("target dir");
     std::fs::write(home.path().join("secret-token.txt"), "hunter2\n").expect("home secret");
     std::fs::create_dir_all(home.path().join(".ssh")).expect("ssh dir");
     std::fs::write(home.path().join(".ssh").join("id_ed25519"), "fake key\n")
@@ -526,6 +558,12 @@ fn denied_sandbox_refuses_every_forbidden_action() {
             "clipboard probe missing: {denial}"
         );
     }
+    if cfg!(unix) {
+        assert!(
+            denial.contains("reach-daemon"),
+            "the daemon was reachable: {denial}"
+        );
+    }
     assert!(
         denial.contains("succeeded=[]"),
         "a forbidden action leaked through: {denial}"
@@ -552,6 +590,12 @@ fn allowed_network_sandbox_refuses_everything_but_the_connection() {
         denial.contains("succeeded=[\"network\"]"),
         "expected only the network attempt to succeed:\n{stderr}"
     );
+    if cfg!(unix) {
+        assert!(
+            denial.contains("reach-daemon"),
+            "the daemon was reachable: {denial}"
+        );
+    }
 }
 
 /// The proc-macro runs inside the sandboxed rustc — the same denials
@@ -686,7 +730,12 @@ fn assert_protect(cache_off: bool) {
     let (refused, succeeded) = probe_level("protect", cache_off);
     assert_contains_all(
         &refused,
-        &["read-credential", "write-persistence", "read-env"],
+        &[
+            "read-credential",
+            "write-persistence",
+            "read-env",
+            "reach-daemon",
+        ],
         "refused",
     );
     // The machine is otherwise open, and the build still downloads.
@@ -770,6 +819,9 @@ fn explicit_protect_is_refused_on_windows() {
 
 fn assert_strict(cache_off: bool) {
     let (refused, succeeded) = probe_level("strict", cache_off);
+    if cfg!(unix) {
+        assert_contains_all(&refused, &["reach-daemon"], "refused");
+    }
     assert_contains_all(
         &refused,
         &[
@@ -950,7 +1002,7 @@ fn write_c_fixture(dir: &Path, shm: &Path) {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_sandboxed_c_wrapper_never_opens_the_state_database() {
-    let cache = tempfile::tempdir().expect("cache dir");
+    let cache = support::tempdir().expect("cache dir");
     let shm = cache.path().join("state-v3.sqlite3-shm");
     let mut env = sandbox_env(|dir, _home| write_c_fixture(dir, &shm));
     // The fixture's cache is the one the shm path names.
@@ -982,8 +1034,8 @@ fn a_sandboxed_c_wrapper_never_opens_the_state_database() {
 /// (stow#1441).
 #[cfg(target_os = "linux")]
 struct LauncherToolchain {
-    launcher_dir: tempfile::TempDir,
-    proxy_dir: tempfile::TempDir,
+    launcher_dir: support::TempDir,
+    proxy_dir: support::TempDir,
 }
 
 #[cfg(target_os = "linux")]
@@ -1003,11 +1055,11 @@ impl LauncherToolchain {
             "{} is not a native executable; run this test with the real cargo first on PATH",
             real_cargo.display()
         );
-        let proxy_dir = tempfile::tempdir().expect("proxy dir");
+        let proxy_dir = support::tempdir().expect("proxy dir");
         // A copy, not a link: the sandbox checks the path that is executed,
         // and a link would execute the real file in the user's toolchain.
         std::fs::copy(&real_cargo, proxy_dir.path().join("cargo")).expect("copy the cargo proxy");
-        let launcher_dir = tempfile::tempdir().expect("launcher dir");
+        let launcher_dir = support::tempdir().expect("launcher dir");
         let launcher = launcher_dir.path().join("cargo");
         std::fs::write(
             &launcher,

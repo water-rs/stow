@@ -300,8 +300,8 @@ async fn clear_pending(config: &StowConfig, claim: &Claim) -> stow_types::error:
 
 /// Whether this install reports at all: not opted out, and a cache mode that
 /// reaches the network (the report is the only thing it counts for).
-fn reports_enabled(config: &StowConfig) -> bool {
-    !crate::edge_client::analytics_opted_out() && config.cache.reaches_network()
+const fn reports_enabled(config: &StowConfig) -> bool {
+    !config.switches.no_analytics && config.cache.reaches_network()
 }
 
 /// Post the deltas since the last accepted report when a new UTC day
@@ -374,6 +374,7 @@ mod tests {
             artifact_cache_max_bytes: 1024,
             index_refresh_interval: Duration::from_mins(5),
             verify_mode: crate::config::VerifyMode::GithubCi,
+            switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),

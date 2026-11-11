@@ -35,8 +35,8 @@ use build_fixture::{
 };
 
 /// The debug event `must_build_locally` emits when a linked `--extern`
-/// artifact is already locally built, emitted in the supervisor, which
-/// lives inside the `stow-cli` process this test drives.
+/// artifact is already locally built, emitted in the session, whose events
+/// the daemon routes to the `stow-cli` process this test drives.
 fn compiled_behind_local_dependency(stderr: &str, crate_name: &str) -> bool {
     let crate_name = format!("crate_name={crate_name} ");
     stderr.lines().any(|line| {
@@ -119,14 +119,14 @@ fn stderr_of(output: &Output) -> String {
 
 #[test]
 fn a_renamed_dependency_compiled_locally_sends_its_consumer_local() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
+    let dir = support::tempdir().expect("temp dir");
+    let cargo_home = support::tempdir().expect("cargo home");
     write_fixture(dir.path(), cargo_home.path());
     stow_setup_in(dir.path(), cargo_home.path());
     let edge_url = refused_url();
     let registry_url = refused_url();
-    let cache = tempfile::tempdir().expect("cache dir");
-    // `stow_cli=debug` puts the supervisor's per-unit decisions on this
+    let cache = support::tempdir().expect("cache dir");
+    // `stow_cli=debug` puts the session's per-unit decisions on this
     // stderr, where the test can read which rule sent each unit local.
     let build = |target: &Path, label: &str| {
         let output = stow_build_in_with_env(
@@ -149,7 +149,7 @@ fn a_renamed_dependency_compiled_locally_sends_its_consumer_local() {
 
     // Build 1: everything misses and compiles, so the git chain and the
     // `proc-macro2`/`quote` pair are stored for build 2 to cover.
-    let target_a = tempfile::tempdir().expect("target dir a");
+    let target_a = support::tempdir().expect("target dir a");
     build(target_a.path(), "build 1");
     apply_unicode_ident_patch(dir.path(), cargo_home.path());
 
@@ -158,7 +158,7 @@ fn a_renamed_dependency_compiled_locally_sends_its_consumer_local() {
     // covered) and every covered unit above it must compile locally
     // behind it rather than serve the cached copies linked against a
     // different `unicode-ident`.
-    let target_b = tempfile::tempdir().expect("target dir b");
+    let target_b = support::tempdir().expect("target dir b");
     let output = build(target_b.path(), "build 2");
     let stderr = stderr_of(&output);
 

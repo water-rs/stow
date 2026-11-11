@@ -249,7 +249,7 @@ CREATE TABLE lockfile_graph_cache (
 );
 
 -- stow#317: per-compile observations are in-memory only, scoped to one
--- build — see `ObservedUnit` and `BuildSupervisor` in lib.rs. Misses
+-- build — see `ObservedUnit` and `Session` in daemon/session. Misses
 -- mint post-build from the build's own compile observations; nothing
 -- about them is persisted here.
 

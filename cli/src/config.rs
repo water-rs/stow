@@ -27,10 +27,6 @@ const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
 const STOW_REGISTRY_BASE_URL_ENV: &str = "STOW_REGISTRY_BASE_URL";
 const STOW_INDEX_REFRESH_SECS_ENV: &str = "STOW_INDEX_REFRESH_SECS";
 const STOW_ARTIFACT_CACHE_MAX_BYTES_ENV: &str = "STOW_ARTIFACT_CACHE_MAX_BYTES";
-/// Carries the parent `stow check` driver's already-resolved `StowConfig` to
-/// every rustc-wrapper subprocess as a JSON blob, so the wrapper does not
-/// re-read `~/.config/stow/config.toml` on each rustc invocation.
-pub const STOW_CONFIG_BLOB_ENV: &str = "STOW_CONFIG_BLOB";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_NEGATIVE_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_CIRCUIT_RESET_SECS: u64 = 60;
@@ -112,8 +108,51 @@ impl CacheLayers {
     }
 }
 
+/// The environment switches that shape what a command sends and writes
+/// rather than what it builds: resolved once with the config, so the
+/// process answering for a build reads them from the build's environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Switches {
+    /// `STOW_NO_ANALYTICS=1`: requests carry the opt-out header and no
+    /// usage report is sent.
+    pub no_analytics: bool,
+    /// `CI` is set: requests carry the CI environment header.
+    pub ci: bool,
+    /// `STOW_IDENTITY_TRACE`: the directory the identity-input probe writes
+    /// to, when set.
+    pub identity_trace: Option<PathBuf>,
+}
+
+impl Switches {
+    /// The switches in `environ`.
+    #[must_use]
+    pub fn of_environ(environ: &[(std::ffi::OsString, std::ffi::OsString)]) -> Self {
+        let var = |key: &str| {
+            environ
+                .iter()
+                .find(|(name, _)| stow_types::env_name::eq(name, key))
+                .map(|(_, value)| value)
+        };
+        Self {
+            no_analytics: var(crate::edge_client::NO_ANALYTICS_ENV)
+                .is_some_and(|value| value == "1"),
+            ci: var("CI").is_some(),
+            identity_trace: var("STOW_IDENTITY_TRACE").map(PathBuf::from),
+        }
+    }
+
+    /// The switches of this process's environment.
+    #[must_use]
+    pub fn of_this_process() -> Self {
+        Self::of_environ(&std::env::vars_os().collect::<Vec<_>>())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowConfig {
+    /// Analytics, CI and trace switches of the environment this config was
+    /// resolved in.
+    pub switches: Switches,
     /// The resolved cache layers: the global config's `[cache]` table, then
     /// the run's flags. Every network request goes through
     /// [`Self::registry_http`] or [`crate::edge_client::client`], which both
@@ -145,8 +184,8 @@ pub struct StowConfig {
     /// `artifact_cache` / circuit / stats call draws the one pool from
     /// it, so the rustc-wrapper hot path does not pay the
     /// `SqliteConnectOptions` / schema-identity check on each invocation.
-    /// Never serialised — a config read back from `STOW_CONFIG_BLOB`
-    /// takes the reading process's handle.
+    /// Never serialised — a config a session receives from its driver
+    /// takes the daemon's handle.
     #[serde(skip, default)]
     pub state_db: StateDb,
     /// Lazily loaded Sigstore trust root, shared by every verification
@@ -307,41 +346,15 @@ impl VerifyMode {
 }
 
 impl StowConfig {
-    /// Encode the resolved config as a JSON blob suitable for passing to a
-    /// child process via `STOW_CONFIG_BLOB` env. Used by `stow check` to skip
-    /// re-parsing the user config inside every rustc wrapper invocation.
-    pub fn to_env_blob(&self) -> stow_types::error::Result<String> {
-        serde_json::to_string(self).wrap_err("serialize STOW_CONFIG_BLOB")
-    }
-
-    /// Decode a previously-encoded `STOW_CONFIG_BLOB`, returning `None` when
-    /// the env var is unset. The blob carries no handle, so the decoded
-    /// config takes `state_db` — the process's own.
-    fn from_env_blob(state_db: &StateDb) -> stow_types::error::Result<Option<Self>> {
-        let Some(raw) = std::env::var_os(STOW_CONFIG_BLOB_ENV) else {
-            return Ok(None);
-        };
-        let raw = raw
-            .into_string()
-            .map_err(|_| stow_types::stow_error!("{STOW_CONFIG_BLOB_ENV} must be valid UTF-8"))?;
-        let mut config: Self = serde_json::from_str(&raw)
-            .wrap_err_with(|| format!("parse {STOW_CONFIG_BLOB_ENV} as JSON"))?;
-        config.state_db = state_db.clone();
-        Ok(Some(config))
-    }
-
     #[tracing::instrument(name = "stow.config.load", skip_all)]
     pub fn load(state_db: StateDb) -> stow_types::error::Result<Self> {
-        if let Some(config) = Self::from_env_blob(&state_db)? {
-            tracing::Span::current().record("source", "env_blob");
-            return Ok(config);
-        }
         let file_config = load_user_config()?;
         let edge_url = resolve_edge_url(file_config.as_ref());
         let local_cache_dir = resolve_cache_dir(file_config.as_ref())?;
         let verify_mode = load_verify_mode(file_config.as_ref())?;
 
         Ok(Self {
+            switches: Switches::of_this_process(),
             cache: file_config
                 .as_ref()
                 .and_then(|config| config.cache)
@@ -382,12 +395,10 @@ impl StowConfig {
     }
 
     pub fn load_local(state_db: StateDb) -> stow_types::error::Result<Self> {
-        if let Some(config) = Self::from_env_blob(&state_db)? {
-            return Ok(config);
-        }
         let file_config = load_user_config()?;
         let verify_mode = load_verify_mode(file_config.as_ref())?;
         Ok(Self {
+            switches: Switches::of_this_process(),
             cache: file_config
                 .as_ref()
                 .and_then(|config| config.cache)
@@ -477,28 +488,12 @@ pub fn load_isolation_config() -> stow_types::error::Result<crate::isolation::Is
 }
 
 /// The `[cache]` table of the global config, every layer on when the file or
-/// the table is absent. A driver's `STOW_CONFIG_BLOB` carries the resolved
-/// layers already, flags included, so a wrapper under a driver never re-reads
-/// the file.
+/// the table is absent.
 ///
 /// # Errors
 ///
-/// A config file that exists and cannot be read or parsed, or a blob that
-/// cannot be decoded.
+/// A config file that exists and cannot be read or parsed.
 pub fn load_cache_layers() -> stow_types::error::Result<CacheLayers> {
-    #[derive(serde::Deserialize)]
-    struct Blob {
-        #[serde(default)]
-        cache: CacheLayers,
-    }
-    if let Some(raw) = std::env::var_os(STOW_CONFIG_BLOB_ENV) {
-        let raw = raw
-            .into_string()
-            .map_err(|_| stow_types::stow_error!("{STOW_CONFIG_BLOB_ENV} must be valid UTF-8"))?;
-        let blob: Blob = serde_json::from_str(&raw)
-            .wrap_err_with(|| format!("parse {STOW_CONFIG_BLOB_ENV} as JSON"))?;
-        return Ok(blob.cache);
-    }
     Ok(load_user_config()?
         .and_then(|config| config.cache)
         .unwrap_or_default())
@@ -576,11 +571,24 @@ pub fn require_cargo_home() -> stow_types::error::Result<PathBuf> {
 }
 
 /// [`cargo_home`] with the environment injected, so a caller — or a test —
-/// answers `CARGO_HOME` from its own lookup instead of the process's.
+/// answers `CARGO_HOME`, and the home directory it falls back to, from its
+/// own lookup instead of the process's.
 pub fn cargo_home_with(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
     env("CARGO_HOME")
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".cargo")))
+        .or_else(|| home_dir_with(env).map(|home| home.join(".cargo")))
+}
+
+/// The home directory the environment `env` reads names, as cargo's
+/// `home` crate resolves it: the variable it reads first (`HOME`, or
+/// `USERPROFILE` on Windows) when set and non-empty, else the account's
+/// own home directory.
+pub fn home_dir_with(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    env(variable)
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
 }
 
 fn resolve_cache_dir(file_config: Option<&StowUserConfig>) -> stow_types::error::Result<PathBuf> {
