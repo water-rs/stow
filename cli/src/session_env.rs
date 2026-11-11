@@ -111,7 +111,6 @@ impl SessionEnv {
     }
 }
 
-#[cfg(test)]
 impl SessionEnv {
     /// This environment with `key` set to `value`, the cargo home
     /// re-resolved.
@@ -122,8 +121,16 @@ impl SessionEnv {
         environ.push((OsString::from(key), value.as_ref().to_owned()));
         Self::new(environ, self.cwd)
     }
+}
 
+#[cfg(test)]
+impl SessionEnv {
     /// A session over exactly `vars`, in the test's own working directory.
+    ///
+    /// # Panics
+    ///
+    /// The test's working directory cannot be read.
+    #[must_use]
     pub fn for_tests<const N: usize>(vars: [(&str, &OsStr); N]) -> Self {
         Self::new(
             vars.into_iter()

@@ -793,6 +793,8 @@ pub async fn phase_unit_graphs(
     } else {
         None
     };
+    // The query answers from the task's own cargo home, not the runner's.
+    let env = stow_cli::SessionEnv::of_this_process()?.with_var("CARGO_HOME", cargo_home);
     let mut graphs = Vec::new();
     for &phase in cargo_phases(cargo_subcommand) {
         let mut invocations = std::collections::VecDeque::from(phase_invocations(task).to_vec());
@@ -820,7 +822,7 @@ pub async fn phase_unit_graphs(
                 workspace.workspace_root(),
                 runner_host_triple(task)?,
                 &task.rustc_version,
-                Some(cargo_home),
+                &env,
             )
             .await?;
             let planned = PhaseUnitGraph {

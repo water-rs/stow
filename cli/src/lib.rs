@@ -74,6 +74,10 @@ pub use workspace_deps::{
     resolve_exact_dependency_graph,
 };
 
+/// The environment, working directory and cargo home a build's analysis
+/// runs in; [`resolve_exact_dependency_graph`] answers for it.
+pub use session_env::SessionEnv;
+
 /// What a supervisor exports beside its endpoint so a wrapper can tell
 /// it was started by its own build — the stub supervisors export it the
 /// way the real one does (stow#645).
