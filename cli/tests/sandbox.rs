@@ -383,6 +383,29 @@ struct ProbeEnv {
 /// cache and target dir — nothing real of the user's machine is read or
 /// written.
 fn probe_env(with_macro: bool, net_target: &str) -> ProbeEnv {
+    sandbox_env(|dir, home| {
+        write_fixture(dir, with_macro);
+        // An empty `probes=` line makes the build-script probe inert so the
+        // proc-macro probe is the only actor under test.
+        std::fs::write(
+            dir.join("deps").join("sandbox-probe").join("probe.conf"),
+            if with_macro {
+                "probes=
+"
+                .to_owned()
+            } else {
+                conf_text(home, dir, net_target)
+            },
+        )
+        .expect("write build-script probe conf");
+        write_conf(&dir.join("probe-macro.conf"), home, dir, net_target);
+    })
+}
+
+/// The isolated filesystem every sandbox fixture builds in; `write` lays
+/// the fixture out in the workspace directory (given with the temporary
+/// HOME) before `stow setup` runs.
+fn sandbox_env(write: impl FnOnce(&Path, &Path)) -> ProbeEnv {
     let dir = tempfile::tempdir().expect("workspace dir");
     let home = tempfile::tempdir().expect("home dir");
     let cargo_home = tempfile::tempdir().expect("cargo home");
@@ -393,29 +416,7 @@ fn probe_env(with_macro: bool, net_target: &str) -> ProbeEnv {
     std::fs::write(home.path().join(".ssh").join("id_ed25519"), "fake key\n")
         .expect("fake credential");
     std::fs::write(home.path().join(".zshrc"), "# startup\n").expect("fake startup file");
-    write_fixture(dir.path(), with_macro);
-    // An empty `probes=` line makes the build-script probe inert so the
-    // proc-macro probe is the only actor under test.
-    std::fs::write(
-        dir.path()
-            .join("deps")
-            .join("sandbox-probe")
-            .join("probe.conf"),
-        if with_macro {
-            "probes=
-"
-            .to_owned()
-        } else {
-            conf_text(home.path(), dir.path(), net_target)
-        },
-    )
-    .expect("write build-script probe conf");
-    write_conf(
-        &dir.path().join("probe-macro.conf"),
-        home.path(),
-        dir.path(),
-        net_target,
-    );
+    write(dir.path(), home.path());
     stow_setup_in(dir.path(), cargo_home.path());
     ProbeEnv {
         dir: dir.path().to_path_buf(),
@@ -839,6 +840,139 @@ fn an_unknown_level_fails() {
     assert!(
         stderr.contains("loose") && stderr.contains("protect"),
         "the error should name the bad value and the valid levels:\n{stderr}"
+    );
+}
+
+/// The build script of the C fixture: compile C through the `CC` shim
+/// `stow setup` wired — the wrapper process the sandbox confines — and
+/// check, from inside the sandbox, that the driver's SQLite locks on the
+/// state database's `-shm` survived it (stow#1442).
+///
+/// SQLite's WAL locking is POSIX record locks, which a process loses when
+/// it closes *any* descriptor of the file; heel's file broker serves a
+/// sandboxed open of the state database by opening it in the driver and
+/// closing its own copy there. A wrapper that opens the database therefore
+/// strips the driver of its locks, and the next wrapper takes itself for
+/// the first connection and truncates `-shm` under the driver's mapping.
+/// `/proc/locks` lists the driver's lock on the dead-man-switch byte
+/// without opening the file, so the check cannot disturb what it reads.
+#[cfg(target_os = "linux")]
+const C_BUILD_RS: &str = r#"use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The byte SQLite's unix VFS takes its dead-man-switch lock on in `-shm`.
+const DEAD_MAN_SWITCH_BYTE: u64 = 128;
+
+fn dead_man_switch_held(shm: &Path) -> bool {
+    let inode = std::fs::metadata(shm)
+        .unwrap_or_else(|error| panic!("stat {}: {error}", shm.display()))
+        .ino();
+    let locks = std::fs::read_to_string("/proc/locks").expect("read /proc/locks");
+    // `1: POSIX  ADVISORY  READ  4242 08:02:131077 128 128`
+    locks.lines().any(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [_, "POSIX", _, _, _, id, start, end] = fields[..] else {
+            return false;
+        };
+        let on_shm = id
+            .rsplit(':')
+            .next()
+            .and_then(|node| node.parse::<u64>().ok())
+            == Some(inode);
+        let start = start.parse::<u64>().expect("lock start");
+        let end = end.parse::<u64>().unwrap_or(u64::MAX);
+        on_shm && start <= DEAD_MAN_SWITCH_BYTE && DEAD_MAN_SWITCH_BYTE <= end
+    })
+}
+
+fn main() {
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let shm = PathBuf::from(
+        std::fs::read_to_string(manifest.join("shm.path")).expect("read shm.path"),
+    );
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let target = std::env::var("TARGET").expect("TARGET");
+    let cc_key = format!("CC_{}", target.replace(['-', '.'], "_"));
+    let cc = std::env::var(&cc_key).unwrap_or_else(|_| panic!("{cc_key} is not set"));
+
+    assert!(
+        dead_man_switch_held(&shm),
+        "STATE-DB-LOCK-LOST: the driver does not hold {} before any C compile",
+        shm.display()
+    );
+    // Two sources, one compiled twice: whatever each invocation decides
+    // — a miss that compiles, a hit that serves — the wrapper process
+    // must leave the driver's locks alone.
+    for (name, body) in [("a", "int a(void) { return 1; }\n"), ("b", "int b(void) { return 2; }\n")] {
+        std::fs::write(out.join(format!("{name}.c")), body).expect("write C source");
+    }
+    for name in ["a", "b", "a"] {
+        let status = Command::new(&cc)
+            .current_dir(&out)
+            .args(["-c", &format!("{name}.c"), "-o", &format!("{name}.o")])
+            .status()
+            .expect("run the CC shim");
+        assert!(status.success(), "the CC shim failed to compile {name}.c");
+        assert!(out.join(format!("{name}.o")).is_file(), "no {name}.o");
+        assert!(
+            dead_man_switch_held(&shm),
+            "STATE-DB-LOCK-LOST: the driver lost its lock on {} after compiling {name}.c",
+            shm.display()
+        );
+    }
+}
+"#;
+
+/// A binary whose build script compiles C: the sandboxed process that
+/// used to open the state database.
+#[cfg(target_os = "linux")]
+fn write_c_fixture(dir: &Path, shm: &Path) {
+    std::fs::create_dir_all(dir.join("src")).expect("src");
+    std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("main.rs");
+    std::fs::write(dir.join("build.rs"), C_BUILD_RS).expect("build.rs");
+    std::fs::write(dir.join("shm.path"), shm.display().to_string()).expect("shm.path");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n",
+    )
+    .expect("manifest");
+}
+
+/// stow#1442: under the default isolation a build script's C compile
+/// goes through the `CC` shim inside the sandbox, and that process must
+/// not open the state database — only the driving process does. The build
+/// script fails with `STATE-DB-LOCK-LOST` when the driver's `-shm` lock
+/// disappears, which is deterministic on the cause (an open of the
+/// database from the sandbox) rather than on a race between a truncation
+/// and a read. The compiled objects must still land in the C object cache:
+/// the daemon stores them.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_sandboxed_c_wrapper_never_opens_the_state_database() {
+    let cache = tempfile::tempdir().expect("cache dir");
+    let shm = cache.path().join("state-v3.sqlite3-shm");
+    let mut env = sandbox_env(|dir, _home| write_c_fixture(dir, &shm));
+    // The fixture's cache is the one the shm path names.
+    env.cache = cache.path().to_path_buf();
+    let output = run_build(&env, &["build"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the sandboxed C build failed:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("STATE-DB-LOCK-LOST"),
+        "a sandboxed process disturbed the driver's state database:\n{stderr}"
+    );
+    let stored = std::fs::read_dir(cache.path().join("cc"))
+        .expect("the daemon created the C object cache")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "o"))
+        .count();
+    assert!(
+        stored >= 2,
+        "the daemon stored {stored} C objects; the wrapper's compiles never reached it:\n{stderr}"
     );
 }
 

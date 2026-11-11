@@ -39,6 +39,15 @@ pub enum Request {
     /// system so every platform speaks it over the transport it already
     /// carries (stow#347).
     AwaitServeMap(AwaitServeMap),
+    /// The C compiler wrapper asking whether the object cache holds the
+    /// object a keyed invocation would produce. Answered with
+    /// [`Answer::CcHit`] or [`Answer::CcMiss`]; a hit's records are
+    /// written after the answer.
+    CcLookup(CcLookup),
+    /// The C compiler wrapper reporting the compile a [`Answer::CcMiss`]
+    /// sent it to run. Answered with [`Answer::Received`] once the object
+    /// is snapshotted; the store and its records follow the answer.
+    CcCompiled(CcCompiled),
 }
 
 impl Request {
@@ -217,6 +226,58 @@ pub struct AwaitServeMap {
     pub token: String,
 }
 
+/// One keyed C/C++ compile as the wrapper computed it: the key covers
+/// everything that shapes the object, so the daemon never sees the
+/// command line.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CcLookup {
+    /// Proves the sender is part of this build; checked on every frame.
+    pub token: String,
+    /// The object's cache key.
+    pub cache_key: String,
+}
+
+/// The wrapper reporting the compile a [`CcLookup`] miss sent it to run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CcCompiled {
+    /// Proves the sender is part of this build; checked on every frame.
+    pub token: String,
+    /// The key the miss was for.
+    pub cache_key: String,
+    /// The compiler's output file, OS-encoded like the argv: the object
+    /// the daemon snapshots into the cache.
+    pub output_path: Vec<u8>,
+    /// Whether the compiler exited successfully.
+    pub success: bool,
+}
+
+impl CcCompiled {
+    /// Build a report for this compile.
+    #[must_use]
+    pub fn new(
+        token: String,
+        cache_key: String,
+        output_path: &std::path::Path,
+        success: bool,
+    ) -> Self {
+        Self {
+            token,
+            cache_key,
+            output_path: os_bytes::encode(output_path.as_os_str()),
+            success,
+        }
+    }
+
+    /// The compiler's output file.
+    ///
+    /// # Errors
+    ///
+    /// When the peer's encoding is not decodable on this platform.
+    pub fn output_path(&self) -> Result<std::path::PathBuf, String> {
+        os_bytes::decode(&self.output_path).map(std::path::PathBuf::from)
+    }
+}
+
 /// The rustc artifact-notification lines a served invocation owes cargo.
 ///
 /// Each entry is one complete `{"$message_type":"artifact",…}` line —
@@ -260,6 +321,15 @@ pub enum Answer {
     /// The build's serve map is final: the facade re-reads the map file
     /// and decides on what it finds (stow#347).
     ServeMapReady,
+    /// The object cache holds the object: the wrapper clones the file at
+    /// `object` (OS-encoded) to the compiler's output path and exits 0.
+    CcHit {
+        /// The cached object's path.
+        object: Vec<u8>,
+    },
+    /// The object cache does not hold it: the wrapper runs the real
+    /// compiler and then sends [`CcCompiled`].
+    CcMiss,
     /// The supervisor could not answer. The facade fails the build with
     /// this message rather than quietly compiling without the cache.
     Failed {
