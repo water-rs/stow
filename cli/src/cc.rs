@@ -850,13 +850,7 @@ fn serve_cached_object_blocking(
     } else {
         Placement::Cloned
     };
-    crate::inject::place_staged(staged, output_path, || {
-        matches!(
-            (std::fs::read(cache_path), std::fs::read(output_path)),
-            (Ok(cached), Ok(served)) if cached == served
-        )
-    })
-    .wrap_err_with(|| {
+    crate::inject::place_staged(staged, output_path).wrap_err_with(|| {
         format!(
             "move cached object {} into place at {}",
             cache_path.display(),

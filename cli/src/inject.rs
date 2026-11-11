@@ -456,12 +456,7 @@ fn materialize_cached_file_blocking(
     // The stamp goes on the staged file: a rename keeps the inode and its
     // mtime, so the final path never holds an unstamped output.
     stamp_materialized_mtime(staged.path())?;
-    let source_len = source_metadata.len();
-    place_staged(staged, output_path, || {
-        target_matches_cached_file(source_path, output_path, expected_sha256, source_len)
-            .unwrap_or(false)
-    })
-    .wrap_err_with(|| {
+    place_staged(staged, output_path).wrap_err_with(|| {
         format!(
             "move cached artifact {} into place at {}",
             source_path.display(),
@@ -496,61 +491,24 @@ pub fn stage_clone(
         })
 }
 
-/// The pauses between attempts to rename a staged file over a destination
-/// that another placement is replacing at the same moment.
+/// Rename `staged` over `destination`, which other placements may be
+/// replacing at the same moment.
 ///
-/// `rename(2)` replaces atomically, so elsewhere there is one attempt. On
-/// Windows a rename that meets a concurrent replace of its destination is
-/// refused with access denied while the other rename is in flight, which
-/// lasts microseconds: five pauses doubling from one millisecond outlast it
-/// by three orders of magnitude and bound the wait at 31 ms before the
-/// refusal is reported.
-#[cfg(windows)]
-const REPLACE_RETRY_PAUSES: [std::time::Duration; 5] = [
-    std::time::Duration::from_millis(1),
-    std::time::Duration::from_millis(2),
-    std::time::Duration::from_millis(4),
-    std::time::Duration::from_millis(8),
-    std::time::Duration::from_millis(16),
-];
-#[cfg(not(windows))]
-const REPLACE_RETRY_PAUSES: [std::time::Duration; 0] = [];
-
-/// Rename `staged` over `destination`, which other placements of the same
-/// bytes may be replacing at the same moment.
-///
-/// A rename refused because the destination is being replaced has lost to
-/// a placement of the same bytes: `already_placed` says whether the
-/// destination now holds them, which is this placement's own postcondition.
-/// Where it does not yet, the rename is tried again after each of
-/// [`REPLACE_RETRY_PAUSES`], and the last refusal is the error.
+/// The rename is `std::fs::rename`, an atomic replace on every platform:
+/// `rename(2)`, and on Windows a POSIX-semantics rename, which replaces a
+/// destination that is open or being replaced. `NamedTempFile::persist` is
+/// `MoveFileExW` there, which is refused while another replace of the same
+/// destination is in flight and leaves the path absent for a moment.
 pub fn place_staged<F>(
-    mut staged: tempfile::NamedTempFile<F>,
+    staged: tempfile::NamedTempFile<F>,
     destination: &std::path::Path,
-    already_placed: impl Fn() -> bool,
 ) -> std::io::Result<()> {
-    for pause in REPLACE_RETRY_PAUSES {
-        match staged.persist(destination) {
-            Ok(_) => return Ok(()),
-            Err(refused) if refused.error.kind() == std::io::ErrorKind::PermissionDenied => {
-                if already_placed() {
-                    return Ok(());
-                }
-                staged = refused.file;
-                std::thread::sleep(pause);
-            }
-            Err(refused) => return Err(refused.error),
-        }
-    }
-    match staged.persist(destination) {
-        Ok(_) => Ok(()),
-        Err(refused)
-            if refused.error.kind() == std::io::ErrorKind::PermissionDenied && already_placed() =>
-        {
-            Ok(())
-        }
-        Err(refused) => Err(refused.error),
-    }
+    // Closing the staged file first: the rename moves a path, and the
+    // staged file is removed with it if the rename fails.
+    let mut staged = staged.into_temp_path();
+    std::fs::rename(&staged, destination)?;
+    staged.disable_cleanup(true);
+    Ok(())
 }
 
 /// Stamp a materialized output with the mtime rustc's own write would
@@ -660,7 +618,12 @@ fn write_materialized_marker(
     // always one writer's whole line, never an interleaving of two.
     let mut staged = tempfile::Builder::new()
         .prefix(".stow-marker-")
-        .tempfile_in(marker_dir)
+        .make_in(marker_dir, |staged| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(staged)
+        })
         .wrap_err_with(|| {
             format!(
                 "stage materialized artifact marker for {}",
@@ -685,11 +648,7 @@ fn write_materialized_marker(
             marker_path.display()
         )
     })?;
-    let output_len = output_metadata.len();
-    place_staged(staged, &marker_path, || {
-        materialized_marker_matches(output_path, output_len, Some(expected_sha256)).unwrap_or(false)
-    })
-    .wrap_err_with(|| {
+    place_staged(staged, &marker_path).wrap_err_with(|| {
         format!(
             "write materialized artifact marker {}",
             marker_path.display()
