@@ -446,19 +446,69 @@ fn materialize_cached_file_blocking(
         write_materialized_marker(output_path, expected_sha256)?;
         return Ok(false);
     }
-    remove_existing_output(output_path)?;
-    reflink_copy::reflink_or_copy(source_path, output_path)
-        .map(|_| ())
-        .wrap_err_with(|| {
-            format!(
-                "clone or copy cached artifact {} into {}",
-                source_path.display(),
-                output_path.display()
-            )
-        })?;
-    stamp_materialized_mtime(output_path)?;
+    let staged = stage_clone(source_path, output_path).wrap_err_with(|| {
+        format!(
+            "clone or copy cached artifact {} into {}",
+            source_path.display(),
+            output_path.display()
+        )
+    })?;
+    // The stamp goes on the staged file: a rename keeps the inode and its
+    // mtime, so the final path never holds an unstamped output.
+    stamp_materialized_mtime(staged.path())?;
+    place_staged(staged, output_path).wrap_err_with(|| {
+        format!(
+            "move cached artifact {} into place at {}",
+            source_path.display(),
+            output_path.display()
+        )
+    })?;
     write_materialized_marker(output_path, expected_sha256)?;
     Ok(true)
+}
+
+/// Clone `source` (APFS `clonefile`, Linux `FICLONE`, else a byte copy) to a
+/// uniquely named file beside `destination`, not yet visible at it.
+///
+/// Placing a file at a path another serve may be placing at the same moment
+/// is `persist` onto the final path — a rename, which replaces atomically
+/// and leaves a reader either the old file or the whole new one — never a
+/// check or remove followed by a create at that path, where the second
+/// creator finds the first one's file (stow#1444). The staged file is
+/// removed on drop if it is never persisted.
+pub fn stage_clone(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<tempfile::NamedTempFile<Option<u64>>> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    tempfile::Builder::new()
+        .prefix(".stow-stage-")
+        .make_in(parent, |staged| {
+            reflink_copy::reflink_or_copy(source, staged)
+        })
+}
+
+/// Rename `staged` over `destination`, which other placements may be
+/// replacing at the same moment.
+///
+/// The rename is `std::fs::rename`, an atomic replace on every platform:
+/// `rename(2)`, and on Windows a POSIX-semantics rename, which replaces a
+/// destination that is open or being replaced. `NamedTempFile::persist` is
+/// `MoveFileExW` there, which is refused while another replace of the same
+/// destination is in flight and leaves the path absent for a moment.
+pub fn place_staged<F>(
+    staged: tempfile::NamedTempFile<F>,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    // Closing the staged file first: the rename moves a path, and the
+    // staged file is removed with it if the rename fails.
+    let mut staged = staged.into_temp_path();
+    std::fs::rename(&staged, destination)?;
+    staged.disable_cleanup(true);
+    Ok(())
 }
 
 /// Stamp a materialized output with the mtime rustc's own write would
@@ -474,18 +524,6 @@ fn stamp_materialized_mtime(output_path: &std::path::Path) -> stow_types::error:
         .open(output_path)
         .and_then(|file| file.set_modified(std::time::SystemTime::now()))
         .wrap_err_with(|| format!("stamp mtime on {}", output_path.display()))
-}
-
-fn remove_existing_output(output_path: &std::path::Path) -> stow_types::error::Result<()> {
-    match std::fs::symlink_metadata(output_path) {
-        Ok(_) => std::fs::remove_file(output_path)
-            .wrap_err_with(|| format!("remove existing cached artifact {}", output_path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(stow_types::error::Error::from(error).wrap_err(format!(
-            "stat existing cached artifact {}",
-            output_path.display()
-        ))),
-    }
 }
 
 fn target_matches_cached_file(
@@ -575,8 +613,25 @@ fn write_materialized_marker(
             marker_dir.display()
         )
     })?;
-    std::fs::write(
-        &marker_path,
+    // Two materializers of one output both write this marker. Each writes
+    // its own staged file and renames it over the marker, so the marker is
+    // always one writer's whole line, never an interleaving of two.
+    let mut staged = tempfile::Builder::new()
+        .prefix(".stow-marker-")
+        .make_in(marker_dir, |staged| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(staged)
+        })
+        .wrap_err_with(|| {
+            format!(
+                "stage materialized artifact marker for {}",
+                marker_path.display()
+            )
+        })?;
+    std::io::Write::write_all(
+        &mut staged,
         format!(
             "{} {} {} {} {}\n",
             MATERIALIZED_MARKER_VERSION,
@@ -584,9 +639,16 @@ fn write_materialized_marker(
             modified_secs,
             modified_nanos,
             expected_sha256
-        ),
+        )
+        .as_bytes(),
     )
     .wrap_err_with(|| {
+        format!(
+            "write materialized artifact marker {}",
+            marker_path.display()
+        )
+    })?;
+    place_staged(staged, &marker_path).wrap_err_with(|| {
         format!(
             "write materialized artifact marker {}",
             marker_path.display()
@@ -1044,6 +1106,69 @@ mod tests {
             b"artifact",
             "a rewrite of the cache entry reached the materialized output"
         );
+    }
+
+    /// Two serves of one build can need the same dependency output at
+    /// once. Every one of them must succeed and the output must be the
+    /// cached bytes whole, whichever placement wins.
+    #[test]
+    fn concurrent_materializations_of_one_output_all_succeed() {
+        const THREADS: usize = 32;
+        const ROUNDS: usize = 20;
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let source = tempdir.path().join("cache").join("lib.rlib");
+        let output_dir = tempdir.path().join("target").join("deps");
+        std::fs::create_dir_all(source.parent().unwrap()).expect("source parent");
+        std::fs::create_dir_all(&output_dir).expect("output parent");
+        let contents = vec![0x5a_u8; 256 * 1024];
+        std::fs::write(&source, &contents).expect("source");
+        let sha256 = hex::encode(sha2::Sha256::digest(&contents));
+
+        for writers in [
+            OutputDirWriters::StowOnly,
+            OutputDirWriters::UntrustedCodeToo,
+        ] {
+            for round in 0..ROUNDS {
+                let output = output_dir.join(format!("lib-{round}.rlib"));
+                let barrier = std::sync::Barrier::new(THREADS);
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = (0..THREADS)
+                        .map(|_| {
+                            scope.spawn(|| {
+                                barrier.wait();
+                                materialize_cached_file_blocking(
+                                    &source,
+                                    &output,
+                                    Some(&sha256),
+                                    writers,
+                                )
+                            })
+                        })
+                        .collect();
+                    for handle in handles {
+                        handle
+                            .join()
+                            .expect("materializer thread")
+                            .expect("every concurrent materialization succeeds");
+                    }
+                });
+                assert_eq!(std::fs::read(&output).expect("output"), contents);
+            }
+        }
+        for dir in [
+            output_dir.clone(),
+            output_dir.join(super::MATERIALIZED_MARKERS_DIR),
+        ] {
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .expect("read dir")
+                .map(|entry| entry.expect("entry").file_name())
+                .filter(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with(".stow-stage-") || name.starts_with(".stow-marker-")
+                })
+                .collect();
+            assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+        }
     }
 
     #[test]

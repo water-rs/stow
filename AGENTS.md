@@ -33,6 +33,8 @@ The single source of repository instructions; `CLAUDE.md` is a symlink to it.
 - GitHub-hosted CI is the only builder and crates.io the only metadata source. The build path never calls the edge.
 - GHCR records signed by the pinned builder identity are the only record store; every other store is a mirror of them, and every reader verifies the signature before trusting a row.
 - The edge is untrusted serving infrastructure.
+- Build isolation is best effort, not an absolute guarantee; the developer's experience comes first.
+- The known isolation weakness is artifact poisoning of the local cache; it may be closed later. Documents state the limits of isolation honestly.
 
 ## Rules
 

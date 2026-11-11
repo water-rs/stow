@@ -787,14 +787,17 @@ impl LockedSlice<Exclusive> {
         let committed = self.dir.join(name);
         let mut staged = tempfile::Builder::new()
             .prefix(&format!(".{hint}.tmp-"))
-            .tempfile_in(&self.dir)
+            .make_in(&self.dir, |staged| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(staged)
+            })
             .wrap_err_with(|| format!("create index staging file in {}", self.dir.display()))?;
         staged
             .write_all(bytes)
             .wrap_err_with(|| format!("write index staging file {}", staged.path().display()))?;
-        staged
-            .persist(&committed)
-            .map_err(|error| error.error)
+        crate::inject::place_staged(staged, &committed)
             .wrap_err_with(|| format!("commit {}", committed.display()))?;
         Ok(())
     }
