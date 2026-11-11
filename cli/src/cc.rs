@@ -1223,6 +1223,7 @@ mod tests {
             artifact_cache_max_bytes: crate::config::DEFAULT_ARTIFACT_CACHE_MAX_BYTES,
             index_refresh_interval: Duration::from_mins(1),
             verify_mode: VerifyMode::GithubCi,
+            switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),

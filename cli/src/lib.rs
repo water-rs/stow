@@ -55,6 +55,7 @@ mod report;
 mod resolve;
 mod rustc_args;
 mod sandbox;
+mod session_env;
 mod state_db;
 mod stats;
 mod supervisor;
@@ -892,8 +893,10 @@ impl BuildContext {
             return Ok(sources);
         }
         let span = tracing::Span::current();
+        let env = session_env::SessionEnv::of_this_process()?;
         let sources =
-            smol::unblock(move || span.in_scope(RegistrySources::from_cargo_config)).await?;
+            smol::unblock(move || span.in_scope(|| RegistrySources::from_cargo_config(&env)))
+                .await?;
         Ok(self.registry_sources.get_or_init(|| sources))
     }
 }
@@ -940,15 +943,19 @@ impl RegistrySources {
     /// # Errors
     ///
     /// The lockfile is unreadable or unparseable.
-    pub(crate) async fn from_lockfile(workspace_root: &Path) -> stow_types::error::Result<Self> {
+    pub(crate) async fn from_lockfile(
+        workspace_root: &Path,
+        env: &session_env::SessionEnv,
+    ) -> stow_types::error::Result<Self> {
         let lockfile_path = workspace_root.join("Cargo.lock");
+        let env = env.clone();
         let span = tracing::Span::current();
         smol::unblock(move || {
             span.in_scope(|| {
                 let contents = match std::fs::read(&lockfile_path) {
                     Ok(contents) => contents,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Self::from_cargo_config();
+                        return Self::from_cargo_config(&env);
                     }
                     Err(error) => {
                         return Err(stow_types::stow_error!(
@@ -963,7 +970,7 @@ impl RegistrySources {
                         lockfile_path.display()
                     )
                 })?;
-                Self::parse_lockfile(&contents, &cargo_config_hosts()?).map_err(|error| {
+                Self::parse_lockfile(&contents, &cargo_config_hosts(&env)?).map_err(|error| {
                     stow_types::stow_error!("parse lockfile {}: {error}", lockfile_path.display())
                 })
             })
@@ -1007,8 +1014,10 @@ impl RegistrySources {
     /// # Errors
     ///
     /// See [`cargo_config_hosts`].
-    pub(crate) fn from_cargo_config() -> stow_types::error::Result<Self> {
-        Ok(Self::CargoConfig(cargo_config_hosts()?))
+    pub(crate) fn from_cargo_config(
+        env: &session_env::SessionEnv,
+    ) -> stow_types::error::Result<Self> {
+        Ok(Self::CargoConfig(cargo_config_hosts(env)?))
     }
 
     /// Whether the registry slot's `(package, version)` at `index_dir`
@@ -1054,9 +1063,11 @@ fn index_dir_in_hosts(index_dir: &str, hosts: &std::collections::BTreeSet<String
 /// The cargo config does not load, or its chain names an undefined
 /// source, loops, or carries a registry URL without a host — configs
 /// cargo itself rejects, so no classification is guessed from them.
-fn cargo_config_hosts() -> stow_types::error::Result<std::collections::BTreeSet<String>> {
+fn cargo_config_hosts(
+    env: &session_env::SessionEnv,
+) -> stow_types::error::Result<std::collections::BTreeSet<String>> {
     let mut hosts = std::collections::BTreeSet::from(["index.crates.io".to_owned()]);
-    let config = cargo_config2::Config::load()
+    let config = mold::cargo_config(env.cwd(), env.cargo_home())
         .map_err(|error| stow_types::stow_error!("load the cargo config: {error}"))?;
     let mut source = Some("crates-io".to_owned());
     let mut seen = std::collections::BTreeSet::new();
@@ -1747,7 +1758,11 @@ async fn run_rustc_standalone(
     // The user's own process runs the user's own rustc: the toolchain is
     // resolved from it through the code a build's driver resolves its own
     // with. One that cannot be resolved bypasses the cache.
-    let toolchain = match toolchain::BuildToolchain::for_executable(&command.executable).await {
+    let resolved = match session_env::SessionEnv::of_this_process() {
+        Ok(env) => toolchain::BuildToolchain::for_executable(&command.executable, &env).await,
+        Err(error) => Err(error.to_string()),
+    };
+    let toolchain = match resolved {
         Ok(toolchain) => std::sync::Arc::new(toolchain),
         Err(error) => {
             tracing::warn!(error = %error, "failed to resolve the rustc toolchain, bypassing rust cache");
@@ -5108,6 +5123,7 @@ async fn build_stable_exact_identity(
         DependencyCMetadataResolution::Resolved(resolved) => resolved,
         DependencyCMetadataResolution::Unrecorded(..) => {
             trace_identity_inputs(
+                config,
                 parsed,
                 target,
                 rustc_version,
@@ -5146,6 +5162,7 @@ async fn build_stable_exact_identity(
         &dependencies.c_metadata_json,
     )?;
     trace_identity_inputs(
+        config,
         parsed,
         target,
         rustc_version,
@@ -5191,6 +5208,7 @@ struct IdentityTraceRecord<'a> {
 /// stable compile key, so client-side keys can be diffed against D1 rows
 /// field by field. Inert when the env var is unset.
 async fn trace_identity_inputs(
+    config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
     target: &str,
     rustc_version: &str,
@@ -5198,7 +5216,7 @@ async fn trace_identity_inputs(
     identity: Option<&stow_types::public_cache::StableUnitIdentity>,
     outcome: &str,
 ) {
-    let Some(trace_dir) = std::env::var_os("STOW_IDENTITY_TRACE") else {
+    let Some(trace_dir) = config.switches.identity_trace.clone() else {
         return;
     };
     let record = IdentityTraceRecord {
@@ -5214,7 +5232,6 @@ async fn trace_identity_inputs(
         computed_compile_key: identity.map(|identity| identity.compile_key.as_str()),
         computed_c_metadata: identity.map(|identity| identity.c_metadata.as_str()),
     };
-    let trace_dir = PathBuf::from(trace_dir);
     let file_name = format!(
         "{}-{}-{}.json",
         parsed.crate_name,
@@ -6807,6 +6824,7 @@ mod tests {
             artifact_cache_max_bytes: 1,
             index_refresh_interval: std::time::Duration::from_mins(10),
             verify_mode: crate::config::VerifyMode::GithubCi,
+            switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
@@ -6840,12 +6858,18 @@ mod tests {
         let config = env_base_test_config(&dir);
         let build_rustc =
             crate::rustc_args::BuildRustc::Configured(std::ffi::OsString::from("rustc"));
-        let driver =
-            crate::toolchain::BuildToolchain::for_build(&build_rustc, None, &test_shared_vv())
-                .await
-                .expect("the driver's toolchain resolves on a machine with rustc");
+        let env = crate::session_env::SessionEnv::of_this_process()
+            .expect("the test process's environment");
+        let driver = crate::toolchain::BuildToolchain::for_build(
+            &build_rustc,
+            None,
+            &test_shared_vv(),
+            &env,
+        )
+        .await
+        .expect("the driver's toolchain resolves on a machine with rustc");
         let standalone =
-            crate::toolchain::BuildToolchain::for_executable(std::ffi::OsStr::new("rustc"))
+            crate::toolchain::BuildToolchain::for_executable(std::ffi::OsStr::new("rustc"), &env)
                 .await
                 .expect("the standalone toolchain resolves on the same rustc");
         assert_eq!(driver.rustc(), standalone.rustc());
@@ -7333,6 +7357,7 @@ mod tests {
             artifact_cache_max_bytes: 0,
             index_refresh_interval: std::time::Duration::ZERO,
             verify_mode: crate::config::VerifyMode::GithubCi,
+            switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
@@ -7586,6 +7611,7 @@ mod tests {
                 artifact_cache_max_bytes: u64::MAX,
                 index_refresh_interval: Duration::ZERO,
                 verify_mode: crate::config::VerifyMode::GithubCi,
+                switches: crate::config::Switches::default(),
                 state_db: crate::state_db::StateDb::default(),
                 trust_material: std::sync::Arc::default(),
                 registry_http: std::sync::Arc::default(),

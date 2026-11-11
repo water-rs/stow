@@ -21,6 +21,7 @@ use crate::log_nonfatal_result;
 use crate::prefetch::{self, PrefetchArtifact};
 use crate::resolve;
 use crate::rustc_args::{self, STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, STOW_PUBLIC_CACHE_TARGET_ENV};
+use crate::session_env::SessionEnv;
 use crate::state_db::StateDb;
 use crate::stats;
 use crate::workspace_deps::{self, ExpandedDependencyGraph, PackageKey};
@@ -284,7 +285,8 @@ async fn run_inner(
     // The one slice memo of this build: the driver's analyses and the
     // in-build enrichment fetch through it, so a slice is verified once.
     let slices = index::SliceFetches::default();
-    let mut public_cache_mode = PublicCacheMode::for_build(&project.rustc_version, cache_layers);
+    let mut public_cache_mode =
+        PublicCacheMode::for_build(&project.facts.rustc_version, cache_layers);
     if let PublicCacheMode::Disabled {
         message: Some(message),
     } = &public_cache_mode
@@ -298,15 +300,13 @@ async fn run_inner(
     // only the remote half: every unit is local-only by construction
     // (stow#1006).
     // Units compile for the target and, under `--target`, for the host.
-    let compiled_targets = if project.target_given {
-        vec![project.target.as_str(), project.host_target.as_str()]
-    } else {
-        vec![project.target.as_str()]
-    };
+    let compiled_targets = project.facts.compiled_targets();
     if public_cache_mode.is_enabled()
-        && let Some(divergence) =
-            crate::profile_guard::dev_profile_divergence(&project.workspace_root, &compiled_targets)
-                .await?
+        && let Some(divergence) = crate::profile_guard::dev_profile_divergence(
+            &project.facts.workspace_root,
+            &compiled_targets,
+        )
+        .await?
     {
         let message = format!(
             "warning: stow public cache is disabled for this build because {divergence}; \
@@ -352,6 +352,7 @@ async fn run_inner(
         maybe_analysis
             .as_ref()
             .map_or(0, |analysis| analysis.prefetch_artifacts.len()),
+        &project.env,
     );
 
     let selected = select_upgrades(
@@ -438,14 +439,14 @@ async fn analyze_or_warn(
         return None;
     }
     let config = config?;
-    match analyze_workspace_prediction_lite(project, config).await {
+    match analyze_workspace_prediction_lite(&project.facts, &project.env, config).await {
         Ok(analysis) => Some(analysis),
         Err(error) => {
             tracing::warn!(
                 error = %error,
                 "compatible upgrade analysis failed, running original cargo command"
             );
-            warn_when_no_index_covers_the_toolchain(config, project).await;
+            warn_when_no_index_covers_the_toolchain(config, &project.facts).await;
             None
         }
     }
@@ -460,7 +461,7 @@ async fn analyze_or_warn(
 /// had simply covered nothing, and the only way to tell the two apart was
 /// `RUST_LOG=stow_cli=debug`. A benchmark ran twice against a toolchain
 /// with no index before anyone noticed.
-async fn warn_when_no_index_covers_the_toolchain(config: &StowConfig, project: &ProjectContext) {
+async fn warn_when_no_index_covers_the_toolchain(config: &StowConfig, project: &ProjectFacts) {
     let cached = index::cached_slice(config, &project.target, &project.rustc_version).await;
     if matches!(cached, Ok(Some(_))) {
         return;
@@ -508,7 +509,7 @@ async fn run_uncovered_passthrough(
         project,
         &invocation.action,
         &invocation.cargo_args,
-        project.current_dir(),
+        project.facts.current_dir(),
         &invocation.isolation,
     )
     .await
@@ -545,8 +546,8 @@ async fn run_original_workspace_build(
         config,
         action: &invocation.action,
         cargo_args: &invocation.cargo_args,
-        source_root: &project.workspace_root,
-        current_dir: project.current_dir(),
+        source_root: &project.facts.workspace_root,
+        current_dir: project.facts.current_dir(),
         cache_policy_entries: cache_policy_entries.as_deref(),
         public_cache_mode,
         unit_nodes: unit_nodes.as_ref(),
@@ -578,25 +579,29 @@ async fn run_mirrored_upgrade_build(
     selected: &[CompatibleUpgrade],
     slices: &index::SliceFetches,
 ) -> stow_types::error::Result<ExitStatus> {
-    let mirror = create_workspace_mirror(project, &project.workspace_root).await?;
-    apply_selected_upgrades(project, &mirror, selected).await?;
-    let mirror_args = rewrite_args_for_mirror(&invocation.cargo_args, project, &mirror)?;
-    let mirror_manifest_path = mirror_manifest_path(project, &mirror)?;
+    let mirror = create_workspace_mirror(&project.facts, &project.facts.workspace_root).await?;
+    apply_selected_upgrades(&project.facts, &mirror, selected).await?;
+    let mirror_args = rewrite_args_for_mirror(&invocation.cargo_args, &project.facts, &mirror)?;
+    let mirror_manifest_path = mirror_manifest_path(&project.facts, &mirror)?;
 
     // After applying upgrades, re-analyze the mirror so the wrapper's exact +
     // semantic paths get the post-upgrade transitive graph + prefetch list.
     // Without this, the upgrade branch ran the mirror with no cache plumbing
     // and saw 0 hits — the primary cause of the predict-vs-runtime gap
     // reported on populated mocks.
-    let mirror_project = build_mirror_project_context(project, &mirror)?;
+    let mirror_project = build_mirror_project_facts(&project.facts, &mirror)?;
+    let scope = AnalysisScope {
+        project: &mirror_project,
+        env: &project.env,
+        slices,
+    };
     let mirror_analysis = match config {
         Some(config) => match analyze_workspace_prediction(
-            &mirror_project,
+            scope,
             mirror_project.current_dir(),
             &mirror_project.manifest_path,
             config,
             None,
-            slices,
         )
         .await
         {
@@ -629,13 +634,12 @@ async fn run_mirrored_upgrade_build(
 
     let cache_policy_entries = Box::pin(prepare_build_cache_plan(
         config,
-        project,
+        AnalysisScope::of(project, slices),
         &mirror.current_dir(),
         &mirror_manifest_path,
         public_cache_mode,
         mirror_analysis,
         budget,
-        slices,
     ))
     .await?;
 
@@ -662,10 +666,10 @@ async fn run_mirrored_upgrade_build(
     .await
 }
 
-fn build_mirror_project_context(
-    project: &ProjectContext,
+fn build_mirror_project_facts(
+    project: &ProjectFacts,
     mirror: &WorkspaceMirror,
-) -> stow_types::error::Result<ProjectContext> {
+) -> stow_types::error::Result<ProjectFacts> {
     let workspace_root = mirror.root().to_path_buf();
     let current_dir = mirror.current_dir();
     let manifest_path = mirror_manifest_path(project, mirror)?;
@@ -677,7 +681,7 @@ fn build_mirror_project_context(
     // lockfile graph under the mirror's key (stow#551).
     let mut metadata_args = project.metadata_args.clone();
     metadata_args.manifest_path = Some(manifest_path.clone());
-    Ok(ProjectContext {
+    Ok(ProjectFacts {
         action: project.action.clone(),
         cargo_args: rewrite_args_for_mirror(&project.cargo_args, project, mirror)?,
         workspace_root,
@@ -689,11 +693,6 @@ fn build_mirror_project_context(
         target_given: project.target_given,
         host_target: project.host_target.clone(),
         rustc_version: project.rustc_version.clone(),
-        mold: project.mold.clone(),
-        env_base: project.env_base.clone(),
-        build_rustc: project.build_rustc.clone(),
-        toolchain: project.toolchain.clone(),
-        foreground: project.foreground.clone(),
     })
 }
 
@@ -733,18 +732,17 @@ async fn analyze_for_prediction(
     config.require_network("stow predict")?;
     if let PublicCacheMode::Disabled {
         message: Some(message),
-    } = PublicCacheMode::for_build(&project.rustc_version, config.cache)
+    } = PublicCacheMode::for_build(&project.facts.rustc_version, config.cache)
     {
         write_stdout(&format!("{message}\n"))?;
         return Ok(None);
     }
     analyze_workspace_prediction(
-        &project,
-        project.current_dir(),
-        &project.manifest_path,
+        AnalysisScope::of(&project, &index::SliceFetches::default()),
+        project.facts.current_dir(),
+        &project.facts.manifest_path,
         &config,
         None,
-        &index::SliceFetches::default(),
     )
     .await
     .map(Some)
@@ -780,8 +778,32 @@ impl CargoInvocation {
     }
 }
 
+/// What one build's analyses read besides the config: the project, the
+/// environment it runs in and the build's slice memo. They travel
+/// together, so every analysis of a build draws on the same three.
+#[derive(Debug, Clone, Copy)]
+struct AnalysisScope<'a> {
+    project: &'a ProjectFacts,
+    env: &'a SessionEnv,
+    slices: &'a index::SliceFetches,
+}
+
+impl<'a> AnalysisScope<'a> {
+    const fn of(project: &'a ProjectContext, slices: &'a index::SliceFetches) -> Self {
+        Self {
+            project: &project.facts,
+            env: &project.env,
+            slices,
+        }
+    }
+}
+
+/// What the analysis of a build reads about its project: plain data, no
+/// handle on the driver's process. Together with a [`SessionEnv`] it is
+/// everything the unit-graph query, the cache key and the serve-map
+/// prediction need, so a process other than the driver's can run them.
 #[derive(Debug, Clone)]
-pub struct ProjectContext {
+pub struct ProjectFacts {
     /// The wrapped action (`check`, `build`, `test`, `predict`, …) —
     /// picks the cargo subcommand the unit-graph query re-runs.
     pub action: String,
@@ -803,6 +825,32 @@ pub struct ProjectContext {
     /// a `--target` build (stow#317) and not a target-to-runner mapping.
     pub host_target: String,
     pub rustc_version: String,
+}
+
+impl ProjectFacts {
+    fn current_dir(&self) -> &Path {
+        &self.current_dir
+    }
+
+    /// The targets units compile for: the consumer target and, under
+    /// `--target`, the host.
+    fn compiled_targets(&self) -> Vec<&str> {
+        if self.target_given {
+            vec![self.target.as_str(), self.host_target.as_str()]
+        } else {
+            vec![self.target.as_str()]
+        }
+    }
+}
+
+/// The driver's view of a build's project: the [`ProjectFacts`] the
+/// analysis reads, the environment the build runs in, and the handles
+/// only the driver holds.
+#[derive(Debug, Clone)]
+pub struct ProjectContext {
+    pub facts: ProjectFacts,
+    /// The environment and working directory the command was started in.
+    pub env: SessionEnv,
     /// The cargo `--config` values this build needs so its Linux units
     /// link with mold — empty on non-Linux, and empty when the cargo
     /// configuration already selects a reachable mold (the setup path).
@@ -868,13 +916,19 @@ fn shared_toolchain(
     build_rustc: &rustc_args::BuildRustc,
     workspace_wrapper: Option<PathBuf>,
     shared_vv: crate::rustc_args::SharedRustcVv,
+    env: SessionEnv,
 ) -> SharedToolchain {
     let build_rustc = build_rustc.clone();
     async move {
-        crate::toolchain::BuildToolchain::for_build(&build_rustc, workspace_wrapper, &shared_vv)
-            .await
-            .map(std::sync::Arc::new)
-            .map_err(std::sync::Arc::new)
+        crate::toolchain::BuildToolchain::for_build(
+            &build_rustc,
+            workspace_wrapper,
+            &shared_vv,
+            &env,
+        )
+        .await
+        .map(std::sync::Arc::new)
+        .map_err(std::sync::Arc::new)
     }
     .boxed()
     .shared()
@@ -954,6 +1008,7 @@ async fn join_env_base(
 /// than after them, then `finish` joins what the probes answered
 /// (stow#517).
 struct PendingProjectContext {
+    env: SessionEnv,
     action: String,
     cargo_args: Vec<OsString>,
     workspace_root: PathBuf,
@@ -989,7 +1044,8 @@ impl ProjectContext {
     /// Everything `load` resolves without waiting on rustc: the workspace
     /// layout, and both probes already running beside it.
     fn begin(invocation: &CargoInvocation) -> stow_types::error::Result<PendingProjectContext> {
-        let invocation_dir = std::env::current_dir().wrap_err("resolve current directory")?;
+        let env = SessionEnv::of_this_process()?;
+        let invocation_dir = env.cwd().to_path_buf();
         let metadata_args = MetadataArgs::parse(&invocation_dir, &invocation.cargo_args)?;
         // Cargo's target chain: spelled `--target`(s), then
         // `--config build.target` — the one config input
@@ -1064,8 +1120,10 @@ impl ProjectContext {
             &build_rustc,
             cargo_config.build.rustc_workspace_wrapper.clone(),
             rustc_vv.clone(),
+            env.clone(),
         );
         Ok(PendingProjectContext {
+            env,
             action: invocation.action.clone(),
             cargo_args: invocation.cargo_args.clone(),
             workspace_root,
@@ -1091,10 +1149,6 @@ impl ProjectContext {
         // only if something awaits it (stow#653).
         let mold = defer_mold_provision(&pending);
         pending.finish(mold, enter_foreground_hold()).await
-    }
-
-    fn current_dir(&self) -> &Path {
-        &self.current_dir
     }
 }
 
@@ -1124,17 +1178,20 @@ impl PendingProjectContext {
             .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
         let foreground = foreground?;
         Ok(ProjectContext {
-            action: self.action,
-            cargo_args: self.cargo_args,
-            workspace_root: self.workspace_root,
-            current_dir: self.current_dir,
-            current_dir_relative: self.current_dir_relative,
-            manifest_path: self.manifest_path,
-            metadata_args: self.metadata_args,
-            target,
-            target_given: self.resolved_target.is_some(),
-            host_target,
-            rustc_version,
+            facts: ProjectFacts {
+                action: self.action,
+                cargo_args: self.cargo_args,
+                workspace_root: self.workspace_root,
+                current_dir: self.current_dir,
+                current_dir_relative: self.current_dir_relative,
+                manifest_path: self.manifest_path,
+                metadata_args: self.metadata_args,
+                target,
+                target_given: self.resolved_target.is_some(),
+                host_target,
+                rustc_version,
+            },
+            env: self.env,
             mold,
             env_base: None,
             build_rustc: self.build_rustc,
@@ -1287,20 +1344,24 @@ struct CompatibleUpgrade {
 }
 
 async fn analyze_workspace_prediction(
-    project: &ProjectContext,
+    scope: AnalysisScope<'_>,
     _current_dir: &Path,
     manifest_path: &Path,
     config: &StowConfig,
     resolution_done: Option<&crate::ResolutionDone>,
-    slices: &index::SliceFetches,
 ) -> stow_types::error::Result<WorkspacePrediction> {
+    let AnalysisScope {
+        project,
+        env,
+        slices,
+    } = scope;
     // Resolution never leaves the machine: the verified index slice is
     // the only catalog consulted, and the graph walk runs in-process.
     // The resolve and the slice fetch are independent — the slice
     // fetch's registry round trip does not wait on cargo's resolution
     // gate (stow#608).
     let (expanded, consumer_slices) = tokio::join!(
-        expanded_graph(config, project, manifest_path, resolution_done),
+        expanded_graph(config, project, env, manifest_path, resolution_done),
         ensure_consumer_slices(config, project, slices),
     );
     let expanded = expanded?;
@@ -1331,11 +1392,12 @@ async fn analyze_workspace_prediction(
 /// missing graph cannot name: the local listing's units or a slice's
 /// index rows (stow#608, stow#617, stow#805).
 async fn analyze_workspace_prediction_lite(
-    project: &ProjectContext,
+    project: &ProjectFacts,
+    env: &SessionEnv,
     config: &StowConfig,
 ) -> stow_types::error::Result<WorkspacePrediction> {
     let (expanded, slices) = tokio::join!(
-        expanded_graph_cached(config, project)
+        expanded_graph_cached(config, project, env)
             .instrument(tracing::debug_span!("stow.precargo.expanded_graph_load")),
         cached_consumer_slices(config, project)
             .instrument(tracing::debug_span!("stow.precargo.cached_slices")),
@@ -1390,7 +1452,7 @@ struct AnalysisInputs {
 }
 
 async fn analyze_workspace_prediction_from(
-    project: &ProjectContext,
+    project: &ProjectFacts,
     config: &StowConfig,
     inputs: AnalysisInputs,
 ) -> stow_types::error::Result<WorkspacePrediction> {
@@ -1483,7 +1545,7 @@ fn inexact_report_entries(
 /// read, the serve map's set algebra, the dependency-graph resolve and
 /// the bookkeeping over its answer.
 fn predict_from_inputs(
-    project: &ProjectContext,
+    project: &ProjectFacts,
     inputs: AnalysisInputs,
     local_units: &[(String, String, String)],
 ) -> stow_types::error::Result<WorkspacePrediction> {
@@ -1632,7 +1694,7 @@ fn predict_from_inputs(
 /// as an empty set — no fallback, no error — so the in-build enrichment
 /// covers such a build as today.
 fn build_serve_map(
-    project: &ProjectContext,
+    project: &ProjectFacts,
     consumer_rows: &[stow_types::index::ArtifactIndexRow],
     host: Option<&index::IndexSlice>,
     expanded_entries: &[ResolvedDependencyGraphEntry],
@@ -1854,7 +1916,7 @@ fn prefetch_servable_wildcards(
 /// compiles the miss lane reports (stow#367).
 async fn ensure_consumer_slices(
     config: &StowConfig,
-    project: &ProjectContext,
+    project: &ProjectFacts,
     slices: &index::SliceFetches,
 ) -> Result<(index::IndexSlice, Option<index::IndexSlice>), index::SliceFetchError> {
     let host_target = stow_types::api::runner_family(&project.target)
@@ -1894,7 +1956,7 @@ async fn ensure_consumer_slices(
 /// in-build enrichment fetches anyway (stow#347).
 async fn cached_consumer_slices(
     config: &StowConfig,
-    project: &ProjectContext,
+    project: &ProjectFacts,
 ) -> stow_types::error::Result<(Option<index::IndexSlice>, Option<index::IndexSlice>, bool)> {
     let host_target = stow_types::api::runner_family(&project.target)
         .map(|family| family.host_triple().to_owned())
@@ -2162,11 +2224,12 @@ async fn query_admissions(
 /// miss or load error (with the result written back best-effort).
 async fn expanded_graph(
     config: &StowConfig,
-    project: &ProjectContext,
+    project: &ProjectFacts,
+    env: &SessionEnv,
     manifest_path: &Path,
     resolution_done: Option<&crate::ResolutionDone>,
 ) -> stow_types::error::Result<ExpandedDependencyGraph> {
-    let expanded_cache_key = expanded_graph_cache_key(project).await?;
+    let expanded_cache_key = expanded_graph_cache_key(project, env).await?;
     match crate::lockfile_graph_cache::load(config, &expanded_cache_key).await {
         Ok(Some(graph)) => {
             tracing::debug!(
@@ -2196,7 +2259,7 @@ async fn expanded_graph(
             host_triple,
             &stow_types::identity::WireRustcVersion::parse(project.rustc_version.as_str())
                 .wrap_err("parse rustc_version")?,
-            None,
+            env,
         ),
     )
     .await?;
@@ -2235,9 +2298,10 @@ where
 /// (stow#347).
 async fn expanded_graph_cached(
     config: &StowConfig,
-    project: &ProjectContext,
+    project: &ProjectFacts,
+    env: &SessionEnv,
 ) -> stow_types::error::Result<Option<ExpandedDependencyGraph>> {
-    let expanded_cache_key = expanded_graph_cache_key(project).await?;
+    let expanded_cache_key = expanded_graph_cache_key(project, env).await?;
     match crate::lockfile_graph_cache::load(config, &expanded_cache_key).await {
         Ok(graph) => Ok(graph),
         Err(error) => {
@@ -2250,9 +2314,13 @@ async fn expanded_graph_cached(
 /// [`crate::lockfile_graph_cache::cache_key`] on a blocking thread: the
 /// key reads and hashes the lockfile, whose size is the project's
 /// package count (stow#624).
-async fn expanded_graph_cache_key(project: &ProjectContext) -> stow_types::error::Result<String> {
+async fn expanded_graph_cache_key(
+    project: &ProjectFacts,
+    env: &SessionEnv,
+) -> stow_types::error::Result<String> {
     let project = project.clone();
-    smol::unblock(move || crate::lockfile_graph_cache::cache_key(&project)).await
+    let env = env.clone();
+    smol::unblock(move || crate::lockfile_graph_cache::cache_key(&project, &env)).await
 }
 
 /// The unit graph's direct registry dependencies as depth-1
@@ -2462,16 +2530,26 @@ async fn try_stow_resolver(
     invocation: &CargoInvocation,
     slices: &index::SliceFetches,
 ) -> stow_types::error::Result<Option<ExitStatus>> {
-    let Some(stow_lockfile_toml) = synthesize_lockfile(config, project).await? else {
+    let Some(stow_lockfile_toml) = synthesize_lockfile(config, &project.facts).await? else {
         return Ok(None);
     };
 
-    let public_cache_mode = PublicCacheMode::for_build(&project.rustc_version, config.cache);
-    let Some(pinned) = prepare_pinned_mirror(project, invocation, &stow_lockfile_toml).await?
+    let public_cache_mode = PublicCacheMode::for_build(&project.facts.rustc_version, config.cache);
+    let Some(pinned) =
+        prepare_pinned_mirror(&project.facts, invocation, &stow_lockfile_toml).await?
     else {
         return Ok(None);
     };
-    let Some(mirror_analysis) = analyze_pinned_mirror(config, &pinned.project, slices).await else {
+    let Some(mirror_analysis) = analyze_pinned_mirror(
+        config,
+        AnalysisScope {
+            project: &pinned.project,
+            env: &project.env,
+            slices,
+        },
+    )
+    .await
+    else {
         return Ok(None);
     };
 
@@ -2501,7 +2579,7 @@ async fn try_stow_resolver(
 /// brings a fresher index to a running build.
 async fn synthesize_lockfile(
     config: &StowConfig,
-    project: &ProjectContext,
+    project: &ProjectFacts,
 ) -> stow_types::error::Result<Option<String>> {
     // The resolver needs a cached slice to pin against — read it first,
     // so a cold cache skips the manifest walk entirely (stow#608).
@@ -2558,14 +2636,14 @@ struct PinnedMirror {
     mirror: WorkspaceMirror,
     args: Vec<OsString>,
     manifest_path: PathBuf,
-    project: ProjectContext,
+    project: ProjectFacts,
 }
 
 /// Mirror `project`, install the synthesized lockfile, and run cargo's
 /// `--locked` dry-run correctness gate. Returns `None` when the gate
 /// rejects the lockfile.
 async fn prepare_pinned_mirror(
-    project: &ProjectContext,
+    project: &ProjectFacts,
     invocation: &CargoInvocation,
     stow_lockfile_toml: &str,
 ) -> stow_types::error::Result<Option<PinnedMirror>> {
@@ -2584,7 +2662,7 @@ async fn prepare_pinned_mirror(
     // the local index for the gaps the resolver intentionally omitted.
     let args = rewrite_args_for_mirror(&invocation.cargo_args, project, &mirror)?;
     let manifest_path = mirror_manifest_path(project, &mirror)?;
-    let mirror_project = build_mirror_project_context(project, &mirror)?;
+    let mirror_project = build_mirror_project_facts(project, &mirror)?;
 
     // Correctness gate: cargo's own resolver verifies the synthesized
     // lockfile against the workspace's `Cargo.toml`. Under `--locked`,
@@ -2614,16 +2692,15 @@ async fn prepare_pinned_mirror(
 /// that broken lockfile to a real build invocation downstream.
 async fn analyze_pinned_mirror(
     config: &StowConfig,
-    mirror_project: &ProjectContext,
-    slices: &index::SliceFetches,
+    scope: AnalysisScope<'_>,
 ) -> Option<WorkspacePrediction> {
+    let mirror_project = scope.project;
     match analyze_workspace_prediction(
-        mirror_project,
+        scope,
         mirror_project.current_dir(),
         &mirror_project.manifest_path,
         config,
         None,
-        slices,
     )
     .await
     {
@@ -2668,17 +2745,16 @@ async fn run_pinned_mirror_build(
 
     // The resolver path builds its own graph analysis for the pinned mirror,
     // so it sizes its own allowance from that.
-    let budget = CacheBudget::for_covered_units(mirror_prefetch.len());
+    let budget = CacheBudget::for_covered_units(mirror_prefetch.len(), &project.env);
 
     let cache_policy_entries = Box::pin(prepare_build_cache_plan(
         Some(config),
-        project,
+        AnalysisScope::of(project, slices),
         &pinned.mirror.current_dir(),
         &pinned.manifest_path,
         public_cache_mode,
         Some(mirror_analysis),
         &budget,
-        slices,
     ))
     .await?;
 
@@ -2966,7 +3042,7 @@ async fn write_lockfile_into_mirror(
 /// pins via `analyze_workspace_prediction`, and falls back to passthrough
 /// then.
 async fn validate_pinned_lockfile(
-    mirror_project: &ProjectContext,
+    mirror_project: &ProjectFacts,
 ) -> stow_types::error::Result<bool> {
     let mut command = async_process::Command::new("cargo");
     command
@@ -3070,13 +3146,12 @@ async fn prefetch_graph_artifacts(
 
 async fn prepare_build_cache_plan(
     config: Option<&StowConfig>,
-    project: &ProjectContext,
+    scope: AnalysisScope<'_>,
     current_dir: &Path,
     manifest_path: &Path,
     public_cache_mode: &PublicCacheMode,
     precomputed_analysis: Option<WorkspacePrediction>,
     budget: &CacheBudget,
-    slices: &index::SliceFetches,
 ) -> stow_types::error::Result<Option<Vec<CachePolicyEntry>>> {
     let Some(config) = config else {
         return Ok(None);
@@ -3088,15 +3163,8 @@ async fn prepare_build_cache_plan(
     let analysis = match precomputed_analysis {
         Some(analysis) => analysis,
         None => {
-            match analyze_workspace_prediction(
-                project,
-                current_dir,
-                manifest_path,
-                config,
-                None,
-                slices,
-            )
-            .await
+            match analyze_workspace_prediction(scope, current_dir, manifest_path, config, None)
+                .await
             {
                 Ok(analysis) => analysis,
                 Err(error) => {
@@ -3376,7 +3444,7 @@ impl WorkspaceMirror {
 }
 
 async fn create_workspace_mirror(
-    project: &ProjectContext,
+    project: &ProjectFacts,
     source_root: &Path,
 ) -> stow_types::error::Result<WorkspaceMirror> {
     let workspace_root = source_root.to_path_buf();
@@ -3426,7 +3494,7 @@ async fn create_workspace_mirror(
 }
 
 async fn apply_selected_upgrades(
-    project: &ProjectContext,
+    project: &ProjectFacts,
     mirror: &WorkspaceMirror,
     selected: &[CompatibleUpgrade],
 ) -> stow_types::error::Result<()> {
@@ -3604,7 +3672,7 @@ async fn load_current_lockfile_versions(
 }
 
 fn mirror_manifest_path(
-    project: &ProjectContext,
+    project: &ProjectFacts,
     mirror: &WorkspaceMirror,
 ) -> stow_types::error::Result<PathBuf> {
     relative_path(&project.workspace_root, &project.manifest_path)
@@ -3613,7 +3681,7 @@ fn mirror_manifest_path(
 
 fn rewrite_args_for_mirror(
     cargo_args: &[OsString],
-    project: &ProjectContext,
+    project: &ProjectFacts,
     mirror: &WorkspaceMirror,
 ) -> stow_types::error::Result<Vec<OsString>> {
     rewrite_args_for_root(cargo_args, project, mirror.root())
@@ -3621,7 +3689,7 @@ fn rewrite_args_for_mirror(
 
 fn rewrite_args_for_root(
     cargo_args: &[OsString],
-    project: &ProjectContext,
+    project: &ProjectFacts,
     root: &Path,
 ) -> stow_types::error::Result<Vec<OsString>> {
     let mut rewritten = Vec::with_capacity(cargo_args.len());
@@ -3684,7 +3752,7 @@ fn rewrite_args_for_root(
 }
 
 fn rewrite_path_for_root(
-    project: &ProjectContext,
+    project: &ProjectFacts,
     root: &Path,
     path: &Path,
 ) -> stow_types::error::Result<PathBuf> {
@@ -3779,19 +3847,19 @@ async fn run_cargo_passthrough_sandboxed(
         argv.push(OsString::from("--offline"));
     }
     let mut envs: Vec<(OsString, OsString)> = Vec::new();
-    if std::env::var_os("CARGO_TARGET_DIR").is_none() && !has_explicit_target_dir(cargo_args) {
+    if project.env.var_os("CARGO_TARGET_DIR").is_none() && !has_explicit_target_dir(cargo_args) {
         envs.push((
             OsString::from("CARGO_TARGET_DIR"),
-            project.workspace_root.join("target").into_os_string(),
+            project.facts.workspace_root.join("target").into_os_string(),
         ));
     }
-    let target_dir = resolved_target_dir(project, cargo_args, current_dir);
+    let target_dir = resolved_target_dir(&project.facts, &project.env, cargo_args, current_dir);
     let runtime = std::env::current_exe().wrap_err("resolve current executable")?;
     // The workspace root plus the manifest directory `current_dir`
     // walks up to: a member's cargo reads its workspace root manifest,
     // and a mirrored run's sources link into the real workspace — both
     // spellings are covered.
-    let mut source_roots = vec![project.workspace_root.clone()];
+    let mut source_roots = vec![project.facts.workspace_root.clone()];
     let manifest_root = enclosing_manifest_dir(current_dir);
     if !source_roots.contains(&manifest_root) {
         source_roots.push(manifest_root);
@@ -3799,14 +3867,14 @@ async fn run_cargo_passthrough_sandboxed(
     let request = crate::sandbox::SandboxRequest {
         confinement,
         isolation,
-        lockfile_root: &project.workspace_root,
+        lockfile_root: &project.facts.workspace_root,
         source_roots: &source_roots,
         target_dir: &target_dir,
         scratch_dir: None,
         shims_dir: None,
         runtime_executable: &runtime,
         rustc_executable: Path::new(project.build_rustc.executable()),
-        host_target: project.host_target.as_str(),
+        host_target: project.facts.host_target.as_str(),
         cargo_dir: current_dir,
         cargo_args,
         ipc: None,
@@ -3852,10 +3920,10 @@ async fn passthrough_command(
         command.arg("--config").arg(config_arg);
     }
     command.args(cargo_args).current_dir(current_dir);
-    if std::env::var_os("CARGO_TARGET_DIR").is_none() && !has_explicit_target_dir(cargo_args) {
+    if project.env.var_os("CARGO_TARGET_DIR").is_none() && !has_explicit_target_dir(cargo_args) {
         command.env(
             "CARGO_TARGET_DIR",
-            project.workspace_root.join("target").into_os_string(),
+            project.facts.workspace_root.join("target").into_os_string(),
         );
     }
     Ok(command)
@@ -3989,7 +4057,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     } = *plan;
     let (setup, registry_sources) = futures_util::try_join!(
         prepare_cargo_run(plan),
-        crate::RegistrySources::from_lockfile(&project.workspace_root)
+        crate::RegistrySources::from_lockfile(&project.facts.workspace_root, &project.env)
             .instrument(tracing::debug_span!("stow.precargo.registry_sources")),
     )?;
     let CargoRunSetup {
@@ -4023,7 +4091,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         crate::BuildSupervisor::new(
             crate::BuildContext {
                 policy_dir: cache_policy_path.clone(),
-                public_cache_target: Some(project.target.clone()),
+                public_cache_target: Some(project.facts.target.clone()),
                 public_cache_disabled: !public_cache_mode.is_enabled(),
                 cache: config
                     .map_or_else(crate::config::CacheLayers::default, |config| config.cache),
@@ -4040,7 +4108,8 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
             crate::supervisor::invocation::RefusalPolicy::of_this_build(),
         )
         .with_target_dir(resolved_target_dir(
-            project,
+            &project.facts,
+            &project.env,
             plan.cargo_args,
             plan.current_dir,
         )),
@@ -4064,7 +4133,8 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         // returns is warming this build can no longer use; the plan path
         // fetches on demand.
         Some(spawn_build_enrichment(BuildEnrichment {
-            project: project.clone(),
+            project: project.facts.clone(),
+            env: project.env.clone(),
             config: config.clone(),
             circuit: handler.circuit(),
             cell: analysis_cell,
@@ -4375,18 +4445,23 @@ async fn sandboxed_cargo_run(
     {
         launch.argv.push(OsString::from("--offline"));
     }
-    let target_dir = resolved_target_dir(plan.project, plan.cargo_args, plan.current_dir);
+    let target_dir = resolved_target_dir(
+        &plan.project.facts,
+        &plan.project.env,
+        plan.cargo_args,
+        plan.current_dir,
+    );
     let shims_dir = Path::new(&wrappers.rustc).parent().ok_or_else(|| {
         stow_types::stow_error!("rustc wrapper shim {} has no parent", wrappers.rustc)
     })?;
     // The mirror build compiles inside the mirror, whose sources are
     // links into the real workspace — both must be readable.
-    let source_roots: Vec<PathBuf> = if plan.source_root == plan.project.workspace_root {
+    let source_roots: Vec<PathBuf> = if plan.source_root == plan.project.facts.workspace_root {
         vec![plan.source_root.to_path_buf()]
     } else {
         vec![
             plan.source_root.to_path_buf(),
-            plan.project.workspace_root.clone(),
+            plan.project.facts.workspace_root.clone(),
         ]
     };
     let request = crate::sandbox::SandboxRequest {
@@ -4399,7 +4474,7 @@ async fn sandboxed_cargo_run(
         shims_dir: Some(shims_dir),
         runtime_executable: &wrappers.runtime_executable,
         rustc_executable: Path::new(plan.project.build_rustc.executable()),
-        host_target: plan.project.host_target.as_str(),
+        host_target: plan.project.facts.host_target.as_str(),
         cargo_dir: plan.current_dir,
         cargo_args: plan.cargo_args,
         ipc: Some(router),
@@ -4633,7 +4708,8 @@ async fn export_wrapper_env(
         semantic_fallback_enabled,
         ..
     } = *plan;
-    export_wrapper_shim_envs(envs, wrappers, &project.target);
+    let facts = &project.facts;
+    export_wrapper_shim_envs(envs, wrappers, &facts.target);
     // The extra rustc arguments ride a build file like the run's other
     // generated tables (stow#625) — and a build with no stow config still
     // writes this one.
@@ -4646,11 +4722,11 @@ async fn export_wrapper_env(
     ));
     envs.push((
         OsString::from(STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV),
-        OsString::from(&project.rustc_version),
+        OsString::from(&facts.rustc_version),
     ));
     envs.push((
         OsString::from(STOW_PUBLIC_CACHE_TARGET_ENV),
-        OsString::from(&project.target),
+        OsString::from(&facts.target),
     ));
     // Pass the parent's already-resolved StowConfig as a JSON env blob so the
     // rustc wrapper does not re-read ~/.config/stow/config.toml on every
@@ -4697,10 +4773,10 @@ async fn export_wrapper_env(
         let (key, value) = cache_policy::cache_policy_env(path);
         envs.push((OsString::from(key), value));
     }
-    if std::env::var_os("CARGO_TARGET_DIR").is_none() && !has_explicit_target_dir(cargo_args) {
+    if project.env.var_os("CARGO_TARGET_DIR").is_none() && !has_explicit_target_dir(cargo_args) {
         envs.push((
             OsString::from("CARGO_TARGET_DIR"),
-            project.workspace_root.join("target").into_os_string(),
+            facts.workspace_root.join("target").into_os_string(),
         ));
     }
     Ok(())
@@ -4812,7 +4888,8 @@ async fn write_build_json_file(
 /// supervisor's fact cell, the serve map file the facades read, and the
 /// policy directory the allow markers gate (stow#347).
 struct BuildEnrichment {
-    project: ProjectContext,
+    project: ProjectFacts,
+    env: SessionEnv,
     config: StowConfig,
     cell: std::sync::Arc<std::sync::OnceLock<crate::AnalysisFacts>>,
     map_path: Option<PathBuf>,
@@ -4866,7 +4943,8 @@ fn policy_ready_signal(commit_pending: bool) -> std::sync::Arc<crate::facade::Se
 /// rather than wait on the resolve it exists to outrun.
 async fn coarse_cache_policy_entries(
     config: &StowConfig,
-    project: &ProjectContext,
+    project: &ProjectFacts,
+    env: &SessionEnv,
     slice: &index::IndexSlice,
     host_slice: Option<&index::IndexSlice>,
 ) -> stow_types::error::Result<(Vec<cache_policy::CachePolicyEntry>, bool)> {
@@ -4878,7 +4956,7 @@ async fn coarse_cache_policy_entries(
         .map(|row| row.crate_name.as_str())
         .collect();
     let compiled: Option<std::collections::BTreeSet<String>> =
-        if let Some(graph) = expanded_graph_cached(config, project).await? {
+        if let Some(graph) = expanded_graph_cached(config, project, env).await? {
             Some(
                 graph
                     .entries
@@ -4984,9 +5062,14 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     // plan path's waiters, and an early return releases them the same
     // way (stow#788).
     if let Some(policy_dir) = &work.policy_dir {
-        let (entries, complete) =
-            coarse_cache_policy_entries(&work.config, &work.project, &slice, host_slice.as_ref())
-                .await?;
+        let (entries, complete) = coarse_cache_policy_entries(
+            &work.config,
+            &work.project,
+            &work.env,
+            &slice,
+            host_slice.as_ref(),
+        )
+        .await?;
         cache_policy::write_policy_entries(policy_dir, &entries).await?;
         if complete {
             drop(work.policy_ready.take());
@@ -5003,18 +5086,22 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     // waiters; an early return releases them the same way (stow#347).
     if work.readiness.is_some() {
         if let Some(map_path) = &work.map_path {
-            let lite = analyze_workspace_prediction_lite(&work.project, &work.config).await?;
+            let lite =
+                analyze_workspace_prediction_lite(&work.project, &work.env, &work.config).await?;
             write_build_json_file(map_path, lite.servable_units.unwrap_or_default()).await?;
         }
         drop(work.readiness.take());
     }
     let analysis = analyze_workspace_prediction(
-        &work.project,
+        AnalysisScope {
+            project: &work.project,
+            env: &work.env,
+            slices: &work.slices,
+        },
         work.project.current_dir(),
         &work.project.manifest_path,
         &work.config,
         Some(&work.resolution_done),
-        &work.slices,
     )
     .await?;
     if let Some(map_path) = &work.map_path {
@@ -5051,7 +5138,7 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     // The prefetch is the last step and best-effort: the artifacts it
     // warms are what the plan path serves, and a unit reached before its
     // artifact lands still fetches on demand.
-    let budget = CacheBudget::for_covered_units(analysis.prefetch_artifacts.len());
+    let budget = CacheBudget::for_covered_units(analysis.prefetch_artifacts.len(), &work.env);
     if let Err(error) =
         prefetch_graph_artifacts(&work.config, &analysis.prefetch_artifacts, &budget).await
     {
@@ -5074,32 +5161,32 @@ fn journal_and_drain_misses(
     inexact_entries: &[DependencyGraphEntry],
     report_due: bool,
 ) {
-    let target_dir = resolved_target_dir(project, cargo_args, current_dir);
+    let facts = &project.facts;
+    let target_dir = resolved_target_dir(facts, &project.env, cargo_args, current_dir);
     // The drain mints each miss's dependency subgraph off the build's
     // persisted expanded graph when it can load it, and off the
     // journal's context sidecar when it cannot (stow#588).
-    let expanded_cache_key =
-        crate::lockfile_graph_cache::cache_key(project).unwrap_or_else(|error| {
+    let expanded_cache_key = crate::lockfile_graph_cache::cache_key(facts, &project.env)
+        .unwrap_or_else(|error| {
             tracing::warn!(error = %error, "could not key the expanded graph for the miss journal");
             String::new()
         });
-    let env = std::env::vars_os().collect::<Vec<_>>();
     let key_inputs = crate::lockfile_graph_cache::KeyInputs {
-        action: &project.action,
-        cargo_args: &project.cargo_args,
-        current_dir: &project.current_dir,
-        manifest_path: &project.manifest_path,
-        workspace_root: &project.workspace_root,
-        target: &project.target,
-        target_given: project.target_given,
-        rustc_version: &project.rustc_version,
-        env: &env,
+        action: &facts.action,
+        cargo_args: &facts.cargo_args,
+        current_dir: &facts.current_dir,
+        manifest_path: &facts.manifest_path,
+        workspace_root: &facts.workspace_root,
+        target: &facts.target,
+        target_given: facts.target_given,
+        rustc_version: &facts.rustc_version,
+        env: &project.env,
     };
     let consumer = crate::miss_journal::JournalConsumer {
-        manifest_dir: project
+        manifest_dir: facts
             .manifest_path
             .parent()
-            .unwrap_or(project.current_dir.as_path()),
+            .unwrap_or(facts.current_dir.as_path()),
         key: &key_inputs,
     };
     crate::miss_journal::journal_supervised(
@@ -5246,11 +5333,12 @@ fn has_explicit_target_dir(cargo_args: &[OsString]) -> bool {
 /// workspace's own `target/`; a relative value resolves against
 /// `current_dir`, the directory cargo runs in.
 fn resolved_target_dir(
-    project: &ProjectContext,
+    project: &ProjectFacts,
+    env: &SessionEnv,
     cargo_args: &[OsString],
     current_dir: &Path,
 ) -> PathBuf {
-    std::env::var_os("CARGO_TARGET_DIR")
+    env.var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .map_or_else(
             || cargo_target_dir(&project.workspace_root, cargo_args, current_dir),
@@ -5388,10 +5476,11 @@ mod tests {
     #[cfg(unix)]
     use super::create_workspace_mirror;
     use super::{
-        CargoRunPlan, MetadataArgs, MoldSelection, ProjectContext, PublicCacheMode,
+        CargoRunPlan, MetadataArgs, MoldSelection, ProjectContext, ProjectFacts, PublicCacheMode,
         WorkspaceMirror, relative_path, rewrite_args_for_mirror, rewrite_args_for_root,
     };
     use crate::prefetch::PrefetchArtifact;
+    use crate::session_env::SessionEnv;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
@@ -5408,6 +5497,7 @@ mod tests {
             artifact_cache_max_bytes: 0,
             index_refresh_interval: std::time::Duration::ZERO,
             verify_mode: crate::config::VerifyMode::GithubCi,
+            switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
@@ -5415,8 +5505,8 @@ mod tests {
         }
     }
 
-    fn project_context() -> ProjectContext {
-        ProjectContext {
+    fn project_facts() -> ProjectFacts {
+        ProjectFacts {
             action: "check".to_owned(),
             cargo_args: Vec::new(),
             workspace_root: PathBuf::from("/workspace"),
@@ -5428,6 +5518,13 @@ mod tests {
             target_given: false,
             host_target: "aarch64-apple-darwin".to_owned(),
             rustc_version: "1.91.1".to_owned(),
+        }
+    }
+
+    fn project_context() -> ProjectContext {
+        ProjectContext {
+            facts: project_facts(),
+            env: SessionEnv::of_this_process().expect("the test process's environment"),
             mold: MoldSelection::resolved(Vec::new()),
             env_base: None,
             // These tests assemble no supervisor, so nothing awaits it.
@@ -5484,7 +5581,7 @@ mod tests {
 
     #[test]
     fn rewrite_args_for_root_keeps_manifest_path_but_does_not_force_target() {
-        let project = project_context();
+        let project = project_facts();
         let rewritten = rewrite_args_for_root(
             &[
                 OsString::from("--manifest-path"),
@@ -5515,10 +5612,10 @@ mod tests {
     fn rewrite_args_for_mirror_replaces_an_absolute_manifest_path() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mirror_dir = tempfile::tempdir().expect("mirror tempdir");
-        let project = ProjectContext {
+        let project = ProjectFacts {
             workspace_root: workspace.path().to_path_buf(),
             manifest_path: workspace.path().join("Cargo.toml"),
-            ..project_context()
+            ..project_facts()
         };
         let mirror = WorkspaceMirror {
             tempdir: mirror_dir,
@@ -5600,10 +5697,10 @@ mod tests {
         std::fs::create_dir_all(&real).expect("real dir");
         let link = base.path().join("link");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
-        let project = ProjectContext {
+        let project = ProjectFacts {
             workspace_root: std::fs::canonicalize(&link).expect("canonical root"),
             manifest_path: link.join("Cargo.toml"),
-            ..project_context()
+            ..project_facts()
         };
         let mirror = WorkspaceMirror {
             tempdir: tempfile::tempdir().expect("mirror"),
@@ -5656,7 +5753,8 @@ mod tests {
         };
         let cargo_args = vec![OsString::from("--offline")];
         let command = tokio::spawn(async move {
-            super::passthrough_command(&project, "build", &cargo_args, project.current_dir()).await
+            super::passthrough_command(&project, "build", &cargo_args, project.facts.current_dir())
+                .await
         });
         // The released `--config` value in the assembled args is the
         // proof the command waited: it exists only behind the
@@ -5702,8 +5800,8 @@ mod tests {
                 config: None,
                 action: "check",
                 cargo_args: &cargo_args,
-                source_root: &project.workspace_root,
-                current_dir: &project.current_dir,
+                source_root: &project.facts.workspace_root,
+                current_dir: &project.facts.current_dir,
                 cache_policy_entries: None,
                 public_cache_mode: &PublicCacheMode::Enabled,
                 unit_nodes: None,
@@ -5755,7 +5853,7 @@ mod tests {
             }),
             ..project_context()
         };
-        let error = super::passthrough_command(&project, "build", &[], project.current_dir())
+        let error = super::passthrough_command(&project, "build", &[], project.facts.current_dir())
             .await
             .expect_err("a failed provisioning must not assemble a cargo command");
         assert!(
@@ -5821,14 +5919,17 @@ mod tests {
             .expect("write a lib that does not compile");
 
         let project = ProjectContext {
-            action: "build".to_owned(),
-            workspace_root: workspace.to_path_buf(),
-            current_dir: member.clone(),
-            current_dir_relative: PathBuf::from("member"),
-            manifest_path: member.join("Cargo.toml"),
+            facts: ProjectFacts {
+                action: "build".to_owned(),
+                workspace_root: workspace.to_path_buf(),
+                current_dir: member.clone(),
+                current_dir_relative: PathBuf::from("member"),
+                manifest_path: member.join("Cargo.toml"),
+                ..project_facts()
+            },
             ..project_context()
         };
-        let mirror = create_workspace_mirror(&project, &project.workspace_root)
+        let mirror = create_workspace_mirror(&project.facts, &project.facts.workspace_root)
             .await
             .expect("create workspace mirror");
         let target_dir = tempfile::tempdir().expect("target dir");
@@ -5884,7 +5985,7 @@ mod tests {
     /// The map `build_serve_map` produces with no index rows — these
     /// tests exercise the local half's unit set alone.
     fn local_only_map(
-        project: &ProjectContext,
+        project: &ProjectFacts,
         expanded_entries: &[stow_types::api::ResolvedDependencyGraphEntry],
         local_units: &[(&str, &str, &str)],
         lockfile_packages: &[(&str, &str)],
@@ -5924,10 +6025,10 @@ mod tests {
         let cache = tempfile::tempdir().expect("cache");
         // No Cargo.toml and no Cargo.lock: there is nothing to read.
         let config = test_config(cache.path());
-        let project = ProjectContext {
+        let project = ProjectFacts {
             workspace_root: workspace.path().to_path_buf(),
             manifest_path: workspace.path().join("Cargo.toml"),
-            ..project_context()
+            ..project_facts()
         };
         let prediction = super::analyze_workspace_prediction_from(
             &project,
@@ -5975,10 +6076,10 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed the local unit");
-        let project = ProjectContext {
+        let project = ProjectFacts {
             workspace_root: workspace.path().to_path_buf(),
             manifest_path: workspace.path().join("Cargo.toml"),
-            ..project_context()
+            ..project_facts()
         };
         let prediction = super::analyze_workspace_prediction_from(
             &project,
@@ -6009,7 +6110,7 @@ mod tests {
     /// does not name stays out.
     #[test]
     fn a_local_unit_serves_without_an_expanded_graph() {
-        let project = project_context();
+        let project = project_facts();
         let map = local_only_map(
             &project,
             &[],
@@ -6037,10 +6138,10 @@ mod tests {
     /// a consumer-platform row lands on the target list (stow#617).
     #[test]
     fn a_host_platform_row_lands_on_the_host_list() {
-        let project = ProjectContext {
+        let project = ProjectFacts {
             target: "aarch64-apple-ios".to_owned(),
             target_given: true,
-            ..project_context()
+            ..project_facts()
         };
         let map = local_only_map(
             &project,
@@ -6108,7 +6209,7 @@ mod tests {
     /// produces over index rows, with no expanded graph and no local
     /// units.
     fn index_rows_map(
-        project: &ProjectContext,
+        project: &ProjectFacts,
         consumer_rows: &[stow_types::index::ArtifactIndexRow],
         host_rows: &[stow_types::index::ArtifactIndexRow],
         lockfile_packages: &[(&str, &str)],
@@ -6138,7 +6239,7 @@ mod tests {
     /// spells no `--target`, so the covered pair lands on the host list.
     #[test]
     fn a_cold_project_serves_index_units_natively() {
-        let project = project_context();
+        let project = project_facts();
         let consumer_rows = [index_row("a", "1.0.0"), index_row("b", "2.0.0")];
         let map = index_rows_map(
             &project,
@@ -6155,10 +6256,10 @@ mod tests {
     /// list and one the host slice covers on the host list.
     #[test]
     fn a_cold_project_serves_index_units_on_both_sides_of_a_target_build() {
-        let project = ProjectContext {
+        let project = ProjectFacts {
             target: "aarch64-apple-ios".to_owned(),
             target_given: true,
-            ..project_context()
+            ..project_facts()
         };
         let consumer_rows = [index_row("b", "2.0.0")];
         let host_rows = [index_row("a", "1.0.0")];
@@ -6188,10 +6289,10 @@ mod tests {
         )
         .expect("write lockfile");
         let config = test_config(cache.path());
-        let project = ProjectContext {
+        let project = ProjectFacts {
             workspace_root: workspace.path().to_path_buf(),
             manifest_path: workspace.path().join("Cargo.toml"),
-            ..project_context()
+            ..project_facts()
         };
         let prediction = super::analyze_workspace_prediction_from(
             &project,
@@ -6215,7 +6316,7 @@ mod tests {
     /// stored crate the graph does not name stays out.
     #[test]
     fn a_cached_graph_still_gates_the_local_half() {
-        let project = project_context();
+        let project = project_facts();
         let entries = [
             graph_entry("a", "1.0.0", false),
             graph_entry("d", "4.0.0", true),
@@ -6266,6 +6367,7 @@ mod tests {
             artifact_cache_max_bytes: 1,
             index_refresh_interval: std::time::Duration::from_secs(1),
             verify_mode: crate::config::VerifyMode::GithubCi,
+            switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
@@ -6322,9 +6424,12 @@ mod tests {
         let cache = tempfile::tempdir().expect("cache dir");
         let workspace = cache.path().join("ws");
         let project = ProjectContext {
-            workspace_root: workspace.clone(),
-            current_dir: workspace.clone(),
-            manifest_path: workspace.join("Cargo.toml"),
+            facts: ProjectFacts {
+                workspace_root: workspace.clone(),
+                current_dir: workspace.clone(),
+                manifest_path: workspace.join("Cargo.toml"),
+                ..project_facts()
+            },
             ..project_context()
         };
         let config = stow_config(cache.path());
@@ -6342,8 +6447,8 @@ mod tests {
             config: Some(&config),
             action: "check",
             cargo_args: &[],
-            source_root: &project.workspace_root,
-            current_dir: &project.current_dir,
+            source_root: &project.facts.workspace_root,
+            current_dir: &project.facts.current_dir,
             cache_policy_entries: None,
             public_cache_mode: &PublicCacheMode::Enabled,
             unit_nodes: Some(&table),

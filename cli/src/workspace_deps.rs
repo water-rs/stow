@@ -14,6 +14,7 @@ use stow_types::node_profile::NodeProfile;
 use stow_types::public_cache::UnitSide;
 
 use crate::cargo_cmd::MetadataArgs;
+use crate::session_env::SessionEnv;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct SelectedRegistryDependency {
@@ -255,10 +256,10 @@ pub async fn resolve_exact_dependency_graph(
     current_dir: &Path,
     host_triple: &str,
     rustc_version: &stow_types::identity::WireRustcVersion,
-    cargo_home: Option<&Path>,
+    env: &SessionEnv,
 ) -> stow_types::error::Result<ExpandedDependencyGraph> {
     let (mut unit_graph, subcommand) =
-        unit_graph_command(manifest_path, action, cargo_args, current_dir, cargo_home).await?;
+        unit_graph_command(manifest_path, action, cargo_args, current_dir, env).await?;
     let unit_graph_output = unit_graph
         .output()
         .await
@@ -276,21 +277,19 @@ pub async fn resolve_exact_dependency_graph(
 /// The command half of [`resolve_exact_dependency_graph`]: the `cargo
 /// <subcommand> --unit-graph` invocation, built but not yet spawned,
 /// and the subcommand name the failure's error text uses (stow#667).
-/// `cargo_home` pins `CARGO_HOME` on the child — and the global config
-/// the `[unstable]` gate reads — so a test answers from its own home
-/// rather than the developer's; `None` inherits the process's.
+/// `cargo` resolves through `env`'s `PATH` and the child runs with
+/// exactly `env`'s variables — its `CARGO_HOME` included, which the
+/// `[unstable]` gate reads too — so the query answers for the build's
+/// environment, not the process that runs it.
 async fn unit_graph_command(
     manifest_path: &Path,
     action: &str,
     cargo_args: &[OsString],
     current_dir: &Path,
-    cargo_home: Option<&Path>,
+    env: &SessionEnv,
 ) -> stow_types::error::Result<(Command, &'static str)> {
     let subcommand = unit_graph_subcommand(action)?;
-    let mut unit_graph = Command::new("cargo");
-    if let Some(home) = cargo_home {
-        unit_graph.env("CARGO_HOME", home);
-    }
+    let mut unit_graph = env.command("cargo")?;
     unit_graph
         .arg(subcommand)
         // Before the user's args: never lands behind a `--` terminator.
@@ -313,9 +312,8 @@ async fn unit_graph_command(
     // through untouched because the user's build sees the same cfgs.
     // If a future cargo drops the override, cargo rejects `-Z` and the
     // query fails loudly below — no fallback.
-    if std::env::var_os("RUSTC_BOOTSTRAP").is_none() && cargo_channel_is_stable(current_dir).await?
-    {
-        unstable_feature_gate(current_dir, cargo_args, cargo_home)?;
+    if env.var_os("RUSTC_BOOTSTRAP").is_none() && cargo_channel_is_stable(current_dir, env).await? {
+        unstable_feature_gate(current_dir, cargo_args, env)?;
         for (key, value) in unit_graph_channel_env() {
             unit_graph.env(key, value);
         }
@@ -380,11 +378,11 @@ pub async fn resolve_exact_dependency_graph_stoppable(
     current_dir: &Path,
     host_triple: &str,
     rustc_version: &stow_types::identity::WireRustcVersion,
-    cargo_home: Option<&Path>,
+    env: &SessionEnv,
     slot: &mut crate::derive_gate::DerivationSlot,
 ) -> stow_types::error::Result<Option<ExpandedDependencyGraph>> {
     let (mut unit_graph, subcommand) =
-        unit_graph_command(manifest_path, action, cargo_args, current_dir, cargo_home).await?;
+        unit_graph_command(manifest_path, action, cargo_args, current_dir, env).await?;
     unit_graph
         .stdout(async_process::Stdio::piped())
         .stderr(async_process::Stdio::piped());
@@ -507,8 +505,12 @@ fn unit_graph_subcommand(action: &str) -> stow_types::error::Result<&'static str
 /// suffixes take `-Z` flags without `RUSTC_BOOTSTRAP`, so the query needs
 /// no injection there (beta counts as stable-channel, the same answer
 /// cargo's own feature gate gives for `RUSTC_BOOTSTRAP`).
-async fn cargo_channel_is_stable(current_dir: &Path) -> stow_types::error::Result<bool> {
-    let output = Command::new("cargo")
+async fn cargo_channel_is_stable(
+    current_dir: &Path,
+    env: &SessionEnv,
+) -> stow_types::error::Result<bool> {
+    let output = env
+        .command("cargo")?
         .arg("-V")
         .current_dir(current_dir)
         // Dropped with the resolve it answers for (stow#624).
@@ -540,16 +542,17 @@ fn unit_graph_channel_env() -> Vec<(&'static str, &'static str)> {
 fn unstable_feature_gate(
     current_dir: &Path,
     cargo_args: &[OsString],
-    cargo_home: Option<&Path>,
+    env: &SessionEnv,
 ) -> stow_types::error::Result<()> {
     let mut enabled = Vec::<String>::new();
-    for (key, _value) in std::env::vars() {
-        if let Some(name) = env_name::strip_prefix(&key, "CARGO_UNSTABLE_") {
+    for (key, _value) in env.environ() {
+        let Some(key) = key.to_str() else { continue };
+        if let Some(name) = env_name::strip_prefix(key, "CARGO_UNSTABLE_") {
             enabled.push(format!("CARGO_UNSTABLE_{name}"));
         }
     }
     for (source, document) in
-        crate::mold::cargo_config_documents(current_dir, cargo_args, cargo_home)
+        crate::mold::cargo_config_documents(current_dir, cargo_args, env.cargo_home())
     {
         let Some(item) = document.get("unstable") else {
             continue;
@@ -3126,7 +3129,76 @@ mod unit_graph_tests {
         parse_pkg_id, path_pkg_root, resolve_exact_dependency_graph, rustc_test,
         unit_graph_channel_env, unit_graph_subcommand, unstable_feature_gate,
     };
+    use crate::session_env::SessionEnv;
     use stow_types::api::ResolvedDependencyGraphEntry;
+
+    /// The query runs the `cargo` the given environment's `PATH` names,
+    /// with exactly that environment, from the directory it is told: a
+    /// stub found only through the given `PATH` records what it was
+    /// started with, and none of the test process's own variables are in
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn the_unit_graph_query_runs_in_the_given_environment() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("bin");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&bin).expect("create the stub's directory");
+        std::fs::create_dir_all(&project).expect("create the project directory");
+        let record = dir.path().join("record");
+        let stub = bin.join("cargo");
+        // `cargo -V` answers a nightly, which takes the query's channel
+        // gate out of the way; any other call records its directory and
+        // environment.
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = -V ]; then echo 'cargo 1.0.0-nightly'; exit 0; fi\n{{ pwd; /usr/bin/env; }} > '{}'\n",
+                record.display()
+            ),
+        )
+        .expect("write the stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub executable");
+        let env = SessionEnv::new(
+            vec![
+                (OsString::from("PATH"), bin.clone().into_os_string()),
+                (OsString::from("STOW_TEST_MARKER"), OsString::from("given")),
+            ],
+            dir.path().to_path_buf(),
+        );
+
+        let (mut command, _) = smol::block_on(super::unit_graph_command(
+            &project.join("Cargo.toml"),
+            "build",
+            &[],
+            &project,
+            &env,
+        ))
+        .expect("build the query");
+        let output = smol::block_on(command.output()).expect("run the stub");
+        assert!(output.status.success(), "the stub ran: {output:?}");
+
+        let record = std::fs::read_to_string(&record).expect("the stub recorded its start");
+        let mut lines = record.lines();
+        assert_eq!(
+            Path::new(lines.next().expect("the working directory")),
+            project.canonicalize().expect("canonicalize the project"),
+            "the query runs in the directory it was given"
+        );
+        let vars: Vec<&str> = lines.collect();
+        assert!(vars.contains(&"STOW_TEST_MARKER=given"), "{vars:?}");
+        assert!(
+            vars.iter()
+                .any(|var| *var == format!("PATH={}", bin.display())),
+            "{vars:?}"
+        );
+        assert!(
+            !vars.iter().any(|var| var.starts_with("HOME=")),
+            "the process's own variables stay out: {vars:?}"
+        );
+    }
 
     #[cfg(unix)]
     const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
@@ -3272,7 +3344,9 @@ mod unit_graph_tests {
             root,
             "x86_64-unknown-linux-gnu",
             rustc_test(),
-            Some(&cargo_home),
+            &SessionEnv::of_this_process()
+                .expect("the test process's environment")
+                .with_var("CARGO_HOME", &cargo_home),
         ))
         .expect("resolve exact dependency graph")
     }
@@ -3888,8 +3962,10 @@ mod unit_graph_tests {
         // (stow#800).
         let cargo_home = root.join("cargo-home");
         std::fs::create_dir_all(&cargo_home).expect("create cargo home");
-        let error =
-            unstable_feature_gate(root, &[], Some(&cargo_home)).expect_err("unstable gate errors");
+        let env = SessionEnv::of_this_process()
+            .expect("the test process's environment")
+            .with_var("CARGO_HOME", &cargo_home);
+        let error = unstable_feature_gate(root, &[], &env).expect_err("unstable gate errors");
         assert!(
             error.to_string().contains("unstable.unit-graph"),
             "the setting names itself: {error}"

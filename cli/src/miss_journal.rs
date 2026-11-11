@@ -20,6 +20,7 @@ use std::process::Stdio;
 use crate::artifact_cache::{LocalBuildArtifact, ObservedUnit};
 use crate::config::StowConfig;
 use crate::rustc_args::ParsedRustcArgs;
+use crate::session_env::SessionEnv;
 use crate::state_db::StateDb;
 
 const JOURNAL_PREFIX: &str = "stow-misses.";
@@ -655,7 +656,8 @@ pub async fn drain(target_dir: &Path, state_db: &StateDb) -> stow_types::error::
     // The gate directory is the cargo home's: the package-cache lock a
     // derivation cargo holds is per cargo home, so the gate is too
     // (stow#667).
-    let mut gate = crate::config::cargo_home().map_or_else(
+    let env = SessionEnv::of_this_process()?;
+    let mut gate = env.cargo_home().map_or_else(
         || {
             tracing::warn!(
                 "could not resolve the cargo home; this drain will not re-derive unit graphs"
@@ -666,7 +668,7 @@ pub async fn drain(target_dir: &Path, state_db: &StateDb) -> stow_types::error::
     );
     let mut prepared = Vec::new();
     for journal in &journals {
-        if let Some(journal) = prepare_journal(&config, journal, &mut gate).await {
+        if let Some(journal) = prepare_journal(&config, journal, &mut gate, &env).await {
             prepared.push(journal);
         }
     }
@@ -776,7 +778,8 @@ async fn drain_journal(
     journal: &Path,
     gate: &mut crate::derive_gate::DerivationGate,
 ) {
-    if let Some(prepared) = prepare_journal(config, journal, gate).await {
+    let env = SessionEnv::of_this_process().expect("the test process's environment");
+    if let Some(prepared) = prepare_journal(config, journal, gate, &env).await {
         post_journal(config, prepared).await;
     }
 }
@@ -790,6 +793,7 @@ async fn prepare_journal(
     config: &StowConfig,
     journal: &Path,
     gate: &mut crate::derive_gate::DerivationGate,
+    env: &SessionEnv,
 ) -> Option<PreparedJournal> {
     let file_name = journal
         .file_name()
@@ -880,11 +884,7 @@ async fn prepare_journal(
         if let Some(prepared) = prepare_group(
             config,
             &journal,
-            DrainContext {
-                consumer_target: &consumer_target,
-                build_host: &build_host,
-                spelled: consumer_spelled_target,
-            },
+            PrepareContext::new(&consumer_target, &build_host, consumer_spelled_target, env),
             &key,
             context.as_ref(),
             group,
@@ -994,9 +994,8 @@ impl SidecarKeyInputs {
     /// Recompute the build's `cache_key` over the project's *current*
     /// files — equal to the journal's `expanded_cache_key` iff nothing
     /// the function hashes changed since the build (stow#588).
-    fn key_of(&self) -> stow_types::error::Result<String> {
+    fn key_of(&self, env: &SessionEnv) -> stow_types::error::Result<String> {
         let cargo_args: Vec<OsString> = self.cargo_args.iter().map(OsString::from).collect();
-        let env = std::env::vars_os().collect::<Vec<_>>();
         crate::lockfile_graph_cache::key_of(&crate::lockfile_graph_cache::KeyInputs {
             action: &self.action,
             cargo_args: &cargo_args,
@@ -1006,7 +1005,7 @@ impl SidecarKeyInputs {
             target: &self.target,
             target_given: self.target_given,
             rustc_version: &self.rustc_version,
-            env: &env,
+            env,
         })
     }
 }
@@ -1091,6 +1090,32 @@ struct DrainContext<'a> {
     spelled: bool,
 }
 
+/// What preparing a journal group reads besides the journal: the
+/// build-level facts, and the environment the graph is re-derived in —
+/// the drain's own.
+struct PrepareContext<'a> {
+    drain: DrainContext<'a>,
+    env: &'a SessionEnv,
+}
+
+impl<'a> PrepareContext<'a> {
+    const fn new(
+        consumer_target: &'a str,
+        build_host: &'a str,
+        spelled: bool,
+        env: &'a SessionEnv,
+    ) -> Self {
+        Self {
+            drain: DrainContext {
+                consumer_target,
+                build_host,
+                spelled,
+            },
+            env,
+        }
+    }
+}
+
 /// What a drain group's memo miss comes to.
 enum MemoMiss {
     /// The same function of the same inputs, derived again.
@@ -1122,17 +1147,21 @@ async fn rederive_memoized_graph(
     context: &JournalContext,
     key: &DrainGroupKey,
     units: usize,
-    ctx: &DrainContext<'_>,
+    ctx: &PrepareContext<'_>,
     gate: &mut crate::derive_gate::DerivationGate,
 ) -> MemoMiss {
-    let consumer_target = ctx.consumer_target;
-    let consumer_spelled_target = ctx.spelled;
+    let consumer_target = ctx.drain.consumer_target;
+    let consumer_spelled_target = ctx.drain.spelled;
     let DrainGroupKey {
         rustc_version,
         expanded_cache_key,
     } = key;
     if !expanded_cache_key.is_empty() {
-        match context.cache_key.as_ref().map(SidecarKeyInputs::key_of) {
+        match context
+            .cache_key
+            .as_ref()
+            .map(|inputs| inputs.key_of(ctx.env))
+        {
             Some(Ok(drain_key)) if drain_key == *expanded_cache_key => {}
             Some(Ok(drain_key)) => {
                 tracing::warn!(
@@ -1176,7 +1205,7 @@ async fn rederive_memoized_graph(
                 stow_types::api::runner_family(consumer_target)
                     .map_or(consumer_target, |family| family.host_triple()),
                 &rustc,
-                None,
+                ctx.env,
                 slot,
             )
             .await
@@ -1221,7 +1250,7 @@ async fn rederive_memoized_graph(
 async fn prepare_group(
     config: &StowConfig,
     journal: &Path,
-    ctx: DrainContext<'_>,
+    ctx: PrepareContext<'_>,
     key: &DrainGroupKey,
     context: Option<&JournalContext>,
     group: Vec<JournalEntry>,
@@ -1449,6 +1478,7 @@ mod tests {
             artifact_cache_max_bytes: 0,
             index_refresh_interval: std::time::Duration::ZERO,
             verify_mode: crate::config::VerifyMode::GithubCi,
+            switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
@@ -1617,10 +1647,12 @@ mod tests {
                 target: "wasm32-unknown-unknown",
                 target_given: true,
                 rustc_version: "1.99.0",
-                // The same environment the drain's recompute sees —
-                // `cache_key` reads `vars_os` on the live path, so the
-                // memoized key must too (stow#617).
-                env: Box::leak(Box::new(std::env::vars_os().collect::<Vec<_>>())).as_slice(),
+                // The same environment the drain's recompute sees — the
+                // process's, as `cache_key` reads it on the live path,
+                // so the memoized key must too (stow#617).
+                env: Box::leak(Box::new(
+                    SessionEnv::of_this_process().expect("the test process's environment"),
+                )),
             },
         )
     }
@@ -1943,7 +1975,8 @@ mod tests {
         // The grouping pass: one group holding the inexact line, with
         // its payload intact and the keyed graph resolved.
         let mut gate = crate::derive_gate::DerivationGate::unopened(dir.path().join("gate"));
-        let prepared = prepare_journal(&config, &journal, &mut gate)
+        let env = SessionEnv::of_this_process().expect("the test process's environment");
+        let prepared = prepare_journal(&config, &journal, &mut gate, &env)
             .await
             .expect("the journal prepares");
         assert_eq!(prepared.groups.len(), 1);

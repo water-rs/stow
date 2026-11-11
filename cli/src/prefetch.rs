@@ -428,6 +428,8 @@ mod tests {
 
     use futures_util::{StreamExt as _, stream};
 
+    use crate::session_env::SessionEnv;
+
     use super::{
         CacheBudget, MAX_BUDGET, PREFETCH_CONCURRENCY, PrefetchOutcome, PrefetchedArtifactMetrics,
         drain_pulls,
@@ -465,7 +467,7 @@ mod tests {
             pulls(Vec::new()),
             async { panic!("the trust root was loaded for a prefetch that downloads nothing") },
             0,
-            &CacheBudget::for_covered_units(0),
+            &CacheBudget::for_covered_units(0, &SessionEnv::for_tests([])),
         )
         .await
         .expect("an empty prefetch drains");
@@ -481,7 +483,7 @@ mod tests {
             ]),
             std::future::pending(),
             2,
-            &CacheBudget::for_covered_units(2),
+            &CacheBudget::for_covered_units(2, &SessionEnv::for_tests([])),
         )
         .await
         .expect("absent pulls drain");
@@ -497,7 +499,7 @@ mod tests {
                 Ok(())
             },
             1,
-            &CacheBudget::for_covered_units(1),
+            &CacheBudget::for_covered_units(1, &SessionEnv::for_tests([])),
         )
         .await
         .expect("the pull inside the allowance drains");
@@ -525,7 +527,7 @@ mod tests {
                 Ok(())
             },
             1,
-            &CacheBudget::for_covered_units(1),
+            &CacheBudget::for_covered_units(1, &SessionEnv::for_tests([])),
         )
         .await
         .expect("the pull drains beside the trust load");
@@ -548,7 +550,7 @@ mod tests {
             pulls(vec![pull(Duration::from_secs(10), Ok(stored("demo")))]),
             async { Ok(()) },
             1,
-            &CacheBudget::for_covered_units(1),
+            &CacheBudget::for_covered_units(1, &SessionEnv::for_tests([])),
         )
         .await
         .expect("the deadline drains");
@@ -566,7 +568,7 @@ mod tests {
             pulls(vec![pull(Duration::from_secs(600), Ok(stored("demo")))]),
             std::future::pending(),
             1,
-            &CacheBudget::for_covered_units(1),
+            &CacheBudget::for_covered_units(1, &SessionEnv::for_tests([])),
         )
         .await
         .expect_err("a trust load without an answer ends the prefetch");
@@ -586,7 +588,7 @@ mod tests {
                 Err(stow_types::stow_error!("no trust root"))
             },
             1,
-            &CacheBudget::for_covered_units(1),
+            &CacheBudget::for_covered_units(1, &SessionEnv::for_tests([])),
         )
         .await
         .expect_err("a failed trust load ends the prefetch");

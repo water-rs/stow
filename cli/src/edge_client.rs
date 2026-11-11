@@ -12,7 +12,7 @@ use std::convert::Infallible;
 use zenwave::middleware::MiddlewareError;
 use zenwave::{Client, Endpoint, Middleware, Request, Response, header};
 
-use crate::config::StowConfig;
+use crate::config::{StowConfig, Switches};
 
 /// The environment variable that opts the CLI out of usage analytics.
 pub const NO_ANALYTICS_ENV: &str = "STOW_NO_ANALYTICS";
@@ -32,25 +32,12 @@ pub fn client(config: &StowConfig) -> stow_types::error::Result<impl Client> {
     config.require_network("an edge request")?;
     Ok(zenwave::client()
         .timeout(config.request_timeout)
-        .with(EdgeHeaders::new()))
-}
-
-/// Whether `STOW_NO_ANALYTICS` is set to `1`.
-#[must_use]
-pub fn analytics_opted_out() -> bool {
-    analytics_opted_out_in(|key| std::env::var(key).ok())
-}
-
-/// [`analytics_opted_out`] with the environment injected, so a caller —
-/// or a test — answers `STOW_NO_ANALYTICS` from its own lookup instead
-/// of the process's.
-fn analytics_opted_out_in(env: impl Fn(&str) -> Option<String>) -> bool {
-    env(NO_ANALYTICS_ENV).as_deref() == Some("1")
+        .with(EdgeHeaders::new(&config.switches)))
 }
 
 /// Per-request header middleware: the `stow-cli/<version> (<os>)` user
-/// agent, and the opt-out header when `STOW_NO_ANALYTICS=1`. Infallible —
-/// it only writes headers.
+/// agent, and the opt-out header when the config's switches say
+/// `STOW_NO_ANALYTICS=1`. Infallible — it only writes headers.
 #[derive(Debug)]
 struct EdgeHeaders {
     user_agent: String,
@@ -59,15 +46,15 @@ struct EdgeHeaders {
 }
 
 impl EdgeHeaders {
-    fn new() -> Self {
+    fn new(switches: &Switches) -> Self {
         Self {
             user_agent: format!(
                 "stow-cli/{} ({})",
                 env!("CARGO_PKG_VERSION"),
                 std::env::consts::OS
             ),
-            no_analytics: analytics_opted_out(),
-            ci: std::env::var_os("CI").is_some(),
+            no_analytics: switches.no_analytics,
+            ci: switches.ci,
         }
     }
 }
@@ -104,25 +91,37 @@ impl Middleware for EdgeHeaders {
 
 #[cfg(test)]
 mod tests {
-    use super::{NO_ANALYTICS_ENV, analytics_opted_out_in};
+    use super::NO_ANALYTICS_ENV;
+    use crate::config::Switches;
 
-    /// An environment lookup over `values` — the test answers
-    /// `STOW_NO_ANALYTICS` itself rather than reading whatever the
+    /// The switches of an environment of exactly `values` — the test
+    /// answers `STOW_NO_ANALYTICS` itself rather than reading whatever the
     /// developer's shell exported (stow#800).
-    fn env<'a>(values: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + use<'a> {
-        move |key| {
-            values
+    fn switches(values: &[(&str, &str)]) -> Switches {
+        Switches::of_environ(
+            &values
                 .iter()
-                .find(|(name, _)| *name == key)
-                .map(|(_, value)| (*value).to_owned())
-        }
+                .map(|(name, value)| ((*name).into(), (*value).into()))
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[test]
     fn opt_out_reflects_the_environment_variable() {
-        assert!(analytics_opted_out_in(env(&[(NO_ANALYTICS_ENV, "1")])));
-        assert!(!analytics_opted_out_in(env(&[(NO_ANALYTICS_ENV, "0")])));
-        assert!(!analytics_opted_out_in(env(&[])));
-        assert!(!analytics_opted_out_in(env(&[("OTHER", "1")])));
+        assert!(switches(&[(NO_ANALYTICS_ENV, "1")]).no_analytics);
+        assert!(!switches(&[(NO_ANALYTICS_ENV, "0")]).no_analytics);
+        assert!(!switches(&[]).no_analytics);
+        assert!(!switches(&[("OTHER", "1")]).no_analytics);
+    }
+
+    #[test]
+    fn ci_and_the_identity_trace_come_from_the_given_environment() {
+        let switches = switches(&[("CI", ""), ("STOW_IDENTITY_TRACE", "/trace")]);
+        assert!(switches.ci);
+        assert_eq!(
+            switches.identity_trace.as_deref(),
+            Some(std::path::Path::new("/trace"))
+        );
+        assert!(!self::switches(&[]).ci);
     }
 }

@@ -112,8 +112,51 @@ impl CacheLayers {
     }
 }
 
+/// The environment switches that shape what a command sends and writes
+/// rather than what it builds: resolved once with the config, so the
+/// process answering for a build reads them from the build's environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Switches {
+    /// `STOW_NO_ANALYTICS=1`: requests carry the opt-out header and no
+    /// usage report is sent.
+    pub no_analytics: bool,
+    /// `CI` is set: requests carry the CI environment header.
+    pub ci: bool,
+    /// `STOW_IDENTITY_TRACE`: the directory the identity-input probe writes
+    /// to, when set.
+    pub identity_trace: Option<PathBuf>,
+}
+
+impl Switches {
+    /// The switches in `environ`.
+    #[must_use]
+    pub fn of_environ(environ: &[(std::ffi::OsString, std::ffi::OsString)]) -> Self {
+        let var = |key: &str| {
+            environ
+                .iter()
+                .find(|(name, _)| stow_types::env_name::eq(name, key))
+                .map(|(_, value)| value)
+        };
+        Self {
+            no_analytics: var(crate::edge_client::NO_ANALYTICS_ENV)
+                .is_some_and(|value| value == "1"),
+            ci: var("CI").is_some(),
+            identity_trace: var("STOW_IDENTITY_TRACE").map(PathBuf::from),
+        }
+    }
+
+    /// The switches of this process's environment.
+    #[must_use]
+    pub fn of_this_process() -> Self {
+        Self::of_environ(&std::env::vars_os().collect::<Vec<_>>())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowConfig {
+    /// Analytics, CI and trace switches of the environment this config was
+    /// resolved in.
+    pub switches: Switches,
     /// The resolved cache layers: the global config's `[cache]` table, then
     /// the run's flags. Every network request goes through
     /// [`Self::registry_http`] or [`crate::edge_client::client`], which both
@@ -342,6 +385,7 @@ impl StowConfig {
         let verify_mode = load_verify_mode(file_config.as_ref())?;
 
         Ok(Self {
+            switches: Switches::of_this_process(),
             cache: file_config
                 .as_ref()
                 .and_then(|config| config.cache)
@@ -388,6 +432,7 @@ impl StowConfig {
         let file_config = load_user_config()?;
         let verify_mode = load_verify_mode(file_config.as_ref())?;
         Ok(Self {
+            switches: Switches::of_this_process(),
             cache: file_config
                 .as_ref()
                 .and_then(|config| config.cache)

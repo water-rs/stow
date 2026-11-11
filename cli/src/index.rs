@@ -161,9 +161,11 @@ pub async fn ensure_slice(
 /// A failed fetch is not memoized: the next caller retries it.
 #[derive(Debug, Clone, Default)]
 pub struct SliceFetches {
-    cells:
-        Arc<std::sync::Mutex<BTreeMap<(String, String), Arc<tokio::sync::OnceCell<IndexSlice>>>>>,
+    cells: Arc<std::sync::Mutex<BTreeMap<(String, String), SliceCell>>>,
 }
+
+/// One slice's fetch, shared by every caller that asks for it.
+type SliceCell = Arc<tokio::sync::OnceCell<IndexSlice>>;
 
 impl SliceFetches {
     /// [`ensure_slice`], memoized: concurrent callers for one slice share
@@ -935,6 +937,7 @@ mod tests {
             artifact_cache_max_bytes: 1024,
             index_refresh_interval: std::time::Duration::from_mins(10),
             verify_mode: VerifyMode::GithubCi,
+            switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
