@@ -493,26 +493,42 @@ fn stage_compiled_object_blocking(
 }
 
 /// Serve a cached object: replace whatever sits at `output_path` with a
-/// clone of the cache entry.
+/// clone of the cache entry. The clone is staged beside the output and
+/// renamed over it, so two serves of one output both succeed (stow#1444).
 fn serve_cached_object_blocking(
     cache_path: &Path,
     output_path: &Path,
 ) -> stow_types::error::Result<Placement> {
-    match std::fs::remove_file(output_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(stow_types::error::Error::from(error)
-                .wrap_err(format!("remove stale object {}", output_path.display())));
-        }
-    }
-    clone_or_copy(cache_path, output_path).wrap_err_with(|| {
+    let staged = crate::inject::stage_clone(cache_path, output_path).wrap_err_with(|| {
         format!(
             "serve cached object {} into {}",
             cache_path.display(),
             output_path.display()
         )
-    })
+    })?;
+    let placement = if staged.as_file().is_some() {
+        Placement::Copied
+    } else {
+        Placement::Cloned
+    };
+    staged
+        .persist(output_path)
+        .map_err(|error| error.error)
+        .wrap_err_with(|| {
+            format!(
+                "move cached object {} into place at {}",
+                cache_path.display(),
+                output_path.display()
+            )
+        })?;
+    if placement == Placement::Copied {
+        tracing::debug!(
+            source = %cache_path.display(),
+            destination = %output_path.display(),
+            "filesystem cannot clone; copied C/C++ object bytes"
+        );
+    }
+    Ok(placement)
 }
 
 fn cc_cache_path(config: &StowConfig, cache_key: &str) -> PathBuf {
@@ -1240,6 +1256,40 @@ mod tests {
             std::fs::read(&served).expect("read served"),
             b"object bytes"
         );
+    }
+
+    /// Serving one cached object to one output from many threads at once
+    /// never fails and leaves the object whole (stow#1444).
+    #[test]
+    fn concurrent_serves_of_one_object_all_succeed() {
+        const THREADS: usize = 32;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = dir.path().join("key.o");
+        std::fs::write(&cache_path, vec![0x5a_u8; 64 * 1024]).expect("write cached object");
+        for round in 0..20 {
+            let served = dir.path().join(format!("served-{round}.o"));
+            let barrier = std::sync::Barrier::new(THREADS);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            super::serve_cached_object_blocking(&cache_path, &served)
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle
+                        .join()
+                        .expect("serve thread")
+                        .expect("every concurrent serve succeeds");
+                }
+            });
+            assert_eq!(
+                std::fs::read(&served).expect("read served"),
+                vec![0x5a_u8; 64 * 1024]
+            );
+        }
     }
 
     /// Two sources whose preprocessed text is identical but that sit at
