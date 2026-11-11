@@ -29,6 +29,7 @@ mod log;
 mod notify;
 pub mod protocol;
 mod serve;
+pub mod session;
 mod start;
 #[cfg(windows)]
 mod windows;
@@ -215,6 +216,12 @@ impl RunDir {
     #[must_use]
     pub fn log(&self) -> PathBuf {
         self.0.join("daemon.log")
+    }
+
+    /// The directory holding one subdirectory per open session.
+    #[must_use]
+    pub fn sessions(&self) -> PathBuf {
+        self.0.join("sessions")
     }
 
     /// Where clients reach the daemon: a Unix socket in the directory, or

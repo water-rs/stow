@@ -39,7 +39,7 @@ impl std::fmt::Display for Field {
 /// directory, that one too. A path a request names as its output must lie
 /// under one of them, so a build's roots never authorize another build's
 /// paths.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OutputRoots {
     dirs: Vec<PathBuf>,
 }
@@ -151,7 +151,7 @@ impl std::error::Error for Refusal {}
 /// is a contract violation between stow's own wrapper and supervisor, so
 /// it is surfaced where the build is developed and survived where it is
 /// used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RefusalPolicy {
     /// Answer the request as a failure and fail the build once cargo has
     /// exited, naming the field.

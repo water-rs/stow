@@ -84,6 +84,8 @@ sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runti
 axoupdater = "0.10"
 which = "8"
 same-file = "1"
+# A session id is 128 random bits from the operating system.
+getrandom = { version = "0.4", default-features = false }
 time = { version = "0.3.55", default-features = false, features = [
     "std",
     "formatting",

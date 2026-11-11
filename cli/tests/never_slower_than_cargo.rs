@@ -12,7 +12,7 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
 
-use stow_cli::protocol::{Answer, Plan, Request};
+use stow_cli::protocol::{Answer, CompileCommand, Plan, Request};
 
 mod support;
 
@@ -739,7 +739,7 @@ fn serve_stub_connection(
         };
         let crate_name = frame_crate_name(&request);
         let answer = match &request {
-            Request::Plan(_) => {
+            Request::Plan(plan) => {
                 counts
                     .lock()
                     .expect("frame counts")
@@ -747,7 +747,10 @@ fn serve_stub_connection(
                     .entry(crate_name)
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
-                Answer::Compile
+                Answer::Compile(CompileCommand::new(
+                    &plan.executable().expect("the plan's executable decodes"),
+                    &plan.args().expect("the plan's arguments decode"),
+                ))
             }
             Request::Compiled(_) => {
                 counts
@@ -857,7 +860,7 @@ fn drain_stub(endpoint: &str, stub: &StubSupervisor) {
     probe.read_exact(&mut body).expect("read answer body");
     let answer: Answer = serde_json::from_slice(&body).expect("decode probe answer");
     assert!(
-        matches!(answer, Answer::Compile),
+        matches!(answer, Answer::Compile(_)),
         "the probe must be answered: {answer:?}"
     );
     drop(probe);

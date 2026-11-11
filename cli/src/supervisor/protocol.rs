@@ -254,6 +254,46 @@ impl ArtifactNotifications {
     }
 }
 
+/// The compile a wrapper runs, as the deciding process fixed it: the
+/// executable and the full argument list, the build's own extra arguments
+/// included. The wrapper adds nothing and removes nothing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompileCommand {
+    /// The executable, OS-encoded like the argv.
+    pub executable: Vec<u8>,
+    /// Everything after the executable, in order.
+    pub args: Vec<Vec<u8>>,
+}
+
+impl CompileCommand {
+    /// A command running `executable` with `args`.
+    #[must_use]
+    pub fn new(executable: &std::ffi::OsStr, args: &[OsString]) -> Self {
+        Self {
+            executable: os_bytes::encode(executable),
+            args: args.iter().map(|arg| os_bytes::encode(arg)).collect(),
+        }
+    }
+
+    /// The executable to run.
+    ///
+    /// # Errors
+    ///
+    /// When the peer's encoding is not decodable on this platform.
+    pub fn executable(&self) -> Result<OsString, String> {
+        os_bytes::decode(&self.executable)
+    }
+
+    /// The arguments to run it with.
+    ///
+    /// # Errors
+    ///
+    /// When the peer's encoding is not decodable on this platform.
+    pub fn args(&self) -> Result<Vec<OsString>, String> {
+        self.args.iter().map(|arg| os_bytes::decode(arg)).collect()
+    }
+}
+
 /// What the supervisor answers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Answer {
@@ -261,10 +301,10 @@ pub enum Answer {
     /// without running rustc. The payload is the artifact-notification
     /// lines the facade owes cargo's stderr first (stow#633).
     Served(ArtifactNotifications),
-    /// Nothing serves this unit. The facade runs the real rustc and then
-    /// sends [`Compiled`] on the same connection, which holds the compile
-    /// until it does.
-    Compile,
+    /// Nothing serves this unit. The facade runs exactly the command in
+    /// the answer and then sends [`Compiled`] on the same connection,
+    /// which holds the compile until it does.
+    Compile(CompileCommand),
     /// The report arrived and the unit's rustc is recorded as exited; the
     /// supervisor's bookkeeping runs after this answer and the facade
     /// exits with the compile's own status without waiting for it

@@ -21,8 +21,8 @@ use tokio::sync::oneshot;
 
 use super::invocation::{Refusal, RefusalPolicy, VerifiedInvocation};
 use super::protocol::{
-    Answer, ArtifactNotifications, CcCompiled, CcLookup, Compiled, Plan, Request, read_frame,
-    write_frame,
+    Answer, ArtifactNotifications, CcCompiled, CcLookup, CompileCommand, Compiled, Plan, Request,
+    read_frame, write_frame,
 };
 use super::{BINARY_ENV, BinaryIdentity, ENDPOINT_ENV, TOKEN_ENV};
 use crate::local_socket::{self, Endpoint};
@@ -79,6 +79,21 @@ pub trait Handler: Send + Sync + 'static {
     /// report and every request that names an output directory.
     fn output_roots(self: &Arc<Self>) -> Option<&super::invocation::OutputRoots> {
         None
+    }
+
+    /// The arguments a request is decided and compiled with: the request's
+    /// own, plus whatever the build adds to every unit. The default adds
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// The request's environment cannot be decoded.
+    fn plan_args(
+        self: &Arc<Self>,
+        args: Vec<std::ffi::OsString>,
+        _env: &crate::supervisor::protocol::InvocationEnv,
+    ) -> Result<Vec<std::ffi::OsString>, String> {
+        Ok(args)
     }
 
     /// What the handler needs to remember between asking for a compile and
@@ -920,6 +935,14 @@ async fn answer_plan<H: Handler>(
             return Answer::Failed { message: error };
         }
     };
+    // A refused request compiles as cargo asked, with nothing the build
+    // adds to the arguments.
+    let as_requested = CompileCommand::new(&executable, &args);
+    let args = match handler.plan_args(args, &plan.env) {
+        Ok(args) => args,
+        Err(message) => return Answer::Failed { message },
+    };
+    let command = CompileCommand::new(&executable, &args);
     let invocation = match VerifiedInvocation::verify(
         handler.toolchain(),
         handler.output_roots(),
@@ -941,7 +964,7 @@ async fn answer_plan<H: Handler>(
                         pending: H::Pending::default(),
                         completion: None,
                     });
-                    Answer::Compile
+                    Answer::Compile(as_requested)
                 }
             };
         }
@@ -961,7 +984,7 @@ async fn answer_plan<H: Handler>(
                 pending,
                 completion: recordable_paths.map(|paths| in_flight.register(paths)),
             });
-            Answer::Compile
+            Answer::Compile(command)
         }
     }
 }
@@ -1157,7 +1180,7 @@ mod tests {
             .await
             .expect("plan");
         assert!(
-            matches!(decision, ClientDecision::Compile),
+            matches!(decision, ClientDecision::Compile { .. }),
             "the stub asks for a compile"
         );
         connection
@@ -1305,7 +1328,7 @@ mod tests {
             .await
             .expect("a refused plan is answered with a compile");
         assert!(
-            matches!(decision, ClientDecision::Compile),
+            matches!(decision, ClientDecision::Compile { .. }),
             "a refused plan is answered with a compile, never served"
         );
         connection
@@ -1462,9 +1485,8 @@ mod tests {
         let answer: Option<Answer> = read_frame(&mut *stream)
             .await
             .expect("read the plan's answer");
-        assert_eq!(
-            answer,
-            Some(Answer::Compile),
+        assert!(
+            matches!(answer, Some(Answer::Compile(_))),
             "the handler asks for a compile"
         );
         let report = Compiled {
@@ -1698,7 +1720,7 @@ mod tests {
             .await
             .expect("plan");
         assert!(
-            matches!(decision, ClientDecision::Compile),
+            matches!(decision, ClientDecision::Compile { .. }),
             "the handler asks for a compile"
         );
         let dependent =
@@ -1773,7 +1795,7 @@ mod tests {
             .await
             .expect("plan");
         assert!(
-            matches!(decision, ClientDecision::Compile),
+            matches!(decision, ClientDecision::Compile { .. }),
             "the handler asks for a compile"
         );
         let flight = in_flight.flight(&dep_rlib);
@@ -1830,9 +1852,8 @@ mod tests {
             .await
             .expect("write the plan");
         let answer: Option<Answer> = read_frame(&mut planned).await.expect("read the answer");
-        assert_eq!(
-            answer,
-            Some(Answer::Compile),
+        assert!(
+            matches!(answer, Some(Answer::Compile(_))),
             "the handler asks for a compile"
         );
         // The plan's answer came after the flight registered.
@@ -1892,7 +1913,7 @@ mod tests {
             .plan(std::ffi::OsStr::new("rustc"), &args)
             .await
             .expect("the first plan");
-        assert!(matches!(decision, ClientDecision::Compile));
+        assert!(matches!(decision, ClientDecision::Compile { .. }));
         let error = connection
             .plan(std::ffi::OsStr::new("rustc"), &args)
             .await

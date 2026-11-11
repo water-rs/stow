@@ -121,9 +121,8 @@ fn load_stow_config(state_db: &StateDb) -> Option<StowConfig> {
     Some(config)
 }
 
-/// The provisioning behind a [`MoldSelection`], shaped like
-/// [`SharedEnvBase`]: `Shared` so every clone of the context awaits
-/// the one resolution (stow#653).
+/// The provisioning behind a [`MoldSelection`]: `Shared` so every clone
+/// of the context awaits the one resolution (stow#653).
 type MoldProvision =
     Shared<BoxFuture<'static, Result<std::sync::Arc<[String]>, std::sync::Arc<String>>>>;
 
@@ -210,11 +209,11 @@ impl MoldSelection {
     }
 }
 
-/// The workspace layout, rustc probes, mold provisioning and the
-/// supervisor env base of a build, started together so every independent
-/// probe runs beside the others (stow#608). The finished context
-/// carries the mold selection — still resolving — so no cargo build
-/// can be assembled before it answers (stow#653).
+/// The workspace layout, rustc probes and mold provisioning of a build,
+/// started together so every independent probe runs beside the others
+/// (stow#608). The finished context carries the mold selection — still
+/// resolving — so no cargo build can be assembled before it answers
+/// (stow#653).
 async fn begin_project(
     config: Option<&StowConfig>,
     invocation: &CargoInvocation,
@@ -222,16 +221,13 @@ async fn begin_project(
     let pending = tracing::debug_span!("stow.precargo.project_context")
         .in_scope(|| ProjectContext::begin(invocation))?;
     let mold = spawn_mold_provision(&pending, config);
-    let env_base = spawn_env_base(config, &pending);
-    // Start the toolchain's probes beside mold's and the base's even
-    // when no base is built, so `run_cargo` finds them answered.
+    // Start the toolchain's probes beside mold's, so `run_cargo` finds
+    // them answered.
     let toolchain = pending.toolchain.clone();
     tokio::spawn(async move {
         let _ = toolchain.await;
     });
-    let mut project = pending.finish(mold, enter_foreground_hold()).await?;
-    project.env_base = env_base;
-    Ok(project)
+    pending.finish(mold, enter_foreground_hold()).await
 }
 
 /// The command's claim on the package-cache lock's next holder: while
@@ -368,7 +364,6 @@ async fn run_inner(
             &invocation,
             &public_cache_mode,
             maybe_analysis,
-            &slices,
         )
         .await
     } else {
@@ -524,7 +519,6 @@ async fn run_original_workspace_build(
     invocation: &CargoInvocation,
     public_cache_mode: &PublicCacheMode,
     analysis: Option<WorkspacePrediction>,
-    slices: &index::SliceFetches,
 ) -> stow_types::error::Result<ExitStatus> {
     let unit_nodes = analysis
         .as_ref()
@@ -562,7 +556,6 @@ async fn run_original_workspace_build(
         semantic_fallback_enabled,
         covered_units,
         isolation: &invocation.isolation,
-        slices,
     })
     .await
 }
@@ -661,7 +654,6 @@ async fn run_mirrored_upgrade_build(
         semantic_fallback_enabled: mirror_semantic_fallback,
         covered_units: mirror_prefetch.as_ref().map_or(0, Vec::len),
         isolation: &invocation.isolation,
-        slices,
     })
     .await
 }
@@ -802,7 +794,7 @@ impl<'a> AnalysisScope<'a> {
 /// handle on the driver's process. Together with a [`SessionEnv`] it is
 /// everything the unit-graph query, the cache key and the serve-map
 /// prediction need, so a process other than the driver's can run them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProjectFacts {
     /// The wrapped action (`check`, `build`, `test`, `predict`, …) —
     /// picks the cargo subcommand the unit-graph query re-runs.
@@ -860,13 +852,6 @@ pub struct ProjectContext {
     /// identical whether it came from `--config` or from a written
     /// config file.
     pub(crate) mold: MoldSelection,
-    /// The supervisor's wrapper base, still computing while the driver's
-    /// other work proceeds — `Shared` so every `run_cargo` the context
-    /// reaches awaits the one task rather than letting the first
-    /// facade's `compiled` re-probe on cargo's critical path (stow#608).
-    /// `None` on the paths that never had a `StowConfig` to build it
-    /// from; the lazy load then behaves exactly as before.
-    pub(crate) env_base: Option<SharedEnvBase>,
     /// The build's rustc — the configured `RUSTC`/`build.rustc` when
     /// set, else the toolchain's — the executable every driver-side
     /// probe names (stow#608).
@@ -886,23 +871,10 @@ pub struct ProjectContext {
 /// one probe (stow#517).
 type SharedTargetProbe = Shared<BoxFuture<'static, Result<String, String>>>;
 
-/// The wrapper environment base the driver's supervisor seeds, still
-/// computing — `Shared` so a cloned `ProjectContext` (a mirrored
-/// upgrade build) awaits the same task rather than a second one.
-/// A failed probe is an `Err` here, not a silent `None`: the build
-/// fails on the driver's timeline with the probe's own error instead
-/// of hiding the failure behind a lazy re-probe (stow#608).
-type SharedEnvBase = Shared<
-    BoxFuture<
-        'static,
-        Result<Option<std::sync::Arc<crate::WrapperEnvBase>>, std::sync::Arc<String>>,
-    >,
->;
-
 /// The build's toolchain while its probes are still answering: `Shared`
-/// so the supervisor's base task and `run_cargo` await the one
-/// resolution. A failed probe is an `Err`: the build fails with the
-/// probe's own error, as plain cargo fails there.
+/// so every `run_cargo` the context reaches awaits the one resolution. A
+/// failed probe is an `Err`: the build fails with the probe's own error,
+/// as plain cargo fails there.
 type SharedToolchain = Shared<
     BoxFuture<
         'static,
@@ -950,55 +922,6 @@ async fn join_toolchain(
         .clone()
         .await
         .map_err(|error| stow_types::stow_error!("resolve the build's rustc toolchain: {error}"))
-}
-
-/// Spawn the supervisor's base build on the driver's own timeline —
-/// the toolchain's probes and `prepare_local_cache` overlap the
-/// context's remaining work and mold's provisioning, so `run_cargo` finds
-/// them already answered (stow#608). No `StowConfig` means nothing to
-/// build and no task to await.
-fn spawn_env_base(
-    config: Option<&StowConfig>,
-    pending: &PendingProjectContext,
-) -> Option<SharedEnvBase> {
-    let config = config.cloned()?;
-    let toolchain = pending.toolchain.clone();
-    let task = tokio::spawn(
-        async move {
-            let toolchain = join_toolchain(&toolchain)
-                .await
-                .map_err(|error| std::sync::Arc::new(error.to_string()))?;
-            Ok(crate::load_wrapper_env_base(config, &toolchain)
-                .await
-                .map(std::sync::Arc::new))
-        }
-        .instrument(tracing::debug_span!("stow.precargo.env_base")),
-    );
-    Some(
-        async move {
-            match task.await {
-                Ok(base) => base,
-                Err(error) => Err(std::sync::Arc::new(format!(
-                    "join supervisor env base task: {error}"
-                ))),
-            }
-        }
-        .boxed()
-        .shared(),
-    )
-}
-
-/// The seeded base, joined: `Some` awaits the shared task and
-/// propagates a probe failure as the build's own error (stow#608).
-async fn join_env_base(
-    shared: Option<&SharedEnvBase>,
-) -> stow_types::error::Result<Option<std::sync::Arc<crate::WrapperEnvBase>>> {
-    match shared {
-        Some(shared) => shared.clone().await.map_err(|error| {
-            stow_types::stow_error!("build the supervisor environment base: {error}")
-        }),
-        None => Ok(None),
-    }
 }
 
 /// The half of a [`ProjectContext`] that never waits on rustc: the
@@ -1193,7 +1116,6 @@ impl PendingProjectContext {
             },
             env: self.env,
             mold,
-            env_base: None,
             build_rustc: self.build_rustc,
             toolchain: self.toolchain,
             foreground,
@@ -1201,7 +1123,7 @@ impl PendingProjectContext {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MetadataArgs {
     pub(crate) manifest_path: Option<PathBuf>,
     /// Every spelled `--target` in order — cargo compiles all of them.
@@ -2776,7 +2698,6 @@ async fn run_pinned_mirror_build(
         semantic_fallback_enabled: mirror_semantic_fallback,
         covered_units: mirror_prefetch.len(),
         isolation: &invocation.isolation,
-        slices,
     })
     .await
 }
@@ -3971,9 +3892,6 @@ struct CargoRunPlan<'a> {
     /// The level the build's cargo, build scripts and proc macros run at
     /// (stow#1000).
     isolation: &'a crate::isolation::Isolation,
-    /// The build's slice memo, shared with the driver's analyses so the
-    /// in-build enrichment reuses what they fetched.
-    slices: &'a index::SliceFetches,
 }
 
 /// The build's cargo run under the wrapper. Returns cargo's own exit
@@ -3983,27 +3901,18 @@ struct CargoRunPlan<'a> {
 /// The build's pre-cargo state — everything `run_cargo` lays out before
 /// the supervisor and cargo spawn: the scratch directory every generated
 /// file lives under (stow#630), the wrapper shims, the argv and `STOW_*`
-/// environment cargo reads, the seeded policy dir and the serve map
-/// whose `pending` signal holds the facades it cannot yet cover.
+/// environment cargo reads.
 struct CargoRunSetup {
     scratch: tempfile::TempDir,
     wrappers: crate::commands::WrapperCommands,
     launch: CargoLaunch,
-    cache_policy_path: Option<PathBuf>,
-    serve_map_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
-    /// The side that replaces the build's serve map; `None` when the
-    /// build started without one.
-    serve_map_writer: Option<crate::facade::ServeMapWriter>,
-    serve_map: crate::facade::ServeMapView,
-    serve_waiters: Option<crate::facade::ServeMapWaiters>,
 }
 
 async fn prepare_cargo_run(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<CargoRunSetup> {
-    // Every file this build generates — the serve map, the graph
-    // tables, the extra-args list, the cache-policy markers — lives in
-    // one directory the build owns, beside the supervisor's socket
-    // directory in the system temp directory, and the build removes it
-    // when it ends (stow#630).
+    // Every file this build generates — the graph tables and the
+    // extra-args list — lives in one directory the build owns, in the
+    // system temp directory, and the build removes it when it ends
+    // (stow#630).
     let scratch = tempfile::Builder::new()
         .prefix("stow-build-")
         .tempdir()
@@ -4011,43 +3920,50 @@ async fn prepare_cargo_run(plan: &CargoRunPlan<'_>) -> stow_types::error::Result
     let wrappers =
         tracing::debug_span!("stow.precargo.detect_wrappers").in_scope(detect_wrapper_commands)?;
     let argv = cargo_argv(plan).await?;
-
-    let cache_policy_path = seed_cache_policy(scratch.path(), plan.cache_policy_entries)
-        .instrument(tracing::debug_span!("stow.precargo.policy_dir"))
-        .await;
-
-    // The serve map lives in the supervisor's memory: the plan path reads
-    // it, and the enrichment replaces it (stow#347). A map still
-    // `pending` arms the waiters' signal alongside: plans for units it
-    // cannot cover hold until the final write lands rather than
-    // compiling what the in-flight fetch may cover.
-    let serve_map_ready = std::sync::Arc::new(crate::facade::ServeMapSignal::pending());
-    let mut serve_waiters = plan
-        .servable_units
-        .filter(|map| map.pending)
-        .map(|_| crate::facade::ServeMapWaiters::new(std::sync::Arc::clone(&serve_map_ready)));
-    let (serve_map_writer, serve_map) = {
-        let (writer, view) = crate::facade::serve_map_cell(plan.servable_units.cloned());
-        (plan.servable_units.map(|_| writer), view)
-    };
-    arm_or_settle_serve_map_ready(plan, plan.config, &serve_map_ready, &mut serve_waiters);
-    let envs = collect_wrapper_env(
-        plan,
-        &wrappers,
-        cache_policy_path.as_deref(),
-        scratch.path(),
-    )
-    .instrument(tracing::debug_span!("stow.precargo.export_env"))
-    .await?;
+    let envs = collect_wrapper_env(plan, &wrappers, scratch.path())
+        .instrument(tracing::debug_span!("stow.precargo.export_env"))
+        .await?;
     Ok(CargoRunSetup {
         scratch,
         wrappers,
         launch: CargoLaunch { argv, envs },
-        cache_policy_path,
-        serve_map_ready,
-        serve_map_writer,
-        serve_map,
-        serve_waiters,
+    })
+}
+
+/// The facts the build's session opens with, gathered from what the
+/// driver's analysis settled before cargo starts.
+fn session_facts(
+    plan: &CargoRunPlan<'_>,
+    toolchain: &crate::toolchain::BuildToolchain,
+    registry_sources: crate::RegistrySources,
+) -> stow_types::error::Result<crate::daemon::session::SessionFacts> {
+    let project = plan.project;
+    Ok(crate::daemon::session::SessionFacts {
+        environ: project.env.environ().to_vec(),
+        cwd: project.env.cwd().to_owned(),
+        project: project.facts.clone(),
+        toolchain: toolchain.facts(),
+        build_rustc: project.build_rustc.executable().to_owned(),
+        config: plan.config.cloned(),
+        public_cache_disabled: !plan.public_cache_mode.is_enabled(),
+        roots: resolved_output_roots(
+            &project.facts,
+            &project.env,
+            plan.cargo_args,
+            plan.current_dir,
+        )?,
+        refusal_policy: crate::supervisor::invocation::RefusalPolicy::of_this_build(),
+        registry_sources,
+        seed: crate::daemon::session::Seed {
+            serve_map: plan.servable_units.cloned(),
+            cache_policy_entries: plan.cache_policy_entries.map(<[_]>::to_vec),
+            unit_nodes: plan.unit_nodes.cloned(),
+            prefetch_artifacts: plan.prefetch_artifacts.map(<[_]>::to_vec),
+            semantic_fallback_enabled: plan.semantic_fallback_enabled,
+            deferred: plan.deferred_analysis,
+            inexact_entries: plan.inexact_entries.unwrap_or(&[]).to_vec(),
+        },
+        rustc_extra_args: rustc_wrapper_extra_args(plan.source_root)?,
     })
 }
 
@@ -4056,7 +3972,6 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         project,
         config,
         action,
-        public_cache_mode,
         covered_units,
         ..
     } = *plan;
@@ -4069,108 +3984,34 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         scratch,
         wrappers,
         launch,
-        cache_policy_path,
-        serve_map_ready,
-        serve_map_writer,
-        serve_map,
-        serve_waiters,
     } = setup;
 
-    // Every rustc invocation this cargo run spawns is a facade that asks
-    // this process what to do, so the whole build shares one transport —
-    // one pooled connection, one QUIC endpoint. The `STOW_*` context lands
-    // on cargo's environment, so the deciding process holds the resolved
-    // values itself (stow#347).
-    let analysis_cell = analysis_cell(plan);
-    let policy_ready = policy_ready_signal(cache_policy_path.is_some() && plan.deferred_analysis);
+    // Every rustc invocation this cargo run spawns is a wrapper that asks
+    // the build's session what to do, so the whole build shares one
+    // transport — one pooled connection, one QUIC endpoint (stow#347).
     // The driver-built wrapper base lands here: the task spawned in
     // `run_inner` has been running beside mold's provisioning and the
     // analysis, so this await is almost always an immediate take (stow#608).
     let toolchain = join_toolchain(&project.toolchain).await?;
-    let env_base = join_env_base(project.env_base.as_ref()).await?;
-    let (resolution_done, release_hold) = spawn_resolution_lease(project);
-    // The supervisor and the handler share the build's in-flight unit
-    // registry: the server marks and completes flights, the post-compiles
-    // wait on them before resolving dependency identities (stow#618).
-    let in_flight = crate::supervisor::server::InFlightUnits::default();
-    let handler = std::sync::Arc::new(
-        crate::BuildSupervisor::new(
-            crate::BuildContext {
-                policy_dir: cache_policy_path.clone(),
-                public_cache_target: Some(project.facts.target.clone()),
-                public_cache_disabled: !public_cache_mode.is_enabled(),
-                cache: config
-                    .map_or_else(crate::config::CacheLayers::default, |config| config.cache),
-                analysis: std::sync::Arc::clone(&analysis_cell),
-                serve_map,
-                serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
-                policy_ready: std::sync::Arc::clone(&policy_ready),
-                in_flight: in_flight.clone(),
-                registry_sources: std::sync::OnceLock::from(registry_sources),
-            },
-            config.cloned(),
-            toolchain,
-            env_base,
-            resolution_done.clone(),
-            crate::supervisor::invocation::RefusalPolicy::of_this_build(),
-        )
-        .with_output_roots(resolved_output_roots(
-            &project.facts,
-            &project.env,
-            plan.cargo_args,
-            plan.current_dir,
-        )?),
-    );
+    let facts = session_facts(plan, &toolchain, registry_sources)?;
+    let session = open_session(facts, config).await?;
+    // The release task rides the session's resolution signal: once cargo
+    // holds the package-cache lock only shared, a drain's cargo can no
+    // longer make this build wait (stow#667).
+    let release_hold = spawn_hold_release(session.resolution_done(), project.foreground.clone());
     let (mut cargo_run, mut supervisor) =
-        spawn_cargo_run(plan, &handler, in_flight, &wrappers, launch, scratch.path()).await?;
+        spawn_cargo_run(plan, &session, &wrappers, launch, scratch.path()).await?;
 
     let before = coverage_snapshot(config).await;
 
-    // The full graph analysis — the verified index fetch and the live
-    // `--unit-graph` resolve — runs while cargo builds rather than in
-    // front of it: its answers land in the serve map and the cell the
-    // supervisor's plan path reads, mid-build
-    // (stow#347).
-    let enricher = if plan.deferred_analysis
-        && let Some(config) = config
-    {
-        // Aborted at cargo's exit, below: what the analysis commits for
-        // this build — the map, the policy markers, the facts — lands
-        // while cargo runs, and whatever is still running when cargo
-        // returns is warming this build can no longer use; the plan path
-        // fetches on demand.
-        Some(spawn_build_enrichment(BuildEnrichment {
-            project: project.facts.clone(),
-            env: project.env.clone(),
-            config: config.clone(),
-            circuit: handler.circuit(),
-            cell: analysis_cell,
-            map: serve_map_writer,
-            policy_dir: cache_policy_path.clone(),
-            readiness: serve_waiters,
-            policy_ready: (!policy_ready.has_completed())
-                .then(|| crate::facade::ServeMapWaiters::new(std::sync::Arc::clone(&policy_ready))),
-            resolution_done,
-            slices: plan.slices.clone(),
-        }))
-    } else {
-        // No enrichment, so no fetch will ever land a slice: release
-        // whatever waits on one before cargo runs, not when it returns
-        // (stow#735).
-        drop(serve_waiters);
-        None
-    };
-
     tracing::debug!("stow.precargo.cargo_spawn");
     let status = cargo_run.status().await;
-    // The analysis stops with cargo, whichever way cargo ended: its
-    // future is dropped here — and with it the `kill_on_drop` cargo
+    // The session's analysis stops with cargo, whichever way cargo ended:
+    // its future is dropped here — and with it the `kill_on_drop` cargo
     // children it may still be driving — before anything else runs
     // (stow#624). The release task stops too — a hold released after
     // this build ends would open the gate on a lie.
-    if let Some(enricher) = enricher {
-        stop_build_task(enricher).await;
-    }
+    session.stop_enrichment().await;
     stop_build_task(release_hold).await;
     let status = status.wrap_err_with(|| format!("run cargo {action}"))?;
     finish_cargo_run(
@@ -4180,9 +4021,27 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         status,
         before,
         covered_units,
-        &handler,
+        &session,
     )
     .await
+}
+
+/// Open the build's session in this process, with the state database
+/// handle the config already holds: the driver keeps one pool for the
+/// whole command.
+async fn open_session(
+    facts: crate::daemon::session::SessionFacts,
+    config: Option<&StowConfig>,
+) -> stow_types::error::Result<std::sync::Arc<crate::daemon::session::Session>> {
+    let mut resources = config.map_or_else(
+        crate::daemon::session::Resources::default,
+        crate::daemon::session::Resources::adopting,
+    );
+    let handles = config.map_or_else(crate::daemon::session::CacheDirHandles::default, |config| {
+        resources.handles_for(&config.cache_dir)
+    });
+    let sessions = crate::daemon::RunDir::prepare(crate::daemon::RunDir::locate()?)?.sessions();
+    crate::daemon::session::Session::open(facts, &handles, &sessions).await
 }
 
 /// What `finish_cargo_run` releases, in order: the run — and with it a
@@ -4203,7 +4062,7 @@ async fn finish_cargo_run(
     status: ExitStatus,
     before: CoverageSnapshot,
     covered_units: usize,
-    handler: &std::sync::Arc<crate::BuildSupervisor>,
+    session: &std::sync::Arc<crate::daemon::session::Session>,
 ) -> stow_types::error::Result<ExitStatus> {
     // Cargo has exited, so every facade has: stop accepting and drain the
     // last connections' post-compile bookkeeping before the runtime goes
@@ -4213,6 +4072,10 @@ async fn finish_cargo_run(
     // The sandbox's grants name the scratch directory, and its drop revokes
     // them, so it goes before the directory does.
     drop(cleanup.cargo_run);
+    // The session writes the miss journal as it ends — the build's
+    // compile observations are its miss list (stow#317), a failed build's
+    // units included — and removes its directory.
+    let end = session.end().await?;
     if let Some(config) = plan.config {
         if status.success() {
             report_cache_coverage(config, before, covered_units).await;
@@ -4221,7 +4084,7 @@ async fn finish_cargo_run(
         // Misses, admissions and the usage report exist only to reach the
         // network; the local-only and off cache modes keep none of them.
         if config.cache.reaches_network() {
-            admit_build_misses(plan, config, handler).await;
+            admit_build_misses(plan, config).await;
         }
     }
     // Nothing writes into the scratch directory any more — cargo has
@@ -4231,57 +4094,58 @@ async fn finish_cargo_run(
     if let Err(error) = cleanup.scratch.close() {
         tracing::warn!(%error, "could not remove the build scratch directory");
     }
-    // A request the supervisor refused fails the build, whatever cargo
-    // made of it: a one-way report has no answer to carry the refusal, so
-    // it is raised here, naming the field of each.
-    handler.ensure_no_refusals()?;
+    // A request the session refused fails the build, whatever cargo made
+    // of it: a one-way report has no answer to carry the refusal, so it
+    // is raised here, naming the field of each.
+    if !end.refusals.is_empty() {
+        return Err(stow_types::stow_error!(
+            "the build supervisor refused {} request(s): {}",
+            end.refusals.len(),
+            end.refusals.join("; ")
+        ));
+    }
     Ok(status)
 }
 
-/// The build's compile observations are its miss list (stow#317) — a failed
-/// build's units are real misses too, whatever its last unit did. They land
-/// in the same journal a plain-cargo wrapper writes, and a detached drain
-/// posts the admission — the command returns as soon as cargo does. The
-/// caller has given up the foreground hold first: the drain this build
-/// spawns must find the gate open (stow#667).
-async fn admit_build_misses(
-    plan: &CargoRunPlan<'_>,
-    config: &StowConfig,
-    handler: &std::sync::Arc<crate::BuildSupervisor>,
-) {
+/// A detached drain posts the build's miss admission — the command returns
+/// as soon as cargo does. The caller has given up the foreground hold
+/// first: the drain this build spawns must find the gate open (stow#667).
+async fn admit_build_misses(plan: &CargoRunPlan<'_>, config: &StowConfig) {
     // The day's usage report posts from the detached drain — never on the
     // build's wall clock — so a due report is a reason to spawn that drain
     // even when this build leaves no journal (stow#889).
     let report_due = crate::report::report_due_today(config).await;
-    journal_and_drain_misses(
-        plan.project,
-        plan.cargo_args,
-        plan.current_dir,
-        &handler.observations(),
-        plan.inexact_entries.unwrap_or(&[]),
-        report_due,
-    );
+    let facts = &plan.project.facts;
+    let target_dir =
+        resolved_target_dir(facts, &plan.project.env, plan.cargo_args, plan.current_dir);
+    // An all-hit build leaves no journal for `spawn_drain` to find; a due
+    // usage report forces the spawn so the day's deltas still leave the
+    // machine through the detached lane (stow#889).
+    if report_due {
+        crate::miss_journal::spawn_drain_unconditional(&target_dir);
+    } else {
+        crate::miss_journal::spawn_drain(&target_dir);
+    }
     // One supervised run is one build the install ran — counted here rather
     // than by the journal, whose supervised files the drain skips to keep
     // the count single.
     crate::report::bump_build(config).await;
 }
 
-/// The build's supervisor, bound beside the handler it shares the
+/// The build's supervisor, bound beside the session it shares the
 /// in-flight registry with (stow#618). The runtime executable the shims
 /// resolve to is passed in — the supervisor exports its identity to
 /// cargo so a facade running a different build refuses before a frame is
 /// sent (stow#645).
 fn start_supervisor(
-    handler: &std::sync::Arc<crate::BuildSupervisor>,
-    in_flight: crate::supervisor::server::InFlightUnits,
+    session: &std::sync::Arc<crate::daemon::session::Session>,
     wrappers: &crate::commands::WrapperCommands,
 ) -> stow_types::error::Result<crate::supervisor::server::Supervisor> {
     tracing::debug_span!("stow.precargo.supervisor_start")
         .in_scope(|| {
             crate::supervisor::server::start(
-                std::sync::Arc::clone(handler),
-                in_flight,
+                std::sync::Arc::clone(session),
+                session.in_flight().clone(),
                 &wrappers.runtime_executable,
             )
         })
@@ -4355,7 +4219,7 @@ enum SupervisorHandle {
     /// The supervisor served over heel's IPC socket inside the sandbox.
     Ipc(
         crate::supervisor::ipc::SandboxedSupervisor<
-            <crate::BuildSupervisor as crate::supervisor::server::Handler>::Pending,
+            <crate::daemon::session::Session as crate::supervisor::server::Handler>::Pending,
         >,
     ),
 }
@@ -4384,15 +4248,14 @@ struct CargoLaunch {
 
 async fn spawn_cargo_run(
     plan: &CargoRunPlan<'_>,
-    handler: &std::sync::Arc<crate::BuildSupervisor>,
-    in_flight: crate::supervisor::server::InFlightUnits,
+    session: &std::sync::Arc<crate::daemon::session::Session>,
     wrappers: &crate::commands::WrapperCommands,
     mut launch: CargoLaunch,
     scratch: &Path,
 ) -> stow_types::error::Result<(CargoRun, SupervisorHandle)> {
     match plan.isolation.level.confinement() {
         None => {
-            let supervisor = start_supervisor(handler, in_flight, wrappers)?;
+            let supervisor = start_supervisor(session, wrappers)?;
             launch.envs.extend(
                 supervisor
                     .env()
@@ -4409,16 +4272,7 @@ async fn spawn_cargo_run(
             ))
         }
         Some(confinement) => {
-            sandboxed_cargo_run(
-                plan,
-                confinement,
-                handler,
-                in_flight,
-                wrappers,
-                launch,
-                scratch,
-            )
-            .await
+            sandboxed_cargo_run(plan, confinement, session, wrappers, launch, scratch).await
         }
     }
 }
@@ -4433,8 +4287,7 @@ async fn spawn_cargo_run(
 async fn sandboxed_cargo_run(
     plan: &CargoRunPlan<'_>,
     confinement: crate::isolation::Confinement,
-    handler: &std::sync::Arc<crate::BuildSupervisor>,
-    in_flight: crate::supervisor::server::InFlightUnits,
+    session: &std::sync::Arc<crate::daemon::session::Session>,
     wrappers: &crate::commands::WrapperCommands,
     mut launch: CargoLaunch,
     scratch: &Path,
@@ -4443,8 +4296,8 @@ async fn sandboxed_cargo_run(
         crate::sandbox::fetch_dependencies(plan.current_dir, plan.cargo_args).await?;
     }
     let (pending, router) = crate::supervisor::ipc::start(
-        std::sync::Arc::clone(handler),
-        in_flight,
+        std::sync::Arc::clone(session),
+        session.in_flight().clone(),
         &wrappers.runtime_executable,
     )
     .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
@@ -4520,66 +4373,6 @@ async fn sandboxed_cargo_run(
     ))
 }
 
-/// The cell the supervisor's plan path reads the analysis's facts from:
-/// filled here when the analysis ran before cargo, left for the in-build
-/// enrichment to fill when it is deferred (stow#347).
-fn analysis_cell(
-    plan: &CargoRunPlan<'_>,
-) -> std::sync::Arc<std::sync::OnceLock<crate::AnalysisFacts>> {
-    let cell = std::sync::Arc::new(std::sync::OnceLock::new());
-    if !plan.deferred_analysis {
-        cell.set(crate::AnalysisFacts {
-            semantic_fallback_enabled: plan.semantic_fallback_enabled,
-            unit_nodes: plan.unit_nodes.cloned(),
-            prefetch_candidates: plan
-                .prefetch_artifacts
-                .map_or_else(BTreeMap::new, |artifacts| {
-                    crate::prefetch_candidate_c_metadatas(
-                        artifacts.iter().map(|artifact| {
-                            (artifact.crate_name.clone(), artifact.c_metadata.clone())
-                        }),
-                    )
-                }),
-        })
-        .expect(
-            "the analysis cell is written once per build; the pre-cargo fill is its only \
-             writer when the analysis is not deferred",
-        );
-    }
-    cell
-}
-
-/// Create the build's cache-policy directory inside its scratch
-/// directory and write `entries`' allow markers into it; `None` entries
-/// are a build with no policy. The directory exists before cargo does:
-/// the supervisor writes local-build provenance markers into it during
-/// the build, and the facades read it per plan call (stow#347).
-///
-/// `None` also when it cannot be written: without a policy the wrapper
-/// treats every invocation as allowed, which costs lookups but still
-/// builds. Failing here would not.
-async fn seed_cache_policy(
-    scratch_dir: &Path,
-    entries: Option<&[CachePolicyEntry]>,
-) -> Option<PathBuf> {
-    let entries = entries?;
-    let seeded = async {
-        let dir = cache_policy::create_policy_dir(scratch_dir).await?;
-        cache_policy::write_policy_entries(&dir, entries).await?;
-        Ok::<_, stow_types::error::Error>(dir)
-    };
-    match seeded.await {
-        Ok(dir) => Some(dir),
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "failed to write the cache policy; the build continues without one"
-            );
-            None
-        }
-    }
-}
-
 /// The build's pre-cargo coverage snapshot, instrumented as its own
 /// span.
 async fn coverage_snapshot(config: Option<&StowConfig>) -> CoverageSnapshot {
@@ -4588,23 +4381,10 @@ async fn coverage_snapshot(config: Option<&StowConfig>) -> CoverageSnapshot {
         .await
 }
 
-/// The supervisor completes the latch on the first facade frame that
-/// describes a real compile unit — the moment cargo's resolution is
-/// over — so the package-cache lock always goes to the real build first
-/// (stow#608). The release task rides it: once cargo holds the
-/// package-cache lock only shared, a drain's cargo can no longer make
-/// this build wait — and a `stow run` that stays up for hours must not
-/// keep every drain shut (stow#667). The task is stopped with cargo.
-fn spawn_resolution_lease(
-    project: &ProjectContext,
-) -> (crate::ResolutionDone, tokio::task::JoinHandle<()>) {
-    let resolution_done = crate::ResolutionDone::pending();
-    let release_hold = spawn_hold_release(resolution_done.clone(), project.foreground.clone());
-    (resolution_done, release_hold)
-}
-
 /// The task `run_cargo` stops with cargo: release the foreground hold
-/// the moment `resolution_done` fires (stow#667).
+/// the moment `resolution_done` fires — the first wrapper frame that
+/// describes a real compile unit, so a `stow run` that stays up for hours
+/// must not keep every drain shut (stow#667).
 fn spawn_hold_release(
     resolution_done: crate::ResolutionDone,
     foreground: crate::derive_gate::ForegroundHold,
@@ -4619,7 +4399,7 @@ fn spawn_hold_release(
 /// hold's release — and return once its future is gone, so nothing of
 /// it outlives the build: no write into the scratch directory, no
 /// cargo child. A panic inside it is the build's panic.
-async fn stop_build_task(task: tokio::task::JoinHandle<()>) {
+pub async fn stop_build_task(task: tokio::task::JoinHandle<()>) {
     task.abort();
     match task.await {
         Ok(()) => {}
@@ -4641,11 +4421,10 @@ async fn stop_build_task(task: tokio::task::JoinHandle<()>) {
 async fn collect_wrapper_env(
     plan: &CargoRunPlan<'_>,
     wrappers: &crate::commands::WrapperCommands,
-    cache_policy_path: Option<&Path>,
     scratch: &Path,
 ) -> stow_types::error::Result<Vec<(OsString, OsString)>> {
     let mut envs = Vec::new();
-    export_wrapper_env(&mut envs, plan, wrappers, cache_policy_path, scratch).await?;
+    export_wrapper_env(&mut envs, plan, wrappers, scratch).await?;
     Ok(envs)
 }
 
@@ -4696,7 +4475,6 @@ async fn export_wrapper_env(
     envs: &mut Vec<(OsString, OsString)>,
     plan: &CargoRunPlan<'_>,
     wrappers: &crate::commands::WrapperCommands,
-    cache_policy_path: Option<&Path>,
     scratch_dir: &Path,
 ) -> stow_types::error::Result<()> {
     let CargoRunPlan {
@@ -4764,10 +4542,6 @@ async fn export_wrapper_env(
             OsString::from(path.as_os_str()),
         ));
     }
-    if let Some(path) = cache_policy_path {
-        let (key, value) = cache_policy::cache_policy_env(path);
-        envs.push((OsString::from(key), value));
-    }
     if project.env.var_os("CARGO_TARGET_DIR").is_none() && !has_explicit_target_dir(cargo_args) {
         envs.push((
             OsString::from("CARGO_TARGET_DIR"),
@@ -4775,35 +4549,6 @@ async fn export_wrapper_env(
         ));
     }
     Ok(())
-}
-
-/// A missing slice is final only once the build's fetch has settled —
-/// the same settling a pending serve map's plans wait on — so `serve_map_ready` must
-/// complete in lockstep with that fetch or a lookup waits forever
-/// (stow#735). When the lite pass produced no map the enrichment still
-/// fetches the consumer slices mid-build, so the guard rides with it;
-/// when nothing in this build can land a slice the signal settles now —
-/// a build that cannot serve must not hold a lookup for a fetch that is
-/// never coming.
-fn arm_or_settle_serve_map_ready(
-    plan: &CargoRunPlan<'_>,
-    config: Option<&StowConfig>,
-    serve_map_ready: &std::sync::Arc<crate::facade::ServeMapSignal>,
-    serve_waiters: &mut Option<crate::facade::ServeMapWaiters>,
-) {
-    if serve_waiters.is_some() {
-        return;
-    }
-    if plan.deferred_analysis
-        && config.is_some()
-        && plan.servable_units.as_ref().is_none_or(|map| map.pending)
-    {
-        *serve_waiters = Some(crate::facade::ServeMapWaiters::new(std::sync::Arc::clone(
-            serve_map_ready,
-        )));
-    } else {
-        serve_map_ready.complete();
-    }
 }
 
 /// One build-scoped JSON table, `{name}.json` in the build's scratch
@@ -4855,51 +4600,40 @@ async fn write_build_json_file(
 /// analysis resolves, and the three places its answer lands — the
 /// supervisor's fact cell, the serve map its plans read, and the
 /// policy directory the allow markers gate (stow#347).
-struct BuildEnrichment {
-    project: ProjectFacts,
-    env: SessionEnv,
-    config: StowConfig,
-    cell: std::sync::Arc<std::sync::OnceLock<crate::AnalysisFacts>>,
+pub struct BuildEnrichment {
+    pub(crate) project: ProjectFacts,
+    pub(crate) env: SessionEnv,
+    pub(crate) config: StowConfig,
+    pub(crate) cell: std::sync::Arc<std::sync::OnceLock<crate::AnalysisFacts>>,
     /// Replaces the build's serve map; `None` for a build that started
     /// without one.
-    map: Option<crate::facade::ServeMapWriter>,
-    policy_dir: Option<PathBuf>,
+    pub(crate) map: Option<crate::facade::ServeMapWriter>,
+    /// The side that replaces the build's allow set; `None` for a build
+    /// with no policy.
+    pub(crate) allow: Option<cache_policy::AllowWriter>,
     /// The build fetch's completion guard: held until the consumer
     /// slices have settled — its drop releases the plans waiting on a
     /// pending serve map and the slice memo's lookups, whichever way the
     /// analysis ends (stow#347, stow#735).
-    readiness: Option<crate::facade::ServeMapWaiters>,
+    pub(crate) readiness: Option<crate::facade::ServeMapWaiters>,
     /// The policy gate's completion guard: dropped right after the
-    /// coarse allow commit lands the fetched slices' markers — or by an
+    /// coarse allow commit lands the fetched slices' entries — or by an
     /// early return — so a denied unit waits out the commit once, never
     /// the task's whole lifetime (stow#788).
-    policy_ready: Option<crate::facade::ServeMapWaiters>,
+    pub(crate) policy_ready: Option<crate::facade::ServeMapWaiters>,
     /// Held until the supervisor's first compile-unit frame says
     /// cargo's resolution is over: only then may this task's own
     /// `--unit-graph` cargo take the package-cache lock — before that
     /// it would queue the user's real build behind a whole second
     /// resolve (stow#608).
-    resolution_done: crate::ResolutionDone,
+    pub(crate) resolution_done: crate::ResolutionDone,
     /// The build's circuit handle — tripped when the index fetch finds
     /// the registry unreachable, releasing the plan path and in-flight
     /// downloads to local compile at once (stow#977).
-    circuit: crate::circuit::BuildCircuit,
+    pub(crate) circuit: crate::circuit::BuildCircuit,
     /// The build's slice memo: the driver's analyses fetched through the
     /// same value, so the enrichment never re-reads a verified slice.
-    slices: index::SliceFetches,
-}
-
-/// The policy gate's readiness latch for this build: pending only while
-/// a deferred build's enrichment still owes the seeded directory its
-/// coarse commit — released by the commit or by the guard dropping with
-/// the task; every other build answers a missing marker at once
-/// (stow#788).
-fn policy_ready_signal(commit_pending: bool) -> std::sync::Arc<crate::facade::ServeMapSignal> {
-    std::sync::Arc::new(if commit_pending {
-        crate::facade::ServeMapSignal::pending()
-    } else {
-        crate::facade::ServeMapSignal::settled()
-    })
+    pub(crate) slices: index::SliceFetches,
 }
 
 /// The policy gate's first commit — every crate the fetched slices
@@ -4988,7 +4722,7 @@ async fn coarse_cache_policy_entries(
 /// proves. Failures degrade, never fail the build: the serve map keeps
 /// its filesystem-only answer, the policy directory keeps denying, and
 /// the plan path keeps its conservative defaults.
-fn spawn_build_enrichment(work: BuildEnrichment) -> tokio::task::JoinHandle<()> {
+pub fn spawn_build_enrichment(work: BuildEnrichment) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn(async move {
         if let Err(error) = Box::pin(run_build_enrichment(work)).await {
             tracing::warn!(
@@ -5031,7 +4765,7 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     // is already the final allow answer; the guard's drop releases the
     // plan path's waiters, and an early return releases them the same
     // way (stow#788).
-    if let Some(policy_dir) = &work.policy_dir {
+    if let Some(allow) = &work.allow {
         let (entries, complete) = coarse_cache_policy_entries(
             &work.config,
             &work.project,
@@ -5040,7 +4774,7 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
             host_slice.as_ref(),
         )
         .await?;
-        cache_policy::write_policy_entries(policy_dir, &entries).await?;
+        allow.commit(&entries);
         if complete {
             drop(work.policy_ready.take());
         }
@@ -5081,9 +4815,9 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     // graph to bound it — so the analysis's exact allow set is the
     // release-worthy commit for the units still parked on the latch.
     if work.policy_ready.is_some()
-        && let Some(policy_dir) = &work.policy_dir
+        && let Some(allow) = &work.allow
     {
-        cache_policy::write_policy_entries(policy_dir, &analysis.cache_policy_entries).await?;
+        allow.commit(&analysis.cache_policy_entries);
     }
     drop(work.policy_ready.take());
     work.cell
@@ -5117,63 +4851,6 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
         );
     }
     Ok(())
-}
-
-/// Leave this build's compile observations in the miss journal a plain
-/// `cargo build` writes, and kick the detached drain that posts the
-/// admission — `stow build` returns as soon as cargo does (stow#317).
-fn journal_and_drain_misses(
-    project: &ProjectContext,
-    cargo_args: &[OsString],
-    current_dir: &Path,
-    observations: &[crate::artifact_cache::ObservedUnit],
-    inexact_entries: &[DependencyGraphEntry],
-    report_due: bool,
-) {
-    let facts = &project.facts;
-    let target_dir = resolved_target_dir(facts, &project.env, cargo_args, current_dir);
-    // The drain mints each miss's dependency subgraph off the build's
-    // persisted expanded graph when it can load it, and off the
-    // journal's context sidecar when it cannot (stow#588).
-    let expanded_cache_key = crate::lockfile_graph_cache::cache_key(facts, &project.env)
-        .unwrap_or_else(|error| {
-            tracing::warn!(error = %error, "could not key the expanded graph for the miss journal");
-            String::new()
-        });
-    let key_inputs = crate::lockfile_graph_cache::KeyInputs {
-        action: &facts.action,
-        cargo_args: &facts.cargo_args,
-        current_dir: &facts.current_dir,
-        manifest_path: &facts.manifest_path,
-        workspace_root: &facts.workspace_root,
-        target: &facts.target,
-        target_given: facts.target_given,
-        rustc_version: &facts.rustc_version,
-        env: &project.env,
-    };
-    let consumer = crate::miss_journal::JournalConsumer {
-        manifest_dir: facts
-            .manifest_path
-            .parent()
-            .unwrap_or(facts.current_dir.as_path()),
-        key: &key_inputs,
-    };
-    crate::miss_journal::journal_supervised(
-        project.build_rustc.executable(),
-        &consumer,
-        observations,
-        &target_dir,
-        &expanded_cache_key,
-        inexact_entries,
-    );
-    // An all-hit build leaves no journal for `spawn_drain` to find;
-    // a due usage report forces the spawn so the day's deltas still
-    // leave the machine through the detached lane (stow#889).
-    if report_due {
-        crate::miss_journal::spawn_drain_unconditional(&target_dir);
-    } else {
-        crate::miss_journal::spawn_drain(&target_dir);
-    }
 }
 
 /// The `PrefetchArtifactRow`s `STOW_PREFETCH_ARTIFACTS_PATH`'s file
@@ -5576,7 +5253,6 @@ mod tests {
             facts: project_facts(),
             env: SessionEnv::of_this_process().expect("the test process's environment"),
             mold: MoldSelection::resolved(Vec::new()),
-            env_base: None,
             // These tests assemble no supervisor, so nothing awaits it.
             toolchain: super::pending_toolchain(),
             build_rustc: crate::rustc_args::BuildRustc::ToolchainDefault,
@@ -5862,7 +5538,6 @@ mod tests {
                 semantic_fallback_enabled: false,
                 covered_units: 0,
                 isolation: &crate::isolation::Isolation::off(),
-                slices: &crate::index::SliceFetches::default(),
             };
             super::cargo_command(&plan).await
         });
@@ -6509,14 +6184,12 @@ mod tests {
             deferred_analysis: false,
             covered_units: ledger.len(),
             isolation: &crate::isolation::Isolation::off(),
-            slices: &crate::index::SliceFetches::default(),
         };
         let mut envs = Vec::new();
         smol::block_on(super::export_wrapper_env(
             &mut envs,
             &plan,
             &wrappers,
-            None,
             cache.path(),
         ))
         .expect("export wrapper env");

@@ -21,7 +21,7 @@ use crate::verify;
 // edge, so the cost of another one in flight is a stream, not a socket.
 const PREFETCH_CONCURRENCY: usize = 32;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct PrefetchArtifact {
     pub crate_name: String,
     pub c_metadata: String,

@@ -8223,6 +8223,7 @@ dependencies = [
  "flate2",
  "futures-lite",
  "futures-util",
+ "getrandom 0.4.3",
  "gix",
  "glob",
  "heel",

@@ -474,7 +474,8 @@ enum Outcome {
 /// The bookkeeping that only exists once a real rustc has run: the stable
 /// aliases, the output metadata, and the local cache entry this build's
 /// own outputs become for the next one.
-struct PostCompile {
+#[derive(Debug)]
+pub struct PostCompile {
     /// `None` for an invocation stow could not parse — a probe, or a rustc
     /// command line it does not understand. There is nothing to record.
     parsed: Option<rustc_args::ParsedRustcArgs>,
@@ -833,9 +834,13 @@ fn wrapped_crate_name(args: &[OsString]) -> Option<String> {
 /// from the environment it actually inherits.
 #[derive(Debug, Default)]
 pub(crate) struct BuildContext {
-    /// `STOW_CACHE_POLICY_PATH`: the per-build directory the allow markers
-    /// and the local-build provenance markers live under.
-    pub(crate) policy_dir: Option<PathBuf>,
+    /// The build's session directory, which the local-build provenance
+    /// markers live under. `None` records and refuses nothing: there is no
+    /// build to reason about.
+    pub(crate) marks_dir: Option<PathBuf>,
+    /// The crates the build's analysis marked as worth a public lookup.
+    /// `None` is "no policy": every unit is allowed.
+    pub(crate) allowed: Option<cache_policy::AllowSet>,
     /// `STOW_PUBLIC_CACHE_TARGET`: the consumer target the driver told
     /// its wrappers they build for — a fallback for invocations that do
     /// not spell `--target`.
@@ -920,7 +925,7 @@ impl BuildContext {
 /// The source map a build classifies registry slots against (stow#1006):
 /// only crates.io packages may carry a crates.io identity — every other
 /// registry's package is [`UncachedReason::NonCratesIoRegistry`].
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) enum RegistrySources {
     /// The `(package, version)` → registry-source map `Cargo.lock`
     /// records — a supervised build's authoritative answer, but read
@@ -931,7 +936,9 @@ pub(crate) enum RegistrySources {
     /// directory classifies correctly.
     Lockfile {
         /// `(package, version)` → the registry `SourceId`s the lockfile
-        /// records for it.
+        /// records for it. A JSON object cannot key on a pair, so it
+        /// travels as a list of entries.
+        #[serde(with = "pairs")]
         sources: std::collections::BTreeMap<
             (String, String),
             std::collections::BTreeSet<cargo_lock::package::SourceId>,
@@ -1060,6 +1067,34 @@ impl RegistrySources {
             }
             Self::CargoConfig(hosts) => index_dir_in_hosts(index_dir, hosts),
         }
+    }
+}
+
+/// A map serialized as a list of `(key, value)` entries, for keys JSON
+/// cannot spell as object names.
+mod pairs {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S, K, V>(map: &BTreeMap<K, V>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        K: serde::Serialize,
+        V: serde::Serialize,
+    {
+        serializer.collect_seq(map)
+    }
+
+    pub fn deserialize<'de, D, K, V>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+    where
+        D: Deserializer<'de>,
+        K: Deserialize<'de> + Ord,
+        V: Deserialize<'de>,
+    {
+        Ok(Vec::<(K, V)>::deserialize(deserializer)?
+            .into_iter()
+            .collect())
     }
 }
 
@@ -1275,7 +1310,8 @@ impl BuildContext {
             )
         });
         Ok(Self {
-            policy_dir: cache_policy::policy_dir(),
+            marks_dir: None,
+            allowed: None,
             public_cache_target: std::env::var(rustc_args::STOW_PUBLIC_CACHE_TARGET_ENV)
                 .ok()
                 .filter(|target| !target.trim().is_empty()),
@@ -1366,344 +1402,6 @@ pub(crate) fn prefetch_candidate_c_metadatas(
     candidates
 }
 
-/// The build's supervisor: it answers every facade this build spawns.
-///
-/// It holds no state of its own yet — the decision path reads the config
-/// from the environment blob the parent already resolved — but it is the
-/// process boundary that matters: every edge request for the whole build
-/// now happens here, over one pooled connection.
-/// The build's supervisor, plus the compile observations it collects:
-/// every locally-compiled registry unit lands here at the identity its
-/// rustc invocation actually used. `run_cargo` mints the build's misses
-/// from this list once cargo finishes — the observations are the build's
-/// own, in memory, and die with it (stow#317).
-#[derive(Debug)]
-pub(crate) struct BuildSupervisor {
-    /// The build-scoped wrapper environment memo — one config load,
-    /// rustc probe pair and cache lease for the whole build.
-    env_cache: WrapperEnvCache,
-    /// The build facts `run_cargo` resolved before cargo started — the
-    /// policy dir, the expanded graph, the prefetch candidates — which
-    /// this process's environment never carried.
-    ctx: BuildContext,
-    /// Completed by the first facade frame that describes a real
-    /// compile unit — the boundary after which the enrichment's own
-    /// cargo may take the package-cache lock without holding the real
-    /// cargo back (stow#608).
-    resolution_done: ResolutionDone,
-    observations: std::sync::Mutex<Vec<artifact_cache::ObservedUnit>>,
-    /// The directories cargo builds into — where the compiler outputs
-    /// the wrappers report, and the `--out-dir` of every request, must
-    /// live. Unknown until the driver tells it; unknown ones refuse every
-    /// report and every request naming an output directory.
-    output_roots: Option<supervisor::invocation::OutputRoots>,
-    /// What a refused request does to the build, chosen where the
-    /// supervisor is built.
-    refusal_policy: supervisor::invocation::RefusalPolicy,
-    /// The requests this build refused under `FailBuild`; `run_cargo`
-    /// fails the build on them once cargo has exited. Empty under
-    /// `CompileUncached`.
-    refusals: std::sync::Mutex<Vec<supervisor::invocation::Refusal>>,
-}
-
-impl BuildSupervisor {
-    /// The build's target and build directories, as cargo resolves them.
-    #[must_use]
-    pub(crate) fn with_output_roots(mut self, roots: supervisor::invocation::OutputRoots) -> Self {
-        self.output_roots = Some(roots);
-        self
-    }
-
-    /// A supervisor that owns the build's resolved context rather than
-    /// rediscovering it per invocation. `toolchain` is the build's rustc
-    /// as the driver resolved it before cargo spawned: every rustc fact
-    /// the supervisor uses comes from it, and a request's executable is
-    /// only compared against it. `base` is the wrapper environment built
-    /// on that toolchain, also before cargo spawned (stow#608); `None`
-    /// bypasses the cache for the whole build. `config` is the driver's
-    /// resolved config, with the run's cache-layer flags and state
-    /// database (stow#682, stow#1007).
-    pub(crate) fn new(
-        ctx: BuildContext,
-        config: Option<StowConfig>,
-        toolchain: std::sync::Arc<toolchain::BuildToolchain>,
-        base: Option<std::sync::Arc<WrapperEnvBase>>,
-        resolution_done: ResolutionDone,
-        refusal_policy: supervisor::invocation::RefusalPolicy,
-    ) -> Self {
-        Self {
-            env_cache: WrapperEnvCache::for_build(config, toolchain, base),
-            ctx,
-            resolution_done,
-            observations: std::sync::Mutex::default(),
-            output_roots: None,
-            refusal_policy,
-            refusals: std::sync::Mutex::default(),
-        }
-    }
-
-    /// Fail the build if the supervisor refused any request, naming the
-    /// field of each.
-    ///
-    /// # Errors
-    ///
-    /// One error listing every refusal, in the order they arrived.
-    pub(crate) fn ensure_no_refusals(&self) -> stow_types::error::Result<()> {
-        let refusals = self.refusals.lock().expect("refusals mutex").clone();
-        if refusals.is_empty() {
-            return Ok(());
-        }
-        let refused = refusals
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ");
-        Err(stow_types::stow_error!(
-            "the build supervisor refused {} request(s): {refused}",
-            refusals.len()
-        ))
-    }
-
-    /// The build's circuit handle — shared with the enrichment so its
-    /// index-fetch outage trips the breaker the plan path reads and the
-    /// broadcast in-flight downloads abandon on (stow#977).
-    pub(crate) fn circuit(&self) -> circuit::BuildCircuit {
-        self.env_cache.circuit.clone()
-    }
-
-    /// Every unit this build compiled locally, in compile order.
-    pub(crate) fn observations(&self) -> Vec<artifact_cache::ObservedUnit> {
-        self.observations
-            .lock()
-            .expect("observations mutex")
-            .clone()
-    }
-
-    /// `compiled` and the observed report finish the same way: resolve the
-    /// build's own outputs, then mint its miss observation.
-    async fn finish_and_observe(
-        &self,
-        post: &PostCompile,
-        success: bool,
-        local_base: Option<&WrapperEnvBase>,
-    ) {
-        if let Ok(Some(build)) =
-            finish_rustc_compile(post, success, local_base, &self.env_cache, &self.ctx).await
-            && let Some(parsed) = post.parsed.as_ref()
-            && let Some(unit) = miss_journal::observed_unit(parsed, &build)
-        {
-            // The unit compiled locally: it is a cache miss by
-            // definition, so the build records it for the post-build
-            // admissions post (stow#317).
-            self.observations
-                .lock()
-                .expect("observations mutex")
-                .push(unit);
-        }
-    }
-}
-
-impl supervisor::server::Handler for BuildSupervisor {
-    type Pending = Box<PostCompile>;
-
-    fn cc_config(self: &std::sync::Arc<Self>) -> Option<&StowConfig> {
-        self.env_cache.config()
-    }
-
-    fn output_roots(self: &std::sync::Arc<Self>) -> Option<&supervisor::invocation::OutputRoots> {
-        self.output_roots.as_ref()
-    }
-
-    async fn plan(
-        self: &std::sync::Arc<Self>,
-        invocation: supervisor::invocation::VerifiedInvocation,
-        invocation_env: supervisor::protocol::InvocationEnv,
-    ) -> supervisor::server::Decision<Self::Pending> {
-        let args = invocation.into_args();
-        let classified = classify_invocation(&args);
-        if !self.resolution_done.has_completed() && describes_compile_unit(&classified) {
-            self.resolution_done.complete();
-        }
-        let Some(parsed) = classify_or_log(classified, &args) else {
-            return supervisor::server::Decision::Compile(Box::new(PostCompile::raw()));
-        };
-        if self.serve_map_rules_out(&parsed).await {
-            // The map ruled the unit out: no lookup runs, so nothing
-            // before the compile waits on a dependency's records either.
-            // The marker is the one a `Compile` decision writes before
-            // rustc runs, for the reason `compile` states.
-            let target = parsed
-                .target
-                .clone()
-                .unwrap_or_else(|| self.env_cache.toolchain.host_target().to_owned());
-            record_local_build_mark(&parsed, &target, self.ctx.policy_dir.as_deref()).await;
-            return supervisor::server::Decision::Compile(Box::new(PostCompile {
-                parsed: Some(parsed),
-                env: invocation_env,
-                compile_time: std::time::Duration::ZERO,
-                owes_miss: true,
-            }));
-        }
-        // Every lookup the decision makes reads the `--extern`
-        // dependencies' `materialized_outputs` rows, and a facade exits
-        // with its rustc: a dependency cargo finished before starting
-        // this unit may still be writing them. Wait for the ones whose
-        // rustc has exited — not for one still compiling, which a
-        // pipelined unit plans against unrecorded, as it always did
-        // (stow#1431). The dependency's flight also spans its store,
-        // which `load_cached_bundle_by_compile_key` in the serve binding
-        // reads from the dependent's plan.
-        self.ctx.in_flight.wait_for_exited_externs(&parsed).await;
-        match decide_rustc_invocation(parsed, &self.env_cache, &self.ctx, &invocation_env).await {
-            Outcome::Served(notifications) => supervisor::server::Decision::Served(notifications),
-            Outcome::Compile(post) => supervisor::server::Decision::Compile(post),
-        }
-    }
-
-    async fn compiled(
-        self: &std::sync::Arc<Self>,
-        mut pending: Self::Pending,
-        success: bool,
-        compile_time: std::time::Duration,
-    ) {
-        pending.compile_time = compile_time;
-        if pending.owes_miss {
-            self.report_uncovered(pending, success).await;
-            return;
-        }
-        let local_base = self.env_cache.base().await;
-        self.finish_and_observe(&pending, success, local_base.as_deref())
-            .await;
-    }
-
-    fn toolchain(self: &std::sync::Arc<Self>) -> &std::sync::Arc<toolchain::BuildToolchain> {
-        &self.env_cache.toolchain
-    }
-
-    fn refusal_policy(self: &std::sync::Arc<Self>) -> supervisor::invocation::RefusalPolicy {
-        self.refusal_policy
-    }
-
-    fn refused(self: &std::sync::Arc<Self>, refusal: supervisor::invocation::Refusal) {
-        self.refusals.lock().expect("refusals mutex").push(refusal);
-    }
-}
-
-impl BuildSupervisor {
-    /// Whether the build's serve map rules `parsed` out before any lookup:
-    /// a registry unit nothing in the build could serve. A pending map's
-    /// "not covered" is provisional while the build's fetch is in flight,
-    /// so the plan holds, bounded, for the final map rather than compile a
-    /// unit the fetch is about to cover (stow#347, stow#788). A build with
-    /// no map, every cache layer off and the identity trace — which wants
-    /// the full decision's probes — never rule a unit out.
-    async fn serve_map_rules_out(&self, parsed: &rustc_args::ParsedRustcArgs) -> bool {
-        if self.ctx.cache.is_off()
-            || self
-                .env_cache
-                .config()
-                .is_some_and(|config| config.switches.identity_trace.is_some())
-        {
-            return false;
-        }
-        let Some(mut map) = self.ctx.serve_map.current() else {
-            return false;
-        };
-        let Some((crate_name, version)) = registry_unit_identity(parsed) else {
-            return false;
-        };
-        let Ok(version) = semver::Version::parse(&version) else {
-            return false;
-        };
-        let name = canonical_crate_name(&crate_name);
-        let version = version.to_string();
-        let covered =
-            |map: &crate::facade::ServeMap| map.covers(parsed.target.is_some(), &name, &version);
-        if covered(&map) {
-            return false;
-        }
-        if map.pending {
-            if tokio::time::timeout(
-                crate::facade::SERVE_MAP_WAIT_TIMEOUT,
-                self.ctx.serve_map_ready.wait(),
-            )
-            .await
-            .is_err()
-            {
-                // A driver that is alive but stuck: decide on the map in
-                // hand.
-                tracing::warn!(
-                    crate_name = %parsed.crate_name,
-                    "the pending serve map did not settle in time; deciding on the map in hand"
-                );
-            }
-            let Some(settled) = self.ctx.serve_map.current() else {
-                return false;
-            };
-            map = settled;
-            if covered(&map) {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// The bookkeeping of a compile the serve map ruled out: the miss
-    /// outcome a lookup would have recorded, then the same resolution of
-    /// the unit's own outputs every local compile gets.
-    async fn report_uncovered(&self, mut post: Box<PostCompile>, success: bool) {
-        let Some(local_base) = self.env_cache.base().await else {
-            return;
-        };
-        let Some(mut parsed) = post.parsed.take() else {
-            return;
-        };
-        // The mark's key is the target decide computes: the unit's own
-        // spelled `--target`, else this build's rustc host triple — the
-        // key a dependent's `must_build_locally` checks under.
-        let target = parsed
-            .target
-            .clone()
-            .unwrap_or_else(|| self.env_cache.toolchain.host_target().to_owned());
-        resolve_native_target_cpu(&mut parsed, &self.env_cache).await;
-        let source = match post.env.manifest_dir() {
-            Ok(manifest_dir) => {
-                detect_unit_source(&parsed, manifest_dir.as_deref(), &self.env_cache, &self.ctx)
-                    .await
-                    .map_err(|error| error.to_string())
-            }
-            Err(error) => Err(error),
-        };
-        match source {
-            Ok(source) => {
-                let class = parsed.unit_class(source, post.env.primary_package, &target);
-                // Only a publicly-missable unit counts: a git source or
-                // extra codegen could never have been served remotely,
-                // so its local compile is not a cache miss (stow#1006).
-                record_unit_outcome(
-                    &local_base.config,
-                    &parsed,
-                    &target,
-                    local_base.rustc_version(),
-                    UnitOutcome::Miss,
-                    class.remote_missable(),
-                )
-                .await;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    crate_name = %parsed.crate_name,
-                    "failed to detect an uncovered unit's source; miss outcome skipped"
-                );
-            }
-        }
-        post.parsed = Some(parsed);
-        self.finish_and_observe(&post, success, Some(&local_base))
-            .await;
-    }
-}
-
 /// A duration in whole milliseconds, the unit the cache records compile time
 /// in.
 pub(crate) fn duration_millis(duration: std::time::Duration) -> u64 {
@@ -1723,22 +1421,27 @@ async fn run_rustc_wrapper(
     mut command: WrapperCommandArgs,
     state_db: &StateDb,
 ) -> stow_types::error::Result<std::process::ExitStatus> {
-    // The supervising run's extra rustc arguments (workspace path remap and
-    // any flags it selected) arrive appended to the argv so the user's own
-    // rustflags sources — env or config — keep their cargo semantics.
-    command
-        .wrapped_args
-        .extend(rustc_args::extra_args_from_env()?);
-    stow_types::rustc::remap_build_output(
-        &mut command.wrapped_args,
-        std::env::var_os("OUT_DIR").as_deref(),
-    );
     // An endpoint that is set but unusable fails the build. A wrapper that
     // quietly compiled everything itself would leave a build that is
     // merely slow, which is the failure mode that hides.
-    match supervisor::from_env().map_err(|error| stow_types::stow_error!("{error}"))? {
-        Some((endpoint, token)) => delegate_to_supervisor(&endpoint, token, &command).await,
-        None => run_rustc_standalone(&command, state_db).await,
+    if let Some((endpoint, token)) =
+        supervisor::from_env().map_err(|error| stow_types::stow_error!("{error}"))?
+    {
+        delegate_to_supervisor(&endpoint, token, &command).await
+    } else {
+        // The supervising run's extra rustc arguments (workspace path
+        // remap and any flags it selected) arrive appended to the argv
+        // so the user's own rustflags sources — env or config — keep
+        // their cargo semantics. Under a supervisor the supervisor
+        // appends them itself.
+        command
+            .wrapped_args
+            .extend(rustc_args::extra_args_from_env()?);
+        stow_types::rustc::remap_build_output(
+            &mut command.wrapped_args,
+            std::env::var_os("OUT_DIR").as_deref(),
+        );
+        run_rustc_standalone(&command, state_db).await
     }
 }
 
@@ -1759,16 +1462,19 @@ async fn delegate_to_supervisor(
         served = matches!(decision, supervisor::client::Decision::Served(_)),
         "the build supervisor answered this invocation"
     );
-    if let supervisor::client::Decision::Served(notifications) = decision {
-        connection
-            .close()
-            .await
-            .map_err(|error| stow_types::stow_error!("{error}"))?;
-        write_served_artifact_notifications(&notifications)?;
-        return Ok(std::process::ExitStatus::default());
-    }
+    let (executable, args) = match decision {
+        supervisor::client::Decision::Served(notifications) => {
+            connection
+                .close()
+                .await
+                .map_err(|error| stow_types::stow_error!("{error}"))?;
+            write_served_artifact_notifications(&notifications)?;
+            return Ok(std::process::ExitStatus::default());
+        }
+        supervisor::client::Decision::Compile { executable, args } => (executable, args),
+    };
     let started = std::time::Instant::now();
-    let status = run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
+    let status = run_passthrough_status(&executable, &[], &args).await?;
     let compile_time = started.elapsed();
     connection
         .report(status.success(), compile_time)
@@ -1905,7 +1611,7 @@ async fn decide_rustc_invocation(
                     .target
                     .as_deref()
                     .or(ctx.public_cache_target.as_deref()),
-                ctx.policy_dir.as_deref(),
+                ctx.marks_dir.as_deref(),
                 invocation_env,
             )
             .await;
@@ -1924,7 +1630,7 @@ async fn decide_rustc_invocation(
                 .target
                 .as_deref()
                 .or(ctx.public_cache_target.as_deref()),
-            ctx.policy_dir.as_deref(),
+            ctx.marks_dir.as_deref(),
             invocation_env,
         )
         .await;
@@ -1937,7 +1643,7 @@ async fn decide_rustc_invocation(
                 .target
                 .as_deref()
                 .or(ctx.public_cache_target.as_deref()),
-            ctx.policy_dir.as_deref(),
+            ctx.marks_dir.as_deref(),
             invocation_env,
         )
         .await;
@@ -1954,7 +1660,7 @@ async fn decide_rustc_invocation(
             // The policy wait only exists for a public lookup — a
             // local-only unit was diverted before it (stow#788).
             let exact_public_cache_allowed = exact_public_cache_allowed(&parsed, ctx).await;
-            if must_build_locally(&parsed, &env.target, ctx.policy_dir.as_deref()) {
+            if must_build_locally(&parsed, &env.target, ctx.marks_dir.as_deref()) {
                 record_unit_outcome(
                     &env.env_base.config,
                     &parsed,
@@ -1967,7 +1673,7 @@ async fn decide_rustc_invocation(
                 return compile(
                     &parsed,
                     Some(env.target.as_str()),
-                    ctx.policy_dir.as_deref(),
+                    ctx.marks_dir.as_deref(),
                     invocation_env,
                 )
                 .await;
@@ -2044,7 +1750,7 @@ async fn exact_public_cache_allowed(
     ctx: &BuildContext,
 ) -> bool {
     let mut policy_answer = cache_policy::public_cache_allowed(
-        ctx.policy_dir.as_deref(),
+        ctx.allowed.as_ref(),
         parsed,
         ctx.public_cache_target.as_deref(),
     );
@@ -2055,7 +1761,7 @@ async fn exact_public_cache_allowed(
         )
         .await;
         policy_answer = cache_policy::public_cache_allowed(
-            ctx.policy_dir.as_deref(),
+            ctx.allowed.as_ref(),
             parsed,
             ctx.public_cache_target.as_deref(),
         );
@@ -2114,7 +1820,7 @@ async fn serve_or_compile(
             compile(
                 parsed,
                 Some(env.target.as_str()),
-                ctx.policy_dir.as_deref(),
+                ctx.marks_dir.as_deref(),
                 invocation_env,
             )
             .await
@@ -2418,18 +2124,18 @@ impl WrapperEnvCache {
         )
     }
 
-    /// A build's memo: the driver's resolved `config`, `toolchain` and
-    /// `base`, settled before cargo started. Nothing is loaded from the
-    /// environment — the closed handle fails any such load instead of
+    /// A session's memo: the build's resolved `config`, with the handles
+    /// of the process running the session, and its `toolchain`. The base
+    /// is prepared on first use under that config. Nothing is loaded from
+    /// the environment — the closed handle fails any such load instead of
     /// opening a second database.
-    fn for_build(
+    pub(crate) fn for_session(
         config: Option<StowConfig>,
         toolchain: std::sync::Arc<toolchain::BuildToolchain>,
-        base: Option<std::sync::Arc<WrapperEnvBase>>,
     ) -> Self {
         Self::with_parts(
             std::sync::OnceLock::from(config),
-            tokio::sync::OnceCell::new_with(Some(base)),
+            tokio::sync::OnceCell::new(),
             StateDb::closed(),
             toolchain,
         )
@@ -3366,7 +3072,7 @@ async fn decide_local_only(
         unreachable!("decide_local_only only runs for a keyed unit");
     };
     let target = prep.target;
-    if must_build_locally(parsed, &target, ctx.policy_dir.as_deref()) {
+    if must_build_locally(parsed, &target, ctx.marks_dir.as_deref()) {
         // A remote-missable unit records the build against stats; a
         // local-only-by-source one is never reported (stow#1006).
         record_unit_outcome(
@@ -3381,7 +3087,7 @@ async fn decide_local_only(
         return compile(
             parsed,
             Some(target.as_str()),
-            ctx.policy_dir.as_deref(),
+            ctx.marks_dir.as_deref(),
             invocation_env,
         )
         .await;
@@ -3424,7 +3130,7 @@ async fn decide_local_only(
     compile(
         parsed,
         Some(target.as_str()),
-        ctx.policy_dir.as_deref(),
+        ctx.marks_dir.as_deref(),
         invocation_env,
     )
     .await
@@ -6054,10 +5760,36 @@ mod tests {
         )
     }
 
+    /// A session over the test machine's own rustc with an empty
+    /// `BuildContext`, its directory in the returned tempdir.
+    async fn test_session(
+        resolution_done: super::ResolutionDone,
+        refusal_policy: crate::supervisor::invocation::RefusalPolicy,
+    ) -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::daemon::session::Session>,
+    ) {
+        let sessions = tempfile::tempdir().expect("sessions directory");
+        let session = crate::daemon::session::Session::from_parts_for_tests(
+            crate::daemon::session::TestParts {
+                ctx: super::BuildContext::default(),
+                env_cache: super::WrapperEnvCache::for_session(
+                    None,
+                    crate::toolchain::BuildToolchain::for_tests().await,
+                ),
+                roots: everywhere(),
+                refusal_policy,
+                resolution_done,
+            },
+            sessions.path(),
+        );
+        (sessions, session)
+    }
+
     /// An invocation of the build's own rustc, which the handler's
     /// toolchain verifies.
     async fn verified_rustc(
-        handler: &std::sync::Arc<super::BuildSupervisor>,
+        handler: &std::sync::Arc<crate::daemon::session::Session>,
         args: Vec<OsString>,
     ) -> crate::supervisor::invocation::VerifiedInvocation {
         let toolchain = crate::supervisor::server::Handler::toolchain(handler);
@@ -6429,14 +6161,11 @@ mod tests {
     #[tokio::test]
     async fn resolution_done_fires_only_on_a_compile_unit_plan() {
         let resolution_done = super::ResolutionDone::pending();
-        let handler = std::sync::Arc::new(super::BuildSupervisor::new(
-            super::BuildContext::default(),
-            None,
-            crate::toolchain::BuildToolchain::for_tests().await,
-            None,
+        let (_sessions, handler) = test_session(
             resolution_done.clone(),
             crate::supervisor::invocation::RefusalPolicy::FailBuild,
-        ));
+        )
+        .await;
 
         let _ = crate::supervisor::server::Handler::plan(
             &handler,
@@ -6491,19 +6220,15 @@ mod tests {
         resolution_done.wait().await;
     }
 
-    /// A refusal the supervisor recorded fails the build once cargo has
-    /// exited, naming the field; a build with none does not fail.
+    /// A refusal the session recorded is reported when the build ends,
+    /// naming the field, for the driver to fail the build on.
     #[tokio::test]
-    async fn a_recorded_refusal_fails_the_build_naming_the_field() {
-        let handler = std::sync::Arc::new(super::BuildSupervisor::new(
-            super::BuildContext::default(),
-            None,
-            crate::toolchain::BuildToolchain::for_tests().await,
-            None,
+    async fn a_recorded_refusal_is_reported_naming_the_field() {
+        let (_sessions, handler) = test_session(
             super::ResolutionDone::pending(),
             crate::supervisor::invocation::RefusalPolicy::FailBuild,
-        ));
-        handler.ensure_no_refusals().expect("nothing was refused");
+        )
+        .await;
 
         let toolchain = crate::supervisor::server::Handler::toolchain(&handler);
         let refusal = crate::supervisor::invocation::VerifiedInvocation::verify(
@@ -6516,10 +6241,9 @@ mod tests {
         .await
         .expect_err("another executable is refused");
         crate::supervisor::server::Handler::refused(&handler, refusal);
-        let error = handler
-            .ensure_no_refusals()
-            .expect_err("a refusal fails the build");
-        assert!(error.to_string().contains("executable"), "{error}");
+        let end = handler.end().await.expect("end the session");
+        assert_eq!(end.refusals.len(), 1, "{:?}", end.refusals);
+        assert!(end.refusals[0].contains("executable"), "{:?}", end.refusals);
     }
 
     /// Compiling uncached, the supervisor records no refusal, so the
@@ -6527,19 +6251,17 @@ mod tests {
     /// no unit to do bookkeeping for.
     #[tokio::test]
     async fn a_build_compiling_uncached_has_no_refusal_to_fail_on() {
-        let handler = std::sync::Arc::new(super::BuildSupervisor::new(
-            super::BuildContext::default(),
-            None,
-            crate::toolchain::BuildToolchain::for_tests().await,
-            None,
+        let (_sessions, handler) = test_session(
             super::ResolutionDone::pending(),
             crate::supervisor::invocation::RefusalPolicy::CompileUncached,
-        ));
+        )
+        .await;
         assert_eq!(
             crate::supervisor::server::Handler::refusal_policy(&handler),
             crate::supervisor::invocation::RefusalPolicy::CompileUncached
         );
-        handler.ensure_no_refusals().expect("nothing was recorded");
+        let end = handler.end().await.expect("end the session");
+        assert!(end.refusals.is_empty(), "nothing was recorded");
         assert!(super::PostCompile::default().parsed.is_none());
     }
 
@@ -6871,10 +6593,9 @@ mod tests {
     /// A build's `WrapperEnvCache` over the test machine's own rustc,
     /// with no config and no base.
     async fn test_cache() -> super::WrapperEnvCache {
-        super::WrapperEnvCache::for_build(
+        super::WrapperEnvCache::for_session(
             None,
             crate::toolchain::BuildToolchain::for_tests().await,
-            None,
         )
     }
 
@@ -6912,21 +6633,6 @@ mod tests {
             .expect("the env base builds over the toolchain");
         assert_eq!(base.host_target(), driver.host_target());
         assert_eq!(base.rustc_version(), driver.release());
-    }
-
-    /// A build whose driver settled no base bypasses the cache for every
-    /// invocation: the cache never prepares one of its own from a
-    /// request's spelling or the environment.
-    #[tokio::test]
-    async fn a_build_with_no_base_bypasses_the_cache() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = env_base_test_config(&dir);
-        let cache = super::WrapperEnvCache::for_build(
-            Some(config),
-            crate::toolchain::BuildToolchain::for_tests().await,
-            None,
-        );
-        assert!(cache.base().await.is_none());
     }
 
     /// An empty index under the fixture header — the slice-memo tests
@@ -7132,7 +6838,8 @@ mod tests {
         serve_map_ready: &std::sync::Arc<crate::facade::ServeMapSignal>,
     ) -> super::BuildContext {
         super::BuildContext {
-            policy_dir: None,
+            marks_dir: None,
+            allowed: None,
             public_cache_target: None,
             public_cache_disabled: false,
             cache: crate::config::CacheLayers::default(),
@@ -7539,17 +7246,18 @@ mod tests {
     /// `--extern` whose rows are still being written is a pending write,
     /// not a missing one. These tests drive the real supervisor over the
     /// real socket with `Plan` and `Compiled` frames, a real
-    /// `BuildSupervisor`, and a temp-dir cache — cargo-free end to end.
+    /// `Session`, and a temp-dir cache — cargo-free end to end.
     mod in_flight_ordering {
         use std::ffi::{OsStr, OsString};
         use std::path::Path;
         use std::sync::Arc;
         use std::time::Duration;
 
+        use crate::daemon::session::Session;
         use crate::local_socket::Endpoint;
         use crate::supervisor::protocol::{Compiled, Plan, Request, write_frame};
         use crate::supervisor::{server, server::Handler as _};
-        use crate::{AnalysisFacts, BuildContext, BuildSupervisor, WrapperEnvBase};
+        use crate::{AnalysisFacts, BuildContext};
 
         /// A `tracing` writer whose buffer the test can inspect — the
         /// assertions on what the post-compile logged read it back.
@@ -7707,16 +7415,15 @@ mod tests {
             .expect("write rmeta");
         }
 
-        /// A `BuildSupervisor` whose bases for the `rustc` spelling the
-        /// fixture's frames carry are already memoized with a temp-dir
-        /// config — the cells are set, so `observed` and `plan` never
-        /// touch the process environment or probe a toolchain.
+        /// A `Session` over a temp-dir config and the fixture's
+        /// toolchain facts, so `observed` and `plan` never touch the
+        /// process environment or probe a toolchain.
         async fn fixture(
             root: &Path,
         ) -> (
             crate::config::StowConfig,
             server::InFlightUnits,
-            Arc<BuildSupervisor>,
+            Arc<Session>,
         ) {
             fixture_covering(root, &[]).await
         }
@@ -7743,7 +7450,7 @@ mod tests {
         ) -> (
             crate::config::StowConfig,
             server::InFlightUnits,
-            Arc<BuildSupervisor>,
+            Arc<Session>,
         ) {
             fixture_ctx(root, |in_flight| {
                 build_ctx(in_flight, serve_map_covering(covered), None)
@@ -7757,11 +7464,12 @@ mod tests {
         fn build_ctx(
             in_flight: &server::InFlightUnits,
             serve_map: crate::facade::ServeMapView,
-            policy_dir: Option<std::path::PathBuf>,
+            marks_dir: Option<std::path::PathBuf>,
         ) -> BuildContext {
             BuildContext {
                 serve_map,
-                policy_dir,
+                marks_dir,
+                allowed: None,
                 public_cache_target: Some(HOST_TARGET.to_owned()),
                 public_cache_disabled: false,
                 cache: crate::config::CacheLayers::default(),
@@ -7788,7 +7496,7 @@ mod tests {
         ) -> (
             crate::config::StowConfig,
             server::InFlightUnits,
-            Arc<BuildSupervisor>,
+            Arc<Session>,
         ) {
             let config = test_config(root);
             config.ensure_dirs().await.expect("ensure cache dirs");
@@ -7797,25 +7505,18 @@ mod tests {
             let toolchain =
                 crate::toolchain::BuildToolchain::for_tests_with_facts(HOST_TARGET, RUSTC_VERSION)
                     .await;
-            let base = Arc::new(WrapperEnvBase {
-                toolchain: Arc::clone(&toolchain),
-                config: config.clone(),
-                _version_lease: crate::prepare_local_cache(&config, RUSTC_VERSION)
-                    .await
-                    .expect("prepare local cache"),
-            });
             let in_flight = server::InFlightUnits::default();
-            let env_cache =
-                crate::WrapperEnvCache::for_build(Some(config.clone()), toolchain, Some(base));
-            let handler = Arc::new(BuildSupervisor {
-                env_cache,
-                ctx: ctx(&in_flight),
-                observations: std::sync::Mutex::new(Vec::new()),
-                resolution_done: crate::ResolutionDone::pending(),
-                output_roots: Some(super::everywhere()),
-                refusal_policy: crate::supervisor::invocation::RefusalPolicy::FailBuild,
-                refusals: std::sync::Mutex::new(Vec::new()),
-            });
+            let env_cache = crate::WrapperEnvCache::for_session(Some(config.clone()), toolchain);
+            let handler = crate::daemon::session::Session::from_parts_for_tests(
+                crate::daemon::session::TestParts {
+                    env_cache,
+                    ctx: ctx(&in_flight),
+                    resolution_done: crate::ResolutionDone::pending(),
+                    roots: super::everywhere(),
+                    refusal_policy: crate::supervisor::invocation::RefusalPolicy::FailBuild,
+                },
+                &root.join("sessions"),
+            );
             (config, in_flight, handler)
         }
 
@@ -7862,9 +7563,11 @@ mod tests {
                 crate::supervisor::protocol::read_frame(&mut *stream)
                     .await
                     .expect("read the plan's answer");
-            assert_eq!(
-                answer,
-                Some(crate::supervisor::protocol::Answer::Compile),
+            assert!(
+                matches!(
+                    answer,
+                    Some(crate::supervisor::protocol::Answer::Compile(_))
+                ),
                 "a unit the serve map rules out is told to compile"
             );
         }
@@ -7937,16 +7640,18 @@ mod tests {
         /// the policy directory is seeded empty and the enrichment still
         /// owes it the coarse allow commit (stow#788).
         fn pending_policy_ctx(
-            policy_dir: std::path::PathBuf,
+            marks_dir: std::path::PathBuf,
+            allowed: crate::cache_policy::AllowSet,
             ready: &Arc<crate::facade::ServeMapSignal>,
             in_flight: &server::InFlightUnits,
         ) -> BuildContext {
             BuildContext {
+                allowed: Some(allowed),
                 policy_ready: std::sync::Arc::clone(ready),
                 ..build_ctx(
                     in_flight,
                     crate::facade::ServeMapView::absent(),
-                    Some(policy_dir),
+                    Some(marks_dir),
                 )
             }
         }
@@ -7962,11 +7667,12 @@ mod tests {
             let out_dir = tempdir.path().join("deps");
             std::fs::create_dir_all(&out_dir).expect("create deps dir");
             let registry_src = tempdir.path().join("cargo_home/registry/src");
-            let policy_dir = tempdir.path().join("policy");
-            std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+            let marks_dir = tempdir.path().join("marks");
+            std::fs::create_dir_all(&marks_dir).expect("create marks dir");
             let policy_ready = Arc::new(crate::facade::ServeMapSignal::pending());
+            let (allow, allowed) = crate::cache_policy::allow_cell(&[]);
             let (config, _in_flight, handler) = fixture_ctx(tempdir.path(), |in_flight| {
-                pending_policy_ctx(policy_dir.clone(), &policy_ready, in_flight)
+                pending_policy_ctx(marks_dir.clone(), allowed, &policy_ready, in_flight)
             })
             .await;
             // The build's slice carries no row for the unit: the exact
@@ -8000,17 +7706,12 @@ mod tests {
             // commit: from here only the commit can answer it.
             policy_ready.parked(1).await;
 
-            // The enrichment's commit: the marker lands, then the latch
+            // The enrichment's commit: the entry lands, then the latch
             // releases — the order `run_build_enrichment` writes it.
-            crate::cache_policy::write_policy_entries(
-                &policy_dir,
-                &[crate::cache_policy::CachePolicyEntry {
-                    target: HOST_TARGET.to_owned(),
-                    crate_name: "demo".to_owned(),
-                }],
-            )
-            .await
-            .expect("write the allow marker");
+            allow.commit(&[crate::cache_policy::CachePolicyEntry {
+                target: HOST_TARGET.to_owned(),
+                crate_name: "demo".to_owned(),
+            }]);
             policy_ready.complete();
 
             let decision = deciding.await.expect("join the plan");
@@ -8041,7 +7742,7 @@ mod tests {
             let dependent = crate::rustc_args::ParsedRustcArgs::parse(&dependent_args)
                 .expect("parse dependent");
             assert!(
-                !crate::must_build_locally(&dependent, HOST_TARGET, Some(&policy_dir)),
+                !crate::must_build_locally(&dependent, HOST_TARGET, Some(&marks_dir)),
                 "a served dependency must not start the local-build cascade"
             );
         }
@@ -8055,11 +7756,12 @@ mod tests {
             let out_dir = tempdir.path().join("deps");
             std::fs::create_dir_all(&out_dir).expect("create deps dir");
             let registry_src = tempdir.path().join("cargo_home/registry/src");
-            let policy_dir = tempdir.path().join("policy");
-            std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+            let marks_dir = tempdir.path().join("marks");
+            std::fs::create_dir_all(&marks_dir).expect("create marks dir");
             let policy_ready = Arc::new(crate::facade::ServeMapSignal::pending());
+            let (_allow, allowed) = crate::cache_policy::allow_cell(&[]);
             let (_config, _in_flight, handler) = fixture_ctx(tempdir.path(), |in_flight| {
-                pending_policy_ctx(policy_dir.clone(), &policy_ready, in_flight)
+                pending_policy_ctx(marks_dir.clone(), allowed, &policy_ready, in_flight)
             })
             .await;
             let args = unit_args(&registry_src, &out_dir, "demo", "1.0.0", "demometa", &[]);
@@ -8376,7 +8078,7 @@ mod tests {
                 "topmeta",
                 &[("mid", &mid_rlib)],
             );
-            let plan_top = |handler: &Arc<BuildSupervisor>| {
+            let plan_top = |handler: &Arc<Session>| {
                 let handler = Arc::clone(handler);
                 let args = top_args.clone();
                 tokio::spawn(async move {

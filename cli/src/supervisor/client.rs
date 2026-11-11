@@ -32,9 +32,15 @@ pub enum Decision {
     /// artifact-notification lines cargo is owed to this process's
     /// stderr (stow#633).
     Served(ArtifactNotifications),
-    /// Run the real rustc, then call [`Connection::report`] with its
-    /// outcome on this connection.
-    Compile,
+    /// Run exactly this command — the build's own arguments are already in
+    /// it — then call [`Connection::report`] with its outcome on this
+    /// connection.
+    Compile {
+        /// The executable to run.
+        executable: OsString,
+        /// Its arguments.
+        args: Vec<OsString>,
+    },
 }
 
 /// The transport a [`Connection`] speaks: the build's own socket, or a
@@ -108,7 +114,10 @@ impl Connection {
         );
         match self.exchange(&Request::Plan(plan)).await? {
             Answer::Served(notifications) => Ok(Decision::Served(notifications)),
-            Answer::Compile => Ok(Decision::Compile),
+            Answer::Compile(command) => Ok(Decision::Compile {
+                executable: command.executable()?,
+                args: command.args()?,
+            }),
             Answer::Received | Answer::CcHit { .. } | Answer::CcMiss => {
                 Err("supervisor answered a plan with an answer that is not a decision".to_owned())
             }
@@ -136,7 +145,7 @@ impl Connection {
                 .map_err(|error| format!("supervisor named an undecodable object path: {error}")),
             Answer::CcMiss => Ok(CcDecision::Miss),
             Answer::Failed { message } => Ok(CcDecision::Bypass(message)),
-            Answer::Served(..) | Answer::Compile | Answer::Received => Err(
+            Answer::Served(..) | Answer::Compile(_) | Answer::Received => Err(
                 "supervisor answered a C/C++ lookup with an answer that is not a cache decision"
                     .to_owned(),
             ),
@@ -168,7 +177,7 @@ impl Connection {
         match self.exchange(&Request::CcCompiled(report)).await? {
             Answer::Received => Ok(None),
             Answer::Failed { message } => Ok(Some(message)),
-            Answer::Served(..) | Answer::Compile | Answer::CcHit { .. } | Answer::CcMiss => {
+            Answer::Served(..) | Answer::Compile(_) | Answer::CcHit { .. } | Answer::CcMiss => {
                 Err("supervisor answered a C/C++ report with a lookup answer".to_owned())
             }
         }
@@ -195,7 +204,7 @@ impl Connection {
         match self.exchange(&Request::Compiled(report)).await? {
             Answer::Received => Ok(()),
             Answer::Failed { message } => Err(message),
-            Answer::Served(..) | Answer::Compile | Answer::CcHit { .. } | Answer::CcMiss => {
+            Answer::Served(..) | Answer::Compile(_) | Answer::CcHit { .. } | Answer::CcMiss => {
                 Err("supervisor answered a report with a plan answer".to_owned())
             }
         }
