@@ -154,6 +154,22 @@ credentials are unreachable). An explicit `protect` on Windows still fails and
 is never replaced by `strict`. No level falls back to
 another. A sandbox that cannot be set up fails the command.
 
+### What isolation does not guarantee
+
+Isolation is best effort, not an absolute guarantee. Where confinement and
+a working build conflict, stow keeps the build working: `protect` is a
+denylist over an otherwise open machine, and code a build runs can still
+read and write everything the lists do not name.
+
+One weakness is known. The local cache is shared by every project a user
+builds, and what it stores for a crate is whatever the build left in the
+target directory. A build script or proc macro can therefore alter the
+artifact stored for another crate of the same build, and a later build of
+any project that needs that crate at the same identity reuses it — at any
+isolation level, `off` included. The public cache is not affected: it
+holds only artifacts built and signed by stow's CI. `stow clean` removes
+every locally stored artifact. This may be closed in a later release.
+
 ## `stow predict`
 
 Read-only cache-coverage analysis. It posts nothing and enqueues nothing:
