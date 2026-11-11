@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/water-rs/stow/compare/stow-cli-v0.15.1...stow-cli-v0.16.0) - 2026-11-11
+
+### Added
+
+- *(cli)* add the per-user daemon, its single-instance start path and the macOS login trigger ([#1437](https://github.com/water-rs/stow/pull/1437))
+
+### Fixed
+
+- *(cli)* never replace a served output that already holds its bytes ([#1462](https://github.com/water-rs/stow/pull/1462))
+- *(cli)* retry a bundle download the edge cut short ([#1461](https://github.com/water-rs/stow/pull/1461))
+- *(cli)* resolve a build's toolchain once and check requests against it ([#1451](https://github.com/water-rs/stow/pull/1451))
+- *(cli)* place a served output by rename, not remove-then-create ([#1447](https://github.com/water-rs/stow/pull/1447))
+- *(cli)* keep the state database out of the sandboxed C wrapper ([#1445](https://github.com/water-rs/stow/pull/1445))
+- *(cli)* say why a sandboxed cargo could not be executed ([#1441](https://github.com/water-rs/stow/pull/1441)) ([#1443](https://github.com/water-rs/stow/pull/1443))
+- *(cli)* print why each errored unit was not served ([#1439](https://github.com/water-rs/stow/pull/1439)) ([#1440](https://github.com/water-rs/stow/pull/1440))
+- *(cli)* answer a compile report with a receipt and run its bookkeeping after the facade exits ([#1434](https://github.com/water-rs/stow/pull/1434))
+- move to heel 0.9.7 so build scripts can canonicalize on Windows ([#1424](https://github.com/water-rs/stow/pull/1424))
+- *(ci)* give a cross MSVC task its target's linker environment ([#1423](https://github.com/water-rs/stow/pull/1423))
+
+### Other
+
+- *(cli)* commit the git-checkout fixture under the ambient signing setting ([#1429](https://github.com/water-rs/stow/pull/1429))
+
 ## [0.15.1](https://github.com/water-rs/stow/compare/stow-cli-v0.15.0...stow-cli-v0.15.1) - 2026-11-10
 
 ### Other

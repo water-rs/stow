@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/water-rs/stow/compare/stow-types-v0.15.1...stow-types-v0.16.0) - 2026-11-11
+
+### Fixed
+
+- *(ci)* serve a build only from the nodes its task pins ([#1416](https://github.com/water-rs/stow/pull/1416))
+- *(admin)* repeat the preheat cost resubmit until a pass inserts nothing ([#1408](https://github.com/water-rs/stow/pull/1408))
+
+### Other
+
+- *(types)* [**breaking**] move the preheat cost report into stow-admin ([#1436](https://github.com/water-rs/stow/pull/1436))
+
 ## [0.15.0](https://github.com/water-rs/stow/compare/stow-types-v0.14.0...stow-types-v0.15.0) - 2026-11-10
 
 ### Added
