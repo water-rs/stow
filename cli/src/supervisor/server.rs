@@ -85,10 +85,11 @@ pub trait Handler: Send + Sync + 'static {
         None
     }
 
-    /// The build's target directory: the only place a compiler output a
-    /// wrapper reports may live. `None` — the default — when the handler
-    /// does not know one, which refuses every report.
-    fn cc_target_dir(self: &Arc<Self>) -> Option<&std::path::Path> {
+    /// The build's output roots: the only places a compiler output a
+    /// wrapper reports, or an `--out-dir` it names, may live. `None` — the
+    /// default — when the handler does not know them, which refuses every
+    /// report and every request that names an output directory.
+    fn output_roots(self: &Arc<Self>) -> Option<&super::invocation::OutputRoots> {
         None
     }
 
@@ -923,12 +924,12 @@ async fn answer_cc_compiled<H: Handler>(
         // The path is the wrapper's word and this process is not
         // sandboxed: the file is opened and checked as one descriptor,
         // and staged from it, so a refused path is never read.
-        let Some(root) = handler.cc_target_dir().map(std::path::Path::to_path_buf) else {
+        let Some(roots) = handler.output_roots().map(|roots| roots.dirs().to_vec()) else {
             return refuse_cc_output(&output_path, "the build's target directory is unknown");
         };
         let opened = {
             let output_path = output_path.clone();
-            smol::unblock(move || crate::cc::open_reported_output(&output_path, &root)).await
+            smol::unblock(move || crate::cc::open_reported_output(&output_path, &roots)).await
         };
         let source = match opened {
             Ok(source) => source,
@@ -1012,7 +1013,15 @@ async fn answer_plan<H: Handler>(
             return Answer::Failed { message: error };
         }
     };
-    let invocation = match VerifiedInvocation::verify(handler.toolchain(), executable, args).await {
+    let invocation = match VerifiedInvocation::verify(
+        handler.toolchain(),
+        handler.output_roots(),
+        executable,
+        args,
+        &plan.env,
+    )
+    .await
+    {
         Ok(invocation) => invocation,
         Err(refusal) => {
             return match settle_refusal(handler, refusal, "plan request") {
@@ -1119,7 +1128,15 @@ async fn answer_observation<H: Handler>(
         tracing::warn!("supervisor observation could not be decoded; dropped");
         return Reply::nothing();
     };
-    let invocation = match VerifiedInvocation::verify(handler.toolchain(), executable, args).await {
+    let invocation = match VerifiedInvocation::verify(
+        handler.toolchain(),
+        handler.output_roots(),
+        executable,
+        args,
+        &observed.env,
+    )
+    .await
+    {
         Ok(invocation) => invocation,
         Err(refusal) => {
             // A report is answered with the refusal and a mark has no
@@ -1238,10 +1255,20 @@ mod tests {
         std::env::current_exe().expect("current exe")
     }
 
+    /// Output roots that contain every path: the fixtures name an
+    /// `--out-dir` that is no real build's.
+    fn everywhere() -> crate::supervisor::invocation::OutputRoots {
+        crate::supervisor::invocation::OutputRoots::new(
+            std::path::PathBuf::from(std::path::MAIN_SEPARATOR_STR),
+            None,
+        )
+    }
+
     /// Serves anything whose first argument is `--serve-me`, asks for a
     /// compile otherwise, and counts the reports it receives.
     struct Stub {
         reports: AtomicUsize,
+        roots: crate::supervisor::invocation::OutputRoots,
         /// Every call that reached the handler's own decision or
         /// bookkeeping: what a refused request must not add to.
         plans: AtomicUsize,
@@ -1259,6 +1286,7 @@ mod tests {
         async fn with_policy(policy: RefusalPolicy) -> Arc<Self> {
             Arc::new(Self {
                 reports: AtomicUsize::new(0),
+                roots: everywhere(),
                 plans: AtomicUsize::new(0),
                 observations: AtomicUsize::new(0),
                 policy,
@@ -1315,6 +1343,10 @@ mod tests {
 
         fn refusal_policy(self: &Arc<Self>) -> RefusalPolicy {
             self.policy
+        }
+
+        fn output_roots(self: &Arc<Self>) -> Option<&crate::supervisor::invocation::OutputRoots> {
+            Some(&self.roots)
         }
 
         fn refused(self: &Arc<Self>, refusal: Refusal) {
@@ -1396,6 +1428,7 @@ mod tests {
         ready: tokio::sync::watch::Receiver<bool>,
         parked: tokio::sync::mpsc::UnboundedSender<()>,
         toolchain: Arc<BuildToolchain>,
+        roots: crate::supervisor::invocation::OutputRoots,
     }
 
     impl Handler for Gated {
@@ -1445,6 +1478,10 @@ mod tests {
         }
 
         fn refused(self: &Arc<Self>, _refusal: Refusal) {}
+
+        fn output_roots(self: &Arc<Self>) -> Option<&crate::supervisor::invocation::OutputRoots> {
+            Some(&self.roots)
+        }
     }
 
     /// The serve-map wait rides the loopback transport the Windows
@@ -1461,6 +1498,7 @@ mod tests {
             ready: ready_rx,
             parked: parked_tx,
             toolchain: BuildToolchain::for_tests().await,
+            roots: everywhere(),
         });
         let (tickets, ticket_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::task::spawn(super::run_tickets(ticket_rx));
@@ -1613,7 +1651,7 @@ mod tests {
                 &[],
                 success,
                 0,
-                InvocationEnv::default(),
+                InvocationEnv::for_tests(),
             ))
         };
         super::write_frame(&mut stream, &observed(None))
@@ -1702,7 +1740,7 @@ mod tests {
                 &[],
                 success,
                 0,
-                InvocationEnv::default(),
+                InvocationEnv::for_tests(),
             ))
         };
         super::write_frame(&mut stream, &observed(None))
@@ -1748,6 +1786,7 @@ mod tests {
         started: tokio::sync::watch::Sender<usize>,
         finished: AtomicUsize,
         toolchain: Arc<BuildToolchain>,
+        roots: crate::supervisor::invocation::OutputRoots,
     }
 
     impl Bookkeeping {
@@ -1758,6 +1797,7 @@ mod tests {
                 started: tokio::sync::watch::channel(0).0,
                 finished: AtomicUsize::new(0),
                 toolchain: BuildToolchain::for_tests().await,
+                roots: everywhere(),
             })
         }
 
@@ -1824,6 +1864,10 @@ mod tests {
         }
 
         fn refused(self: &Arc<Self>, _refusal: Refusal) {}
+
+        fn output_roots(self: &Arc<Self>) -> Option<&crate::supervisor::invocation::OutputRoots> {
+            Some(&self.roots)
+        }
     }
 
     /// Open the raw transport to the supervisor — no client framing: the
@@ -1870,7 +1914,7 @@ mod tests {
                 OsString::from("--crate-type"),
                 OsString::from("lib"),
             ],
-            InvocationEnv::default(),
+            InvocationEnv::for_tests(),
         );
         write_frame(&mut *stream, &Request::Plan(plan))
             .await
@@ -2237,7 +2281,7 @@ mod tests {
                 token.clone(),
                 std::ffi::OsStr::new("rustc"),
                 &dep_args,
-                InvocationEnv::default(),
+                InvocationEnv::for_tests(),
             );
             write_frame(&mut stream, &Request::Plan(plan))
                 .await
@@ -2319,7 +2363,7 @@ mod tests {
     /// cache is all it answers.
     struct CcCache {
         config: crate::config::StowConfig,
-        target_dir: std::path::PathBuf,
+        roots: crate::supervisor::invocation::OutputRoots,
         toolchain: Arc<BuildToolchain>,
     }
 
@@ -2330,8 +2374,8 @@ mod tests {
             Some(&self.config)
         }
 
-        fn cc_target_dir(self: &Arc<Self>) -> Option<&std::path::Path> {
-            Some(&self.target_dir)
+        fn output_roots(self: &Arc<Self>) -> Option<&crate::supervisor::invocation::OutputRoots> {
+            Some(&self.roots)
         }
 
         fn plan(
@@ -2404,7 +2448,10 @@ mod tests {
         let target = tempfile::tempdir().expect("target dir");
         let handler = Arc::new(CcCache {
             config: config.clone(),
-            target_dir: target.path().to_path_buf(),
+            roots: crate::supervisor::invocation::OutputRoots::new(
+                target.path().to_path_buf(),
+                None,
+            ),
             toolchain: BuildToolchain::for_tests().await,
         });
         let mut supervisor = start(
@@ -2514,7 +2561,10 @@ mod tests {
         };
         let handler = Arc::new(CcCache {
             config: config.clone(),
-            target_dir: target.path().to_path_buf(),
+            roots: crate::supervisor::invocation::OutputRoots::new(
+                target.path().to_path_buf(),
+                None,
+            ),
             toolchain: BuildToolchain::for_tests().await,
         });
         let mut supervisor = start(

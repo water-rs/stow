@@ -1375,10 +1375,11 @@ pub(crate) struct BuildSupervisor {
     /// cargo back (stow#608).
     resolution_done: ResolutionDone,
     observations: std::sync::Mutex<Vec<artifact_cache::ObservedUnit>>,
-    /// The target directory cargo builds into — where the C compiler
-    /// outputs the wrappers report must live. Unknown until the driver
-    /// tells it; an unknown one refuses every report.
-    target_dir: Option<PathBuf>,
+    /// The directories cargo builds into — where the compiler outputs
+    /// the wrappers report, and the `--out-dir` of every request, must
+    /// live. Unknown until the driver tells it; unknown ones refuse every
+    /// report and every request naming an output directory.
+    output_roots: Option<supervisor::invocation::OutputRoots>,
     /// What a refused request does to the build, chosen where the
     /// supervisor is built.
     refusal_policy: supervisor::invocation::RefusalPolicy,
@@ -1389,10 +1390,10 @@ pub(crate) struct BuildSupervisor {
 }
 
 impl BuildSupervisor {
-    /// The build's target directory, as cargo resolves it.
+    /// The build's target and build directories, as cargo resolves them.
     #[must_use]
-    pub(crate) fn with_target_dir(mut self, target_dir: PathBuf) -> Self {
-        self.target_dir = Some(target_dir);
+    pub(crate) fn with_output_roots(mut self, roots: supervisor::invocation::OutputRoots) -> Self {
+        self.output_roots = Some(roots);
         self
     }
 
@@ -1418,7 +1419,7 @@ impl BuildSupervisor {
             ctx,
             resolution_done,
             observations: std::sync::Mutex::default(),
-            target_dir: None,
+            output_roots: None,
             refusal_policy,
             refusals: std::sync::Mutex::default(),
         }
@@ -1492,8 +1493,8 @@ impl supervisor::server::Handler for BuildSupervisor {
         self.env_cache.config()
     }
 
-    fn cc_target_dir(self: &std::sync::Arc<Self>) -> Option<&Path> {
-        self.target_dir.as_deref()
+    fn output_roots(self: &std::sync::Arc<Self>) -> Option<&supervisor::invocation::OutputRoots> {
+        self.output_roots.as_ref()
     }
 
     async fn plan(
@@ -5971,6 +5972,22 @@ mod tests {
         parts.iter().map(std::ffi::OsString::from).collect()
     }
 
+    /// A request running in the test's own working directory.
+    fn here() -> crate::supervisor::protocol::InvocationEnv {
+        crate::supervisor::protocol::InvocationEnv::in_dir(
+            &std::env::current_dir().expect("the test's working directory"),
+        )
+    }
+
+    /// Output roots that contain every path: the fixtures name an
+    /// `--out-dir` that is no real build's.
+    fn everywhere() -> crate::supervisor::invocation::OutputRoots {
+        crate::supervisor::invocation::OutputRoots::new(
+            PathBuf::from(std::path::MAIN_SEPARATOR_STR),
+            None,
+        )
+    }
+
     /// An invocation of the build's own rustc, which the handler's
     /// toolchain verifies.
     async fn verified_rustc(
@@ -5980,8 +5997,10 @@ mod tests {
         let toolchain = crate::supervisor::server::Handler::toolchain(handler);
         crate::supervisor::invocation::VerifiedInvocation::verify(
             toolchain,
+            Some(&everywhere()),
             OsString::from("rustc"),
             args,
+            &here(),
         )
         .await
         .expect("the build's own rustc passes verification")
@@ -6356,7 +6375,7 @@ mod tests {
         let _ = crate::supervisor::server::Handler::plan(
             &handler,
             verified_rustc(&handler, args(&["-vV"])).await,
-            crate::supervisor::protocol::InvocationEnv::default(),
+            crate::supervisor::protocol::InvocationEnv::for_tests(),
         )
         .await;
         assert!(!resolution_done.has_completed());
@@ -6375,7 +6394,7 @@ mod tests {
                 ]),
             )
             .await,
-            crate::supervisor::protocol::InvocationEnv::default(),
+            crate::supervisor::protocol::InvocationEnv::for_tests(),
         )
         .await;
         assert!(!resolution_done.has_completed());
@@ -6398,7 +6417,7 @@ mod tests {
                 ]),
             )
             .await,
-            crate::supervisor::protocol::InvocationEnv::default(),
+            crate::supervisor::protocol::InvocationEnv::for_tests(),
         )
         .await;
         assert!(resolution_done.has_completed());
@@ -6423,8 +6442,10 @@ mod tests {
         let toolchain = crate::supervisor::server::Handler::toolchain(&handler);
         let refusal = crate::supervisor::invocation::VerifiedInvocation::verify(
             toolchain,
+            None,
             OsString::from("/nonexistent/not-rustc"),
             Vec::new(),
+            &here(),
         )
         .await
         .expect_err("another executable is refused");
@@ -6478,7 +6499,7 @@ mod tests {
                 invocation: verified_rustc(&handler, args(&["-vV"])).await,
                 success: None,
                 compile_time: std::time::Duration::ZERO,
-                env: crate::supervisor::protocol::InvocationEnv::default(),
+                env: crate::supervisor::protocol::InvocationEnv::for_tests(),
             },
         )
         .await;
@@ -6505,7 +6526,7 @@ mod tests {
                 .await,
                 success: None,
                 compile_time: std::time::Duration::ZERO,
-                env: crate::supervisor::protocol::InvocationEnv::default(),
+                env: crate::supervisor::protocol::InvocationEnv::for_tests(),
             },
         )
         .await;
@@ -7739,7 +7760,7 @@ mod tests {
                 ctx: ctx(&in_flight),
                 observations: std::sync::Mutex::new(Vec::new()),
                 resolution_done: crate::ResolutionDone::pending(),
-                target_dir: None,
+                output_roots: Some(super::everywhere()),
                 refusal_policy: crate::supervisor::invocation::RefusalPolicy::FailBuild,
                 refusals: std::sync::Mutex::new(Vec::new()),
             });
@@ -7788,7 +7809,7 @@ mod tests {
                 args,
                 success,
                 0,
-                crate::supervisor::protocol::InvocationEnv::default(),
+                crate::supervisor::protocol::InvocationEnv::for_tests(),
             );
             write_frame(&mut *stream, &Request::Observed(frame))
                 .await
@@ -7909,7 +7930,7 @@ mod tests {
                     handler
                         .plan(
                             super::verified_rustc(&handler, args).await,
-                            crate::supervisor::protocol::InvocationEnv::default(),
+                            crate::supervisor::protocol::InvocationEnv::for_tests(),
                         )
                         .await
                 })
@@ -7990,7 +8011,7 @@ mod tests {
                     handler
                         .plan(
                             super::verified_rustc(&handler, args).await,
-                            crate::supervisor::protocol::InvocationEnv::default(),
+                            crate::supervisor::protocol::InvocationEnv::for_tests(),
                         )
                         .await
                 })
@@ -8009,7 +8030,7 @@ mod tests {
             let decision = handler
                 .plan(
                     super::verified_rustc(&handler, args).await,
-                    crate::supervisor::protocol::InvocationEnv::default(),
+                    crate::supervisor::protocol::InvocationEnv::for_tests(),
                 )
                 .await;
             assert!(
@@ -8204,7 +8225,7 @@ mod tests {
                     handler
                         .plan(
                             super::verified_rustc(&handler, args).await,
-                            crate::supervisor::protocol::InvocationEnv::default(),
+                            crate::supervisor::protocol::InvocationEnv::for_tests(),
                         )
                         .await
                 })

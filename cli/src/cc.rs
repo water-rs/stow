@@ -656,14 +656,14 @@ fn clone_or_copy_file(source: &std::fs::File, destination: &Path) -> std::io::Re
 ///
 /// The final component is not followed (`O_NOFOLLOW`, or the reparse
 /// point itself on Windows), the file must be a regular one, and the
-/// descriptor's own real path must lie under `root`, the build's target
-/// directory: a wrapper cannot name a file the sandbox keeps from it, or
-/// a link through the target directory to one, and have the supervisor
-/// read it for the cache the sandbox can read.
+/// descriptor's own real path must lie under one of `roots`, the build's
+/// target and build directories: a wrapper cannot name a file the sandbox
+/// keeps from it, or a link through those directories to one, and have
+/// the supervisor read it for the cache the sandbox can read.
 ///
 /// # Errors
 /// The reason the report is refused, naming the path.
-pub fn open_reported_output(path: &Path, root: &Path) -> Result<std::fs::File, String> {
+pub fn open_reported_output(path: &Path, roots: &[PathBuf]) -> Result<std::fs::File, String> {
     let file = open_without_following(path).map_err(|error| {
         format!(
             "cannot open reported C/C++ output {}: {error}",
@@ -688,17 +688,19 @@ pub fn open_reported_output(path: &Path, root: &Path) -> Result<std::fs::File, S
             path.display()
         )
     })?;
-    let root = std::fs::canonicalize(root).map_err(|error| {
-        format!(
-            "cannot resolve the build's target directory {}: {error}",
-            root.display()
-        )
-    })?;
-    if !real.starts_with(&root) {
+    let under_a_root = roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .any(|root| real.starts_with(root));
+    if !under_a_root {
+        let roots = roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(format!(
-            "reported C/C++ output {} is outside the build's target directory {}",
-            path.display(),
-            root.display()
+            "reported C/C++ output {} is outside the build's target directory ({roots})",
+            path.display()
         ));
     }
     Ok(file)

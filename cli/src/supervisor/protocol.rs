@@ -84,6 +84,11 @@ pub struct InvocationEnv {
     /// says which `--cfg` and link arguments the build script, rather than
     /// the consumer, put on the command line (stow#1047).
     pub out_dir: Option<Vec<u8>>,
+    /// The invocation's working directory — what a relative spelling in
+    /// its argv or environment resolves against — OS-encoded like the
+    /// argv. Cargo runs rustc in the workspace root or the package
+    /// directory, which is not the directory the deciding process runs in.
+    pub cwd: Option<Vec<u8>>,
 }
 
 impl InvocationEnv {
@@ -96,7 +101,43 @@ impl InvocationEnv {
             manifest_dir: std::env::var_os("CARGO_MANIFEST_DIR")
                 .map(|value| os_bytes::encode(&value)),
             out_dir: std::env::var_os("OUT_DIR").map(|value| os_bytes::encode(&value)),
+            cwd: std::env::current_dir()
+                .ok()
+                .map(|dir| os_bytes::encode(dir.as_os_str())),
         }
+    }
+
+    /// An environment with no variables set, running in `cwd`.
+    #[must_use]
+    pub fn in_dir(cwd: &std::path::Path) -> Self {
+        Self {
+            cwd: Some(os_bytes::encode(cwd.as_os_str())),
+            ..Self::default()
+        }
+    }
+
+    /// An environment with no variables set, running in the test's own
+    /// working directory.
+    ///
+    /// # Panics
+    ///
+    /// The working directory cannot be read.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_tests() -> Self {
+        Self::in_dir(&std::env::current_dir().expect("the test's working directory"))
+    }
+
+    /// The decoded working directory.
+    ///
+    /// # Errors
+    ///
+    /// When the peer's encoding is not decodable on this platform.
+    pub fn cwd(&self) -> Result<Option<std::path::PathBuf>, String> {
+        self.cwd
+            .as_ref()
+            .map(|bytes| os_bytes::decode(bytes).map(std::path::PathBuf::from))
+            .transpose()
     }
 
     /// The decoded `CARGO_MANIFEST_DIR`.
@@ -447,7 +488,7 @@ mod tests {
             "token".to_owned(),
             std::ffi::OsStr::new("/usr/bin/rustc"),
             &[OsString::from("--crate-name"), OsString::from("serde")],
-            super::InvocationEnv::default(),
+            super::InvocationEnv::for_tests(),
         );
         let mut buffer = Vec::new();
         write_frame(&mut buffer, &Request::Plan(plan.clone()))

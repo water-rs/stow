@@ -4107,12 +4107,12 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
             resolution_done.clone(),
             crate::supervisor::invocation::RefusalPolicy::of_this_build(),
         )
-        .with_target_dir(resolved_target_dir(
+        .with_output_roots(resolved_output_roots(
             &project.facts,
             &project.env,
             plan.cargo_args,
             plan.current_dir,
-        )),
+        )?),
     );
     let (mut cargo_run, mut supervisor) =
         spawn_cargo_run(plan, &handler, in_flight, &wrappers, launch, scratch.path()).await?;
@@ -5352,6 +5352,87 @@ fn resolved_target_dir(
         )
 }
 
+/// The directories this run's rustc invocations write under: the target
+/// directory, and the build directory when cargo is configured with one
+/// elsewhere.
+fn resolved_output_roots(
+    project: &ProjectFacts,
+    env: &SessionEnv,
+    cargo_args: &[OsString],
+    current_dir: &Path,
+) -> stow_types::error::Result<crate::supervisor::invocation::OutputRoots> {
+    Ok(crate::supervisor::invocation::OutputRoots::new(
+        resolved_target_dir(project, env, cargo_args, current_dir),
+        resolved_build_dir(project, env, cargo_args, current_dir)?,
+    ))
+}
+
+/// The directory cargo keeps a build's intermediate outputs in when
+/// `build.build-dir` places them away from the target directory — a
+/// spelled `--config`, `CARGO_BUILD_BUILD_DIR`, or a config file, in
+/// cargo's precedence — else `None`: they are in the target directory.
+///
+/// A template resolves the way cargo does for `{workspace-root}` and
+/// `{cargo-cache-home}`; one whose value cargo derives (`{workspace-path-hash}`)
+/// stands for the directory that precedes it, under which cargo creates it.
+fn resolved_build_dir(
+    project: &ProjectFacts,
+    env: &SessionEnv,
+    cargo_args: &[OsString],
+    current_dir: &Path,
+) -> stow_types::error::Result<Option<PathBuf>> {
+    let spelled = crate::mold::config_arg_documents(current_dir, cargo_args)
+        .into_iter()
+        .rev()
+        .find_map(|(_, document)| {
+            document
+                .get("build")?
+                .get("build-dir")?
+                .as_str()
+                .map(str::to_owned)
+        });
+    let raw = if let Some(raw) = spelled {
+        raw
+    } else {
+        let options = cargo_config2::ResolveOptions::default()
+            .cargo_home(env.cargo_home().map(Path::to_path_buf))
+            .env(env.environ().iter().cloned());
+        let config = cargo_config2::Config::load_with_options(current_dir, options)
+            .wrap_err("load the cargo config")?;
+        let Some(dir) = config.build.build_dir else {
+            return Ok(None);
+        };
+        dir.to_string_lossy().into_owned()
+    };
+    let mut expanded = raw.replace(
+        "{workspace-root}",
+        &project.workspace_root.to_string_lossy(),
+    );
+    if expanded.contains("{cargo-cache-home}") {
+        let home = env.cargo_home().ok_or_else(|| {
+            stow_types::stow_error!(
+                "build.build-dir names {{cargo-cache-home}}, but no cargo home is set"
+            )
+        })?;
+        expanded = expanded.replace("{cargo-cache-home}", &home.to_string_lossy());
+    }
+    if let Some(template) = expanded.find('{') {
+        // The directory that holds what cargo derives: keep whole
+        // components only.
+        expanded.truncate(template);
+        let keep = expanded
+            .rfind(['/', std::path::MAIN_SEPARATOR])
+            .map_or(0, |separator| separator + 1);
+        expanded.truncate(keep);
+        if expanded.is_empty() {
+            return Err(stow_types::stow_error!(
+                "build.build-dir `{raw}` has no fixed directory to check outputs against"
+            ));
+        }
+    }
+    Ok(Some(resolve_user_path(current_dir, &expanded)))
+}
+
 fn cargo_target_dir(workspace_root: &Path, cargo_args: &[OsString], current_dir: &Path) -> PathBuf {
     let mut iter = cargo_args.iter();
     while let Some(arg) = iter.next() {
@@ -6543,5 +6624,211 @@ mod tests {
             .spawn()
             .expect_err("a 200,000-byte environment value cannot pass execve");
         assert_eq!(error.raw_os_error(), Some(libc::E2BIG));
+    }
+
+    /// How a build here places its build directory.
+    #[cfg(unix)]
+    struct Setup<'a> {
+        label: &'a str,
+        /// Extra environment variables.
+        extra: Vec<(&'a str, &'a Path)>,
+        /// The project's `.cargo/config.toml`, when it has one.
+        config_file: Option<String>,
+    }
+
+    /// A project directory with a library, a build script and a wrapper
+    /// script that records each rustc invocation it is given — its
+    /// `OUT_DIR`, its working directory, then its arguments, one per
+    /// line — under `records`.
+    #[cfg(unix)]
+    struct WrappedProject {
+        dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl WrappedProject {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = tempfile::tempdir().expect("project dir");
+            std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+            std::fs::write(
+                dir.path().join("Cargo.toml"),
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .expect("write the manifest");
+            std::fs::write(dir.path().join("src/lib.rs"), "pub fn probe() {}\n")
+                .expect("write the library");
+            std::fs::write(dir.path().join("build.rs"), "fn main() {}\n")
+                .expect("write the build script");
+            std::fs::create_dir_all(dir.path().join("records")).expect("create records");
+            let wrapper = dir.path().join("wrapper.sh");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\n{{ printf '%s\\n' \"$OUT_DIR\"; pwd; printf '%s\\n' \"$@\"; }} > '{}/'\"$$\"\nexec \"$@\"\n",
+                    dir.path().join("records").display()
+                ),
+            )
+            .expect("write the wrapper");
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+                .expect("make the wrapper executable");
+            Self { dir }
+        }
+
+        fn path(&self) -> &Path {
+            self.dir.path()
+        }
+
+        /// The environment of a build here: cargo's own, a target
+        /// directory beside the project, and `extra`.
+        fn vars(&self, extra: &[(&str, &Path)]) -> Vec<(OsString, OsString)> {
+            let mut vars: Vec<(OsString, OsString)> =
+                ["PATH", "HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"]
+                    .into_iter()
+                    .filter_map(|name| Some((OsString::from(name), std::env::var_os(name)?)))
+                    .collect();
+            let mut set = |name: &str, value: &Path| {
+                vars.push((OsString::from(name), value.as_os_str().to_owned()));
+            };
+            set("CARGO_HOME", &self.path().join("cargo-home"));
+            set("CARGO_TARGET_DIR", &self.path().join("target"));
+            set("RUSTC_WRAPPER", &self.path().join("wrapper.sh"));
+            for (name, value) in extra {
+                set(name, value);
+            }
+            vars
+        }
+
+        /// Run `cargo build` here under `vars`; the recorded invocations.
+        fn build(&self, vars: &[(OsString, OsString)]) -> Vec<(OsString, PathBuf, Vec<OsString>)> {
+            let status = std::process::Command::new("cargo")
+                .arg("build")
+                .current_dir(self.path())
+                .env_clear()
+                .envs(vars.iter().map(|(name, value)| (name, value)))
+                .status()
+                .expect("run cargo");
+            assert!(status.success(), "cargo build failed: {status}");
+            std::fs::read_dir(self.path().join("records"))
+                .expect("read the records")
+                .map(|record| {
+                    let text = std::fs::read_to_string(record.expect("record").path())
+                        .expect("read a record");
+                    let mut lines = text.lines();
+                    let out_dir = OsString::from(lines.next().expect("OUT_DIR line"));
+                    let cwd = PathBuf::from(lines.next().expect("cwd line"));
+                    (out_dir, cwd, lines.map(OsString::from).collect())
+                })
+                .collect()
+        }
+    }
+
+    /// Every rustc invocation a real cargo makes, with the build directory
+    /// left at its default, spelled in the environment or placed by a
+    /// config file, names an `--out-dir` and an `OUT_DIR` the resolved
+    /// roots accept — and one outside them is still refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_out_dir_cargo_chooses_is_under_the_resolved_roots() {
+        let toolchain = crate::toolchain::BuildToolchain::for_tests().await;
+        let separate = tempfile::tempdir().expect("separate build dir");
+        let by_env = separate.path().join("by-env");
+        let from_file = separate.path().join("from-file");
+        let from_file_spelling = from_file.to_str().expect("utf8 path");
+
+        let setups = [
+            Setup {
+                label: "the default",
+                extra: Vec::new(),
+                config_file: None,
+            },
+            Setup {
+                label: "CARGO_BUILD_BUILD_DIR",
+                extra: vec![("CARGO_BUILD_BUILD_DIR", by_env.as_path())],
+                config_file: None,
+            },
+            Setup {
+                label: "a config file",
+                extra: Vec::new(),
+                config_file: Some(format!("[build]\nbuild-dir = \"{from_file_spelling}\"\n")),
+            },
+        ];
+        for Setup {
+            label,
+            extra,
+            config_file,
+        } in setups
+        {
+            let project = WrappedProject::new();
+            if let Some(contents) = config_file {
+                std::fs::create_dir_all(project.path().join(".cargo")).expect("create .cargo");
+                std::fs::write(project.path().join(".cargo/config.toml"), contents)
+                    .expect("write the config file");
+            }
+            let vars = project.vars(&extra);
+            let session = SessionEnv::new(vars.clone(), project.path().to_path_buf());
+            let facts = ProjectFacts {
+                workspace_root: project.path().to_path_buf(),
+                current_dir: project.path().to_path_buf(),
+                manifest_path: project.path().join("Cargo.toml"),
+                ..project_facts()
+            };
+            let roots = super::resolved_output_roots(&facts, &session, &[], project.path())
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+
+            let records = project.build(&vars);
+            assert!(!records.is_empty(), "{label}: cargo ran no rustc");
+            let mut named = 0;
+            for (out_dir, cwd, args) in records {
+                named += args.iter().filter(|arg| *arg == "--out-dir").count();
+                let mut env = crate::supervisor::protocol::InvocationEnv::in_dir(&cwd);
+                env.out_dir =
+                    (!out_dir.is_empty()).then(|| crate::supervisor::os_bytes::encode(&out_dir));
+                crate::supervisor::invocation::VerifiedInvocation::verify(
+                    &toolchain,
+                    Some(&roots),
+                    OsString::from("rustc"),
+                    args.into_iter().skip(1).collect(),
+                    &env,
+                )
+                .await
+                .unwrap_or_else(|refusal| panic!("{label}: {refusal} (roots {roots:?})"));
+            }
+            assert!(named > 0, "{label}: no invocation named an --out-dir");
+        }
+    }
+
+    #[test]
+    fn a_templated_build_directory_stands_for_the_directory_before_the_template() {
+        let session = SessionEnv::new(
+            vec![
+                (
+                    OsString::from("CARGO_HOME"),
+                    OsString::from("/home/dev/.cargo"),
+                ),
+                (
+                    OsString::from("CARGO_BUILD_BUILD_DIR"),
+                    OsString::from("{cargo-cache-home}/build/{workspace-path-hash}"),
+                ),
+            ],
+            PathBuf::from("/workspace"),
+        );
+        let build_dir =
+            super::resolved_build_dir(&project_facts(), &session, &[], Path::new("/workspace"))
+                .expect("resolve the build directory");
+        assert_eq!(build_dir, Some(PathBuf::from("/home/dev/.cargo/build/")));
+        let none = SessionEnv::new(Vec::new(), PathBuf::from("/nonexistent-workspace"));
+        assert_eq!(
+            super::resolved_build_dir(
+                &project_facts(),
+                &none,
+                &[OsString::from(
+                    "--config=build.build-dir='{workspace-root}/bd'"
+                )],
+                Path::new("/workspace"),
+            )
+            .expect("a spelled --config"),
+            Some(PathBuf::from("/workspace/bd"))
+        );
     }
 }

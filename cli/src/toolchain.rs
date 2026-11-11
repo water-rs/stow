@@ -96,10 +96,10 @@ impl BuildToolchain {
         let release = rustc_args::vv_release(vv)?;
         let env = env.clone();
         let (files, env) = tokio::task::spawn_blocking(move || {
-            let (rustc, rustc_file) = resolve_file(&spelling, &env)?;
-            let (_, launcher_file) = resolve_file(&launcher, &env)?;
+            let (rustc, rustc_file) = resolve_file(&spelling, &env, env.cwd())?;
+            let (_, launcher_file) = resolve_file(&launcher, &env, env.cwd())?;
             let workspace_wrapper = workspace_wrapper
-                .map(|wrapper| resolve_file(wrapper.as_os_str(), &env))
+                .map(|wrapper| resolve_file(wrapper.as_os_str(), &env, env.cwd()))
                 .transpose()?
                 .map(|(_, file)| file);
             Ok::<_, String>(((rustc, rustc_file, launcher_file, workspace_wrapper), env))
@@ -160,23 +160,25 @@ impl BuildToolchain {
             .as_deref()
     }
 
-    /// Whether `spelling` names this toolchain's rustc — the toolchain
-    /// file or the file the driver launches it through: a bare name
-    /// resolves through the environment the toolchain was resolved in,
-    /// and files are compared by identity, not by string (stow#608).
-    /// Stats the file system; callers run it off the runtime workers.
+    /// Whether `spelling`, written in a process running in `cwd`, names
+    /// this toolchain's rustc — the toolchain file or the file the driver
+    /// launches it through: a bare name resolves through the `PATH` the
+    /// toolchain was resolved under, a relative path against `cwd`, and
+    /// files are compared by identity, not by string (stow#608). Stats
+    /// the file system; callers run it off the runtime workers.
     #[must_use]
-    pub fn is_rustc(&self, spelling: &OsStr) -> bool {
-        resolve_file(spelling, &self.env)
+    pub fn is_rustc(&self, spelling: &OsStr, cwd: &Path) -> bool {
+        resolve_file(spelling, &self.env, cwd)
             .is_ok_and(|(_, file)| file == self.rustc_file || file == self.launcher_file)
     }
 
-    /// Whether `spelling` names the configured workspace wrapper.
+    /// Whether `spelling`, written in a process running in `cwd`, names
+    /// the configured workspace wrapper.
     #[must_use]
-    pub fn is_workspace_wrapper(&self, spelling: &OsStr) -> bool {
+    pub fn is_workspace_wrapper(&self, spelling: &OsStr, cwd: &Path) -> bool {
         self.workspace_wrapper
             .as_ref()
-            .is_some_and(|wrapper| names_file(spelling, &self.env, wrapper))
+            .is_some_and(|wrapper| names_file(spelling, &self.env, cwd, wrapper))
     }
 }
 
@@ -228,18 +230,22 @@ fn parse_native_cpu(stdout: &str) -> Option<String> {
     })
 }
 
-/// The file `spelling` resolves to in `env` — through its `PATH`, from its
-/// working directory — and its identity.
-fn resolve_file(spelling: &OsStr, env: &SessionEnv) -> Result<(PathBuf, Handle), String> {
-    let path = which::which_in(spelling, Some(env.search_path()), env.cwd())
+/// The file `spelling` resolves to — through `env`'s `PATH`, from `cwd` —
+/// and its identity.
+fn resolve_file(
+    spelling: &OsStr,
+    env: &SessionEnv,
+    cwd: &Path,
+) -> Result<(PathBuf, Handle), String> {
+    let path = which::which_in(spelling, Some(env.search_path()), cwd)
         .map_err(|error| format!("resolve {}: {error}", Path::new(spelling).display()))?;
     let file = Handle::from_path(&path)
         .map_err(|error| format!("identify {}: {error}", path.display()))?;
     Ok((path, file))
 }
 
-fn names_file(spelling: &OsStr, env: &SessionEnv, target: &Handle) -> bool {
-    resolve_file(spelling, env).is_ok_and(|(_, file)| file == *target)
+fn names_file(spelling: &OsStr, env: &SessionEnv, cwd: &Path, target: &Handle) -> bool {
+    resolve_file(spelling, env, cwd).is_ok_and(|(_, file)| file == *target)
 }
 
 #[cfg(test)]
@@ -282,8 +288,9 @@ mod tests {
         )
         .await
         .expect("resolve the toolchain");
-        assert!(toolchain.is_rustc(rustc.as_os_str()));
-        assert!(toolchain.is_rustc(launcher.as_os_str()));
-        assert!(!toolchain.is_rustc(other.as_os_str()));
+        let cwd = dir.path();
+        assert!(toolchain.is_rustc(rustc.as_os_str(), cwd));
+        assert!(toolchain.is_rustc(launcher.as_os_str(), cwd));
+        assert!(!toolchain.is_rustc(other.as_os_str(), cwd));
     }
 }
