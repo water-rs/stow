@@ -30,6 +30,7 @@ mod circuit;
 mod cli_args;
 mod commands;
 mod config;
+mod daemon;
 mod derive_gate;
 mod edge_client;
 mod facade;
@@ -108,6 +109,7 @@ use crate::cli_args::{Cli, Command as CliCommand, WrapperCommandArgs};
 use crate::config::StowConfig;
 use crate::fetch::FetchRequest;
 use crate::state_db::StateDb;
+use crate::stats::{ServeSource, ServeStage};
 use crate::supervisor::protocol::ArtifactNotifications;
 
 const STOW_EXPANDED_GRAPH_PATH_ENV: &str = "STOW_EXPANDED_GRAPH_PATH";
@@ -136,6 +138,11 @@ struct TracingGuard {
 /// Returns an error when the selected subcommand fails before it can
 /// produce an exit status.
 pub fn run() -> stow_types::error::Result<()> {
+    // The daemon drops what it inherited before anything of its own is
+    // opened, so this runs first.
+    if daemon::is_serving(&process_args()) {
+        daemon::prepare_process()?;
+    }
     if let Some(status) = delegate_to_capture()? {
         std::process::exit(status);
     }
@@ -314,6 +321,11 @@ fn should_install_tracing_for_args(
     rust_log: Option<&OsStr>,
     trace_wrapped_compilers: Option<OsString>,
 ) -> bool {
+    // The daemon logs to its own file, installed once its runtime
+    // directory is known.
+    if daemon::is_serving(args) {
+        return false;
+    }
     let is_wrapper_subcommand = matches!(
         args.get(1).map(OsString::as_os_str),
         Some(command) if command == "rustc" || command == "cc"
@@ -360,6 +372,7 @@ async fn run_cli(
         CliCommand::Test(command) => {
             return Box::pin(cargo_cmd::run("test", command, state_db)).await;
         }
+        CliCommand::Daemon(args) => daemon::run(args).await,
         CliCommand::Rustc(command) => return run_rustc_wrapper(command, state_db).await,
         CliCommand::Cc(command) => return run_cc_wrapper(command, state_db).await,
         CliCommand::Predict(command) => Box::pin(cargo_cmd::predict(command, state_db)).await,
@@ -396,6 +409,7 @@ const fn subcommand_name(command: &CliCommand) -> &'static str {
         CliCommand::Index(_) => "index",
         CliCommand::Rustc(_) => "rustc",
         CliCommand::Cc(_) => "cc",
+        CliCommand::Daemon(_) => "daemon",
         CliCommand::PurgeCacheDir(_) => "purge-cache-dir",
         CliCommand::DrainMisses(_) => "drain-misses",
     }
@@ -1990,7 +2004,7 @@ async fn serve_or_compile(
         parsed,
         &env.target,
         &env.rustc_version,
-        UnitOutcome::of(served.is_some(), &tally, refused),
+        UnitOutcome::of(served.is_some(), tally, refused),
         true,
     )
     .await;
@@ -3144,8 +3158,12 @@ async fn try_remote_exact_serve(
         // The circuit opened mid-download: the breaker is already
         // tripped, so nothing more is counted — the unit compiles.
         Err(fetch::FetchError::CircuitOpen) => {
-            tally.failed = true;
-            tracing::debug!(
+            tally.fail(
+                ServeSource::ExactDownload,
+                ServeStage::Fetch,
+                "the circuit opened mid-download",
+            );
+            tracing::warn!(
                 crate_name = %parsed.crate_name,
                 target = %env.target,
                 rustc_version = %env.rustc_version,
@@ -3170,8 +3188,8 @@ async fn try_remote_exact_serve(
             env.env_cache
                 .record_circuit_failure(&env.env_base.config)
                 .await;
-            tally.failed = true;
-            tracing::debug!(
+            tally.fail(ServeSource::ExactDownload, ServeStage::Fetch, &error);
+            tracing::warn!(
                 crate_name = %parsed.crate_name,
                 target = %env.target,
                 rustc_version = %env.rustc_version,
@@ -3248,8 +3266,12 @@ async fn try_remote_semantic_serve(
                 .map_or(RemoteServe::Bypass, RemoteServe::Served)
         }
         Err(fetch::FetchError::CircuitOpen) => {
-            tally.failed = true;
-            tracing::debug!(
+            tally.fail(
+                ServeSource::SemanticDownload,
+                ServeStage::Fetch,
+                "the circuit opened mid-download",
+            );
+            tracing::warn!(
                 crate_name = %parsed.crate_name,
                 semantic_crate_name = %semantic_request.crate_name,
                 semantic_version = %semantic_request.version,
@@ -3265,8 +3287,8 @@ async fn try_remote_semantic_serve(
             env.env_cache
                 .record_circuit_failure(&env.env_base.config)
                 .await;
-            tally.failed = true;
-            tracing::debug!(
+            tally.fail(ServeSource::SemanticDownload, ServeStage::Fetch, &error);
+            tracing::warn!(
                 crate_name = %parsed.crate_name,
                 semantic_crate_name = %semantic_request.crate_name,
                 semantic_version = %semantic_request.version,
@@ -3286,16 +3308,31 @@ async fn try_remote_semantic_serve(
 /// (stow#696).
 #[derive(Debug, Default)]
 struct LookupTally {
-    /// A stage that should have worked did not: an entry that could not
-    /// be read, verified or materialized, or a fetch that failed.
-    failed: bool,
+    /// The stages that should have worked and did not, in order: an entry
+    /// that could not be read, verified or materialized, or a fetch that
+    /// failed. Each carries why, for the build summary.
+    failures: Vec<stats::ServeFailure>,
+}
+
+impl LookupTally {
+    /// Note a failed stage and why.
+    fn fail(
+        &mut self,
+        source: stats::ServeSource,
+        stage: stats::ServeStage,
+        reason: impl std::fmt::Display,
+    ) {
+        self.failures
+            .push(stats::ServeFailure::new(source, stage, reason));
+    }
 }
 
 /// The one outcome an invocation contributes to the build's counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum UnitOutcome {
     Hit,
-    Error,
+    /// The stages that failed, which the build summary names.
+    Error(Vec<stats::ServeFailure>),
     GlibcRefusal,
     Miss,
     /// The unit never reached a lookup: a dependency cargo hands it was
@@ -3309,11 +3346,11 @@ impl UnitOutcome {
     /// Served wins: a unit that was served is a hit whatever failed on
     /// the way. Otherwise a failure outranks a refusal, and a refusal a
     /// miss.
-    const fn of(served: bool, tally: &LookupTally, refused: bool) -> Self {
+    fn of(served: bool, tally: LookupTally, refused: bool) -> Self {
         if served {
             Self::Hit
-        } else if tally.failed {
-            Self::Error
+        } else if !tally.failures.is_empty() {
+            Self::Error(tally.failures)
         } else if refused {
             Self::GlibcRefusal
         } else {
@@ -3350,9 +3387,9 @@ async fn record_unit_outcome(
             "failed to record rust cache hit stats",
             stats::record_hit(config, &parsed.crate_name).await,
         ),
-        UnitOutcome::Error => log_nonfatal_result(
+        UnitOutcome::Error(failures) => log_nonfatal_result(
             "failed to record rust cache error stats",
-            stats::record_error(config, &parsed.crate_name).await,
+            stats::record_unit_error(config, &parsed.crate_name, &failures).await,
         ),
         UnitOutcome::GlibcRefusal => log_nonfatal_result(
             "failed to record rust glibc refusal stats",
@@ -3474,13 +3511,13 @@ async fn decide_local_only(
         // public cache does not carry, so an unmet local lookup means
         // nothing was promised. A serve and a failed lookup are the
         // only outcomes.
-        if served.is_some() || tally.failed {
+        if served.is_some() || !tally.failures.is_empty() {
             record_unit_outcome(
                 &prep.env_base.config,
                 parsed,
                 &target,
                 &prep.env_base.rustc_version,
-                UnitOutcome::of(served.is_some(), &tally, false),
+                UnitOutcome::of(served.is_some(), tally, false),
                 false,
             )
             .await;
@@ -3795,14 +3832,14 @@ async fn try_serve_local_cached_bundle(
     let cached_bundle = match load_cached_bundle(config, request).await {
         Ok(bundle) => bundle,
         Err(error) => {
-            tracing::debug!(
+            tracing::warn!(
                 error = %error,
                 crate_name = %parsed.crate_name,
                 target = %request.target,
                 rustc_version = %request.rustc_version,
                 "failed to read local stow artifact cache entry"
             );
-            tally.failed = true;
+            tally.fail(ServeSource::LocalEntry, ServeStage::Read, &error);
             return None;
         }
     };
@@ -3974,13 +4011,14 @@ async fn try_serve_loaded_local_cached_bundle(
             }
             EntryOrigin::ExactKey => {}
         }
-        tracing::debug!(
+        tracing::warn!(
             error = %mismatch,
             crate_name = %parsed.crate_name,
             target = %request.target,
             rustc_version = %request.rustc_version,
             "local stow artifact cache entry semantic mismatch, evicting and falling back to rustc"
         );
+        tally.fail(ServeSource::LocalEntry, ServeStage::Identity, &mismatch);
         drop(cached_bundle);
         evict_cached_bundle(
             config,
@@ -3989,18 +4027,18 @@ async fn try_serve_loaded_local_cached_bundle(
             "failed to evict local stow artifact cache entry with semantic mismatch",
         )
         .await;
-        tally.failed = true;
         return None;
     }
 
     if let Err(error) = verify::verify_cached_bundle_signature(config, &cached_bundle).await {
-        tracing::debug!(
+        tracing::warn!(
             error = %error,
             crate_name = %parsed.crate_name,
             target = %request.target,
             rustc_version = %request.rustc_version,
             "local stow artifact cache entry failed verification, evicting and falling back to rustc"
         );
+        tally.fail(ServeSource::LocalEntry, ServeStage::Verify, &error);
         drop(cached_bundle);
         evict_cached_bundle(
             config,
@@ -4009,7 +4047,6 @@ async fn try_serve_loaded_local_cached_bundle(
             "failed to evict untrusted local stow artifact cache entry",
         )
         .await;
-        tally.failed = true;
         return None;
     }
 
@@ -4025,14 +4062,14 @@ async fn try_serve_loaded_local_cached_bundle(
         // The binding no longer holds — a miss, not a path failure.
         Ok(None) => return None,
         Err(error) => {
-            tracing::debug!(
+            tracing::warn!(
                 error = %error,
                 crate_name = %parsed.crate_name,
                 target = %request.target,
                 rustc_version = %request.rustc_version,
                 "failed to materialize dependency closure aliases for local stow artifact cache entry"
             );
-            tally.failed = true;
+            tally.fail(ServeSource::LocalEntry, ServeStage::ClosureAliases, &error);
             return None;
         }
     };
@@ -4060,13 +4097,14 @@ async fn materialize_local_cached_bundle(
     {
         Ok(()) => finish_local_serve(config, parsed, request, cached_bundle, tally).await,
         Err(error) => {
-            tracing::debug!(
+            tracing::warn!(
                 error = %error,
                 crate_name = %parsed.crate_name,
                 target = %request.target,
                 rustc_version = %request.rustc_version,
                 "failed to materialize local stow artifact cache entry, evicting and falling back to rustc"
             );
+            tally.fail(ServeSource::LocalEntry, ServeStage::Materialize, &error);
             drop(cached_bundle);
             evict_cached_bundle(
                 config,
@@ -4075,7 +4113,6 @@ async fn materialize_local_cached_bundle(
                 "failed to evict broken local stow artifact cache entry",
             )
             .await;
-            tally.failed = true;
             None
         }
     }
@@ -4095,26 +4132,27 @@ async fn finish_local_serve(
     if let Err(error) =
         record_materialized_bundle_outputs(config, parsed, &cached_bundle, request.target).await
     {
-        tracing::debug!(
+        tracing::warn!(
             error = %error,
             crate_name = %parsed.crate_name,
             target = %request.target,
             rustc_version = %request.rustc_version,
             "failed to record materialized local stow artifact outputs"
         );
-        tally.failed = true;
+        tally.fail(ServeSource::LocalEntry, ServeStage::RecordOutputs, &error);
         return None;
     }
     let notifications = match cached_rustc_artifact_notifications(parsed, request.target) {
         Ok(notifications) => notifications,
         Err(error) => {
-            tracing::debug!(
+            tracing::warn!(
                 error = %error,
                 crate_name = %parsed.crate_name,
                 target = %request.target,
                 rustc_version = %request.rustc_version,
                 "failed to compute rustc artifact notifications for local stow artifact cache entry"
             );
+            tally.fail(ServeSource::LocalEntry, ServeStage::Notifications, &error);
             drop(cached_bundle);
             evict_cached_bundle(
                 config,
@@ -4123,7 +4161,6 @@ async fn finish_local_serve(
                 "failed to evict local stow artifact cache entry missing rustc artifact notifications",
             )
             .await;
-            tally.failed = true;
             return None;
         }
     };
@@ -4743,7 +4780,7 @@ async fn try_serve_local_semantic_cached_bundle(
     let cached_bundle = match load_semantic_cached_bundle(config, semantic_request).await {
         Ok(bundle) => bundle,
         Err(error) => {
-            tracing::debug!(
+            tracing::warn!(
                 error = %error,
                 crate_name = %parsed.crate_name,
                 semantic_crate_name = %semantic_request.crate_name,
@@ -4752,7 +4789,7 @@ async fn try_serve_local_semantic_cached_bundle(
                 rustc_version = %semantic_request.rustc_version,
                 "failed to read local semantic stow artifact cache entry"
             );
-            tally.failed = true;
+            tally.fail(ServeSource::LocalSemanticEntry, ServeStage::Read, &error);
             return None;
         }
     };
@@ -4782,7 +4819,7 @@ async fn try_serve_local_semantic_cached_bundle(
         return None;
     }
     if let Err(error) = verify::verify_cached_bundle_signature(config, &cached_bundle).await {
-        tracing::debug!(
+        tracing::warn!(
             error = %error,
             crate_name = %parsed.crate_name,
             semantic_crate_name = %semantic_request.crate_name,
@@ -4792,7 +4829,7 @@ async fn try_serve_local_semantic_cached_bundle(
             cached_c_metadata = %cached_bundle.c_metadata,
             "local semantic stow artifact cache entry failed verification"
         );
-        tally.failed = true;
+        tally.fail(ServeSource::LocalSemanticEntry, ServeStage::Verify, &error);
         return None;
     }
     let cached_c_metadata = cached_bundle.c_metadata.clone();
@@ -4813,7 +4850,7 @@ async fn try_serve_local_semantic_cached_bundle(
         // The binding no longer holds — a miss, not a path failure.
         Ok(None) => return None,
         Err(error) => {
-            tracing::debug!(
+            tracing::warn!(
                 error = %error,
                 crate_name = %parsed.crate_name,
                 semantic_crate_name = %semantic_request.crate_name,
@@ -4823,7 +4860,11 @@ async fn try_serve_local_semantic_cached_bundle(
                 cached_c_metadata = %request.c_metadata,
                 "failed to materialize dependency closure aliases for local semantic stow artifact cache entry"
             );
-            tally.failed = true;
+            tally.fail(
+                ServeSource::LocalSemanticEntry,
+                ServeStage::ClosureAliases,
+                &error,
+            );
             return None;
         }
     };
@@ -4850,7 +4891,7 @@ async fn materialize_semantic_cached_bundle(
     )
     .await
     {
-        tracing::debug!(
+        tracing::warn!(
             error = %error,
             crate_name = %parsed.crate_name,
             semantic_crate_name = %semantic_request.crate_name,
@@ -4860,14 +4901,18 @@ async fn materialize_semantic_cached_bundle(
             cached_c_metadata = %cached_bundle.c_metadata,
             "failed to materialize local semantic stow artifact cache entry"
         );
-        tally.failed = true;
+        tally.fail(
+            ServeSource::LocalSemanticEntry,
+            ServeStage::Materialize,
+            &error,
+        );
         return None;
     }
     if let Err(error) =
         record_materialized_bundle_outputs(config, parsed, &cached_bundle, &semantic_request.target)
             .await
     {
-        tracing::debug!(
+        tracing::warn!(
             error = %error,
             crate_name = %parsed.crate_name,
             semantic_crate_name = %semantic_request.crate_name,
@@ -4877,24 +4922,32 @@ async fn materialize_semantic_cached_bundle(
             cached_c_metadata = %cached_bundle.c_metadata,
             "failed to record materialized local semantic stow artifact outputs"
         );
-        tally.failed = true;
+        tally.fail(
+            ServeSource::LocalSemanticEntry,
+            ServeStage::RecordOutputs,
+            &error,
+        );
         return None;
     }
     let notifications = match cached_rustc_artifact_notifications(parsed, &semantic_request.target)
     {
         Ok(notifications) => notifications,
         Err(error) => {
-            tracing::debug!(
-                    error = %error,
-                    crate_name = %parsed.crate_name,
-                    semantic_crate_name = %semantic_request.crate_name,
+            tracing::warn!(
+                error = %error,
+                crate_name = %parsed.crate_name,
+                semantic_crate_name = %semantic_request.crate_name,
                 semantic_version = %semantic_request.version,
                 target = %semantic_request.target,
                 rustc_version = %semantic_request.rustc_version,
                 cached_c_metadata = %cached_bundle.c_metadata,
                 "failed to compute rustc artifact notifications for local semantic stow artifact cache entry"
             );
-            tally.failed = true;
+            tally.fail(
+                ServeSource::LocalSemanticEntry,
+                ServeStage::Notifications,
+                &error,
+            );
             return None;
         }
     };
@@ -4968,14 +5021,14 @@ async fn try_serve_verified_downloaded_bundle(
         Err(error) => {
             // A local store or verification failure — the transport worked,
             // so the circuit counts nothing for it (stow#1044).
-            tracing::debug!(
+            tracing::warn!(
                 error = %error,
                 crate_name = %parsed.crate_name,
                 target = %request.target,
                 rustc_version = %request.rustc_version,
                 "failed to cache verified stow bundle"
             );
-            tally.failed = true;
+            tally.fail(ServeSource::DownloadedBundle, ServeStage::Store, &error);
             return None;
         }
     };
@@ -4990,7 +5043,7 @@ async fn try_serve_verified_downloaded_bundle(
             // records nothing (stow#836).
             Ok(None) => return None,
             Err(error) => {
-                tracing::debug!(
+                tracing::warn!(
                     error = %error,
                     crate_name = %parsed.crate_name,
                     target = %request.target,
@@ -5006,7 +5059,11 @@ async fn try_serve_verified_downloaded_bundle(
             .await;
                 // A local materialization failure — the transport worked,
                 // so the circuit counts nothing for it (stow#1044).
-                tally.failed = true;
+                tally.fail(
+                    ServeSource::DownloadedBundle,
+                    ServeStage::ClosureAliases,
+                    &error,
+                );
                 return None;
             }
         };
@@ -5035,12 +5092,17 @@ async fn materialize_downloaded_bundle(
     {
         Ok(()) => finish_downloaded_serve(env, parsed, request, cached_bundle, tally).await,
         Err(error) => {
-            tracing::debug!(
+            tracing::warn!(
                 error = %error,
                 crate_name = %parsed.crate_name,
                 target = %request.target,
                 rustc_version = %request.rustc_version,
                 "failed to materialize verified stow bundle, evicting local cache entry"
+            );
+            tally.fail(
+                ServeSource::DownloadedBundle,
+                ServeStage::Materialize,
+                &error,
             );
             drop(cached_bundle);
             evict_cached_bundle(
@@ -5052,7 +5114,6 @@ async fn materialize_downloaded_bundle(
             .await;
             // A local materialization failure — the transport worked, so
             // the circuit counts nothing for it (stow#1044).
-            tally.failed = true;
             None
         }
     }
@@ -5074,12 +5135,17 @@ async fn finish_downloaded_serve(
     if let Err(error) =
         record_materialized_bundle_outputs(config, parsed, &cached_bundle, request.target).await
     {
-        tracing::debug!(
+        tracing::warn!(
             error = %error,
             crate_name = %parsed.crate_name,
             target = %request.target,
             rustc_version = %request.rustc_version,
             "failed to record materialized downloaded stow artifact outputs"
+        );
+        tally.fail(
+            ServeSource::DownloadedBundle,
+            ServeStage::RecordOutputs,
+            &error,
         );
         drop(cached_bundle);
         evict_cached_bundle(
@@ -5091,18 +5157,22 @@ async fn finish_downloaded_serve(
         .await;
         // A local bookkeeping failure — the transport worked, so the
         // circuit counts nothing for it (stow#1044).
-        tally.failed = true;
         return None;
     }
     let notifications = match cached_rustc_artifact_notifications(parsed, request.target) {
         Ok(notifications) => notifications,
         Err(error) => {
-            tracing::debug!(
+            tracing::warn!(
                 error = %error,
                 crate_name = %parsed.crate_name,
                 target = %request.target,
                 rustc_version = %request.rustc_version,
                 "failed to compute rustc artifact notifications for downloaded stow bundle"
+            );
+            tally.fail(
+                ServeSource::DownloadedBundle,
+                ServeStage::Notifications,
+                &error,
             );
             drop(cached_bundle);
             evict_cached_bundle(
@@ -5114,7 +5184,6 @@ async fn finish_downloaded_serve(
             .await;
             // A local bookkeeping failure — the transport worked, so the
             // circuit counts nothing for it (stow#1044).
-            tally.failed = true;
             return None;
         }
     };
@@ -6380,6 +6449,22 @@ mod tests {
     }
 
     #[test]
+    fn the_serving_daemon_installs_its_own_log_not_the_terminal_one() {
+        for rust_log in [None, Some("debug")] {
+            assert!(!should_install_tracing_for_args(
+                &args(&["stow", "daemon", "--ready", "x"]),
+                env_value(rust_log).as_deref(),
+                env_value(None),
+            ));
+        }
+        assert!(should_install_tracing_for_args(
+            &args(&["stow", "daemon", "status"]),
+            env_value(None).as_deref(),
+            env_value(None),
+        ));
+    }
+
+    #[test]
     fn unparseable_rustc_invocation_passes_through_instead_of_failing() {
         // A flag stow does not model must never fail the unit: the
         // invocation goes to the real rustc verbatim.
@@ -6667,30 +6752,39 @@ mod tests {
     /// into an error.
     #[test]
     fn a_served_unit_is_a_hit_whatever_failed_on_the_way() {
+        let tally = super::LookupTally::default();
+        assert_eq!(
+            super::UnitOutcome::of(true, tally, false),
+            super::UnitOutcome::Hit
+        );
+        assert_eq!(
+            super::UnitOutcome::of(true, failed_tally(), true),
+            super::UnitOutcome::Hit
+        );
+    }
+
+    fn failed_tally() -> super::LookupTally {
         let mut tally = super::LookupTally::default();
-        assert_eq!(
-            super::UnitOutcome::of(true, &tally, false),
-            super::UnitOutcome::Hit
+        tally.fail(
+            crate::stats::ServeSource::ExactDownload,
+            crate::stats::ServeStage::Fetch,
+            "boom",
         );
-        tally.failed = true;
-        assert_eq!(
-            super::UnitOutcome::of(true, &tally, true),
-            super::UnitOutcome::Hit
-        );
+        tally
     }
 
     /// stow#696: an unserved unit whose chain saw a failure is an error
     /// — outranking both the refusal and the plain miss.
     #[test]
     fn a_failure_outranks_a_refusal_and_a_miss() {
-        let tally = super::LookupTally { failed: true };
+        let failures = failed_tally().failures;
         assert_eq!(
-            super::UnitOutcome::of(false, &tally, false),
-            super::UnitOutcome::Error
+            super::UnitOutcome::of(false, failed_tally(), false),
+            super::UnitOutcome::Error(failures.clone())
         );
         assert_eq!(
-            super::UnitOutcome::of(false, &tally, true),
-            super::UnitOutcome::Error
+            super::UnitOutcome::of(false, failed_tally(), true),
+            super::UnitOutcome::Error(failures)
         );
     }
 
@@ -6700,7 +6794,7 @@ mod tests {
     fn a_refusal_outranks_a_miss() {
         let tally = super::LookupTally::default();
         assert_eq!(
-            super::UnitOutcome::of(false, &tally, true),
+            super::UnitOutcome::of(false, tally, true),
             super::UnitOutcome::GlibcRefusal
         );
     }
@@ -6711,7 +6805,7 @@ mod tests {
     fn nothing_seen_is_a_miss() {
         let tally = super::LookupTally::default();
         assert_eq!(
-            super::UnitOutcome::of(false, &tally, false),
+            super::UnitOutcome::of(false, tally, false),
             super::UnitOutcome::Miss
         );
     }
@@ -6789,7 +6883,7 @@ mod tests {
         .await;
         assert!(served.is_none(), "another version's entry cannot serve");
         assert!(
-            !tally.failed,
+            tally.failures.is_empty(),
             "finding no entry for this invocation is not a failure"
         );
 
@@ -7297,7 +7391,17 @@ mod tests {
             super::materialize_downloaded_bundle(&env, &parsed, &request, cached, &mut tally).await;
 
         assert!(served.is_none());
-        assert!(tally.failed, "the failure is still reported");
+        assert_eq!(
+            tally.failures.len(),
+            1,
+            "the failure is still reported: {:?}",
+            tally.failures
+        );
+        let reported = tally.failures[0].to_string();
+        assert!(
+            reported.starts_with("downloaded bundle materialize failed: "),
+            "the report names the stage and the reason: {reported}"
+        );
         assert!(
             !crate::circuit::is_tripped(&config)
                 .await
@@ -7310,7 +7414,7 @@ mod tests {
     /// still in flight parks on `serve_map_ready`, writes no
     /// negative-cache entry while parked, and retries once on the
     /// fetched slice. Here the retry reaches the row's bundle fetch —
-    /// which the dead test registry refuses (`tally.failed`) — and the
+    /// which the dead test registry refuses (`tally.failures`) — and the
     /// memo serves the fresh row to every later invocation.
     #[tokio::test]
     async fn a_miss_on_a_pending_slice_retries_the_fetched_answer() {
@@ -7378,10 +7482,10 @@ mod tests {
         };
 
         // The retry finds the row: the bundle fetch it then pays fails
-        // on the dead test registry, which `tally.failed` records.
+        // on the dead test registry, which `tally.failures` records.
         assert!(matches!(outcome, super::RemoteServe::Miss));
         assert!(
-            tally.failed,
+            !tally.failures.is_empty(),
             "the retry must reach the fetched row's bundle fetch"
         );
 
@@ -7441,7 +7545,7 @@ mod tests {
         .await
         .expect("a miss on a settled slice must not wait on serve_map_ready");
         assert!(matches!(outcome, super::RemoteServe::Miss));
-        assert!(!tally.failed);
+        assert_eq!(tally.failures, []);
         assert!(
             crate::circuit::negative_cache_contains(&config, &env.cache_key)
                 .await

@@ -92,6 +92,12 @@ time = { version = "0.3.55", default-features = false, features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The launch agent plist (`cli/templates/launch_agent.xml`): XML-escaped by
+# a template, never concatenated. Already in the lockfile for the edge and
+# the admin.
+askama = { version = "0.14", default-features = false, features = ["derive", "std"] }
+
 [target.'cfg(windows)'.dependencies]
 # Parent-pid and process-liveness lookups for the miss journal.
 windows-sys = { version = "0.60", features = [
@@ -99,6 +105,9 @@ windows-sys = { version = "0.60", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
+    # The daemon's named pipe is restricted to the current user's SID.
+    "Win32_Security",
+    "Win32_Security_Authorization",
 ] }
 
 [dev-dependencies]

@@ -8208,6 +8208,7 @@ dependencies = [
 name = "stow-cli"
 version = "0.15.1"
 dependencies = [
+ "askama 0.14.0",
  "async-fs",
  "async-process",
  "axoupdater",

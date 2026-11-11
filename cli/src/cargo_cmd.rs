@@ -5097,6 +5097,10 @@ async fn report_cache_coverage(
         "failed to print stow cache coverage",
         write_stdout(&delta.summary_line(covered_units, &errored_crates)),
     );
+    log_nonfatal_result(
+        "failed to print why units errored",
+        write_stdout(&stats::failure_lines(&errored_crates, &after.failures)),
+    );
     let divergence_after = stats::read_profile_divergence(config)
         .await
         .unwrap_or_default();

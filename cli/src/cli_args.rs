@@ -29,6 +29,10 @@ pub enum Command {
     /// Manage the signed local artifact index this toolchain resolves
     /// against.
     Index(IndexArgs),
+    /// Run the per-user stow daemon in the foreground, or with `status`
+    /// report the running one. Clients start the daemon themselves; this
+    /// is what they run.
+    Daemon(DaemonArgs),
     #[command(name = "rustc", hide = true)]
     Rustc(WrapperCommandArgs),
     #[command(name = "cc", hide = true)]
@@ -40,6 +44,24 @@ pub enum Command {
     /// or a later wrapper spawns it detached; it is never for users.
     #[command(name = "__drain-misses", hide = true)]
     DrainMisses(DrainMissesArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct DaemonArgs {
+    /// The endpoint to report readiness to — how the client that spawned
+    /// this daemon learns it is serving. Internal to the start path.
+    #[arg(long, value_name = "ENDPOINT", hide = true)]
+    pub ready: Option<PathBuf>,
+    #[command(subcommand)]
+    pub command: Option<DaemonCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DaemonCommand {
+    /// Print the running daemon's stow version and protocol, starting the
+    /// daemon first when it is not running.
+    Status,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -372,6 +394,24 @@ mod tests {
             panic!("expected index command");
         };
         assert!(matches!(args.command, IndexCommand::Status));
+    }
+
+    #[test]
+    fn parses_the_daemon_and_its_status_command() {
+        let cli = Cli::try_parse_from(["stow", "daemon", "--ready", "/run/ready.sock"])
+            .expect("parse daemon command");
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        assert_eq!(args.ready, Some(PathBuf::from("/run/ready.sock")));
+        assert!(args.command.is_none());
+
+        let cli = Cli::try_parse_from(["stow", "daemon", "status"]).expect("parse status");
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        assert!(matches!(args.command, Some(DaemonCommand::Status)));
+        assert!(Cli::try_parse_from(["stow", "daemon", "--ready", "x", "status"]).is_err());
     }
 
     #[test]
