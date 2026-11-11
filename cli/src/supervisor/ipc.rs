@@ -25,7 +25,8 @@ use tokio::sync::mpsc;
 
 use super::protocol::{Answer, Request};
 use super::server::{self, ConnectionMark, Handler, InFlightUnits, Ticket};
-use super::{BINARY_ENV, BinaryIdentity, ENDPOINT_ENV, Endpoint, TOKEN_ENV};
+use super::{BINARY_ENV, BinaryIdentity, ENDPOINT_ENV, TOKEN_ENV};
+use crate::local_socket::Endpoint;
 
 /// The method name the IPC router registers the supervisor under —
 /// `[A-Za-z][A-Za-z0-9_-]*`, since heel also spells it as a shim's file

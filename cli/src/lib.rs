@@ -39,6 +39,7 @@ mod file_lock;
 mod index;
 mod inject;
 mod isolation;
+mod local_socket;
 mod lockfile_graph_cache;
 mod lockfile_resolver;
 mod miss_journal;
@@ -1662,7 +1663,7 @@ async fn run_rustc_wrapper(
 
 /// Ask the supervisor, then do what it says.
 async fn delegate_to_supervisor(
-    endpoint: &supervisor::Endpoint,
+    endpoint: &local_socket::Endpoint,
     token: String,
     command: &WrapperCommandArgs,
 ) -> stow_types::error::Result<std::process::ExitStatus> {
@@ -3438,7 +3439,7 @@ async fn run_cc_wrapper(
 /// database — this process holds a closed handle, so nothing here could
 /// open one.
 async fn run_cc_supervised(
-    endpoint: &supervisor::Endpoint,
+    endpoint: &local_socket::Endpoint,
     token: String,
     compiler: &cc::ResolvedCompiler,
     compiler_args: &[OsString],
@@ -7488,8 +7489,9 @@ mod tests {
         use std::sync::Arc;
         use std::time::Duration;
 
+        use crate::local_socket::Endpoint;
         use crate::supervisor::protocol::{Observed, Request, write_frame};
-        use crate::supervisor::{Endpoint, server, server::Handler as _};
+        use crate::supervisor::{server, server::Handler as _};
         use crate::{AnalysisFacts, BuildContext, BuildSupervisor, WrapperEnvBase};
 
         /// A `tracing` writer whose buffer the test can inspect — the

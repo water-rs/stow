@@ -24,10 +24,11 @@ use stow_types::error::Context;
 use stow_types::public_cache::{canonical_crate_name, detect_registry_crate_version};
 use stow_types::rustc::ParsedRustcArgs;
 
+use crate::local_socket::Endpoint;
 use crate::rustc_args;
+use crate::supervisor;
 use crate::supervisor::ipc::{IPC_METHOD, IpcCall, IpcCallBody, mint_connection_id};
 use crate::supervisor::protocol::{Answer, AwaitServeMap, Observed, Request};
-use crate::supervisor::{self, Endpoint};
 
 /// The `stow build` wiring carrying the serve-map file path to every
 /// facade.
@@ -616,7 +617,7 @@ mod tests {
     use std::io::{Read as _, Write as _};
 
     use super::{ServeMap, WILDCARD};
-    use crate::supervisor::Endpoint;
+    use crate::local_socket::Endpoint;
 
     /// The final write can land before any facade has asked: a facade
     /// that asks afterwards must hear it at once, not wait out its

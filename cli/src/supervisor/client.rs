@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::ipc::{IPC_METHOD, IpcCall, IpcCallBody, mint_connection_id};
+use super::os_bytes;
 use super::protocol::{
     Answer, ArtifactNotifications, CcCompiled, CcLookup, Compiled, Plan, Request, read_frame,
     write_frame,
 };
-use super::{Endpoint, Stream, os_bytes};
+use crate::local_socket::{self, Endpoint, Stream};
 
 /// What the supervisor decided for a keyed C/C++ invocation.
 #[derive(Debug)]
@@ -86,7 +87,7 @@ impl Connection {
                 token,
             });
         }
-        let stream = super::connect(endpoint).await?;
+        let stream = local_socket::connect(endpoint).await?;
         Ok(Self {
             inner: ConnectionInner::Stream(stream),
             token,

@@ -24,7 +24,8 @@ use super::protocol::{
     Answer, ArtifactNotifications, AwaitServeMap, CcCompiled, CcLookup, Compiled, Observed, Plan,
     Request, read_frame, write_frame,
 };
-use super::{BINARY_ENV, BinaryIdentity, ENDPOINT_ENV, Endpoint, TOKEN_ENV};
+use super::{BINARY_ENV, BinaryIdentity, ENDPOINT_ENV, TOKEN_ENV};
+use crate::local_socket::{self, Endpoint};
 use crate::toolchain::BuildToolchain;
 
 /// What a supervisor does with the invocations its facades send.
@@ -266,12 +267,12 @@ where
     tokio::spawn(run_tickets(ticket_rx));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let connections = Arc::new(Connections::default());
-    let listener = super::bind("stow-supervisor-")?;
+    let listener = local_socket::bind("stow-supervisor-")?;
     let endpoint = listener.endpoint();
 
     #[cfg(unix)]
     {
-        let super::Listener::Unix {
+        let local_socket::Listener::Unix {
             listener,
             dir: socket_dir,
         } = listener;
@@ -298,7 +299,7 @@ where
 
     #[cfg(not(unix))]
     {
-        let super::Listener::Loopback { listener, port } = listener;
+        let local_socket::Listener::Loopback { listener, port } = listener;
         let accept_task = tokio::spawn(accept_loopback(
             listener,
             handler,
@@ -1339,7 +1340,7 @@ mod tests {
         )
         .expect("start the supervisor");
         let [(_, endpoint), (_, token), _] = supervisor.env();
-        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
 
         let mut connection = Connection::open(&endpoint, token)
             .await
@@ -1526,7 +1527,7 @@ mod tests {
         )
         .expect("start the supervisor");
         let [(_, endpoint), (_, token), _] = supervisor.env();
-        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
 
         let mut connection = Connection::open(&endpoint, token)
             .await
@@ -1550,7 +1551,7 @@ mod tests {
         let supervisor = start(handler, super::InFlightUnits::default(), &test_executable())
             .expect("start the supervisor");
         let [(_, endpoint), ..] = supervisor.env();
-        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
 
         let mut connection = Connection::open(&endpoint, "not-the-token".to_owned())
             .await
@@ -1593,7 +1594,7 @@ mod tests {
         )
         .expect("start the supervisor");
         let [(_, endpoint), (_, token), _] = supervisor.env();
-        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
 
         let mut connection = Connection::open(&endpoint, token.clone())
             .await
@@ -1672,7 +1673,7 @@ mod tests {
         )
         .expect("start the supervisor");
         let [(_, endpoint), (_, token), _] = supervisor.env();
-        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
 
         // The plan: told to compile, and the report that follows is
         // received.
@@ -1828,8 +1829,8 @@ mod tests {
     /// Open the raw transport to the supervisor — no client framing: the
     /// test writes its frames itself.
     #[cfg(unix)]
-    async fn connect_raw(endpoint: &crate::supervisor::Endpoint) -> tokio::net::UnixStream {
-        let crate::supervisor::Endpoint::Unix(path) = endpoint else {
+    async fn connect_raw(endpoint: &crate::local_socket::Endpoint) -> tokio::net::UnixStream {
+        let crate::local_socket::Endpoint::Unix(path) = endpoint else {
             panic!("the unix transport is the only one this platform starts");
         };
         tokio::net::UnixStream::connect(path)
@@ -1840,8 +1841,8 @@ mod tests {
     /// Open the raw transport to the supervisor — no client framing: the
     /// test writes its frames itself.
     #[cfg(not(unix))]
-    async fn connect_raw(endpoint: &crate::supervisor::Endpoint) -> tokio::net::TcpStream {
-        let crate::supervisor::Endpoint::Loopback(port) = endpoint else {
+    async fn connect_raw(endpoint: &crate::local_socket::Endpoint) -> tokio::net::TcpStream {
+        let crate::local_socket::Endpoint::Loopback(port) = endpoint else {
             panic!("the loopback transport is the only one this platform starts");
         };
         tokio::net::TcpStream::connect(("127.0.0.1", *port))
@@ -1929,7 +1930,7 @@ mod tests {
         )
         .expect("start the supervisor");
         let [(_, endpoint), (_, token), _] = supervisor.env();
-        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
         let mut stream = connect_raw(&endpoint).await;
         plan_and_report(&mut stream, &token).await;
         handler.started(1).await;
@@ -1957,7 +1958,7 @@ mod tests {
         )
         .expect("start the supervisor");
         let [(_, endpoint), (_, token), _] = supervisor.env();
-        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
 
         // Connections that end without any bookkeeping in flight. Accept
         // is FIFO, so the held report's bookkeeping starting below means
@@ -1994,7 +1995,7 @@ mod tests {
         )
         .expect("start the supervisor");
         let [(_, endpoint), (_, token), _] = supervisor.env();
-        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
         let mut stream = connect_raw(&endpoint).await;
         plan_and_report(&mut stream, &token).await;
         handler.started(1).await;
@@ -2100,7 +2101,7 @@ mod tests {
         let mut supervisor = start(Arc::clone(&handler), in_flight.clone(), &test_executable())
             .expect("start the supervisor");
         let [(_, endpoint), (_, token), _] = supervisor.env();
-        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
 
         let dep_args = unit_args("dep", &[]);
         let dep_rlib = rlib_path(&dep_args);
@@ -2171,7 +2172,7 @@ mod tests {
         let mut supervisor = start(Arc::clone(&handler), in_flight.clone(), &test_executable())
             .expect("start the supervisor");
         let [(_, endpoint), (_, token), _] = supervisor.env();
-        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
 
         let dep_args = unit_args("dep", &[]);
         let dep_rlib = rlib_path(&dep_args);
@@ -2224,7 +2225,7 @@ mod tests {
         let mut supervisor = start(Arc::clone(&handler), in_flight.clone(), &test_executable())
             .expect("start the supervisor");
         let [(_, endpoint), (_, token), _] = supervisor.env();
-        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
 
         let dep_args = unit_args("dep", &[]);
         let mut stream = connect_raw(&endpoint).await;
@@ -2412,7 +2413,7 @@ mod tests {
         )
         .expect("start the supervisor");
         let [(_, endpoint), (_, token), _] = supervisor.env();
-        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
         let output = target.path().join("probe.o");
         std::fs::write(&output, b"object bytes").expect("write the compiler's output");
 
@@ -2521,7 +2522,7 @@ mod tests {
         )
         .expect("start the supervisor");
         let [(_, endpoint), (_, token), _] = supervisor.env();
-        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let endpoint = crate::local_socket::Endpoint::parse(&endpoint).expect("endpoint");
 
         let mut connection = Connection::open(&endpoint, token)
             .await
