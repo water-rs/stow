@@ -4,7 +4,8 @@
 //! wrapper asks what to do with one rustc invocation and, when it is told
 //! to compile, reports the result so the supervisor can finish the work
 //! that only exists after a real compile (stable aliases, output
-//! bookkeeping).
+//! bookkeeping). The supervisor answers the report with a receipt that
+//! precedes that work, so the facade exits with rustc.
 
 use std::ffi::OsString;
 
@@ -23,11 +24,14 @@ const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub enum Request {
     /// One rustc invocation, before anything has run.
     Plan(Plan),
-    /// The result of a compile the supervisor asked for.
+    /// The result of a compile the supervisor asked for. Answered with
+    /// [`Answer::Received`] before the supervisor's bookkeeping, which the
+    /// facade never waits for (stow#1431).
     Compiled(Compiled),
     /// A compile the facade already decided on its own — the local-build
-    /// mark before rustc starts and the report after it ends. One-way:
-    /// the supervisor never answers it.
+    /// mark before rustc starts and the report after it ends. The mark is
+    /// one-way: the supervisor never answers it. The report is answered
+    /// with [`Answer::Received`], as [`Request::Compiled`] is.
     Observed(Observed),
     /// A facade whose unit a `pending` serve map does not cover asks the
     /// supervisor to answer only once the build's final map has landed —
@@ -124,7 +128,8 @@ pub struct Plan {
     pub env: InvocationEnv,
 }
 
-/// The facade reporting the compile the supervisor asked for.
+/// The facade reporting the compile the supervisor asked for. The
+/// supervisor answers it with a receipt that precedes its bookkeeping.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Compiled {
     /// Proves the sender is part of this build; checked on every frame.
@@ -247,9 +252,11 @@ pub enum Answer {
         /// The ticket the [`Compiled`] report carries back.
         ticket: u64,
     },
-    /// The report was applied; the facade exits with the compile's own
-    /// status.
-    Recorded,
+    /// The report arrived and the unit's rustc is recorded as exited; the
+    /// supervisor's bookkeeping runs after this answer and the facade
+    /// exits with the compile's own status without waiting for it
+    /// (stow#1431).
+    Received,
     /// The build's serve map is final: the facade re-reads the map file
     /// and decides on what it finds (stow#347).
     ServeMapReady,

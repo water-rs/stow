@@ -4164,7 +4164,7 @@ impl SupervisorHandle {
             Self::Socket(supervisor) => {
                 supervisor.shutdown().await;
             }
-            Self::Ipc(supervisor) => supervisor.shutdown(),
+            Self::Ipc(supervisor) => supervisor.shutdown().await,
         }
     }
 }

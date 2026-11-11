@@ -721,8 +721,8 @@ fn frame_crate_name(request: &Request) -> String {
         .unwrap_or_default()
 }
 
-/// One stub-supervisor connection: plans are told to compile, reports are
-/// acknowledged, observations need no answer. Every frame is counted.
+/// One stub-supervisor connection: plans are told to compile, reports
+/// get a receipt, marks need no answer. Every frame is counted.
 fn serve_stub_connection(
     mut stream: std::net::TcpStream,
     counts: &std::sync::Mutex<StubSupervision>,
@@ -762,7 +762,7 @@ fn serve_stub_connection(
                     .entry(crate_name)
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
-                Some(Answer::Recorded)
+                Some(Answer::Received)
             }
             Request::Observed(observed) => {
                 let mut counts = counts.lock().expect("frame counts");
@@ -775,7 +775,8 @@ fn serve_stub_connection(
                     .entry(crate_name)
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
-                None
+                // A report is answered with a receipt, a mark is not.
+                observed.success.map(|_| Answer::Received)
             }
             Request::AwaitServeMap(_) => None,
         };
@@ -794,7 +795,7 @@ fn serve_stub_connection(
 }
 
 /// A supervisor that answers every plan with `Compile` and every report
-/// with `Recorded`, while counting which frames each crate produced.
+/// with a receipt, while counting which frames each crate produced.
 /// Returns the loopback endpoint pieces and the shared count map.
 fn spawn_stub_supervisor() -> (String, std::sync::Arc<StubSupervisor>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub supervisor");

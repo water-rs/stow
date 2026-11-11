@@ -109,7 +109,7 @@ pub enum Decision<P> {
 /// queued still runs — sqlite writes and file copies that take
 /// milliseconds. The bound exists for the bookkeeping that hangs instead:
 /// a wedged store must not hang a build that is already over.
-const CONNECTION_DRAIN_BUDGET: Duration = Duration::from_secs(30);
+pub(super) const CONNECTION_DRAIN_BUDGET: Duration = Duration::from_secs(30);
 
 /// A running supervisor: the endpoint its facades connect to, and the
 /// tasks that serve them.
@@ -359,6 +359,17 @@ pub async fn run_tickets<P>(mut messages: mpsc::UnboundedReceiver<Ticket<P>>) {
 /// that bookkeeping writes, so its post-compile waits on every in-flight
 /// unit its `--extern` set names instead of racing the write.
 ///
+/// The flight has two legs and the report frame's arrival is the boundary
+/// between them. Until the frame arrives rustc is running; the facade
+/// exits once the receipt for its report arrives — sent as soon as this
+/// latch has fired, before the bookkeeping — so from the frame on only
+/// the supervisor's bookkeeping is left, and a dependent cargo starts
+/// after the facade's exit always finds the latch fired (stow#1431). A dependent's plan
+/// waits for a unit in its second leg — cargo starts a dependent after a
+/// proc macro or a build script has fully finished, and that dependent
+/// plans against the unit's rows — and never for one in its first, which
+/// a pipelined dependent legitimately plans against while it compiles.
+///
 /// `std::sync::Mutex` around a map rather than another actor: completing a
 /// unit has to happen in `Drop` — an early return, an error and a dead
 /// connection all end the flight the same way — and a drop cannot await a
@@ -375,6 +386,7 @@ impl InFlightUnits {
     fn register(&self, paths: Vec<String>) -> Completion {
         let unit = Arc::new(InFlightUnit {
             paths,
+            exited: crate::Latch::pending(),
             done: crate::Latch::pending(),
         });
         {
@@ -395,36 +407,64 @@ impl InFlightUnits {
     /// (stow#810).
     #[cfg(test)]
     pub(crate) async fn parked_on(&self, path: &str, waits: usize) {
-        let unit = Arc::clone(
+        self.flight(path).done.parked(waits).await;
+    }
+
+    /// The unit in flight under `path`, for a test that observes its
+    /// flight directly.
+    #[cfg(test)]
+    fn flight(&self, path: &str) -> Arc<InFlightUnit> {
+        Arc::clone(
             self.units
                 .lock()
                 .expect("in-flight units mutex")
                 .get(path)
                 .unwrap_or_else(|| panic!("no unit in flight under {path}")),
-        );
-        unit.done.parked(waits).await;
+        )
+    }
+
+    /// The in-flight units one of `parsed`'s `--extern` dependencies could
+    /// be, deduplicated, that satisfy `keep`. The paths come from the same
+    /// `extern_output_paths` derivation the identity resolution uses, so
+    /// the set covers exactly the units whose `materialized_outputs` rows
+    /// it reads (stow#618).
+    fn externs_in_flight(
+        &self,
+        parsed: &ParsedRustcArgs,
+        keep: impl Fn(&InFlightUnit) -> bool,
+    ) -> Vec<Arc<InFlightUnit>> {
+        let externs = crate::artifact_cache::extern_output_paths(parsed).unwrap_or_default();
+        let units = self.units.lock().expect("in-flight units mutex");
+        // One unit registers several paths and a dependent can name
+        // more than one of them — dedupe on the unit itself.
+        let mut seen = HashSet::new();
+        externs
+            .iter()
+            .filter_map(|(_, path)| units.get(path))
+            .filter(|unit| keep(unit))
+            .filter(|unit| seen.insert(Arc::as_ptr(unit)))
+            .cloned()
+            .collect()
     }
 
     /// Wait for the bookkeeping of every in-flight unit one of `parsed`'s
-    /// `--extern` dependencies could be. The paths come from the same
-    /// `extern_output_paths` derivation the identity resolution uses, so
-    /// the wait covers exactly the units whose `materialized_outputs`
-    /// rows it reads (stow#618).
+    /// `--extern` dependencies could be, whichever leg it is in: the
+    /// dependent's post-compile reads their rows once its own rustc has
+    /// finished (stow#618).
     pub async fn wait_for_externs(&self, parsed: &ParsedRustcArgs) {
-        let externs = crate::artifact_cache::extern_output_paths(parsed).unwrap_or_default();
-        let waiting = {
-            let units = self.units.lock().expect("in-flight units mutex");
-            // One unit registers several paths and a dependent can name
-            // more than one of them — dedupe on the unit itself.
-            let mut seen = HashSet::new();
-            externs
-                .iter()
-                .filter_map(|(_, path)| units.get(path))
-                .filter(|unit| seen.insert(Arc::as_ptr(unit)))
-                .cloned()
-                .collect::<Vec<Arc<InFlightUnit>>>()
-        };
-        for unit in waiting {
+        for unit in self.externs_in_flight(parsed, |_| true) {
+            unit.wait().await;
+        }
+    }
+
+    /// Wait for the bookkeeping of every in-flight unit one of `parsed`'s
+    /// `--extern` dependencies could be whose rustc has exited — the
+    /// units whose rows are about to land. A dependency still compiling
+    /// is not waited for: nothing recorded it yet and nothing will until
+    /// it exits, so a pipelined dependent plans against it as it always
+    /// did (stow#1431).
+    pub async fn wait_for_exited_externs(&self, parsed: &ParsedRustcArgs) {
+        for unit in self.externs_in_flight(parsed, |unit| unit.exited.has_completed()) {
             unit.wait().await;
         }
     }
@@ -447,7 +487,9 @@ impl InFlightUnits {
         }
         // A dependent waits on its dependencies one at a time, so this
         // flight can end before the dependent has subscribed to it: the
-        // latch stores the end either way (stow#642).
+        // latch stores the end either way (stow#642). A flight that ends
+        // without a report ends its first leg with it.
+        unit.exited.complete();
         unit.done.complete();
     }
 }
@@ -460,6 +502,9 @@ struct InFlightUnit {
     /// records — normalized by the same `path_to_string` the
     /// `materialized_outputs` rows and the extern lookup use.
     paths: Vec<String>,
+    /// Fired when the report frame arrives: rustc has exited and only the
+    /// supervisor's bookkeeping is left (stow#1431).
+    exited: crate::Latch,
     /// Fired once the flight ends; a waiter that arrives late resolves
     /// at once.
     done: crate::Latch,
@@ -480,6 +525,14 @@ impl InFlightUnit {
 struct Completion {
     registry: InFlightUnits,
     unit: Arc<InFlightUnit>,
+}
+
+impl Completion {
+    /// The report frame arrived: rustc has exited, the flight's second
+    /// leg — the bookkeeping — begins (stow#1431).
+    fn rustc_exited(&self) {
+        self.unit.exited.complete();
+    }
 }
 
 impl Drop for Completion {
@@ -659,19 +712,99 @@ async fn serve_connection<S, H>(
                 break;
             }
         };
-        if let Some(answer) =
-            answer_request(&handler, &tickets, &token, &in_flight, &mut marks, request).await
-            && let Err(error) = write_frame(&mut stream, &answer).await
-        {
+        let reply =
+            answer_request(&handler, &tickets, &token, &in_flight, &mut marks, request).await;
+        let answered = match reply.answer {
+            Some(answer) => write_frame(&mut stream, &answer).await,
+            None => Ok(()),
+        };
+        // The receipt is out: the bookkeeping runs now, whether or not
+        // the facade is still there to hear anything more (stow#1431).
+        if let Some(work) = reply.work {
+            finish_report(&handler, work).await;
+        }
+        if let Err(error) = answered {
             tracing::warn!(%error, "supervisor could not answer a facade");
             break;
         }
     }
 }
 
-/// Answer the request, or `None` when the request is one-way — an
-/// observation carries no reply because the facade that sent it is not
-/// waiting on one.
+/// What a request earns: the answer the facade reads, if it reads one,
+/// and the bookkeeping the answer precedes.
+pub struct Reply<P> {
+    answer: Option<Answer>,
+    /// The post-compile bookkeeping of a report, to run once the answer
+    /// is out — the facade's wait ends at the receipt, never at this.
+    work: Option<ReportWork<P>>,
+}
+
+impl<P> Reply<P> {
+    const fn answer(answer: Answer) -> Self {
+        Self {
+            answer: Some(answer),
+            work: None,
+        }
+    }
+
+    fn failed(message: impl Into<String>) -> Self {
+        Self::answer(Answer::Failed {
+            message: message.into(),
+        })
+    }
+
+    const fn nothing() -> Self {
+        Self {
+            answer: None,
+            work: None,
+        }
+    }
+
+    /// The answer to write and the bookkeeping to run after it, for a
+    /// transport that schedules the two itself.
+    pub fn split(self) -> (Option<Answer>, Option<ReportWork<P>>) {
+        (self.answer, self.work)
+    }
+}
+
+/// A report's post-compile bookkeeping, with the guard that ends the
+/// unit's flight: dropping it — when the bookkeeping ends, or unrun —
+/// completes the unit (stow#618).
+pub struct ReportWork<P> {
+    completion: Option<Completion>,
+    kind: ReportKind<P>,
+}
+
+enum ReportKind<P> {
+    /// A `Compiled` report with its restored ticket.
+    Compiled {
+        pending: P,
+        success: bool,
+        compile_time: Duration,
+    },
+    /// An `Observed` report of the finished compile.
+    Observed(Observation),
+}
+
+/// Run a report's bookkeeping; the flight ends when it does, succeeded
+/// or not.
+pub async fn finish_report<H: Handler>(handler: &Arc<H>, work: ReportWork<H::Pending>) {
+    let ReportWork { completion, kind } = work;
+    match kind {
+        ReportKind::Compiled {
+            pending,
+            success,
+            compile_time,
+        } => handler.compiled(pending, success, compile_time).await,
+        ReportKind::Observed(observation) => handler.observed(observation).await,
+    }
+    drop(completion);
+}
+
+/// Answer the request. A report is answered with a receipt as soon as the
+/// unit's `exited` latch has fired — before any bookkeeping is awaited,
+/// which the reply carries for the transport to run after the answer is
+/// out (stow#1431). A mark is one-way: the facade reads nothing for it.
 pub async fn answer_request<H: Handler>(
     handler: &Arc<H>,
     tickets: &mpsc::UnboundedSender<Ticket<H::Pending>>,
@@ -679,20 +812,17 @@ pub async fn answer_request<H: Handler>(
     in_flight: &InFlightUnits,
     marks: &mut Vec<ConnectionMark>,
     request: Request,
-) -> Option<Answer> {
+) -> Reply<H::Pending> {
     match request {
         Request::Plan(plan) => {
-            Some(answer_plan(handler, tickets, token, in_flight, marks, plan).await)
+            Reply::answer(answer_plan(handler, tickets, token, in_flight, marks, plan).await)
         }
-        Request::Compiled(report) => {
-            Some(answer_report(handler, tickets, token, marks, report).await)
-        }
+        Request::Compiled(report) => accept_report(tickets, token, marks, report).await,
         Request::Observed(observed) => {
-            answer_observation(handler, token, in_flight, marks, observed).await;
-            None
+            answer_observation(handler, token, in_flight, marks, observed).await
         }
         Request::AwaitServeMap(await_map) => {
-            Some(answer_await_serve_map(handler, token, await_map).await)
+            Reply::answer(answer_await_serve_map(handler, token, await_map).await)
         }
     }
 }
@@ -784,100 +914,116 @@ async fn answer_observation<H: Handler>(
     in_flight: &InFlightUnits,
     marks: &mut Vec<ConnectionMark>,
     observed: Observed,
-) {
+) -> Reply<H::Pending> {
+    // Only the report is answered, so only the report's refusal is: the
+    // mark's facade reads nothing, and its refusal is logged.
+    let is_report = observed.success.is_some();
     if observed.token != token {
+        if is_report {
+            return Reply::failed("supervisor token mismatch");
+        }
         tracing::warn!("supervisor observation with the wrong token dropped");
-        return;
+        return Reply::nothing();
     }
     let (Ok(executable), Ok(args)) = (observed.executable(), observed.args()) else {
-        tracing::warn!("supervisor observation could not be decoded; dropped");
-        return;
-    };
-    // The flight spans the mark frame's arrival to the end of this call:
-    // on the report the mark's guard moves into this scope, so the
-    // bookkeeping below — including every early return and error inside
-    // it — is what the unit's waiters are blocked on (stow#618).
-    let _completion = match observed.success {
-        None => {
-            if let Ok(parsed) = ParsedRustcArgs::parse(&args) {
-                match handler.rustc_host_target(&executable).await {
-                    Ok(host) => {
-                        if let Some(paths) = recordable_output_paths(&parsed, &host) {
-                            marks.push(ConnectionMark {
-                                ticket: None,
-                                completion: in_flight.register(paths),
-                            });
-                        }
-                    }
-                    // The frame is one-way, so the probe's failure is
-                    // reported in the build's log rather than answered;
-                    // the observation itself still reaches the handler.
-                    Err(error) => {
-                        tracing::warn!(%error, "supervisor could not probe the rustc host target, registering no in-flight mark");
-                    }
-                }
-            }
-            None
+        if is_report {
+            return Reply::failed("supervisor report could not be decoded");
         }
-        Some(_) => marks
+        tracing::warn!("supervisor observation could not be decoded; dropped");
+        return Reply::nothing();
+    };
+    let observation = Observation {
+        executable,
+        args,
+        success: observed.success,
+        compile_time: Duration::from_millis(observed.compile_millis),
+        env: observed.env,
+    };
+    if is_report {
+        // The report frame ends the flight's first leg: rustc has exited.
+        // The mark's guard rides with the bookkeeping, so the unit's
+        // waiters release exactly when it has run, including every early
+        // return and error inside it (stow#618, stow#1431).
+        let completion = marks
             .iter()
             .position(|mark| mark.ticket.is_none())
-            .map(|index| marks.remove(index).completion),
-    };
-    handler
-        .observed(Observation {
-            executable,
-            args,
-            success: observed.success,
-            compile_time: Duration::from_millis(observed.compile_millis),
-            env: observed.env,
-        })
-        .await;
+            .map(|index| marks.remove(index).completion)
+            .inspect(Completion::rustc_exited);
+        return Reply {
+            answer: Some(Answer::Received),
+            work: Some(ReportWork {
+                completion,
+                kind: ReportKind::Observed(observation),
+            }),
+        };
+    }
+    // The flight spans the mark frame's arrival to its report's
+    // bookkeeping: registered here, before rustc starts (stow#618).
+    if let Ok(parsed) = ParsedRustcArgs::parse(&observation.args) {
+        match handler.rustc_host_target(&observation.executable).await {
+            Ok(host) => {
+                if let Some(paths) = recordable_output_paths(&parsed, &host) {
+                    marks.push(ConnectionMark {
+                        ticket: None,
+                        completion: in_flight.register(paths),
+                    });
+                }
+            }
+            // The frame is one-way, so the probe's failure is
+            // reported in the build's log rather than answered;
+            // the observation itself still reaches the handler.
+            Err(error) => {
+                tracing::warn!(%error, "supervisor could not probe the rustc host target, registering no in-flight mark");
+            }
+        }
+    }
+    handler.observed(observation).await;
+    Reply::nothing()
 }
 
-async fn answer_report<H: Handler>(
-    handler: &Arc<H>,
-    tickets: &mpsc::UnboundedSender<Ticket<H::Pending>>,
+/// Accept the report of a compile the supervisor asked for: fire the
+/// unit's `exited` latch and answer with a receipt, carrying the
+/// bookkeeping for the transport to run after it (stow#1431). A report
+/// the supervisor cannot use is refused — the facade is listening for
+/// the receipt.
+async fn accept_report<P>(
+    tickets: &mpsc::UnboundedSender<Ticket<P>>,
     token: &str,
     marks: &mut Vec<ConnectionMark>,
     report: Compiled,
-) -> Answer {
+) -> Reply<P> {
     if report.token != token {
-        return Answer::Failed {
-            message: "supervisor token mismatch".to_owned(),
-        };
+        return Reply::failed("supervisor token mismatch");
     }
+    // The mark's guard is taken before anything awaits: a refusal below
+    // drops it and ends the flight, and an accepted report hands it to
+    // the bookkeeping (stow#618).
+    let completion = marks
+        .iter()
+        .position(|mark| mark.ticket == Some(report.ticket))
+        .map(|index| marks.remove(index).completion)
+        .inspect(Completion::rustc_exited);
     let (sender, restored) = oneshot::channel();
     if tickets.send(Ticket::Take(report.ticket, sender)).is_err() {
-        return Answer::Failed {
-            message: "supervisor ticket task is gone".to_owned(),
-        };
+        return Reply::failed("supervisor ticket task is gone");
     }
     match restored.await {
-        Ok(Some(pending)) => {
-            // The compile's bookkeeping is the flight's last leg: hold
-            // the mark's guard across it so the unit's waiters release
-            // exactly when the store has run, succeeded or not
-            // (stow#618).
-            let _completion = marks
-                .iter()
-                .position(|mark| mark.ticket == Some(report.ticket))
-                .map(|index| marks.remove(index).completion);
-            handler
-                .compiled(
+        Ok(Some(pending)) => Reply {
+            answer: Some(Answer::Received),
+            work: Some(ReportWork {
+                completion,
+                kind: ReportKind::Compiled {
                     pending,
-                    report.success,
-                    Duration::from_millis(report.compile_millis),
-                )
-                .await;
-            Answer::Recorded
-        }
-        Ok(None) => Answer::Failed {
-            message: format!("supervisor has no record of compile {}", report.ticket),
+                    success: report.success,
+                    compile_time: Duration::from_millis(report.compile_millis),
+                },
+            }),
         },
-        Err(_) => Answer::Failed {
-            message: "supervisor ticket task dropped the lookup".to_owned(),
-        },
+        Ok(None) => Reply::failed(format!(
+            "supervisor has no record of compile {}",
+            report.ticket
+        )),
+        Err(_) => Reply::failed("supervisor ticket task dropped the lookup"),
     }
 }
 
@@ -951,15 +1097,17 @@ mod tests {
         }
     }
 
-    /// The whole round trip a facade makes: ask, be told to compile, run
-    /// the compile, report it. This is the assertion that fails if either
+    /// The whole exchange a facade makes: ask, be told to compile, run
+    /// the compile, report it for a receipt and close. The bookkeeping
+    /// is applied after the receipt, so the assertion reads it once the
+    /// shutdown drain has run. This is the assertion that fails if either
     /// side of the wire changes without the other.
     #[tokio::test]
     async fn a_facade_plans_and_reports_over_the_wire() {
         let handler = Arc::new(Stub {
             reports: AtomicUsize::new(0),
         });
-        let supervisor = start(
+        let mut supervisor = start(
             Arc::clone(&handler),
             super::InFlightUnits::default(),
             &test_executable(),
@@ -985,6 +1133,8 @@ mod tests {
             .report(&ticket, true, Duration::ZERO)
             .await
             .expect("report");
+        connection.close().await.expect("close");
+        assert_eq!(supervisor.shutdown().await, 0, "the drain finishes cleanly");
         assert_eq!(handler.reports.load(Ordering::SeqCst), 1);
     }
 
@@ -1229,7 +1379,7 @@ mod tests {
             _args: Vec<OsString>,
             _env: crate::supervisor::protocol::InvocationEnv,
         ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
-            std::future::ready(Decision::Served(ArtifactNotifications::default()))
+            std::future::ready(Decision::Compile(OsString::new()))
         }
 
         fn compiled(
@@ -1238,18 +1388,8 @@ mod tests {
             _success: bool,
             _compile_time: Duration,
         ) -> impl std::future::Future<Output = ()> + Send {
-            std::future::ready(())
-        }
-
-        fn observed(
-            self: &Arc<Self>,
-            observation: super::Observation,
-        ) -> impl std::future::Future<Output = ()> + Send {
             let this = Arc::clone(self);
             async move {
-                if observation.success.is_none() {
-                    return;
-                }
                 let mut release = this.release.subscribe();
                 this.started.send_modify(|begun| *begun += 1);
                 while !*release.borrow() {
@@ -1259,6 +1399,13 @@ mod tests {
                 }
                 this.finished.fetch_add(1, Ordering::SeqCst);
             }
+        }
+
+        fn observed(
+            self: &Arc<Self>,
+            _observation: super::Observation,
+        ) -> impl std::future::Future<Output = ()> + Send {
+            std::future::ready(())
         }
 
         fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
@@ -1274,7 +1421,7 @@ mod tests {
     }
 
     /// Open the raw transport to the supervisor — no client framing: the
-    /// test writes its `Observed` frames itself.
+    /// test writes its frames itself.
     #[cfg(unix)]
     async fn connect_raw(endpoint: &crate::supervisor::Endpoint) -> tokio::net::UnixStream {
         let crate::supervisor::Endpoint::Unix(path) = endpoint else {
@@ -1286,7 +1433,7 @@ mod tests {
     }
 
     /// Open the raw transport to the supervisor — no client framing: the
-    /// test writes its `Observed` frames itself.
+    /// test writes its frames itself.
     #[cfg(not(unix))]
     async fn connect_raw(endpoint: &crate::supervisor::Endpoint) -> tokio::net::TcpStream {
         let crate::supervisor::Endpoint::Loopback(port) = endpoint else {
@@ -1297,14 +1444,18 @@ mod tests {
             .expect("connect to the supervisor")
     }
 
-    /// Write the one-way post-compile `Observed` frame a facade sends
-    /// after its rustc exits.
-    async fn send_report<S>(stream: &mut S, token: &str)
+    /// What a facade does around its rustc: plan the invocation, hear
+    /// `Compile`, and — once rustc has exited — write the `Compiled`
+    /// report and read its receipt. Returns after the receipt, not after
+    /// the bookkeeping is applied.
+    async fn plan_and_report<S>(stream: &mut S, token: &str)
     where
-        S: tokio::io::AsyncWrite + Unpin + Send,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
-        use crate::supervisor::protocol::{Observed, Request, write_frame};
-        let report = Observed::new(
+        use crate::supervisor::protocol::{
+            Answer, Compiled, InvocationEnv, Plan, Request, read_frame, write_frame,
+        };
+        let plan = Plan::new(
             token.to_owned(),
             std::ffi::OsStr::new("rustc"),
             &[
@@ -1313,13 +1464,30 @@ mod tests {
                 OsString::from("--crate-type"),
                 OsString::from("lib"),
             ],
-            Some(true),
-            0,
-            crate::supervisor::protocol::InvocationEnv::default(),
+            InvocationEnv::default(),
         );
-        write_frame(&mut *stream, &Request::Observed(report))
+        write_frame(&mut *stream, &Request::Plan(plan))
+            .await
+            .expect("write the plan frame");
+        let Some(Answer::Compile { ticket }) = read_frame(&mut *stream)
+            .await
+            .expect("read the plan's answer")
+        else {
+            panic!("the handler asks for a compile");
+        };
+        let report = Compiled {
+            token: token.to_owned(),
+            ticket,
+            success: true,
+            compile_millis: 0,
+        };
+        write_frame(&mut *stream, &Request::Compiled(report))
             .await
             .expect("write the report frame");
+        let receipt: Option<Answer> = read_frame(&mut *stream)
+            .await
+            .expect("read the report's receipt");
+        assert_eq!(receipt, Some(Answer::Received));
     }
 
     /// Drive the shutdown `drain` until it waits on exactly one
@@ -1358,7 +1526,7 @@ mod tests {
         let [(_, endpoint), (_, token), _] = supervisor.env();
         let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
         let mut stream = connect_raw(&endpoint).await;
-        send_report(&mut stream, &token).await;
+        plan_and_report(&mut stream, &token).await;
         handler.started(1).await;
 
         let draining = supervisor.connections.draining.subscribe();
@@ -1395,7 +1563,7 @@ mod tests {
             drop(connect_raw(&endpoint).await);
         }
         let mut stream = connect_raw(&endpoint).await;
-        send_report(&mut stream, &token).await;
+        plan_and_report(&mut stream, &token).await;
         handler.started(1).await;
 
         let draining = supervisor.connections.draining.subscribe();
@@ -1423,7 +1591,7 @@ mod tests {
         let [(_, endpoint), (_, token), _] = supervisor.env();
         let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
         let mut stream = connect_raw(&endpoint).await;
-        send_report(&mut stream, &token).await;
+        plan_and_report(&mut stream, &token).await;
         handler.started(1).await;
 
         // The release never comes: the drain must give the connection up.
@@ -1478,5 +1646,266 @@ mod tests {
             .await
             .expect("the dependent is released once both flights have ended")
             .expect("join the waiter");
+    }
+
+    /// The argv of one library unit compiling into `/deps`: `-C metadata`
+    /// and `--out-dir` make it a unit whose outputs the supervisor
+    /// records and registers a flight for, and each `externs` entry is a
+    /// dependency's rlib.
+    fn unit_args(name: &str, externs: &[&str]) -> Vec<OsString> {
+        let mut args = [
+            "--crate-name",
+            name,
+            "--crate-type",
+            "lib",
+            "--emit",
+            "dep-info,metadata,link",
+            "--out-dir",
+            "/deps",
+            "-C",
+            "metadata=m",
+            "-C",
+            "extra-filename=-m",
+            "src/lib.rs",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        for rlib in externs {
+            args.push(OsString::from("--extern"));
+            args.push(OsString::from(format!("dep={rlib}")));
+        }
+        args
+    }
+
+    /// The rlib path a unit's flight is registered under.
+    fn rlib_path(args: &[OsString]) -> String {
+        let parsed = crate::rustc_args::ParsedRustcArgs::parse(args).expect("parse the unit");
+        crate::artifact_cache::path_to_string(&parsed.output_rlib_path().expect("an rlib unit"))
+            .expect("utf-8 output path")
+    }
+
+    /// The facade's report returns — its receipt read — and the
+    /// connection ends while the supervisor's bookkeeping is still held,
+    /// and a dependent's plan waits for the unit's rows once its rustc
+    /// has exited — until the bookkeeping ends (stow#1431).
+    #[tokio::test]
+    async fn a_report_returns_while_its_bookkeeping_is_held() {
+        let handler = Bookkeeping::held();
+        let in_flight = super::InFlightUnits::default();
+        let mut supervisor = start(Arc::clone(&handler), in_flight.clone(), &test_executable())
+            .expect("start the supervisor");
+        let [(_, endpoint), (_, token), _] = supervisor.env();
+        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+
+        let dep_args = unit_args("dep", &[]);
+        let dep_rlib = rlib_path(&dep_args);
+        let mut connection = Connection::open(&endpoint, token)
+            .await
+            .expect("connect to the supervisor");
+        let ClientDecision::Compile(ticket) = connection
+            .plan(std::ffi::OsStr::new("rustc"), &dep_args)
+            .await
+            .expect("plan")
+        else {
+            panic!("the handler asks for a compile");
+        };
+        let dependent =
+            crate::rustc_args::ParsedRustcArgs::parse(&unit_args("consumer", &[&dep_rlib]))
+                .expect("parse the dependent");
+
+        // Still compiling: a dependent's plan is not held.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            in_flight.wait_for_exited_externs(&dependent),
+        )
+        .await
+        .expect("a dependent of a unit still compiling is not held");
+
+        // The facade reports and leaves; the bookkeeping is still held.
+        connection
+            .report(&ticket, true, Duration::ZERO)
+            .await
+            .expect("the report returns without the bookkeeping");
+        connection.close().await.expect("the connection ends");
+        handler.started(1).await;
+        assert_eq!(
+            handler.finished.load(Ordering::SeqCst),
+            0,
+            "the report returned while its bookkeeping was held"
+        );
+
+        // rustc has exited and the rows are not written: the plan waits.
+        let planning = tokio::spawn({
+            let in_flight = in_flight.clone();
+            async move { in_flight.wait_for_exited_externs(&dependent).await }
+        });
+        in_flight.parked_on(&dep_rlib, 1).await;
+        assert!(
+            !planning.is_finished(),
+            "the plan ran before the rows landed"
+        );
+
+        handler.release.send(true).expect("release the bookkeeping");
+        tokio::time::timeout(Duration::from_secs(5), planning)
+            .await
+            .expect("the plan is released once the bookkeeping ends")
+            .expect("join the plan");
+        assert_eq!(supervisor.shutdown().await, 0, "the drain finishes cleanly");
+        assert_eq!(handler.finished.load(Ordering::SeqCst), 1);
+    }
+
+    /// A dependent's plan issued the moment the report's receipt is read
+    /// waits: the receipt is sent only once the unit's `exited` latch
+    /// has fired, so no gap exists between a facade's exit and the
+    /// plan's wait. Nothing synchronizes with the bookkeeping first
+    /// (stow#1431).
+    #[tokio::test]
+    async fn a_plan_right_after_the_report_always_waits() {
+        let handler = Bookkeeping::held();
+        let in_flight = super::InFlightUnits::default();
+        let mut supervisor = start(Arc::clone(&handler), in_flight.clone(), &test_executable())
+            .expect("start the supervisor");
+        let [(_, endpoint), (_, token), _] = supervisor.env();
+        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+
+        let dep_args = unit_args("dep", &[]);
+        let dep_rlib = rlib_path(&dep_args);
+        let dependent =
+            crate::rustc_args::ParsedRustcArgs::parse(&unit_args("consumer", &[&dep_rlib]))
+                .expect("parse the dependent");
+        let mut connection = Connection::open(&endpoint, token)
+            .await
+            .expect("connect to the supervisor");
+        let ClientDecision::Compile(ticket) = connection
+            .plan(std::ffi::OsStr::new("rustc"), &dep_args)
+            .await
+            .expect("plan")
+        else {
+            panic!("the handler asks for a compile");
+        };
+        let flight = in_flight.flight(&dep_rlib);
+        connection
+            .report(&ticket, true, Duration::ZERO)
+            .await
+            .expect("the report returns");
+        assert!(
+            flight.exited.has_completed(),
+            "the receipt came before the unit was recorded as exited"
+        );
+        // The dependent plans at once; it must park on the unit.
+        let planning = tokio::spawn({
+            let in_flight = in_flight.clone();
+            async move { in_flight.wait_for_exited_externs(&dependent).await }
+        });
+        in_flight.parked_on(&dep_rlib, 1).await;
+        assert!(!planning.is_finished());
+
+        handler.release.send(true).expect("release the bookkeeping");
+        tokio::time::timeout(Duration::from_secs(5), planning)
+            .await
+            .expect("the plan is released once the bookkeeping ends")
+            .expect("join the plan");
+        connection.close().await.expect("close");
+        assert_eq!(supervisor.shutdown().await, 0);
+    }
+
+    /// A report the supervisor cannot use is refused with `Failed` — the
+    /// facade is listening for a receipt — and the unit's flight ends
+    /// with the facade's connection (stow#1431).
+    #[tokio::test]
+    async fn a_report_with_an_unknown_ticket_is_refused() {
+        let handler = Bookkeeping::held();
+        let in_flight = super::InFlightUnits::default();
+        let mut supervisor = start(Arc::clone(&handler), in_flight.clone(), &test_executable())
+            .expect("start the supervisor");
+        let [(_, endpoint), (_, token), _] = supervisor.env();
+        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+
+        let dep_args = unit_args("dep", &[]);
+        let mut stream = connect_raw(&endpoint).await;
+        let flight = {
+            use crate::supervisor::protocol::{
+                Answer, Compiled, InvocationEnv, Plan, Request, read_frame, write_frame,
+            };
+            let plan = Plan::new(
+                token.clone(),
+                std::ffi::OsStr::new("rustc"),
+                &dep_args,
+                InvocationEnv::default(),
+            );
+            write_frame(&mut stream, &Request::Plan(plan))
+                .await
+                .expect("write the plan");
+            let Some(Answer::Compile { ticket }) =
+                read_frame(&mut stream).await.expect("read the answer")
+            else {
+                panic!("the handler asks for a compile");
+            };
+            // Another ticket than the one the plan was given.
+            let report = Compiled {
+                token,
+                ticket: ticket + 1,
+                success: true,
+                compile_millis: 0,
+            };
+            // The plan's answer came after the flight registered.
+            let flight = in_flight.flight(&rlib_path(&dep_args));
+            write_frame(&mut stream, &Request::Compiled(report))
+                .await
+                .expect("write the report");
+            let refusal: Option<Answer> = read_frame(&mut stream)
+                .await
+                .expect("read the report's answer");
+            assert!(
+                matches!(&refusal, Some(Answer::Failed { message }) if message.contains("no record")),
+                "{refusal:?}"
+            );
+            flight
+        };
+        // The report matches no flight, so it ends none: the unit stays
+        // in flight until its facade's connection ends, as for a facade
+        // that dies without reporting. The bookkeeping never runs.
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), flight.wait())
+            .await
+            .expect("the connection's end releases the flight");
+        assert_eq!(supervisor.shutdown().await, 0);
+        assert_eq!(handler.started.borrow().to_owned(), 0);
+    }
+
+    /// The first leg of a flight is rustc running: a plan does not wait
+    /// for it. The second leg — the report arrived, the rows are
+    /// pending — it does, until the flight ends however it ends
+    /// (stow#1431).
+    #[tokio::test]
+    async fn a_plan_waits_for_exited_units_only() {
+        let in_flight = super::InFlightUnits::default();
+        let flight = in_flight.register(vec!["/deps/libdep-m.rlib".to_owned()]);
+        let dependent = crate::rustc_args::ParsedRustcArgs::parse(&unit_args(
+            "consumer",
+            &["/deps/libdep-m.rlib"],
+        ))
+        .expect("parse the dependent");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            in_flight.wait_for_exited_externs(&dependent),
+        )
+        .await
+        .expect("a unit still compiling is not waited for");
+
+        flight.rustc_exited();
+        let planning = tokio::spawn({
+            let in_flight = in_flight.clone();
+            async move { in_flight.wait_for_exited_externs(&dependent).await }
+        });
+        in_flight.parked_on("/deps/libdep-m.rlib", 1).await;
+        assert!(!planning.is_finished());
+        // The facade's connection ending without anything more releases it.
+        drop(flight);
+        tokio::time::timeout(Duration::from_secs(5), planning)
+            .await
+            .expect("the plan is released when the flight ends")
+            .expect("join the plan");
     }
 }
