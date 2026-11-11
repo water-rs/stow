@@ -1162,6 +1162,38 @@ fn build_crate_declarations() {
     );
 }
 
+/// The replay job runs only for a failed build that uploaded a candidate
+/// source failure: any other failed build has nothing to replay, and the job
+/// would take a runner only to fail on the missing artifact.
+#[test]
+fn build_crate_verifies_only_a_candidate_failure() {
+    let wf = load_workflow("build-crate.yml");
+    assert_eq!(
+        at(&wf, "jobs.build.outputs.failure-candidate")
+            .map(scalar)
+            .as_deref(),
+        Some("${{ steps.failure-candidate.outputs.artifact-id }}")
+    );
+    let upload = at(&wf, "jobs.build.steps")
+        .and_then(serde_yml::Value::as_sequence)
+        .and_then(|steps| {
+            steps
+                .iter()
+                .find(|step| field(step, "id").map(scalar).as_deref() == Some("failure-candidate"))
+        })
+        .expect("the build job's failure-candidate step");
+    assert_eq!(
+        at(upload, "with.name").map(scalar).as_deref(),
+        Some("failure-candidate-${{ github.run_attempt }}")
+    );
+    assert_eq!(
+        at(&wf, "jobs.verify-failure.if").map(scalar).as_deref(),
+        Some(
+            "always() && inputs.repack_rustc == '' && needs.build.result == 'failure' && needs.build.outputs.failure-candidate != ''"
+        )
+    );
+}
+
 /// The operator's repack job runs only in a repack run and republishes
 /// under the builder identity, so it holds the publish job's rights.
 #[test]
