@@ -35,6 +35,14 @@ struct Fixture {
     proc_macro: bool,
 }
 
+/// The environment a unit-graph query runs in under a test's own cargo
+/// home, not the developer's.
+fn cargo_home_env(cargo_home: &Path) -> stow_cli::SessionEnv {
+    stow_cli::SessionEnv::of_this_process()
+        .expect("the test process's environment")
+        .with_var("CARGO_HOME", cargo_home)
+}
+
 fn toml_document(value: &Value) -> String {
     toml::to_string(value).expect("fixture toml")
 }
@@ -1206,6 +1214,7 @@ fn native_dedup_shadow_mints_the_resolver_ids() {
             std::ffi::OsString::from("--target"),
             std::ffi::OsString::from(host.as_str()),
         ];
+        let env = cargo_home_env(cargo_home.path());
         let unit_graph = |explicit: bool| {
             let (cargo_args, target) = if explicit {
                 (&explicit_args[..], Some(host.as_str()))
@@ -1220,7 +1229,7 @@ fn native_dedup_shadow_mints_the_resolver_ids() {
                 manifest.parent().unwrap(),
                 host.as_str(),
                 rustc,
-                Some(cargo_home.path()),
+                &env,
             )
         };
         // Native spelling: no `--target` — cargo dedups `shared` into
@@ -1737,7 +1746,7 @@ fn platform_gated_dependencies_match_the_cargo_unit_graph() {
                 manifest.parent().unwrap(),
                 host.as_str(),
                 rustc,
-                Some(cargo_home.path()),
+                &cargo_home_env(cargo_home.path()),
             )
             .await
             .unwrap_or_else(|error| panic!("{target} cargo --unit-graph: {error}"));
@@ -2033,7 +2042,7 @@ fn outcome3_host_task_mints_a_distinct_id_and_verifies() {
                 manifest.parent().unwrap(),
                 host.as_str(),
                 rustc,
-                Some(cargo_home.path()),
+                &cargo_home_env(cargo_home.path()),
             )
             .await
             .unwrap_or_else(|error| panic!("{label} native build unit graph: {error}"));
@@ -2078,7 +2087,7 @@ fn outcome3_host_task_mints_a_distinct_id_and_verifies() {
                 workspace.manifest_path().parent().unwrap(),
                 host.as_str(),
                 rustc,
-                Some(cargo_home.path()),
+                &cargo_home_env(cargo_home.path()),
             )
             .await
             .unwrap_or_else(|error| panic!("{label} wrapper native build unit graph: {error}"));

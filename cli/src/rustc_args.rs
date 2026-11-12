@@ -6,47 +6,25 @@ use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Shared};
 use tracing::Instrument as _;
 
+use crate::session_env::SessionEnv;
+
 pub use stow_types::rustc::ParsedRustcArgs;
 
 pub const STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV: &str = "STOW_PUBLIC_CACHE_RUSTC_VERSION";
 pub const STOW_PUBLIC_CACHE_TARGET_ENV: &str = "STOW_PUBLIC_CACHE_TARGET";
 
-/// Env channel carrying the rustc argument a `stow`-supervised cargo run
-/// appends to every unit — the workspace path remap. It names a JSON
-/// `Vec<String>` build file rather than carrying the list itself — the
-/// same file-table channel the build's other generated payloads use
-/// (stow#625). A private channel
-/// rather than `RUSTFLAGS`, because env rustflags replace the user's
-/// configured rustflags outright: assigning `RUSTFLAGS` would make cargo
-/// ignore `.cargo/config.toml` `target.*.rustflags` — the usual way
-/// `-C link-arg=-fuse-ld=mold` is enabled — for the whole build.
-pub const STOW_RUSTC_EXTRA_ARGS_FILE_ENV: &str = "STOW_RUSTC_EXTRA_ARGS_FILE";
-
-/// The extra rustc arguments the driver named on the environment —
-/// empty when the variable is unset.
-///
-/// # Errors
-///
-/// A set variable whose file is missing or malformed is a wiring bug and
-/// fails loudly, naming the path — the same contract the build's other
-/// table files follow (stow#625).
-pub fn extra_args_from_env() -> stow_types::error::Result<Vec<std::ffi::OsString>> {
-    let Some(path) = std::env::var_os(STOW_RUSTC_EXTRA_ARGS_FILE_ENV) else {
-        return Ok(Vec::new());
-    };
-    let path = std::path::PathBuf::from(path);
-    let args = crate::read_build_json_table::<Vec<String>>(&path, STOW_RUSTC_EXTRA_ARGS_FILE_ENV)?;
-    Ok(args.into_iter().map(std::ffi::OsString::from).collect())
-}
 #[tracing::instrument(name = "stow.rustc.probe.version", skip_all, fields(env_cache_hit))]
-pub async fn detect_rustc_version(rustc: &std::ffi::OsStr) -> Result<String, String> {
-    if let Some(version) = configured_public_cache_rustc_version() {
+pub async fn detect_rustc_version(
+    rustc: &std::ffi::OsStr,
+    env: &SessionEnv,
+) -> Result<String, String> {
+    if let Some(version) = configured_public_cache_rustc_version(env) {
         tracing::Span::current().record("env_cache_hit", true);
         return Ok(version);
     }
     tracing::Span::current().record("env_cache_hit", false);
 
-    let output = Command::new(rustc)
+    let output = probe_command(rustc, env)?
         .arg("--version")
         .output()
         .await
@@ -68,31 +46,47 @@ pub async fn detect_rustc_version(rustc: &std::ffi::OsStr) -> Result<String, Str
 }
 
 #[tracing::instrument(name = "stow.rustc.probe.host", skip_all, fields(env_cache_hit))]
-pub async fn detect_rustc_host_target(rustc: &std::ffi::OsStr) -> Result<String, String> {
-    if let Some(target) = configured_public_cache_target() {
+pub async fn detect_rustc_host_target(
+    rustc: &std::ffi::OsStr,
+    env: &SessionEnv,
+) -> Result<String, String> {
+    if let Some(target) = configured_public_cache_target(env) {
         tracing::Span::current().record("env_cache_hit", true);
         return Ok(target);
     }
     tracing::Span::current().record("env_cache_hit", false);
 
-    rustc_host_target(rustc).await
+    rustc_host_target(rustc, env).await
+}
+
+/// A command running the rustc `rustc` names in `env`: resolved through
+/// its `PATH`, started with exactly its variables, in its working
+/// directory. Probes of a build's rustc run in the build's environment —
+/// under rustup `RUSTUP_TOOLCHAIN` and `PATH` pick the toolchain — never
+/// in the probing process's own.
+fn probe_command(rustc: &OsStr, env: &SessionEnv) -> Result<Command, String> {
+    env.command(rustc)
+        .map_err(|error| format!("{}: {error}", Path::new(rustc).display()))
 }
 
 /// The compiling rustc's own `host:` triple — a real `-vV` probe, never
 /// the `STOW_PUBLIC_CACHE_TARGET` shortcut. The env carries the build's
 /// *consumer* target, which is a different platform than the host a
 /// unit without `--target` links for under a `--target` build (stow#317).
-pub async fn rustc_host_target(rustc: &std::ffi::OsStr) -> Result<String, String> {
-    vv_host(&rustc_vv(rustc).await?)
+pub async fn rustc_host_target(
+    rustc: &std::ffi::OsStr,
+    env: &SessionEnv,
+) -> Result<String, String> {
+    vv_host(&rustc_vv(rustc, env).await?)
 }
 
 /// The raw stdout of one `rustc -vV` — the one probe every rustc-facts
 /// consumer shares (stow#608): the host probe, the version probe and the
-/// supervisor base's facts all come out of this output, so pre-cargo
+/// session base's facts all come out of this output, so pre-cargo
 /// rustc spawns about rustc itself are exactly `-vV` and `--print
 /// sysroot`, run concurrently.
-pub async fn rustc_vv(rustc: &std::ffi::OsStr) -> Result<String, String> {
-    let output = Command::new(rustc)
+pub async fn rustc_vv(rustc: &std::ffi::OsStr, env: &SessionEnv) -> Result<String, String> {
+    let output = probe_command(rustc, env)?
         .arg("-vV")
         .output()
         .await
@@ -166,10 +160,10 @@ impl BuildRustc {
     /// configured one verbatim, or the toolchain's
     /// `<sysroot>/bin/rustc` — the path cargo hands its wrapper when it
     /// asks the rustup shim for the real rustc.
-    pub async fn facade_spelling(&self) -> Result<OsString, String> {
+    pub async fn facade_spelling(&self, env: &SessionEnv) -> Result<OsString, String> {
         match self {
             Self::Configured(rustc) => Ok(rustc.clone()),
-            Self::ToolchainDefault => sysroot_rustc_executable(self.executable()).await,
+            Self::ToolchainDefault => sysroot_rustc_executable(self.executable(), env).await,
         }
     }
 }
@@ -180,8 +174,8 @@ impl BuildRustc {
 /// passing the bare name, and `rustc --print sysroot` answers the same
 /// directory. `rustc` is the executable the probe runs — the build
 /// rustc's [`BuildRustc::executable`].
-async fn sysroot_rustc_executable(rustc: &OsStr) -> Result<OsString, String> {
-    let output = Command::new(rustc)
+async fn sysroot_rustc_executable(rustc: &OsStr, env: &SessionEnv) -> Result<OsString, String> {
+    let output = probe_command(rustc, env)?
         .arg("--print")
         .arg("sysroot")
         .output()
@@ -202,17 +196,18 @@ async fn sysroot_rustc_executable(rustc: &OsStr) -> Result<OsString, String> {
 }
 
 /// One `rustc -vV` shared by every consumer — the project context's
-/// target and version facts, the supervisor base's facts, and the link
+/// target and version facts, the session base's facts, and the link
 /// resolution's key — so the probe spawns once.
 pub type SharedRustcVv = Shared<BoxFuture<'static, Result<std::sync::Arc<String>, String>>>;
 
 /// The one constructor every `SharedRustcVv` comes from: spawn the
 /// `-vV` probe now, share the pending result. `rustc` is the build's
 /// rustc — the configured one when `RUSTC` / `build.rustc` names one,
-/// else the toolchain default (stow#608).
-pub fn shared_rustc_vv(rustc: std::ffi::OsString) -> SharedRustcVv {
+/// else the toolchain default (stow#608). The probe runs in `env`, the
+/// build's environment.
+pub fn shared_rustc_vv(rustc: std::ffi::OsString, env: SessionEnv) -> SharedRustcVv {
     let probe = tokio::spawn(
-        async move { rustc_vv(&rustc).await }
+        async move { rustc_vv(&rustc, &env).await }
             .instrument(tracing::debug_span!("stow.precargo.rustc_vv_probe")),
     );
     async move {
@@ -225,14 +220,91 @@ pub fn shared_rustc_vv(rustc: std::ffi::OsString) -> SharedRustcVv {
     .shared()
 }
 
-pub fn configured_public_cache_rustc_version() -> Option<String> {
-    std::env::var(STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+pub fn configured_public_cache_rustc_version(env: &SessionEnv) -> Option<String> {
+    configured_text(env, STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV)
 }
 
-pub fn configured_public_cache_target() -> Option<String> {
-    std::env::var(STOW_PUBLIC_CACHE_TARGET_ENV)
-        .ok()
+pub fn configured_public_cache_target(env: &SessionEnv) -> Option<String> {
+    configured_text(env, STOW_PUBLIC_CACHE_TARGET_ENV)
+}
+
+/// The non-blank Unicode value of `key` in `env`.
+fn configured_text(env: &SessionEnv, key: &str) -> Option<String> {
+    env.var_os(key)
+        .and_then(OsStr::to_str)
         .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::ffi::OsStr;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::{
+        STOW_PUBLIC_CACHE_TARGET_ENV, configured_public_cache_target, detect_rustc_host_target,
+    };
+    use crate::session_env::SessionEnv;
+
+    /// The probe runs the `rustc` the build's `PATH` names, with the
+    /// build's variables: a stub on a `PATH` only the environment holds
+    /// answers `-vV`, and records what it saw.
+    #[tokio::test]
+    async fn the_rustc_probe_runs_in_the_builds_environment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seen = dir.path().join("seen");
+        let stub = dir.path().join("rustc");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho \"$STOW_PROBE_MARK $1\" > \"$STOW_PROBE_SEEN\"\necho 'rustc 9.9.9 (stub)'\necho 'host: stub-host-triple'\necho 'release: 9.9.9'\n",
+        )
+        .expect("write the stub rustc");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub executable");
+        let env = SessionEnv::for_tests([
+            ("PATH", dir.path().as_os_str()),
+            ("STOW_PROBE_MARK", OsStr::new("the-builds-variable")),
+            ("STOW_PROBE_SEEN", seen.as_os_str()),
+        ]);
+
+        let vv = super::rustc_vv(OsStr::new("rustc"), &env)
+            .await
+            .expect("the stub answers -vV");
+        assert_eq!(super::vv_host(&vv).as_deref(), Ok("stub-host-triple"));
+        assert_eq!(
+            std::fs::read_to_string(&seen).expect("the stub recorded its run"),
+            "the-builds-variable -vV\n"
+        );
+        assert_eq!(
+            detect_rustc_host_target(OsStr::new("rustc"), &env)
+                .await
+                .as_deref(),
+            Ok("stub-host-triple")
+        );
+    }
+
+    /// The public-cache target override is the environment's own.
+    #[tokio::test]
+    async fn the_public_cache_target_is_read_from_the_given_environment() {
+        let env = SessionEnv::for_tests([(
+            STOW_PUBLIC_CACHE_TARGET_ENV,
+            OsStr::new("x86_64-unknown-linux-gnu"),
+        )]);
+        assert_eq!(
+            configured_public_cache_target(&env).as_deref(),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        // The override short-circuits the probe: no rustc is on this
+        // environment's (empty) `PATH`.
+        assert_eq!(
+            detect_rustc_host_target(OsStr::new("rustc"), &env)
+                .await
+                .as_deref(),
+            Ok("x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            configured_public_cache_target(&SessionEnv::for_tests([])),
+            None
+        );
+    }
 }

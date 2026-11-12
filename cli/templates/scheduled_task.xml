@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-16"?>
+{#- Every element below is from the Task Scheduler 1.2 schema, https://learn.microsoft.com/windows/win32/taskschd/task-scheduler-schema, and each value is the one the documentation of that element names for the stated behaviour. #}
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+	<RegistrationInfo>
+		<Description>Starts the per-user stow daemon at logon and whenever a build needs it.</Description>
+	</RegistrationInfo>
+	<Triggers>
+		{#- LogonTrigger fires when the user named by UserId logs on. Without a UserId it fires for every user and registering it needs elevation; with the user's own SID it does not. #}
+		<LogonTrigger>
+			<Enabled>true</Enabled>
+			<UserId>{{ user_sid }}</UserId>
+		</LogonTrigger>
+	</Triggers>
+	<Principals>
+		{#- InteractiveToken runs the task as the logged-on user, only while that user is logged on, with no stored password; LeastPrivilege is the user's unelevated token (RunLevelType). #}
+		<Principal id="Author">
+			<UserId>{{ user_sid }}</UserId>
+			<LogonType>InteractiveToken</LogonType>
+			<RunLevel>LeastPrivilege</RunLevel>
+		</Principal>
+	</Principals>
+	<Settings>
+		{#- Queue (MultipleInstancesPolicy): a run requested while an instance runs starts when that instance ends, so a client that asks for a run while a retiring daemon is still exiting gets the successor; the daemon takes its own lock, so a queued run that fires while a daemon serves exits at once. #}
+		<MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>
+		{#- A laptop on battery still serves its builds. #}
+		<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+		<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+		{#- `schtasks /End` and `/Delete` may end the daemon. #}
+		<AllowHardTerminate>true</AllowHardTerminate>
+		{#- AllowStartOnDemand is what lets `schtasks /Run` start the task. #}
+		<AllowStartOnDemand>true</AllowStartOnDemand>
+		<Enabled>true</Enabled>
+		<Hidden>false</Hidden>
+		{#- PT0S (an ISO 8601 duration of zero) is no execution time limit: the schema's default of 72 hours would end the daemon. #}
+		<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+		{#- Priority 4 is the normal process priority class; the default, 7, is below normal and would slow the builds the daemon serves. #}
+		<Priority>4</Priority>
+	</Settings>
+	<Actions Context="Author">
+		{#- Command is the runtime executable `stow setup` ran from, Arguments its `daemon` command naming the run directory this task serves. #}
+		<Exec>
+			<Command>{{ program }}</Command>
+			<Arguments>{{ arguments }}</Arguments>
+		</Exec>
+	</Actions>
+</Task>

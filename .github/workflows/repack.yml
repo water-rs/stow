@@ -1,0 +1,49 @@
+name: repack
+
+# A repack sweep: `build-crate.yml`'s `repack` job, called as a reusable
+# workflow. The job has to run from `build-crate.yml` because the
+# certificate identity clients trust is that file on main, which a called
+# workflow's `job_workflow_ref` (Fulcio's SAN) still names. The call lives
+# in its own workflow so that `repack-followup.yml` can trigger on this one
+# alone: a `workflow_run` trigger filters by workflow name, never by run
+# title or input, and a trigger on `build-crate` created a skipped
+# follow-up run for every build run.
+#
+# The sweep is dispatched by an operator or by `repack-followup.yml` with
+# its GitHub App token, so the completion of this run triggers the
+# follow-up (see there).
+
+run-name: ${{ format('{0}-repack', inputs.repack_rustc) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      repack_rustc:
+        description: Rustc whose published nodes are repacked into the single-pack layout
+        required: true
+        type: string
+      repack_concurrency:
+        description: Tasks a repack run repacks at once
+        required: false
+        type: string
+        default: '4'
+
+permissions: {}
+
+# A repack run serializes per rustc: a second dispatch for the same rustc
+# queues behind the sweep in flight instead of racing it.
+concurrency:
+  group: ${{ format('repack-{0}', inputs.repack_rustc) }}
+  cancel-in-progress: false
+
+jobs:
+  repack:
+    uses: ./.github/workflows/build-crate.yml
+    # The called job's own permissions; a caller must grant at least them.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      repack_rustc: ${{ inputs.repack_rustc }}
+      repack_concurrency: ${{ inputs.repack_concurrency }}

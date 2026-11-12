@@ -35,9 +35,12 @@ fn wrapper_version_output(env: &[(&str, &str)]) -> Vec<u8> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     command.arg("rustc").arg(rustc_path()).arg("-vV");
     // A wrapper invocation reads the stow config and the ambient
-    // supervisor variables — the sealed home and cleared `STOW_*` keep
+    // session variables — the sealed home and cleared `STOW_*` keep
     // the developer's `~/.stow` and shell exports out of it (stow#800).
-    let home = tempfile::tempdir().expect("home");
+    let home = support::tempdir().expect("home");
+    // The probe is answered by the daemon, which this test starts under
+    // its home and stops with it.
+    let _daemon = support::PrivateDaemon::in_home(home.path());
     hermetic_stow_env(
         &mut command,
         &refused_url(),
@@ -57,15 +60,13 @@ fn wrapper_version_output(env: &[(&str, &str)]) -> Vec<u8> {
     output.stdout
 }
 
-/// A supervised endpoint naming a different build's binary identity is
-/// refused before any connection: the shim resolves to whatever binary
-/// sits at its path now, and the supervisor's export must match the
-/// wrapper's own (stow#645). The endpoint points at nothing, so a
-/// wrapper that connected before checking could only fail differently —
-/// the refusal text proves the order.
+/// A wrapper naming a session the daemon never opened — the daemon
+/// restarted, or the build that opened it ended — fails the build and says
+/// so, rather than compiling uncached on its own.
 #[test]
-fn a_foreign_supervisor_is_refused_before_any_connection() {
-    let home = tempfile::tempdir().expect("home");
+fn a_wrapper_naming_an_unknown_session_fails_saying_so() {
+    let home = support::tempdir().expect("home");
+    let session = "00112233445566778899aabbccddeeff";
     let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     command.arg("rustc").arg(rustc_path()).arg("-vV");
     hermetic_stow_env(
@@ -75,30 +76,18 @@ fn a_foreign_supervisor_is_refused_before_any_connection() {
         home.path(),
     );
     let output = command
-        .env("STOW_SUPERVISOR_ENDPOINT", supervisor_endpoint())
-        .env("STOW_SUPERVISOR_TOKEN", "a-token")
-        .env("STOW_SUPERVISOR_BINARY", "1:1")
+        .env("STOW_SESSION", session)
         .output()
-        .expect("run the wrapper under a foreign supervisor");
+        .expect("run the wrapper under an unknown session");
     assert!(
         !output.status.success(),
-        "a foreign supervisor was not refused"
+        "a session the daemon never opened was served"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("replaced while the build was running"),
-        "stderr carries no refusal text:\n{stderr}"
+        stderr.contains(&format!("no session {session}")),
+        "stderr does not name the session:\n{stderr}"
     );
-}
-
-#[cfg(unix)]
-const fn supervisor_endpoint() -> &'static str {
-    "unix:/nonexistent/stow-test.sock"
-}
-
-#[cfg(not(unix))]
-const fn supervisor_endpoint() -> &'static str {
-    "tcp:9"
 }
 
 #[test]

@@ -32,6 +32,17 @@ Then build as usual:
 cargo build
 ```
 
+A plain `cargo build` is a session of the per-user stow daemon: each rustc and
+C/C++ wrapper asks the daemon what to do with its unit, runs the compiler when
+told to, and exits as soon as the compiler does; the lookups, the stores and
+the bookkeeping happen in the daemon. The wrapper starts the daemon when it is
+not running. A build whose sandbox cannot reach the daemon's socket, or start
+the daemon, fails and says so: no wrapper decides anything on its own, so
+there is no fallback that builds without stow. On Windows the daemon is started
+by a scheduled task that `stow setup` registers once (the installer runs it);
+without that task a build fails naming `stow setup`. See
+[Sandboxes](docs/USAGE.md#sandboxes).
+
 Without `stow setup`, `stow check`, `stow build` and `stow test` are
 drop-in replacements for the cargo subcommands. `stow update` updates the
 install. In GitHub Actions, `- uses: water-rs/stow@main` does the same

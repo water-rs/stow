@@ -454,9 +454,12 @@ Constants (media types, paths) are defined in `types/src/bundle.rs`.
 
 The CLI reads only this layout. A node published before it stored one zstd
 layer per file; `build-crate.yml` repacks those without rebuilding. A
-dispatch with `repack_rustc` set (and `repack_concurrency`, tasks in
-flight, default 4) runs the `repack` job under the same signing identity as
-a build: `stow-build repack` lists the rustc's `records-*` artifacts,
+`repack.yml` dispatch with `repack_rustc` (and `repack_concurrency`, tasks
+in flight, default 4) calls `build-crate.yml`'s `repack` job as a reusable
+workflow, whose certificate identity is the called file's, the same signing
+identity as a build; `stow-build repack` and every keyless signer refuse a
+certificate for any other identity before a signature is pushed.
+`stow-build repack` lists the rustc's `records-*` artifacts,
 verifies each task's records and each node still in the old layout under
 the pinned builder identity, checks every file's SHA-256 against the signed
 config, publishes the single-layer artifact and bundle through the build's
@@ -465,8 +468,9 @@ The config blob is carried over byte for byte, so a node's identity does
 not change. The next index export folds the new records over the old rows.
 A sweep only touches nodes still in the old layout, so it is safe to rerun,
 and a second sweep after in-flight old-layout builds drain finishes the
-cutover. Its run is titled `<rustc>-repack`; no scheduler task carries that
-id, so the scheduler logs the completion as an orphan run.
+cutover. Its run is a `repack` workflow run titled `<rustc>-repack`, not a
+`build-crate` run, so the scheduler receives no delivery for it and a
+build run's completion triggers no repack follow-up.
 
 ## Artifact index
 
@@ -1047,6 +1051,8 @@ handed to runners. While frozen, the work-submitting routes
 naming the trigger; the `github/workflow-run` webhook and the task
 completion it forwards stay open so
 in-flight builds still land. Recovery is manual only:
+`stow-admin watchdog clear` re-enables the disabled workflows and then lifts
+the freeze; the underlying
 `POST /api/v1/admin/dispatch-freeze` (`stow-admin dispatch-freeze clear
 --yes`, which dispatches `operations.yml`) lifts the freeze and
 immediately resumes dispatch, while

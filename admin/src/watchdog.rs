@@ -76,9 +76,10 @@ pub struct WatchdogArgs {
 /// `stow-admin watchdog` subcommands.
 #[derive(Subcommand)]
 pub enum WatchdogCommand {
-    /// Manual recovery: maintenance rule off, workflows re-enabled, incident
-    /// commented and closed, and the clear mail sent. The watchdog
-    /// itself never does this on its own.
+    /// Manual recovery, the one step: maintenance rule off, workflows
+    /// re-enabled, then the scheduler's dispatch freeze lifted if engaged,
+    /// incident commented and closed, and the clear mail sent. The
+    /// watchdog itself never does this on its own.
     Clear,
 }
 
@@ -1176,9 +1177,7 @@ impl Watcher<'_> {
     /// itself, so the watchdog's job is the `incident` issue — reason,
     /// since, and the last transitions land in the body.
     async fn freeze_reading(&self) -> Result<Vec<Reading>, String> {
-        let freeze: DispatchFreeze = self
-            .edge
-            .get_json("/api/v1/admin/dispatch-freeze")
+        let freeze = crate::read_dispatch_freeze(self.edge)
             .await
             .map_err(|error| error.to_string())?;
         let mut evidence = Vec::new();
@@ -2469,16 +2468,76 @@ async fn apply_clear(
         .await;
         (workflow, result)
     });
+    let mut enable_failed = false;
     for (workflow, result) in futures_util::future::join_all(enables).await {
         match result {
             Ok(()) => outcome.actions.push(format!("enabled {workflow}")),
-            Err(error) => outcome.failures.push(format!("enable {workflow}: {error}")),
+            Err(error) => {
+                enable_failed = true;
+                outcome.failures.push(format!("enable {workflow}: {error}"));
+            }
         }
     }
     for workflow in TRIP_WORKFLOWS {
         if !restore.contains(*workflow) {
             outcome.actions.push(format!("left {workflow} untouched"));
         }
+    }
+    // The freeze lifts only after the workflows are back: the edge runs
+    // a dispatch pass on the lift, and a disabled `build-crate.yml`
+    // would strand that whole window of claims unbound.
+    let freeze = crate::read_dispatch_freeze(watcher.edge)
+        .await
+        .map(|freeze| freeze.enabled)
+        .map_err(|error| error.to_string());
+    match freeze_step(enable_failed, &freeze) {
+        FreezeStep::NotEngaged => outcome
+            .actions
+            .push("dispatch freeze not engaged".to_owned()),
+        FreezeStep::Held => outcome
+            .actions
+            .push("dispatch freeze left engaged — a workflow failed to re-enable".to_owned()),
+        FreezeStep::Lift => {
+            let plan = DispatchFreeze {
+                enabled: false,
+                record: None,
+                transitions: Vec::new(),
+            };
+            match crate::write_dispatch_freeze(watcher.edge, &plan).await {
+                Ok(_) => outcome.actions.push("dispatch freeze lifted".to_owned()),
+                Err(error) => outcome
+                    .failures
+                    .push(format!("lift dispatch freeze: {error}")),
+            }
+        }
+        FreezeStep::ReadFailed(error) => outcome
+            .failures
+            .push(format!("read dispatch freeze: {error}")),
+    }
+}
+
+/// What `watchdog clear` does about the scheduler's dispatch freeze.
+#[derive(Debug, PartialEq, Eq)]
+enum FreezeStep {
+    /// Not engaged: nothing to lift.
+    NotEngaged,
+    /// Engaged, but a workflow failed to re-enable: lifting would strand
+    /// claims again, so the freeze stays.
+    Held,
+    /// Engaged and every recorded workflow is back: lift it.
+    Lift,
+    /// The freeze could not be read.
+    ReadFailed(String),
+}
+
+/// The freeze decision, pure for tests: lift only when engaged and no
+/// workflow enable failed.
+fn freeze_step(enable_failed: bool, freeze: &Result<bool, String>) -> FreezeStep {
+    match freeze {
+        Err(error) => FreezeStep::ReadFailed(error.clone()),
+        Ok(false) => FreezeStep::NotEngaged,
+        Ok(true) if enable_failed => FreezeStep::Held,
+        Ok(true) => FreezeStep::Lift,
     }
 }
 
@@ -3420,10 +3479,12 @@ fn finish(output: Output, report: &WatchdogReport) -> stow_types::error::Result<
     Ok(())
 }
 
-/// `watchdog clear` — maintenance rule off, the workflows the incident's
-/// trip record names re-enabled (no incident or no record: nothing),
-/// incident commented+closed, clear-mail. Manual recovery; the watchdog
-/// never does this on its own.
+/// `watchdog clear` — the single recovery step: maintenance rule off, the
+/// workflows the incident's trip record names re-enabled (no incident or
+/// no record: nothing), then the scheduler's dispatch freeze lifted when
+/// engaged (skipped, and reported as a failure, when a workflow failed to
+/// re-enable), incident commented+closed, clear-mail. Manual recovery; the
+/// watchdog never does this on its own.
 #[allow(clippy::too_many_lines)]
 async fn clear(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error::Result<()> {
     let gh_token = crate::github_token().await?;
@@ -3493,6 +3554,17 @@ async fn clear(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
                     .actions
                     .push(format!("would leave {workflow} untouched"));
             }
+        }
+        match crate::read_dispatch_freeze(edge).await {
+            Ok(freeze) if freeze.enabled => outcome.actions.push(
+                "would lift the dispatch freeze after the workflows are re-enabled".to_owned(),
+            ),
+            Ok(_) => outcome
+                .actions
+                .push("dispatch freeze not engaged — nothing to lift".to_owned()),
+            Err(error) => outcome
+                .failures
+                .push(format!("read dispatch freeze: {error}")),
         }
         outcome
             .actions
@@ -4478,6 +4550,20 @@ mod tests {
         assert_eq!(set, BTreeSet::from(["build-crate.yml".to_owned()]));
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("index-publish-cron.yml"));
+    }
+
+    /// The freeze lifts only when engaged and every workflow enable
+    /// succeeded; a failed enable holds it, a failed read is reported.
+    #[test]
+    fn clear_lifts_the_freeze_only_after_the_workflows_are_back() {
+        assert_eq!(freeze_step(false, &Ok(true)), FreezeStep::Lift);
+        assert_eq!(freeze_step(true, &Ok(true)), FreezeStep::Held);
+        assert_eq!(freeze_step(false, &Ok(false)), FreezeStep::NotEngaged);
+        assert_eq!(freeze_step(true, &Ok(false)), FreezeStep::NotEngaged);
+        assert_eq!(
+            freeze_step(false, &Err("boom".to_owned())),
+            FreezeStep::ReadFailed("boom".to_owned())
+        );
     }
 
     /// The clear restores exactly the marker's set; no incident and no

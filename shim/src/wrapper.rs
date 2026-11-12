@@ -112,6 +112,17 @@ pub fn capture_executable_beside(program: &Path) -> PathBuf {
     dir.join(executable_file_name(CAPTURE_LINK_PATH))
 }
 
+/// The runtime executable materialized beside a wrapper: `stow-runtime`
+/// (with the platform executable suffix) in the wrapper's directory. A
+/// wrapper is the runtime under another name, and a process started from
+/// that name would play the wrapper's role, so what starts the daemon from
+/// a wrapper starts this instead.
+#[must_use]
+pub fn runtime_executable_beside(program: &Path) -> PathBuf {
+    let dir = program.parent().unwrap_or_else(|| Path::new(""));
+    dir.join(executable_file_name(RUNTIME_LINK_PATH))
+}
+
 fn executable_file_name(base: &str) -> String {
     format!("{base}{}", std::env::consts::EXE_SUFFIX)
 }
@@ -292,10 +303,6 @@ fn materialize_in(
 
 /// Put `executable` at `<base>/<name>.exe`, leaving an identical file alone.
 /// `source_bytes` caches the source read across placements of one executable.
-/// A byte copy is stamped with the source's modification time before it is
-/// placed: the identity a wrapper compares against its supervisor's is the
-/// source's `(len, modified)` — a hard link shares it, a copy must be given
-/// it (stow#645).
 ///
 /// Concurrent runs place the same wrappers while builds execute them, and
 /// a lookup racing a replace of the name can find it absent on Windows
@@ -362,10 +369,7 @@ fn replace_executable(destination: &Path, executable: &Path) -> stow_types::erro
     })
 }
 
-/// The byte-copy half of a placement. `fs::copy` gives the staged file its
-/// own write's modification time, so it is re-stamped with the source's —
-/// every placed wrapper carries the source's `(len, modified)`, the
-/// identity a wrapper compares (stow#645).
+/// The byte-copy half of a placement, taken when the hard link failed.
 #[cfg(windows)]
 fn copy_for_placement(
     executable: &Path,
@@ -379,24 +383,7 @@ fn copy_for_placement(
             temp_path.display()
         )
     })?;
-    let modified = fs::metadata(executable)
-        .and_then(|meta| meta.modified())
-        .wrap_err_with(|| {
-            format!(
-                "read modification time of {} for its copy",
-                executable.display()
-            )
-        })?;
-    fs::File::options()
-        .write(true)
-        .open(temp_path)
-        .and_then(|file| file.set_modified(modified))
-        .wrap_err_with(|| {
-            format!(
-                "stamp {} with its source's modification time",
-                temp_path.display()
-            )
-        })
+    Ok(())
 }
 
 /// Whether `destination` already holds the bytes of `source`; `None` when
@@ -554,6 +541,7 @@ mod tests {
 
     use super::{
         REAL_CC_ENV, REAL_CXX_ENV, RESOLVE_CC, RESOLVE_CXX, WrapperRole, capture_executable_beside,
+        runtime_executable_beside,
     };
 
     /// Every wrapper resolves to the runtime executable itself, so starting
@@ -604,41 +592,6 @@ mod tests {
 
     fn args(parts: &[&str]) -> Vec<OsString> {
         parts.iter().map(OsString::from).collect()
-    }
-
-    /// A byte-copied wrapper has no inode to share its source's metadata
-    /// through, so the placement re-stamps it: the identity a wrapper
-    /// compares — the source's `(len, modified)` — must survive the copy
-    /// (stow#645).
-    #[cfg(windows)]
-    #[test]
-    fn a_byte_copied_wrapper_carries_the_sources_stamp() {
-        let base = std::env::temp_dir().join(format!("stow-shim-test-{}", std::process::id()));
-        std::fs::create_dir_all(&base).expect("create the test tool dir");
-        let source = base.join("runtime-executable.exe");
-        std::fs::write(&source, b"runtime").expect("write the source executable");
-        // A stamp old enough that the copy's own write time provably
-        // differs from it.
-        let stamped =
-            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
-        std::fs::File::options()
-            .write(true)
-            .open(&source)
-            .and_then(|file| file.set_modified(stamped))
-            .expect("stamp the source");
-        let staged = base.join("staged.exe");
-        let link_error = std::io::Error::other("forced byte copy");
-        super::copy_for_placement(&source, &staged, &link_error).expect("place by byte copy");
-        assert_eq!(
-            std::fs::metadata(&staged)
-                .and_then(|meta| meta.modified())
-                .expect("staged mtime"),
-            std::fs::metadata(&source)
-                .and_then(|meta| meta.modified())
-                .expect("source mtime"),
-            "the copy does not carry the source's modification time"
-        );
-        std::fs::remove_dir_all(&base).expect("remove the test tool dir");
     }
 
     #[test]
@@ -703,6 +656,16 @@ mod tests {
         assert_eq!(
             capture,
             tools.join(format!("stow-capture{}", std::env::consts::EXE_SUFFIX))
+        );
+    }
+
+    #[test]
+    fn runtime_executable_sits_beside_the_wrapper() {
+        let tools = Path::new("/home/ci/.local/share/stow/tools");
+        let runtime = runtime_executable_beside(&tools.join("stow-rustc-wrapper"));
+        assert_eq!(
+            runtime,
+            tools.join(format!("stow-runtime{}", std::env::consts::EXE_SUFFIX))
         );
     }
 }

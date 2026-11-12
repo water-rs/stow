@@ -4,7 +4,7 @@ use crate::state_db::{db_int, duration_millis, now_millis};
 /// A build's shared circuit handle: the state-db row behind the breaker,
 /// the tripped answer this build memoizes for its plan path, and the
 /// open broadcast an in-flight edge download abandons on (stow#977).
-/// The supervisor and the build's enrichment write through the same
+/// The session and the build's enrichment write through the same
 /// handle.
 #[derive(Debug, Clone)]
 pub struct BuildCircuit {
@@ -34,7 +34,7 @@ impl BuildCircuit {
     }
 
     /// The circuit's tripped state for this build, read once — the
-    /// per-invocation state-db query was the supervisor's busiest query
+    /// per-invocation state-db query was the session's busiest query
     /// (stow#347).
     pub async fn tripped(&self, config: &StowConfig) -> stow_types::error::Result<bool> {
         Ok(*self.cell(config).await?.borrow())

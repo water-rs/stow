@@ -1660,6 +1660,11 @@ impl Graph {
                 "submission dep index {dep} out of range ({len} nodes)"
             )));
         }
+        // A closure holding two feature sets of one package version on
+        // one side can only fail on a runner (stow#1470): refuse it here,
+        // where every submission passes once.
+        tree.ensure_closure_agreement()
+            .map_err(|error| QueueError::Invariant(error.to_string()))?;
         tree.nodes
             .iter()
             .map(|sub| {
@@ -5397,6 +5402,35 @@ mod tests {
             assert_eq!(payload.profile, node.profile);
             assert_eq!(payload.task_id, node.task_id);
         }
+    }
+
+    /// A submission whose closure holds one package version on one side
+    /// with two feature sets is refused at the route, naming the package
+    /// (stow#1470) — never discovered on a runner.
+    #[test]
+    fn a_closure_with_two_feature_sets_of_one_package_is_refused() {
+        let libc = |features: &[&str]| {
+            let mut node = sub("libc");
+            node.version = CrateVersion::new(semver::Version::new(0, 2, 191));
+            node.features_json =
+                FeaturesJson::from_sorted(features.iter().map(|f| (*f).to_owned()).collect())
+                    .expect("features");
+            node.task_id = minted_id(&node);
+            node
+        };
+        let mut polyval = sub("polyval");
+        polyval.deps = vec![0, 1];
+        let tree = SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![2],
+            nodes: vec![
+                libc(&["default", "extra_traits", "std"]),
+                libc(&["default", "std"]),
+                polyval,
+            ],
+        };
+        let error = Graph::default().merge(&tree, 0).expect_err("refused");
+        assert!(error.to_string().contains("libc 0.2.191"), "{error}");
     }
 
     /// A → B → C chain (a depends on b, b on c), nodes in leaf order.

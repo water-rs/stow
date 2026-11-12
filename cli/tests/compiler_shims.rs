@@ -95,7 +95,7 @@ fn resolved_cc(config: &toml::Value) -> String {
 /// shims and no second install re-points them (stow#645).
 #[test]
 fn the_shims_live_under_the_cargo_home() {
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = support::tempdir().expect("temp dir");
     let cargo_home = dir.path().join("cargo-home");
     let config = setup_in(dir.path());
     let rustc_wrapper = config
@@ -117,7 +117,7 @@ fn the_shims_live_under_the_cargo_home() {
 
 #[test]
 fn cc_is_invoked_with_compiler_arguments_only() {
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = support::tempdir().expect("temp dir");
     let config = setup_in(dir.path());
 
     let recorded = env_value(&config, "STOW_REAL_CC").map(str::to_owned);
@@ -151,12 +151,33 @@ fn cc_is_invoked_with_compiler_arguments_only() {
     // The shim re-enters `stow-cli`, which reads the stow config — the
     // sealed home keeps the developer's `~/.stow` out of it (stow#800).
     let home = dir.path().join("stow-home");
+    // The shim's compile is answered by the daemon, which this test starts
+    // under its home and stops with it.
+    let _daemon = support::PrivateDaemon::in_home(&home);
     hermetic_stow_env(
         &mut command,
         &refused_url(),
         &home.join("stow-cache"),
         &home,
     );
+    // Not run by a cargo: the test process owns the build, and the `CARGO`
+    // the test runner leaves in the environment names a process that is
+    // not among the shim's ancestors.
+    command.env_remove("CARGO");
+    // What cargo sets for a build script, which is what a C compiler runs
+    // under: the daemon lays the session's roots out from `OUT_DIR` and
+    // takes the toolchain from `RUSTC`.
+    command
+        .env(
+            "OUT_DIR",
+            dir.path()
+                .join("target")
+                .join("debug")
+                .join("build")
+                .join("probe-0123456789abcdef")
+                .join("out"),
+        )
+        .env("RUSTC", "rustc");
     if msvc_family {
         command.arg(format!("-Fo{}", object.display()));
     } else {
@@ -182,7 +203,7 @@ fn cc_is_invoked_with_compiler_arguments_only() {
 
 #[test]
 fn the_launcher_and_the_compilers_are_three_different_shims() {
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = support::tempdir().expect("temp dir");
     let config = setup_in(dir.path());
 
     let cc = scoped_env_value(&config, "CC");
@@ -201,7 +222,7 @@ fn the_launcher_and_the_compilers_are_three_different_shims() {
 
 #[test]
 fn an_explicit_toolchain_survives_setup() {
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = support::tempdir().expect("temp dir");
     let cargo_home = dir.path().join("cargo-home");
     let mut setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     setup

@@ -4229,6 +4229,231 @@ mod tests {
         }
     }
 
+    /// A hand-built node of a real package at a real version.
+    fn versioned_node(
+        crate_name: &str,
+        version: &str,
+        features: &[&str],
+        host_side: bool,
+        deps: &[u32],
+        task_id: &str,
+    ) -> crate::api::SubmissionNode {
+        let mut node = submission_node(crate_name, features, deps, task_id);
+        node.version = version.parse().expect("version");
+        node.host_side = host_side;
+        node
+    }
+
+    use std::collections::BTreeSet;
+
+    /// The feature sets `crate_name` holds on one side of `tree`.
+    fn sets_of(
+        tree: &crate::api::SubmissionTree,
+        crate_name: &str,
+        host_side: bool,
+    ) -> BTreeSet<Vec<String>> {
+        tree.nodes
+            .iter()
+            .filter(|node| node.crate_name.as_str() == crate_name && node.host_side == host_side)
+            .map(|node| node.features_json.features().to_vec())
+            .collect()
+    }
+
+    /// polyval 0.6.2 (stow#1470): libc 0.2.191 sits at `default, std`
+    /// on both sides — the host twin pins the target one in place — and
+    /// the published pool serves cpufeatures from a chain that holds
+    /// libc at `default, extra_traits, std`. Moving cpufeatures would
+    /// leave the closure two libc sets, so it keeps its own chain.
+    #[test]
+    fn substitution_keeps_a_node_whose_published_chain_disagrees() {
+        use crate::identity::DependencyIdentity;
+        use crate::task_graph::TaskNodeIdentity;
+
+        let identity = |name: &str, version: &str, features: &[&str]| TaskNodeIdentity {
+            crate_name: name.parse().expect("crate name"),
+            version: version.parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(
+                features.iter().map(|f| (*f).to_owned()).collect(),
+            )
+            .expect("features"),
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            host_side: false,
+            profile: crate::node_profile::NodeProfile::Dev,
+        };
+        let leaf = DependencyIdentity::leaf().expect("leaf digest");
+        let libc_task_id =
+            identity("libc", "0.2.191", &["default", "extra_traits", "std"]).task_id(&leaf);
+        let published = vec![crate::api::PublishedIndexSlice {
+            local_programs: Vec::new(),
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            rows: vec![
+                {
+                    let mut row = published_row(
+                        "libc",
+                        &["default", "extra_traits", "std"],
+                        &[],
+                        Vec::new(),
+                        "11",
+                        false,
+                    );
+                    row.version = "0.2.191".parse().expect("version");
+                    row
+                },
+                {
+                    let mut row = published_row(
+                        "cpufeatures",
+                        &["std"],
+                        &[("libc", "11")],
+                        vec![libc_task_id],
+                        "22",
+                        false,
+                    );
+                    row.version = "0.2.17".parse().expect("version");
+                    row
+                },
+            ],
+        }];
+        let mut trees = vec![tree(vec![
+            versioned_node("polyval", "0.6.2", &["std"], false, &[1, 2, 4], "polyval"),
+            versioned_node("cpufeatures", "0.2.17", &[], false, &[3], "cpufeatures"),
+            versioned_node("getrandom", "0.2.17", &["std"], false, &[3], "getrandom"),
+            versioned_node("libc", "0.2.191", &["default", "std"], false, &[], "libc"),
+            versioned_node(
+                "libc",
+                "0.2.191",
+                &["default", "std"],
+                true,
+                &[3],
+                "libc-host",
+            ),
+        ])];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        let tree = &trees[0];
+        for host_side in [false, true] {
+            assert_eq!(
+                sets_of(tree, "libc", host_side),
+                BTreeSet::from([vec!["default".to_owned(), "std".to_owned()]]),
+                "libc keeps one set (host side: {host_side})"
+            );
+        }
+        assert_eq!(
+            sets_of(tree, "cpufeatures", false),
+            BTreeSet::from([Vec::new()]),
+            "cpufeatures builds its exact set"
+        );
+        tree.ensure_closure_agreement().expect("closure agrees");
+    }
+
+    /// wgpu-hal 29.0.4 (stow#1470): the root names host syn 2.0.119 at
+    /// `derive` directly, and its host twin pins that set in place.
+    /// naga's serving set, from another tree, carries host syn at
+    /// `derive, fold`; moving naga would give the root two host syn
+    /// sets, so naga keeps its own chain.
+    #[test]
+    fn substitution_keeps_a_node_whose_batch_subtree_disagrees() {
+        let mut trees = vec![
+            tree(vec![
+                versioned_node("wgpu-hal", "29.0.4", &[], false, &[3, 4], "wgpu-hal"),
+                versioned_node("syn", "2.0.119", &["derive"], false, &[], "syn-target"),
+                versioned_node("syn", "2.0.119", &["derive"], true, &[1], "syn-host"),
+                versioned_node("naga", "29.0.0", &["spv-out"], false, &[2], "naga-spv"),
+                versioned_node("syn", "2.0.119", &["derive"], true, &[], "syn-host-direct"),
+            ]),
+            tree(vec![
+                versioned_node(
+                    "naga",
+                    "29.0.0",
+                    &["spv-out", "wgsl-in"],
+                    false,
+                    &[1],
+                    "naga-wgsl",
+                ),
+                versioned_node(
+                    "syn",
+                    "2.0.119",
+                    &["derive", "fold"],
+                    true,
+                    &[],
+                    "syn-host-fold",
+                ),
+            ]),
+        ];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &[])
+            .expect("substitution");
+        let tree = &trees[0];
+        assert_eq!(
+            sets_of(tree, "syn", true),
+            BTreeSet::from([vec!["derive".to_owned()]]),
+            "host syn keeps one set"
+        );
+        assert_eq!(
+            sets_of(tree, "naga", false),
+            BTreeSet::from([vec!["spv-out".to_owned()]]),
+            "naga builds its exact set"
+        );
+        tree.ensure_closure_agreement().expect("closure agrees");
+    }
+
+    /// An agreeing splice still moves: nothing is blocked when the
+    /// serving subtree holds the tree's own sets.
+    #[test]
+    fn substitution_still_moves_a_node_whose_subtree_agrees() {
+        let mut trees = vec![
+            tree(vec![
+                versioned_node("wgpu-hal", "29.0.4", &[], false, &[1, 2], "wgpu-hal"),
+                versioned_node("naga", "29.0.0", &["spv-out"], false, &[2], "naga-spv"),
+                versioned_node("syn", "2.0.119", &["derive"], true, &[], "syn-host"),
+            ]),
+            tree(vec![
+                versioned_node(
+                    "naga",
+                    "29.0.0",
+                    &["spv-out", "wgsl-in"],
+                    false,
+                    &[1],
+                    "naga-wgsl",
+                ),
+                versioned_node("syn", "2.0.119", &["derive"], true, &[], "syn-host-b"),
+            ]),
+        ];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &[])
+            .expect("substitution");
+        assert_eq!(
+            sets_of(&trees[0], "naga", false),
+            BTreeSet::from([vec!["spv-out".to_owned(), "wgsl-in".to_owned()]]),
+        );
+        trees[0].ensure_closure_agreement().expect("closure agrees");
+    }
+
+    /// A submitted tree whose closure holds one package version twice
+    /// on one side is refused, naming the package.
+    #[test]
+    fn a_closure_with_two_sets_of_one_package_is_rejected() {
+        let submitted = tree(vec![
+            versioned_node("polyval", "0.6.2", &["std"], false, &[1, 2], "polyval"),
+            versioned_node(
+                "libc",
+                "0.2.191",
+                &["default", "extra_traits", "std"],
+                false,
+                &[],
+                "a",
+            ),
+            versioned_node("libc", "0.2.191", &["default", "std"], false, &[], "b"),
+        ]);
+        let error = submitted
+            .ensure_closure_agreement()
+            .expect_err("two libc sets");
+        assert!(error.to_string().contains("libc 0.2.191"), "{error}");
+        let mut trees = vec![submitted];
+        let error = crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &[])
+            .expect_err("substitution refuses it too");
+        assert!(error.to_string().contains("libc 0.2.191"), "{error}");
+    }
+
     /// A shadow twin edge (stow#506/#722): the row's children include
     /// the host lib and its same-features target twin — two tasks no
     /// `--extern` list names together (stow#919). The task-id join
@@ -5082,6 +5307,99 @@ impl SubmissionTree {
         Ok((piece, bytes))
     }
 
+    /// Reject a tree whose dependency closure holds two feature sets of
+    /// one `(crate, version, target, side)` (stow#1470): the build's
+    /// wrapper manifest declares a package version once per side, so
+    /// such a task can only fail on a runner. Every node's closure is
+    /// covered by the closures of the nodes no other node depends on
+    /// and of the roots, which are the ones walked.
+    ///
+    /// # Errors
+    /// `Error` naming the package a closure holds twice. Dep indexes
+    /// must be in range; the submit path checks that first.
+    pub fn ensure_closure_agreement(&self) -> crate::error::Result<()> {
+        // A group the whole tree holds one set of cannot disagree inside
+        // any closure; only the contested groups are walked for.
+        let mut first = BTreeMap::<ClosureGroup, &[String]>::new();
+        let mut contested = BTreeSet::<ClosureGroup>::new();
+        for node in &self.nodes {
+            let features = node.features_json.features();
+            match first.entry(closure_group(node)) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(features);
+                }
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    if *slot.get() != features {
+                        contested.insert(slot.key().clone());
+                    }
+                }
+            }
+        }
+        if contested.is_empty() {
+            return Ok(());
+        }
+        let contested_node = self
+            .nodes
+            .iter()
+            .map(|node| contested.contains(&closure_group(node)))
+            .collect::<Vec<_>>();
+        let mut depended_on = vec![false; self.nodes.len()];
+        for dep in self.nodes.iter().flat_map(|node| &node.deps) {
+            depended_on[*dep as usize] = true;
+        }
+        let tops = self
+            .roots
+            .iter()
+            .map(|&root| root as usize)
+            .chain((0..self.nodes.len()).filter(|&index| !depended_on[index]));
+        for top in tops {
+            if let Some(group) = self.closure_disagreement(top, &contested_node) {
+                return Err(disagreement_error(&self.nodes[top].task_id, &group));
+            }
+        }
+        Ok(())
+    }
+
+    /// The feature set `group` holds in node `start`'s closure, walked
+    /// over this tree's own edges without descending below a node
+    /// `stop` accepts. `stop` sees every node the walk visits.
+    fn closure_set(
+        &self,
+        start: usize,
+        group: &ClosureGroup,
+        mut stop: impl FnMut(usize) -> bool,
+    ) -> Option<&[String]> {
+        let mut found = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![start];
+        while let Some(index) = stack.pop() {
+            if !seen.insert(index) {
+                continue;
+            }
+            let node = &self.nodes[index];
+            if closure_group(node) == *group {
+                found = Some(node.features_json.features());
+            }
+            if !stop(index) {
+                stack.extend(node.deps.iter().map(|&dep| dep as usize));
+            }
+        }
+        found
+    }
+
+    /// The first group holding two feature sets in node `start`'s
+    /// closure.
+    fn closure_disagreement(&self, start: usize, contested: &[bool]) -> Option<ClosureGroup> {
+        crate::feature_sets::closure_disagreement(
+            start,
+            |index| {
+                let node = &self.nodes[index];
+                contested[index].then(|| (closure_group(node), node.features_json.features()))
+            },
+            |index, stack| stack.extend(self.nodes[index].deps.iter().map(|&dep| dep as usize)),
+        )
+    }
+
     /// Apply the superset-serving rule (stow#881): a feature set
     /// contained in another set of the same `(crate, version, target,
     /// rustc, side)` is never built — its node is replaced by the
@@ -5113,8 +5431,17 @@ impl SubmissionTree {
     /// published task id — a mismatch means the pulled slices disagree
     /// with the rows' recorded dep closures.
     ///
+    /// A node moves only when the subtree it splices agrees with every
+    /// closure it joins (stow#1470): a root's closure never holds two
+    /// feature sets of one `(crate, version, target, side)`. A move whose
+    /// splice carries a set the root's own closure does not hold is
+    /// blocked — the node keeps its own chain and exact set, never a
+    /// union — and the pass reruns until no closure disagrees, so what
+    /// moves is a function of the batch alone.
+    ///
     /// # Errors
-    /// Fails as [`ResolvedTaskGraph::resolve`] does, and fails fast when
+    /// Fails as [`ResolvedTaskGraph::resolve`] does, when a tree's own
+    /// closure holds two sets of one package, and fails fast when
     /// a reconstructed published subtree resolves to an id other than
     /// the row's published one.
     ///
@@ -5126,6 +5453,11 @@ impl SubmissionTree {
         trees: &mut [Self],
         published: &[PublishedIndexSlice],
     ) -> crate::error::Result<()> {
+        // A submitted tree already holding two sets of one group is no
+        // resolve's output; moves can only agree with closures that do.
+        for tree in trees.iter() {
+            tree.ensure_closure_agreement()?;
+        }
         // Each group's distinct feature sets over the batch ∪ the
         // published slices, and the serving map over them: a set
         // contained in no other is built; every other set is served by
@@ -5207,36 +5539,55 @@ impl SubmissionTree {
         }
         let (published_reps, row_task_ids) = published_pool_index(published, &serving)?;
 
-        let mut substitution = Substitution {
-            trees,
-            published,
-            serving: &serving,
-            representatives: &representatives,
-            published_reps: &published_reps,
-            row_task_ids: &row_task_ids,
-            by_task_id: &by_task_id,
-            arena: Vec::new(),
-            closure_pm: Vec::new(),
-            interned: std::collections::HashMap::new(),
-            memo: std::collections::HashMap::new(),
-            published_memo: std::collections::HashMap::new(),
-            pinned: std::collections::HashMap::new(),
-        };
-        // Substituting a node into another node's dep position can never
-        // close a cycle: the spliced subtree is the dependency closure
-        // of a real resolved node (batch) or of a published artifact's
-        // recorded chain (index), and a build graph is acyclic.
-        for (tree_index, tree) in trees.iter().enumerate() {
-            for node_index in 0..tree.nodes.len() {
-                substitution.substitute(tree_index, node_index);
+        // A node moves only when the subtree it splices agrees with the
+        // closures it joins (stow#1470). Agreement depends on which
+        // other nodes moved, so the pass runs to a fixed point: each
+        // round substitutes under `blocked`, finds every root closure
+        // holding two sets of one group, and blocks the moves whose
+        // splice carries the set the tree's own closure does not. A
+        // block only ever grows, so the loop ends, and what it blocks
+        // is a function of the batch alone.
+        let mut blocked = BTreeSet::<(usize, usize)>::new();
+        let (arena, memo, pinned) = loop {
+            let mut substitution = Substitution {
+                trees,
+                published,
+                serving: &serving,
+                representatives: &representatives,
+                published_reps: &published_reps,
+                row_task_ids: &row_task_ids,
+                by_task_id: &by_task_id,
+                blocked: &blocked,
+                moved: BTreeSet::new(),
+                arena: Vec::new(),
+                closure_pm: Vec::new(),
+                interned: std::collections::HashMap::new(),
+                memo: std::collections::HashMap::new(),
+                published_memo: std::collections::HashMap::new(),
+                pinned: std::collections::HashMap::new(),
+            };
+            // Substituting a node into another node's dep position can
+            // never close a cycle: the spliced subtree is the
+            // dependency closure of a real resolved node (batch) or of a
+            // published artifact's recorded chain (index), and a build
+            // graph is acyclic.
+            for (tree_index, tree) in trees.iter().enumerate() {
+                for node_index in 0..tree.nodes.len() {
+                    substitution.substitute(tree_index, node_index);
+                }
             }
-        }
-        let Substitution {
-            arena,
-            memo,
-            pinned,
-            ..
-        } = substitution;
+            let fresh = substitution.moves_to_block()?;
+            if fresh.is_empty() {
+                let Substitution {
+                    arena,
+                    memo,
+                    pinned,
+                    ..
+                } = substitution;
+                break (arena, memo, pinned);
+            }
+            blocked.extend(fresh);
+        };
         let resolved = ResolvedTaskGraph::resolve(arena)?;
         // A reconstructed published node is pinned to the id its row
         // records — recompute reproducing it proves the pulled slices
@@ -5326,6 +5677,46 @@ impl PublishedIndexSlice {
             rows,
         }
     }
+}
+
+/// The `(crate, version, target, side)` a closure holds one feature
+/// set of (stow#1470).
+type ClosureGroup = (CrateName, CrateVersion, TargetTriple, bool);
+
+fn closure_group(node: &SubmissionNode) -> ClosureGroup {
+    (
+        node.crate_name.clone(),
+        node.version.clone(),
+        node.target.clone(),
+        node.host_side,
+    )
+}
+
+fn arena_group(identity: &TaskNodeIdentity) -> ClosureGroup {
+    (
+        identity.crate_name.clone(),
+        identity.version.clone(),
+        identity.target.clone(),
+        identity.host_side,
+    )
+}
+
+fn twin_pair_key(node: &SubmissionNode) -> TwinPairKey {
+    (
+        node.crate_name.clone(),
+        node.version.clone(),
+        node.target.clone(),
+        node.rustc_version.clone(),
+        node.profile,
+    )
+}
+
+fn disagreement_error(task_id: &str, group: &ClosureGroup) -> crate::error::Error {
+    let (crate_name, version, target, host_side) = group;
+    stow_error!(
+        "the closure of task {task_id} holds {crate_name} {version} with two feature sets on the {} side for {target}",
+        if *host_side { "host" } else { "target" }
+    )
 }
 
 /// The identity group the superset-serving rule keys on (stow#881) —
@@ -5617,6 +6008,12 @@ struct Substitution<'a> {
     /// `task id` → `(slice, row)` across every pulled slice — the
     /// dep-edge join a row's `dependency_task_ids` names (stow#919).
     by_task_id: &'a std::collections::HashMap<&'a str, (usize, usize)>,
+    /// Occurrences that keep their own chain and exact set because the
+    /// subtree their serving set splices disagrees with a closure they
+    /// join (stow#1470).
+    blocked: &'a BTreeSet<(usize, usize)>,
+    /// Occurrences this round moved onto a serving set's subtree.
+    moved: BTreeSet<(usize, usize)>,
     arena: Vec<ResolvedTaskNode>,
     /// Parallel to `arena`: a proc-macro reaches this node's dep
     /// closure, or the node is one itself. Only published
@@ -5641,6 +6038,116 @@ struct Substitution<'a> {
 }
 
 impl Substitution<'_> {
+    /// The moves to block after this round (stow#1470): for every root
+    /// whose substituted closure holds two feature sets of one group,
+    /// the moves reachable from that root whose spliced subtree carries
+    /// a set of the group other than the one the root's own closure
+    /// holds — all of them when the root's own closure has none. A
+    /// blocked node's twin (same package and set on the other side,
+    /// stow#723) is blocked with it, so the pair stays together.
+    ///
+    /// # Errors
+    /// Fails naming the package when a closure disagrees and no move
+    /// accounts for it.
+    fn moves_to_block(&self) -> crate::error::Result<BTreeSet<(usize, usize)>> {
+        let mut fresh = BTreeSet::new();
+        for (tree_index, tree) in self.trees.iter().enumerate() {
+            for &root in &tree.roots {
+                let image = self.memo[&(tree_index, root as usize)];
+                let Some(group) = self.image_disagreement(image) else {
+                    continue;
+                };
+                let own = tree.closure_set(root as usize, &group, |_| false);
+                let mut accounted = false;
+                let mut spliced = Vec::new();
+                tree.closure_set(root as usize, &group, |node_index| {
+                    let moved = self.moved.contains(&(tree_index, node_index));
+                    if moved {
+                        spliced.push(node_index);
+                    }
+                    moved
+                });
+                for node_index in spliced {
+                    let image = self.memo[&(tree_index, node_index)];
+                    if self.image_holds_other_set(image, &group, own) {
+                        fresh.insert((tree_index, node_index));
+                        accounted = true;
+                    }
+                }
+                if !accounted {
+                    return Err(disagreement_error(
+                        &tree.nodes[root as usize].task_id,
+                        &group,
+                    ));
+                }
+            }
+        }
+        let twins = fresh
+            .iter()
+            .map(|&(tree_index, node_index)| {
+                let node = &self.trees[tree_index].nodes[node_index];
+                (
+                    tree_index,
+                    twin_pair_key(node),
+                    node.features_json.features().to_vec(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        for (tree_index, tree) in self.trees.iter().enumerate() {
+            for (node_index, node) in tree.nodes.iter().enumerate() {
+                if !self.blocked.contains(&(tree_index, node_index))
+                    && self.moved.contains(&(tree_index, node_index))
+                    && twins.contains(&(
+                        tree_index,
+                        twin_pair_key(node),
+                        node.features_json.features().to_vec(),
+                    ))
+                {
+                    fresh.insert((tree_index, node_index));
+                }
+            }
+        }
+        Ok(fresh)
+    }
+
+    /// The first group holding two feature sets in arena node
+    /// `image`'s closure.
+    fn image_disagreement(&self, image: usize) -> Option<ClosureGroup> {
+        crate::feature_sets::closure_disagreement(
+            image,
+            |index| {
+                let identity = &self.arena[index].identity;
+                Some((arena_group(identity), identity.features_json.features()))
+            },
+            |index, stack| stack.extend(self.arena[index].dependencies.iter().copied()),
+        )
+    }
+
+    /// Whether arena node `image`'s closure holds `group` with a set
+    /// other than `own` (any set when `own` is `None`).
+    fn image_holds_other_set(
+        &self,
+        image: usize,
+        group: &ClosureGroup,
+        own: Option<&[String]>,
+    ) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![image];
+        while let Some(index) = stack.pop() {
+            if !seen.insert(index) {
+                continue;
+            }
+            let identity = &self.arena[index].identity;
+            if arena_group(identity) == *group
+                && own.is_none_or(|own| own != identity.features_json.features())
+            {
+                return true;
+            }
+            stack.extend(self.arena[index].dependencies.iter().copied());
+        }
+        false
+    }
+
     /// The arena node one `(tree, node)` occurrence maps to —
     /// memoized. A node whose set is served by a containing set
     /// resolves to that set's published row when one exists — its
@@ -5655,7 +6162,9 @@ impl Substitution<'_> {
         let node = &self.trees[tree_index].nodes[node_index];
         let key = substitution_group_key(node);
         let serve = &self.serving[&key][node.features_json.features()];
-        let index = if serve.as_slice() == node.features_json.features() {
+        let index = if serve.as_slice() == node.features_json.features()
+            || self.blocked.contains(&(tree_index, node_index))
+        {
             self.intern(tree_index, node)
         } else {
             let published = self
@@ -5664,9 +6173,15 @@ impl Substitution<'_> {
                 .map(|&(slice_index, row_index, _)| (slice_index, row_index))
                 .and_then(|(slice_index, row_index)| self.published_node(slice_index, row_index));
             match published {
-                Some(index) => index,
+                Some(index) => {
+                    self.moved.insert((tree_index, node_index));
+                    index
+                }
                 None => match self.representatives.get(&(key, serve.clone())) {
-                    Some(&(rep_tree, rep_node)) => self.substitute(rep_tree, rep_node),
+                    Some(&(rep_tree, rep_node)) => {
+                        self.moved.insert((tree_index, node_index));
+                        self.substitute(rep_tree, rep_node)
+                    }
                     None => self.intern(tree_index, node),
                 },
             }

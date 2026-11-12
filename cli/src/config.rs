@@ -13,6 +13,7 @@ use tokio::sync::OnceCell;
 use stow_types::public_cache::UnitSource;
 
 use crate::artifact_cache::ArtifactProvenance;
+use crate::session_env::SessionEnv;
 use crate::state_db::StateDb;
 use crate::wrapper_shim;
 
@@ -27,10 +28,6 @@ const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
 const STOW_REGISTRY_BASE_URL_ENV: &str = "STOW_REGISTRY_BASE_URL";
 const STOW_INDEX_REFRESH_SECS_ENV: &str = "STOW_INDEX_REFRESH_SECS";
 const STOW_ARTIFACT_CACHE_MAX_BYTES_ENV: &str = "STOW_ARTIFACT_CACHE_MAX_BYTES";
-/// Carries the parent `stow check` driver's already-resolved `StowConfig` to
-/// every rustc-wrapper subprocess as a JSON blob, so the wrapper does not
-/// re-read `~/.config/stow/config.toml` on each rustc invocation.
-pub const STOW_CONFIG_BLOB_ENV: &str = "STOW_CONFIG_BLOB";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_NEGATIVE_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_CIRCUIT_RESET_SECS: u64 = 60;
@@ -112,8 +109,45 @@ impl CacheLayers {
     }
 }
 
+/// The environment switches that shape what a command sends and writes
+/// rather than what it builds: resolved once with the config, so the
+/// process answering for a build reads them from the build's environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Switches {
+    /// `STOW_NO_ANALYTICS=1`: requests carry the opt-out header and no
+    /// usage report is sent.
+    pub no_analytics: bool,
+    /// `CI` is set: requests carry the CI environment header.
+    pub ci: bool,
+    /// `STOW_IDENTITY_TRACE`: the directory the identity-input probe writes
+    /// to, when set.
+    pub identity_trace: Option<PathBuf>,
+}
+
+impl Switches {
+    /// The switches in `environ`.
+    #[must_use]
+    pub fn of_environ(environ: &[(std::ffi::OsString, std::ffi::OsString)]) -> Self {
+        let var = |key: &str| {
+            environ
+                .iter()
+                .find(|(name, _)| stow_types::env_name::eq(name, key))
+                .map(|(_, value)| value)
+        };
+        Self {
+            no_analytics: var(crate::edge_client::NO_ANALYTICS_ENV)
+                .is_some_and(|value| value == "1"),
+            ci: var("CI").is_some(),
+            identity_trace: var("STOW_IDENTITY_TRACE").map(PathBuf::from),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowConfig {
+    /// Analytics, CI and trace switches of the environment this config was
+    /// resolved in.
+    pub switches: Switches,
     /// The resolved cache layers: the global config's `[cache]` table, then
     /// the run's flags. Every network request goes through
     /// [`Self::registry_http`] or [`crate::edge_client::client`], which both
@@ -145,8 +179,8 @@ pub struct StowConfig {
     /// `artifact_cache` / circuit / stats call draws the one pool from
     /// it, so the rustc-wrapper hot path does not pay the
     /// `SqliteConnectOptions` / schema-identity check on each invocation.
-    /// Never serialised — a config read back from `STOW_CONFIG_BLOB`
-    /// takes the reading process's handle.
+    /// Never serialised — a config a session receives from its driver
+    /// takes the daemon's handle.
     #[serde(skip, default)]
     pub state_db: StateDb,
     /// Lazily loaded Sigstore trust root, shared by every verification
@@ -307,94 +341,36 @@ impl VerifyMode {
 }
 
 impl StowConfig {
-    /// Encode the resolved config as a JSON blob suitable for passing to a
-    /// child process via `STOW_CONFIG_BLOB` env. Used by `stow check` to skip
-    /// re-parsing the user config inside every rustc wrapper invocation.
-    pub fn to_env_blob(&self) -> stow_types::error::Result<String> {
-        serde_json::to_string(self).wrap_err("serialize STOW_CONFIG_BLOB")
-    }
-
-    /// Decode a previously-encoded `STOW_CONFIG_BLOB`, returning `None` when
-    /// the env var is unset. The blob carries no handle, so the decoded
-    /// config takes `state_db` — the process's own.
-    fn from_env_blob(state_db: &StateDb) -> stow_types::error::Result<Option<Self>> {
-        let Some(raw) = std::env::var_os(STOW_CONFIG_BLOB_ENV) else {
-            return Ok(None);
-        };
-        let raw = raw
-            .into_string()
-            .map_err(|_| stow_types::stow_error!("{STOW_CONFIG_BLOB_ENV} must be valid UTF-8"))?;
-        let mut config: Self = serde_json::from_str(&raw)
-            .wrap_err_with(|| format!("parse {STOW_CONFIG_BLOB_ENV} as JSON"))?;
-        config.state_db = state_db.clone();
-        Ok(Some(config))
-    }
-
+    /// The config of this process's own environment.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load_in`], and the working directory cannot be read.
     #[tracing::instrument(name = "stow.config.load", skip_all)]
     pub fn load(state_db: StateDb) -> stow_types::error::Result<Self> {
-        if let Some(config) = Self::from_env_blob(&state_db)? {
-            tracing::Span::current().record("source", "env_blob");
-            return Ok(config);
-        }
-        let file_config = load_user_config()?;
-        let edge_url = resolve_edge_url(file_config.as_ref());
-        let local_cache_dir = resolve_cache_dir(file_config.as_ref())?;
-        let verify_mode = load_verify_mode(file_config.as_ref())?;
-
-        Ok(Self {
-            cache: file_config
-                .as_ref()
-                .and_then(|config| config.cache)
-                .unwrap_or_default(),
-            edge_url,
-            registry_base_url: resolve_registry_base_url(file_config.as_ref()),
-            cache_dir: local_cache_dir,
-            request_timeout: Duration::from_secs(
-                file_config
-                    .as_ref()
-                    .and_then(|config| config.request_timeout_secs)
-                    .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
-            ),
-            negative_cache_ttl: Duration::from_secs(
-                file_config
-                    .as_ref()
-                    .and_then(|config| config.negative_cache_ttl_secs)
-                    .unwrap_or(DEFAULT_NEGATIVE_CACHE_TTL_SECS),
-            ),
-            circuit_reset_after: Duration::from_secs(
-                file_config
-                    .as_ref()
-                    .and_then(|config| config.circuit_reset_secs)
-                    .unwrap_or(DEFAULT_CIRCUIT_RESET_SECS),
-            ),
-            circuit_trip_threshold: file_config
-                .as_ref()
-                .and_then(|config| config.circuit_trip_threshold)
-                .unwrap_or(DEFAULT_CIRCUIT_TRIP_THRESHOLD),
-            artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
-            index_refresh_interval: load_index_refresh_interval(file_config.as_ref())?,
-            verify_mode,
-            state_db,
-            trust_material: Arc::default(),
-            registry_http: Arc::default(),
-            artifact_cache_staging: Arc::default(),
-        })
+        Self::load_in(&SessionEnv::of_this_process()?, state_db)
     }
 
-    pub fn load_local(state_db: StateDb) -> stow_types::error::Result<Self> {
-        if let Some(config) = Self::from_env_blob(&state_db)? {
-            return Ok(config);
-        }
-        let file_config = load_user_config()?;
-        let verify_mode = load_verify_mode(file_config.as_ref())?;
+    /// The config `env` names: its variables, its home directory and the
+    /// config file under it decide every value, never the loading
+    /// process's own environment.
+    ///
+    /// # Errors
+    ///
+    /// A config file that cannot be read or parsed, or a value that does
+    /// not parse.
+    pub fn load_in(env: &SessionEnv, state_db: StateDb) -> stow_types::error::Result<Self> {
+        let file_config = load_user_config(env)?;
+        let verify_mode = load_verify_mode(env, file_config.as_ref())?;
         Ok(Self {
+            switches: Switches::of_environ(env.environ()),
             cache: file_config
                 .as_ref()
                 .and_then(|config| config.cache)
                 .unwrap_or_default(),
-            edge_url: resolve_edge_url(file_config.as_ref()),
-            registry_base_url: resolve_registry_base_url(file_config.as_ref()),
-            cache_dir: resolve_cache_dir(file_config.as_ref())?,
+            edge_url: resolve_edge_url(env, file_config.as_ref()),
+            registry_base_url: resolve_registry_base_url(env, file_config.as_ref()),
+            cache_dir: resolve_cache_dir(env, file_config.as_ref())?,
             request_timeout: Duration::from_secs(
                 file_config
                     .as_ref()
@@ -417,8 +393,8 @@ impl StowConfig {
                 .as_ref()
                 .and_then(|config| config.circuit_trip_threshold)
                 .unwrap_or(DEFAULT_CIRCUIT_TRIP_THRESHOLD),
-            artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
-            index_refresh_interval: load_index_refresh_interval(file_config.as_ref())?,
+            artifact_cache_max_bytes: load_artifact_cache_max_bytes(env, file_config.as_ref())?,
+            index_refresh_interval: load_index_refresh_interval(env, file_config.as_ref())?,
             verify_mode,
             state_db,
             trust_material: Arc::default(),
@@ -454,10 +430,35 @@ impl StowConfig {
     }
 }
 
-pub fn config_file_path() -> stow_types::error::Result<PathBuf> {
+/// The stow config file `env` names.
+///
+/// # Errors
+///
+/// No per-user config directory can be resolved for `env`.
+pub fn config_file_path(env: &SessionEnv) -> stow_types::error::Result<PathBuf> {
     let config_dir =
-        dirs::config_dir().ok_or_else(|| stow_types::stow_error!("resolve config directory"))?;
+        config_dir_in(env).ok_or_else(|| stow_types::stow_error!("resolve config directory"))?;
     Ok(config_dir.join("stow").join("config.toml"))
+}
+
+/// The per-user config directory in `env`, by the rule the `dirs` crate
+/// applies to the process's own environment: `$XDG_CONFIG_HOME` when it
+/// is absolute, else `~/.config` on Linux and the other Unixes;
+/// `~/Library/Application Support` on macOS; the known folder on Windows,
+/// which no variable decides.
+fn config_dir_in(env: &SessionEnv) -> Option<PathBuf> {
+    if cfg!(windows) {
+        return dirs::config_dir();
+    }
+    if cfg!(target_os = "macos") {
+        return env
+            .home_dir()
+            .map(|home| home.join("Library").join("Application Support"));
+    }
+    env.var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| env.home_dir().map(|home| home.join(".config")))
 }
 
 /// The `[isolation]` table of the global config, the defaults when the file
@@ -470,37 +471,11 @@ pub fn config_file_path() -> stow_types::error::Result<PathBuf> {
 /// # Errors
 ///
 /// A config file that exists and cannot be read or parsed.
-pub fn load_isolation_config() -> stow_types::error::Result<crate::isolation::IsolationConfig> {
-    Ok(load_user_config()?
+pub fn load_isolation_config(
+    env: &SessionEnv,
+) -> stow_types::error::Result<crate::isolation::IsolationConfig> {
+    Ok(load_user_config(env)?
         .and_then(|config| config.isolation)
-        .unwrap_or_default())
-}
-
-/// The `[cache]` table of the global config, every layer on when the file or
-/// the table is absent. A driver's `STOW_CONFIG_BLOB` carries the resolved
-/// layers already, flags included, so a wrapper under a driver never re-reads
-/// the file.
-///
-/// # Errors
-///
-/// A config file that exists and cannot be read or parsed, or a blob that
-/// cannot be decoded.
-pub fn load_cache_layers() -> stow_types::error::Result<CacheLayers> {
-    #[derive(serde::Deserialize)]
-    struct Blob {
-        #[serde(default)]
-        cache: CacheLayers,
-    }
-    if let Some(raw) = std::env::var_os(STOW_CONFIG_BLOB_ENV) {
-        let raw = raw
-            .into_string()
-            .map_err(|_| stow_types::stow_error!("{STOW_CONFIG_BLOB_ENV} must be valid UTF-8"))?;
-        let blob: Blob = serde_json::from_str(&raw)
-            .wrap_err_with(|| format!("parse {STOW_CONFIG_BLOB_ENV} as JSON"))?;
-        return Ok(blob.cache);
-    }
-    Ok(load_user_config()?
-        .and_then(|config| config.cache)
         .unwrap_or_default())
 }
 
@@ -517,9 +492,15 @@ pub fn audit_dir() -> stow_types::error::Result<PathBuf> {
     Ok(data_dir.join("stow").join("audit"))
 }
 
-pub fn cache_dir() -> stow_types::error::Result<PathBuf> {
-    let file_config = load_user_config()?;
-    resolve_cache_dir(file_config.as_ref())
+/// The artifact cache directory `env` names.
+///
+/// # Errors
+///
+/// A config file that cannot be read or parsed, an empty override, or no
+/// home directory.
+pub fn cache_dir(env: &SessionEnv) -> stow_types::error::Result<PathBuf> {
+    let file_config = load_user_config(env)?;
+    resolve_cache_dir(env, file_config.as_ref())
 }
 
 /// The per-user tools directory (`~/Library/Application Support/stow/tools`
@@ -576,15 +557,31 @@ pub fn require_cargo_home() -> stow_types::error::Result<PathBuf> {
 }
 
 /// [`cargo_home`] with the environment injected, so a caller — or a test —
-/// answers `CARGO_HOME` from its own lookup instead of the process's.
+/// answers `CARGO_HOME`, and the home directory it falls back to, from its
+/// own lookup instead of the process's.
 pub fn cargo_home_with(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
     env("CARGO_HOME")
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".cargo")))
+        .or_else(|| home_dir_with(env).map(|home| home.join(".cargo")))
 }
 
-fn resolve_cache_dir(file_config: Option<&StowUserConfig>) -> stow_types::error::Result<PathBuf> {
-    if let Some(value) = std::env::var_os(STOW_CACHE_DIR_ENV) {
+/// The home directory the environment `env` reads names, as cargo's
+/// `home` crate resolves it: the variable it reads first (`HOME`, or
+/// `USERPROFILE` on Windows) when set and non-empty, else the account's
+/// own home directory.
+pub fn home_dir_with(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    env(variable)
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+}
+
+fn resolve_cache_dir(
+    env: &SessionEnv,
+    file_config: Option<&StowUserConfig>,
+) -> stow_types::error::Result<PathBuf> {
+    if let Some(value) = env.var_os(STOW_CACHE_DIR_ENV) {
         if value.is_empty() {
             return Err(stow_types::stow_error!(
                 "{STOW_CACHE_DIR_ENV} must not be empty"
@@ -602,29 +599,37 @@ fn resolve_cache_dir(file_config: Option<&StowUserConfig>) -> stow_types::error:
         return Ok(PathBuf::from(value));
     }
 
-    let home_dir =
-        dirs::home_dir().ok_or_else(|| stow_types::stow_error!("resolve home directory"))?;
+    let home_dir = env
+        .home_dir()
+        .ok_or_else(|| stow_types::stow_error!("resolve home directory"))?;
     Ok(home_dir.join(".stow"))
 }
 
-fn resolve_edge_url(file_config: Option<&StowUserConfig>) -> String {
-    std::env::var(STOW_EDGE_URL_ENV)
-        .ok()
+/// The value of `key` in `env` as text; a value that is not Unicode is
+/// absent, as `std::env::var(..).ok()` reads it.
+fn text_var(env: &SessionEnv, key: &str) -> Option<String> {
+    env.var_os(key)
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_owned)
+}
+
+fn resolve_edge_url(env: &SessionEnv, file_config: Option<&StowUserConfig>) -> String {
+    text_var(env, STOW_EDGE_URL_ENV)
         .or_else(|| file_config.and_then(|config| config.edge_url.clone()))
         .unwrap_or_else(|| DEFAULT_EDGE_URL.to_owned())
 }
 
-fn resolve_registry_base_url(file_config: Option<&StowUserConfig>) -> String {
-    std::env::var(STOW_REGISTRY_BASE_URL_ENV)
-        .ok()
+fn resolve_registry_base_url(env: &SessionEnv, file_config: Option<&StowUserConfig>) -> String {
+    text_var(env, STOW_REGISTRY_BASE_URL_ENV)
         .or_else(|| file_config.and_then(|config| config.registry_base_url.clone()))
         .unwrap_or_else(|| stow_types::registry::GHCR_REGISTRY_URL.to_owned())
 }
 
 fn load_index_refresh_interval(
+    env: &SessionEnv,
     file_config: Option<&StowUserConfig>,
 ) -> stow_types::error::Result<Duration> {
-    let raw = std::env::var(STOW_INDEX_REFRESH_SECS_ENV).ok().or_else(|| {
+    let raw = text_var(env, STOW_INDEX_REFRESH_SECS_ENV).or_else(|| {
         file_config
             .and_then(|config| config.index_refresh_secs)
             .map(|value| value.to_string())
@@ -638,8 +643,8 @@ fn load_index_refresh_interval(
     Ok(Duration::from_secs(value))
 }
 
-fn load_user_config() -> stow_types::error::Result<Option<StowUserConfig>> {
-    let config_path = config_file_path()?;
+fn load_user_config(env: &SessionEnv) -> stow_types::error::Result<Option<StowUserConfig>> {
+    let config_path = config_file_path(env)?;
     if !config_path.exists() {
         return Ok(None);
     }
@@ -669,17 +674,18 @@ struct StowUserConfig {
     mock_public_key_path: Option<String>,
 }
 
-fn load_verify_mode(file_config: Option<&StowUserConfig>) -> stow_types::error::Result<VerifyMode> {
-    let raw = std::env::var(STOW_VERIFY_MODE_ENV)
-        .ok()
+fn load_verify_mode(
+    env: &SessionEnv,
+    file_config: Option<&StowUserConfig>,
+) -> stow_types::error::Result<VerifyMode> {
+    let raw = text_var(env, STOW_VERIFY_MODE_ENV)
         .or_else(|| file_config.and_then(|config| config.verify_mode.clone()))
         .unwrap_or_else(|| "github-ci".to_owned());
     match raw.as_str() {
         "github-ci" => Ok(VerifyMode::GithubCi),
         #[cfg(feature = "mock-verify")]
         "mock-key" => {
-            let public_key_path = std::env::var(STOW_MOCK_PUBLIC_KEY_PATH_ENV)
-                .ok()
+            let public_key_path = text_var(env, STOW_MOCK_PUBLIC_KEY_PATH_ENV)
                 .map(PathBuf::from)
                 .or_else(|| {
                     file_config
@@ -714,15 +720,14 @@ fn load_verify_mode(file_config: Option<&StowUserConfig>) -> stow_types::error::
 }
 
 fn load_artifact_cache_max_bytes(
+    env: &SessionEnv,
     file_config: Option<&StowUserConfig>,
 ) -> stow_types::error::Result<u64> {
-    let raw = std::env::var(STOW_ARTIFACT_CACHE_MAX_BYTES_ENV)
-        .ok()
-        .or_else(|| {
-            file_config
-                .and_then(|config| config.artifact_cache_max_bytes)
-                .map(|value| value.to_string())
-        });
+    let raw = text_var(env, STOW_ARTIFACT_CACHE_MAX_BYTES_ENV).or_else(|| {
+        file_config
+            .and_then(|config| config.artifact_cache_max_bytes)
+            .map(|value| value.to_string())
+    });
     let value = match raw {
         Some(raw) => raw.parse::<u64>().map_err(|error| {
             stow_types::stow_error!(
@@ -777,6 +782,52 @@ mod tests {
     }
 
     use std::path::Path;
+
+    /// Every value a config carries comes from the environment it is
+    /// loaded in — the variables, the home directory the config file is
+    /// found under — never from the loading process's own. Windows finds
+    /// the config directory through a known folder no variable decides, so
+    /// the file half of the check is a Unix one.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_resolves_from_the_given_environment_alone() {
+        use std::ffi::OsStr;
+
+        use crate::session_env::SessionEnv;
+        use crate::state_db::StateDb;
+
+        let home = tempfile::tempdir().expect("home");
+        let cache = home.path().join("elsewhere");
+        let bare = SessionEnv::for_tests([("HOME", home.path().as_os_str())]);
+        let file = super::config_file_path(&bare).expect("the config file's path");
+        assert!(
+            file.starts_with(home.path()),
+            "{} is not under the environment's home {}",
+            file.display(),
+            home.path().display()
+        );
+        std::fs::create_dir_all(file.parent().expect("the config directory"))
+            .expect("create the config directory");
+        std::fs::write(
+            &file,
+            "registry_base_url = \"http://from-the-file.invalid\"\n",
+        )
+        .expect("write the config file");
+
+        let env = SessionEnv::for_tests([
+            ("HOME", home.path().as_os_str()),
+            ("STOW_CACHE_DIR", cache.as_os_str()),
+            ("STOW_EDGE_URL", OsStr::new("http://from-the-env.invalid")),
+        ]);
+        let config = super::StowConfig::load_in(&env, StateDb::closed()).expect("load the config");
+        assert_eq!(config.cache_dir, cache);
+        assert_eq!(config.edge_url, "http://from-the-env.invalid");
+        assert_eq!(config.registry_base_url, "http://from-the-file.invalid");
+        assert_eq!(
+            super::cache_dir(&bare).expect("the default cache directory"),
+            home.path().join(".stow")
+        );
+    }
 
     #[test]
     fn shims_dir_is_a_16_hex_key_under_the_cargo_home() {

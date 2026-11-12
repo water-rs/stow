@@ -401,7 +401,12 @@ impl Stack {
         &self,
         trust: Arc<stow_oci::verify::TrustMaterial>,
     ) -> stow_oci::KeylessSigner {
-        stow_oci::KeylessSigner::new(self.http.clone(), trust, self.sigstore.services())
+        stow_oci::KeylessSigner::new(
+            self.http.clone(),
+            trust,
+            self.sigstore.services(),
+            CERTIFICATE_IDENTITY,
+        )
     }
 
     fn session(&self, writes: &stow_oci::WriteBudget) -> stow_oci::RegistrySession {
@@ -530,6 +535,35 @@ async fn a_keyless_signature_verifies_with_the_readers_verifier() {
         .as_str()
         .expect("chain");
     assert_eq!(chain, stack.sigstore.with(|state| state.ca.pem()));
+}
+
+/// A certificate for any identity but the one the signer is bound to is
+/// refused before a signature layer is pushed.
+#[tokio::test]
+async fn a_certificate_for_another_identity_is_never_published() {
+    let stack = Stack::new().await;
+    let session = stack.session(&unbounded());
+    let reference = session.reference("wrong-identity").expect("reference");
+    let digest = stow_types::registry::sha256_digest(b"manifest");
+    let other = "https://github.com/water-rs/stow/.github/workflows/repack.yml@refs/heads/main";
+    let signer = stow_oci::KeylessSigner::new(
+        stack.http.clone(),
+        stack.sigstore.trust(),
+        stack.sigstore.services(),
+        other,
+    );
+    let error = signer
+        .sign(&session, &reference.to_string(), &digest)
+        .await
+        .expect_err("the certificate names another identity");
+    assert!(
+        format!("{error:?}").contains(other),
+        "the error names the required identity: {error:?}"
+    );
+    assert!(
+        stack.signature_manifest(&digest).is_none(),
+        "nothing was pushed"
+    );
 }
 
 /// The in-memory material is the signature published to the registry,
@@ -808,6 +842,7 @@ async fn independent_publishers_recover_without_re_signing() {
                 http,
                 stack.sigstore.trust(),
                 stack.sigstore.services(),
+                CERTIFICATE_IDENTITY,
             );
             let sign = |reference: String, digest: String| {
                 let (session, signer) = (&session, &signer);

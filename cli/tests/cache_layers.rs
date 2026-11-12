@@ -44,6 +44,10 @@ const SERVED_LOCALLY: &str = "served rustc invocation from local stow artifact c
 /// The debug event a gated lookup emits when the layer is off for the entry.
 const LAYER_OFF: &str = "cache layer off for this entry";
 
+/// The decision log for a unit kept local behind a dependency the build
+/// compiled itself.
+const DEPENDENCY_COMPILED_LOCALLY: &str = "dependency was compiled locally in this build";
+
 const REMOTE_OFF: &str = "[cache]\nremote = false\n";
 const CRATES_IO_OFF: &str = "[cache]\nlocal_crates_io = false\n";
 const GIT_OFF: &str = "[cache]\nlocal_git = false\n";
@@ -86,17 +90,17 @@ fn packages(entries: &[StoredEntry]) -> Vec<String> {
 /// One project, one `CARGO_HOME`, one cache: the pieces every scenario
 /// shares.
 struct Project {
-    dir: tempfile::TempDir,
-    cargo_home: tempfile::TempDir,
-    cache: tempfile::TempDir,
+    dir: support::TempDir,
+    cargo_home: support::TempDir,
+    cache: support::TempDir,
 }
 
 impl Project {
     fn registry(config: &str) -> Self {
         let project = Self {
-            dir: tempfile::tempdir().expect("temp dir"),
-            cargo_home: tempfile::tempdir().expect("cargo home"),
-            cache: tempfile::tempdir().expect("cache dir"),
+            dir: support::tempdir().expect("temp dir"),
+            cargo_home: support::tempdir().expect("cargo home"),
+            cache: support::tempdir().expect("cache dir"),
         };
         write_fixture(
             project.dir.path(),
@@ -138,7 +142,7 @@ impl Project {
 
 struct Built {
     output: Output,
-    target: tempfile::TempDir,
+    target: support::TempDir,
 }
 
 fn build_in(
@@ -149,7 +153,7 @@ fn build_in(
     flags: &[&str],
     label: &str,
 ) -> Built {
-    let target = tempfile::tempdir().expect("target dir");
+    let target = support::tempdir().expect("target dir");
     let mut args = vec!["build"];
     args.extend_from_slice(flags);
     args.push("--offline");
@@ -288,10 +292,16 @@ fn remote_off_does_not_serve_downloaded_entries(config: &str, flags: &[&str]) {
     }
     // A unit over a dependency that compiled here compiles here too, without
     // a lookup; the leaves are looked up and refused by the layer gate.
-    for package in ["cfg_if", "memchr", "unicode_ident", "proc_macro2"] {
+    for package in ["cfg_if", "memchr", "unicode_ident"] {
         assert!(
             logged(&stderr, LAYER_OFF, package),
             "the downloaded {package} entry was not refused by the layer gate:\n{stderr}"
+        );
+    }
+    for package in ["proc_macro2", "quote"] {
+        assert!(
+            logged(&stderr, DEPENDENCY_COMPILED_LOCALLY, package),
+            "{package} was not kept local behind its locally compiled dependency:\n{stderr}"
         );
     }
     assert_eq!(
@@ -394,7 +404,7 @@ fn crates_io_off_stores_and_serves_nothing(config: &str, flags: &[&str]) {
     );
 
     // And stores nothing: a fresh cache stays empty.
-    let empty = tempfile::tempdir().expect("empty cache");
+    let empty = support::tempdir().expect("empty cache");
     build_in(
         project.dir.path(),
         project.cargo_home.path(),
@@ -457,15 +467,15 @@ fn a_remote_off_build_still_stores_every_local_kind() {
 /// A scenario with a git dependency: `unicode-ident` patched to a
 /// `file://` repository, under `quote` and `proc-macro2`.
 struct GitProject {
-    root: tempfile::TempDir,
-    cargo_home: tempfile::TempDir,
+    root: support::TempDir,
+    cargo_home: support::TempDir,
     patch: String,
 }
 
 impl GitProject {
     fn new() -> Self {
-        let root = tempfile::tempdir().expect("root");
-        let cargo_home = tempfile::tempdir().expect("cargo home");
+        let root = support::tempdir().expect("root");
+        let cargo_home = support::tempdir().expect("cargo home");
         let home = root.path().join("git-home");
         std::fs::create_dir_all(&home).expect("create git home");
         // The registry copy of `unicode-ident` must be extracted before the
@@ -566,7 +576,7 @@ fn each_local_switch_gates_only_its_source_kind() {
     } in cases
     {
         let label = format!("config {config:?} flags {flags:?}");
-        let cache = tempfile::tempdir().expect("cache");
+        let cache = support::tempdir().expect("cache");
         let first = git.project("first", config);
         git.build(&first, cache.path(), flags, "first build");
         let entries = stored_entries(&cache.path().join("state-v3.sqlite3"));
@@ -590,7 +600,7 @@ fn each_local_switch_gates_only_its_source_kind() {
 #[test]
 fn a_layer_off_does_not_serve_entries_another_run_stored() {
     let git = GitProject::new();
-    let cache = tempfile::tempdir().expect("cache");
+    let cache = support::tempdir().expect("cache");
     let first = git.project("first", "");
     git.build(&first, cache.path(), &[], "fill build");
     assert_eq!(

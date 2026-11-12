@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::file_lock::FileLock;
-use crate::supervisor::{self, Endpoint, Listener, Stream};
+use crate::local_socket::{self, Endpoint, Listener, Stream};
 
 /// `<gate_dir>/foreground.lock` — see the module docs.
 const FOREGROUND_LOCK: &str = "foreground.lock";
@@ -176,7 +176,7 @@ async fn stop_derivation(pointer: &Path) {
     // pointer has actually been removed.
     let deadline = tokio::time::Instant::now() + STOP_DEADLINE;
     let Ok(Ok(mut stream)) =
-        tokio::time::timeout(CONNECT_DEADLINE, supervisor::connect(&endpoint)).await
+        tokio::time::timeout(CONNECT_DEADLINE, local_socket::connect(&endpoint)).await
     else {
         remove_pointer(pointer).await;
         return;
@@ -325,7 +325,7 @@ fn open_slot_blocking(gate_dir: &Path) -> Result<OpenAttempt, String> {
     let derive = gate_dir.join(DERIVE_DIR);
     std::fs::create_dir_all(&derive)
         .map_err(|error| format!("create {}: {error}", derive.display()))?;
-    let listener = supervisor::bind("stow-derive-")?;
+    let listener = local_socket::bind("stow-derive-")?;
     let endpoint = listener.endpoint();
     let pid = std::process::id();
     let pointer = derive.join(pid.to_string());
@@ -486,7 +486,7 @@ mod tests {
         // An endpoint nobody listens on, under the pid of a process
         // that is alive — this one: the listener is dropped as soon as
         // the pointer is written.
-        let listener = supervisor::bind("stow-derive-").expect("bind");
+        let listener = local_socket::bind("stow-derive-").expect("bind");
         let endpoint = listener.endpoint();
         let pointer = derive.join(std::process::id().to_string());
         std::fs::write(&pointer, endpoint.encode()).expect("write pointer");
@@ -516,7 +516,7 @@ mod tests {
         std::fs::create_dir_all(&derive).expect("derive dir");
         // A listener that would hold a connection for the whole
         // deadline, under the pid of a process that has exited.
-        let listener = supervisor::bind("stow-derive-").expect("bind");
+        let listener = local_socket::bind("stow-derive-").expect("bind");
         let endpoint = listener.endpoint();
         let pointer = derive.join(crate::miss_journal::dead_pid().to_string());
         std::fs::write(&pointer, endpoint.encode()).expect("write pointer");
@@ -553,7 +553,7 @@ mod tests {
         let gate_dir = dir.path().join("gate");
         let derive = gate_dir.join(DERIVE_DIR);
         std::fs::create_dir_all(&derive).expect("derive dir");
-        let listener = supervisor::bind("stow-derive-").expect("bind");
+        let listener = local_socket::bind("stow-derive-").expect("bind");
         let endpoint = listener.endpoint();
         let pointer = derive.join(std::process::id().to_string());
         std::fs::write(&pointer, endpoint.encode()).expect("write pointer");

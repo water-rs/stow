@@ -25,6 +25,6 @@ mod wrapper;
 #[cfg(not(target_arch = "wasm32"))]
 pub use wrapper::{
     CAPTURE_DIR_ENV, REAL_CC_ENV, REAL_CXX_ENV, RESOLVE_CC, RESOLVE_CXX, WrapperRole,
-    WrapperShimPaths, capture_executable_beside, materialize_wrapper_shims, tools_dir,
-    tools_dir_in,
+    WrapperShimPaths, capture_executable_beside, materialize_wrapper_shims,
+    runtime_executable_beside, tools_dir, tools_dir_in,
 };

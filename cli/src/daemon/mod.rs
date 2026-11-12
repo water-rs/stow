@@ -3,14 +3,22 @@
 //!
 //! * [`serve`] is the daemon: it takes `daemon.lock` in the runtime
 //!   directory, binds its endpoint there, reports readiness and answers
-//!   [`protocol`] requests.
+//!   [`protocol`] requests. A build is a [`session`] of it: the driver
+//!   opens one over a control connection ([`client::DaemonSession`]) and
+//!   the build's wrappers name it by id ([`client::WrapperConnection`]);
+//!   a wrapper in a sandbox reaches the daemon through the driver's
+//!   [`relay`].
 //! * [`start`] is the one path every client uses to reach it: connect,
 //!   else take `start.lock`, spawn the daemon detached, wait for its
 //!   readiness notification, connect. It is synchronous and std-only —
 //!   no runtime, no configuration — because the clients it serves run
 //!   hundreds of times per build.
 //! * [`launch_agent`] is the macOS login trigger `stow setup` installs.
-//!   Nothing else touches the service manager.
+//!   Nothing else touches launchd.
+//! * [`scheduled_task`] is the Windows counterpart: the per-user task `stow
+//!   setup` registers, which is both the login trigger and the only way
+//!   the start path starts the daemon, because a process started from a
+//!   cargo build stays inside cargo's job object and ends with it.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -21,22 +29,32 @@ use stow_types::error::{Context, Result};
 use crate::cli_args::{DaemonArgs, DaemonCommand};
 use crate::write_stdout;
 
+pub mod client;
 #[cfg(unix)]
 mod descriptors;
+pub mod detached;
+pub mod events;
 #[cfg(target_os = "macos")]
 pub mod launch_agent;
 mod log;
 mod notify;
+pub mod owner;
+mod peer;
 pub mod protocol;
+pub mod relay;
+mod retire;
+#[cfg(windows)]
+pub mod scheduled_task;
 mod serve;
+pub mod session;
 mod start;
+mod table;
 #[cfg(windows)]
 mod windows;
-
-pub use start::connect_or_start;
+pub mod wrapper;
 
 /// Overrides the runtime directory.
-const STOW_DAEMON_DIR_ENV: &str = "STOW_DAEMON_DIR";
+pub const STOW_DAEMON_DIR_ENV: &str = "STOW_DAEMON_DIR";
 /// How long a connected daemon may take to answer, in seconds.
 const STOW_DAEMON_ANSWER_SECS_ENV: &str = "STOW_DAEMON_ANSWER_SECS";
 /// How long a client waits for the daemon it started, in seconds.
@@ -51,6 +69,16 @@ const DEFAULT_ANSWER_SECS: u64 = 10;
 /// under a second normally. Thirty seconds covers the same binary paged in
 /// from a cold disk on a host whose cores cargo's jobs already saturate.
 const DEFAULT_START_SECS: u64 = 30;
+/// A retiring daemon waits this long for the builds it holds before it
+/// cuts them. A build that asks for a session meanwhile waits out the same
+/// time, then the start bound for the successor, so the bound is the most
+/// an upgrade adds to that build; a build already running is cut if it is
+/// still running when the bound ends. It is the answer bound: a live peer
+/// answers within it, so nothing waits longer than it takes to know the
+/// peer is wedged.
+const DEFAULT_DRAIN_SECS: u64 = DEFAULT_ANSWER_SECS;
+/// How long a retiring daemon waits for the builds it holds, in seconds.
+const STOW_DAEMON_DRAIN_SECS_ENV: &str = "STOW_DAEMON_DRAIN_SECS";
 /// A daemon logs a few lines per start and per refused connection, so
 /// 8 MiB is weeks of history; with the one predecessor the log is bounded
 /// at 16 MiB, small beside the cache the daemon sits next to.
@@ -71,6 +99,8 @@ pub struct Settings {
     pub start: Duration,
     /// The size at which the daemon rotates its log.
     pub log_bytes: u64,
+    /// How long a retiring daemon waits for the builds it holds.
+    pub drain: Duration,
 }
 
 impl Settings {
@@ -102,6 +132,7 @@ impl Settings {
             )?),
             start: Duration::from_secs(positive(STOW_DAEMON_START_SECS_ENV, DEFAULT_START_SECS)?),
             log_bytes: positive(STOW_DAEMON_LOG_BYTES_ENV, DEFAULT_LOG_BYTES)?,
+            drain: Duration::from_secs(positive(STOW_DAEMON_DRAIN_SECS_ENV, DEFAULT_DRAIN_SECS)?),
         })
     }
 }
@@ -121,6 +152,19 @@ impl RunDir {
     /// directory.
     pub fn locate() -> Result<PathBuf> {
         Self::locate_with(std::env::var_os(STOW_DAEMON_DIR_ENV), dirs::cache_dir())
+    }
+
+    /// The directory a daemon was told to use (`stow daemon --run-dir`),
+    /// else [`RunDir::locate`]. A daemon the Task Scheduler starts has none
+    /// of its starter's environment, so the task names the directory.
+    ///
+    /// # Errors
+    ///
+    /// As [`RunDir::locate`]; the given directory must be absolute.
+    pub fn locate_given(given: Option<PathBuf>) -> Result<PathBuf> {
+        given.map_or_else(Self::locate, |path| {
+            Self::locate_with(Some(path.into_os_string()), None)
+        })
     }
 
     fn locate_with(over: Option<OsString>, cache_dir: Option<PathBuf>) -> Result<PathBuf> {
@@ -193,6 +237,35 @@ impl RunDir {
         Ok(Self(path))
     }
 
+    /// The prepared runtime directory spelled as the kernel resolves it, for
+    /// a sandbox profile that must name the directory and the daemon's
+    /// socket in it: a rule written through a symlink does not cover the
+    /// resolved path. Windows has no such rule, so the path stays as
+    /// located.
+    ///
+    /// # Errors
+    ///
+    /// [`RunDir::locate`] or [`RunDir::prepare`] fails, or the directory
+    /// cannot be resolved.
+    pub fn locate_resolved() -> Result<Self> {
+        let dir = Self::prepare(Self::locate()?)?;
+        #[cfg(unix)]
+        {
+            std::fs::canonicalize(dir.path())
+                .map(Self)
+                .wrap_err_with(|| {
+                    format!(
+                        "resolve the daemon runtime directory {}",
+                        dir.path().display()
+                    )
+                })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(dir)
+        }
+    }
+
     /// The directory itself.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -217,6 +290,12 @@ impl RunDir {
         self.0.join("daemon.log")
     }
 
+    /// The directory holding one subdirectory per open session.
+    #[must_use]
+    pub fn sessions(&self) -> PathBuf {
+        self.0.join("sessions")
+    }
+
     /// Where clients reach the daemon: a Unix socket in the directory, or
     /// on Windows a named pipe named after it, since pipes live in one
     /// machine-wide namespace.
@@ -228,11 +307,20 @@ impl RunDir {
         }
         #[cfg(windows)]
         {
-            let digest = blake3::hash(self.0.as_os_str().as_encoded_bytes()).to_hex();
-            // Thirty-two hex digits are 128 bits: distinct directories
-            // never share a pipe.
-            PathBuf::from(format!(r"\\.\pipe\stow-daemon-{}", &digest[..32]))
+            PathBuf::from(format!(r"\\.\pipe\{}", Self::identity(&self.0)))
         }
+    }
+
+    /// What names one runtime directory machine-wide: the pipe of the
+    /// daemon that serves it and the Task Scheduler task that starts that
+    /// daemon are both called this.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn identity(path: &Path) -> String {
+        let digest = blake3::hash(path.as_os_str().as_encoded_bytes()).to_hex();
+        // Thirty-two hex digits are 128 bits: distinct directories never
+        // share a name.
+        format!("stow-daemon-{}", &digest[..32])
     }
 
     /// Where a starting client listens for the daemon's readiness
@@ -240,6 +328,16 @@ impl RunDir {
     #[cfg(unix)]
     fn notify_endpoint(&self) -> PathBuf {
         self.0.join("ready.sock")
+    }
+
+    /// The file a starting client publishes its readiness address in, for a
+    /// daemon the Task Scheduler starts: the task's command line is fixed
+    /// when `stow setup` registers it, so it cannot carry the address of
+    /// the client that asks for the run. Only the holder of `start.lock`
+    /// writes it.
+    #[cfg(windows)]
+    fn notify_address_file(&self) -> PathBuf {
+        self.0.join("ready.addr")
     }
 }
 
@@ -252,22 +350,53 @@ pub fn is_serving(args: &[OsString]) -> bool {
 }
 
 /// Make this process the daemon's: close every inherited descriptor above
-/// stderr and make everything it creates owner-only (Unix). Called before
+/// stderr except the lock and the socket a daemon it replaces passed on
+/// (`args` names them), and make everything it creates owner-only (Unix), or
+/// give up the console the Task Scheduler gave it (Windows). Called before
 /// anything else in the process opens a descriptor.
 ///
 /// # Errors
 ///
 /// The open descriptors cannot be enumerated.
-pub fn prepare_process() -> Result<()> {
+#[cfg_attr(
+    windows,
+    expect(unused_variables, reason = "a Windows daemon inherits nothing")
+)]
+pub fn prepare_process(args: &[OsString]) -> Result<()> {
     #[cfg(unix)]
     {
-        let inherited = descriptors::open_from(descriptors::FIRST_INHERITED)
+        let kept = inherited_descriptors(args);
+        let mut inherited = descriptors::open_from(descriptors::FIRST_INHERITED)
             .wrap_err("list the inherited descriptors")?;
+        inherited.retain(|fd| !kept.contains(fd));
         descriptors::close(&inherited);
         // SAFETY: `umask` has no preconditions and cannot fail.
         unsafe { libc::umask(0o077) };
     }
+    #[cfg(windows)]
+    {
+        // The Task Scheduler starts a console program with a console
+        // window of its own, which would stay open for as long as the
+        // daemon runs. Freeing the console closes it; the call fails only
+        // when there is no console, which is what is wanted.
+        // SAFETY: `FreeConsole` has no preconditions.
+        let _ = unsafe { windows_sys::Win32::System::Console::FreeConsole() };
+    }
     Ok(())
+}
+
+/// The descriptors `args`, the command line of a daemon, say a daemon it
+/// replaces passed on: the process has not parsed its arguments yet when it
+/// closes what it inherited.
+#[cfg(unix)]
+fn inherited_descriptors(args: &[OsString]) -> Vec<std::os::fd::RawFd> {
+    args.windows(2)
+        .filter(|pair| {
+            pair[0] == crate::cli_args::INHERIT_LOCK_FLAG
+                || pair[0] == crate::cli_args::INHERIT_LISTENER_FLAG
+        })
+        .filter_map(|pair| pair[1].to_str()?.parse().ok())
+        .collect()
 }
 
 /// `stow daemon`: serve, or with `status` report the running daemon.
@@ -279,7 +408,20 @@ pub fn prepare_process() -> Result<()> {
 pub async fn run(args: DaemonArgs) -> Result<()> {
     match args.command {
         Some(DaemonCommand::Status) => status().await,
-        None => serve::run(args.ready).await,
+        None => {
+            #[cfg(unix)]
+            let inherited = args
+                .inherit_lock
+                .zip(args.inherit_listener)
+                .map(|(lock, listener)| serve::Inherited { lock, listener });
+            serve::run(
+                args.ready,
+                args.run_dir,
+                #[cfg(unix)]
+                inherited,
+            )
+            .await
+        }
     }
 }
 
@@ -289,7 +431,7 @@ async fn status() -> Result<()> {
     let reply = tokio::task::spawn_blocking(|| {
         let exe = std::env::current_exe().wrap_err("resolve the current executable")?;
         let settings = Settings::from_env()?;
-        connect_or_start(&exe, settings)?.status()
+        start::status_of(&exe, settings)
     })
     .await
     .wrap_err("run the daemon status client")??;
@@ -322,6 +464,10 @@ mod tests {
         assert_eq!(defaults.answer, Duration::from_secs(10));
         assert_eq!(defaults.start, Duration::from_secs(30));
         assert_eq!(defaults.log_bytes, 8 * 1024 * 1024);
+        assert_eq!(defaults.drain, Duration::from_secs(10));
+        let drained =
+            Settings::from_lookup(lookup(&[("STOW_DAEMON_DRAIN_SECS", "3")])).expect("drained");
+        assert_eq!(drained.drain, Duration::from_secs(3));
         let sized =
             Settings::from_lookup(lookup(&[("STOW_DAEMON_LOG_BYTES", "4096")])).expect("sized");
         assert_eq!(sized.log_bytes, 4096);
@@ -339,6 +485,7 @@ mod tests {
         for bad in ["0", "soon", "-1", ""] {
             assert!(
                 Settings::from_lookup(lookup(&[("STOW_DAEMON_START_SECS", bad)])).is_err()
+                    && Settings::from_lookup(lookup(&[("STOW_DAEMON_DRAIN_SECS", bad)])).is_err()
                     && Settings::from_lookup(lookup(&[("STOW_DAEMON_LOG_BYTES", bad)])).is_err(),
                 "`{bad}` must be refused"
             );
@@ -379,6 +526,31 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).expect("chmod");
         let error = RunDir::prepare(path).expect_err("group access is refused");
         assert!(error.to_string().contains("owner"), "{error}");
+    }
+
+    /// The descriptors a replaced daemon passed on survive the close of
+    /// everything a process inherited.
+    #[cfg(unix)]
+    #[test]
+    fn the_descriptors_a_daemon_passed_on_are_the_ones_named_on_its_command_line() {
+        let args = |parts: &[&str]| parts.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            super::inherited_descriptors(&args(&[
+                "stow",
+                "daemon",
+                "--run-dir",
+                "/run",
+                "--inherit-lock",
+                "7",
+                "--inherit-listener",
+                "9",
+            ])),
+            [7, 9]
+        );
+        assert_eq!(
+            super::inherited_descriptors(&args(&["stow", "daemon"])),
+            Vec::<i32>::new()
+        );
     }
 
     #[test]

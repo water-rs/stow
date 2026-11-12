@@ -1,11 +1,9 @@
 //! Misses are admitted from a per-target-dir journal: one JSON line per
-//! unit a build compiled locally, appended by whatever saw the compile —
-//! the rustc wrapper under a plain `cargo build`, or the supervising
-//! driver itself. A journal is turned into admissions detached from every
-//! build's wall clock: the driver spawns a `stow __drain-misses` child as
-//! soon as cargo exits, and under plain cargo the first wrapper of a
-//! later build does the same for any journal whose cargo exited
-//! (stow#317).
+//! unit a build compiled locally, written by the build's daemon session
+//! when the build ends. A journal is turned into admissions detached from
+//! every build's wall clock: the driver, or the daemon for a plain
+//! `cargo build`, spawns a `stow __drain-misses` child as soon as cargo
+//! exits (stow#317).
 //!
 //! The drain detaches into its own session so a `SIGINT` that kills the
 //! build's process group does not strand a claimed journal; a claim file
@@ -15,11 +13,12 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use crate::artifact_cache::{LocalBuildArtifact, ObservedUnit};
 use crate::config::StowConfig;
+use crate::daemon::session::SessionId;
 use crate::rustc_args::ParsedRustcArgs;
+use crate::session_env::SessionEnv;
 use crate::state_db::StateDb;
 
 const JOURNAL_PREFIX: &str = "stow-misses.";
@@ -213,77 +212,15 @@ fn journal_path(target_dir: &Path, build: &str) -> PathBuf {
     target_dir.join(format!("{JOURNAL_PREFIX}{build}{JOURNAL_SUFFIX}"))
 }
 
-/// The target dir a compile's out dir sits under — cargo lays units out
-/// as `<target>/<profile>/deps`, so the journal lives two levels up.
-/// `None` for an out dir outside that layout (a bare `--out-dir`): the
-/// observation is dropped rather than written somewhere arbitrary.
-fn target_dir_for(out_dir: &Path) -> Option<PathBuf> {
-    if out_dir.file_name() != Some(OsStr::new("deps")) {
-        return None;
-    }
-    out_dir.parent()?.parent().map(Path::to_path_buf)
-}
+/// What every journal's id starts with: each is a session's, written
+/// complete when its build ends, so it is drainable the moment it exists.
+const SESSION_JOURNAL_MARK: &str = "stow-";
 
-/// The cargo build a standalone wrapper belongs to: the process that
-/// spawned it. While that pid lives the journal is still being written.
-fn cargo_build() -> String {
-    parent_pid().to_string()
-}
-
-/// The wrapper's parent process id — the cargo that spawned it on every
-/// platform cargo runs it under, so one build journals to one file.
-#[cfg(unix)]
-fn parent_pid() -> u32 {
-    u32::try_from(unsafe { libc::getppid() }).unwrap_or_else(|_| std::process::id())
-}
-
-/// Windows carries no parent-pid in `std`: read it out of the process
-/// snapshot. `None` falls back to the wrapper's own (short-lived) pid —
-/// more journals, same drain.
-#[cfg(windows)]
-fn parent_pid() -> u32 {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPPROCESS,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
-            return std::process::id();
-        }
-        let mut entry: PROCESSENTRY32 = std::mem::zeroed();
-        // A zero size makes Process32First fail, which falls back to
-        // the wrapper's own pid — more journals, same drain.
-        entry.dwSize = u32::try_from(std::mem::size_of::<PROCESSENTRY32>()).unwrap_or_default();
-        let own = GetCurrentProcessId();
-        let mut found = None;
-        if Process32First(snapshot, &raw mut entry) != 0 {
-            loop {
-                if entry.th32ProcessID == own {
-                    found = Some(entry.th32ParentProcessID);
-                    break;
-                }
-                if Process32Next(snapshot, &raw mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snapshot);
-        found.unwrap_or_else(std::process::id)
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn parent_pid() -> u32 {
-    std::process::id()
-}
-
-/// The journal id for a supervised build: the driver writes the file
-/// complete after cargo exits, so the `stow-` mark makes it drainable
-/// without a liveness check.
-fn supervised_build() -> String {
-    format!("stow-{}", std::process::id())
+/// The journal id for a session's build. The session's own id names it:
+/// one daemon serves many builds, so nothing about the writing process
+/// can.
+fn session_journal_id(session: SessionId) -> String {
+    format!("{SESSION_JOURNAL_MARK}{session}")
 }
 
 /// Whether a process id still names a live process. `EPERM` means the
@@ -344,20 +281,6 @@ pub fn dead_pid() -> u32 {
     child.id()
 }
 
-/// Whether the journal's writing build has finished: a driver's `stow-*`
-/// file is complete on write, and a cargo pid that no longer names a
-/// live process means its build exited. Anything unanswerable waits —
-/// posting early is harmless only when the writer is actually done.
-fn build_finished(build: &str) -> bool {
-    if build.starts_with("stow-") {
-        return true;
-    }
-    let Ok(pid) = build.parse::<u32>() else {
-        return true;
-    };
-    !process_alive(pid)
-}
-
 /// The pid a `…{DRAIN_CLAIM}<pid>` claim name carries, if any.
 fn claim_pid(file_name: &str) -> Option<u32> {
     file_name
@@ -365,11 +288,10 @@ fn claim_pid(file_name: &str) -> Option<u32> {
         .and_then(|(_, pid)| pid.parse().ok())
 }
 
-/// The journals in `target_dir` ready to post: finished builds' files
-/// and stale claims whose drainer died mid-post (a SIGKILL, or a
-/// `SIGINT` that reached the whole process group before the drain's
-/// own session detached). Reading the directory is the only cost a
-/// wrapper pays for the check, and only target dirs that stow built in
+/// The journals in `target_dir` ready to post: every session's file, each
+/// complete on write, and stale claims whose drainer died mid-post (a
+/// SIGKILL, or a `SIGINT` that reached the whole process group before the
+/// drain's own session detached). Only target dirs that stow built in
 /// carry journals at all.
 fn finished_journals(target_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(target_dir) else {
@@ -381,7 +303,9 @@ fn finished_journals(target_dir: &Path) -> Vec<PathBuf> {
             let name = entry.file_name().to_str()?.to_owned();
             let rest = name.strip_prefix(JOURNAL_PREFIX)?;
             if let Some(build) = rest.strip_suffix(JOURNAL_SUFFIX) {
-                return build_finished(build).then(|| entry.path());
+                return build
+                    .starts_with(SESSION_JOURNAL_MARK)
+                    .then(|| entry.path());
             }
             // A `…jsonl.draining-<dead drainer pid>` claim is
             // reclaimable: its entries were never posted.
@@ -398,19 +322,21 @@ fn finished_journals(target_dir: &Path) -> Vec<PathBuf> {
 /// Spawn the detached drainer for a target dir — but only when a journal
 /// is actually pending, so steady-state invocations pay nothing.
 /// Nobody waits on the child, so posting admissions never sits on a
-/// build's wall clock.
-pub fn spawn_drain(target_dir: &Path) {
+/// build's wall clock. The drain runs in `env`: the environment of the
+/// build whose misses it posts, which is not the spawning process's when
+/// the daemon spawns it.
+pub fn spawn_drain(target_dir: &Path, env: &SessionEnv) {
     if finished_journals(target_dir).is_empty() {
         return;
     }
-    spawn_drain_unconditional(target_dir);
+    spawn_drain_unconditional(target_dir, env);
 }
 
 /// Spawn the detached drainer whether or not a journal is pending — the
 /// day's usage report rides in the same process, and an all-hit build
 /// leaves no journal for [`spawn_drain`] to find (stow#889). The child
 /// exits promptly when it finds nothing to do.
-pub fn spawn_drain_unconditional(target_dir: &Path) {
+pub fn spawn_drain_unconditional(target_dir: &Path, env: &SessionEnv) {
     // Under a shim name `current_exe` is the runtime's role name —
     // `expand_wrapper_role` leaves the `__drain-misses` subcommand
     // untouched regardless of argv[0]'s name.
@@ -433,46 +359,27 @@ pub fn spawn_drain_unconditional(target_dir: &Path) {
         .append(true)
         .open(&log)
         .ok();
-    let stderr = log_file
-        .as_ref()
-        .and_then(|file| file.try_clone().ok())
-        .map_or_else(Stdio::null, Stdio::from);
-    let mut command = std::process::Command::new(&exe);
-    command
+    // Detached, so a `SIGINT`/`SIGTERM` or Ctrl-C aimed at the build's
+    // process group never kills the drain mid-claim, and it holds none of
+    // the build's descriptors or handles: a caller reading the build's
+    // output to its end never waits for the drain. The drain starts at the
+    // caller's own priority: its re-derivation cargo holds the
+    // package-cache lock the user's next command needs, so a niced cargo
+    // would hold it *longer* — the drain lowers itself before the part
+    // that only burns CPU instead (stow#667).
+    let mut command = crate::daemon::detached::Detached::new(&exe)
         .arg("__drain-misses")
         .arg(target_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr)
         // The chrome trace file is one process's: a second writer
         // truncates it on open and the parent's spans are lost.
-        .env_remove(crate::STOW_TRACE_FILE_ENV);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        // A session of its own: a `SIGINT`/`SIGTERM` aimed at the
-        // build's process group never kills the drain mid-claim. The
-        // drain starts at the caller's own priority: its re-derivation
-        // cargo holds the package-cache lock the user's next command
-        // needs, so a niced cargo would hold it *longer* — the drain
-        // lowers itself before the part that only burns CPU instead
-        // (stow#667).
-        unsafe {
-            command.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        // DETACHED_PROCESS | CREATE_NO_WINDOW: no console flashes open.
-        // The drain starts at the caller's priority for the same
-        // reason — its cargo holds the lock the user's next command
-        // needs; it lowers itself once only CPU-bound posting remains
-        // (stow#667).
-        command.creation_flags(0x0000_0008 | 0x0000_0200);
+        .envs(
+            env.environ()
+                .iter()
+                .filter(|(name, _)| !stow_types::env_name::eq(name, crate::STOW_TRACE_FILE_ENV))
+                .cloned(),
+        );
+    if let Some(stderr) = log_file.as_ref().and_then(|file| file.try_clone().ok()) {
+        command = command.stderr(stderr);
     }
     if let Err(error) = command.spawn() {
         tracing::warn!(error = %error, "could not spawn the miss drain");
@@ -497,46 +404,7 @@ fn append_lines(journal: &Path, entries: &[JournalEntry]) -> std::io::Result<()>
     file.write_all(&buffer)
 }
 
-/// Record one locally compiled unit to the standalone build's journal.
-/// The wrapper's whole cost is a single append — the observation rides
-/// the identity the compile already resolved.
-pub fn record_observation(
-    rustc: &OsStr,
-    parsed: &ParsedRustcArgs,
-    build: &LocalBuildArtifact,
-    build_host: &str,
-) {
-    let Some(unit) = observed_unit(parsed, build) else {
-        return;
-    };
-    let Some(out_dir) = parsed.out_dir.as_deref() else {
-        return;
-    };
-    let Some(target_dir) = target_dir_for(out_dir) else {
-        tracing::warn!(
-            out_dir = %out_dir.display(),
-            "compile's out dir is outside cargo's target layout; observation dropped"
-        );
-        return;
-    };
-    let entry = JournalEntry::Unit(UnitLine {
-        rustc: rustc.to_string_lossy().into_owned(),
-        rustc_version: build.rustc_version.clone(),
-        build_host: build_host.to_owned(),
-        consumer_spelled_target: unit.explicit_target.is_some(),
-        // The rustc wrapper has no project context — it cannot name
-        // the build's expanded graph; the build's context sidecar does
-        // (stow#588).
-        expanded_cache_key: String::new(),
-        unit,
-    });
-    let journal = journal_path(&target_dir, &cargo_build());
-    if let Err(error) = append_lines(&journal, &[entry]) {
-        tracing::warn!(error = %error, journal = %journal.display(), "could not journal the compile observation");
-    }
-}
-
-/// The probed build host recorded for a supervised journal: a host
+/// The probed build host recorded for a session journal: a host
 /// unit's recorded platform already is the compiling rustc's `host:`
 /// triple (cargo passes it no `--target`); a build without host units
 /// never consults the value, so the consumer stands in.
@@ -547,25 +415,37 @@ fn recorded_build_host(units: &[ObservedUnit], consumer_target: &str) -> String 
         .map_or_else(|| consumer_target.to_owned(), |unit| unit.target.clone())
 }
 
-/// The consumer's recorded build facts a supervised journal carries:
+/// The consumer's recorded build facts a session journal carries:
 /// its manifest directory — the project the drain re-derives the
 /// expanded graph from when the enrichment's memoized store has not
-/// landed — and the inputs `lockfile_graph_cache::key_of` hashes,
-/// serialized into the sidecar so the drain can tell a same-inputs
-/// re-derivation from a project that changed after the build
-/// (stow#588).
+/// landed — and, when a driver analysed the build, the inputs
+/// `lockfile_graph_cache::key_of` hashes, serialized into the sidecar so
+/// the drain can tell a same-inputs re-derivation from a project that
+/// changed after the build (stow#588).
 pub struct JournalConsumer<'a> {
-    pub manifest_dir: &'a Path,
-    pub key: &'a crate::lockfile_graph_cache::KeyInputs<'a>,
+    /// The manifest directory of the package the build was asked for;
+    /// `None` when no unit named it, which leaves the drain no project to
+    /// re-derive from.
+    pub manifest_dir: Option<&'a Path>,
+    /// The rustc version the build's units compiled under.
+    pub rustc_version: &'a str,
+    /// The consumer's target.
+    pub target: &'a str,
+    /// Whether the consumer's cargo invocation spelled `--target`.
+    pub target_given: bool,
+    /// The inputs of the build's expanded-graph key; `None` for a build
+    /// no driver analysed.
+    pub key: Option<&'a crate::lockfile_graph_cache::KeyInputs<'a>>,
 }
 
-/// Write the supervising build's journal: one batch append by the driver
-/// after cargo exits, then kick the drain — `stow build` returns as soon
-/// as cargo does. `inexact_entries` is the analysis's inexact superset-
-/// hit report — the direct-dep entries above every superset-served node —
-/// journaled as one `inexact` line so the report's admission rides the
-/// same detached drain a miss does (stow#882).
-pub fn journal_supervised(
+/// Write a session's journal: one batch append when the session ends its
+/// build; the driver then spawns the drain, so `stow build` returns as
+/// soon as cargo does. `inexact_entries` is the analysis's inexact
+/// superset-hit report — the direct-dep entries above every superset-served
+/// node — journaled as one `inexact` line so the report's admission rides
+/// the same detached drain a miss does (stow#882).
+pub fn journal_session(
+    session: SessionId,
     rustc: &OsStr,
     consumer: &JournalConsumer<'_>,
     observations: &[ObservedUnit],
@@ -579,17 +459,17 @@ pub fn journal_supervised(
     // The consumer's flag plus any observed explicit `--target` — the
     // flag covers a build where every observed unit is host-side and
     // none carries the flag itself.
-    let consumer_spelled_target = consumer.key.target_given
+    let consumer_spelled_target = consumer.target_given
         || observations
             .iter()
             .any(|unit| unit.explicit_target.is_some());
-    let build_host = recorded_build_host(observations, consumer.key.target);
+    let build_host = recorded_build_host(observations, consumer.target);
     let mut entries: Vec<JournalEntry> = observations
         .iter()
         .map(|unit| {
             JournalEntry::Unit(UnitLine {
                 rustc: rustc.to_string_lossy().into_owned(),
-                rustc_version: consumer.key.rustc_version.to_owned(),
+                rustc_version: consumer.rustc_version.to_owned(),
                 build_host: build_host.clone(),
                 consumer_spelled_target,
                 expanded_cache_key: expanded_cache_key.to_owned(),
@@ -599,14 +479,14 @@ pub fn journal_supervised(
         .collect();
     if !inexact_entries.is_empty() {
         entries.push(JournalEntry::Inexact(InexactReport {
-            rustc_version: consumer.key.rustc_version.to_owned(),
-            consumer_spelled_target: consumer.key.target_given,
+            rustc_version: consumer.rustc_version.to_owned(),
+            consumer_spelled_target: consumer.target_given,
             expanded_cache_key: expanded_cache_key.to_owned(),
-            target: consumer.key.target.to_owned(),
+            target: consumer.target.to_owned(),
             entries: inexact_entries.to_vec(),
         }));
     }
-    let journal = journal_path(target_dir, &supervised_build());
+    let journal = journal_path(target_dir, &session_journal_id(session));
     if let Err(error) = append_lines(&journal, &entries) {
         tracing::warn!(error = %error, journal = %journal.display(), "could not journal the build's compile observations");
     }
@@ -614,16 +494,8 @@ pub fn journal_supervised(
     // reaches it — a build aborts that analysis when cargo exits, and a
     // fast build's cargo exits first — so the journal also carries the
     // context the drain re-derives the same graph from (stow#588).
-    write_consumer_context(&journal, consumer.manifest_dir, Some(consumer.key));
-}
-
-/// Kick the deferred drain for journals left by builds that already
-/// exited — the standalone path's way of admitting misses with no stow
-/// parent process. The check is one directory listing that only finds
-/// files in target dirs stow has built in.
-pub fn drain_finished_builds(out_dir: &Path) {
-    if let Some(target_dir) = target_dir_for(out_dir) {
-        spawn_drain(&target_dir);
+    if let Some(manifest_dir) = consumer.manifest_dir {
+        write_consumer_context(&journal, manifest_dir, consumer.key);
     }
 }
 
@@ -637,7 +509,7 @@ pub fn drain_finished_builds(out_dir: &Path) {
 /// can stop — then, with the gate shut and the priority lowered, *post*
 /// (stow#667).
 pub async fn drain(target_dir: &Path, state_db: &StateDb) -> stow_types::error::Result<()> {
-    let config = StowConfig::load_local(state_db.clone())?;
+    let config = StowConfig::load(state_db.clone())?;
     if !config.cache.reaches_network() {
         // Journals were written under a mode that reached the network; they
         // wait for it to return.
@@ -655,7 +527,8 @@ pub async fn drain(target_dir: &Path, state_db: &StateDb) -> stow_types::error::
     // The gate directory is the cargo home's: the package-cache lock a
     // derivation cargo holds is per cargo home, so the gate is too
     // (stow#667).
-    let mut gate = crate::config::cargo_home().map_or_else(
+    let env = SessionEnv::of_this_process()?;
+    let mut gate = env.cargo_home().map_or_else(
         || {
             tracing::warn!(
                 "could not resolve the cargo home; this drain will not re-derive unit graphs"
@@ -666,7 +539,7 @@ pub async fn drain(target_dir: &Path, state_db: &StateDb) -> stow_types::error::
     );
     let mut prepared = Vec::new();
     for journal in &journals {
-        if let Some(journal) = prepare_journal(&config, journal, &mut gate).await {
+        if let Some(journal) = prepare_journal(&config, journal, &mut gate, &env).await {
             prepared.push(journal);
         }
     }
@@ -680,28 +553,13 @@ pub async fn drain(target_dir: &Path, state_db: &StateDb) -> stow_types::error::
     // while it held the package-cache lock the user's next command
     // needs (stow#667).
     lower_own_priority();
+    // Every journal is a session's, and its build was counted when the
+    // session ended.
     for journal in prepared {
-        // A journal is one build; a `stow-`-named file is a supervised
-        // build's journal, already counted at the driver's tail —
-        // counting it again would double it.
-        if is_plain_cargo_journal(&journal.journal) {
-            crate::report::bump_build(&config).await;
-        }
         post_journal(&config, journal).await;
     }
     crate::report::maybe_report(&config).await;
     Ok(())
-}
-
-/// Whether the journal file belongs to a plain `cargo` build — its
-/// build token is the parent cargo's pid, so it lacks the `stow-`
-/// prefix `supervised_build` writes.
-fn is_plain_cargo_journal(journal: &Path) -> bool {
-    journal
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_prefix(JOURNAL_PREFIX))
-        .is_some_and(|rest| !rest.starts_with("stow-"))
 }
 
 /// Drop the drain's scheduling priority for its CPU-only posting
@@ -776,7 +634,8 @@ async fn drain_journal(
     journal: &Path,
     gate: &mut crate::derive_gate::DerivationGate,
 ) {
-    if let Some(prepared) = prepare_journal(config, journal, gate).await {
+    let env = SessionEnv::of_this_process().expect("the test process's environment");
+    if let Some(prepared) = prepare_journal(config, journal, gate, &env).await {
         post_journal(config, prepared).await;
     }
 }
@@ -790,6 +649,7 @@ async fn prepare_journal(
     config: &StowConfig,
     journal: &Path,
     gate: &mut crate::derive_gate::DerivationGate,
+    env: &SessionEnv,
 ) -> Option<PreparedJournal> {
     let file_name = journal
         .file_name()
@@ -862,8 +722,8 @@ async fn prepare_journal(
     // host-side; each line's own recorded evidence counts too.
     let consumer_spelled_target = entries.iter().any(JournalEntry::spelled_evidence);
     // The build's context sidecar names the consumer manifest the
-    // drain re-derives its unit graph from, and — for a supervised
-    // build — the inputs its expanded-graph key hashed (stow#588).
+    // drain re-derives its unit graph from, and — for a session
+    // journal — the inputs its expanded-graph key hashed (stow#588).
     let context = read_context(&work);
     let mut groups: BTreeMap<DrainGroupKey, Vec<JournalEntry>> = BTreeMap::new();
     for entry in entries {
@@ -880,11 +740,7 @@ async fn prepare_journal(
         if let Some(prepared) = prepare_group(
             config,
             &journal,
-            DrainContext {
-                consumer_target: &consumer_target,
-                build_host: &build_host,
-                spelled: consumer_spelled_target,
-            },
+            PrepareContext::new(&consumer_target, &build_host, consumer_spelled_target, env),
             &key,
             context.as_ref(),
             group,
@@ -942,7 +798,7 @@ async fn post_journal(config: &StowConfig, prepared: PreparedJournal) {
 }
 
 /// What names one journal group: the rustc its build ran, plus the
-/// supervised lane's persisted expanded graph (by cache key). Empty key
+/// session's persisted expanded graph (by cache key). Empty key
 /// groups drain through the journal's context sidecar instead (stow#588).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DrainGroupKey {
@@ -950,31 +806,10 @@ struct DrainGroupKey {
     expanded_cache_key: String,
 }
 
-/// The context sidecar one standalone `cargo build` drops next to its
-/// journal: the consumer package's manifest dir, so the drain can
-/// re-derive the build's unit graph after the build exits (stow#588).
+/// The context sidecar a session drops next to its journal: the consumer
+/// package's manifest dir, so the drain can re-derive the build's unit
+/// graph after the build exits (stow#588).
 const CONTEXT_PREFIX: &str = "stow-context.";
-
-/// Every wrapper invocation under the build's root package lands here:
-/// cargo marks it `CARGO_PRIMARY_PACKAGE`, and `CARGO_MANIFEST_DIR` then
-/// names the manifest the user is building — a path dep's or registry
-/// crate's units never qualify (stow#588).
-pub fn note_consumer_context(out_dir: &Path) {
-    if std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none() {
-        return;
-    }
-    let (Some(manifest_dir), Some(target_dir)) = (
-        std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from),
-        target_dir_for(out_dir),
-    ) else {
-        return;
-    };
-    write_consumer_context(
-        &journal_path(&target_dir, &cargo_build()),
-        &manifest_dir,
-        None,
-    );
-}
 
 /// The sidecar's serialized `cache_key` inputs: the owned mirror of
 /// `KeyInputs` the drain hands back to `key_of` (stow#588).
@@ -994,9 +829,8 @@ impl SidecarKeyInputs {
     /// Recompute the build's `cache_key` over the project's *current*
     /// files — equal to the journal's `expanded_cache_key` iff nothing
     /// the function hashes changed since the build (stow#588).
-    fn key_of(&self) -> stow_types::error::Result<String> {
+    fn key_of(&self, env: &SessionEnv) -> stow_types::error::Result<String> {
         let cargo_args: Vec<OsString> = self.cargo_args.iter().map(OsString::from).collect();
-        let env = std::env::vars_os().collect::<Vec<_>>();
         crate::lockfile_graph_cache::key_of(&crate::lockfile_graph_cache::KeyInputs {
             action: &self.action,
             cargo_args: &cargo_args,
@@ -1006,14 +840,14 @@ impl SidecarKeyInputs {
             target: &self.target,
             target_given: self.target_given,
             rustc_version: &self.rustc_version,
-            env: &env,
+            env,
         })
     }
 }
 
 /// Drop a journal's context sidecar: the consumer manifest dir the
 /// drain re-derives the build's unit graph from, plus — for a
-/// supervised journal — the inputs its `expanded_cache_key` hashed, so
+/// session journal — the inputs its `expanded_cache_key` hashed, so
 /// the drain's re-derivation is a memo of that one function rather
 /// than a guess at whatever the project reads now (stow#588).
 fn write_consumer_context(
@@ -1058,7 +892,7 @@ fn context_path(journal: &Path) -> PathBuf {
 }
 
 /// A journal's context sidecar: the consumer manifest dir to
-/// re-derive the build's unit graph from, plus — for a supervised
+/// re-derive the build's unit graph from, plus — for a session
 /// journal — the `cache_key` inputs the memo check recomputes
 /// (stow#588).
 struct JournalContext {
@@ -1091,6 +925,32 @@ struct DrainContext<'a> {
     spelled: bool,
 }
 
+/// What preparing a journal group reads besides the journal: the
+/// build-level facts, and the environment the graph is re-derived in —
+/// the drain's own.
+struct PrepareContext<'a> {
+    drain: DrainContext<'a>,
+    env: &'a SessionEnv,
+}
+
+impl<'a> PrepareContext<'a> {
+    const fn new(
+        consumer_target: &'a str,
+        build_host: &'a str,
+        spelled: bool,
+        env: &'a SessionEnv,
+    ) -> Self {
+        Self {
+            drain: DrainContext {
+                consumer_target,
+                build_host,
+                spelled,
+            },
+            env,
+        }
+    }
+}
+
 /// What a drain group's memo miss comes to.
 enum MemoMiss {
     /// The same function of the same inputs, derived again.
@@ -1107,14 +967,14 @@ enum MemoMiss {
 /// Re-derive a drain group's expanded graph when the keyed memo missed.
 ///
 /// The keyed store is the memo of "the expanded graph for the inputs
-/// `cache_key` hashes". A supervised journal's sidecar carries those
+/// `cache_key` hashes". A session journal's sidecar carries those
 /// inputs, so the drain recomputes the key over the project's *current*
 /// files before re-deriving: equal keys mean the same function of the
 /// same inputs — the derived graph is the memo's own value and fills
 /// the store under the build's key. A different key means the project
 /// changed since the build: no build of the project as it now is will
 /// ever store a graph under the recorded key, so the group's units can
-/// never mint and are dropped (stow#674). A standalone build journals
+/// never mint and are dropped (stow#674). A plain cargo's build journals
 /// no key; its re-derivation is the only graph it ever had (stow#588).
 async fn rederive_memoized_graph(
     config: &StowConfig,
@@ -1122,17 +982,21 @@ async fn rederive_memoized_graph(
     context: &JournalContext,
     key: &DrainGroupKey,
     units: usize,
-    ctx: &DrainContext<'_>,
+    ctx: &PrepareContext<'_>,
     gate: &mut crate::derive_gate::DerivationGate,
 ) -> MemoMiss {
-    let consumer_target = ctx.consumer_target;
-    let consumer_spelled_target = ctx.spelled;
+    let consumer_target = ctx.drain.consumer_target;
+    let consumer_spelled_target = ctx.drain.spelled;
     let DrainGroupKey {
         rustc_version,
         expanded_cache_key,
     } = key;
     if !expanded_cache_key.is_empty() {
-        match context.cache_key.as_ref().map(SidecarKeyInputs::key_of) {
+        match context
+            .cache_key
+            .as_ref()
+            .map(|inputs| inputs.key_of(ctx.env))
+        {
             Some(Ok(drain_key)) if drain_key == *expanded_cache_key => {}
             Some(Ok(drain_key)) => {
                 tracing::warn!(
@@ -1176,7 +1040,7 @@ async fn rederive_memoized_graph(
                 stow_types::api::runner_family(consumer_target)
                     .map_or(consumer_target, |family| family.host_triple()),
                 &rustc,
-                None,
+                ctx.env,
                 slot,
             )
             .await
@@ -1197,7 +1061,7 @@ async fn rederive_memoized_graph(
             }
         }
     };
-    // A supervised re-derivation fills the memo under the build's own
+    // A session journal's re-derivation fills the memo under the build's own
     // key — the same function of the same inputs — so the next drain of
     // this key loads instead of re-deriving again.
     if !expanded_cache_key.is_empty()
@@ -1221,7 +1085,7 @@ async fn rederive_memoized_graph(
 async fn prepare_group(
     config: &StowConfig,
     journal: &Path,
-    ctx: DrainContext<'_>,
+    ctx: PrepareContext<'_>,
     key: &DrainGroupKey,
     context: Option<&JournalContext>,
     group: Vec<JournalEntry>,
@@ -1449,6 +1313,7 @@ mod tests {
             artifact_cache_max_bytes: 0,
             index_refresh_interval: std::time::Duration::ZERO,
             verify_mode: crate::config::VerifyMode::GithubCi,
+            switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
@@ -1457,31 +1322,9 @@ mod tests {
     }
 
     #[test]
-    fn target_dir_resolves_cargo_deps_layout() {
-        assert_eq!(
-            target_dir_for(Path::new("/ws/target/debug/deps")),
-            Some(PathBuf::from("/ws/target"))
-        );
-        assert_eq!(target_dir_for(Path::new("/ws/target")), None);
-        assert_eq!(target_dir_for(Path::new("/custom/out")), None);
-    }
-
-    #[test]
-    fn supervised_journals_are_always_finished() {
-        assert!(build_finished("stow-123"));
-        assert!(!build_finished(&std::process::id().to_string()));
-    }
-
-    #[test]
-    fn a_dead_cargo_pid_makes_its_journal_finished() {
-        assert!(build_finished(&dead_pid().to_string()));
-    }
-
-    #[test]
-    fn a_live_process_is_not_finished() {
+    fn a_live_process_is_alive_and_an_exited_one_is_not() {
         // EPERM would mean the same: an unsignalable process is alive,
-        // never finished.
-        assert!(!build_finished(&std::process::id().to_string()));
+        // never gone.
         assert!(process_alive(std::process::id()));
         assert!(!process_alive(dead_pid()));
     }
@@ -1505,15 +1348,15 @@ mod tests {
         assert_eq!(parsed.unit.externs.len(), 1);
     }
 
+    /// Every journal is a session's, complete on write, so each is listed
+    /// the moment it exists. A journal named by a process id — what an
+    /// older stow wrote for a plain cargo — is not a session's and is left
+    /// alone.
     #[test]
-    fn only_finished_journals_are_listed() {
+    fn only_session_journals_are_listed() {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(journal_path(dir.path(), "stow-1"), "{}\n").expect("write");
-        std::fs::write(
-            journal_path(dir.path(), &std::process::id().to_string()),
-            "{}\n",
-        )
-        .expect("write");
+        std::fs::write(journal_path(dir.path(), &dead_pid().to_string()), "{}\n").expect("write");
         std::fs::write(dir.path().join("unrelated.txt"), "{}\n").expect("write");
         let finished = finished_journals(dir.path());
         assert_eq!(finished, vec![journal_path(dir.path(), "stow-1")]);
@@ -1595,8 +1438,52 @@ mod tests {
         assert!(!work.exists());
     }
 
+    /// Two builds of one daemon that share a target directory each keep
+    /// their own journal and context sidecar: the daemon's pid is the same
+    /// for both, so only the session's id can name them apart.
+    #[test]
+    fn two_sessions_in_one_target_dir_keep_their_own_journal_and_context() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).expect("target dir");
+        let mut sessions = Vec::new();
+        for name in ["first", "second"] {
+            let (project, key_inputs) = keyed_project(&dir.path().join(name));
+            let session = SessionId::mint();
+            journal_session(
+                session,
+                OsStr::new("rustc"),
+                &JournalConsumer {
+                    manifest_dir: Some(&project),
+                    rustc_version: key_inputs.rustc_version,
+                    target: key_inputs.target,
+                    target_given: key_inputs.target_given,
+                    key: Some(&key_inputs),
+                },
+                &[unit(&format!("only-{name}"), None)],
+                &target,
+                "",
+                &[],
+            );
+            sessions.push((session, name, project));
+        }
+        for (session, name, project) in &sessions {
+            let journal = journal_path(&target, &session_journal_id(*session));
+            let lines = std::fs::read_to_string(&journal).expect("the session's own journal");
+            assert_eq!(lines.lines().count(), 1, "{name}: {lines}");
+            assert!(lines.contains(&format!("only-{name}")), "{name}: {lines}");
+            assert_eq!(
+                read_context(&journal)
+                    .expect("the session's own context")
+                    .manifest_dir,
+                *project
+            );
+        }
+        assert_eq!(finished_journals(&target).len(), 2);
+    }
+
     /// A minimal resolvable project plus the key inputs its build's
-    /// `cache_key` hashed — the supervised journal's sidecar record.
+    /// `cache_key` hashed — the session journal's sidecar record.
     fn keyed_project(dir: &Path) -> (PathBuf, crate::lockfile_graph_cache::KeyInputs<'static>) {
         let project = dir.join("consumer");
         std::fs::create_dir_all(project.join("src")).expect("src");
@@ -1617,20 +1504,22 @@ mod tests {
                 target: "wasm32-unknown-unknown",
                 target_given: true,
                 rustc_version: "1.99.0",
-                // The same environment the drain's recompute sees —
-                // `cache_key` reads `vars_os` on the live path, so the
-                // memoized key must too (stow#617).
-                env: Box::leak(Box::new(std::env::vars_os().collect::<Vec<_>>())).as_slice(),
+                // The same environment the drain's recompute sees — the
+                // process's, as `cache_key` reads it on the live path,
+                // so the memoized key must too (stow#617).
+                env: Box::leak(Box::new(
+                    SessionEnv::of_this_process().expect("the test process's environment"),
+                )),
             },
         )
     }
 
-    /// A supervised journal whose keyed store is absent re-derives the
+    /// A session journal whose keyed store is absent re-derives the
     /// graph by memo: the sidecar's recorded inputs still hash to the
     /// journal's key, so the drain mints off the derived graph and
     /// fills the store under the build's key (stow#588).
     #[tokio::test]
-    async fn a_supervised_drain_memoizes_rederivation_under_the_builds_key() {
+    async fn a_session_journal_drain_memoizes_rederivation_under_the_builds_key() {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = test_config(dir.path());
         let (project, key_inputs) = keyed_project(dir.path());
@@ -1667,7 +1556,7 @@ mod tests {
     /// units: no build of the project as it now is will ever store a
     /// graph under that key, so the group can never mint (stow#674).
     #[tokio::test]
-    async fn a_supervised_drain_drops_units_when_the_project_changed() {
+    async fn a_session_journal_drain_drops_units_when_the_project_changed() {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = test_config(dir.path());
         let (project, key_inputs) = keyed_project(dir.path());
@@ -1943,7 +1832,8 @@ mod tests {
         // The grouping pass: one group holding the inexact line, with
         // its payload intact and the keyed graph resolved.
         let mut gate = crate::derive_gate::DerivationGate::unopened(dir.path().join("gate"));
-        let prepared = prepare_journal(&config, &journal, &mut gate)
+        let env = SessionEnv::of_this_process().expect("the test process's environment");
+        let prepared = prepare_journal(&config, &journal, &mut gate, &env)
             .await
             .expect("the journal prepares");
         assert_eq!(prepared.groups.len(), 1);

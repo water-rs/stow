@@ -15,11 +15,13 @@ use crate::cli_args::{
     CheckArtifactArgs, FetchArtifactArgs, IndexRefreshArgs, PurgeCacheDirArgs, SetupArgs, StatsArgs,
 };
 use crate::config::{self, StowConfig};
+use crate::daemon::client::Restarted;
 use crate::fetch;
 use crate::index;
 use crate::mold;
 use crate::resolve;
 use crate::rustc_args::{detect_rustc_host_target, detect_rustc_version};
+use crate::session_env::SessionEnv;
 use crate::state_db::StateDb;
 use crate::stats;
 use crate::wrapper_shim;
@@ -38,9 +40,10 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
     let cargo_home = config::require_cargo_home()?;
     // The host triple and the version probe are independent answers
     // from the same toolchain — await them together (stow#1032).
+    let env = SessionEnv::of_this_process()?;
     let (host_target, rustc_version) = tokio::join!(
-        detect_rustc_host_target(std::ffi::OsStr::new("rustc")),
-        detect_rustc_version(std::ffi::OsStr::new("rustc")),
+        detect_rustc_host_target(std::ffi::OsStr::new("rustc"), &env),
+        detect_rustc_version(std::ffi::OsStr::new("rustc"), &env),
     );
     let host_target = host_target
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
@@ -143,8 +146,28 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
         let installed = install_launch_agent(&wrappers.runtime_executable).await?;
         write_stdout(&format!("launch agent: {}\n", installed.plist.display()))?;
     }
+    // The Windows counterpart: the task that is both the login trigger and
+    // the only way a build starts the daemon (stow#1454).
+    #[cfg(windows)]
+    {
+        let task = register_daemon_task(&wrappers.runtime_executable).await?;
+        write_stdout(&format!("scheduled task: {task}\n"))?;
+    }
 
     Ok(())
+}
+
+/// Register the Task Scheduler task that starts the daemon for the run
+/// directory this process resolves, and return its name.
+#[cfg(windows)]
+async fn register_daemon_task(runtime_executable: &Path) -> stow_types::error::Result<String> {
+    let runtime_executable = runtime_executable.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let run_dir = crate::daemon::RunDir::locate()?;
+        crate::daemon::scheduled_task::register(&run_dir, &runtime_executable)
+    })
+    .await
+    .wrap_err("register the daemon's scheduled task")?
 }
 
 /// Write the daemon's `LaunchAgent` under the user's `~/Library` and load
@@ -283,9 +306,12 @@ fn configure_document(
 async fn print_setup_env(state_db: &StateDb) -> stow_types::error::Result<()> {
     let wrappers = detect_wrapper_commands()?;
     let config = StowConfig::load(state_db.clone())?;
-    let host_target = detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
-        .await
-        .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
+    let host_target = detect_rustc_host_target(
+        std::ffi::OsStr::new("rustc"),
+        &SessionEnv::of_this_process()?,
+    )
+    .await
+    .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
     write_stdout(&setup_env_output(
         &wrappers,
         &host_target,
@@ -501,6 +527,9 @@ async fn update_with(mut updater: axoupdater::AxoUpdater) -> stow_types::error::
              this stow was not installed by the installer and cannot update itself"
         ));
     }
+    // The installer replaces the executable at this path, which reads as
+    // deleted afterwards on Linux and is renamed aside on Windows.
+    let exe = std::env::current_exe().wrap_err("resolve the current executable")?;
     let result = updater
         .run()
         .await
@@ -512,6 +541,16 @@ async fn update_with(mut updater: axoupdater::AxoUpdater) -> stow_types::error::
         ))?,
         None => write_stdout("stow-cli is already up to date\n")?,
     }
+    let installed = result.as_ref().map(|update| update.new_version.to_string());
+    if let Some(report) = restart_daemon_after(
+        installed.as_deref(),
+        &exe,
+        crate::daemon::client::retire_onto,
+    )
+    .await?
+    {
+        write_stdout(&format!("{report}\n"))?;
+    }
     let wrappers = detect_wrapper_commands()?;
     tracing::info!(
         rustc_wrapper = %wrappers.rustc,
@@ -519,6 +558,47 @@ async fn update_with(mut updater: axoupdater::AxoUpdater) -> stow_types::error::
         "refreshed wrapper shims"
     );
     Ok(())
+}
+
+/// Put the running daemon onto the stow an update installed. The process
+/// that ran the update is the old binary, at the version the daemon runs,
+/// so the daemon is asked to retire onto `exe`, where the new one now is.
+/// Nothing is asked when the update installed nothing (`installed` is
+/// `None`), and a daemon that is not running is not started.
+///
+/// Returns what to tell the person, if anything.
+///
+/// # Errors
+///
+/// The daemon cannot be restarted, or comes back as a stow other than the
+/// installed one.
+async fn restart_daemon_after(
+    installed: Option<&str>,
+    exe: &Path,
+    retire: impl AsyncFnOnce(&Path) -> stow_types::error::Result<Option<Restarted>>,
+) -> stow_types::error::Result<Option<String>> {
+    let Some(installed) = installed else {
+        return Ok(None);
+    };
+    let Some(restarted) = retire(exe).await? else {
+        return Ok(None);
+    };
+    if restarted.now != installed {
+        return Err(stow_types::stow_error!(
+            "the stow daemon restarted as stow {}, but stow {installed} was installed: \
+             the executable that starts the daemon is not the one installed{}",
+            restarted.now,
+            if cfg!(windows) {
+                "; run `stow setup` to register the installed stow's task"
+            } else {
+                ""
+            }
+        ));
+    }
+    Ok(Some(format!(
+        "restarted the stow daemon: {} -> {}",
+        restarted.left, restarted.now
+    )))
 }
 
 /// `stow stats`: print this install's own cache counters — served hits,
@@ -632,7 +712,7 @@ fn local_stats_table(report: &StatsReport) -> String {
 
 /// `stow clean`: remove the local stow cache directory.
 pub async fn clean_project() -> stow_types::error::Result<()> {
-    let cache_dir = config::cache_dir()?;
+    let cache_dir = config::cache_dir(&SessionEnv::of_this_process()?)?;
     if cache_dir.exists() {
         async_fs::remove_dir_all(&cache_dir)
             .await
@@ -765,9 +845,12 @@ pub async fn index_status(state_db: &StateDb) -> stow_types::error::Result<()> {
 async fn resolve_index_target(overridden: Option<String>) -> stow_types::error::Result<String> {
     match overridden {
         Some(target) => Ok(target),
-        None => detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
-            .await
-            .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}")),
+        None => detect_rustc_host_target(
+            std::ffi::OsStr::new("rustc"),
+            &SessionEnv::of_this_process()?,
+        )
+        .await
+        .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}")),
     }
 }
 
@@ -776,9 +859,12 @@ async fn resolve_index_rustc_version(
 ) -> stow_types::error::Result<String> {
     match overridden {
         Some(rustc_version) => Ok(rustc_version),
-        None => detect_rustc_version(std::ffi::OsStr::new("rustc"))
-            .await
-            .map_err(|error| stow_types::stow_error!("detect rustc version: {error}")),
+        None => detect_rustc_version(
+            std::ffi::OsStr::new("rustc"),
+            &SessionEnv::of_this_process()?,
+        )
+        .await
+        .map_err(|error| stow_types::stow_error!("detect rustc version: {error}")),
     }
 }
 
@@ -840,9 +926,8 @@ pub struct WrapperCommands {
     /// Compiler-shaped, for C++.
     pub(crate) cxx_compiler: String,
     /// The executable the shims resolve to — the path
-    /// [`crate::config::shims_dir`] keyed on, and the binary whose
-    /// identity the supervisor exports so a wrapper can tell its own
-    /// build from a replacement (stow#645).
+    /// [`crate::config::shims_dir`] keyed on, and the binary the daemon's
+    /// launch agent runs (stow#645).
     pub(crate) runtime_executable: PathBuf,
 }
 
@@ -1225,7 +1310,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use super::{WrapperCommands, setup_env_output};
+    use super::{Restarted, WrapperCommands, setup_env_output};
     use crate::config::{StowConfig, VerifyMode};
 
     fn test_config(verify_mode: VerifyMode) -> StowConfig {
@@ -1241,6 +1326,7 @@ mod tests {
             artifact_cache_max_bytes: 1024,
             index_refresh_interval: Duration::from_mins(5),
             verify_mode,
+            switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
@@ -1608,6 +1694,71 @@ mod tests {
         assert!(
             format!("{error}").contains("/elsewhere"),
             "the refusal names the foreign prefix: {error}"
+        );
+    }
+
+    /// The daemon is asked to retire onto the executable that was
+    /// updated, only when the update installed something.
+    #[tokio::test]
+    async fn the_daemon_is_restarted_only_when_an_update_installed_something() {
+        let exe = std::path::Path::new("/install/bin/stow");
+        let asked = std::cell::RefCell::new(Vec::new());
+        let retire = async |onto: &std::path::Path| {
+            asked.borrow_mut().push(onto.to_owned());
+            Ok(Some(Restarted {
+                left: "0.16.0".to_owned(),
+                now: "0.17.0".to_owned(),
+            }))
+        };
+
+        assert_eq!(
+            super::restart_daemon_after(None, exe, retire)
+                .await
+                .expect("up to date"),
+            None
+        );
+        assert!(asked.borrow().is_empty(), "nothing was installed");
+
+        let report = super::restart_daemon_after(Some("0.17.0"), exe, retire)
+            .await
+            .expect("restarted");
+        assert_eq!(
+            report.as_deref(),
+            Some("restarted the stow daemon: 0.16.0 -> 0.17.0")
+        );
+        assert_eq!(*asked.borrow(), [exe.to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_is_not_running_is_not_started_by_an_update() {
+        let report = super::restart_daemon_after(
+            Some("0.17.0"),
+            std::path::Path::new("/install/bin/stow"),
+            async |_: &std::path::Path| Ok(None),
+        )
+        .await
+        .expect("nothing to restart");
+        assert_eq!(report, None);
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_comes_back_older_than_the_install_is_named() {
+        let error = super::restart_daemon_after(
+            Some("0.17.0"),
+            std::path::Path::new("/install/bin/stow"),
+            async |_: &std::path::Path| {
+                Ok(Some(Restarted {
+                    left: "0.16.0".to_owned(),
+                    now: "0.16.0".to_owned(),
+                }))
+            },
+        )
+        .await
+        .expect_err("the daemon is not the installed stow");
+        let error = error.to_string();
+        assert!(
+            error.contains("0.16.0") && error.contains("0.17.0"),
+            "{error}"
         );
     }
 

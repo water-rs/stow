@@ -46,6 +46,18 @@ pub enum Command {
     DrainMisses(DrainMissesArgs),
 }
 
+/// The spelling of [`DaemonArgs::run_dir`]. A daemon starts its successor
+/// with these three flags, and an older image starts a newer one, so they
+/// never change.
+#[cfg(unix)]
+pub const RUN_DIR_FLAG: &str = "--run-dir";
+/// The spelling of [`DaemonArgs::inherit_lock`].
+#[cfg(unix)]
+pub const INHERIT_LOCK_FLAG: &str = "--inherit-lock";
+/// The spelling of [`DaemonArgs::inherit_listener`].
+#[cfg(unix)]
+pub const INHERIT_LISTENER_FLAG: &str = "--inherit-listener";
+
 #[derive(Debug, Clone, Args)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct DaemonArgs {
@@ -53,6 +65,24 @@ pub struct DaemonArgs {
     /// this daemon learns it is serving. Internal to the start path.
     #[arg(long, value_name = "ENDPOINT", hide = true)]
     pub ready: Option<PathBuf>,
+    /// The runtime directory to serve, instead of `STOW_DAEMON_DIR` or the
+    /// default. The Windows scheduled task names it, because a daemon the
+    /// Task Scheduler starts has none of its starter's environment.
+    /// Internal to the scheduled task.
+    #[arg(long, value_name = "DIR", hide = true)]
+    pub run_dir: Option<PathBuf>,
+    /// The descriptor of `daemon.lock`, locked by the daemon this one
+    /// replaces: adopt it instead of locking the file. Internal to the
+    /// replacement of a running daemon.
+    #[cfg(unix)]
+    #[arg(long, value_name = "FD", hide = true, requires = "inherit_listener")]
+    pub inherit_lock: Option<std::os::fd::RawFd>,
+    /// The descriptor of the listening socket of the daemon this one
+    /// replaces: serve on it instead of binding. Internal to the
+    /// replacement of a running daemon.
+    #[cfg(unix)]
+    #[arg(long, value_name = "FD", hide = true, requires = "inherit_lock")]
+    pub inherit_listener: Option<std::os::fd::RawFd>,
     #[command(subcommand)]
     pub command: Option<DaemonCommand>,
 }
@@ -257,6 +287,36 @@ mod tests {
         );
     }
 
+    /// A daemon starts its successor with this command line, and an older
+    /// image starts a newer one, so what it names must keep parsing.
+    #[cfg(unix)]
+    #[test]
+    fn a_daemons_successor_command_line_parses() {
+        let cli = Cli::try_parse_from([
+            "stow",
+            "daemon",
+            RUN_DIR_FLAG,
+            "/run",
+            INHERIT_LOCK_FLAG,
+            "5",
+            INHERIT_LISTENER_FLAG,
+            "6",
+        ])
+        .expect("parse the successor command line");
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected the daemon command");
+        };
+        assert_eq!(args.run_dir, Some(PathBuf::from("/run")));
+        assert_eq!(
+            (args.inherit_lock, args.inherit_listener),
+            (Some(5), Some(6))
+        );
+        assert!(
+            Cli::try_parse_from(["stow", "daemon", INHERIT_LOCK_FLAG, "5"]).is_err(),
+            "the two descriptors come together"
+        );
+    }
+
     #[test]
     fn each_cache_flag_turns_off_its_own_layer_over_the_config() {
         use crate::config::CacheLayers;
@@ -405,6 +465,14 @@ mod tests {
         };
         assert_eq!(args.ready, Some(PathBuf::from("/run/ready.sock")));
         assert!(args.command.is_none());
+
+        let cli = Cli::try_parse_from(["stow", "daemon", "--run-dir", "/run/stow"])
+            .expect("parse daemon command with a run directory");
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        assert_eq!(args.run_dir, Some(PathBuf::from("/run/stow")));
+        assert!(args.ready.is_none());
 
         let cli = Cli::try_parse_from(["stow", "daemon", "status"]).expect("parse status");
         let Command::Daemon(args) = cli.command else {

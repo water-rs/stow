@@ -1026,7 +1026,7 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
             // The keyless signer checks every signature it makes against
             // the trust readers verify with.
             let trust = stow_oci::verify::records_trust().await?;
-            let publisher = stow_oci::Publisher::from_env(http, &trust)?;
+            let publisher = stow_oci::Publisher::from_env(http, &trust, INDEX_CERT_URL)?;
             let outcome = stow_oci::publish_index(
                 &publisher,
                 &bytes,

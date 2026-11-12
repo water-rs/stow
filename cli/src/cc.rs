@@ -325,37 +325,6 @@ pub async fn plan_compile(
     })
 }
 
-/// The standalone decision, made in the wrapper process itself: look the
-/// key up, record the hit and serve it. A supervised build never calls
-/// this — its daemon owns the lookup and the records.
-pub async fn try_compile(
-    config: &StowConfig,
-    compiler: &ResolvedCompiler,
-    compiler_args: &[OsString],
-) -> stow_types::error::Result<CcOutcome> {
-    let CcPlan::Keyed {
-        cache_key,
-        output_path,
-    } = plan_compile(compiler, compiler_args).await?
-    else {
-        return Ok(CcOutcome::Passthrough);
-    };
-    if let Some(cache_path) = locate_cached_object(config, &cache_key).await? {
-        record_cc_hit(config, &cache_key, &cache_path).await?;
-        serve_cached_object(&cache_path, &output_path).await?;
-        return Ok(CcOutcome::Hit {
-            cache_key,
-            output_path,
-        });
-    }
-    let cache_path = cc_cache_path(config, &cache_key);
-    Ok(CcOutcome::Miss {
-        cache_key,
-        cache_path,
-        output_path,
-    })
-}
-
 /// The stored object at `cache_key`, if there is one. Makes sure the
 /// object directory exists so a later store has somewhere to stage.
 pub async fn locate_cached_object(
@@ -433,61 +402,23 @@ fn expand_response_arg(
     Ok(())
 }
 
-/// Store a freshly compiled object under its cache key: clone it into a
-/// uniquely named file beside the key, then rename that into place, so a
-/// concurrent lookup sees either no object or a complete one (stow#837).
-/// The first writer wins; a later store of the same key leaves it alone.
-///
-/// The published object joins `cc_cache_entries` — the shared
-/// `artifact_cache_max_bytes` LRU the rustc entries live under
-/// (stow#980) — and the post-store eviction pass runs against the whole
-/// cache.
-pub async fn store_compiled_object(
-    config: &StowConfig,
-    cache_path: &Path,
-    output_path: &Path,
-) -> stow_types::error::Result<()> {
-    let staged = stage_compiled_object(cache_path, output_path).await?;
-    publish_staged_object(config, staged).await
-}
-
 /// A compiled object cloned into the C object cache directory, not yet
 /// visible at its cache key: the snapshot a store takes while the
 /// compiler's output is still in place, so the publish and its
 /// bookkeeping can run after the compiler's wrapper has exited.
+///
+/// A store clones the object into a uniquely named file beside the key
+/// and renames that into place, so a concurrent lookup sees either no
+/// object or a complete one (stow#837). The first writer wins; a later
+/// store of the same key leaves it alone.
 pub struct StagedCcObject {
     cache_key: String,
     staged: StagedObject,
 }
 
-/// Clone the compiled object at `output_path` beside the key `cache_path`
-/// names.
-///
-/// # Errors
-/// A cache path with no key file name, or a clone that fails.
-pub async fn stage_compiled_object(
-    cache_path: &Path,
-    output_path: &Path,
-) -> stow_types::error::Result<StagedCcObject> {
-    let cache_key = cache_path
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "C object cache path {} has no cache-key file name",
-                cache_path.display()
-            )
-        })?
-        .to_owned();
-    let cache_path = cache_path.to_path_buf();
-    let output_path = output_path.to_path_buf();
-    let staged =
-        smol::unblock(move || stage_compiled_object_blocking(&cache_path, &output_path)).await?;
-    Ok(StagedCcObject { cache_key, staged })
-}
-
-/// [`stage_compiled_object`] from a file already opened and checked by
-/// [`open_reported_output`]: the staged bytes are that descriptor's.
+/// Clone the compiled object `source`, already opened and checked by
+/// [`open_reported_output`], beside the key `cache_path` names: the staged
+/// bytes are that descriptor's.
 ///
 /// # Errors
 /// A cache path with no key file name, or a clone that fails.
@@ -539,7 +470,7 @@ pub fn cached_object_path(config: &StowConfig, cache_key: &str) -> PathBuf {
     cc_cache_path(config, cache_key)
 }
 
-/// The records a supervised C compile leaves for the daemon to write once
+/// The records a session's C compile leaves for the daemon to write once
 /// the wrapper has its answer: they cost the wrapper — and the job slot
 /// cargo holds for it — nothing.
 pub enum CcRecord {
@@ -555,8 +486,7 @@ pub enum CcRecord {
 }
 
 /// Write a [`CcRecord`] against the daemon's own state database: the LRU
-/// row and the hit, miss or error statistic, each as the standalone
-/// wrapper writes them.
+/// row and the hit, miss or error statistic.
 pub async fn write_record(config: &StowConfig, record: CcRecord) {
     match record {
         CcRecord::Hit { cache_key } => {
@@ -639,14 +569,17 @@ fn clone_or_copy_file(source: &std::fs::File, destination: &Path) -> std::io::Re
 ///
 /// The final component is not followed (`O_NOFOLLOW`, or the reparse
 /// point itself on Windows), the file must be a regular one, and the
-/// descriptor's own real path must lie under `root`, the build's target
-/// directory: a wrapper cannot name a file the sandbox keeps from it, or
-/// a link through the target directory to one, and have the supervisor
-/// read it for the cache the sandbox can read.
+/// descriptor's own real path must lie under one of `roots`, the build's
+/// target and build directories: a wrapper cannot name a file the sandbox
+/// keeps from it, or a link through those directories to one, and have
+/// the session read it for the cache the sandbox can read.
 ///
 /// # Errors
 /// The reason the report is refused, naming the path.
-pub fn open_reported_output(path: &Path, root: &Path) -> Result<std::fs::File, String> {
+pub fn open_reported_output(
+    path: &Path,
+    roots: &crate::daemon::session::invocation::OutputRoots,
+) -> Result<std::fs::File, String> {
     let file = open_without_following(path).map_err(|error| {
         format!(
             "cannot open reported C/C++ output {}: {error}",
@@ -671,26 +604,20 @@ pub fn open_reported_output(path: &Path, root: &Path) -> Result<std::fs::File, S
             path.display()
         )
     })?;
-    let root = std::fs::canonicalize(root).map_err(|error| {
+    roots.admit(&real).map_err(|roots| {
         format!(
-            "cannot resolve the build's target directory {}: {error}",
-            root.display()
+            "reported C/C++ output {} (resolved {}) is outside the build's target and build directories ({roots})",
+            path.display(),
+            real.display()
         )
     })?;
-    if !real.starts_with(&root) {
-        return Err(format!(
-            "reported C/C++ output {} is outside the build's target directory {}",
-            path.display(),
-            root.display()
-        ));
-    }
     Ok(file)
 }
 
 #[cfg(unix)]
 fn open_without_following(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    // `O_NONBLOCK` keeps the open of a FIFO from hanging the supervisor;
+    // `O_NONBLOCK` keeps the open of a FIFO from hanging the session;
     // the regular-file check refuses it right after.
     std::fs::OpenOptions::new()
         .read(true)
@@ -792,15 +719,6 @@ impl StagedObject {
             ),
         }
     }
-}
-
-fn stage_compiled_object_blocking(
-    cache_path: &Path,
-    output_path: &Path,
-) -> stow_types::error::Result<StagedObject> {
-    let source = std::fs::File::open(output_path)
-        .wrap_err_with(|| format!("open compiled object {}", output_path.display()))?;
-    stage_open_object_blocking(cache_path, &source, output_path)
 }
 
 /// Clone the open `source` — `label` names it in errors — to a temporary
@@ -1205,20 +1123,6 @@ impl ParsedCcInvocation {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum CcOutcome {
-    Passthrough,
-    Hit {
-        cache_key: String,
-        output_path: PathBuf,
-    },
-    Miss {
-        cache_key: String,
-        cache_path: PathBuf,
-        output_path: PathBuf,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     /// The cache keys of every `cc_cache_entries` row.
@@ -1236,14 +1140,51 @@ mod tests {
     #[cfg(unix)]
     use std::time::Duration;
 
-    #[cfg(unix)]
-    use super::CcOutcome;
     use super::{DepfileMode, DepfileTarget, ParsedCcInvocation};
     #[cfg(unix)]
     use crate::config::{StowConfig, VerifyMode};
 
     fn args(values: &[&str]) -> Vec<std::ffi::OsString> {
         values.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    /// Stage the object at `output` beside `cache_path` the way the daemon
+    /// stages a reported output: from the open descriptor.
+    fn stage(
+        cache_path: &std::path::Path,
+        output: &std::path::Path,
+    ) -> stow_types::error::Result<super::StagedObject> {
+        let source = std::fs::File::open(output).expect("open the compiled object");
+        super::stage_open_object_blocking(cache_path, &source, output)
+    }
+
+    /// Plan a cacheable compile: its cache key and output path.
+    #[cfg(unix)]
+    async fn plan(cc: &super::ResolvedCompiler, args: &[OsString]) -> (String, std::path::PathBuf) {
+        match super::plan_compile(cc, args)
+            .await
+            .expect("plan the compile")
+        {
+            super::CcPlan::Keyed {
+                cache_key,
+                output_path,
+            } => (cache_key, output_path),
+            super::CcPlan::Passthrough => panic!("the compile must be cacheable"),
+        }
+    }
+
+    /// Store the object at `output` under `cache_path` the way the daemon
+    /// does: stage it from the open descriptor, then publish it into the
+    /// shared LRU.
+    #[cfg(unix)]
+    async fn store(config: &StowConfig, cache_path: &std::path::Path, output: &std::path::Path) {
+        let source = std::fs::File::open(output).expect("open the compiled object");
+        let staged = super::stage_opened_object(cache_path, source, output)
+            .await
+            .expect("stage the compiled object");
+        super::publish_staged_object(config, staged)
+            .await
+            .expect("publish the compiled object");
     }
 
     #[cfg(unix)]
@@ -1260,6 +1201,7 @@ mod tests {
             artifact_cache_max_bytes: crate::config::DEFAULT_ARTIFACT_CACHE_MAX_BYTES,
             index_refresh_interval: Duration::from_mins(1),
             verify_mode: VerifyMode::GithubCi,
+            switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
@@ -1585,10 +1527,8 @@ mod tests {
         std::fs::write(&first_output, b"first object").expect("write first object");
         std::fs::write(&second_output, b"second object").expect("write second object");
 
-        let first = super::stage_compiled_object_blocking(&cache_path, &first_output)
-            .expect("stage first object");
-        let second = super::stage_compiled_object_blocking(&cache_path, &second_output)
-            .expect("stage second object");
+        let first = stage(&cache_path, &first_output).expect("stage first object");
+        let second = stage(&cache_path, &second_output).expect("stage second object");
         assert!(!cache_path.exists(), "a staged object must not be visible");
 
         first.publish().expect("publish first object");
@@ -1621,8 +1561,7 @@ mod tests {
         std::fs::write(&compiled, b"object bytes").expect("write compiled object");
         std::fs::write(&served, b"stale object").expect("write stale output");
 
-        let staged = super::stage_compiled_object_blocking(&cache_path, &compiled)
-            .expect("stage compiled object");
+        let staged = stage(&cache_path, &compiled).expect("stage compiled object");
         assert_eq!(*staged.staged.as_file(), super::Placement::Cloned);
         staged.publish().expect("publish compiled object");
 
@@ -1694,44 +1633,21 @@ mod tests {
             .expect("write a.c");
         std::fs::write(dir.join("b.c"), format!("{}{body}", "// pad\n".repeat(28)))
             .expect("write b.c");
-        let config = test_config(dir.join("stow-cache"));
-        let compile_args = |name: &str| {
-            vec![
+        let key = |name: &'static str| {
+            let compile_args = vec![
                 OsString::from("-c"),
                 dir.join(name).into_os_string(),
                 OsString::from("-o"),
                 dir.join(format!("{name}.o")).into_os_string(),
-            ]
+            ];
+            let cc = &cc;
+            async move { plan(cc, &compile_args).await.0 }
         };
 
-        let first_args = compile_args("a.c");
-        let first = super::try_compile(&config, &cc, &first_args)
-            .await
-            .expect("first try_compile");
-        let CcOutcome::Miss {
-            cache_path,
-            output_path,
-            ..
-        } = first
-        else {
-            panic!("first compile must be a cache miss");
-        };
-        let status = async_process::Command::new(&cc.program)
-            .args(&first_args)
-            .status()
-            .await
-            .expect("spawn cc");
-        assert!(status.success());
-        super::store_compiled_object(&config, &cache_path, &output_path)
-            .await
-            .expect("store compiled object");
-
-        let second = super::try_compile(&config, &cc, &compile_args("b.c"))
-            .await
-            .expect("second try_compile");
-        assert!(
-            matches!(second, CcOutcome::Miss { .. }),
-            "b.c at another file and line must not be served a.c's object"
+        assert_ne!(
+            key("a.c").await,
+            key("b.c").await,
+            "b.c at another file and line must not share a.c's object"
         );
     }
 
@@ -1791,35 +1707,51 @@ mod tests {
             object.clone().into_os_string(),
         ];
 
-        let first = super::try_compile(&config, &cc, &compiler_args)
-            .await
-            .expect("first try_compile");
-        let CcOutcome::Miss {
-            cache_path,
-            output_path,
-            ..
-        } = first
-        else {
-            panic!("first compile must be a cache miss");
-        };
+        // What a session's wrapper and daemon do for a miss: plan the
+        // compile, find no object at the key, run the compiler, and have
+        // the daemon store the reported output.
+        let (cache_key, output_path) = plan(&cc, &compiler_args).await;
+        assert!(
+            super::locate_cached_object(&config, &cache_key)
+                .await
+                .expect("look the key up")
+                .is_none(),
+            "the first compile must be a cache miss"
+        );
         let status = async_process::Command::new(&cc.program)
             .args(&compiler_args)
             .status()
             .await
             .expect("spawn cc");
         assert!(status.success());
-        super::store_compiled_object(&config, &cache_path, &output_path)
-            .await
-            .expect("store compiled object");
+        store(
+            &config,
+            &super::cached_object_path(&config, &cache_key),
+            &output_path,
+        )
+        .await;
 
         std::fs::remove_dir_all(&build).expect("remove build dir");
 
-        let second = super::try_compile(&config, &cc, &compiler_args)
+        // The hit: planning writes the depfile again (the preprocessor
+        // does), the wrapper clones the object onto the output, and the
+        // daemon records the hit.
+        let (second_key, output_path) = plan(&cc, &compiler_args).await;
+        assert_eq!(second_key, cache_key);
+        let cache_path = super::locate_cached_object(&config, &cache_key)
             .await
-            .expect("second try_compile");
-        let CcOutcome::Hit { cache_key, .. } = second else {
-            panic!("second compile must be a cache hit");
-        };
+            .expect("look the key up")
+            .expect("the second compile must be a cache hit");
+        super::serve_cached_object(&cache_path, &output_path)
+            .await
+            .expect("serve the cached object");
+        super::write_record(
+            &config,
+            super::CcRecord::Hit {
+                cache_key: cache_key.clone(),
+            },
+        )
+        .await;
         assert!(object.exists());
         let pool = crate::state_db::connect(&config.cache_dir)
             .await
@@ -1855,9 +1787,7 @@ mod tests {
             .len();
 
         for key in ["key-a", "key-b", "key-c"] {
-            super::store_compiled_object(&config, &cc_dir.join(format!("{key}.o")), &output)
-                .await
-                .expect("store compiled object");
+            store(&config, &cc_dir.join(format!("{key}.o")), &output).await;
         }
 
         let pool = crate::state_db::connect(&config.cache_dir)
@@ -1896,12 +1826,8 @@ mod tests {
 
         let first = cc_dir.join("first.o");
         let second = cc_dir.join("second.o");
-        super::store_compiled_object(&config, &first, &output)
-            .await
-            .expect("store first object");
-        super::store_compiled_object(&config, &second, &output)
-            .await
-            .expect("store second object");
+        store(&config, &first, &output).await;
+        store(&config, &second, &output).await;
 
         let pool = crate::state_db::connect(&config.cache_dir)
             .await
@@ -1921,9 +1847,7 @@ mod tests {
             .await
             .expect("hit on first object");
 
-        super::store_compiled_object(&config, &cc_dir.join("third.o"), &output)
-            .await
-            .expect("store third object");
+        store(&config, &cc_dir.join("third.o"), &output).await;
 
         let entries = list_cc_cache_keys(&pool).await;
         assert!(

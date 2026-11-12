@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use semver::Version;
 use stow_types::api::{DependencyGraphEntry, ResolvedDependencyGraphEntry, runner_family};
-use stow_types::feature_sets::smallest_containing_set;
+use stow_types::feature_sets::{FeatureAgreement, smallest_containing_set};
 use stow_types::glibc::GlibcVersion;
 use stow_types::identity::{
     CMetadata, CrateName, CrateVersion, DependencyIdentity, FeaturesJson, TargetTriple,
@@ -96,8 +96,7 @@ pub struct AnalysisEntry {
 }
 
 /// One exact artifact the driver should prefetch: its identity plus the
-/// content digest the bundle blob lives under in the registry. Serialized
-/// into the `STOW_PREFETCH_ARTIFACTS_PATH` file for the wrapper.
+/// content digest the bundle blob lives under in the registry.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PrefetchArtifactRow {
     /// Crate name as published.
@@ -896,6 +895,14 @@ fn deduplicate_cached_candidate(
 /// published — reachable or not — is never moved: its `S` is already the
 /// smallest containing set, and an unreachable exact chain keeps the
 /// node on the miss path it has.
+///
+/// A serving row joins only when its whole recorded chain agrees with
+/// the build (stow#1470): every target-side row in the chain holds the
+/// set the build requests for its package and the set the chains
+/// accepted so far hold, so a build never holds two sets of one
+/// package. The node's own package is the one that moves, so it is
+/// exempt from the request but not from those chains. Nodes are taken in
+/// key order, so the outcome is a function of the request and the slice.
 fn add_superset_candidates<'a>(
     candidates: &mut Vec<ReachableCandidateRow<'a>>,
     key_pairs: &BTreeSet<(PackageKey, String)>,
@@ -904,7 +911,9 @@ fn add_superset_candidates<'a>(
 ) -> stow_types::error::Result<()> {
     // The chooser's pool: every canonical target-side row is built by
     // definition, grouped by package with its decoded feature set.
-    let mut published = BTreeMap::<PackageKey, Vec<(&'a ArtifactIndexRow, Vec<String>)>>::new();
+    let mut pool = Vec::<PoolRow<'a>>::new();
+    let mut published = BTreeMap::<PackageKey, Vec<usize>>::new();
+    let mut by_c_metadata = BTreeMap::<&str, Vec<usize>>::new();
     for row in rows {
         if row.unit_shape.side != UnitSide::Target || !cached_row_has_canonical_metadata(row)? {
             continue;
@@ -913,14 +922,26 @@ fn add_superset_candidates<'a>(
         else {
             continue;
         };
-        published
-            .entry(PackageKey {
-                crate_name: row.crate_name.clone(),
-                version: row.version.as_semver().clone(),
-            })
+        let key = PackageKey {
+            crate_name: row.crate_name.clone(),
+            version: row.version.as_semver().clone(),
+        };
+        published.entry(key.clone()).or_default().push(pool.len());
+        by_c_metadata
+            .entry(row.c_metadata.as_str())
             .or_default()
-            .push((row, features));
+            .push(pool.len());
+        pool.push(PoolRow { key, row, features });
     }
+    // What the build asks of each package, and what the chains accepted
+    // so far hold (stow#1470).
+    let mut requested_sets = FeatureAgreement::<PackageKey>::default();
+    for (key, features_json) in key_pairs {
+        if let Ok(features) = serde_json::from_str::<Vec<String>>(features_json) {
+            requested_sets.replace(key.clone(), features);
+        }
+    }
+    let mut pinned = FeatureAgreement::<PackageKey>::default();
     let mut added = BTreeSet::<(String, SemanticKey)>::new();
     for key_pair in key_pairs {
         if covered.contains(key_pair) {
@@ -932,9 +953,12 @@ fn add_superset_candidates<'a>(
         let Ok(requested) = serde_json::from_str::<Vec<String>>(key_pair.1.as_str()) else {
             continue;
         };
-        let Some(serving) =
-            smallest_containing_set(&requested, pkg_rows.iter().map(|(_, f)| f.as_slice()))
-        else {
+        let Some(serving) = smallest_containing_set(
+            &requested,
+            pkg_rows
+                .iter()
+                .map(|&index| pool[index].features.as_slice()),
+        ) else {
             continue;
         };
         if serving == requested.as_slice() {
@@ -943,8 +967,20 @@ fn add_superset_candidates<'a>(
             // existing exact artifact.
             continue;
         }
-        for (row, features) in pkg_rows {
+        for &index in pkg_rows {
+            let PoolRow { row, features, .. } = &pool[index];
             if features.as_slice() != serving {
+                continue;
+            }
+            // The row's whole recorded chain must agree with the build:
+            // the node's own package moves, so only the chain's other
+            // packages answer to the request.
+            let chain = chain_sets(&pool, &by_c_metadata, index);
+            let agrees = requested_sets
+                .disagreement(chain.iter().filter(|(key, _)| **key != key_pair.0).copied())
+                .is_none()
+                && pinned.disagreement(chain.iter().copied()).is_none();
+            if !agrees {
                 continue;
             }
             let dependency_identities = canonicalize_dependency_identities(
@@ -958,6 +994,7 @@ fn add_superset_candidates<'a>(
                     .collect(),
             );
             if added.insert((row.c_metadata.as_str().to_owned(), key_pair.clone())) {
+                pinned.hold(chain.iter().copied());
                 candidates.push(ReachableCandidateRow {
                     semantic_key: key_pair.clone(),
                     row,
@@ -968,6 +1005,43 @@ fn add_superset_candidates<'a>(
         }
     }
     Ok(())
+}
+
+/// One canonical target-side row of the superset pool, with its decoded
+/// feature set.
+struct PoolRow<'a> {
+    key: PackageKey,
+    row: &'a ArtifactIndexRow,
+    features: Vec<String>,
+}
+
+/// The package and feature set of every pool row in the recorded chain
+/// of `pool[start]`, itself included. An edge names `c_metadata` alone,
+/// so every row carrying it is a member.
+fn chain_sets<'a>(
+    pool: &'a [PoolRow<'_>],
+    by_c_metadata: &BTreeMap<&str, Vec<usize>>,
+    start: usize,
+) -> Vec<(&'a PackageKey, &'a [String])> {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![start];
+    let mut sets = Vec::new();
+    while let Some(index) = stack.pop() {
+        if !seen.insert(index) {
+            continue;
+        }
+        let PoolRow { key, row, features } = &pool[index];
+        sets.push((key, features.as_slice()));
+        for entry in row.dependency_c_metadata_json.entries() {
+            stack.extend(
+                by_c_metadata
+                    .get(entry.c_metadata.as_str())
+                    .into_iter()
+                    .flatten(),
+            );
+        }
+    }
+    sets
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1667,6 +1741,89 @@ mod tests {
         assert_eq!(reachable.candidates[0].row.crate_name.as_str(), "same-file");
         assert_eq!(reachable.candidates[1].row.crate_name.as_str(), "walkdir");
         assert!(reachable.chain_rows.is_empty());
+    }
+
+    /// polyval 0.6.2's shape (stow#1470): the slice serves cpufeatures
+    /// 0.2.17 from a published set whose recorded chain holds libc
+    /// 0.2.191 at `default, extra_traits, std`, while the build asks for
+    /// libc at `default, std` — published itself. Taking that chain
+    /// would give the build two libc sets, so cpufeatures stays a miss.
+    #[test]
+    fn a_superset_chain_that_disagrees_with_the_build_is_not_served() {
+        let key_pairs = BTreeSet::from([
+            (key("cpufeatures", "0.2.17"), "[]".to_owned()),
+            (key("libc", "0.2.191"), r#"["default","std"]"#.to_owned()),
+        ]);
+        let rows = vec![
+            row(
+                "libc",
+                "0.2.191",
+                "1111111111111111",
+                &["default", "std"],
+                &[],
+            ),
+            row(
+                "libc",
+                "0.2.191",
+                "2222222222222222",
+                &["default", "extra_traits", "std"],
+                &[],
+            ),
+            row(
+                "cpufeatures",
+                "0.2.17",
+                "3333333333333333",
+                &["std"],
+                &[("libc", "2222222222222222")],
+            ),
+        ];
+        let reachable =
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows, &[])
+                .unwrap();
+        let served = reachable
+            .candidates
+            .iter()
+            .map(|candidate| candidate.row.crate_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(served, ["libc"], "cpufeatures must not be served");
+    }
+
+    /// The same slice, with the serving chain holding the libc set the
+    /// build asks for: the node moves.
+    #[test]
+    fn a_superset_chain_that_agrees_with_the_build_is_served() {
+        let key_pairs = BTreeSet::from([
+            (key("cpufeatures", "0.2.17"), "[]".to_owned()),
+            (key("libc", "0.2.191"), r#"["default","std"]"#.to_owned()),
+        ]);
+        let rows = vec![
+            row(
+                "libc",
+                "0.2.191",
+                "1111111111111111",
+                &["default", "std"],
+                &[],
+            ),
+            row(
+                "cpufeatures",
+                "0.2.17",
+                "3333333333333333",
+                &["std"],
+                &[("libc", "1111111111111111")],
+            ),
+        ];
+        let reachable =
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows, &[])
+                .unwrap();
+        let served = reachable
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.row.crate_name.as_str(), candidate.superset))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            served,
+            BTreeSet::from([("cpufeatures", true), ("libc", false)])
+        );
     }
 
     #[test]

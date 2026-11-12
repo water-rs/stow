@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+	<RegistrationInfo>
+		<Description>Starts the per-user stow daemon at logon and whenever a build needs it.</Description>
+	</RegistrationInfo>
+	<Triggers>
+		<LogonTrigger>
+			<Enabled>true</Enabled>
+			<UserId>S-1-5-21-1-2-3-1001</UserId>
+		</LogonTrigger>
+	</Triggers>
+	<Principals>
+		<Principal id="Author">
+			<UserId>S-1-5-21-1-2-3-1001</UserId>
+			<LogonType>InteractiveToken</LogonType>
+			<RunLevel>LeastPrivilege</RunLevel>
+		</Principal>
+	</Principals>
+	<Settings>
+		<MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>
+		<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+		<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+		<AllowHardTerminate>true</AllowHardTerminate>
+		<AllowStartOnDemand>true</AllowStartOnDemand>
+		<Enabled>true</Enabled>
+		<Hidden>false</Hidden>
+		<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+		<Priority>4</Priority>
+	</Settings>
+	<Actions Context="Author">
+		<Exec>
+			<Command>C:\Program Files\stow\stow-runtime.exe</Command>
+			<Arguments>daemon --run-dir &#34;C:\Users\a b\AppData\Local\stow\run&#34;</Arguments>
+		</Exec>
+	</Actions>
+</Task>

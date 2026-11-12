@@ -293,6 +293,76 @@ project's configured rustflags wholesale), so a job on Linux also runs
 plain `stow setup`, which writes the mold selection into the runner's
 `$CARGO_HOME/config.toml`.
 
+### Sandboxes
+
+Every compile of a plain `cargo build` through the wrappers is answered
+by the per-user daemon, which opens a session of that cargo and ends it
+when the cargo exits: the wrapper asks, runs the compiler when told to,
+reports and exits, and the lookup, the store and the bookkeeping happen in
+the daemon after the wrapper has gone. The process running cargo must
+therefore be able to connect to `<run dir>/daemon.sock` (the named pipe on
+Windows), or to start the daemon, which needs write access to the run
+directory.
+
+On Windows `stow setup` registers a per-user Task Scheduler task named
+`stow-daemon-<hash of the run directory>` that runs `stow daemon` when you
+log on, with no stored password and no elevation, and the wrapper starts the
+daemon by asking the Task Scheduler to run that task: cargo runs inside a
+job object that ends every process in it when cargo ends, so a daemon the
+wrapper started itself would end with the first cargo that is killed. Run
+`stow setup` once per user (and once for each `STOW_DAEMON_DIR` you use). A
+build that finds no daemon running and no task registered fails with an error
+naming the stow daemon and `stow setup`; it never starts the daemon any other
+way. The daemon the task starts reads `STOW_DAEMON_ANSWER_SECS` and
+`STOW_DAEMON_LOG_BYTES` from your user environment, not from the build's.
+
+A build whose sandbox allows neither fails. There is no fallback: a
+wrapper never decides anything on its own, so a build that cannot reach the
+daemon cannot build through stow's wrappers at all. Cargo's first probe of
+the compiler fails, and the error names the endpoint, the run directory and
+the daemon's pid and log. The run directory is `STOW_DAEMON_DIR` when it is
+set, and the per-user cache directory's `stow/run` otherwise.
+
+The daemon takes what it knows about a plain build from the processes that
+connect, so who may connect decides whose cache and target directories it
+works in: the endpoint is owner-only (a `0600` socket in a `0700`
+directory on Unix, a pipe only the user's SID may open on Windows), and a
+sandbox that lets a process reach it gives that process the daemon's
+authority over the user's cache and the target directories of its builds.
+The output directories a session accepts are derived from the first unit
+of the build; they are not a security boundary.
+
+The daemon outlives the stow that started it, so a newer stow replaces it.
+The daemon retires when a client that opens a session is a newer stow (by
+its version, and a version that is not a semantic version is refused), and
+when stow was installed over the executable the daemon runs. The client
+that found it waits for the successor and makes the same request again, so
+the build that triggered the replacement is not failed; a client that
+cannot get a successor within the drain bound, a start and an answer fails
+naming the daemon. A retiring daemon keeps serving the builds it holds
+(its wrappers and its probes) for up to `STOW_DAEMON_DRAIN_SECS`, answers
+anything that would open a session with a request to retry, and then
+replaces itself with the successor. On Unix the replacement keeps the
+process id, the lock and the listening socket, so connections made during
+it wait in the socket's backlog for the successor. A driver's build still
+open when the bound ends fails, and the message names the restart.
+
+A daemon from a stow that predates retirement (protocol 3 and older) cannot
+be asked to retire: it refuses the newer stow's hello. The client that finds
+it ends that process (builds it holds are lost with it) and starts a daemon
+of its own stow; if the daemon that starts still cannot retire, the client
+fails naming it.
+
+A daemon that restarts while a cargo is building leaves that build without
+the session's in-flight state and its record of locally built crates. The
+new daemon refuses that cargo's wrappers until it exits, so the build fails
+saying the daemon restarted; run it again.
+
+What the daemon logs while it decides a unit, such as a refused request,
+reaches the wrapper's stderr at `warn` and above. With
+`STOW_TRACE_WRAPPED_COMPILERS` set, `RUST_LOG` selects what else returns.
+Everything else is in the daemon's log, `<run dir>/daemon.log`.
+
 ## `stow update`
 
 Updates this install to the latest stow-cli release. The shell and
@@ -303,6 +373,14 @@ runs it against the recorded prefix — then re-materializes the wrapper
 shims so they keep resolving to the fresh binary. A binary that was not
 installed by the installer (a `cargo install` or source build has no
 receipt) refuses with the reason instead of clobbering itself.
+
+When the update installs a release and a daemon is running, `stow update`
+restarts it onto the installed stow and prints `restarted the stow daemon:
+<old version> -> <new version>`; builds the daemon holds are served first,
+for up to `STOW_DAEMON_DRAIN_SECS`. A daemon that is not running is not
+started, and an update that finds nothing newer leaves the daemon alone.
+The update fails, naming both versions, when the daemon comes back as a
+stow other than the installed one.
 
 GitHub API calls for the release lookup accept a token from
 `STOW_CLI_GITHUB_TOKEN`, `GITHUB_TOKEN`, or `GH_TOKEN` — only useful

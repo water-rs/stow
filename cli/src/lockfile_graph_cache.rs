@@ -24,6 +24,7 @@ use stow_types::env_name;
 use stow_types::error::Context;
 
 use crate::config::StowConfig;
+use crate::session_env::SessionEnv;
 use crate::state_db::{db_int, duration_millis, now_millis};
 use crate::workspace_deps::ExpandedDependencyGraph;
 
@@ -100,8 +101,10 @@ fn normalized_args<'a>(action: &str, cargo_args: &'a [OsString]) -> Vec<&'a [u8]
 /// values alike); and `CARGO_UNSTABLE_*` alongside the other env inputs.
 /// Member manifests leave the key — the entry's recorded local-manifest
 /// hashes verify them on load.
-pub fn cache_key(project: &crate::cargo_cmd::ProjectContext) -> stow_types::error::Result<String> {
-    let env = std::env::vars_os().collect::<Vec<_>>();
+pub fn cache_key(
+    project: &crate::cargo_cmd::ProjectFacts,
+    env: &SessionEnv,
+) -> stow_types::error::Result<String> {
     key_of(&KeyInputs {
         action: &project.action,
         cargo_args: &project.cargo_args,
@@ -111,12 +114,12 @@ pub fn cache_key(project: &crate::cargo_cmd::ProjectContext) -> stow_types::erro
         target: &project.target,
         target_given: project.target_given,
         rustc_version: &project.rustc_version,
-        env: &env,
+        env,
     })
 }
 
 /// The invocation fields [`cache_key`] hashes, borrowed for one
-/// computation. A `ProjectContext` supplies them for the live build;
+/// computation. A `ProjectFacts` supplies them for the live build;
 /// the miss-journal drain rebuilds them from the journal's context
 /// sidecar so it can recompute the same key over the project's
 /// *current* files — the same function of the same inputs is the same
@@ -130,10 +133,11 @@ pub struct KeyInputs<'a> {
     pub target: &'a str,
     pub target_given: bool,
     pub rustc_version: &'a str,
-    /// The environment the unit-graph run reads — the process
-    /// environment for a live build or drain; a test hands its own.
-    /// `key_of` picks the variables cargo's own inputs map to.
-    pub env: &'a [(OsString, OsString)],
+    /// The environment the unit-graph run reads — the build's own for a
+    /// live build, the drain's process environment for a drain; a test
+    /// hands its own. `key_of` picks the variables cargo's own inputs
+    /// map to, and the cargo home the config documents are read from.
+    pub env: &'a SessionEnv,
 }
 
 /// [`cache_key`] over a borrowed input set — the single function both
@@ -172,7 +176,7 @@ pub fn key_of(project: &KeyInputs<'_>) -> stow_types::error::Result<String> {
     // than serving a stale graph. The output directories change where artifacts land, never
     // which units exist, so `CARGO_TARGET_DIR` and every
     // `CARGO_BUILD_*` other than the three named stay out (stow#617).
-    for (key, value) in project.env {
+    for (key, value) in project.env.environ() {
         let Some(key) = key.to_str() else { continue };
         // The hashed name is one spelling per variable — the listed
         // name for an exact match, the uppercase convention for a
@@ -207,9 +211,11 @@ pub fn key_of(project: &KeyInputs<'_>) -> stow_types::error::Result<String> {
     // Every config document cargo reads — files in merge order plus
     // each `--config` value — hashed as cargo sees them (source label
     // + parsed form).
-    for (name, document) in
-        crate::mold::cargo_config_documents(project.current_dir, project.cargo_args, None)
-    {
+    for (name, document) in crate::mold::cargo_config_documents(
+        project.current_dir,
+        project.cargo_args,
+        project.env.cargo_home(),
+    ) {
         hasher.update(name.as_bytes());
         hasher.update(&[0]);
         hasher.update(document.to_string().as_bytes());
@@ -308,11 +314,12 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{cache_key, normalized_args};
-    use crate::cargo_cmd::{MetadataArgs, MoldSelection, ProjectContext};
+    use crate::cargo_cmd::{MetadataArgs, ProjectFacts};
+    use crate::session_env::SessionEnv;
     use crate::workspace_deps::ExpandedDependencyGraph;
 
-    fn project(dir: &std::path::Path, manifest: &std::path::Path) -> ProjectContext {
-        ProjectContext {
+    fn project(dir: &std::path::Path, manifest: &std::path::Path) -> ProjectFacts {
+        ProjectFacts {
             action: "check".to_owned(),
             cargo_args: Vec::new(),
             workspace_root: dir.to_path_buf(),
@@ -324,11 +331,6 @@ mod tests {
             target_given: false,
             host_target: "x86_64-unknown-linux-gnu".to_owned(),
             rustc_version: "1.99.0".to_owned(),
-            mold: MoldSelection::resolved(Vec::new()),
-            env_base: None,
-            toolchain: crate::cargo_cmd::pending_toolchain(),
-            build_rustc: crate::rustc_args::BuildRustc::ToolchainDefault,
-            foreground: crate::derive_gate::ForegroundHold::detached(),
         }
     }
 
@@ -351,9 +353,10 @@ mod tests {
         }
         let a = project(&root.join("a"), &root.join("a/Cargo.toml"));
         let b = project(&root.join("b"), &root.join("b/Cargo.toml"));
+        let env = SessionEnv::of_this_process().expect("the test process's environment");
         assert_ne!(
-            cache_key(&a).expect("key a"),
-            cache_key(&b).expect("key b"),
+            cache_key(&a, &env).expect("key a"),
+            cache_key(&b, &env).expect("key b"),
             "the canonical manifest and invocation dir separate the keys"
         );
     }
@@ -361,9 +364,9 @@ mod tests {
     /// A `KeyInputs` over `project`'s fields with explicit args and
     /// environment — the test-side mirror of `cache_key`.
     fn key_inputs<'a>(
-        project: &'a crate::cargo_cmd::ProjectContext,
+        project: &'a ProjectFacts,
         cargo_args: &'a [OsString],
-        env: &'a [(OsString, OsString)],
+        env: &'a SessionEnv,
     ) -> super::KeyInputs<'a> {
         super::KeyInputs {
             action: &project.action,
@@ -396,10 +399,12 @@ mod tests {
         let project = project(root, &root.join("Cargo.toml"));
 
         let key = |vars: &[(&str, &str)], args: &[&str]| {
-            let env: Vec<(OsString, OsString)> = vars
-                .iter()
-                .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-                .collect();
+            let env = SessionEnv::new(
+                vars.iter()
+                    .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+                    .collect(),
+                root.to_path_buf(),
+            );
             let cargo_args: Vec<OsString> = args.iter().map(OsString::from).collect();
             super::key_of(&key_inputs(&project, &cargo_args, &env)).expect("key")
         };
@@ -490,10 +495,11 @@ mod tests {
         let zed = PathBuf::from("/home/ubuntu/scratch/zed");
         let manifest = zed.join("Cargo.toml");
         let project = project(&zed, &manifest);
+        let env = SessionEnv::of_this_process().expect("the test process's environment");
         let mut key_ms = Vec::new();
         for _ in 0..5 {
             let start = std::time::Instant::now();
-            let key = cache_key(&project).expect("key");
+            let key = cache_key(&project, &env).expect("key");
             key_ms.push(start.elapsed().as_millis());
             assert_eq!(key.len(), 64, "blake3 hex key");
         }
@@ -508,7 +514,7 @@ mod tests {
             &zed,
             "x86_64-unknown-linux-gnu",
             &stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
-            None,
+            &env,
         ))
         .expect("resolve zed");
         let json = serde_json::to_string(&graph).expect("encode");

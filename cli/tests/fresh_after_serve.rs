@@ -23,11 +23,10 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::SystemTime;
 
 use build_fixture::{refused_url, stow_build_in, stow_setup_in, write_fixture};
-use support::sealed_home_env;
 
 /// Registry crates with build scripts that print `cargo:rerun-if-changed`
 /// / `cargo:rerun-if-env-changed` lines (`anyhow`, `libc`, `serde` — and
@@ -146,8 +145,7 @@ fn clone_registry_into(cargo_home: &Path, other_home: &Path) {
 /// `cargo build` with no stow wiring at all: a `CARGO_HOME` that never
 /// saw `stow setup`, `RUSTC_WRAPPER` removed from the environment.
 fn plain_cargo_build(dir: &Path, cargo_home: &Path, target_dir: &Path) -> Output {
-    let mut command = Command::new("cargo");
-    sealed_home_env(&mut command, &dir.join("stow-home"));
+    let mut command = support::cargo_command(&dir.join("stow-home"));
     command
         .args(["build", "--offline"])
         .current_dir(dir)
@@ -213,13 +211,13 @@ fn assert_same_output(
 
 #[test]
 fn a_served_build_stays_fresh_until_the_fixture_itself_changes() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cargo_home = tempfile::tempdir().expect("cargo home");
+    let dir = support::tempdir().expect("temp dir");
+    let cargo_home = support::tempdir().expect("cargo home");
     write_fixture(dir.path(), cargo_home.path(), FIXTURE_DEPENDENCIES);
     stow_setup_in(dir.path(), cargo_home.path());
     let edge_url = refused_url();
     let registry_url = refused_url();
-    let cache = tempfile::tempdir().expect("stow cache dir");
+    let cache = support::tempdir().expect("stow cache dir");
     let build = |args: &[&str], target: &Path, label: &str| {
         let output = stow_build_in(
             dir.path(),
@@ -240,13 +238,13 @@ fn a_served_build_stays_fresh_until_the_fixture_itself_changes() {
 
     // Build 1: fresh target, fresh cache — everything compiles and is
     // stored.
-    let target1 = tempfile::tempdir().expect("target dir 1");
+    let target1 = support::tempdir().expect("target dir 1");
     build(&["build", "--offline"], target1.path(), "build 1 (fill)");
 
     // Build 2: a second fresh target dir against the same cache serves
     // the stored units. The summary line must report served units so the
     // test cannot pass by not serving.
-    let target2 = tempfile::tempdir().expect("target dir 2");
+    let target2 = support::tempdir().expect("target dir 2");
     let output = build(&["build", "--offline"], target2.path(), "build 2 (serve)");
     assert!(served_count(&output) > 0, "build 2 served no units");
 
@@ -280,9 +278,9 @@ fn a_served_build_stays_fresh_until_the_fixture_itself_changes() {
     // dir must be what cargo's own build-script run produced — compare
     // against a plain `cargo build` in its own target dir with a
     // CARGO_HOME stow never configured.
-    let plain_home = tempfile::tempdir().expect("plain cargo home");
+    let plain_home = support::tempdir().expect("plain cargo home");
     clone_registry_into(cargo_home.path(), plain_home.path());
-    let plain_target = tempfile::tempdir().expect("plain target dir");
+    let plain_target = support::tempdir().expect("plain target dir");
     let output = plain_cargo_build(dir.path(), plain_home.path(), plain_target.path());
     assert!(
         output.status.success(),

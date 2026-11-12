@@ -1,7 +1,7 @@
-//! Platform-exact encoding of an `OsStr` for the supervisor wire.
+//! Platform-exact encoding of an `OsStr` for the wrapper wire.
 //!
 //! rustc arguments are paths, and a path is not required to be UTF-8 on
-//! either platform stow runs on. The wrapper and the supervisor are the
+//! either platform stow runs on. The wrapper and the daemon are the
 //! same binary on the same machine, so the wire can carry the platform's
 //! own encoding verbatim rather than a lossy string: raw bytes on Unix,
 //! little-endian UTF-16 code units on Windows.
