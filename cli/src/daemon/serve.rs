@@ -36,6 +36,7 @@ use super::protocol::{
     PROTOCOL_FLOOR, Response, Role, SessionRef, WrapperRequest, negotiate, read_frame_async,
     write_core_async, write_frame_async,
 };
+use super::retire::{Busy, Held, Pending, Retirement};
 use super::session::{
     CacheDirHandles, Cargo, Opener, Origin, Session, SessionFacts, SessionId, keep_only_owner,
     open_facts, os_bytes, recorded_owner,
@@ -67,11 +68,31 @@ struct Daemon<P> {
     /// The machine's processes: which cargo a wrapper runs under, and when
     /// it exits.
     processes: P,
+    /// Whether this daemon is giving way to another stow, and onto what.
+    retirement: Retirement,
+    /// What the daemon holds that giving way would cut.
+    busy: Busy,
 }
 
-/// Run the daemon until it fails. Returns `Ok` only when another daemon
-/// already holds the lock.
-pub async fn run(ready: Option<PathBuf>, given_dir: Option<PathBuf>) -> Result<()> {
+/// The lock and the listening socket of the daemon that replaced its own
+/// image with this process's: the descriptors it passed on.
+#[cfg(unix)]
+pub struct Inherited {
+    /// The descriptor of `daemon.lock`, held locked.
+    pub lock: std::os::fd::RawFd,
+    /// The descriptor of the endpoint's listening socket.
+    pub listener: std::os::fd::RawFd,
+}
+
+/// Run the daemon until it retires or fails. Returns `Ok` when another
+/// daemon already holds the lock, and on Windows when it has drained and
+/// released the pipe and the lock for its successor; on Unix a retiring
+/// daemon replaces its image and never returns.
+pub async fn run(
+    ready: Option<PathBuf>,
+    given_dir: Option<PathBuf>,
+    #[cfg(unix)] inherited: Option<Inherited>,
+) -> Result<()> {
     let logs = SessionLogs::default();
     let run_dir = blocking({
         let logs = logs.clone();
@@ -89,7 +110,13 @@ pub async fn run(ready: Option<PathBuf>, given_dir: Option<PathBuf>) -> Result<(
         "stow daemon process started"
     );
     let lock_path = run_dir.daemon_lock();
-    let Some(_lock) = blocking(move || take_lock(&lock_path)).await? else {
+    let Some(lock) = hold_lock(
+        lock_path,
+        #[cfg(unix)]
+        inherited.as_ref().map(|inherited| inherited.lock),
+    )
+    .await?
+    else {
         tracing::info!("another stow daemon holds the lock; exiting");
         notify_ready(ready, &run_dir, Notification::LockHeld).await?;
         return Ok(());
@@ -112,13 +139,21 @@ pub async fn run(ready: Option<PathBuf>, given_dir: Option<PathBuf>) -> Result<(
         );
     }
     let endpoint = run_dir.endpoint();
-    let listener = bind(&endpoint).await?;
+    let listener = listen(
+        &endpoint,
+        #[cfg(unix)]
+        inherited.as_ref().map(|inherited| inherited.listener),
+    )
+    .await?;
+    let settings = blocking(Settings::from_env).await?;
     let daemon = Daemon {
         sessions,
-        settings: blocking(Settings::from_env).await?,
+        settings,
         logs,
         table: SessionTable::start(),
         processes: OsProcesses,
+        retirement: Retirement::new(settings.drain),
+        busy: Busy::default(),
     };
     for outlived in swept.outlived {
         refuse_until_exit(&daemon, outlived);
@@ -129,7 +164,87 @@ pub async fn run(ready: Option<PathBuf>, given_dir: Option<PathBuf>) -> Result<(
         "stow daemon serving"
     );
     notify_ready(ready, &run_dir, Notification::Ready).await?;
-    accept_loop(listener, daemon).await
+    #[cfg(unix)]
+    {
+        let retired = accept_loop(&listener, daemon).await?;
+        tracing::info!(
+            successor = %retired.successor.display(),
+            "drained; replacing this daemon's image with its successor's"
+        );
+        // Only a failed exec returns: the process then exits, which
+        // releases the lock, and the next client starts a daemon.
+        let error = super::retire::exec_into(
+            &retired.successor,
+            run_dir.path(),
+            lock.as_raw_fd(),
+            std::os::fd::AsRawFd::as_raw_fd(&listener),
+        );
+        Err(error).wrap_err_with(|| {
+            format!(
+                "replace the stow daemon with its successor {}",
+                retired.successor.display()
+            )
+        })
+    }
+    #[cfg(windows)]
+    {
+        let retired = accept_loop(listener, daemon).await?;
+        // The pipe is closed with the listener; the lock is released as the
+        // last thing, so the successor the next client starts finds both
+        // free.
+        drop(lock);
+        tracing::info!(
+            successor = %retired.successor.display(),
+            "drained; the pipe and the lock are released for the successor"
+        );
+        Ok(())
+    }
+}
+
+/// The lock of `daemon.lock`: taken without blocking, `None` when another
+/// daemon holds it — or on Unix, when `inherited` names the descriptor of
+/// the lock the daemon that replaced its image with this process's holds,
+/// which is adopted: locking the file again would conflict with it.
+async fn hold_lock(
+    path: PathBuf,
+    #[cfg(unix)] inherited: Option<std::os::fd::RawFd>,
+) -> Result<Option<FileLock>> {
+    #[cfg(unix)]
+    if let Some(fd) = inherited {
+        use std::os::fd::FromRawFd as _;
+        // SAFETY: the daemon that executed this image passed `fd` on its
+        // command line as the open lock file it holds locked, and nothing
+        // else in this process owns it.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let lock = FileLock::inherited(file);
+        super::descriptors::mark_close_on_exec(&[fd]).wrap_err("close the lock on exec")?;
+        return Ok(Some(lock));
+    }
+    blocking(move || take_lock(&path)).await
+}
+
+/// The listener of `endpoint`: bound here, or on Unix adopted from the
+/// descriptor `inherited` names, which the daemon that replaced its image
+/// with this process's kept listening, so the endpoint never stopped
+/// existing.
+async fn listen(
+    endpoint: &Path,
+    #[cfg(unix)] inherited: Option<std::os::fd::RawFd>,
+) -> Result<Listener> {
+    #[cfg(unix)]
+    if let Some(fd) = inherited {
+        use std::os::fd::FromRawFd as _;
+        // SAFETY: the daemon that executed this image passed `fd` on its
+        // command line as its listening socket, and nothing else in this
+        // process owns it.
+        let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+        listener
+            .set_nonblocking(true)
+            .wrap_err("make the inherited listener non-blocking")?;
+        super::descriptors::mark_close_on_exec(&[fd]).wrap_err("close the listener on exec")?;
+        return Listener::from_std(listener).wrap_err("adopt the inherited listener");
+    }
+    bind(endpoint).await
 }
 
 /// Run `work` off the executor: it does file work.
@@ -323,37 +438,60 @@ async fn bind(endpoint: &Path) -> Result<Listener> {
     })
 }
 
+/// Serve until a retirement has drained, and return it. On Unix the
+/// listener is the caller's, which keeps it open: connections that arrive
+/// from here on wait in its backlog for the successor.
+///
+/// A connection holds the daemon busy from the moment it is accepted, so a
+/// drain that ends never leaves one accepted and unanswered.
 #[cfg(unix)]
-async fn accept_loop(listener: Listener, daemon: Daemon<OsProcesses>) -> Result<()> {
+async fn accept_loop(listener: &Listener, daemon: Daemon<OsProcesses>) -> Result<Pending> {
     let mut connections = JoinSet::new();
+    let drained = daemon
+        .retirement
+        .drained(&daemon.busy, daemon.settings.answer);
+    tokio::pin!(drained);
     loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .wrap_err("accept a daemon connection")?;
-        let peer = peer_of(owner::peer_pid(&stream));
-        connections.spawn(serve_connection(stream, peer, daemon.clone()));
-        reap(&mut connections);
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.wrap_err("accept a daemon connection")?;
+                let request = daemon.busy.request();
+                let peer = peer_of(owner::peer_pid(&stream));
+                connections.spawn(serve_connection(stream, peer, daemon.clone(), request));
+                reap(&mut connections);
+            }
+            pending = &mut drained => return Ok(pending),
+        }
     }
 }
 
+/// Serve until a retirement has drained, and return it. The listener and
+/// the connections end with this call, which frees the pipe for the
+/// successor.
 #[cfg(windows)]
-async fn accept_loop(mut listener: Listener, daemon: Daemon<OsProcesses>) -> Result<()> {
+async fn accept_loop(mut listener: Listener, daemon: Daemon<OsProcesses>) -> Result<Pending> {
     let mut connections = JoinSet::new();
+    let drained = daemon
+        .retirement
+        .drained(&daemon.busy, daemon.settings.answer);
+    tokio::pin!(drained);
     loop {
-        listener
-            .server
-            .connect()
-            .await
-            .wrap_err("accept a daemon connection")?;
-        // The next instance exists before the connected one is served, so
-        // the name never has a moment with none to connect to.
-        let next = super::windows::create_server(&listener.name, false)
-            .wrap_err("create the next daemon pipe instance")?;
-        let connected = std::mem::replace(&mut listener.server, next);
-        let peer = peer_of(owner::peer_pid(&connected));
-        connections.spawn(serve_connection(connected, peer, daemon.clone()));
-        reap(&mut connections);
+        tokio::select! {
+            connected = listener.server.connect() => {
+                connected.wrap_err("accept a daemon connection")?;
+                let request = daemon.busy.request();
+                // The next instance exists before the connected one is
+                // served, so the name never has a moment with none to
+                // connect to.
+                let next = super::windows::create_server(&listener.name, false)
+                    .wrap_err("create the next daemon pipe instance")?;
+                let connected = std::mem::replace(&mut listener.server, next);
+                let peer = peer_of(owner::peer_pid(&connected));
+                connections.spawn(serve_connection(connected, peer, daemon.clone(), request));
+                reap(&mut connections);
+            }
+            pending = &mut drained => return Ok(pending),
+        }
     }
 }
 
@@ -378,8 +516,15 @@ fn reap(connections: &mut JoinSet<Result<()>>) {
 
 /// One client: its `Hello`, then what its role asks until it hangs up.
 ///
-/// `peer` is the process that connected, when the platform says.
-async fn serve_connection<S, P>(mut stream: S, peer: Option<u32>, daemon: Daemon<P>) -> Result<()>
+/// `peer` is the process that connected, when the platform says. `request`
+/// holds the daemon busy until the connection's first request has been
+/// answered or handed to the session it belongs to.
+async fn serve_connection<S, P>(
+    mut stream: S,
+    peer: Option<u32>,
+    daemon: Daemon<P>,
+    request: Held,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     P: Processes,
@@ -395,13 +540,13 @@ where
         }
     };
     match hello.role {
-        Role::Control => serve_control(stream, &daemon, at).await,
+        Role::Control => serve_control(stream, &daemon, at, request).await,
         Role::Wrapper {
             session: SessionRef::Id(id),
-        } => serve_wrapper(stream, &daemon, at, id).await,
+        } => serve_wrapper(stream, &daemon, at, id, request).await,
         Role::Wrapper {
             session: SessionRef::Cargo { cargo, rust_log },
-        } => serve_cargo_wrapper(stream, &daemon, at, peer, cargo, rust_log).await,
+        } => serve_cargo_wrapper(stream, &daemon, at, peer, cargo, rust_log, request).await,
     }
 }
 
@@ -482,30 +627,57 @@ async fn reject<S: AsyncWrite + Unpin + Send>(
 
 /// A driver's connection: status requests, until it opens a session and
 /// the connection becomes the session's.
-async fn serve_control<S, P>(mut stream: S, daemon: &Daemon<P>, at: Negotiated) -> Result<()>
+async fn serve_control<S, P>(
+    mut stream: S,
+    daemon: &Daemon<P>,
+    at: Negotiated,
+    request: Held,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     P: Processes,
 {
+    let mut request = Some(request);
     while let Some(frame) = read_frame_async(&mut stream).await? {
         if !at.admits(frame.protocol) {
             return reject(&mut stream, at, foreign_stamp(at, frame.protocol)).await;
         }
         match frame.decode::<ControlRequest>() {
             Ok(ControlRequest::Status) => {
-                write_frame_async(
-                    &mut stream,
-                    at,
-                    &Response::Status {
+                // A status request is a request to open a session as far as
+                // a retiring daemon is concerned: its asker is about to
+                // build.
+                let answer = daemon
+                    .retirement
+                    .reply()
+                    .unwrap_or_else(|| Response::Status {
                         stow_version: env!("CARGO_PKG_VERSION").to_owned(),
                         protocol: PROTOCOL,
                         floor: PROTOCOL_FLOOR,
-                    },
-                )
-                .await?;
+                    });
+                write_frame_async(&mut stream, at, &answer).await?;
+                request = None;
+            }
+            Ok(ControlRequest::Retire { executable }) => {
+                let successor = match successor_of(&executable) {
+                    Ok(successor) => successor,
+                    Err(reason) => return reject(&mut stream, at, reason).await,
+                };
+                daemon.retirement.begin(successor);
+                let retiring = daemon
+                    .retirement
+                    .reply()
+                    .expect("a daemon that began retiring is retiring");
+                write_frame_async(&mut stream, at, &retiring).await?;
+                request = None;
             }
             Ok(ControlRequest::OpenSession(facts)) => {
-                return serve_session(stream, daemon, at, *facts).await;
+                if let Some(retiring) = daemon.retirement.reply() {
+                    return write_frame_async(&mut stream, at, &retiring).await;
+                }
+                let driver = daemon.busy.driver();
+                drop(request.take());
+                return serve_session(stream, daemon, at, *facts, driver).await;
             }
             Ok(ControlRequest::EndSession) => {
                 return reject(
@@ -519,6 +691,19 @@ where
         }
     }
     Ok(())
+}
+
+/// The executable a `Retire` names, which must be a file at an absolute
+/// path: it is executed in place of this daemon.
+fn successor_of(executable: &[u8]) -> std::result::Result<PathBuf, String> {
+    let successor = PathBuf::from(os_bytes::decode(executable)?);
+    if !successor.is_absolute() || !successor.is_file() {
+        return Err(format!(
+            "the successor {} is not an executable file at an absolute path",
+            successor.display()
+        ));
+    }
+    Ok(successor)
 }
 
 /// The events a driver wants back from its session: what its `RUST_LOG`
@@ -550,6 +735,8 @@ async fn serve_session<S, P>(
     daemon: &Daemon<P>,
     at: Negotiated,
     facts: SessionFacts,
+    // Held until the session is gone, so a retirement waits for it.
+    _driver: Held,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -580,7 +767,17 @@ where
     let answered =
         write_frame_async(&mut write, at, &Response::SessionOpened { session: id }).await;
     let driven = match answered {
-        Ok(()) => drive_session(&mut read, &mut write, at, &session, &mut events).await,
+        Ok(()) => {
+            drive_session(
+                &mut read,
+                &mut write,
+                at,
+                &session,
+                &mut events,
+                &daemon.retirement,
+            )
+            .await
+        }
         Err(error) => Err(error),
     };
     // Removed first, so a wrapper arriving from here on is refused rather
@@ -590,6 +787,10 @@ where
         Ok(Driven::Ended) => Ok(()),
         Ok(Driven::DriverGone) => {
             tracing::info!(session = %id, "the driver of a session went away; ending it");
+            session.abort().await
+        }
+        Ok(Driven::Restarted) => {
+            tracing::warn!(session = %id, "the restart cut a session; ending it");
             session.abort().await
         }
         Err(error) => {
@@ -609,6 +810,9 @@ enum Driven {
     Ended,
     /// The connection closed before the driver ended the session.
     DriverGone,
+    /// The daemon's drain bound ran out while the session was open, and the
+    /// driver was told so.
+    Restarted,
 }
 
 /// Forward the session's events to its driver and wait for it to end the
@@ -620,6 +824,7 @@ async fn drive_session<R, W>(
     at: Negotiated,
     session: &Arc<Session>,
     events: &mut mpsc::UnboundedReceiver<Event>,
+    retirement: &Retirement,
 ) -> Result<Driven>
 where
     R: AsyncRead + Unpin + Send,
@@ -701,6 +906,19 @@ where
                     resolution_sent = true;
                     write_frame_async(write, at, &Response::Event(Event::ResolutionDone)).await?;
                 }
+                () = retirement.cut() => {
+                    let successor = retirement
+                        .pending()
+                        .map(|pending| pending.successor.display().to_string())
+                        .unwrap_or_default();
+                    reject(
+                        write,
+                        at,
+                        format!("the stow daemon is restarting onto {successor} and this build's session cannot carry over; run the build again"),
+                    )
+                    .await?;
+                    return Ok(Driven::Restarted);
+                }
             }
         }
     };
@@ -722,6 +940,7 @@ async fn serve_wrapper<S, P>(
     daemon: &Daemon<P>,
     at: Negotiated,
     id: SessionId,
+    request: Held,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -735,6 +954,8 @@ where
         )
         .await;
     };
+    // The session holds the daemon busy from here on.
+    drop(request);
     let span = session.span().clone();
     converse(
         &mut stream,
@@ -890,6 +1111,7 @@ async fn serve_cargo_wrapper<S, P>(
     peer: Option<u32>,
     cargo: Option<Vec<u8>>,
     rust_log: Option<String>,
+    request: Held,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -908,7 +1130,7 @@ where
     };
     // A probe belongs to no build: it needs neither a cargo nor a session.
     if is_probe(&first) {
-        return serve_probe(stream, at, first).await;
+        return serve_probe(stream, at, first, request).await;
     }
     let owner = match owner_of(daemon, peer, cargo).await {
         Ok(owner) => owner,
@@ -928,7 +1150,16 @@ where
         .await;
     }
     if let Some(session) = slot.session() {
+        // The session holds the daemon busy: a build already under way is
+        // served through a retirement.
+        drop(request);
         return converse_returning_events(&mut stream, at, daemon, &session, first, interest).await;
+    }
+    // A cargo with no session is about to open one, which a retiring
+    // daemon leaves to its successor: nothing of the request is acted on,
+    // so the wrapper replays it.
+    if let Some(retiring) = daemon.retirement.reply() {
+        return write_frame_async(&mut stream, at, &retiring).await;
     }
     // Nothing was settled before cargo started: the wrapper says what it
     // runs in, and the request it was holding is answered once the session
@@ -959,6 +1190,7 @@ where
             return reject(&mut stream, at, reason).await;
         }
     };
+    drop(request);
     converse_returning_events(&mut stream, at, daemon, &session, first, interest).await
 }
 
@@ -995,7 +1227,13 @@ fn is_probe(request: &WrapperRequest) -> bool {
 
 /// A probe's conversation: told to run what it asked for, and its report
 /// received. No session is opened or touched.
-async fn serve_probe<S>(mut stream: S, at: Negotiated, first: WrapperRequest) -> Result<()>
+async fn serve_probe<S>(
+    mut stream: S,
+    at: Negotiated,
+    first: WrapperRequest,
+    // Held for the probe's conversation, which a restart would cut.
+    _request: Held,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -1031,6 +1269,9 @@ async fn open_cargo_session<P: Processes>(
     opener: Opener,
     environment: BuildEnvironment,
 ) -> std::result::Result<Arc<Session<Cargo>>, String> {
+    // Held from the opening until the session's end has concluded, so a
+    // retirement waits for the build and for its journal.
+    let held = daemon.busy.cargo();
     let build = open_facts(&opener, &environment, &daemon.table).await?;
     let handles = match &build.config {
         Some(config) => daemon.table.handles_for(config.cache_dir.clone()).await,
@@ -1049,6 +1290,7 @@ async fn open_cargo_session<P: Processes>(
         owner,
         Arc::clone(&session),
         daemon.table.clone(),
+        held,
     ));
     Ok(session)
 }
@@ -1061,6 +1303,7 @@ async fn end_with_cargo(
     owner: CargoOwner,
     session: Arc<Session<Cargo>>,
     table: SessionTable,
+    held: Held,
 ) {
     let span = session.span().clone();
     async move {
@@ -1079,6 +1322,7 @@ async fn end_with_cargo(
             Err(error) => tracing::warn!(%owner, %error, "a cargo's session did not end cleanly"),
         }
         session.conclude().await;
+        drop(held);
     }
     .instrument(span)
     .await;
@@ -1092,7 +1336,10 @@ mod tests {
 
     use tokio::io::{AsyncWriteExt as _, DuplexStream};
 
-    use super::{Daemon, refuse_until_exit, serve_connection, sweep_sessions, working_meanwhile};
+    use super::{
+        Busy, Daemon, Retirement, refuse_until_exit, serve_connection, sweep_sessions,
+        working_meanwhile,
+    };
     use crate::daemon::Settings;
     use crate::daemon::events::SessionLogs;
     use crate::daemon::owner::{CargoOwner, Processes};
@@ -1192,6 +1439,9 @@ mod tests {
         }
     }
 
+    /// The bound a test daemon's drain lasts.
+    const DRAIN: Duration = Duration::from_millis(400);
+
     fn daemon(sessions: &std::path::Path) -> Daemon<Machine> {
         Daemon {
             sessions: sessions.to_owned(),
@@ -1199,10 +1449,13 @@ mod tests {
                 answer: Duration::from_millis(60),
                 start: Duration::from_secs(30),
                 log_bytes: 1 << 20,
+                drain: DRAIN,
             },
             logs: SessionLogs::default(),
             table: SessionTable::start(),
             processes: Machine::default(),
+            retirement: Retirement::new(DRAIN),
+            busy: Busy::default(),
         }
     }
 
@@ -1226,7 +1479,12 @@ mod tests {
         tokio::task::JoinHandle<stow_types::error::Result<()>>,
     ) {
         let (client, daemon_end) = tokio::io::duplex(1 << 20);
-        let task = tokio::spawn(serve_connection(daemon_end, peer, daemon.clone()));
+        let task = tokio::spawn(serve_connection(
+            daemon_end,
+            peer,
+            daemon.clone(),
+            daemon.busy.request(),
+        ));
         (client, task)
     }
 
@@ -1575,6 +1833,231 @@ mod tests {
                 floor: PROTOCOL_FLOOR,
             }
         );
+    }
+
+    /// The bytes of an executable file that exists: this test binary.
+    fn executable() -> Vec<u8> {
+        crate::daemon::session::os_bytes::encode(
+            std::env::current_exe().expect("current exe").as_os_str(),
+        )
+    }
+
+    async fn retire(daemon: &Daemon<Machine>) -> Response {
+        let (mut client, _task) = connect(daemon);
+        send(&mut client, &hello(Role::Control)).await;
+        send(
+            &mut client,
+            &ControlRequest::Retire {
+                executable: executable(),
+            },
+        )
+        .await;
+        receive(&mut client).await
+    }
+
+    #[tokio::test]
+    async fn a_retire_begins_a_retirement_and_is_answered_with_the_time_left() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let daemon = daemon(sessions.path());
+        let Response::Retiring {
+            stow_version,
+            until_millis,
+        } = retire(&daemon).await
+        else {
+            panic!("a retire is answered with Retiring");
+        };
+        assert_eq!(stow_version, env!("CARGO_PKG_VERSION"));
+        assert!(until_millis <= 400, "{until_millis}");
+        assert_eq!(
+            daemon.retirement.pending().expect("retiring").successor,
+            std::path::PathBuf::from(
+                crate::daemon::session::os_bytes::decode(&executable()).expect("decode")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retire_naming_no_executable_file_is_refused() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let daemon = daemon(sessions.path());
+        for executable in [b"relative/stow".to_vec(), b"/no/such/stow".to_vec()] {
+            let (mut client, _task) = connect(&daemon);
+            send(&mut client, &hello(Role::Control)).await;
+            send(&mut client, &ControlRequest::Retire { executable }).await;
+            assert!(
+                matches!(receive(&mut client).await, Response::Rejected { .. }),
+                "a successor must be a file at an absolute path"
+            );
+        }
+        assert!(daemon.retirement.pending().is_none());
+    }
+
+    /// A retiring daemon leaves the opening of sessions to its successor:
+    /// the asker is told, and nothing of its request is acted on.
+    #[tokio::test]
+    async fn a_retiring_daemon_answers_session_opening_requests_with_retiring() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let target = tempfile::tempdir().expect("target");
+        let daemon = daemon(sessions.path());
+        retire(&daemon).await;
+        let (mut status, _task) = connect(&daemon);
+        send(&mut status, &hello(Role::Control)).await;
+        send(&mut status, &ControlRequest::Status).await;
+        assert!(matches!(
+            receive(&mut status).await,
+            Response::Retiring { .. }
+        ));
+        let (mut opener, _task) = connect(&daemon);
+        send(&mut opener, &hello(Role::Control)).await;
+        send(
+            &mut opener,
+            &ControlRequest::OpenSession(Box::new(facts(target.path()).await)),
+        )
+        .await;
+        assert!(matches!(
+            receive(&mut opener).await,
+            Response::Retiring { .. }
+        ));
+        assert_eq!(
+            std::fs::read_dir(sessions.path())
+                .expect("sessions")
+                .count(),
+            0,
+            "no session was opened"
+        );
+    }
+
+    /// A build under way is carried through the drain: its wrappers are
+    /// served, while anything that would open a session is not.
+    #[tokio::test]
+    async fn a_wrapper_of_an_open_session_is_served_through_a_retirement() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let target = tempfile::tempdir().expect("target");
+        let daemon = daemon(sessions.path());
+        let (_control, _task, id) = open(&daemon, target.path()).await;
+        retire(&daemon).await;
+        let planned = plan_in(&daemon, id, &target.path().join("debug").join("deps")).await;
+        assert!(
+            matches!(planned, Response::Answer(Answer::Compile(_))),
+            "{planned:?}"
+        );
+    }
+
+    /// A cargo with no session is told to retry, and one that has a session
+    /// is served.
+    #[tokio::test]
+    async fn a_cargo_with_no_session_retries_and_one_with_a_session_is_served() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let home = tempfile::tempdir().expect("home");
+        let target = tempfile::tempdir().expect("target");
+        let daemon = daemon(sessions.path());
+        let request = unit_request(target.path()).await;
+        let (mut first, _first_task, asked) = wrapper_of(&daemon, 11, 1, &request).await;
+        assert_eq!(asked, Response::Answer(Answer::Describe));
+        send(
+            &mut first,
+            &WrapperRequest::Describe(environment(home.path())),
+        )
+        .await;
+        answer(&mut first).await;
+        retire(&daemon).await;
+        let (_second, _second_task, served) = wrapper_of(&daemon, 12, 1, &request).await;
+        assert!(
+            matches!(served, Response::Answer(Answer::Compile(_))),
+            "the cargo's session is open: {served:?}"
+        );
+        let (_other, _other_task, told) = wrapper_of(&daemon, 21, 2, &request).await;
+        assert!(
+            matches!(told, Response::Retiring { .. }),
+            "another cargo has no session yet: {told:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(sessions.path())
+                .expect("sessions")
+                .count(),
+            1,
+            "no session was opened for it"
+        );
+    }
+
+    /// A probe belongs to no build and is served through a retirement, so
+    /// the build that follows it is not cut.
+    #[tokio::test]
+    async fn a_probe_is_served_through_a_retirement() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let daemon = daemon(sessions.path());
+        retire(&daemon).await;
+        let toolchain = BuildToolchain::for_tests().await;
+        let probe = WrapperRequest::Plan(Plan::new(
+            toolchain.rustc().as_os_str(),
+            &[OsString::from("-vV")],
+            InvocationEnv::for_tests(),
+        ));
+        let (_wrapper, _task, first) = wrapper_of(&daemon, 11, 1, &probe).await;
+        assert!(
+            matches!(first, Response::Answer(Answer::Compile(_))),
+            "{first:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_drain_ends_when_the_last_driver_session_ends() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let target = tempfile::tempdir().expect("target");
+        let daemon = daemon(sessions.path());
+        let (mut control, task, _id) = open(&daemon, target.path()).await;
+        retire(&daemon).await;
+        let began = std::time::Instant::now();
+        let drained = tokio::spawn({
+            let daemon = daemon.clone();
+            async move {
+                daemon
+                    .retirement
+                    .drained(&daemon.busy, daemon.settings.answer)
+                    .await
+            }
+        });
+        send(&mut control, &ControlRequest::EndSession).await;
+        while let Response::Event(_) = receive(&mut control).await {}
+        task.await.expect("join").expect("served");
+        drained.await.expect("the drain");
+        assert!(
+            began.elapsed() < DRAIN,
+            "it ended with the build, not at the bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_driver_session_still_open_at_the_bound_is_cut_naming_the_restart() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let target = tempfile::tempdir().expect("target");
+        let daemon = daemon(sessions.path());
+        let (mut control, task, id) = open(&daemon, target.path()).await;
+        retire(&daemon).await;
+        let drained = tokio::spawn({
+            let daemon = daemon.clone();
+            async move {
+                daemon
+                    .retirement
+                    .drained(&daemon.busy, daemon.settings.answer)
+                    .await
+            }
+        });
+        let refusal = loop {
+            match receive(&mut control).await {
+                Response::Event(_) => {}
+                other => break other,
+            }
+        };
+        let Response::Rejected { reason } = refusal else {
+            panic!("the cut session is refused: {refusal:?}");
+        };
+        assert!(reason.contains("restarting"), "{reason}");
+        task.await.expect("join").expect("served");
+        drained
+            .await
+            .expect("the drain ends once the session is cut");
+        assert!(daemon.table.join(id).await.is_none(), "the session is gone");
     }
 
     #[tokio::test]

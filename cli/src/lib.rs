@@ -165,8 +165,9 @@ pub fn run() -> std::process::ExitCode {
 fn try_run() -> stow_types::error::Result<()> {
     // The daemon drops what it inherited before anything of its own is
     // opened, so this runs first.
-    if daemon::is_serving(&process_args()) {
-        daemon::prepare_process()?;
+    let args = process_args();
+    if daemon::is_serving(&args) {
+        daemon::prepare_process(&args)?;
     }
     if let Some(status) = delegate_to_capture()? {
         std::process::exit(status);

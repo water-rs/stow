@@ -33,8 +33,10 @@
 //! it is how a newer client reaches an older daemon and how an older client
 //! reads a newer daemon's refusal. These encodings never change: the frame
 //! header, the [`HelloCore`] fields of a [`Hello`], [`ControlRequest::Status`]
-//! and [`Response::Status`] and [`Response::Rejected`]. The golden bytes in
-//! the tests pin each.
+//! and [`ControlRequest::Retire`], and [`Response::Status`],
+//! [`Response::Rejected`] and [`Response::Retiring`]. The golden bytes in
+//! the tests pin each, and so does the `stow daemon` command line a daemon
+//! starts its successor with (`cli_args`).
 
 use std::io::Read;
 use std::ops::RangeInclusive;
@@ -231,6 +233,12 @@ impl Hello {
 pub enum ControlRequest {
     /// Report the daemon's version and protocol.
     Status,
+    /// Replace the daemon with `executable`, which an installer just put
+    /// in place: the daemon drains, then starts that binary in its place.
+    Retire {
+        /// The successor's executable, OS-encoded.
+        executable: Vec<u8>,
+    },
     /// Open the session these facts describe. The connection then belongs
     /// to the session: its end ends the session.
     OpenSession(Box<SessionFacts>),
@@ -280,6 +288,15 @@ pub enum Response {
         /// Why.
         reason: String,
     },
+    /// The daemon is giving way to another stow and acted on nothing of
+    /// this request: reconnect, and the request is served by the
+    /// successor.
+    Retiring {
+        /// The version of the daemon that is leaving.
+        stow_version: String,
+        /// The time the daemon has left to drain, in milliseconds.
+        until_millis: u64,
+    },
     /// The session is open; wrappers name it by this id.
     SessionOpened {
         /// The session the daemon minted.
@@ -302,7 +319,10 @@ impl Response {
     /// whatever protocol stamps the frame.
     #[must_use]
     pub const fn is_core(&self) -> bool {
-        matches!(self, Self::Status { .. } | Self::Rejected { .. })
+        matches!(
+            self,
+            Self::Status { .. } | Self::Rejected { .. } | Self::Retiring { .. }
+        )
     }
 }
 
@@ -534,6 +554,19 @@ mod tests {
         );
         assert_eq!(json_of(&ControlRequest::Status), r#"{"request":"Status"}"#);
         assert_eq!(
+            json_of(&ControlRequest::Retire {
+                executable: b"/s".to_vec()
+            }),
+            r#"{"request":"Retire","executable":[47,115]}"#
+        );
+        assert_eq!(
+            json_of(&Response::Retiring {
+                stow_version: "1.2.3".to_owned(),
+                until_millis: 10_000,
+            }),
+            r#"{"response":"Retiring","stow_version":"1.2.3","until_millis":10000}"#
+        );
+        assert_eq!(
             json_of(&Response::Status {
                 stow_version: "1.2.3".to_owned(),
                 protocol: 4,
@@ -645,6 +678,10 @@ mod tests {
         for core in [
             Response::Rejected {
                 reason: "no".to_owned(),
+            },
+            Response::Retiring {
+                stow_version: "9.0.0".to_owned(),
+                until_millis: 1,
             },
             Response::Status {
                 stow_version: "9.0.0".to_owned(),

@@ -432,15 +432,24 @@ impl PrivateDaemon {
         wait_session_ended_in(&self.run_dir, cargo_pid);
     }
 
-    /// The pids of the daemons that bound the endpoint, from their log.
+    /// The pids of the daemons that bound the endpoint, from their log. A
+    /// daemon that replaced its own image keeps its pid and logs the line
+    /// again, so each pid is listed once.
     pub fn serving_pids(&self) -> Vec<u32> {
-        self.log_lines("stow daemon serving")
+        let mut pids: Vec<u32> = Vec::new();
+        for pid in self
+            .log_lines("stow daemon serving")
             .iter()
             .filter_map(|line| {
                 let rest = line.split("pid=").nth(1)?;
                 rest.split_whitespace().next()?.parse().ok()
             })
-            .collect()
+        {
+            if !pids.contains(&pid) {
+                pids.push(pid);
+            }
+        }
+        pids
     }
 
     /// Stop every daemon the log names and wait until they are gone.

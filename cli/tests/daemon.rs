@@ -4,10 +4,11 @@
 //! `STOW_DAEMON_DIR`.
 #![cfg(unix)]
 
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::net::UnixListener;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,6 +17,7 @@ use std::time::Duration;
 
 mod support;
 
+use stow_cli::protocol::{ControlRequest, Hello, Response, Role};
 use support::PrivateDaemon;
 
 /// How long a test waits for something a healthy daemon does at once.
@@ -302,6 +304,179 @@ fn a_daemon_closes_the_descriptors_it_inherited() {
         all_writers_closed(&mut reader),
         "the daemon kept a descriptor it inherited"
     );
+    daemon.kill().expect("stop the daemon this test spawned");
+    daemon.wait().expect("reap it");
+}
+
+/// The executable of the stow under test, as the daemon is started from it.
+fn stow() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_stow-cli"))
+}
+
+/// Say hello to the daemon of `run_dir` as a driver running `exe`, send
+/// `request` and read the answer.
+fn ask(
+    run_dir: &Path,
+    exe: &Path,
+    request: &ControlRequest,
+) -> std::io::Result<stow_cli::protocol::Response> {
+    let mut stream = UnixStream::connect(run_dir.join("daemon.sock"))?;
+    stream.set_read_timeout(Some(BOUND))?;
+    let mut bytes =
+        stow_cli::protocol::encode(&Hello::new(Role::Control, exe)).expect("encode the hello");
+    bytes.extend(stow_cli::protocol::encode(request).expect("encode the request"));
+    stream.write_all(&bytes)?;
+    let frame = stow_cli::protocol::read_frame(&mut stream)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    stow_cli::protocol::read_response(&frame)
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+/// `Retire` onto `exe`.
+fn retire_request(exe: &Path) -> ControlRequest {
+    ControlRequest::Retire {
+        executable: exe.as_os_str().as_bytes().to_vec(),
+    }
+}
+
+/// Wait until `done` holds.
+fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + BOUND;
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Retire the daemon of `fixture` onto the stow under test and wait for
+/// the successor to answer a status request.
+fn retire_and_wait(fixture: &Fixture) {
+    let reply = ask(&fixture.run_dir(), &stow(), &retire_request(&stow())).expect("retire");
+    assert!(
+        matches!(reply, Response::Retiring { .. }),
+        "a retire is answered with Retiring: {reply:?}"
+    );
+    until("the successor never answered", || {
+        matches!(
+            ask(&fixture.run_dir(), &stow(), &ControlRequest::Status),
+            Ok(Response::Status { .. })
+        )
+    });
+}
+
+#[test]
+fn a_retired_daemon_reexecs_keeping_its_pid_lock_and_endpoint() {
+    let fixture = Fixture::new();
+    run_status(&mut fixture.command(&["daemon", "status"]));
+    let socket = fixture.run_dir().join("daemon.sock");
+    let inode = std::fs::metadata(&socket).expect("socket").ino();
+    let [pid] = fixture.serving_pids()[..] else {
+        panic!("one daemon serves: {:?}", fixture.serving_pids());
+    };
+
+    retire_and_wait(&fixture);
+
+    assert_eq!(fixture.serving_pids(), [pid], "the successor has the pid");
+    assert_eq!(
+        fixture.log_lines("stow daemon process started").len(),
+        2,
+        "the image started again"
+    );
+    assert_eq!(
+        std::fs::metadata(&socket).expect("socket").ino(),
+        inode,
+        "the endpoint was never replaced"
+    );
+    // SAFETY: signal 0 only probes.
+    assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "the daemon lives");
+    // The lock is held across the exec: a daemon started meanwhile finds it
+    // held and exits 0.
+    let second = fixture
+        .command(&["daemon"])
+        .output()
+        .expect("run a second daemon");
+    assert!(second.status.success(), "{second:?}");
+    assert_eq!(
+        fixture
+            .log_lines("another stow daemon holds the lock")
+            .len(),
+        1
+    );
+    assert_eq!(fixture.serving_pids(), [pid]);
+}
+
+#[test]
+fn a_connect_during_the_exec_is_answered_by_the_new_image() {
+    const CLIENTS: usize = 8;
+    const ASKS: usize = 40;
+    let fixture = Fixture::new();
+    run_status(&mut fixture.command(&["daemon", "status"]));
+    let run_dir = fixture.run_dir();
+    let reply = ask(&run_dir, &stow(), &retire_request(&stow())).expect("retire");
+    assert!(matches!(reply, Response::Retiring { .. }), "{reply:?}");
+    // Clients that connect from the retirement on are each answered, by the
+    // old image with a request to retry or by the new one with its status;
+    // none sees a connection closed unanswered.
+    #[expect(
+        clippy::needless_collect,
+        reason = "every client runs before the first is joined"
+    )]
+    let clients: Vec<_> = (0..CLIENTS)
+        .map(|_| {
+            let run_dir = run_dir.clone();
+            std::thread::spawn(move || {
+                (0..ASKS)
+                    .map(|_| {
+                        ask(&run_dir, &stow(), &ControlRequest::Status)
+                            .expect("every connection is answered")
+                    })
+                    .filter(|reply| matches!(reply, Response::Status { .. }))
+                    .count()
+            })
+        })
+        .collect();
+    let answered: usize = clients
+        .into_iter()
+        .map(|client| client.join().expect("a client"))
+        .sum();
+    assert!(answered > 0, "the new image answered");
+    assert_eq!(fixture.log_lines("stow daemon process started").len(), 2);
+}
+
+#[test]
+fn a_reexeced_daemon_holds_only_its_own_descriptors() {
+    let fixture = Fixture::new();
+    let (mut reader, writer) = std::io::pipe().expect("pipe");
+    let endpoint = fixture.dir.path().join("ready.sock");
+    let listener = UnixListener::bind(&endpoint).expect("bind notify endpoint");
+    let mut command = fixture.command(&["daemon", "--ready", endpoint.to_str().expect("utf8")]);
+    inherit(&mut command, writer.as_raw_fd());
+    let mut daemon = command.spawn().expect("spawn daemon");
+    drop(writer);
+    let (mut stream, _) = listener.accept().expect("accept");
+    let mut line = String::new();
+    stream.read_to_string(&mut line).expect("read");
+    assert_eq!(line, "ready\n");
+
+    retire_and_wait(&fixture);
+
+    assert!(
+        all_writers_closed(&mut reader),
+        "the daemon kept a descriptor it inherited"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let pid = daemon.id();
+        let held_by_name = |name: &str| {
+            std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .expect("list the descriptors")
+                .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                .filter(|target| target.file_name().is_some_and(|file| file == name))
+                .count()
+        };
+        assert_eq!(held_by_name("daemon.log"), 1, "one descriptor of the log");
+        assert_eq!(held_by_name("daemon.lock"), 1, "one descriptor of the lock");
+    }
     daemon.kill().expect("stop the daemon this test spawned");
     daemon.wait().expect("reap it");
 }

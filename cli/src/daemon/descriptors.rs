@@ -52,6 +52,17 @@ pub fn mark_close_on_exec(fds: &[RawFd]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Let each descriptor survive the next `exec`.
+pub fn clear_close_on_exec(fds: &[RawFd]) -> std::io::Result<()> {
+    for &fd in fds {
+        // SAFETY: `fcntl` with `F_SETFD` reads no memory.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Close each descriptor.
 pub fn close(fds: &[RawFd]) {
     for &fd in fds {

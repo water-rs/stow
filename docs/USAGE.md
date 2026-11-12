@@ -332,6 +332,15 @@ authority over the user's cache and the target directories of its builds.
 The output directories a session accepts are derived from the first unit
 of the build; they are not a security boundary.
 
+The daemon outlives the stow that started it, so a newer stow replaces it.
+`stow daemon` retires on request: it keeps serving the builds it holds
+(its wrappers and its probes) for up to `STOW_DAEMON_DRAIN_SECS`, answers
+anything that would open a session with a request to retry, and then
+replaces itself with the successor. On Unix the replacement keeps the
+process id, the lock and the listening socket, so connections made during
+it wait in the socket's backlog for the successor. A driver's build still
+open when the bound ends fails, and the message names the restart.
+
 A daemon that restarts while a cargo is building leaves that build without
 the session's in-flight state and its record of locally built crates. The
 new daemon refuses that cargo's wrappers until it exits, so the build fails

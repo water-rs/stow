@@ -44,6 +44,24 @@ impl FileLock {
         }
     }
 
+    /// The lock `file` already holds, which the process that locked it
+    /// passed through an `exec` with the descriptor. Nothing is locked: a
+    /// second lock on a new open file description would conflict with the
+    /// first.
+    #[cfg(unix)]
+    #[must_use]
+    pub const fn inherited(file: File) -> Self {
+        Self::held(file)
+    }
+
+    /// The descriptor of the locked file, for a holder that passes the lock
+    /// through an `exec`.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.file)
+    }
+
     const fn held(file: File) -> Self {
         Self {
             file,

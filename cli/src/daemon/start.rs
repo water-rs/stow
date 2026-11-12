@@ -439,6 +439,7 @@ fn spawn_daemon(exe: &Path, run_dir: &RunDir, notify: &Path) -> Result<detached:
         .chain([
             super::STOW_DAEMON_LOG_BYTES_ENV,
             super::STOW_DAEMON_ANSWER_SECS_ENV,
+            super::STOW_DAEMON_DRAIN_SECS_ENV,
         ])
         .filter_map(|key| std::env::var_os(key).map(|value| (OsString::from(key), value)));
     Detached::new(exe)

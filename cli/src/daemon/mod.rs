@@ -41,6 +41,7 @@ mod notify;
 pub mod owner;
 pub mod protocol;
 pub mod relay;
+mod retire;
 #[cfg(windows)]
 pub mod scheduled_task;
 mod serve;
@@ -69,6 +70,16 @@ const DEFAULT_ANSWER_SECS: u64 = 10;
 /// under a second normally. Thirty seconds covers the same binary paged in
 /// from a cold disk on a host whose cores cargo's jobs already saturate.
 const DEFAULT_START_SECS: u64 = 30;
+/// A retiring daemon waits this long for the builds it holds before it
+/// cuts them. A build that asks for a session meanwhile waits out the same
+/// time, then the start bound for the successor, so the bound is the most
+/// an upgrade adds to that build; a build already running is cut if it is
+/// still running when the bound ends. It is the answer bound: a live peer
+/// answers within it, so nothing waits longer than it takes to know the
+/// peer is wedged.
+const DEFAULT_DRAIN_SECS: u64 = DEFAULT_ANSWER_SECS;
+/// How long a retiring daemon waits for the builds it holds, in seconds.
+const STOW_DAEMON_DRAIN_SECS_ENV: &str = "STOW_DAEMON_DRAIN_SECS";
 /// A daemon logs a few lines per start and per refused connection, so
 /// 8 MiB is weeks of history; with the one predecessor the log is bounded
 /// at 16 MiB, small beside the cache the daemon sits next to.
@@ -89,6 +100,8 @@ pub struct Settings {
     pub start: Duration,
     /// The size at which the daemon rotates its log.
     pub log_bytes: u64,
+    /// How long a retiring daemon waits for the builds it holds.
+    pub drain: Duration,
 }
 
 impl Settings {
@@ -120,6 +133,7 @@ impl Settings {
             )?),
             start: Duration::from_secs(positive(STOW_DAEMON_START_SECS_ENV, DEFAULT_START_SECS)?),
             log_bytes: positive(STOW_DAEMON_LOG_BYTES_ENV, DEFAULT_LOG_BYTES)?,
+            drain: Duration::from_secs(positive(STOW_DAEMON_DRAIN_SECS_ENV, DEFAULT_DRAIN_SECS)?),
         })
     }
 }
@@ -337,18 +351,25 @@ pub fn is_serving(args: &[OsString]) -> bool {
 }
 
 /// Make this process the daemon's: close every inherited descriptor above
-/// stderr and make everything it creates owner-only (Unix), or give up the
-/// console the Task Scheduler gave it (Windows). Called before
+/// stderr except the lock and the socket a daemon it replaces passed on
+/// (`args` names them), and make everything it creates owner-only (Unix), or
+/// give up the console the Task Scheduler gave it (Windows). Called before
 /// anything else in the process opens a descriptor.
 ///
 /// # Errors
 ///
 /// The open descriptors cannot be enumerated.
-pub fn prepare_process() -> Result<()> {
+#[cfg_attr(
+    windows,
+    expect(unused_variables, reason = "a Windows daemon inherits nothing")
+)]
+pub fn prepare_process(args: &[OsString]) -> Result<()> {
     #[cfg(unix)]
     {
-        let inherited = descriptors::open_from(descriptors::FIRST_INHERITED)
+        let kept = inherited_descriptors(args);
+        let mut inherited = descriptors::open_from(descriptors::FIRST_INHERITED)
             .wrap_err("list the inherited descriptors")?;
+        inherited.retain(|fd| !kept.contains(fd));
         descriptors::close(&inherited);
         // SAFETY: `umask` has no preconditions and cannot fail.
         unsafe { libc::umask(0o077) };
@@ -365,6 +386,20 @@ pub fn prepare_process() -> Result<()> {
     Ok(())
 }
 
+/// The descriptors `args`, the command line of a daemon, say a daemon it
+/// replaces passed on: the process has not parsed its arguments yet when it
+/// closes what it inherited.
+#[cfg(unix)]
+fn inherited_descriptors(args: &[OsString]) -> Vec<std::os::fd::RawFd> {
+    args.windows(2)
+        .filter(|pair| {
+            pair[0] == crate::cli_args::INHERIT_LOCK_FLAG
+                || pair[0] == crate::cli_args::INHERIT_LISTENER_FLAG
+        })
+        .filter_map(|pair| pair[1].to_str()?.parse().ok())
+        .collect()
+}
+
 /// `stow daemon`: serve, or with `status` report the running daemon.
 ///
 /// # Errors
@@ -374,7 +409,20 @@ pub fn prepare_process() -> Result<()> {
 pub async fn run(args: DaemonArgs) -> Result<()> {
     match args.command {
         Some(DaemonCommand::Status) => status().await,
-        None => serve::run(args.ready, args.run_dir).await,
+        None => {
+            #[cfg(unix)]
+            let inherited = args
+                .inherit_lock
+                .zip(args.inherit_listener)
+                .map(|(lock, listener)| serve::Inherited { lock, listener });
+            serve::run(
+                args.ready,
+                args.run_dir,
+                #[cfg(unix)]
+                inherited,
+            )
+            .await
+        }
     }
 }
 
@@ -417,6 +465,10 @@ mod tests {
         assert_eq!(defaults.answer, Duration::from_secs(10));
         assert_eq!(defaults.start, Duration::from_secs(30));
         assert_eq!(defaults.log_bytes, 8 * 1024 * 1024);
+        assert_eq!(defaults.drain, Duration::from_secs(10));
+        let drained =
+            Settings::from_lookup(lookup(&[("STOW_DAEMON_DRAIN_SECS", "3")])).expect("drained");
+        assert_eq!(drained.drain, Duration::from_secs(3));
         let sized =
             Settings::from_lookup(lookup(&[("STOW_DAEMON_LOG_BYTES", "4096")])).expect("sized");
         assert_eq!(sized.log_bytes, 4096);
@@ -434,6 +486,7 @@ mod tests {
         for bad in ["0", "soon", "-1", ""] {
             assert!(
                 Settings::from_lookup(lookup(&[("STOW_DAEMON_START_SECS", bad)])).is_err()
+                    && Settings::from_lookup(lookup(&[("STOW_DAEMON_DRAIN_SECS", bad)])).is_err()
                     && Settings::from_lookup(lookup(&[("STOW_DAEMON_LOG_BYTES", bad)])).is_err(),
                 "`{bad}` must be refused"
             );
@@ -474,6 +527,31 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).expect("chmod");
         let error = RunDir::prepare(path).expect_err("group access is refused");
         assert!(error.to_string().contains("owner"), "{error}");
+    }
+
+    /// The descriptors a replaced daemon passed on survive the close of
+    /// everything a process inherited.
+    #[cfg(unix)]
+    #[test]
+    fn the_descriptors_a_daemon_passed_on_are_the_ones_named_on_its_command_line() {
+        let args = |parts: &[&str]| parts.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            super::inherited_descriptors(&args(&[
+                "stow",
+                "daemon",
+                "--run-dir",
+                "/run",
+                "--inherit-lock",
+                "7",
+                "--inherit-listener",
+                "9",
+            ])),
+            [7, 9]
+        );
+        assert_eq!(
+            super::inherited_descriptors(&args(&["stow", "daemon"])),
+            Vec::<i32>::new()
+        );
     }
 
     #[test]
