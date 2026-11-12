@@ -14,7 +14,11 @@
 //!   no runtime, no configuration — because the clients it serves run
 //!   hundreds of times per build.
 //! * [`launch_agent`] is the macOS login trigger `stow setup` installs.
-//!   Nothing else touches the service manager.
+//!   Nothing else touches launchd.
+//! * [`scheduled_task`] is the Windows counterpart: the per-user task `stow
+//!   setup` registers, which is both the login trigger and the only way
+//!   the start path starts the daemon, because a process started from a
+//!   cargo build stays inside cargo's job object and ends with it.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -37,6 +41,8 @@ mod notify;
 pub mod owner;
 pub mod protocol;
 pub mod relay;
+#[cfg(windows)]
+pub mod scheduled_task;
 mod serve;
 pub mod session;
 mod start;
@@ -133,6 +139,19 @@ impl RunDir {
     /// directory.
     pub fn locate() -> Result<PathBuf> {
         Self::locate_with(std::env::var_os(STOW_DAEMON_DIR_ENV), dirs::cache_dir())
+    }
+
+    /// The directory a daemon was told to use (`stow daemon --run-dir`),
+    /// else [`RunDir::locate`]. A daemon the Task Scheduler starts has none
+    /// of its starter's environment, so the task names the directory.
+    ///
+    /// # Errors
+    ///
+    /// As [`RunDir::locate`]; the given directory must be absolute.
+    pub fn locate_given(given: Option<PathBuf>) -> Result<PathBuf> {
+        given.map_or_else(Self::locate, |path| {
+            Self::locate_with(Some(path.into_os_string()), None)
+        })
     }
 
     fn locate_with(over: Option<OsString>, cache_dir: Option<PathBuf>) -> Result<PathBuf> {
@@ -275,11 +294,20 @@ impl RunDir {
         }
         #[cfg(windows)]
         {
-            let digest = blake3::hash(self.0.as_os_str().as_encoded_bytes()).to_hex();
-            // Thirty-two hex digits are 128 bits: distinct directories
-            // never share a pipe.
-            PathBuf::from(format!(r"\\.\pipe\stow-daemon-{}", &digest[..32]))
+            PathBuf::from(format!(r"\\.\pipe\{}", Self::identity(&self.0)))
         }
+    }
+
+    /// What names one runtime directory machine-wide: the pipe of the
+    /// daemon that serves it and the Task Scheduler task that starts that
+    /// daemon are both called this.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn identity(path: &Path) -> String {
+        let digest = blake3::hash(path.as_os_str().as_encoded_bytes()).to_hex();
+        // Thirty-two hex digits are 128 bits: distinct directories never
+        // share a name.
+        format!("stow-daemon-{}", &digest[..32])
     }
 
     /// Where a starting client listens for the daemon's readiness
@@ -287,6 +315,16 @@ impl RunDir {
     #[cfg(unix)]
     fn notify_endpoint(&self) -> PathBuf {
         self.0.join("ready.sock")
+    }
+
+    /// The file a starting client publishes its readiness address in, for a
+    /// daemon the Task Scheduler starts: the task's command line is fixed
+    /// when `stow setup` registers it, so it cannot carry the address of
+    /// the client that asks for the run. Only the holder of `start.lock`
+    /// writes it.
+    #[cfg(windows)]
+    fn notify_address_file(&self) -> PathBuf {
+        self.0.join("ready.addr")
     }
 }
 
@@ -299,7 +337,8 @@ pub fn is_serving(args: &[OsString]) -> bool {
 }
 
 /// Make this process the daemon's: close every inherited descriptor above
-/// stderr and make everything it creates owner-only (Unix). Called before
+/// stderr and make everything it creates owner-only (Unix), or give up the
+/// console the Task Scheduler gave it (Windows). Called before
 /// anything else in the process opens a descriptor.
 ///
 /// # Errors
@@ -314,6 +353,15 @@ pub fn prepare_process() -> Result<()> {
         // SAFETY: `umask` has no preconditions and cannot fail.
         unsafe { libc::umask(0o077) };
     }
+    #[cfg(windows)]
+    {
+        // The Task Scheduler starts a console program with a console
+        // window of its own, which would stay open for as long as the
+        // daemon runs. Freeing the console closes it; the call fails only
+        // when there is no console, which is what is wanted.
+        // SAFETY: `FreeConsole` has no preconditions.
+        let _ = unsafe { windows_sys::Win32::System::Console::FreeConsole() };
+    }
     Ok(())
 }
 
@@ -326,7 +374,7 @@ pub fn prepare_process() -> Result<()> {
 pub async fn run(args: DaemonArgs) -> Result<()> {
     match args.command {
         Some(DaemonCommand::Status) => status().await,
-        None => serve::run(args.ready).await,
+        None => serve::run(args.ready, args.run_dir).await,
     }
 }
 

@@ -3,8 +3,8 @@
 //! It takes `daemon.lock` without blocking, so a second daemon — one the
 //! login trigger started beside a client's, say — finds the lock held and
 //! exits 0. The holder removes a stale endpoint, binds its own, reports
-//! readiness to the client that spawned it (`--ready <endpoint>`) and
-//! serves. The lock is a file lock, so a dead daemon releases it and no
+//! readiness to the client that started it (`--ready <endpoint>`, or on
+//! Windows the address that client published) and serves. The lock is a file lock, so a dead daemon releases it and no
 //! pid file is needed.
 //!
 //! A connection says what it is in its `Hello`. A *control* connection
@@ -70,12 +70,12 @@ struct Daemon<P> {
 
 /// Run the daemon until it fails. Returns `Ok` only when another daemon
 /// already holds the lock.
-pub async fn run(ready: Option<PathBuf>) -> Result<()> {
+pub async fn run(ready: Option<PathBuf>, given_dir: Option<PathBuf>) -> Result<()> {
     let logs = SessionLogs::default();
     let run_dir = blocking({
         let logs = logs.clone();
         move || {
-            let run_dir = RunDir::prepare(RunDir::locate()?)?;
+            let run_dir = RunDir::prepare(RunDir::locate_given(given_dir)?)?;
             install_logging(&run_dir, &logs)?;
             Ok(run_dir)
         }
@@ -90,7 +90,7 @@ pub async fn run(ready: Option<PathBuf>) -> Result<()> {
     let lock_path = run_dir.daemon_lock();
     let Some(_lock) = blocking(move || take_lock(&lock_path)).await? else {
         tracing::info!("another stow daemon holds the lock; exiting");
-        notify_ready(ready, Notification::LockHeld).await?;
+        notify_ready(ready, &run_dir, Notification::LockHeld).await?;
         return Ok(());
     };
     // The lock is held, so no process of a previous daemon is alive: every
@@ -127,7 +127,7 @@ pub async fn run(ready: Option<PathBuf>) -> Result<()> {
         endpoint = %endpoint.display(),
         "stow daemon serving"
     );
-    notify_ready(ready, Notification::Ready).await?;
+    notify_ready(ready, &run_dir, Notification::Ready).await?;
     accept_loop(listener, daemon).await
 }
 
@@ -220,11 +220,36 @@ fn refuse_until_exit<P: Processes>(daemon: &Daemon<P>, outlived: Outlived) {
 
 /// Send the client that spawned this daemon its notification, when it
 /// asked for one.
-async fn notify_ready(ready: Option<PathBuf>, notification: Notification) -> Result<()> {
-    let Some(endpoint) = ready else {
-        return Ok(());
-    };
-    blocking(move || notify::send(&endpoint, notification)).await
+///
+/// A client that spawned the daemon names its endpoint on the command line.
+/// On Windows the Task Scheduler starts the daemon, so the endpoint is the
+/// one the client published in the run directory before it asked for the
+/// run, if it did: the login trigger starts a daemon nobody waits for, and
+/// a client that gave up leaves its address behind, so a failed
+/// notification there is logged, not fatal.
+async fn notify_ready(
+    ready: Option<PathBuf>,
+    run_dir: &RunDir,
+    notification: Notification,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = run_dir;
+        let Some(endpoint) = ready else {
+            return Ok(());
+        };
+        blocking(move || notify::send(&endpoint, notification)).await
+    }
+    #[cfg(windows)]
+    {
+        let Some(endpoint) = ready.or_else(|| notify::published_address(run_dir)) else {
+            return Ok(());
+        };
+        if let Err(error) = blocking(move || notify::send(&endpoint, notification)).await {
+            tracing::warn!(%error, "no client took the daemon's notification");
+        }
+        Ok(())
+    }
 }
 
 /// The daemon writes its own log in the runtime directory: its stderr is
@@ -582,6 +607,14 @@ where
                             }
                             write_frame_async(write, &Response::SessionEnded(end)).await?;
                             tracing::info!(session = %id, "ended a session");
+                            // A driver on Windows may run inside the job
+                            // object of a cargo (`cargo stow`) that ends
+                            // with every process it holds, a drain the
+                            // driver started included: the daemon, which no
+                            // cargo holds, starts it, after the driver has
+                            // released its foreground hold.
+                            #[cfg(windows)]
+                            session.conclude().await;
                             return Ok(Driven::Ended);
                         }
                         Ok(other) => {

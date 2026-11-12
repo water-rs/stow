@@ -4030,6 +4030,13 @@ async fn finish_cargo_run(
     // Cargo has exited, so every wrapper has, and the relay's connections
     // close with the sandbox.
     drop(cargo_run);
+    // On Windows the daemon starts the drain once it has ended the session
+    // (`Session::conclude`): this process may run inside the job object of
+    // a cargo (`cargo stow`) that ends with every process it holds, a drain
+    // started here included. The drain must find the gate open, so the
+    // hold is given up before the session ends.
+    #[cfg(windows)]
+    plan.project.foreground.release();
     // The session drains the last connections' post-compile bookkeeping
     // and writes the miss journal as it ends — the build's compile
     // observations are its miss list (stow#317), a failed build's units
@@ -4042,6 +4049,7 @@ async fn finish_cargo_run(
         plan.project.foreground.release();
         // Misses, admissions and the usage report exist only to reach the
         // network; the local-only and off cache modes keep none of them.
+        #[cfg(not(windows))]
         if config.cache.reaches_network() {
             admit_build_misses(plan, config).await;
         }
@@ -4062,6 +4070,7 @@ async fn finish_cargo_run(
 /// A detached drain posts the build's miss admission — the command returns
 /// as soon as cargo does. The caller has given up the foreground hold
 /// first: the drain this build spawns must find the gate open (stow#667).
+#[cfg(not(windows))]
 async fn admit_build_misses(plan: &CargoRunPlan<'_>, config: &StowConfig) {
     // The day's usage report posts from the detached drain — never on the
     // build's wall clock — so a due report is a reason to spawn that drain

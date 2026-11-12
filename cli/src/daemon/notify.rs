@@ -1,13 +1,16 @@
 //! The readiness notification: how a daemon a client just spawned tells
 //! that client it is serving, or that another daemon already is.
 //!
-//! The client binds the notification endpoint before it spawns the
-//! daemon and hands the daemon its address (`--ready <endpoint>`); the
-//! daemon connects and writes one line. The endpoint is a Unix socket in
-//! the runtime directory, and on Windows, where std has no named-pipe
-//! server, a loopback TCP port: it only carries the one line, and a forged
-//! `ready` costs the client a failed connect to the real endpoint, whose
-//! access is restricted.
+//! The client binds the notification endpoint before it starts the
+//! daemon; the daemon connects and writes one line. On Unix the client
+//! spawns the daemon and hands it the address (`--ready <endpoint>`), a
+//! Unix socket in the runtime directory. On Windows the Task Scheduler
+//! starts the daemon from a command line fixed at registration, so the
+//! client publishes the address of its endpoint, a loopback TCP port (std
+//! has no named-pipe server), in `ready.addr` in the runtime directory and
+//! the daemon reads it when it reports. The endpoint only carries the one
+//! line, and a forged `ready` costs the client a failed connect to the
+//! real endpoint, whose access is restricted.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -22,7 +25,6 @@ use std::os::unix::net::{UnixListener as Listener, UnixStream as Stream};
 #[cfg(windows)]
 use std::net::{TcpListener as Listener, TcpStream as Stream};
 
-#[cfg(unix)]
 use super::RunDir;
 
 /// How often a waiting client looks at its child between notifications. A
@@ -65,6 +67,9 @@ impl Notification {
 pub struct ReadyListener {
     listener: Listener,
     endpoint: PathBuf,
+    /// The file the address is published in.
+    #[cfg(windows)]
+    published: PathBuf,
 }
 
 impl ReadyListener {
@@ -91,13 +96,16 @@ impl ReadyListener {
         Ok(Self { listener, endpoint })
     }
 
-    /// Bind the notification endpoint on a loopback port.
+    /// Bind the notification endpoint on a loopback port and publish its
+    /// address in the run directory, where the daemon the Task Scheduler
+    /// starts looks for it. The caller holds `start.lock`, so any address
+    /// already published is a dead client's.
     ///
     /// # Errors
     ///
-    /// The endpoint cannot be bound.
+    /// The endpoint cannot be bound or its address cannot be written.
     #[cfg(windows)]
-    pub fn bind() -> Result<Self> {
+    pub fn bind(run_dir: &RunDir) -> Result<Self> {
         let listener =
             Listener::bind(("127.0.0.1", 0)).wrap_err("bind the daemon readiness endpoint")?;
         let endpoint = PathBuf::from(
@@ -106,10 +114,18 @@ impl ReadyListener {
                 .wrap_err("read the daemon readiness endpoint")?
                 .to_string(),
         );
-        Ok(Self { listener, endpoint })
+        let file = run_dir.notify_address_file();
+        std::fs::write(&file, endpoint.as_os_str().as_encoded_bytes())
+            .wrap_err_with(|| format!("publish the readiness address in {}", file.display()))?;
+        Ok(Self {
+            listener,
+            endpoint,
+            published: file,
+        })
     }
 
     /// The address the daemon is told to notify.
+    #[cfg(unix)]
     #[must_use]
     pub fn endpoint(&self) -> &Path {
         &self.endpoint
@@ -127,7 +143,12 @@ impl ReadyListener {
         bound: Duration,
         mut alive: impl FnMut() -> Result<()>,
     ) -> Result<Notification> {
-        let Self { listener, endpoint } = self;
+        let Self {
+            listener,
+            endpoint,
+            #[cfg(windows)]
+            published,
+        } = self;
         let (sender, receiver) = mpsc::channel();
         // `accept` cannot be given a deadline through std, so it runs on
         // a thread of its own. It is not joined: its one read is of a
@@ -172,6 +193,10 @@ impl ReadyListener {
         drop(connect(&endpoint));
         #[cfg(unix)]
         let _ = std::fs::remove_file(&endpoint);
+        // The address is no one's once the wait is over: a daemon the
+        // scheduler starts later must not find a dead client's.
+        #[cfg(windows)]
+        let _ = std::fs::remove_file(&published);
         outcome
     }
 }
@@ -196,6 +221,14 @@ fn connect(endpoint: &Path) -> std::io::Result<Stream> {
     {
         Stream::connect(endpoint.to_string_lossy().as_ref())
     }
+}
+
+/// The address a waiting client published for the daemon the Task Scheduler
+/// started, if one did.
+#[cfg(windows)]
+pub fn published_address(run_dir: &RunDir) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(run_dir.notify_address_file()).ok()?;
+    Some(PathBuf::from(text.trim()))
 }
 
 /// The daemon's end: report `notification` to the client that spawned it.

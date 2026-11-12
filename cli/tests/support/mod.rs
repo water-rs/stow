@@ -343,6 +343,11 @@ fn log_lines_in(run_dir: &Path, needle: &str) -> Vec<String> {
 /// ([`sealed_home_env`] points `STOW_DAEMON_DIR` there): found by the pids
 /// its own log names, and stopped when this drops, so a test never leaves
 /// a daemon behind and never touches one it did not start.
+///
+/// On Windows a build starts the daemon only through the Task Scheduler,
+/// so [`PrivateDaemon::in_home`] registers the task of the private run
+/// directory, as `stow setup` does for the user's, and dropping it deletes
+/// the task.
 #[allow(
     dead_code,
     reason = "each test crate compiles this module whole; only some call it"
@@ -361,11 +366,26 @@ impl PrivateDaemon {
         home.join("run")
     }
 
-    /// The daemon of a child whose home is `home`.
+    /// The daemon of a child whose home is `home`; on Windows, with the
+    /// task that starts it registered.
+    ///
+    /// # Panics
+    ///
+    /// On Windows, when the task cannot be registered.
     pub fn in_home(home: &Path) -> Self {
-        Self {
-            run_dir: Self::run_dir_of(home),
-        }
+        let daemon = Self::at(Self::run_dir_of(home));
+        #[cfg(windows)]
+        stow_cli::scheduled_task::register(
+            daemon.run_dir(),
+            Path::new(env!("CARGO_BIN_EXE_stow-cli")),
+        )
+        .unwrap_or_else(|error| panic!("register the daemon's scheduled task: {error}"));
+        daemon
+    }
+
+    /// The daemon that would run in `run_dir`, with nothing registered.
+    const fn at(run_dir: PathBuf) -> Self {
+        Self { run_dir }
     }
 
     pub fn run_dir(&self) -> &Path {
@@ -419,6 +439,13 @@ impl PrivateDaemon {
 impl Drop for PrivateDaemon {
     fn drop(&mut self) {
         self.stop();
+        // A run directory that was never prepared has no task. A failure
+        // to delete one is not a test's failure, and a panic here would
+        // mask the failure that is.
+        #[cfg(windows)]
+        if self.run_dir.exists() {
+            let _ = stow_cli::scheduled_task::unregister(&self.run_dir);
+        }
     }
 }
 
@@ -493,7 +520,7 @@ impl Drop for TempDir {
             }
         }
         for home in homes {
-            drop(PrivateDaemon::in_home(&home));
+            drop(PrivateDaemon::at(PrivateDaemon::run_dir_of(&home)));
         }
     }
 }

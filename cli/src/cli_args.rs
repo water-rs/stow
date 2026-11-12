@@ -53,6 +53,12 @@ pub struct DaemonArgs {
     /// this daemon learns it is serving. Internal to the start path.
     #[arg(long, value_name = "ENDPOINT", hide = true)]
     pub ready: Option<PathBuf>,
+    /// The runtime directory to serve, instead of `STOW_DAEMON_DIR` or the
+    /// default. The Windows scheduled task names it, because a daemon the
+    /// Task Scheduler starts has none of its starter's environment.
+    /// Internal to the scheduled task.
+    #[arg(long, value_name = "DIR", hide = true)]
+    pub run_dir: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Option<DaemonCommand>,
 }
@@ -405,6 +411,14 @@ mod tests {
         };
         assert_eq!(args.ready, Some(PathBuf::from("/run/ready.sock")));
         assert!(args.command.is_none());
+
+        let cli = Cli::try_parse_from(["stow", "daemon", "--run-dir", "/run/stow"])
+            .expect("parse daemon command with a run directory");
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        assert_eq!(args.run_dir, Some(PathBuf::from("/run/stow")));
+        assert!(args.ready.is_none());
 
         let cli = Cli::try_parse_from(["stow", "daemon", "status"]).expect("parse status");
         let Command::Daemon(args) = cli.command else {

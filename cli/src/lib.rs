@@ -85,6 +85,11 @@ pub use daemon::client::STOW_SESSION_ENV;
 /// standing in for the real one in integration tests — uses the product's
 /// own types instead of reimplementing the format.
 pub use daemon::protocol;
+/// The Windows task that starts the daemon, so a test registers and removes
+/// the task of its private runtime directory through the product's own
+/// definition.
+#[cfg(windows)]
+pub use daemon::scheduled_task;
 pub use daemon::session::SessionId;
 /// What a wrapper says and the daemon answers about one invocation.
 pub use daemon::wrapper as wrapper_protocol;

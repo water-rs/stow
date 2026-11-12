@@ -375,68 +375,107 @@ fn main() {
     );
 }
 
-/// A cargo killed under its build script ends its session at once, and the
-/// script it left behind runs on: the session follows the cargo, not the
-/// processes cargo started.
-#[test]
-fn a_killed_cargo_ends_its_session_while_its_build_script_lives() {
-    let dir = support::tempdir().expect("temp dir");
-    let cache = support::tempdir().expect("cache dir");
-    let cargo_home = support::tempdir().expect("cargo home");
-    let tools = support::tempdir().expect("tools dir");
-    let rendezvous = support::tempdir().expect("rendezvous");
-    write_crate(dir.path());
-    std::fs::write(
-        dir.path().join("build.rs"),
-        include_str!("fixtures/rendezvous_build.rs"),
-    )
-    .expect("write the build script");
-    support::write_global_config(
-        &[&dir.path().join("stow-home")],
-        "[cache]\nremote = false\n",
-    );
-    let shim = install_shims(tools.path());
-    let daemon = PrivateDaemon::in_home(&dir.path().join("stow-home"));
+/// A plain build held in its build script: cargo has started the wrapper
+/// that started the daemon, and the script waits on the test's rendezvous
+/// directory.
+struct ScriptBuild {
+    /// Stops the daemon first, while its log still exists.
+    daemon: PrivateDaemon,
+    cargo: std::process::Child,
+    cargo_pid: u32,
+    home: PathBuf,
+    rendezvous: support::TempDir,
+    /// Kept for as long as the build runs.
+    _dirs: [support::TempDir; 4],
+}
 
-    let mut cargo = cargo_build_command(
-        dir.path(),
-        cargo_home.path(),
-        Some(&shim),
-        cache.path(),
-        &dir.path().join("target"),
-    )
-    .env("STOW_TEST_RENDEZVOUS", rendezvous.path())
-    .env("STOW_TEST_BUILD_NAME", "held")
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .spawn()
-    .expect("start cargo");
-    let cargo_pid = cargo.id();
+impl ScriptBuild {
+    /// Start `cargo build` of a crate whose build script holds until the
+    /// test releases it, and wait until the script is running.
+    fn start() -> Self {
+        let dir = support::tempdir().expect("temp dir");
+        let cache = support::tempdir().expect("cache dir");
+        let cargo_home = support::tempdir().expect("cargo home");
+        let tools = support::tempdir().expect("tools dir");
+        let rendezvous = support::tempdir().expect("rendezvous");
+        write_crate(dir.path());
+        std::fs::write(
+            dir.path().join("build.rs"),
+            include_str!("fixtures/rendezvous_build.rs"),
+        )
+        .expect("write the build script");
+        let home = dir.path().join("stow-home");
+        support::write_global_config(&[&home], "[cache]\nremote = false\n");
+        let shim = install_shims(tools.path());
+        let daemon = PrivateDaemon::in_home(&home);
 
-    // The script's own compile went through the wrapper, which opened the
-    // session before the script ran.
-    let started = rendezvous.path().join("held.started");
-    let deadline = Instant::now() + END_LIMIT;
-    while !started.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "the build never reached its script"
-        );
-        std::thread::sleep(Duration::from_millis(20));
+        let cargo = cargo_build_command(
+            dir.path(),
+            cargo_home.path(),
+            Some(&shim),
+            cache.path(),
+            &dir.path().join("target"),
+        )
+        .env("STOW_TEST_RENDEZVOUS", rendezvous.path())
+        .env("STOW_TEST_BUILD_NAME", "held")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start cargo");
+        let cargo_pid = cargo.id();
+        let build = Self {
+            daemon,
+            cargo,
+            cargo_pid,
+            home,
+            rendezvous,
+            _dirs: [dir, cache, cargo_home, tools],
+        };
+
+        // The script's own compile went through the wrapper, which opened
+        // the session before the script ran.
+        let started = build.rendezvous.path().join("held.started");
+        let deadline = Instant::now() + END_LIMIT;
+        while !started.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the build never reached its script"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        build
     }
 
-    // Only cargo: its script and compilers are other processes, which
-    // neither `kill` nor the termination call takes with it.
-    cargo.kill().expect("kill cargo");
-    cargo.wait().expect("reap cargo");
-    daemon.wait_session_ended(cargo_pid);
+    /// Kill cargo alone and wait for the daemon to end its session. The
+    /// script and compilers are other processes, which neither `kill` nor
+    /// the termination call takes with it.
+    fn kill_cargo(&mut self) {
+        self.cargo.kill().expect("kill cargo");
+        self.cargo.wait().expect("reap cargo");
+        self.daemon.wait_session_ended(self.cargo_pid);
+    }
+
+    /// Let the held script finish.
+    fn release_script(&self) {
+        std::fs::write(self.rendezvous.path().join("release"), b"").expect("release the script");
+    }
+}
+
+/// A cargo killed under its build script ends its session at once. On Unix
+/// the script it left behind runs on: the session follows the cargo, not
+/// the processes cargo started. On Windows cargo's job object ends the
+/// script with it, whatever stow does.
+#[test]
+fn a_killed_cargo_ends_its_session_while_its_build_script_lives() {
+    let mut build = ScriptBuild::start();
+    build.kill_cargo();
     assert!(
-        !rendezvous.path().join("held.finished").exists(),
+        !build.rendezvous.path().join("held.finished").exists(),
         "the script was still held when the session ended"
     );
     assert!(
-        std::fs::read_dir(daemon.run_dir().join("sessions"))
+        std::fs::read_dir(build.daemon.run_dir().join("sessions"))
             .into_iter()
             .flatten()
             .next()
@@ -445,16 +484,56 @@ fn a_killed_cargo_ends_its_session_while_its_build_script_lives() {
     );
 
     // Release the orphaned script, and see that it lived to finish.
-    std::fs::write(rendezvous.path().join("release"), b"").expect("release the script");
-    let finished = rendezvous.path().join("held.finished");
-    let deadline = Instant::now() + END_LIMIT;
-    while !finished.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "the script did not outlive its cargo"
-        );
-        std::thread::sleep(Duration::from_millis(20));
+    #[cfg(unix)]
+    {
+        build.release_script();
+        let finished = build.rendezvous.path().join("held.finished");
+        let deadline = Instant::now() + END_LIMIT;
+        while !finished.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the script did not outlive its cargo"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
+}
+
+/// The daemon a build's wrapper started serves every build of the user, so
+/// it outlives the cargo that started it: killing that cargo — as Ctrl-C
+/// does — leaves it running. On Windows cargo's job object ends every
+/// process the cargo's wrappers start, so only a daemon the Task Scheduler
+/// started survives.
+#[test]
+fn a_daemon_started_for_a_build_outlives_the_cargo_killed_under_it() {
+    let mut build = ScriptBuild::start();
+    let started = build.daemon.serving_pids();
+    assert_eq!(
+        started.len(),
+        1,
+        "the build's wrapper starts one daemon:\n{}",
+        build.daemon.log_lines("").join("\n")
+    );
+    build.kill_cargo();
+
+    // A client of the daemon finds the one that is running: a daemon that
+    // died with the cargo would be started afresh, and log serving again.
+    let mut status = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    status.args(["daemon", "status"]).stdin(Stdio::null());
+    support::sealed_home_env(&mut status, &build.home);
+    let output = status.output().expect("ask the daemon for its status");
+    assert!(
+        output.status.success(),
+        "the daemon did not answer after its starter's cargo was killed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        build.daemon.serving_pids(),
+        started,
+        "the daemon that served the build ended with its cargo:\n{}",
+        build.daemon.log_lines("").join("\n")
+    );
+    build.release_script();
 }
 
 /// What the daemon logs at `warn` while deciding a plain build's request

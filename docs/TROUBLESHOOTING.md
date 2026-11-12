@@ -72,7 +72,12 @@ daemon, so a build that cannot reach it fails at cargo's first probe of the
 compiler, with the endpoint, the run directory and the daemon's pid and log
 in the message. A sandbox must let the process running cargo connect to
 `<run dir>/daemon.sock` (the named pipe on Windows) or start the daemon; see
-[Sandboxes](USAGE.md#sandboxes). `the stow daemon restarted during this
+[Sandboxes](USAGE.md#sandboxes). On Windows the daemon is started only by
+the scheduled task `stow setup` registers: `the stow daemon is not running
+and its scheduled task stow-daemon-... is not registered` means setup has not
+run for this user (or for this `STOW_DAEMON_DIR`), so run `stow setup`.
+`schtasks /Query /TN stow-daemon-...` shows whether the task exists.
+`the stow daemon restarted during this
 cargo build` means the daemon was replaced while the build ran, which loses
 the build's in-flight state: run the build again.
 

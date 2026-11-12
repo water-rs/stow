@@ -1,15 +1,21 @@
 //! The one path every client takes to reach the daemon.
 //!
 //! Connect; when nothing listens, take `start.lock`, connect again, and
-//! otherwise spawn the daemon detached, wait for its readiness
-//! notification within the configured bound, and connect. A daemon that
-//! does not come up is an error naming the daemon: there is no fallback.
-//! The path never asks a service manager anything.
+//! otherwise start the daemon, wait for its readiness notification within
+//! the configured bound, and connect. A daemon that does not come up is an
+//! error naming the daemon: there is no fallback.
+//!
+//! On Unix the path spawns the daemon detached and never asks a service
+//! manager anything. On Windows it asks the Task Scheduler to run the
+//! per-user task `stow setup` registered (`scheduled_task`): a
+//! process the path itself spawned would stay in the job object of the
+//! cargo whose wrapper called it, and end with that cargo.
 //!
 //! The whole path is synchronous and std-only: no async runtime and no
 //! configuration load, because the clients that call it run once per
 //! compiled unit.
 
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -18,10 +24,13 @@ use std::time::{Duration, Instant};
 
 use stow_types::error::{Context, Result};
 
+#[cfg(unix)]
+use super::STOW_DAEMON_DIR_ENV;
+#[cfg(unix)]
 use super::detached::{self, Detached};
 use super::notify::{Notification, ReadyListener};
 use super::protocol::{self, ControlRequest, Hello, PROTOCOL, PROTOCOL_FLOOR, Response, Role};
-use super::{RunDir, STOW_DAEMON_DIR_ENV, Settings};
+use super::{RunDir, Settings};
 use crate::file_lock::FileLock;
 
 #[cfg(unix)]
@@ -228,28 +237,16 @@ pub fn connect_or_start(exe: &Path, settings: Settings) -> Result<Connection> {
         return Ok(connected(stream));
     }
     let started = Instant::now();
-    #[cfg(unix)]
     let listener = ReadyListener::bind(&run_dir)?;
-    #[cfg(windows)]
-    let listener = ReadyListener::bind()?;
-    let mut child = spawn_daemon(exe, &run_dir, listener.endpoint())?;
+    let mut child = Started::begin(exe, &run_dir, &listener)?;
     let log = run_dir.log();
-    let notification = listener.wait(settings.start, || {
-        let exited = child.try_wait().wrap_err("watch the stow daemon")?;
-        exited.map_or(Ok(()), |status| {
-            Err(stow_types::stow_error!(
-                "the stow daemon exited with {status} before it was ready; its log is {}",
-                log.display()
-            ))
-        })
-    });
+    let notification = listener.wait(settings.start, || child.check(&log));
     let notification = match notification {
         Ok(notification) => notification,
         Err(error) => {
             // The daemon this path started never reported ready: it does
             // not outlive the failure.
-            let _ = child.kill();
-            let _ = child.wait();
+            child.abandon();
             return Err(error.wrap_err(format!(
                 "start the stow daemon (start bound {} s, log {})",
                 settings.start.as_secs(),
@@ -270,7 +267,7 @@ pub fn connect_or_start(exe: &Path, settings: Settings) -> Result<Connection> {
         Notification::LockHeld => {
             // The daemon this path spawned found another one holding the
             // lock and exits; reap it, and wait for the holder to listen.
-            let _ = child.wait();
+            child.reap();
             reconnect(&endpoint, settings, started)?
         }
     };
@@ -309,19 +306,98 @@ fn open_lock(path: &Path) -> Result<std::fs::File> {
         .wrap_err_with(|| format!("open {}", path.display()))
 }
 
+/// The daemon this path started, as far as the path watches it.
+///
+/// On Unix it is the child the path spawned. On Windows it is the run of
+/// the scheduled task (`scheduled_task`) the path asked for: the
+/// Task Scheduler owns the process, so there is no child to watch, and a
+/// daemon that fails to come up is noticed at the start bound.
+#[cfg(unix)]
+struct Started(detached::Child);
+
+#[cfg(unix)]
+impl Started {
+    /// Spawn the daemon with the readiness endpoint of `listener`.
+    fn begin(exe: &Path, run_dir: &RunDir, listener: &ReadyListener) -> Result<Self> {
+        spawn_daemon(exe, run_dir, listener.endpoint()).map(Self)
+    }
+
+    /// Fails once the daemon has exited.
+    fn check(&mut self, log: &Path) -> Result<()> {
+        let exited = self.0.try_wait().wrap_err("watch the stow daemon")?;
+        exited.map_or(Ok(()), |status| {
+            Err(stow_types::stow_error!(
+                "the stow daemon exited with {status} before it was ready; its log is {}",
+                log.display()
+            ))
+        })
+    }
+
+    /// End a daemon that never reported ready.
+    fn abandon(mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+
+    /// Collect a daemon that exited because another one holds the lock.
+    fn reap(mut self) {
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(windows)]
+struct Started {
+    run_dir: std::path::PathBuf,
+}
+
+#[cfg(windows)]
+impl Started {
+    /// Ask the Task Scheduler to run the task that starts the daemon for
+    /// `run_dir`. The daemon finds the address of `listener` in the run
+    /// directory ([`ReadyListener::bind`] published it). There is no
+    /// fallback: without the task registered the build fails naming `stow
+    /// setup`.
+    fn begin(_exe: &Path, run_dir: &RunDir, _listener: &ReadyListener) -> Result<Self> {
+        super::scheduled_task::run(run_dir.path())
+            .wrap_err("start the stow daemon through the Task Scheduler")?;
+        Ok(Self {
+            run_dir: run_dir.path().to_owned(),
+        })
+    }
+
+    /// The scheduler's process is not this path's to watch.
+    #[allow(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        reason = "the one interface of the start path on both platforms"
+    )]
+    fn check(&mut self, _log: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    /// Stop the task's run: the daemon did not report ready.
+    fn abandon(self) {
+        let _ = super::scheduled_task::end(&self.run_dir);
+    }
+
+    /// Nothing of the scheduler's process to collect.
+    #[allow(
+        clippy::unused_self,
+        reason = "the one interface of the start path on both platforms"
+    )]
+    fn reap(self) {}
+}
+
 /// What a daemon keeps of its starter's environment: what it needs to find
-/// the user's directories and nothing else of the starter's. Winsock
-/// refuses to start in a process whose environment lacks the system root,
-/// so on Windows that one variable, the system's own, is kept.
+/// the user's directories and nothing else of the starter's.
 #[cfg(unix)]
 const KEPT_ENVIRONMENT: [&str; 4] = ["HOME", "USER", "LOGNAME", "TMPDIR"];
-#[cfg(windows)]
-const KEPT_ENVIRONMENT: [&str; 1] = ["SystemRoot"];
 
 /// Spawn the daemon detached so that it keeps nothing of this process
 /// ([`super::detached`]): a cleared environment, null stdio, no inherited
 /// descriptor or handle, and the runtime directory as its working
 /// directory.
+#[cfg(unix)]
 fn spawn_daemon(exe: &Path, run_dir: &RunDir, notify: &Path) -> Result<detached::Child> {
     let kept = KEPT_ENVIRONMENT
         .into_iter()

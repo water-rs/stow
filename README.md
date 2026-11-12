@@ -38,7 +38,9 @@ told to, and exits as soon as the compiler does; the lookups, the stores and
 the bookkeeping happen in the daemon. The wrapper starts the daemon when it is
 not running. A build whose sandbox cannot reach the daemon's socket, or start
 the daemon, fails and says so: no wrapper decides anything on its own, so
-there is no fallback that builds without stow. See
+there is no fallback that builds without stow. On Windows the daemon is started
+by a scheduled task that `stow setup` registers once (the installer runs it);
+without that task a build fails naming `stow setup`. See
 [Sandboxes](docs/USAGE.md#sandboxes).
 
 Without `stow setup`, `stow check`, `stow build` and `stow test` are

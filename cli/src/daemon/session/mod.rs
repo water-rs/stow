@@ -216,12 +216,16 @@ impl Session<Cargo> {
         session.dir.record_owner(owner)?;
         Ok(session)
     }
+}
 
-    /// What the build's driver does once cargo has exited, for a build
-    /// with none: the day's usage report, the detached miss drain over the
-    /// journal this session wrote, and the count of builds. Misses, the
-    /// report and the count exist only to reach the network, so the
-    /// local-only and off cache modes keep none of them.
+impl<O: Origin> Session<O> {
+    /// What follows a build once its session has ended: the day's usage
+    /// report, the detached miss drain over the journal the session wrote,
+    /// and the count of builds. The daemon runs it for a build with no
+    /// driver, and for a driver's build on Windows, where a driver may sit
+    /// inside the job object of a cargo that ends with the drain it
+    /// started. Misses, the report and the count exist only to reach the
+    /// network, so the local-only and off cache modes keep none of them.
     pub(crate) async fn conclude(&self) {
         let Some(config) = self.env_cache.config() else {
             return;
@@ -246,9 +250,7 @@ impl Session<Cargo> {
         }
         crate::report::bump_build(config).await;
     }
-}
 
-impl<O: Origin> Session<O> {
     /// The session of `origin`.
     async fn assemble(
         id: SessionId,

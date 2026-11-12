@@ -145,8 +145,28 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
         let installed = install_launch_agent(&wrappers.runtime_executable).await?;
         write_stdout(&format!("launch agent: {}\n", installed.plist.display()))?;
     }
+    // The Windows counterpart: the task that is both the login trigger and
+    // the only way a build starts the daemon (stow#1454).
+    #[cfg(windows)]
+    {
+        let task = register_daemon_task(&wrappers.runtime_executable).await?;
+        write_stdout(&format!("scheduled task: {task}\n"))?;
+    }
 
     Ok(())
+}
+
+/// Register the Task Scheduler task that starts the daemon for the run
+/// directory this process resolves, and return its name.
+#[cfg(windows)]
+async fn register_daemon_task(runtime_executable: &Path) -> stow_types::error::Result<String> {
+    let runtime_executable = runtime_executable.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let run_dir = crate::daemon::RunDir::locate()?;
+        crate::daemon::scheduled_task::register(&run_dir, &runtime_executable)
+    })
+    .await
+    .wrap_err("register the daemon's scheduled task")?
 }
 
 /// Write the daemon's `LaunchAgent` under the user's `~/Library` and load

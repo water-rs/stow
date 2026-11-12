@@ -94,10 +94,11 @@ time = { version = "0.3.55", default-features = false, features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# The launch agent plist (`cli/templates/launch_agent.xml`): XML-escaped by
-# a template, never concatenated. Already in the lockfile for the edge and
-# the admin.
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+# The launch agent plist (`cli/templates/launch_agent.xml`) and the
+# Windows scheduled task (`cli/templates/scheduled_task.xml`): XML-escaped
+# by a template, never concatenated. Already in the lockfile for the edge
+# and the admin.
 askama = { version = "0.14", default-features = false, features = ["derive", "std"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -113,6 +114,9 @@ windows-sys = { version = "0.60", features = [
     # The daemon's named pipe is restricted to the current user's SID.
     "Win32_Security",
     "Win32_Security_Authorization",
+    # The daemon the Task Scheduler starts detaches from the console the
+    # scheduler gives it.
+    "Win32_System_Console",
 ] }
 
 [dev-dependencies]

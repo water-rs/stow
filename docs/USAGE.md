@@ -304,6 +304,18 @@ therefore be able to connect to `<run dir>/daemon.sock` (the named pipe on
 Windows), or to start the daemon, which needs write access to the run
 directory.
 
+On Windows `stow setup` registers a per-user Task Scheduler task named
+`stow-daemon-<hash of the run directory>` that runs `stow daemon` when you
+log on, with no stored password and no elevation, and the wrapper starts the
+daemon by asking the Task Scheduler to run that task: cargo runs inside a
+job object that ends every process in it when cargo ends, so a daemon the
+wrapper started itself would end with the first cargo that is killed. Run
+`stow setup` once per user (and once for each `STOW_DAEMON_DIR` you use). A
+build that finds no daemon running and no task registered fails with an error
+naming the stow daemon and `stow setup`; it never starts the daemon any other
+way. The daemon the task starts reads `STOW_DAEMON_ANSWER_SECS` and
+`STOW_DAEMON_LOG_BYTES` from your user environment, not from the build's.
+
 A build whose sandbox allows neither fails. There is no fallback: a
 wrapper never decides anything on its own, so a build that cannot reach the
 daemon cannot build through stow's wrappers at all. Cargo's first probe of
