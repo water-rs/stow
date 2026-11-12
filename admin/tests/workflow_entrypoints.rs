@@ -1100,6 +1100,13 @@ fn build_crate_declarations() {
             "{input}"
         );
     }
+}
+
+/// `build-crate.yml`'s per-task `run-name`, concurrency group and the
+/// untrusted build / trusted publish jobs.
+#[test]
+fn build_crate_run_name_concurrency_and_jobs() {
+    let wf = load_workflow("build-crate.yml");
     // Per-task run-name binds the `workflow_run` completion: the
     // scheduler's webhook parses `<rustc>-<task_id>` off `display_title`.
     assert_eq!(
