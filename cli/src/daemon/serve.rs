@@ -136,10 +136,25 @@ pub struct Inherited {
     pub listener: std::os::fd::RawFd,
 }
 
+/// Writes what the daemon's log has queued when dropped, so that no way
+/// the process ends leaves records behind: the thread that writes the log
+/// ends with the process. The one end that skips destructors, the exec of
+/// a successor's image, flushes explicitly first (`replace_image`).
+struct LogGuard(LogWriter);
+
+impl Drop for LogGuard {
+    fn drop(&mut self) {
+        // The log is all there is to report a failed flush to.
+        let _ = std::io::Write::flush(&mut self.0);
+    }
+}
+
 /// Run the daemon until it retires or fails. Returns `Ok` when another
 /// daemon already holds the lock, and on Windows when it has drained and
 /// released the pipe and the lock for its successor; on Unix a retiring
-/// daemon replaces its image and never returns.
+/// daemon replaces its image and never returns. Whatever way it ends, the
+/// records it queued are written first, and a failure is the log's last
+/// record.
 pub async fn run(
     ready: Option<PathBuf>,
     given_dir: Option<PathBuf>,
@@ -155,6 +170,30 @@ pub async fn run(
         }
     })
     .await?;
+    let log = LogGuard(log);
+    let outcome = serve(
+        ready,
+        run_dir,
+        logs,
+        &log.0,
+        #[cfg(unix)]
+        inherited,
+    )
+    .await;
+    if let Err(error) = &outcome {
+        tracing::error!("stow daemon failed: {error}");
+    }
+    outcome
+}
+
+/// The daemon's life after its log is installed.
+async fn serve(
+    ready: Option<PathBuf>,
+    run_dir: RunDir,
+    logs: SessionLogs,
+    log: &LogWriter,
+    #[cfg(unix)] inherited: Option<Inherited>,
+) -> Result<()> {
     tracing::info!(
         pid = std::process::id(),
         version = env!("CARGO_PKG_VERSION"),
@@ -220,7 +259,7 @@ pub async fn run(
     #[cfg(unix)]
     {
         let retired = accept_loop(&listener, daemon).await?;
-        replace_image(&retired, &run_dir, &lock, &listener, &log).await
+        replace_image(&retired, &run_dir, &lock, &listener, log).await
     }
     #[cfg(windows)]
     {
@@ -233,7 +272,6 @@ pub async fn run(
             successor = %retired.successor.display(),
             "drained; the pipe and the lock are released for the successor"
         );
-        flush_log(&log).await?;
         Ok(())
     }
 }
