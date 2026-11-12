@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/water-rs/stow/compare/stow-cli-v0.18.0...stow-cli-v0.19.0) - 2026-11-12
+
+### Fixed
+
+- support cargo 1.100's build-unit layout ([#1490](https://github.com/water-rs/stow/pull/1490))
+
 ## [0.18.0](https://github.com/water-rs/stow/compare/stow-cli-v0.17.0...stow-cli-v0.18.0) - 2026-11-12
 
 ### Other
