@@ -11,6 +11,7 @@
 //! them nor name another session's paths, and the session's own derived
 //! state is written only by the session's tasks.
 
+mod cargo;
 mod facts;
 pub mod handler;
 mod id;
@@ -24,12 +25,14 @@ use std::sync::Arc;
 use stow_types::error::{Context, Result};
 use tracing::Instrument as _;
 
-pub use facts::{Seed, SessionFacts};
-pub use id::{SessionDir, SessionId};
+pub use cargo::{Cargo, Opener, open_facts};
+pub use facts::{BuildFacts, DriverFacts, Seed, SessionFacts};
+pub use id::{SessionDir, SessionId, keep_only_owner, recorded_owner};
 pub use resources::{CacheDirHandles, Resources};
 
 use crate::cache_policy;
 use crate::config::StowConfig;
+use crate::daemon::owner::CargoOwner;
 use crate::daemon::wrapper::InvocationEnv;
 use crate::session_env::SessionEnv;
 use crate::toolchain::BuildToolchain;
@@ -54,15 +57,106 @@ pub struct SessionEnd {
     pub journal_written: bool,
 }
 
-/// A build's session.
+/// What a session's opener contributes beyond the facts every build has:
+/// the analysis a driver settled before cargo started, or the cargo
+/// process a session shares its life with. The parts of a session that
+/// differ by opener are these.
+pub trait Origin: Send + Sync + 'static {
+    /// The analysis a driver settled before cargo started; `None` for an
+    /// origin with none, whose session then decides every unit through
+    /// the lookup chain.
+    fn driver(&self) -> Option<&DriverFacts> {
+        None
+    }
+
+    /// Called with the environment of each plan request before it is
+    /// decided. The default observes nothing.
+    fn planned(&self, _env: &InvocationEnv) {}
+
+    /// Write the build's miss journal from the units it compiled locally.
+    /// Returns whether anything was journaled.
+    fn journal(
+        &self,
+        build: &BuildFacts,
+        id: SessionId,
+        observations: &[artifact_cache::ObservedUnit],
+    ) -> bool;
+}
+
+/// A driver's session: its analysis names the project, the rustc spelling
+/// the drain runs and the superset hits to report.
+impl Origin for DriverFacts {
+    fn driver(&self) -> Option<&DriverFacts> {
+        Some(self)
+    }
+
+    fn journal(
+        &self,
+        build: &BuildFacts,
+        id: SessionId,
+        observations: &[artifact_cache::ObservedUnit],
+    ) -> bool {
+        let facts = &self.project;
+        let env = SessionEnv::new(build.environ.clone(), build.cwd.clone());
+        let target_dir = build
+            .roots
+            .dirs()
+            .first()
+            .expect("a build's output roots start with its target directory");
+        // The drain mints each miss's dependency subgraph off the build's
+        // persisted expanded graph when it can load it, and off the
+        // journal's context sidecar when it cannot (stow#588).
+        let expanded_cache_key = crate::lockfile_graph_cache::cache_key(facts, &env)
+            .unwrap_or_else(|error| {
+                tracing::warn!(error = %error, "could not key the expanded graph for the miss journal");
+                String::new()
+            });
+        let key_inputs = crate::lockfile_graph_cache::KeyInputs {
+            action: &facts.action,
+            cargo_args: &facts.cargo_args,
+            current_dir: &facts.current_dir,
+            manifest_path: &facts.manifest_path,
+            workspace_root: &facts.workspace_root,
+            target: &facts.target,
+            target_given: facts.target_given,
+            rustc_version: &facts.rustc_version,
+            env: &env,
+        };
+        let consumer = miss_journal::JournalConsumer {
+            manifest_dir: Some(
+                facts
+                    .manifest_path
+                    .parent()
+                    .unwrap_or(facts.current_dir.as_path()),
+            ),
+            rustc_version: &facts.rustc_version,
+            target: &facts.target,
+            target_given: facts.target_given,
+            key: Some(&key_inputs),
+        };
+        miss_journal::journal_session(
+            id,
+            &self.build_rustc,
+            &consumer,
+            observations,
+            target_dir,
+            &expanded_cache_key,
+            &self.seed.inexact_entries,
+        );
+        !(observations.is_empty() && self.seed.inexact_entries.is_empty())
+    }
+}
+
+/// A build's session, opened by `O`.
 #[derive(Debug)]
-pub struct Session {
+pub struct Session<O = DriverFacts> {
     id: SessionId,
     /// Everything the session's tasks and requests record is recorded
     /// under this span, which names the session: the daemon routes those
     /// events to the driver that owns it.
     span: tracing::Span,
-    facts: Arc<SessionFacts>,
+    build: BuildFacts,
+    origin: O,
     dir: SessionDir,
     /// The bookkeeping tasks the build's reports spawned, drained when the
     /// session ends (stow#618, stow#1431).
@@ -98,19 +192,84 @@ impl Session {
         handles: &CacheDirHandles,
         sessions: &Path,
     ) -> Result<Arc<Self>> {
+        let SessionFacts { build, driver } = facts;
+        Self::assemble(id, build, driver, handles, sessions).await
+    }
+}
+
+impl Session<Cargo> {
+    /// Open the session of a cargo, from the facts its first wrapper's
+    /// environment gave. No analysis ran before cargo started, so the
+    /// session has no serve map, cache policy or unit graph.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::open`].
+    pub(crate) async fn open_cargo(
+        id: SessionId,
+        owner: CargoOwner,
+        build: BuildFacts,
+        handles: &CacheDirHandles,
+        sessions: &Path,
+    ) -> Result<Arc<Self>> {
+        let session = Self::assemble(id, build, Cargo::default(), handles, sessions).await?;
+        session.dir.record_owner(owner)?;
+        Ok(session)
+    }
+}
+
+impl<O: Origin> Session<O> {
+    /// What follows a build once its session has ended: the day's usage
+    /// report, the detached miss drain over the journal the session wrote,
+    /// and the count of builds. The daemon runs it for a build with no
+    /// driver, and for a driver's build on Windows, where a driver may sit
+    /// inside the job object of a cargo that ends with the drain it
+    /// started. Misses, the report and the count exist only to reach the
+    /// network, so the local-only and off cache modes keep none of them.
+    pub(crate) async fn conclude(&self) {
+        let Some(config) = self.env_cache.config() else {
+            return;
+        };
+        if !config.cache.reaches_network() {
+            return;
+        }
+        let env = SessionEnv::new(self.build.environ.clone(), self.build.cwd.clone());
+        let target_dir = self
+            .build
+            .roots
+            .dirs()
+            .first()
+            .expect("a build's output roots start with its target directory");
+        // An all-hit build leaves no journal for `spawn_drain` to find; a due
+        // usage report forces the spawn so the day's deltas still leave the
+        // machine through the detached lane (stow#889).
+        if crate::report::report_due_today(config).await {
+            miss_journal::spawn_drain_unconditional(target_dir, &env);
+        } else {
+            miss_journal::spawn_drain(target_dir, &env);
+        }
+        crate::report::bump_build(config).await;
+    }
+
+    /// The session of `origin`.
+    async fn assemble(
+        id: SessionId,
+        build: BuildFacts,
+        origin: O,
+        handles: &CacheDirHandles,
+        sessions: &Path,
+    ) -> Result<Arc<Self>> {
+        let no_analysis = Seed::default();
+        let seed = origin.driver().map_or(&no_analysis, |driver| &driver.seed);
         let span = tracing::info_span!(crate::daemon::events::SESSION_SPAN, session = %id);
-        let env = SessionEnv::new(facts.environ.clone(), facts.cwd.clone());
-        let toolchain = BuildToolchain::from_facts(facts.toolchain.clone(), &env)
+        let env = SessionEnv::new(build.environ.clone(), build.cwd.clone());
+        let toolchain = BuildToolchain::from_facts(build.toolchain.clone(), &env)
             .await
             .map(Arc::new)
             .map_err(stow_types::error::Error::msg)
             .wrap_err("reopen the build's toolchain")?;
         let dir = SessionDir::create(sessions, id)?;
-        let mut config = facts.config.clone();
-        if let Some(config) = &mut config {
-            handles.install(config);
-        }
-        let seed = &facts.seed;
+        let config = session_config(&build, handles, id);
         let has_policy = seed.cache_policy_entries.is_some();
         let (allow_writer, allowed) = seed.cache_policy_entries.as_ref().map_or_else(
             || (None, None),
@@ -138,10 +297,14 @@ impl Session {
         let in_flight = InFlightUnits::default();
         let resolution_done = ResolutionDone::pending();
         let ctx = BuildContext {
-            marks_dir: has_policy.then(|| dir.path().to_owned()),
+            // Every session records its locally built crates: a session
+            // with no cache policy still serves remote artifacts, so a
+            // dependent of a locally built crate must be found and kept
+            // off the cache.
+            marks_dir: Some(dir.path().to_owned()),
             allowed,
-            public_cache_target: Some(facts.project.target.clone()),
-            public_cache_disabled: facts.public_cache_disabled,
+            public_cache_target: build.public_cache_target.clone(),
+            public_cache_disabled: build.public_cache_disabled,
             cache: config
                 .as_ref()
                 .map_or_else(crate::config::CacheLayers::default, |config| config.cache),
@@ -150,11 +313,12 @@ impl Session {
             serve_map_ready: Arc::clone(&serve_map_ready),
             policy_ready: Arc::clone(&policy_ready),
             in_flight,
-            registry_sources: std::sync::OnceLock::from(facts.registry_sources.clone()),
+            registry_sources: build.registry_sources.clone(),
         };
         let env_cache = WrapperEnvCache::for_session(config.clone(), toolchain);
         let enrichment = if seed.deferred
             && let Some(config) = config
+            && let Some(driver) = origin.driver()
         {
             // Aborted when the build's cargo exits: what the analysis
             // commits for this build lands while cargo runs, and whatever
@@ -163,7 +327,7 @@ impl Session {
             Some(crate::cargo_cmd::spawn_build_enrichment(
                 span.clone(),
                 crate::cargo_cmd::BuildEnrichment {
-                    project: facts.project.clone(),
+                    project: driver.project.clone(),
                     env,
                     config,
                     circuit: env_cache.circuit.clone(),
@@ -187,7 +351,8 @@ impl Session {
         let session = Arc::new(Self {
             id,
             span: span.clone(),
-            facts: Arc::new(facts),
+            build,
+            origin,
             dir,
             reports: Reports::default(),
             env_cache,
@@ -297,56 +462,14 @@ impl Session {
     /// did. They land in the same journal a plain-cargo wrapper writes;
     /// only a build that reaches the network has anything to admit.
     fn write_journal(&self) -> bool {
-        let Some(config) = &self.facts.config else {
+        let Some(config) = &self.build.config else {
             return false;
         };
         if !config.cache.reaches_network() {
             return false;
         }
-        let facts = &self.facts.project;
-        let env = SessionEnv::new(self.facts.environ.clone(), self.facts.cwd.clone());
-        let target_dir = self
-            .facts
-            .roots
-            .dirs()
-            .first()
-            .expect("a build's output roots start with its target directory");
-        // The drain mints each miss's dependency subgraph off the build's
-        // persisted expanded graph when it can load it, and off the
-        // journal's context sidecar when it cannot (stow#588).
-        let expanded_cache_key = crate::lockfile_graph_cache::cache_key(facts, &env)
-            .unwrap_or_else(|error| {
-                tracing::warn!(error = %error, "could not key the expanded graph for the miss journal");
-                String::new()
-            });
-        let key_inputs = crate::lockfile_graph_cache::KeyInputs {
-            action: &facts.action,
-            cargo_args: &facts.cargo_args,
-            current_dir: &facts.current_dir,
-            manifest_path: &facts.manifest_path,
-            workspace_root: &facts.workspace_root,
-            target: &facts.target,
-            target_given: facts.target_given,
-            rustc_version: &facts.rustc_version,
-            env: &env,
-        };
-        let consumer = miss_journal::JournalConsumer {
-            manifest_dir: facts
-                .manifest_path
-                .parent()
-                .unwrap_or(facts.current_dir.as_path()),
-            key: &key_inputs,
-        };
-        let observations = self.observations();
-        miss_journal::journal_session(
-            &self.facts.build_rustc,
-            &consumer,
-            &observations,
-            target_dir,
-            &expanded_cache_key,
-            &self.facts.seed.inexact_entries,
-        );
-        !(observations.is_empty() && self.facts.seed.inexact_entries.is_empty())
+        self.origin
+            .journal(&self.build, self.id, &self.observations())
     }
 
     /// The build's registry of units whose bookkeeping has not finished.
@@ -499,7 +622,7 @@ impl Session {
     }
 }
 
-impl Handler for Session {
+impl<O: Origin> Handler for Session<O> {
     type Pending = Box<PostCompile>;
 
     fn cc_config(self: &Arc<Self>) -> Option<&StowConfig> {
@@ -507,7 +630,7 @@ impl Handler for Session {
     }
 
     fn output_roots(self: &Arc<Self>) -> Option<&crate::daemon::session::invocation::OutputRoots> {
-        Some(&self.facts.roots)
+        Some(&self.build.roots)
     }
 
     fn plan_args(
@@ -519,7 +642,7 @@ impl Handler for Session {
         // flags it selected) go after the argv so the user's own rustflags
         // sources — env or config — keep their cargo semantics.
         args.extend(
-            self.facts
+            self.build
                 .rustc_extra_args
                 .iter()
                 .map(std::ffi::OsString::from),
@@ -534,6 +657,7 @@ impl Handler for Session {
         invocation: VerifiedInvocation,
         invocation_env: InvocationEnv,
     ) -> Decision<Self::Pending> {
+        self.origin.planned(&invocation_env);
         let args = invocation.into_args();
         let classified = classify_invocation(&args);
         if !self.resolution_done.has_completed() && describes_compile_unit(&classified) {
@@ -596,7 +720,7 @@ impl Handler for Session {
     }
 
     fn refusal_policy(self: &Arc<Self>) -> crate::daemon::session::invocation::RefusalPolicy {
-        self.facts.refusal_policy
+        self.build.refusal_policy
     }
 
     fn refused(self: &Arc<Self>, refusal: Refusal) {
@@ -653,6 +777,23 @@ fn arm_or_settle_serve_map_ready(
     }
 }
 
+/// The build's config as session `id` runs it: on the cache directory's
+/// shared handles, and with its identity trace pointed at a directory of
+/// the session's own. One daemon serves many builds, so its pid cannot
+/// tell their identity records apart.
+fn session_config(
+    build: &BuildFacts,
+    handles: &CacheDirHandles,
+    id: SessionId,
+) -> Option<StowConfig> {
+    let mut config = build.config.clone()?;
+    handles.install(&mut config);
+    if let Some(trace) = &mut config.switches.identity_trace {
+        trace.push(id.to_string());
+    }
+    Some(config)
+}
+
 /// The policy gate's readiness latch for this build: pending only while a
 /// deferred build's enrichment still owes the allow set its coarse commit
 /// — released by the commit or by the guard dropping with the task; every
@@ -680,7 +821,8 @@ impl Session {
         Arc::new(Self {
             id,
             span: tracing::Span::none(),
-            facts: Arc::new(facts),
+            build: facts.build,
+            origin: facts.driver,
             dir: SessionDir::create(sessions, id).expect("create the session directory"),
             reports: Reports::default(),
             env_cache: parts.env_cache,
@@ -751,10 +893,10 @@ mod tests {
             OutputRoots::new(target.to_owned(), None),
             RefusalPolicy::FailBuild,
         );
-        facts.config = config;
-        facts.rustc_extra_args =
+        facts.build.config = config;
+        facts.build.rustc_extra_args =
             vec!["--remap-path-prefix=/workspace=stow-ci://workspace".to_owned()];
-        facts.seed.serve_map = Some(crate::facade::ServeMap {
+        facts.driver.seed.serve_map = Some(crate::facade::ServeMap {
             target: vec![("covered".to_owned(), "*".to_owned())],
             host: Vec::new(),
             pending: false,
@@ -765,6 +907,12 @@ mod tests {
     /// One registry lib unit the serve map above does not cover, compiling
     /// into `out_dir`.
     fn uncovered_unit(out_dir: &Path) -> Vec<OsString> {
+        uncovered_unit_hashed(out_dir, "abc123")
+    }
+
+    /// [`uncovered_unit`] whose `-C metadata` and `-C extra-filename` carry
+    /// `hash`.
+    fn uncovered_unit_hashed(out_dir: &Path, hash: &str) -> Vec<OsString> {
         let mut unit = ["--crate-name", "demo", "--crate-type", "lib"]
             .map(OsString::from)
             .to_vec();
@@ -776,17 +924,78 @@ mod tests {
         ]);
         unit.extend(
             [
-                "-C",
-                "metadata=abc123",
-                "-C",
-                "extra-filename=-abc123",
-                "--target",
-                HOST_TARGET,
-                "/cargo/registry/src/index.crates.io-0123abcd/demo-1.0.0/src/lib.rs",
+                "-C".to_owned(),
+                format!("metadata={hash}"),
+                "-C".to_owned(),
+                format!("extra-filename=-{hash}"),
+                "--target".to_owned(),
+                HOST_TARGET.to_owned(),
+                "/cargo/registry/src/index.crates.io-0123abcd/demo-1.0.0/src/lib.rs".to_owned(),
             ]
             .map(OsString::from),
         );
         unit
+    }
+
+    /// A session with no cache policy still records the crates it
+    /// compiles locally, so a dependent of one is kept off the cache: it
+    /// would otherwise be served a CI copy built against another copy of
+    /// its dependency (E0460).
+    #[tokio::test]
+    async fn a_session_without_a_policy_keeps_a_locally_built_crates_dependents_local() {
+        const HASH: &str = "0123456789abcdef";
+        let sessions = tempfile::tempdir().expect("sessions directory");
+        let target = tempfile::tempdir().expect("target directory");
+        let built = facts(target.path(), None).await;
+        assert!(
+            built.driver.seed.cache_policy_entries.is_none(),
+            "the session has no cache policy"
+        );
+        let session = Session::open(
+            SessionId::mint(),
+            built,
+            &CacheDirHandles::default(),
+            sessions.path(),
+        )
+        .await
+        .expect("open the session");
+        let out_dir = session.build.roots.dirs()[0].join("deps");
+
+        // The dependency: the serve map rules it out, so it compiles
+        // locally and the session records it.
+        let env = InvocationEnv::for_tests();
+        let verified = VerifiedInvocation::verify(
+            &session.env_cache.toolchain,
+            Some(&session.build.roots),
+            session.env_cache.toolchain.rustc().as_os_str().to_owned(),
+            uncovered_unit_hashed(&out_dir, HASH),
+            &env,
+        )
+        .await
+        .expect("the session's own rustc passes verification");
+        assert!(matches!(
+            session.plan(verified, env).await,
+            Decision::Compile(_)
+        ));
+
+        let mut dependent = uncovered_unit_hashed(&out_dir, "fedcba9876543210");
+        let source = dependent.len() - 1;
+        dependent.splice(
+            source..source,
+            [
+                OsString::from("--extern"),
+                OsString::from(format!(
+                    "demo={}",
+                    out_dir.join(format!("libdemo-{HASH}.rlib")).display()
+                )),
+            ],
+        );
+        let dependent = rustc_args::ParsedRustcArgs::parse(&dependent).expect("parse dependent");
+        assert!(
+            crate::must_build_locally(&dependent, HOST_TARGET, Some(session.dir.path())),
+            "a dependent of a locally built crate must build locally"
+        );
+        session.end().await.expect("end the session");
     }
 
     /// What a session decided about the unit, compiling under the
@@ -795,13 +1004,13 @@ mod tests {
     /// would run rustc with.
     async fn decide(session: &Arc<Session>) -> (Option<(String, bool)>, Vec<OsString>) {
         let env = InvocationEnv::for_tests();
-        let unit = uncovered_unit(&session.facts.roots.dirs()[0].join("deps"));
+        let unit = uncovered_unit(&session.build.roots.dirs()[0].join("deps"));
         let args = session
             .plan_args(unit.clone(), &env)
             .expect("plan the arguments");
         let verified = VerifiedInvocation::verify(
             &session.env_cache.toolchain,
-            Some(&session.facts.roots),
+            Some(&session.build.roots),
             session.env_cache.toolchain.rustc().as_os_str().to_owned(),
             unit,
             &env,
@@ -858,6 +1067,66 @@ mod tests {
         assert_eq!(decide(&remote).await, driver_decision);
         driver.end().await.expect("end the driver-built session");
         remote.end().await.expect("end the received session");
+    }
+
+    /// A cargo's session has no driver to tell it the build's graph, ledger
+    /// or fallback.
+    #[tokio::test]
+    async fn an_implicit_sessions_context_carries_no_graph_ledger_or_fallback() {
+        let sessions = tempfile::tempdir().expect("sessions directory");
+        let target = tempfile::tempdir().expect("target directory");
+        let build = facts(target.path(), None).await.build;
+        let session = Session::open_cargo(
+            SessionId::mint(),
+            CargoOwner { pid: 1, started: 1 },
+            build,
+            &CacheDirHandles::default(),
+            sessions.path(),
+        )
+        .await
+        .expect("open the cargo's session");
+        assert!(session.ctx.unit_nodes().is_none());
+        assert!(!session.ctx.semantic_fallback_enabled());
+        assert!(
+            session
+                .ctx
+                .prefetch_candidates()
+                .expect("the facts cell is filled")
+                .is_empty()
+        );
+        session.end().await.expect("end the session");
+    }
+
+    /// The daemon's pid is every session's; each session writes its
+    /// identity records under a directory named by its own id.
+    #[tokio::test]
+    async fn two_sessions_write_identity_records_under_their_own_directories() {
+        let sessions = tempfile::tempdir().expect("sessions directory");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let target = tempfile::tempdir().expect("target directory");
+        let trace = std::path::PathBuf::from("/trace");
+        let handles = Resources::default().handles_for(cache.path());
+        let mut traces = Vec::new();
+        for _ in 0..2 {
+            let mut config = config_in(cache.path());
+            config.switches.identity_trace = Some(trace.clone());
+            let id = SessionId::mint();
+            let session = Session::open(
+                id,
+                facts(target.path(), Some(config)).await,
+                &handles,
+                sessions.path(),
+            )
+            .await
+            .expect("open the session");
+            let own = session
+                .env_cache
+                .config()
+                .and_then(|config| config.switches.identity_trace.clone());
+            assert_eq!(own, Some(trace.join(id.to_string())));
+            traces.push(own);
+        }
+        assert_ne!(traces[0], traces[1]);
     }
 
     /// Two sessions whose configs name different cache directories each

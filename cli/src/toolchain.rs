@@ -3,8 +3,9 @@
 //! Every fact the cache path needs about rustc — where it is, which file
 //! it is, the host triple it compiles for, its release and the CPU
 //! `native` stands for — is read from the build's own rustc. The driver
-//! resolves a [`BuildToolchain`] before cargo starts; a standalone wrapper
-//! resolves one from its own rustc through the same code. A rustc spelling
+//! resolves a [`BuildToolchain`] before cargo starts; the daemon resolves
+//! one for a plain cargo from the rustc its first wrapper names, through
+//! the same code. A rustc spelling
 //! a request carries is only ever compared against it, never run.
 
 use std::ffi::{OsStr, OsString};
@@ -65,7 +66,7 @@ impl BuildToolchain {
         env: &SessionEnv,
     ) -> Result<Self, String> {
         let (spelling, vv) =
-            tokio::join!(build_rustc.facade_spelling(), async { vv.clone().await });
+            tokio::join!(build_rustc.facade_spelling(env), async { vv.clone().await });
         Self::from_probe(
             spelling?,
             build_rustc.executable().to_owned(),
@@ -76,16 +77,28 @@ impl BuildToolchain {
         .await
     }
 
-    /// Resolve the toolchain of the rustc a standalone wrapper was invoked
-    /// for: the user's own process runs the user's own rustc, in the
-    /// environment `env` names — its own.
+    /// Resolve the toolchain of the rustc a build's first wrapper was
+    /// invoked for, from `vv`, the `rustc -vV` output of that rustc in
+    /// `env`. `workspace_wrapper` is the configured
+    /// `RUSTC_WORKSPACE_WRAPPER`, when there is one.
     ///
     /// # Errors
     ///
     /// As [`Self::for_build`].
-    pub async fn for_executable(executable: &OsStr, env: &SessionEnv) -> Result<Self, String> {
-        let vv = rustc_args::rustc_vv(executable).await?;
-        Self::from_probe(executable.to_owned(), executable.to_owned(), None, &vv, env).await
+    pub async fn for_opener(
+        rustc: &OsStr,
+        workspace_wrapper: Option<PathBuf>,
+        vv: &str,
+        env: &SessionEnv,
+    ) -> Result<Self, String> {
+        Self::from_probe(
+            rustc.to_owned(),
+            rustc.to_owned(),
+            workspace_wrapper,
+            vv,
+            env,
+        )
+        .await
     }
 
     async fn from_probe(
@@ -270,14 +283,18 @@ pub struct ToolchainFacts {
 #[cfg(test)]
 impl BuildToolchain {
     /// The test environment's own `rustc`, resolved through `PATH` as a
-    /// standalone wrapper resolves its.
+    /// cargo session resolves its opener's.
     pub async fn for_tests() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::of_the_test_rustc().await)
     }
 
     async fn of_the_test_rustc() -> Self {
         let env = SessionEnv::of_this_process().expect("the test process's environment");
-        Self::for_executable(OsStr::new("rustc"), &env)
+        let rustc = OsStr::new("rustc");
+        let vv = rustc_args::rustc_vv(rustc, &env)
+            .await
+            .expect("the test environment's rustc answers -vV");
+        Self::for_opener(rustc, None, &vv, &env)
             .await
             .expect("resolve the test environment's rustc")
     }
@@ -362,7 +379,9 @@ mod tests {
                 .expect("chmod the program");
         }
         let rustc = which::which("rustc").expect("the test machine has rustc on PATH");
-        let vv = crate::rustc_args::rustc_vv(rustc.as_os_str())
+        let env = crate::session_env::SessionEnv::of_this_process()
+            .expect("the test process's environment");
+        let vv = crate::rustc_args::rustc_vv(rustc.as_os_str(), &env)
             .await
             .expect("rustc -vV");
         let toolchain = super::BuildToolchain::from_probe(
@@ -370,8 +389,7 @@ mod tests {
             launcher.clone().into_os_string(),
             None,
             &vv,
-            &crate::session_env::SessionEnv::of_this_process()
-                .expect("the test process's environment"),
+            &env,
         )
         .await
         .expect("resolve the toolchain");
@@ -397,11 +415,11 @@ mod tests {
                 .expect("chmod the program");
         }
         let rustc = which::which("rustc").expect("the test machine has rustc on PATH");
-        let vv = crate::rustc_args::rustc_vv(rustc.as_os_str())
-            .await
-            .expect("rustc -vV");
         let env = crate::session_env::SessionEnv::of_this_process()
             .expect("the test process's environment");
+        let vv = crate::rustc_args::rustc_vv(rustc.as_os_str(), &env)
+            .await
+            .expect("rustc -vV");
         let original = super::BuildToolchain::from_probe(
             rustc.clone().into_os_string(),
             launcher.clone().into_os_string(),

@@ -293,6 +293,55 @@ project's configured rustflags wholesale), so a job on Linux also runs
 plain `stow setup`, which writes the mold selection into the runner's
 `$CARGO_HOME/config.toml`.
 
+### Sandboxes
+
+Every compile of a plain `cargo build` through the wrappers is answered
+by the per-user daemon, which opens a session of that cargo and ends it
+when the cargo exits: the wrapper asks, runs the compiler when told to,
+reports and exits, and the lookup, the store and the bookkeeping happen in
+the daemon after the wrapper has gone. The process running cargo must
+therefore be able to connect to `<run dir>/daemon.sock` (the named pipe on
+Windows), or to start the daemon, which needs write access to the run
+directory.
+
+On Windows `stow setup` registers a per-user Task Scheduler task named
+`stow-daemon-<hash of the run directory>` that runs `stow daemon` when you
+log on, with no stored password and no elevation, and the wrapper starts the
+daemon by asking the Task Scheduler to run that task: cargo runs inside a
+job object that ends every process in it when cargo ends, so a daemon the
+wrapper started itself would end with the first cargo that is killed. Run
+`stow setup` once per user (and once for each `STOW_DAEMON_DIR` you use). A
+build that finds no daemon running and no task registered fails with an error
+naming the stow daemon and `stow setup`; it never starts the daemon any other
+way. The daemon the task starts reads `STOW_DAEMON_ANSWER_SECS` and
+`STOW_DAEMON_LOG_BYTES` from your user environment, not from the build's.
+
+A build whose sandbox allows neither fails. There is no fallback: a
+wrapper never decides anything on its own, so a build that cannot reach the
+daemon cannot build through stow's wrappers at all. Cargo's first probe of
+the compiler fails, and the error names the endpoint, the run directory and
+the daemon's pid and log. The run directory is `STOW_DAEMON_DIR` when it is
+set, and the per-user cache directory's `stow/run` otherwise.
+
+The daemon takes what it knows about a plain build from the processes that
+connect, so who may connect decides whose cache and target directories it
+works in: the endpoint is owner-only (a `0600` socket in a `0700`
+directory on Unix, a pipe only the user's SID may open on Windows), and a
+sandbox that lets a process reach it gives that process the daemon's
+authority over the user's cache and the target directories of its builds.
+The output directories a session accepts are derived from the first unit
+of the build; they are not a security boundary.
+
+A daemon that restarts while a cargo is building leaves that build without
+the session's in-flight state and its record of locally built crates. The
+new daemon refuses that cargo's wrappers until it exits, so the build fails
+saying the daemon restarted; run it again.
+
+What the daemon logs while it decides a unit, such as a refused request,
+reaches the wrapper's stderr at `warn` and above. With
+`STOW_TRACE_WRAPPED_COMPILERS` set, `RUST_LOG` selects what else returns.
+Everything else is in the daemon's log, `<run dir>/daemon.log`.
+
 ## `stow update`
 
 Updates this install to the latest stow-cli release. The shell and

@@ -65,12 +65,34 @@ slowdown:
    verification). Re-run with `RUST_LOG=stow_cli=debug` and look at the
    `bundle_digest` the warn line names.
 
+## A plain `cargo build` fails naming the stow daemon
+
+Every compile of a build through stow's wrapper is answered by the per-user
+daemon, so a build that cannot reach it fails at cargo's first probe of the
+compiler, with the endpoint, the run directory and the daemon's pid and log
+in the message. A sandbox must let the process running cargo connect to
+`<run dir>/daemon.sock` (the named pipe on Windows) or start the daemon; see
+[Sandboxes](USAGE.md#sandboxes). On Windows the daemon is started only by
+the scheduled task `stow setup` registers: `the stow daemon is not running
+and its scheduled task stow-daemon-... is not registered` means setup has not
+run for this user (or for this `STOW_DAEMON_DIR`), so run `stow setup`.
+`schtasks /Query /TN stow-daemon-...` shows whether the task exists. A
+client that finds no daemon within `STOW_DAEMON_START_SECS` fails naming the
+daemon's log and leaves the task's run alone, since the run may be another
+client's; a run that hangs without serving is ended with `schtasks /End /TN
+stow-daemon-...`.
+`the stow daemon restarted during this
+cargo build` means the daemon was replaced while the build ran, which loses
+the build's in-flight state: run the build again.
+
 ## A unit misses when the index covers it
 
 `stow status` can show the index has rows for the build's dependencies
 without saying which unit failed to match them. Set `STOW_IDENTITY_TRACE`
 to a directory and re-run: every `stow rustc` wrapper process writes one
-`<crate>-<c_metadata>-<pid>.json` there per invocation, carrying the
+`<crate>-<c_metadata>-<pid>.json` per invocation — in a subdirectory
+named by the build's session id when the build runs as a session of the
+daemon — carrying the
 parsed inputs — target, rustc, emit, crate types, profile, features, and
 the resolved dependency `c_metadata` chain — plus the computed compile
 key and `c_metadata`. The diff between a missing unit's record and the

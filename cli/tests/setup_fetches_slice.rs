@@ -305,15 +305,24 @@ fn wrapper_shim(tools: &Path) -> PathBuf {
         "stow-rustc-wrapper{}",
         std::env::consts::EXE_SUFFIX
     ));
+    let runtime = tools.join(format!("stow-runtime{}", std::env::consts::EXE_SUFFIX));
     #[cfg(unix)]
-    std::os::unix::fs::symlink(exe, &shim).expect("symlink shim");
+    {
+        std::os::unix::fs::symlink(exe, &shim).expect("symlink shim");
+        std::os::unix::fs::symlink(exe, &runtime).expect("symlink runtime");
+    }
     #[cfg(windows)]
-    std::fs::copy(exe, &shim).expect("copy shim");
+    {
+        std::fs::copy(exe, &shim).expect("copy shim");
+        std::fs::copy(exe, &runtime).expect("copy runtime");
+    }
     shim
 }
 
 /// A plain `cargo build` through the wrapper shim: no `stow` parent, so
-/// the wrapper runs standalone — exactly the post-setup consumer.
+/// the daemon serves it a session of its cargo — exactly the post-setup
+/// consumer. Returns once that session has ended, so the cache holds
+/// everything the build stored.
 #[allow(
     clippy::too_many_arguments,
     reason = "each argument is one distinct build input"
@@ -328,7 +337,7 @@ fn plain_build(
     target_dir: &Path,
     envs: &[(&str, &Path)],
 ) -> std::process::Output {
-    let mut build = Command::new("cargo");
+    let mut build = support::cargo_command(home);
     hermetic_stow_env(&mut build, edge_url, cache_dir, home);
     build
         .arg("build")
@@ -343,7 +352,7 @@ fn plain_build(
     for (key, value) in envs {
         build.env(key, value);
     }
-    build.output().expect("run cargo build")
+    support::output_after_session(&mut build, home)
 }
 
 #[test]
@@ -358,6 +367,9 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
     let tools = support::tempdir().expect("tools dir");
     write_fixture(dir.path(), cargo_home.path(), "cfg-if = \"1\"\n");
     let shim = wrapper_shim(tools.path());
+    // The wrapper starts the daemon under the build's home; it is stopped
+    // with the test.
+    let _daemon = support::PrivateDaemon::in_home(&dir.path().join("stow-home"));
 
     // Fill: an all-miss build on a scratch cache compiles `cfg-if`
     // through the wrapper, which stores the artifact bundle locally —

@@ -35,6 +35,53 @@ pub enum Request {
     /// wrapper spends the compiler on a cache key. Answered with
     /// [`Answer::CcPolicy`].
     CcPolicy,
+    /// The environment the wrapper runs in, sent once because the daemon
+    /// asked for it with [`Answer::Describe`]. The daemon opens the build's
+    /// session from it and then answers the request it was holding.
+    Describe(BuildEnvironment),
+}
+
+/// The environment and working directory of the process that sends them:
+/// what the daemon opens a build's session from when no driver told it the
+/// build.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuildEnvironment {
+    /// Every variable, as name and value, OS-encoded like the argv.
+    pub environ: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The working directory, OS-encoded like the argv.
+    pub cwd: Vec<u8>,
+}
+
+impl BuildEnvironment {
+    /// The environment of this process.
+    ///
+    /// # Errors
+    ///
+    /// The working directory cannot be read.
+    pub fn current() -> Result<Self, String> {
+        let cwd = std::env::current_dir()
+            .map_err(|error| format!("read the working directory: {error}"))?;
+        Ok(Self {
+            environ: std::env::vars_os()
+                .map(|(name, value)| (os_bytes::encode(&name), os_bytes::encode(&value)))
+                .collect(),
+            cwd: os_bytes::encode(cwd.as_os_str()),
+        })
+    }
+
+    /// The decoded variables and working directory.
+    ///
+    /// # Errors
+    ///
+    /// When the peer's encoding is not decodable on this platform.
+    pub fn decode(&self) -> Result<(Vec<(OsString, OsString)>, std::path::PathBuf), String> {
+        let environ = self
+            .environ
+            .iter()
+            .map(|(name, value)| Ok((os_bytes::decode(name)?, os_bytes::decode(value)?)))
+            .collect::<Result<_, String>>()?;
+        Ok((environ, os_bytes::decode(&self.cwd)?.into()))
+    }
 }
 
 impl Request {
@@ -307,6 +354,10 @@ pub enum Answer {
         /// The build's C/C++ object cache is on.
         enabled: bool,
     },
+    /// No session exists for this build yet: the wrapper answers with
+    /// [`Request::Describe`] and keeps waiting for the answer to the
+    /// request it sent.
+    Describe,
     /// The session could not answer. The facade fails the build with
     /// this message rather than quietly compiling without the cache.
     Failed {

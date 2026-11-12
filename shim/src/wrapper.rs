@@ -112,6 +112,17 @@ pub fn capture_executable_beside(program: &Path) -> PathBuf {
     dir.join(executable_file_name(CAPTURE_LINK_PATH))
 }
 
+/// The runtime executable materialized beside a wrapper: `stow-runtime`
+/// (with the platform executable suffix) in the wrapper's directory. A
+/// wrapper is the runtime under another name, and a process started from
+/// that name would play the wrapper's role, so what starts the daemon from
+/// a wrapper starts this instead.
+#[must_use]
+pub fn runtime_executable_beside(program: &Path) -> PathBuf {
+    let dir = program.parent().unwrap_or_else(|| Path::new(""));
+    dir.join(executable_file_name(RUNTIME_LINK_PATH))
+}
+
 fn executable_file_name(base: &str) -> String {
     format!("{base}{}", std::env::consts::EXE_SUFFIX)
 }
@@ -530,6 +541,7 @@ mod tests {
 
     use super::{
         REAL_CC_ENV, REAL_CXX_ENV, RESOLVE_CC, RESOLVE_CXX, WrapperRole, capture_executable_beside,
+        runtime_executable_beside,
     };
 
     /// Every wrapper resolves to the runtime executable itself, so starting
@@ -644,6 +656,16 @@ mod tests {
         assert_eq!(
             capture,
             tools.join(format!("stow-capture{}", std::env::consts::EXE_SUFFIX))
+        );
+    }
+
+    #[test]
+    fn runtime_executable_sits_beside_the_wrapper() {
+        let tools = Path::new("/home/ci/.local/share/stow/tools");
+        let runtime = runtime_executable_beside(&tools.join("stow-rustc-wrapper"));
+        assert_eq!(
+            runtime,
+            tools.join(format!("stow-runtime{}", std::env::consts::EXE_SUFFIX))
         );
     }
 }

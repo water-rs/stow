@@ -26,7 +26,7 @@ use super::session::{SessionEnd, SessionFacts, SessionId};
 
 /// The protocol number this build speaks. Bumped when a message changes
 /// in a way an older peer cannot read.
-pub const PROTOCOL: u16 = 2;
+pub const PROTOCOL: u16 = 3;
 
 /// The oldest protocol number this build still reads. A daemon serves
 /// `PROTOCOL_FLOOR..=PROTOCOL`.
@@ -67,6 +67,20 @@ pub enum Role {
 pub enum SessionRef {
     /// The session a driver opened, by the id the daemon minted.
     Id(SessionId),
+    /// The session of the cargo that started the wrapper: no driver opened
+    /// one, so the daemon finds the cargo from the connection itself and
+    /// opens the session when the cargo's first wrapper describes the
+    /// build.
+    Cargo {
+        /// The wrapper's `CARGO` — the executable of the cargo that
+        /// started it — OS-encoded; absent when the wrapper's environment
+        /// has none.
+        cargo: Option<Vec<u8>>,
+        /// The `RUST_LOG` directives the wrapper wants the events of its
+        /// requests at, besides the warnings and errors it always gets;
+        /// set only when the wrapper traces (`STOW_TRACE_WRAPPED_COMPILERS`).
+        rust_log: Option<String>,
+    },
 }
 
 /// The first frame of every connection: who the client is.
@@ -344,7 +358,7 @@ mod tests {
             OutputRoots::new("/workspace/target".into(), None),
             RefusalPolicy::FailBuild,
         );
-        facts.environ = vec![
+        facts.build.environ = vec![
             (OsString::from("RUST_LOG"), OsString::from("stow_cli=debug")),
             #[cfg(unix)]
             (OsString::from("RAW"), {
@@ -352,7 +366,7 @@ mod tests {
                 OsString::from_vec(vec![b'a', 0xff, b'b'])
             }),
         ];
-        facts.rustc_extra_args = vec!["--remap-path-prefix=/workspace=.".to_owned()];
+        facts.build.rustc_extra_args = vec!["--remap-path-prefix=/workspace=.".to_owned()];
 
         let wire = encode(&ControlRequest::OpenSession(Box::new(facts.clone()))).expect("encode");
         let frame = read_frame(&mut wire.as_slice()).expect("frame");
@@ -366,8 +380,8 @@ mod tests {
             serde_json::to_value(&*decoded).expect("decoded facts"),
             serde_json::to_value(&facts).expect("original facts"),
         );
-        assert_eq!(decoded.environ, facts.environ);
-        assert_eq!(decoded.rustc_extra_args, facts.rustc_extra_args);
+        assert_eq!(decoded.build.environ, facts.build.environ);
+        assert_eq!(decoded.build.rustc_extra_args, facts.build.rustc_extra_args);
     }
 
     #[test]

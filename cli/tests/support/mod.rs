@@ -202,6 +202,13 @@ pub fn sealed_home_env(command: &mut Command, home: &Path) {
             .unwrap_or_else(|error| panic!("create {key} dir {}: {error}", dir.display()));
         command.env(key, dir);
     }
+    // On Windows every build starts the daemon through the task of its run
+    // directory, so a sealed home has its task before any child runs;
+    // [`TempDir`] deletes it with the home. Registering replaces a task
+    // already there (`schtasks /Create /F`), so a home whose task an earlier
+    // daemon's drop deleted, while its run directory stayed, has it again.
+    #[cfg(windows)]
+    register_daemon_task(&PrivateDaemon::run_dir_of(home));
     command
         // Every build starts the user's daemon when none is running: this
         // test's own runs under its home, where [`PrivateDaemon`] finds and
@@ -262,10 +269,112 @@ pub fn write_global_config(homes: &[&Path], contents: &str) {
     }
 }
 
+/// Longer than the daemon takes to notice an exited cargo and end its
+/// session; a session that never ends fails the test here.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+const SESSION_END_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A command that runs the toolchain's own `cargo`, the one that built this
+/// test. A test waits for the session of the cargo it started
+/// ([`PrivateDaemon::wait_session_ended`]), which the daemon opens for the
+/// process cargo names in `CARGO`. `cargo` found on `PATH` is rustup's proxy
+/// on a machine with rustup; on Windows the proxy runs the real cargo as its
+/// child instead of replacing itself, so the pid a test holds would not be
+/// the cargo the daemon owns the session for.
+///
+/// Sealed to `home` ([`sealed_home_env`]) from the start. A cargo can run
+/// `rustc -vV` through a wrapper whenever its `CARGO_HOME` configures one,
+/// and the wrapper then reaches the daemon of its `STOW_DAEMON_DIR`; an
+/// unsealed cargo would use the developer's real run directory. Every cargo
+/// a test starts comes from here (`sealed_cargo.rs` fails on any other).
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn cargo_command(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO"));
+    sealed_home_env(&mut command, home);
+    command
+}
+
+/// Run `command`, a plain `cargo` build through the stow wrappers, to its
+/// end and collect its output; then wait until the daemon under `home` has
+/// ended the session of that cargo ([`PrivateDaemon::wait_session_ended`]),
+/// so the cache and the target directory hold everything the build left.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn output_after_session(command: &mut Command, home: &Path) -> std::process::Output {
+    let child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start cargo");
+    let pid = child.id();
+    let output = child.wait_with_output().expect("wait for cargo");
+    wait_session_ended_in(&PrivateDaemon::run_dir_of(home), pid);
+    output
+}
+
+/// [`PrivateDaemon::wait_session_ended`] over the daemon log in `run_dir`.
+fn wait_session_ended_in(run_dir: &Path, cargo_pid: u32) {
+    // The daemon logs the owner as `pid <pid> started at tick <tick>`.
+    let owner = format!("pid {cargo_pid} started");
+    let logged = |message: &str| {
+        log_lines_in(run_dir, message)
+            .iter()
+            .any(|line| line.contains(&owner))
+    };
+    if !logged("opened a session for a cargo") {
+        return;
+    }
+    let deadline = std::time::Instant::now() + SESSION_END_LIMIT;
+    while !logged("ended a cargo's session") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon never ended the session of cargo {cargo_pid}:\n{}",
+            log_lines_in(run_dir, "").join("\n")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The lines of the daemon log in `run_dir` that contain `needle`.
+fn log_lines_in(run_dir: &Path, needle: &str) -> Vec<String> {
+    std::fs::read_to_string(run_dir.join("daemon.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(needle))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Register, through the product's own definition, the task that starts
+/// the daemon serving `run_dir`, as `stow setup` does for the user's.
+///
+/// # Panics
+///
+/// When the task cannot be registered.
+#[cfg(windows)]
+fn register_daemon_task(run_dir: &Path) {
+    stow_cli::scheduled_task::register(run_dir, Path::new(env!("CARGO_BIN_EXE_stow-cli")))
+        .unwrap_or_else(|error| panic!("register the daemon's scheduled task: {error}"));
+}
+
 /// The daemon a test's `stow-cli` runs started under `home`
 /// ([`sealed_home_env`] points `STOW_DAEMON_DIR` there): found by the pids
 /// its own log names, and stopped when this drops, so a test never leaves
 /// a daemon behind and never touches one it did not start.
+///
+/// On Windows a build starts the daemon only through the Task Scheduler,
+/// so [`PrivateDaemon::in_home`] registers the task of the private run
+/// directory, as `stow setup` does for the user's, and dropping it deletes
+/// the task.
 #[allow(
     dead_code,
     reason = "each test crate compiles this module whole; only some call it"
@@ -284,11 +393,22 @@ impl PrivateDaemon {
         home.join("run")
     }
 
-    /// The daemon of a child whose home is `home`.
+    /// The daemon of a child whose home is `home`; on Windows, with the
+    /// task that starts it registered.
+    ///
+    /// # Panics
+    ///
+    /// On Windows, when the task cannot be registered.
     pub fn in_home(home: &Path) -> Self {
-        Self {
-            run_dir: Self::run_dir_of(home),
-        }
+        let daemon = Self::at(Self::run_dir_of(home));
+        #[cfg(windows)]
+        register_daemon_task(daemon.run_dir());
+        daemon
+    }
+
+    /// The daemon that would run in `run_dir`, with nothing registered.
+    const fn at(run_dir: PathBuf) -> Self {
+        Self { run_dir }
     }
 
     pub fn run_dir(&self) -> &Path {
@@ -297,12 +417,19 @@ impl PrivateDaemon {
 
     /// The daemon log's lines that contain `needle`.
     pub fn log_lines(&self, needle: &str) -> Vec<String> {
-        std::fs::read_to_string(self.run_dir.join("daemon.log"))
-            .unwrap_or_default()
-            .lines()
-            .filter(|line| line.contains(needle))
-            .map(str::to_owned)
-            .collect()
+        log_lines_in(&self.run_dir, needle)
+    }
+
+    /// Wait until the daemon has ended the session it opened for the cargo
+    /// `cargo_pid`, if it opened one.
+    ///
+    /// A plain build's wrappers exit as soon as their compilers do; the
+    /// session's bookkeeping — the stores, the records, the miss journal —
+    /// completes when the daemon sees the cargo exit, so anything that reads
+    /// the cache after the build waits for this first. A cargo that never
+    /// ran a wrapper has no session, and there is nothing to wait for.
+    pub fn wait_session_ended(&self, cargo_pid: u32) {
+        wait_session_ended_in(&self.run_dir, cargo_pid);
     }
 
     /// The pids of the daemons that bound the endpoint, from their log.
@@ -335,6 +462,13 @@ impl PrivateDaemon {
 impl Drop for PrivateDaemon {
     fn drop(&mut self) {
         self.stop();
+        // A run directory that was never prepared has no task. A failure
+        // to delete one is not a test's failure, and a panic here would
+        // mask the failure that is.
+        #[cfg(windows)]
+        if self.run_dir.exists() {
+            let _ = stow_cli::scheduled_task::unregister(&self.run_dir);
+        }
     }
 }
 
@@ -409,7 +543,7 @@ impl Drop for TempDir {
             }
         }
         for home in homes {
-            drop(PrivateDaemon::in_home(&home));
+            drop(PrivateDaemon::at(PrivateDaemon::run_dir_of(&home)));
         }
     }
 }

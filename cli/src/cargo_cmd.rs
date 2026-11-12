@@ -266,7 +266,7 @@ async fn run_inner(
     // lets a build start at some other level (stow#1000).
     let isolation = crate::isolation::Isolation::resolve(
         args.isolation.isolation,
-        crate::config::load_isolation_config()?,
+        crate::config::load_isolation_config(&SessionEnv::of_this_process()?)?,
     )?;
     let cache_switches = args.cache;
     let invocation = CargoInvocation::new(command, args, isolation);
@@ -994,10 +994,13 @@ impl ProjectContext {
         // One `rustc -vV`, shared by every consumer of rustc facts —
         // the host triple below, the release version, the session
         // base and the link-resolution key (stow#608).
-        let rustc_vv = crate::rustc_args::shared_rustc_vv(build_rustc.executable().to_os_string());
+        let rustc_vv = crate::rustc_args::shared_rustc_vv(
+            build_rustc.executable().to_os_string(),
+            env.clone(),
+        );
         let target: SharedTargetProbe = resolved_targets.into_iter().next().map_or_else(
             || {
-                if let Some(target) = crate::rustc_args::configured_public_cache_target() {
+                if let Some(target) = crate::rustc_args::configured_public_cache_target(&env) {
                     return futures_util::future::ready(Ok(target)).boxed().shared();
                 }
                 let vv = rustc_vv.clone();
@@ -1008,7 +1011,7 @@ impl ProjectContext {
             |target| futures_util::future::ready(Ok(target)).boxed().shared(),
         );
         let rustc_version: Shared<BoxFuture<'static, Result<String, String>>> =
-            crate::rustc_args::configured_public_cache_rustc_version().map_or_else(
+            crate::rustc_args::configured_public_cache_rustc_version(&env).map_or_else(
                 || {
                     let vv = rustc_vv.clone();
                     async move { vv.await.and_then(|vv| crate::rustc_args::vv_release(&vv)) }
@@ -3926,31 +3929,36 @@ fn session_facts(
 ) -> stow_types::error::Result<crate::daemon::session::SessionFacts> {
     let project = plan.project;
     Ok(crate::daemon::session::SessionFacts {
-        environ: project.env.environ().to_vec(),
-        cwd: project.env.cwd().to_owned(),
-        project: project.facts.clone(),
-        toolchain: toolchain.facts(),
-        build_rustc: project.build_rustc.executable().to_owned(),
-        config: plan.config.cloned(),
-        public_cache_disabled: !plan.public_cache_mode.is_enabled(),
-        roots: resolved_output_roots(
-            &project.facts,
-            &project.env,
-            plan.cargo_args,
-            plan.current_dir,
-        )?,
-        refusal_policy: crate::daemon::session::invocation::RefusalPolicy::of_this_build(),
-        registry_sources,
-        seed: crate::daemon::session::Seed {
-            serve_map: plan.servable_units.cloned(),
-            cache_policy_entries: plan.cache_policy_entries.map(<[_]>::to_vec),
-            unit_nodes: plan.unit_nodes.cloned(),
-            prefetch_artifacts: plan.prefetch_artifacts.map(<[_]>::to_vec),
-            semantic_fallback_enabled: plan.semantic_fallback_enabled,
-            deferred: plan.deferred_analysis,
-            inexact_entries: plan.inexact_entries.unwrap_or(&[]).to_vec(),
+        build: crate::daemon::session::BuildFacts {
+            environ: project.env.environ().to_vec(),
+            cwd: project.env.cwd().to_owned(),
+            toolchain: toolchain.facts(),
+            config: plan.config.cloned(),
+            public_cache_disabled: !plan.public_cache_mode.is_enabled(),
+            public_cache_target: Some(project.facts.target.clone()),
+            roots: resolved_output_roots(
+                &project.facts,
+                &project.env,
+                plan.cargo_args,
+                plan.current_dir,
+            )?,
+            refusal_policy: crate::daemon::session::invocation::RefusalPolicy::of_this_build(),
+            registry_sources,
+            rustc_extra_args: rustc_wrapper_extra_args(plan.source_root)?,
         },
-        rustc_extra_args: rustc_wrapper_extra_args(plan.source_root)?,
+        driver: crate::daemon::session::DriverFacts {
+            project: project.facts.clone(),
+            build_rustc: project.build_rustc.executable().to_owned(),
+            seed: crate::daemon::session::Seed {
+                serve_map: plan.servable_units.cloned(),
+                cache_policy_entries: plan.cache_policy_entries.map(<[_]>::to_vec),
+                unit_nodes: plan.unit_nodes.cloned(),
+                prefetch_artifacts: plan.prefetch_artifacts.map(<[_]>::to_vec),
+                semantic_fallback_enabled: plan.semantic_fallback_enabled,
+                deferred: plan.deferred_analysis,
+                inexact_entries: plan.inexact_entries.unwrap_or(&[]).to_vec(),
+            },
+        },
     })
 }
 
@@ -4022,6 +4030,13 @@ async fn finish_cargo_run(
     // Cargo has exited, so every wrapper has, and the relay's connections
     // close with the sandbox.
     drop(cargo_run);
+    // On Windows the daemon starts the drain once it has ended the session
+    // (`Session::conclude`): this process may run inside the job object of
+    // a cargo (`cargo stow`) that ends with every process it holds, a drain
+    // started here included. The drain must find the gate open, so the
+    // hold is given up before the session ends.
+    #[cfg(windows)]
+    plan.project.foreground.release();
     // The session drains the last connections' post-compile bookkeeping
     // and writes the miss journal as it ends — the build's compile
     // observations are its miss list (stow#317), a failed build's units
@@ -4034,6 +4049,7 @@ async fn finish_cargo_run(
         plan.project.foreground.release();
         // Misses, admissions and the usage report exist only to reach the
         // network; the local-only and off cache modes keep none of them.
+        #[cfg(not(windows))]
         if config.cache.reaches_network() {
             admit_build_misses(plan, config).await;
         }
@@ -4054,6 +4070,7 @@ async fn finish_cargo_run(
 /// A detached drain posts the build's miss admission — the command returns
 /// as soon as cargo does. The caller has given up the foreground hold
 /// first: the drain this build spawns must find the gate open (stow#667).
+#[cfg(not(windows))]
 async fn admit_build_misses(plan: &CargoRunPlan<'_>, config: &StowConfig) {
     // The day's usage report posts from the detached drain — never on the
     // build's wall clock — so a due report is a reason to spawn that drain
@@ -4066,9 +4083,9 @@ async fn admit_build_misses(plan: &CargoRunPlan<'_>, config: &StowConfig) {
     // usage report forces the spawn so the day's deltas still leave the
     // machine through the detached lane (stow#889).
     if report_due {
-        crate::miss_journal::spawn_drain_unconditional(&target_dir);
+        crate::miss_journal::spawn_drain_unconditional(&target_dir, &plan.project.env);
     } else {
-        crate::miss_journal::spawn_drain(&target_dir);
+        crate::miss_journal::spawn_drain(&target_dir, &plan.project.env);
     }
     // One session is one build the install ran — counted here rather
     // than by the journal, whose session files the drain skips to keep
@@ -4899,7 +4916,7 @@ fn percentage(numerator: usize, denominator: usize) -> f64 {
 }
 
 #[derive(Debug, Clone)]
-enum PublicCacheMode {
+pub enum PublicCacheMode {
     Enabled,
     /// The public cache is off for this build. `message` is the warning for a
     /// cause the user did not choose; the remote cache layer being off is the
@@ -4910,7 +4927,7 @@ enum PublicCacheMode {
 }
 
 impl PublicCacheMode {
-    fn for_build(rustc_version: &str, cache: crate::config::CacheLayers) -> Self {
+    pub(crate) fn for_build(rustc_version: &str, cache: crate::config::CacheLayers) -> Self {
         if !cache.reaches_network() {
             return Self::Disabled { message: None };
         }
@@ -4925,7 +4942,7 @@ impl PublicCacheMode {
         }
     }
 
-    const fn is_enabled(&self) -> bool {
+    pub(crate) const fn is_enabled(&self) -> bool {
         matches!(self, Self::Enabled)
     }
 }

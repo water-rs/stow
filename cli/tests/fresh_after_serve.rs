@@ -23,11 +23,10 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::SystemTime;
 
 use build_fixture::{refused_url, stow_build_in, stow_setup_in, write_fixture};
-use support::sealed_home_env;
 
 /// Registry crates with build scripts that print `cargo:rerun-if-changed`
 /// / `cargo:rerun-if-env-changed` lines (`anyhow`, `libc`, `serde` — and
@@ -146,8 +145,7 @@ fn clone_registry_into(cargo_home: &Path, other_home: &Path) {
 /// `cargo build` with no stow wiring at all: a `CARGO_HOME` that never
 /// saw `stow setup`, `RUSTC_WRAPPER` removed from the environment.
 fn plain_cargo_build(dir: &Path, cargo_home: &Path, target_dir: &Path) -> Output {
-    let mut command = Command::new("cargo");
-    sealed_home_env(&mut command, &dir.join("stow-home"));
+    let mut command = support::cargo_command(&dir.join("stow-home"));
     command
         .args(["build", "--offline"])
         .current_dir(dir)

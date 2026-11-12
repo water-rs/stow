@@ -19,7 +19,6 @@ mod support;
 use std::io::{BufRead, BufReader, Write as _};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use build_fixture::stow_setup_in;
 
@@ -308,9 +307,13 @@ fn write_fixture(dir: &Path, with_macro: bool) {
     .expect("write manifest");
     // Fetch now so nothing under test needs the network — the probes are
     // path dependencies, so this is a lockfile write, not a download.
-    let fetched = Command::new("cargo")
+    // Sealed, with a cargo home of its own: the developer's `~/.cargo` may
+    // route `rustc -vV` through stow's wrapper to their real daemon.
+    let stow_home = dir.join("stow-home");
+    let fetched = support::cargo_command(&stow_home)
         .args(["fetch", "--offline"])
         .current_dir(dir)
+        .env("CARGO_HOME", stow_home.join(".cargo"))
         .output()
         .expect("cargo fetch");
     assert!(

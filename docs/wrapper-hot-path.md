@@ -17,51 +17,36 @@ Trace this with `STOW_TRACE_FILE=/tmp/stow.json stow check …` and look at the
    `current_thread` since there is at most one concurrent network task;
    every non-wrapper command (`stow check`, `stow build`, `stow predict`,
    the rest) gets `multi_thread`.
-3. **Tracing init** (`should_install_tracing` in `cli/src/lib.rs`). On the
-   wrapper path it installs only when `STOW_TRACE_WRAPPED_COMPILERS` is set
-   to a non-`0` value — `RUST_LOG` alone does not reach wrapped invocations,
-   so hundreds of subscriber builds never run per `cargo build`. Non-wrapper
-   commands always install it.
+3. **Tracing init** (`install_tracing` in `cli/src/lib.rs`). Every process
+   but the daemon installs a subscriber, so a wrapper can print the
+   warnings the daemon returns to it. A wrapper holds it to the default
+   `warn` filter, with no trace file, unless `STOW_TRACE_WRAPPED_COMPILERS`
+   is set to a non-`0` value — `RUST_LOG` alone does not reach wrapped
+   invocations. Non-wrapper commands always read `RUST_LOG`.
 4. **Session lookup** (`SessionLink::from_env` in `cli/src/daemon/client.rs`).
-   `STOW_SESSION` names the build's session on the per-user daemon: with it
-   set, the wrapper hands the invocation to the daemon (`delegate_to_daemon`
-   in `cli/src/lib.rs`, below) and loads no config, opens no state
-   database and reads no index. Unset, the wrapper runs standalone (the
-   second list).
+   `STOW_SESSION` names the build's session on the per-user daemon. Without
+   it the wrapper's first request finds the session of the cargo that
+   started it, which the daemon opens from the wrapper's environment when
+   there is none. Either way the wrapper hands the invocation to the daemon
+   (`delegate_to_daemon` in `cli/src/lib.rs`) and loads no config, opens no
+   state database and reads no index.
 
-With a session, the wrapper:
+The wrapper:
 
 1. connects to the daemon — directly, or through the driver's relay from
    inside a sandbox — and sends the invocation as one `Plan` request;
 2. exits successfully when the daemon served the unit from the cache, or
    runs the real `rustc` the answer names and reports its result, which the
-   session records.
+   session records. The daemon answers the report with a receipt before
+   it does any bookkeeping, so the wrapper exits as soon as `rustc` has and
+   keeps the build's job slot only as long as the compile;
+3. prints what the daemon logged while deciding the request, at `warn` and
+   above, which it sends ahead of the answer.
 
 Everything else — the build's config, toolchain, serve map, index slice,
 local cache, signature verification and the one connection to the edge —
-belongs to the daemon's session for the whole build.
-
-Standalone, with no `STOW_SESSION` (a plain `cargo build` through the
-`RUSTC_WRAPPER` that `stow setup` writes), the wrapper decides in its own
-process:
-
-1. **`StowConfig::load`** (`cli/src/config.rs`). Parses
-   `~/.config/stow/config.toml`.
-2. **`ParsedRustcArgs::parse`** (`types/src/rustc.rs`). In-memory arg walk; no
-   I/O.
-3. **`prepare_local_cache`** (`cli/src/artifact_cache.rs`). Opens the local
-   SQLite pool and walks the artifact cache for the resolved rustc lease.
-4. **Cache lookup** (`load_cached_bundle`). One SQLite query against the
-   exact-key index.
-5. **On exact-key hit:** `verify_cached_bundle_signature` runs once per unique
-   bundle, then materializes outputs into the cargo target dir via
-   `record_materialized_bundle_outputs` (reflink or copy).
-6. **On exact miss:** the wrapper resolves a candidate against the cached
-   index slice (`cli/src/index.rs` — read-only, no network), then
-   `fetch::download_bundle` streams the row's bundle through the edge byte
-   path, requires the bytes to hash to the row's `bundle_digest`, verifies
-   the signature, persists the bundle, then materializes.
-7. **Fall-through:** if no cache is available, exec the real `rustc`.
+belongs to the daemon's session for the whole build. A wrapper that cannot
+reach the daemon fails the compile; it never decides on its own.
 
 ## Things that must never run on this path
 
@@ -81,9 +66,10 @@ in `cargo check`/`cargo build`. Keep them at `stow check` startup, on
 * **`cargo metadata`.** Already removed; do not re-add. Use lockfile parsing
   via `workspace_deps::lockfile_registry_packages` instead.
 * **`rustc -vV` / `rustc --version` probes.** The build's session carries the
-  toolchain's facts, so a wrapper under a session probes nothing.
+  toolchain's facts, so a wrapper probes nothing; a probe it is handed
+  (`-vV`, `--print`) it runs itself, on the answer the daemon gives.
 * **Reading `~/.config/stow/config.toml`.** The build's session carries the
-  resolved config; only the standalone wrapper reads the file.
+  resolved config, loaded in the daemon.
 
 ## Measuring overhead
 

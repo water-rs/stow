@@ -20,6 +20,7 @@ use crate::index;
 use crate::mold;
 use crate::resolve;
 use crate::rustc_args::{detect_rustc_host_target, detect_rustc_version};
+use crate::session_env::SessionEnv;
 use crate::state_db::StateDb;
 use crate::stats;
 use crate::wrapper_shim;
@@ -38,9 +39,10 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
     let cargo_home = config::require_cargo_home()?;
     // The host triple and the version probe are independent answers
     // from the same toolchain — await them together (stow#1032).
+    let env = SessionEnv::of_this_process()?;
     let (host_target, rustc_version) = tokio::join!(
-        detect_rustc_host_target(std::ffi::OsStr::new("rustc")),
-        detect_rustc_version(std::ffi::OsStr::new("rustc")),
+        detect_rustc_host_target(std::ffi::OsStr::new("rustc"), &env),
+        detect_rustc_version(std::ffi::OsStr::new("rustc"), &env),
     );
     let host_target = host_target
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
@@ -143,8 +145,28 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
         let installed = install_launch_agent(&wrappers.runtime_executable).await?;
         write_stdout(&format!("launch agent: {}\n", installed.plist.display()))?;
     }
+    // The Windows counterpart: the task that is both the login trigger and
+    // the only way a build starts the daemon (stow#1454).
+    #[cfg(windows)]
+    {
+        let task = register_daemon_task(&wrappers.runtime_executable).await?;
+        write_stdout(&format!("scheduled task: {task}\n"))?;
+    }
 
     Ok(())
+}
+
+/// Register the Task Scheduler task that starts the daemon for the run
+/// directory this process resolves, and return its name.
+#[cfg(windows)]
+async fn register_daemon_task(runtime_executable: &Path) -> stow_types::error::Result<String> {
+    let runtime_executable = runtime_executable.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let run_dir = crate::daemon::RunDir::locate()?;
+        crate::daemon::scheduled_task::register(&run_dir, &runtime_executable)
+    })
+    .await
+    .wrap_err("register the daemon's scheduled task")?
 }
 
 /// Write the daemon's `LaunchAgent` under the user's `~/Library` and load
@@ -283,9 +305,12 @@ fn configure_document(
 async fn print_setup_env(state_db: &StateDb) -> stow_types::error::Result<()> {
     let wrappers = detect_wrapper_commands()?;
     let config = StowConfig::load(state_db.clone())?;
-    let host_target = detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
-        .await
-        .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
+    let host_target = detect_rustc_host_target(
+        std::ffi::OsStr::new("rustc"),
+        &SessionEnv::of_this_process()?,
+    )
+    .await
+    .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
     write_stdout(&setup_env_output(
         &wrappers,
         &host_target,
@@ -632,7 +657,7 @@ fn local_stats_table(report: &StatsReport) -> String {
 
 /// `stow clean`: remove the local stow cache directory.
 pub async fn clean_project() -> stow_types::error::Result<()> {
-    let cache_dir = config::cache_dir()?;
+    let cache_dir = config::cache_dir(&SessionEnv::of_this_process()?)?;
     if cache_dir.exists() {
         async_fs::remove_dir_all(&cache_dir)
             .await
@@ -765,9 +790,12 @@ pub async fn index_status(state_db: &StateDb) -> stow_types::error::Result<()> {
 async fn resolve_index_target(overridden: Option<String>) -> stow_types::error::Result<String> {
     match overridden {
         Some(target) => Ok(target),
-        None => detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
-            .await
-            .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}")),
+        None => detect_rustc_host_target(
+            std::ffi::OsStr::new("rustc"),
+            &SessionEnv::of_this_process()?,
+        )
+        .await
+        .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}")),
     }
 }
 
@@ -776,9 +804,12 @@ async fn resolve_index_rustc_version(
 ) -> stow_types::error::Result<String> {
     match overridden {
         Some(rustc_version) => Ok(rustc_version),
-        None => detect_rustc_version(std::ffi::OsStr::new("rustc"))
-            .await
-            .map_err(|error| stow_types::stow_error!("detect rustc version: {error}")),
+        None => detect_rustc_version(
+            std::ffi::OsStr::new("rustc"),
+            &SessionEnv::of_this_process()?,
+        )
+        .await
+        .map_err(|error| stow_types::stow_error!("detect rustc version: {error}")),
     }
 }
 

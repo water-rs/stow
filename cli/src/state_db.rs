@@ -209,8 +209,8 @@ async fn ensure_schema(pool: &SqlitePool, path: &Path) -> stow_types::error::Res
 /// A process closes its connection before it exits (see [`StateDb`]),
 /// and the last connection's close otherwise checkpoints the WAL and
 /// syncs the database file — about 20 ms on macOS and Windows for a
-/// process that is the database's only connection, which a standalone
-/// wrapper is once per compiled unit. The close this leaves still
+/// process that is the database's only connection, which a short-lived
+/// command is on every run. The close this leaves still
 /// unmaps `-shm` before it releases the file's locks, which is all the
 /// next opener needs (stow#682); the WAL it leaves is bounded by
 /// [`StateDb::close`], which truncates it once it reaches

@@ -151,12 +151,33 @@ fn cc_is_invoked_with_compiler_arguments_only() {
     // The shim re-enters `stow-cli`, which reads the stow config — the
     // sealed home keeps the developer's `~/.stow` out of it (stow#800).
     let home = dir.path().join("stow-home");
+    // The shim's compile is answered by the daemon, which this test starts
+    // under its home and stops with it.
+    let _daemon = support::PrivateDaemon::in_home(&home);
     hermetic_stow_env(
         &mut command,
         &refused_url(),
         &home.join("stow-cache"),
         &home,
     );
+    // Not run by a cargo: the test process owns the build, and the `CARGO`
+    // the test runner leaves in the environment names a process that is
+    // not among the shim's ancestors.
+    command.env_remove("CARGO");
+    // What cargo sets for a build script, which is what a C compiler runs
+    // under: the daemon lays the session's roots out from `OUT_DIR` and
+    // takes the toolchain from `RUSTC`.
+    command
+        .env(
+            "OUT_DIR",
+            dir.path()
+                .join("target")
+                .join("debug")
+                .join("build")
+                .join("probe-0123456789abcdef")
+                .join("out"),
+        )
+        .env("RUSTC", "rustc");
     if msvc_family {
         command.arg(format!("-Fo{}", object.display()));
     } else {

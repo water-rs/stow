@@ -1,4 +1,10 @@
-//! Starting a process that outlives the one that starts it.
+//! Starting a process that keeps nothing of the one that starts it.
+//!
+//! On Unix the process also outlives its starter. On Windows it does not
+//! leave the starter's job object, and a build's cargo runs in a job that
+//! kills every member when cargo ends, so only a starter outside any such
+//! job — the daemon, which the Task Scheduler starts (`scheduled_task`) —
+//! starts a process meant to outlive a build.
 //!
 //! Such a process keeps nothing of its starter: whatever it inherits stays
 //! open for as long as it runs. A pipe is the sharp case — a caller that
@@ -24,7 +30,7 @@ use std::path::Path;
 #[cfg(unix)]
 pub type Child = std::process::Child;
 #[cfg(windows)]
-pub use windows::Child;
+pub use windows::{Child, arguments_text};
 
 /// A process to start detached: the program, its arguments, exactly the
 /// environment named here, null standard input and output, and the
@@ -414,6 +420,29 @@ mod windows {
         Ok(line)
     }
 
+    /// `args` as the argument part of a command line, quoted as
+    /// [`command_line`] quotes them, for a field that holds one (a
+    /// scheduled task's `Arguments`).
+    ///
+    /// # Errors
+    ///
+    /// An argument is not valid Unicode.
+    pub fn arguments_text(args: &[OsString]) -> io::Result<String> {
+        let mut line = Vec::new();
+        for (index, arg) in args.iter().enumerate() {
+            if index > 0 {
+                line.push(SPACE);
+            }
+            push_argument(&mut line, arg);
+        }
+        String::from_utf16(&line).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an argument is not valid Unicode",
+            )
+        })
+    }
+
     /// Append `arg` as one argument: quoted when it is empty or holds a
     /// space or tab; a quote is escaped with a backslash, and the
     /// backslashes before a quote — or before the closing quote — are
@@ -517,6 +546,15 @@ mod windows {
             // SAFETY: the array came from `CommandLineToArgvW`.
             unsafe { LocalFree(argv.cast()) };
             split
+        }
+
+        #[test]
+        fn arguments_are_quoted_for_a_field_that_holds_a_command_line() {
+            let args = ["daemon", "--run-dir", r"C:\Users\a b\run"].map(OsString::from);
+            assert_eq!(
+                super::arguments_text(&args).expect("text"),
+                r#"daemon --run-dir "C:\Users\a b\run""#
+            );
         }
 
         /// Every argument survives the line as it was, whatever spaces,

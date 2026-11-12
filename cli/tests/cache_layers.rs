@@ -44,6 +44,10 @@ const SERVED_LOCALLY: &str = "served rustc invocation from local stow artifact c
 /// The debug event a gated lookup emits when the layer is off for the entry.
 const LAYER_OFF: &str = "cache layer off for this entry";
 
+/// The decision log for a unit kept local behind a dependency the build
+/// compiled itself.
+const DEPENDENCY_COMPILED_LOCALLY: &str = "dependency was compiled locally in this build";
+
 const REMOTE_OFF: &str = "[cache]\nremote = false\n";
 const CRATES_IO_OFF: &str = "[cache]\nlocal_crates_io = false\n";
 const GIT_OFF: &str = "[cache]\nlocal_git = false\n";
@@ -288,10 +292,16 @@ fn remote_off_does_not_serve_downloaded_entries(config: &str, flags: &[&str]) {
     }
     // A unit over a dependency that compiled here compiles here too, without
     // a lookup; the leaves are looked up and refused by the layer gate.
-    for package in ["cfg_if", "memchr", "unicode_ident", "proc_macro2"] {
+    for package in ["cfg_if", "memchr", "unicode_ident"] {
         assert!(
             logged(&stderr, LAYER_OFF, package),
             "the downloaded {package} entry was not refused by the layer gate:\n{stderr}"
+        );
+    }
+    for package in ["proc_macro2", "quote"] {
+        assert!(
+            logged(&stderr, DEPENDENCY_COMPILED_LOCALLY, package),
+            "{package} was not kept local behind its locally compiled dependency:\n{stderr}"
         );
     }
     assert_eq!(

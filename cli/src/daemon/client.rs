@@ -23,7 +23,9 @@ use super::start::{connect_or_start, describe_daemon};
 use super::{RunDir, Settings};
 use crate::daemon::session::handler::CONNECTION_DRAIN_BUDGET;
 use crate::daemon::session::os_bytes;
-use crate::daemon::wrapper::{Answer, ArtifactNotifications, CcCompiled, CcLookup, Compiled, Plan};
+use crate::daemon::wrapper::{
+    Answer, ArtifactNotifications, BuildEnvironment, CcCompiled, CcLookup, Compiled, Plan,
+};
 
 /// The variable a build's driver exports so its wrappers find the build's
 /// session.
@@ -46,29 +48,32 @@ pub enum SessionLink {
     /// Through the driver's relay at this IPC socket: a sandboxed wrapper
     /// holds neither the daemon's endpoint nor a session id.
     Relay(PathBuf),
+    /// Straight to the daemon, which finds the cargo that started this
+    /// wrapper and serves it a session of its own: no driver opened one.
+    Cargo,
 }
 
 impl SessionLink {
-    /// The link this process's environment names, if it names one. Unset
-    /// or empty means the wrapper runs under no driver.
+    /// The link this process's environment names. Unset or empty means the
+    /// wrapper runs under no driver, so its cargo owns the session.
     ///
     /// # Errors
     ///
     /// The variable is set but is neither a session id nor a relay.
-    pub fn from_env() -> std::result::Result<Option<Self>, String> {
+    pub fn from_env() -> std::result::Result<Self, String> {
         let Some(raw) = std::env::var_os(STOW_SESSION_ENV) else {
-            return Ok(None);
+            return Ok(Self::Cargo);
         };
         let raw = raw
             .to_str()
             .ok_or_else(|| format!("{STOW_SESSION_ENV} is not valid Unicode"))?;
-        if raw.is_empty() {
-            return Ok(None);
-        }
-        Self::parse(raw).map(Some)
+        Self::parse(raw)
     }
 
     fn parse(raw: &str) -> std::result::Result<Self, String> {
+        if raw.is_empty() {
+            return Ok(Self::Cargo);
+        }
         match raw.strip_prefix(RELAY_PREFIX) {
             Some(path) if !path.is_empty() => Ok(Self::Relay(PathBuf::from(path))),
             Some(_) => Err(format!("{STOW_SESSION_ENV} names a relay without a socket")),
@@ -83,6 +88,7 @@ impl SessionLink {
     #[must_use]
     pub fn encode(&self) -> OsString {
         match self {
+            Self::Cargo => OsString::new(),
             Self::Direct(id) => OsString::from(id.to_string()),
             Self::Relay(path) => {
                 let mut value = OsString::from(RELAY_PREFIX);
@@ -196,6 +202,50 @@ pub struct WrapperStream<S> {
     stream: S,
     greeting: Option<Hello>,
     answer: Duration,
+    reach: Option<Reach>,
+}
+
+/// Where the daemon a wrapper talks to lives: what every failure to get an
+/// answer from it names, so one message serves every way the daemon can be
+/// out of reach.
+#[derive(Debug, Clone)]
+pub struct Reach {
+    endpoint: PathBuf,
+    run_dir: PathBuf,
+    log: PathBuf,
+}
+
+/// What every failure to reach the daemon says about the build: no wrapper
+/// decides anything on its own.
+const NO_BUILD_WITHOUT_DAEMON: &str = "every compile of a cargo build through stow's wrapper is answered by the stow daemon, so the build cannot run where the daemon cannot be reached";
+
+impl Reach {
+    /// The daemon of this user's run directory.
+    ///
+    /// # Errors
+    ///
+    /// The run directory cannot be located or created.
+    pub async fn locate() -> Result<Self> {
+        let run_dir = run_dir().await?;
+        Ok(Self {
+            endpoint: run_dir.endpoint(),
+            run_dir: run_dir.path().to_owned(),
+            log: run_dir.log(),
+        })
+    }
+
+    /// `failure` with what a person needs to find the daemon: the endpoint
+    /// and run directory it serves from, its pid and its log, and that no
+    /// compile of the build runs without it.
+    #[must_use]
+    pub fn explain(&self, failure: &str) -> String {
+        format!(
+            "{failure} ({NO_BUILD_WITHOUT_DAEMON}; endpoint {}, run directory {}, daemon {})",
+            self.endpoint.display(),
+            self.run_dir.display(),
+            describe_daemon(&self.log)
+        )
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
@@ -206,10 +256,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
             stream,
             greeting: Some(Hello::new(Role::Wrapper { session })),
             answer,
+            reach: None,
         }
     }
 
-    /// Send `request` and read its answer.
+    /// Name the daemon in every failure of this conversation.
+    #[must_use]
+    pub fn reaching(mut self, reach: Reach) -> Self {
+        self.reach = Some(reach);
+        self
+    }
+
+    /// Send `request` and read its answer. A daemon that has no session
+    /// for the wrapper's cargo asks for the wrapper's environment, which is
+    /// sent before the answer is waited for.
     ///
     /// # Errors
     ///
@@ -219,6 +279,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
         &mut self,
         request: &WrapperRequest,
     ) -> std::result::Result<Answer, String> {
+        self.converse(request)
+            .await
+            .map_err(|failure| match &self.reach {
+                Some(reach) => reach.explain(&failure),
+                None => failure,
+            })
+    }
+
+    async fn send(&mut self, request: &WrapperRequest) -> std::result::Result<(), String> {
         // The `Hello` and the first request go out in one write.
         let mut bytes = match self.greeting.take() {
             Some(hello) => encode(&hello).map_err(|error| error.to_string())?,
@@ -232,7 +301,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
         self.stream
             .flush()
             .await
-            .map_err(|error| format!("send a request to the stow daemon: {error}"))?;
+            .map_err(|error| format!("send a request to the stow daemon: {error}"))
+    }
+
+    async fn converse(&mut self, request: &WrapperRequest) -> std::result::Result<Answer, String> {
+        self.send(request).await?;
         loop {
             let frame = tokio::time::timeout(self.answer, read_frame_async(&mut self.stream))
                 .await
@@ -256,7 +329,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
                 .decode::<Response>()
                 .map_err(|error| error.to_string())?
             {
-                Response::Working => {}
+                // What the daemon logged while deciding this wrapper's
+                // request, which it carries ahead of the answer.
+                Response::Event(Event::Log(record)) => record_log(&record),
+                // A wrapper keeps no spans of the daemon's and waits on no
+                // resolution.
+                Response::Working | Response::Event(_) => {}
+                Response::Answer(Answer::Describe) => {
+                    let environment = BuildEnvironment::current()?;
+                    self.send(&WrapperRequest::Describe(environment)).await?;
+                }
                 Response::Answer(answer) => return Ok(answer),
                 Response::Rejected { reason } => {
                     return Err(format!("the stow daemon refused the request: {reason}"));
@@ -338,18 +420,19 @@ impl WrapperConnection {
     /// hides.
     pub async fn open(link: &SessionLink) -> std::result::Result<Self, String> {
         match link {
-            SessionLink::Direct(id) => {
-                let exe = std::env::current_exe()
-                    .map_err(|error| format!("resolve this wrapper's own executable: {error}"))?;
-                let settings = Settings::from_env().map_err(|error| error.to_string())?;
-                let stream = connect(exe, settings)
-                    .await
-                    .map_err(|error| format!("{error:#}"))?;
-                Ok(Self::Direct(WrapperStream::new(
-                    stream,
-                    SessionRef::Id(*id),
-                    settings.answer,
-                )))
+            SessionLink::Direct(id) => Self::open_direct(SessionRef::Id(*id)).await,
+            SessionLink::Cargo => {
+                Self::open_direct(SessionRef::Cargo {
+                    cargo: std::env::var_os("CARGO").map(|cargo| os_bytes::encode(&cargo)),
+                    // A wrapper that does not trace takes the warnings the
+                    // daemon returns to it and nothing more.
+                    rust_log: crate::wrapper_tracing_requested(
+                        std::env::var_os(crate::STOW_TRACE_WRAPPED_COMPILERS_ENV).as_deref(),
+                    )
+                    .then(|| std::env::var("RUST_LOG").ok())
+                    .flatten(),
+                })
+                .await
             }
             SessionLink::Relay(path) => {
                 let path = path.clone();
@@ -366,37 +449,21 @@ impl WrapperConnection {
         }
     }
 
-    /// Ask what to do with one rustc invocation.
-    ///
-    /// # Errors
-    ///
-    /// Transport failures, and a daemon that answers with a failure of its
-    /// own.
-    pub async fn plan(
-        &mut self,
-        executable: &std::ffi::OsStr,
-        args: &[OsString],
-    ) -> std::result::Result<Decision, String> {
-        let plan = Plan::new(
-            executable,
-            args,
-            crate::daemon::wrapper::InvocationEnv::current(),
-        );
-        match self
-            .exchange(&WrapperRequest::Plan(plan))
-            .await?
-            .ok_or_else(no_answer)?
-        {
-            Answer::Served(notifications) => Ok(Decision::Served(notifications)),
-            Answer::Compile(command) => Ok(Decision::Compile {
-                executable: command.executable()?,
-                args: command.args()?,
-            }),
-            Answer::Failed { message } => Err(message),
-            other => Err(format!(
-                "the daemon answered a plan with {other:?}, which is not a decision"
-            )),
-        }
+    /// A conversation with the daemon, started from the runtime executable
+    /// when it is down.
+    async fn open_direct(session: SessionRef) -> std::result::Result<Self, String> {
+        let exe = runtime_executable()?;
+        let settings = Settings::from_env().map_err(|error| error.to_string())?;
+        // With no run directory there is no endpoint, log or pid to name.
+        let reach = Reach::locate()
+            .await
+            .map_err(|error| format!("{error:#} ({NO_BUILD_WITHOUT_DAEMON})"))?;
+        let stream = connect(exe, settings)
+            .await
+            .map_err(|error| reach.explain(&format!("{error:#}")))?;
+        Ok(Self::Direct(
+            WrapperStream::new(stream, session, settings.answer).reaching(reach),
+        ))
     }
 
     /// Whether the build's C/C++ object cache is on.
@@ -475,34 +542,6 @@ impl WrapperConnection {
         }
     }
 
-    /// Report the compile the daemon asked for and wait for its receipt.
-    /// The receipt precedes the daemon's bookkeeping, so the wrapper exits
-    /// as soon as rustc has and its unit is already recorded as exited
-    /// (stow#1431).
-    ///
-    /// # Errors
-    ///
-    /// Transport failures, and a daemon that refuses the report.
-    pub async fn report(
-        &mut self,
-        success: bool,
-        compile_time: Duration,
-    ) -> std::result::Result<(), String> {
-        let report = Compiled {
-            success,
-            compile_millis: crate::duration_millis(compile_time),
-        };
-        match self
-            .exchange(&WrapperRequest::Compiled(report))
-            .await?
-            .ok_or_else(no_answer)?
-        {
-            Answer::Received => Ok(()),
-            Answer::Failed { message } => Err(message),
-            other => Err(format!("the daemon answered a report with {other:?}")),
-        }
-    }
-
     /// End the conversation, which ends the connection's flight on the
     /// daemon. No wrapper leaves through `std::process::exit` with a
     /// connection in hand (stow#682), so a drop releases it too; the close
@@ -562,6 +601,98 @@ impl WrapperConnection {
             }
         }
     }
+}
+
+/// A wrapper's conversation with its session on the daemon, as a rustc
+/// wrapper has it: ask what to do with an invocation, and report the
+/// compile the answer sent it to run. A wrapper's own code is written
+/// against this, so a test can run it over a stream it holds both ends of.
+pub trait Conversation {
+    /// Send `request` and wait for the daemon's answer.
+    ///
+    /// # Errors
+    ///
+    /// The daemon closes the connection, goes quiet for longer than the
+    /// answer bound, or refuses the request.
+    async fn exchange(&mut self, request: &WrapperRequest) -> std::result::Result<Answer, String>;
+
+    /// Ask what to do with one rustc invocation.
+    ///
+    /// # Errors
+    ///
+    /// Transport failures, and a daemon that answers with a failure of its
+    /// own.
+    async fn plan(
+        &mut self,
+        executable: &std::ffi::OsStr,
+        args: &[OsString],
+    ) -> std::result::Result<Decision, String> {
+        let plan = Plan::new(
+            executable,
+            args,
+            crate::daemon::wrapper::InvocationEnv::current(),
+        );
+        match Conversation::exchange(self, &WrapperRequest::Plan(plan)).await? {
+            Answer::Served(notifications) => Ok(Decision::Served(notifications)),
+            Answer::Compile(command) => Ok(Decision::Compile {
+                executable: command.executable()?,
+                args: command.args()?,
+            }),
+            Answer::Failed { message } => Err(message),
+            other => Err(format!(
+                "the daemon answered a plan with {other:?}, which is not a decision"
+            )),
+        }
+    }
+
+    /// Report the compile the daemon asked for and wait for its receipt.
+    /// The receipt precedes the daemon's bookkeeping, so the wrapper exits
+    /// as soon as rustc has and its unit is already recorded as exited
+    /// (stow#1431).
+    ///
+    /// # Errors
+    ///
+    /// Transport failures, and a daemon that refuses the report.
+    async fn report(
+        &mut self,
+        success: bool,
+        compile_time: Duration,
+    ) -> std::result::Result<(), String> {
+        let report = Compiled {
+            success,
+            compile_millis: crate::duration_millis(compile_time),
+        };
+        match Conversation::exchange(self, &WrapperRequest::Compiled(report)).await? {
+            Answer::Received => Ok(()),
+            Answer::Failed { message } => Err(message),
+            other => Err(format!("the daemon answered a report with {other:?}")),
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> Conversation for WrapperStream<S> {
+    async fn exchange(&mut self, request: &WrapperRequest) -> std::result::Result<Answer, String> {
+        Self::exchange(self, request).await
+    }
+}
+
+impl Conversation for WrapperConnection {
+    async fn exchange(&mut self, request: &WrapperRequest) -> std::result::Result<Answer, String> {
+        Self::exchange(self, request).await?.ok_or_else(no_answer)
+    }
+}
+
+/// The executable that starts the daemon: the runtime. A wrapper is the
+/// runtime under a wrapper's name, which would play that wrapper's role
+/// again, so the `stow-runtime` link beside it is used instead.
+fn runtime_executable() -> std::result::Result<PathBuf, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("resolve this wrapper's own executable: {error}"))?;
+    Ok(if stow_shim::WrapperRole::from_program(&exe).is_some() {
+        stow_shim::runtime_executable_beside(&exe)
+    } else {
+        exe
+    })
 }
 
 fn no_answer() -> String {
@@ -807,6 +938,7 @@ mod tests {
         for link in [
             SessionLink::Direct(id),
             SessionLink::Relay("/tmp/heel/ipc.sock".into()),
+            SessionLink::Cargo,
         ] {
             let spelled = link.encode();
             assert_eq!(
@@ -814,6 +946,106 @@ mod tests {
                 Ok(link)
             );
         }
+    }
+
+    fn reach(dir: &std::path::Path) -> super::Reach {
+        let log = dir.join("daemon.log");
+        std::fs::write(&log, "INFO stow daemon serving pid=4242 endpoint=x\n").expect("log");
+        super::Reach {
+            endpoint: dir.join("daemon.sock"),
+            run_dir: dir.to_owned(),
+            log,
+        }
+    }
+
+    #[test]
+    fn an_unreachable_daemon_is_named_by_endpoint_run_directory_pid_and_log() {
+        let dir = tempfile::tempdir().expect("dir");
+        let message = reach(dir.path()).explain("connect failed");
+        for part in [
+            "connect failed",
+            "daemon.sock",
+            "pid 4242",
+            "daemon.log",
+            &dir.path().display().to_string(),
+            "cannot run where the daemon cannot be reached",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_request_names_the_daemon() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (client, mut daemon_end) = tokio::io::duplex(1 << 16);
+        let mut stream = super::WrapperStream::new(
+            client,
+            super::SessionRef::Cargo {
+                cargo: None,
+                rust_log: None,
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .reaching(reach(dir.path()));
+        let refusal = super::encode(&super::Response::Rejected {
+            reason: "no such cargo".to_owned(),
+        })
+        .expect("encode");
+        tokio::io::AsyncWriteExt::write_all(&mut daemon_end, &refusal)
+            .await
+            .expect("write");
+        let error = stream
+            .exchange(&super::WrapperRequest::CcPolicy)
+            .await
+            .expect_err("refused");
+        assert!(
+            error.contains("no such cargo") && error.contains("pid 4242"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_asks_for_the_environment_is_sent_it_before_the_answer() {
+        let (client, mut daemon_end) = tokio::io::duplex(1 << 20);
+        let mut stream = super::WrapperStream::new(
+            client,
+            super::SessionRef::Cargo {
+                cargo: None,
+                rust_log: None,
+            },
+            std::time::Duration::from_secs(5),
+        );
+        let daemon = async move {
+            // The hello and the held request arrive together.
+            for _ in 0..2 {
+                super::read_frame_async(&mut daemon_end)
+                    .await
+                    .expect("read")
+                    .expect("a frame");
+            }
+            let describe =
+                super::encode(&super::Response::Answer(super::Answer::Describe)).expect("encode");
+            tokio::io::AsyncWriteExt::write_all(&mut daemon_end, &describe)
+                .await
+                .expect("write");
+            let environment = super::read_frame_async(&mut daemon_end)
+                .await
+                .expect("read")
+                .expect("the environment")
+                .decode::<super::WrapperRequest>()
+                .expect("request");
+            assert!(
+                matches!(environment, super::WrapperRequest::Describe(_)),
+                "{environment:?}"
+            );
+            let answer =
+                super::encode(&super::Response::Answer(super::Answer::CcMiss)).expect("encode");
+            tokio::io::AsyncWriteExt::write_all(&mut daemon_end, &answer)
+                .await
+                .expect("write");
+        };
+        let (answer, ()) = tokio::join!(stream.exchange(&super::WrapperRequest::CcPolicy), daemon);
+        assert_eq!(answer, Ok(super::Answer::CcMiss));
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! It takes `daemon.lock` without blocking, so a second daemon — one the
 //! login trigger started beside a client's, say — finds the lock held and
 //! exits 0. The holder removes a stale endpoint, binds its own, reports
-//! readiness to the client that spawned it (`--ready <endpoint>`) and
-//! serves. The lock is a file lock, so a dead daemon releases it and no
+//! readiness to the client that started it (`--ready <endpoint>`, or on
+//! Windows the address that client published) and serves. The lock is a file lock, so a dead daemon releases it and no
 //! pid file is needed.
 //!
 //! A connection says what it is in its `Hello`. A *control* connection
@@ -27,18 +27,22 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, Layer as _};
 
-use super::events::{LogInterest, SessionLogs};
+use super::events::{LogInterest, SESSION_SPAN, SessionLogs};
 use super::log::LogWriter;
 use super::notify::{self, Notification};
+use super::owner::{self, CargoOwner, OsProcesses, Processes};
 use super::protocol::{
     ControlRequest, Event, Frame, Hello, PROTOCOL, PROTOCOL_FLOOR, Response, Role, SessionRef,
     WrapperRequest, read_frame_async, speaks, write_frame_async,
 };
-use super::session::{CacheDirHandles, Session, SessionFacts, SessionId};
+use super::session::{
+    CacheDirHandles, Cargo, Opener, Origin, Session, SessionFacts, SessionId, keep_only_owner,
+    open_facts, os_bytes, recorded_owner,
+};
 use super::table::SessionTable;
 use super::{RunDir, Settings};
-use crate::daemon::session::handler::{Flight, Handler, InFlightUnits, Reports, answer_and_book};
-use crate::daemon::wrapper::Answer;
+use crate::daemon::session::handler::answer_and_book;
+use crate::daemon::wrapper::{Answer, BuildEnvironment, CompileCommand};
 use crate::file_lock::FileLock;
 
 #[cfg(unix)]
@@ -52,23 +56,26 @@ struct Listener {
 
 /// What every connection of one daemon shares.
 #[derive(Debug, Clone)]
-struct Daemon {
+struct Daemon<P> {
     /// Where the sessions' directories live.
     sessions: PathBuf,
     settings: Settings,
     /// The routes carrying a session's events to the driver that owns it.
     logs: SessionLogs,
     table: SessionTable,
+    /// The machine's processes: which cargo a wrapper runs under, and when
+    /// it exits.
+    processes: P,
 }
 
 /// Run the daemon until it fails. Returns `Ok` only when another daemon
 /// already holds the lock.
-pub async fn run(ready: Option<PathBuf>) -> Result<()> {
+pub async fn run(ready: Option<PathBuf>, given_dir: Option<PathBuf>) -> Result<()> {
     let logs = SessionLogs::default();
     let run_dir = blocking({
         let logs = logs.clone();
         move || {
-            let run_dir = RunDir::prepare(RunDir::locate()?)?;
+            let run_dir = RunDir::prepare(RunDir::locate_given(given_dir)?)?;
             install_logging(&run_dir, &logs)?;
             Ok(run_dir)
         }
@@ -83,19 +90,25 @@ pub async fn run(ready: Option<PathBuf>) -> Result<()> {
     let lock_path = run_dir.daemon_lock();
     let Some(_lock) = blocking(move || take_lock(&lock_path)).await? else {
         tracing::info!("another stow daemon holds the lock; exiting");
-        notify_ready(ready, Notification::LockHeld).await?;
+        notify_ready(ready, &run_dir, Notification::LockHeld).await?;
         return Ok(());
     };
     // The lock is held, so no process of a previous daemon is alive: every
-    // session directory under the run directory is a dead build's.
+    // session directory under the run directory is a dead build's. A cargo
+    // that is still running keeps only the record of its owner: its build
+    // lost the session's in-flight state and provenance marks, so its
+    // wrappers are refused until it exits.
     let sessions = run_dir.sessions();
     let swept = blocking({
         let sessions = sessions.clone();
-        move || sweep_sessions(&sessions)
+        move || sweep_sessions(&sessions, &OsProcesses)
     })
     .await?;
-    if swept > 0 {
-        tracing::info!(swept, "removed the sessions a previous daemon left");
+    if swept.removed > 0 {
+        tracing::info!(
+            swept = swept.removed,
+            "removed the sessions a previous daemon left"
+        );
     }
     let endpoint = run_dir.endpoint();
     let listener = bind(&endpoint).await?;
@@ -104,13 +117,17 @@ pub async fn run(ready: Option<PathBuf>) -> Result<()> {
         settings: blocking(Settings::from_env).await?,
         logs,
         table: SessionTable::start(),
+        processes: OsProcesses,
     };
+    for outlived in swept.outlived {
+        refuse_until_exit(&daemon, outlived);
+    }
     tracing::info!(
         pid = std::process::id(),
         endpoint = %endpoint.display(),
         "stow daemon serving"
     );
-    notify_ready(ready, Notification::Ready).await?;
+    notify_ready(ready, &run_dir, Notification::Ready).await?;
     accept_loop(listener, daemon).await
 }
 
@@ -123,34 +140,116 @@ async fn blocking<T: Send + 'static>(
         .wrap_err("run the daemon's blocking work")?
 }
 
-/// Remove every session directory under `sessions`, returning how many.
-fn sweep_sessions(sessions: &Path) -> Result<usize> {
+/// What a start of the daemon found under the sessions directory.
+#[derive(Debug, Default)]
+struct Swept {
+    /// The session directories removed.
+    removed: usize,
+    /// The cargos still running whose session a previous daemon held.
+    outlived: Vec<Outlived>,
+}
+
+/// A cargo that outlived the daemon that held its session, and the
+/// directory that records it.
+#[derive(Debug)]
+struct Outlived {
+    owner: CargoOwner,
+    dir: PathBuf,
+}
+
+/// Remove every session directory under `sessions`, except the owner
+/// record of a cargo that is still running.
+fn sweep_sessions(sessions: &Path, processes: &impl Processes) -> Result<Swept> {
     let entries = match std::fs::read_dir(sessions) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Swept::default()),
         Err(error) => {
             return Err(error).wrap_err_with(|| format!("list {}", sessions.display()));
         }
     };
-    let mut swept = 0;
+    let mut swept = Swept::default();
     for entry in entries {
         let path = entry
             .wrap_err_with(|| format!("list {}", sessions.display()))?
             .path();
-        std::fs::remove_dir_all(&path)
-            .wrap_err_with(|| format!("remove the dead session {}", path.display()))?;
-        swept += 1;
+        match recorded_owner(&path)? {
+            Some(owner) if processes.is_running(owner) => {
+                keep_only_owner(&path)?;
+                swept.outlived.push(Outlived { owner, dir: path });
+            }
+            _ => {
+                std::fs::remove_dir_all(&path)
+                    .wrap_err_with(|| format!("remove the dead session {}", path.display()))?;
+                swept.removed += 1;
+            }
+        }
     }
     Ok(swept)
 }
 
+/// Refuse the wrappers of `outlived`'s cargo until it exits, then forget it
+/// and remove the record of it.
+fn refuse_until_exit<P: Processes>(daemon: &Daemon<P>, outlived: Outlived) {
+    let Outlived { owner, dir } = outlived;
+    let exited = match daemon.processes.watch(owner) {
+        Ok(exited) => exited,
+        Err(reason) => {
+            // Gone or replaced by another process between the sweep and the
+            // watch: there is nothing left to refuse.
+            tracing::warn!(%owner, %reason, "a cargo that outlived the previous daemon cannot be watched");
+            if let Err(error) = std::fs::remove_dir_all(&dir) {
+                tracing::warn!(%error, dir = %dir.display(), "remove the record of a cargo");
+            }
+            return;
+        }
+    };
+    daemon.table.outlived_daemon(owner);
+    tracing::info!(%owner, "a cargo outlived the previous daemon; refusing its wrappers until it exits");
+    let table = daemon.table.clone();
+    tokio::spawn(async move {
+        if let Err(error) = exited.await {
+            tracing::warn!(%owner, %error, "watching a cargo for its exit failed; no longer refusing it");
+        }
+        table.remove_cargo(owner);
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(%error, dir = %dir.display(), "remove the record of a cargo");
+        }
+        tracing::info!(%owner, "a cargo that outlived the previous daemon has exited");
+    });
+}
+
 /// Send the client that spawned this daemon its notification, when it
 /// asked for one.
-async fn notify_ready(ready: Option<PathBuf>, notification: Notification) -> Result<()> {
-    let Some(endpoint) = ready else {
-        return Ok(());
-    };
-    blocking(move || notify::send(&endpoint, notification)).await
+///
+/// A client that spawned the daemon names its endpoint on the command line.
+/// On Windows the Task Scheduler starts the daemon, so the endpoint is the
+/// one the client published in the run directory before it asked for the
+/// run, if it did: the login trigger starts a daemon nobody waits for, and
+/// a client that gave up leaves its address behind, so a failed
+/// notification there is logged, not fatal.
+async fn notify_ready(
+    ready: Option<PathBuf>,
+    run_dir: &RunDir,
+    notification: Notification,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = run_dir;
+        let Some(endpoint) = ready else {
+            return Ok(());
+        };
+        blocking(move || notify::send(&endpoint, notification)).await
+    }
+    #[cfg(windows)]
+    {
+        let Some(endpoint) = ready.or_else(|| notify::published_address(run_dir)) else {
+            return Ok(());
+        };
+        if let Err(error) = blocking(move || notify::send(&endpoint, notification)).await {
+            tracing::warn!(%error, "no client took the daemon's notification");
+        }
+        Ok(())
+    }
 }
 
 /// The daemon writes its own log in the runtime directory: its stderr is
@@ -224,20 +323,21 @@ async fn bind(endpoint: &Path) -> Result<Listener> {
 }
 
 #[cfg(unix)]
-async fn accept_loop(listener: Listener, daemon: Daemon) -> Result<()> {
+async fn accept_loop(listener: Listener, daemon: Daemon<OsProcesses>) -> Result<()> {
     let mut connections = JoinSet::new();
     loop {
         let (stream, _) = listener
             .accept()
             .await
             .wrap_err("accept a daemon connection")?;
-        connections.spawn(serve_connection(stream, daemon.clone()));
+        let peer = peer_of(owner::peer_pid(&stream));
+        connections.spawn(serve_connection(stream, peer, daemon.clone()));
         reap(&mut connections);
     }
 }
 
 #[cfg(windows)]
-async fn accept_loop(mut listener: Listener, daemon: Daemon) -> Result<()> {
+async fn accept_loop(mut listener: Listener, daemon: Daemon<OsProcesses>) -> Result<()> {
     let mut connections = JoinSet::new();
     loop {
         listener
@@ -250,9 +350,18 @@ async fn accept_loop(mut listener: Listener, daemon: Daemon) -> Result<()> {
         let next = super::windows::create_server(&listener.name, false)
             .wrap_err("create the next daemon pipe instance")?;
         let connected = std::mem::replace(&mut listener.server, next);
-        connections.spawn(serve_connection(connected, daemon.clone()));
+        let peer = peer_of(owner::peer_pid(&connected));
+        connections.spawn(serve_connection(connected, peer, daemon.clone()));
         reap(&mut connections);
     }
+}
+
+/// The process on the other end of a connection, when the platform says.
+/// Only a wrapper that names no session needs it, and that wrapper is
+/// refused when the daemon has none.
+fn peer_of(peer: std::io::Result<u32>) -> Option<u32> {
+    peer.inspect_err(|error| tracing::warn!(%error, "the connecting process is unknown"))
+        .ok()
 }
 
 /// Log the connections that have finished.
@@ -267,9 +376,12 @@ fn reap(connections: &mut JoinSet<Result<()>>) {
 }
 
 /// One client: its `Hello`, then what its role asks until it hangs up.
-async fn serve_connection<S>(mut stream: S, daemon: Daemon) -> Result<()>
+///
+/// `peer` is the process that connected, when the platform says.
+async fn serve_connection<S, P>(mut stream: S, peer: Option<u32>, daemon: Daemon<P>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    P: Processes,
 {
     let Some(first) = read_frame_async(&mut stream).await? else {
         return Ok(());
@@ -286,6 +398,9 @@ where
         Role::Wrapper {
             session: SessionRef::Id(id),
         } => serve_wrapper(stream, &daemon, id).await,
+        Role::Wrapper {
+            session: SessionRef::Cargo { cargo, rust_log },
+        } => serve_cargo_wrapper(stream, &daemon, peer, cargo, rust_log).await,
     }
 }
 
@@ -315,9 +430,10 @@ async fn reject<S: AsyncWrite + Unpin + Send>(stream: &mut S, reason: String) ->
 
 /// A driver's connection: status requests, until it opens a session and
 /// the connection becomes the session's.
-async fn serve_control<S>(mut stream: S, daemon: &Daemon) -> Result<()>
+async fn serve_control<S, P>(mut stream: S, daemon: &Daemon<P>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    P: Processes,
 {
     while let Some(frame) = read_frame_async(&mut stream).await? {
         if !speaks(frame.protocol) {
@@ -356,6 +472,7 @@ where
 fn interest_of(facts: &SessionFacts) -> LogInterest {
     let var = |name: &str| {
         facts
+            .build
             .environ
             .iter()
             .find(|(key, _)| stow_types::env_name::eq(key, name))
@@ -373,16 +490,17 @@ fn interest_of(facts: &SessionFacts) -> LogInterest {
 
 /// Open the session `facts` describe and serve its control connection
 /// until the driver ends the session or goes away.
-async fn serve_session<S>(stream: S, daemon: &Daemon, facts: SessionFacts) -> Result<()>
+async fn serve_session<S, P>(stream: S, daemon: &Daemon<P>, facts: SessionFacts) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    P: Processes,
 {
     let (mut read, mut write) = tokio::io::split(stream);
     let id = SessionId::mint();
     // The route exists before the session's tasks do, so none of their
     // events is recorded without one.
     let mut events = daemon.logs.register(id, interest_of(&facts));
-    let handles = match &facts.config {
+    let handles = match &facts.build.config {
         Some(config) => daemon.table.handles_for(config.cache_dir.clone()).await,
         None => CacheDirHandles::default(),
     };
@@ -489,6 +607,14 @@ where
                             }
                             write_frame_async(write, &Response::SessionEnded(end)).await?;
                             tracing::info!(session = %id, "ended a session");
+                            // A driver on Windows may run inside the job
+                            // object of a cargo (`cargo stow`) that ends
+                            // with every process it holds, a drain the
+                            // driver started included: the daemon, which no
+                            // cargo holds, starts it, after the driver has
+                            // released its foreground hold.
+                            #[cfg(windows)]
+                            session.conclude().await;
                             return Ok(Driven::Ended);
                         }
                         Ok(other) => {
@@ -528,9 +654,10 @@ where
 
 /// One wrapper's conversation with its session: a request, its answer,
 /// until the wrapper hangs up — which ends a flight it still holds.
-async fn serve_wrapper<S>(mut stream: S, daemon: &Daemon, id: SessionId) -> Result<()>
+async fn serve_wrapper<S, P>(mut stream: S, daemon: &Daemon<P>, id: SessionId) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    P: Processes,
 {
     let Some(session) = daemon.table.join(id).await else {
         return reject(
@@ -539,61 +666,342 @@ where
         )
         .await;
     };
-    let every = daemon.settings.answer / 2;
     let span = session.span().clone();
+    converse(
+        &mut stream,
+        &session,
+        daemon.settings.answer / 2,
+        None,
+        None,
+        span,
+    )
+    .await
+}
+
+/// What a wrapper's connection delivered.
+enum Incoming {
+    /// The wrapper hung up.
+    Closed,
+    Request(WrapperRequest),
+    /// A frame the daemon will not serve; the reason is the wrapper's to read.
+    Refused(String),
+}
+
+async fn read_request<S: AsyncRead + Unpin + Send>(stream: &mut S) -> Result<Incoming> {
+    let Some(frame) = read_frame_async(stream).await? else {
+        return Ok(Incoming::Closed);
+    };
+    if !speaks(frame.protocol) {
+        return Ok(Incoming::Refused(protocol_mismatch(frame.protocol)));
+    }
+    Ok(match frame.decode::<WrapperRequest>() {
+        Ok(request) => Incoming::Request(request),
+        Err(error) => Incoming::Refused(error.to_string()),
+    })
+}
+
+/// A cargo wrapper's conversation with `session`, whose requests run under
+/// a span of their own: what they log reaches this wrapper as events, as
+/// far as `interest` wants, because no driver's connection carries a plain
+/// build's events.
+async fn converse_returning_events<S, P>(
+    stream: &mut S,
+    daemon: &Daemon<P>,
+    session: &Arc<Session<Cargo>>,
+    first: WrapperRequest,
+    interest: LogInterest,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    P: Processes,
+{
+    // The nearest session span names the route an event goes to, so this
+    // one, nested in the session's own, takes this wrapper's events.
+    let route = SessionId::mint();
+    let mut events = daemon.logs.register(route, interest);
+    let span = tracing::info_span!(parent: session.span(), SESSION_SPAN, session = %route);
+    let served = converse(
+        stream,
+        session,
+        daemon.settings.answer / 2,
+        Some(first),
+        Some(&mut events),
+        span,
+    )
+    .await;
+    daemon.logs.unregister(route);
+    served
+}
+
+/// One wrapper's conversation with `session`: `first` when its request was
+/// already read, then a request and its answer until the wrapper hangs up
+/// — which ends a flight it still holds. Requests run under `span`; the
+/// events `events` collects from it go ahead of each answer.
+async fn converse<S, O>(
+    stream: &mut S,
+    session: &Arc<Session<O>>,
+    every: Duration,
+    first: Option<WrapperRequest>,
+    mut events: Option<&mut mpsc::UnboundedReceiver<Event>>,
+    span: tracing::Span,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    O: Origin,
+{
     async {
         let mut flight = None;
-        while let Some(frame) = read_frame_async(&mut stream).await? {
-            if !speaks(frame.protocol) {
-                return reject(&mut stream, protocol_mismatch(frame.protocol)).await;
-            }
-            let request = match frame.decode::<WrapperRequest>() {
-                Ok(request) => request,
-                Err(error) => return reject(&mut stream, error.to_string()).await,
+        let mut next = first;
+        loop {
+            let request = match next.take() {
+                Some(request) => request,
+                None => match read_request(stream).await? {
+                    Incoming::Closed => return Ok(()),
+                    Incoming::Refused(reason) => return reject(stream, reason).await,
+                    Incoming::Request(request) => request,
+                },
             };
-            let answer = answer_with_progress(
-                &mut stream,
-                &session,
+            // The decision path's future is large and lives for one unit.
+            let answering = Box::pin(answer_and_book(
+                session,
                 session.in_flight(),
                 session.reports(),
                 &mut flight,
                 request,
-                every,
-            )
-            .await?;
-            write_frame_async(&mut stream, &Response::Answer(answer)).await?;
+            ));
+            let answer = working_meanwhile(stream, every, answering).await?;
+            if let Some(events) = events.as_mut() {
+                while let Ok(event) = events.try_recv() {
+                    write_frame_async(stream, &Response::Event(event)).await?;
+                }
+            }
+            write_frame_async(stream, &Response::Answer(answer)).await?;
         }
-        Ok(())
     }
     .instrument(span)
     .await
 }
 
-/// Answer `request`, telling the wrapper every `every` that the decision
-/// is still being made: a wrapper bounds its wait for a frame, and a
-/// decision that fetches from the network legitimately outlasts that.
-async fn answer_with_progress<S, H>(
+/// Await `work`, telling the wrapper every `every` that it is still being
+/// done: a wrapper bounds its wait for a frame, and a decision that
+/// fetches from the network, like the opening of a session, legitimately
+/// outlasts that.
+async fn working_meanwhile<S, T>(
     stream: &mut S,
-    handler: &Arc<H>,
-    in_flight: &InFlightUnits,
-    reports: &Reports,
-    flight: &mut Option<Flight<H::Pending>>,
-    request: WrapperRequest,
     every: Duration,
-) -> Result<Answer>
+    work: impl std::future::Future<Output = T>,
+) -> Result<T>
 where
     S: AsyncWrite + Unpin + Send,
-    H: Handler,
 {
-    let answering = answer_and_book(handler, in_flight, reports, flight, request);
-    tokio::pin!(answering);
+    tokio::pin!(work);
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     loop {
         tokio::select! {
-            answer = &mut answering => return Ok(answer),
+            done = &mut work => return Ok(done),
             _ = tick.tick() => write_frame_async(stream, &Response::Working).await?,
         }
     }
+}
+
+/// A wrapper of a cargo no driver opened a session for: the session of
+/// that cargo, opened by the first of its wrappers to need one.
+async fn serve_cargo_wrapper<S, P>(
+    mut stream: S,
+    daemon: &Daemon<P>,
+    peer: Option<u32>,
+    cargo: Option<Vec<u8>>,
+    rust_log: Option<String>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    P: Processes,
+{
+    // A `RUST_LOG` the filter parser rejects asks for no more than the
+    // warnings and errors every wrapper gets.
+    let interest = LogInterest::of_wrapper(rust_log.as_deref()).unwrap_or_else(|reason| {
+        tracing::warn!(%reason, "ignoring the wrapper's RUST_LOG for its events");
+        LogInterest::of_wrapper(None).expect("the default filter parses")
+    });
+    let first = match read_request(&mut stream).await? {
+        Incoming::Closed => return Ok(()),
+        Incoming::Refused(reason) => return reject(&mut stream, reason).await,
+        Incoming::Request(request) => request,
+    };
+    // A probe belongs to no build: it needs neither a cargo nor a session.
+    if is_probe(&first) {
+        return serve_probe(stream, first).await;
+    }
+    let owner = match owner_of(daemon, peer, cargo).await {
+        Ok(owner) => owner,
+        Err(reason) => {
+            tracing::warn!(%reason, "a wrapper's cargo could not be found");
+            return reject(&mut stream, reason).await;
+        }
+    };
+    let every = daemon.settings.answer / 2;
+    let slot = daemon.table.cargo_slot(owner).await;
+    if slot.is_outlived_daemon() {
+        return reject(
+            &mut stream,
+            "the stow daemon restarted during this cargo build: its in-flight state and provenance marks are gone; run the build again".to_owned(),
+        )
+        .await;
+    }
+    if let Some(session) = slot.session() {
+        return converse_returning_events(&mut stream, daemon, &session, first, interest).await;
+    }
+    // Nothing was settled before cargo started: the wrapper says what it
+    // runs in, and the request it was holding is answered once the session
+    // is open.
+    write_frame_async(&mut stream, &Response::Answer(Answer::Describe)).await?;
+    let environment = match read_request(&mut stream).await? {
+        Incoming::Closed => return Ok(()),
+        Incoming::Refused(reason) => return reject(&mut stream, reason).await,
+        Incoming::Request(WrapperRequest::Describe(environment)) => environment,
+        Incoming::Request(other) => {
+            return reject(
+                &mut stream,
+                format!("the daemon asked for the build's environment, not {other:?}"),
+            )
+            .await;
+        }
+    };
+    let opener = match Opener::of(&first) {
+        Ok(opener) => opener,
+        Err(reason) => return reject(&mut stream, reason).await,
+    };
+    let opening = slot.open_with(|| open_cargo_session(daemon.clone(), owner, opener, environment));
+    let session = match working_meanwhile(&mut stream, every, opening).await? {
+        Ok(session) => session,
+        Err(reason) => {
+            tracing::warn!(%owner, %reason, "a cargo's session could not be opened");
+            return reject(&mut stream, reason).await;
+        }
+    };
+    converse_returning_events(&mut stream, daemon, &session, first, interest).await
+}
+
+/// The cargo a wrapper connecting from `peer` runs under.
+async fn owner_of<P: Processes>(
+    daemon: &Daemon<P>,
+    peer: Option<u32>,
+    cargo: Option<Vec<u8>>,
+) -> std::result::Result<CargoOwner, String> {
+    let peer = peer.ok_or_else(|| {
+        "the daemon cannot tell which process connected, so it cannot find its cargo".to_owned()
+    })?;
+    let cargo = cargo
+        .map(|bytes| os_bytes::decode(&bytes).map(PathBuf::from))
+        .transpose()?;
+    let processes = daemon.processes.clone();
+    tokio::task::spawn_blocking(move || processes.owner_of(peer, cargo.as_deref()))
+        .await
+        .map_err(|error| format!("join the lookup of the wrapper's cargo: {error}"))?
+}
+
+/// Whether `request` asks for no decision the cache could make: cargo's
+/// probes of the compiler (`-vV`, `--print`, the `___` crate) and arguments
+/// that are not a unit. They run before any build exists and are never
+/// recorded.
+fn is_probe(request: &WrapperRequest) -> bool {
+    let WrapperRequest::Plan(plan) = request else {
+        return false;
+    };
+    plan.args().ok().is_none_or(|args| {
+        crate::classify_invocation(&args).map_or(true, |parsed| !crate::is_compile_unit(&parsed))
+    })
+}
+
+/// A probe's conversation: told to run what it asked for, and its report
+/// received. No session is opened or touched.
+async fn serve_probe<S>(mut stream: S, first: WrapperRequest) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let mut next = Some(first);
+    loop {
+        let request = match next.take() {
+            Some(request) => request,
+            None => match read_request(&mut stream).await? {
+                Incoming::Closed => return Ok(()),
+                Incoming::Refused(reason) => return reject(&mut stream, reason).await,
+                Incoming::Request(request) => request,
+            },
+        };
+        let answer = match request {
+            WrapperRequest::Plan(plan) => Answer::Compile(CompileCommand {
+                executable: plan.executable,
+                args: plan.args,
+            }),
+            WrapperRequest::Compiled(_) => Answer::Received,
+            other => Answer::Failed {
+                message: format!("a probe's connection takes a plan and its report, not {other:?}"),
+            },
+        };
+        write_frame_async(&mut stream, &Response::Answer(answer)).await?;
+    }
+}
+
+/// Open the session of `owner`'s cargo and arrange for it to end when the
+/// cargo exits.
+async fn open_cargo_session<P: Processes>(
+    daemon: Daemon<P>,
+    owner: CargoOwner,
+    opener: Opener,
+    environment: BuildEnvironment,
+) -> std::result::Result<Arc<Session<Cargo>>, String> {
+    let build = open_facts(&opener, &environment, &daemon.table).await?;
+    let handles = match &build.config {
+        Some(config) => daemon.table.handles_for(config.cache_dir.clone()).await,
+        None => CacheDirHandles::default(),
+    };
+    // Armed before the session exists: a cargo that is already gone fails
+    // the open rather than leaving a session nothing ends.
+    let exited = daemon.processes.watch(owner)?;
+    let id = SessionId::mint();
+    let session = Session::open_cargo(id, owner, build, &handles, &daemon.sessions)
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    tracing::info!(session = %id, %owner, "opened a session for a cargo");
+    tokio::spawn(end_with_cargo(
+        exited,
+        owner,
+        Arc::clone(&session),
+        daemon.table.clone(),
+    ));
+    Ok(session)
+}
+
+/// End `session` when its cargo has exited, as a driver ends its own at the
+/// end of a build: drain the bookkeeping, write the miss journal and then
+/// do what follows a build.
+async fn end_with_cargo(
+    exited: futures_util::future::BoxFuture<'static, std::io::Result<()>>,
+    owner: CargoOwner,
+    session: Arc<Session<Cargo>>,
+    table: SessionTable,
+) {
+    let span = session.span().clone();
+    async move {
+        if let Err(error) = exited.await {
+            tracing::warn!(%owner, %error, "watching a cargo for its exit failed; ending its session");
+        }
+        // Removed first, so a wrapper arriving from here on opens a session
+        // of its own instead of finding one that is closing.
+        table.remove_cargo(owner);
+        match session.end().await {
+            Ok(end) => tracing::info!(
+                %owner,
+                journal_written = end.journal_written,
+                "ended a cargo's session"
+            ),
+            Err(error) => tracing::warn!(%owner, %error, "a cargo's session did not end cleanly"),
+        }
+        session.conclude().await;
+    }
+    .instrument(span)
+    .await;
 }
 
 #[cfg(all(test, unix))]
@@ -604,21 +1012,107 @@ mod tests {
 
     use tokio::io::{AsyncWriteExt as _, DuplexStream};
 
-    use super::{Daemon, answer_with_progress, serve_connection, sweep_sessions};
+    use super::{Daemon, refuse_until_exit, serve_connection, sweep_sessions, working_meanwhile};
     use crate::daemon::Settings;
     use crate::daemon::events::SessionLogs;
+    use crate::daemon::owner::{CargoOwner, Processes};
     use crate::daemon::protocol::{
         ControlRequest, Hello, PROTOCOL, Response, Role, SessionRef, WrapperRequest, encode,
         read_frame_async,
     };
-    use crate::daemon::session::handler::{Decision, Flight, Handler, InFlightUnits, Reports};
+    use crate::daemon::session::handler::{
+        Decision, Flight, Handler, InFlightUnits, Reports, answer_and_book,
+    };
     use crate::daemon::session::invocation::{OutputRoots, RefusalPolicy};
     use crate::daemon::session::{SessionFacts, SessionId};
     use crate::daemon::table::SessionTable;
-    use crate::daemon::wrapper::{Answer, InvocationEnv, Plan};
+    use crate::daemon::wrapper::{Answer, BuildEnvironment, InvocationEnv, Plan};
+    use crate::session_env::SessionEnv;
     use crate::toolchain::BuildToolchain;
 
-    fn daemon(sessions: &std::path::Path) -> Daemon {
+    /// The processes of a made-up machine: which cargo each wrapper runs
+    /// under, and which cargos have exited.
+    #[derive(Clone, Default)]
+    struct Machine {
+        state: Arc<std::sync::Mutex<MachineState>>,
+    }
+
+    #[derive(Default)]
+    struct MachineState {
+        cargo_of: std::collections::HashMap<u32, u32>,
+        exited: std::collections::HashMap<u32, tokio::sync::watch::Sender<bool>>,
+    }
+
+    impl Machine {
+        /// Process `wrapper` was started by the cargo `cargo`.
+        fn start(&self, wrapper: u32, cargo: u32) {
+            self.state
+                .lock()
+                .expect("machine")
+                .cargo_of
+                .insert(wrapper, cargo);
+        }
+
+        /// The cargo `pid` exits.
+        fn exit(&self, cargo: u32) {
+            self.state
+                .lock()
+                .expect("machine")
+                .exited
+                .entry(cargo)
+                .or_insert_with(|| tokio::sync::watch::channel(false).0)
+                .send_replace(true);
+        }
+    }
+
+    impl Processes for Machine {
+        fn owner_of(
+            &self,
+            peer: u32,
+            _cargo: Option<&std::path::Path>,
+        ) -> Result<CargoOwner, String> {
+            self.state
+                .lock()
+                .expect("machine")
+                .cargo_of
+                .get(&peer)
+                .map(|&pid| CargoOwner { pid, started: 1 })
+                .ok_or_else(|| format!("no process {peer}"))
+        }
+
+        fn watch(
+            &self,
+            owner: CargoOwner,
+        ) -> Result<futures_util::future::BoxFuture<'static, std::io::Result<()>>, String> {
+            let mut exited = self
+                .state
+                .lock()
+                .expect("machine")
+                .exited
+                .entry(owner.pid)
+                .or_insert_with(|| tokio::sync::watch::channel(false).0)
+                .subscribe();
+            Ok(Box::pin(async move {
+                exited
+                    .wait_for(|exited| *exited)
+                    .await
+                    .map(|_| ())
+                    .map_err(std::io::Error::other)
+            }))
+        }
+
+        fn is_running(&self, owner: CargoOwner) -> bool {
+            !self
+                .state
+                .lock()
+                .expect("machine")
+                .exited
+                .get(&owner.pid)
+                .is_some_and(|exited| *exited.borrow())
+        }
+    }
+
+    fn daemon(sessions: &std::path::Path) -> Daemon<Machine> {
         Daemon {
             sessions: sessions.to_owned(),
             settings: Settings {
@@ -628,18 +1122,31 @@ mod tests {
             },
             logs: SessionLogs::default(),
             table: SessionTable::start(),
+            processes: Machine::default(),
         }
     }
 
-    /// One connection to `daemon`, served on a task of its own.
+    /// One connection to `daemon` from no known process, served on a task
+    /// of its own.
     fn connect(
-        daemon: &Daemon,
+        daemon: &Daemon<Machine>,
+    ) -> (
+        DuplexStream,
+        tokio::task::JoinHandle<stow_types::error::Result<()>>,
+    ) {
+        connect_from(daemon, None)
+    }
+
+    /// One connection to `daemon` from the process `peer`.
+    fn connect_from(
+        daemon: &Daemon<Machine>,
+        peer: Option<u32>,
     ) -> (
         DuplexStream,
         tokio::task::JoinHandle<stow_types::error::Result<()>>,
     ) {
         let (client, daemon_end) = tokio::io::duplex(1 << 20);
-        let task = tokio::spawn(serve_connection(daemon_end, daemon.clone()));
+        let task = tokio::spawn(serve_connection(daemon_end, peer, daemon.clone()));
         (client, task)
     }
 
@@ -672,7 +1179,7 @@ mod tests {
     /// Open a session on `daemon` the way a driver does; returns the
     /// control connection, which owns the session, and the session's id.
     async fn open(
-        daemon: &Daemon,
+        daemon: &Daemon<Machine>,
         target: &std::path::Path,
     ) -> (
         DuplexStream,
@@ -692,7 +1199,11 @@ mod tests {
         (control, task, session)
     }
 
-    async fn plan_in(daemon: &Daemon, session: SessionId, out_dir: &std::path::Path) -> Response {
+    async fn plan_in(
+        daemon: &Daemon<Machine>,
+        session: SessionId,
+        out_dir: &std::path::Path,
+    ) -> Response {
         let (mut wrapper, task) = connect(daemon);
         send(
             &mut wrapper,
@@ -855,17 +1366,12 @@ mod tests {
             &args,
             InvocationEnv::for_tests(),
         ));
-        let answer = answer_with_progress(
-            &mut daemon_end,
-            &handler,
-            &InFlightUnits::default(),
-            &Reports::default(),
-            &mut flight,
-            request,
-            Duration::from_millis(20),
-        )
-        .await
-        .expect("answered");
+        let in_flight = InFlightUnits::default();
+        let reports = Reports::default();
+        let answering = answer_and_book(&handler, &in_flight, &reports, &mut flight, request);
+        let answer = working_meanwhile(&mut daemon_end, Duration::from_millis(20), answering)
+            .await
+            .expect("answered");
         assert!(matches!(answer, Answer::Compile(_)), "{answer:?}");
         drop(daemon_end);
         let mut working = 0;
@@ -890,12 +1396,79 @@ mod tests {
             std::fs::create_dir_all(dir.join("local-build")).expect("session dir");
             std::fs::write(dir.join("local-build").join("mark"), b"x").expect("mark");
         }
-        assert_eq!(sweep_sessions(sessions.path()).expect("sweep"), 2);
+        let machine = Machine::default();
+        let swept = sweep_sessions(sessions.path(), &machine).expect("sweep");
+        assert_eq!(swept.removed, 2);
+        assert!(swept.outlived.is_empty());
         assert_eq!(std::fs::read_dir(sessions.path()).expect("list").count(), 0);
         assert_eq!(
-            sweep_sessions(&sessions.path().join("missing")).expect("a missing directory"),
+            sweep_sessions(&sessions.path().join("missing"), &machine)
+                .expect("a missing directory")
+                .removed,
             0
         );
+    }
+
+    /// A session of a cargo that is still running keeps only the record of
+    /// its owner; the session of one that exited, and a driver's, go.
+    #[tokio::test]
+    async fn a_sweep_keeps_only_the_record_of_a_cargo_that_is_still_running() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let machine = Machine::default();
+        let running = CargoOwner { pid: 7, started: 1 };
+        let gone = CargoOwner { pid: 8, started: 1 };
+        for (name, owner) in [
+            ("running", Some(running)),
+            ("gone", Some(gone)),
+            ("driver", None),
+        ] {
+            let dir = sessions.path().join(name);
+            std::fs::create_dir_all(dir.join("local-build")).expect("session dir");
+            std::fs::write(dir.join("local-build").join("mark"), b"x").expect("mark");
+            if let Some(owner) = owner {
+                std::fs::write(
+                    dir.join("owner"),
+                    format!("{} {}\n", owner.pid, owner.started),
+                )
+                .expect("owner record");
+            }
+        }
+        machine.exit(8);
+
+        let swept = sweep_sessions(sessions.path(), &machine).expect("sweep");
+        assert_eq!(swept.removed, 2);
+        assert_eq!(swept.outlived.len(), 1);
+        let kept = &swept.outlived[0];
+        assert_eq!(kept.owner, running);
+        assert_eq!(
+            std::fs::read_dir(&kept.dir)
+                .expect("list")
+                .map(|entry| entry.expect("entry").file_name())
+                .collect::<Vec<_>>(),
+            [OsString::from("owner")],
+            "the marks are gone, the record stays"
+        );
+
+        // Its wrappers are refused until it exits, and then it is a cargo
+        // like any other.
+        let target = tempfile::tempdir().expect("target");
+        let daemon = Daemon {
+            processes: machine,
+            ..daemon(sessions.path())
+        };
+        let request = unit_request(target.path()).await;
+        let outlived = swept.outlived.into_iter().next().expect("outlived");
+        let dir = outlived.dir.clone();
+        refuse_until_exit(&daemon, outlived);
+        let (_wrapper, _task, refused) = wrapper_of(&daemon, 70, 7, &request).await;
+        let Response::Rejected { reason } = refused else {
+            panic!("a cargo that outlived the daemon is refused: {refused:?}");
+        };
+        assert!(reason.contains("daemon restarted"), "{reason}");
+        daemon.processes.exit(7);
+        until(|| !dir.exists()).await;
+        let (_wrapper, _task, asked) = wrapper_of(&daemon, 71, 7, &request).await;
+        assert_eq!(asked, Response::Answer(Answer::Describe));
     }
 
     #[tokio::test]
@@ -944,5 +1517,323 @@ mod tests {
             reason.contains(&(PROTOCOL + 1).to_string()) && reason.contains(&PROTOCOL.to_string()),
             "{reason}"
         );
+    }
+
+    /// The environment a plain cargo's wrapper runs in: this process's,
+    /// with a home, a cache directory and a configuration of its own that
+    /// keeps the build off the network.
+    fn environment(home: &std::path::Path) -> BuildEnvironment {
+        let cache = home.join("cache");
+        let config_home = home.join("config");
+        let overrides = [
+            ("HOME", home.as_os_str()),
+            ("XDG_CONFIG_HOME", config_home.as_os_str()),
+            ("STOW_CACHE_DIR", cache.as_os_str()),
+        ];
+        let mut environ: Vec<(OsString, OsString)> = std::env::vars_os()
+            .filter(|(name, _)| !overrides.iter().any(|(own, _)| name == *own))
+            .collect();
+        environ.extend(
+            overrides
+                .iter()
+                .map(|(name, value)| (OsString::from(name), (*value).to_owned())),
+        );
+        let cwd = std::env::current_dir().expect("cwd");
+        let config = crate::config::config_file_path(&SessionEnv::new(environ.clone(), cwd))
+            .expect("config path");
+        std::fs::create_dir_all(config.parent().expect("config dir")).expect("config dir");
+        std::fs::write(&config, "[cache]\nremote = false\n").expect("config");
+        BuildEnvironment {
+            environ: environ
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        crate::daemon::session::os_bytes::encode(name),
+                        crate::daemon::session::os_bytes::encode(value),
+                    )
+                })
+                .collect(),
+            cwd: crate::daemon::session::os_bytes::encode(
+                std::env::current_dir().expect("cwd").as_os_str(),
+            ),
+        }
+    }
+
+    /// The request of a unit cargo compiles into `<target>/debug/deps`.
+    async fn unit_request(target: &std::path::Path) -> WrapperRequest {
+        let toolchain = BuildToolchain::for_tests().await;
+        let out_dir = target.join("debug").join("deps");
+        let args: Vec<OsString> = ["--crate-name", "demo", "--crate-type", "lib", "--out-dir"]
+            .into_iter()
+            .map(OsString::from)
+            .chain([out_dir.into_os_string()])
+            .collect();
+        WrapperRequest::Plan(Plan::new(
+            toolchain.rustc().as_os_str(),
+            &args,
+            InvocationEnv::for_tests(),
+        ))
+    }
+
+    /// The next answer, past the daemon's progress frames.
+    async fn answer(stream: &mut DuplexStream) -> Response {
+        loop {
+            match receive(stream).await {
+                Response::Working => {}
+                other => return other,
+            }
+        }
+    }
+
+    /// A wrapper of the cargo `cargo`, started as process `wrapper`, that
+    /// sends `request` first.
+    async fn wrapper_of(
+        daemon: &Daemon<Machine>,
+        wrapper: u32,
+        cargo: u32,
+        request: &WrapperRequest,
+    ) -> (
+        DuplexStream,
+        tokio::task::JoinHandle<stow_types::error::Result<()>>,
+        Response,
+    ) {
+        daemon.processes.start(wrapper, cargo);
+        let (mut stream, task) = connect_from(daemon, Some(wrapper));
+        send(
+            &mut stream,
+            &Hello::new(Role::Wrapper {
+                session: SessionRef::Cargo {
+                    cargo: None,
+                    rust_log: None,
+                },
+            }),
+        )
+        .await;
+        send(&mut stream, request).await;
+        let first = answer(&mut stream).await;
+        (stream, task, first)
+    }
+
+    /// Wait until `done` holds, yielding to the daemon's tasks.
+    async fn until(mut done: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !done() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the condition did not come true");
+    }
+
+    #[tokio::test]
+    async fn a_session_less_wrapper_is_asked_for_its_environment_and_then_answered() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let home = tempfile::tempdir().expect("home");
+        let target = tempfile::tempdir().expect("target");
+        let daemon = daemon(sessions.path());
+        let request = unit_request(target.path()).await;
+        let (mut wrapper, task, first) = wrapper_of(&daemon, 11, 1, &request).await;
+        assert_eq!(first, Response::Answer(Answer::Describe));
+        send(
+            &mut wrapper,
+            &WrapperRequest::Describe(environment(home.path())),
+        )
+        .await;
+        let decision = answer(&mut wrapper).await;
+        assert!(
+            matches!(decision, Response::Answer(Answer::Compile(_))),
+            "the held request is answered once the session is open: {decision:?}"
+        );
+        let slot = daemon
+            .table
+            .cargo_slot(CargoOwner { pid: 1, started: 1 })
+            .await;
+        assert!(slot.session().is_some(), "the cargo has a session");
+        wrapper.shutdown().await.expect("shutdown");
+        task.await.expect("join").expect("served");
+    }
+
+    #[tokio::test]
+    async fn two_wrappers_of_one_cargo_share_one_session() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let home = tempfile::tempdir().expect("home");
+        let target = tempfile::tempdir().expect("target");
+        let daemon = daemon(sessions.path());
+        let request = unit_request(target.path()).await;
+        let (mut first, _first_task, asked) = wrapper_of(&daemon, 11, 1, &request).await;
+        assert_eq!(asked, Response::Answer(Answer::Describe));
+        send(
+            &mut first,
+            &WrapperRequest::Describe(environment(home.path())),
+        )
+        .await;
+        answer(&mut first).await;
+        let (_second, _second_task, decision) = wrapper_of(&daemon, 12, 1, &request).await;
+        assert!(
+            matches!(decision, Response::Answer(Answer::Compile(_))),
+            "a second wrapper of the cargo is answered without being asked: {decision:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(sessions.path())
+                .expect("sessions")
+                .count(),
+            1,
+            "one session directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrappers_of_two_cargos_get_two_sessions() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let home = tempfile::tempdir().expect("home");
+        let target = tempfile::tempdir().expect("target");
+        let daemon = daemon(sessions.path());
+        let request = unit_request(target.path()).await;
+        let mut kept = Vec::new();
+        for (wrapper, cargo) in [(11, 1), (21, 2)] {
+            // The connections stay open, so neither session has ended.
+            let (mut stream, task, asked) = wrapper_of(&daemon, wrapper, cargo, &request).await;
+            assert_eq!(
+                asked,
+                Response::Answer(Answer::Describe),
+                "cargo {cargo} has no session yet"
+            );
+            send(
+                &mut stream,
+                &WrapperRequest::Describe(environment(home.path())),
+            )
+            .await;
+            answer(&mut stream).await;
+            kept.push((stream, task));
+        }
+        assert_eq!(
+            std::fs::read_dir(sessions.path())
+                .expect("sessions")
+                .count(),
+            2,
+            "a session directory for each cargo"
+        );
+        assert_eq!(kept.len(), 2, "both wrappers' connections were open");
+    }
+
+    #[tokio::test]
+    async fn a_probe_with_no_session_is_answered_without_opening_one() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let daemon = daemon(sessions.path());
+        let toolchain = BuildToolchain::for_tests().await;
+        let probe = WrapperRequest::Plan(Plan::new(
+            toolchain.rustc().as_os_str(),
+            &[OsString::from("-vV")],
+            InvocationEnv::for_tests(),
+        ));
+        let (mut wrapper, task, first) = wrapper_of(&daemon, 11, 1, &probe).await;
+        let Response::Answer(Answer::Compile(command)) = first else {
+            panic!("a probe is told to run as asked: {first:?}");
+        };
+        assert_eq!(command.args, vec![b"-vV".to_vec()]);
+        send(
+            &mut wrapper,
+            &WrapperRequest::Compiled(crate::daemon::wrapper::Compiled {
+                success: true,
+                compile_millis: 1,
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer(&mut wrapper).await,
+            Response::Answer(Answer::Received)
+        );
+        wrapper.shutdown().await.expect("shutdown");
+        task.await.expect("join").expect("served");
+        let slot = daemon
+            .table
+            .cargo_slot(CargoOwner { pid: 1, started: 1 })
+            .await;
+        assert!(slot.session().is_none(), "no session was opened");
+        assert_eq!(
+            std::fs::read_dir(sessions.path())
+                .expect("sessions")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_ends_when_its_cargo_exits() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let home = tempfile::tempdir().expect("home");
+        let target = tempfile::tempdir().expect("target");
+        let daemon = daemon(sessions.path());
+        let request = unit_request(target.path()).await;
+        let (mut wrapper, _task, asked) = wrapper_of(&daemon, 11, 1, &request).await;
+        assert_eq!(asked, Response::Answer(Answer::Describe));
+        send(
+            &mut wrapper,
+            &WrapperRequest::Describe(environment(home.path())),
+        )
+        .await;
+        answer(&mut wrapper).await;
+        let dir = std::fs::read_dir(sessions.path())
+            .expect("sessions")
+            .next()
+            .expect("a session directory")
+            .expect("entry")
+            .path();
+        daemon.processes.exit(1);
+        until(|| !dir.exists()).await;
+        send(&mut wrapper, &request).await;
+        let Response::Answer(Answer::Failed { message }) = answer(&mut wrapper).await else {
+            panic!("an ended session answers no further request");
+        };
+        assert!(message.contains("has ended"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_ended_session_answers_no_further_request_on_an_open_connection() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let target = tempfile::tempdir().expect("target");
+        let daemon = daemon(sessions.path());
+        let (mut control, _task, id) = open(&daemon, target.path()).await;
+        let (mut wrapper, _wrapper_task) = connect(&daemon);
+        send(
+            &mut wrapper,
+            &Hello::new(Role::Wrapper {
+                session: SessionRef::Id(id),
+            }),
+        )
+        .await;
+        send(&mut wrapper, &unit_request(target.path()).await).await;
+        assert!(matches!(answer(&mut wrapper).await, Response::Answer(_)));
+        send(&mut control, &ControlRequest::EndSession).await;
+        // The session's events reach the driver ahead of the answer.
+        while let Response::Event(_) = receive(&mut control).await {}
+        send(&mut wrapper, &unit_request(target.path()).await).await;
+        let Response::Answer(Answer::Failed { message }) = answer(&mut wrapper).await else {
+            panic!("an ended session answers no further request");
+        };
+        assert!(message.contains("has ended"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_wrapper_the_daemon_cannot_place_is_rejected() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let daemon = daemon(sessions.path());
+        let (mut wrapper, task) = connect_from(&daemon, Some(99));
+        send(
+            &mut wrapper,
+            &Hello::new(Role::Wrapper {
+                session: SessionRef::Cargo {
+                    cargo: None,
+                    rust_log: None,
+                },
+            }),
+        )
+        .await;
+        send(&mut wrapper, &unit_request(sessions.path()).await).await;
+        let Response::Rejected { reason } = receive(&mut wrapper).await else {
+            panic!("a wrapper with no known cargo is rejected");
+        };
+        assert!(reason.contains("no process 99"), "{reason}");
+        task.await.expect("join").expect("served");
     }
 }

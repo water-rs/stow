@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use crate::support::{denied_registry, hermetic_stow_env, sealed_home_env};
+use crate::support::{cargo_command, denied_registry, hermetic_stow_env, sealed_home_env};
 
 /// The home the fixture's child processes get — one directory per
 /// fixture, shared by every command the test runs in `dir` so `stow
@@ -29,18 +29,7 @@ pub fn write_fixture(dir: &Path, cargo_home: &Path, dependencies: &str) {
     .expect("write manifest");
     std::fs::create_dir_all(dir.join("src")).expect("create src");
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
-    let mut fetch = Command::new("cargo");
-    fetch
-        .arg("fetch")
-        .current_dir(dir)
-        .env("CARGO_HOME", cargo_home);
-    sealed_home_env(&mut fetch, &fixture_home(dir));
-    let fetched = fetch.output().expect("run cargo fetch");
-    assert!(
-        fetched.status.success(),
-        "cargo fetch failed:\n{}",
-        String::from_utf8_lossy(&fetched.stderr)
-    );
+    cargo_fetch(dir, cargo_home);
 }
 
 /// A local port with nothing listening on it: the edge and the registry
@@ -330,12 +319,11 @@ pub fn commit_git_repo(repo: &Path, home: &Path) -> String {
 /// builds under test never need the network (git checkouts included).
 #[allow(dead_code)] // only the fixtures that edit their manifest call it
 pub fn cargo_fetch(dir: &Path, cargo_home: &Path) {
-    let mut fetch = Command::new("cargo");
+    let mut fetch = cargo_command(&fixture_home(dir));
     fetch
         .arg("fetch")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
-    sealed_home_env(&mut fetch, &fixture_home(dir));
     let fetched = fetch.output().expect("run cargo fetch");
     assert!(
         fetched.status.success(),
@@ -424,7 +412,9 @@ pub fn resolved_packages(
     project: &Path,
     cargo_home: &Path,
 ) -> std::collections::BTreeMap<String, ResolvedPackage> {
-    let output = Command::new("cargo")
+    // `cargo metadata` runs `rustc -vV` through the wrapper `cargo_home`
+    // configures, so it is sealed to the home the fixture's builds use.
+    let output = cargo_command(&fixture_home(project))
         .args(["metadata", "--format-version", "1", "--offline"])
         .current_dir(project)
         .env("CARGO_HOME", cargo_home)

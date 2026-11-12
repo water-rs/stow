@@ -6,6 +6,8 @@ use std::str::FromStr;
 
 use stow_types::error::{Context, Result};
 
+use crate::daemon::owner::CargoOwner;
+
 /// 128 random bits naming one session, minted where the session opens.
 ///
 /// Random, so a variable a build leaves behind never names a session of a
@@ -100,11 +102,98 @@ impl SessionDir {
     pub fn path(&self) -> &Path {
         &self.0
     }
+
+    /// Record the cargo this session belongs to, so a daemon that starts
+    /// while that cargo still runs can tell which build lost its session.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be written.
+    pub fn record_owner(&self, owner: CargoOwner) -> Result<()> {
+        let path = self.0.join(OWNER_FILE);
+        std::fs::write(&path, format!("{} {}\n", owner.pid, owner.started))
+            .wrap_err_with(|| format!("record the owner in {}", path.display()))
+    }
+}
+
+/// The file in a session directory that names the cargo the session
+/// belongs to. A driver's session has none.
+const OWNER_FILE: &str = "owner";
+
+/// The cargo that the session directory `dir` belongs to, when it records
+/// one.
+///
+/// # Errors
+///
+/// The file exists and cannot be read or is not an owner record.
+pub fn recorded_owner(dir: &Path) -> Result<Option<CargoOwner>> {
+    let path = dir.join(OWNER_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).wrap_err_with(|| format!("read {}", path.display())),
+    };
+    let parsed = text.trim().split_once(' ').and_then(|(pid, started)| {
+        Some(CargoOwner {
+            pid: pid.parse().ok()?,
+            started: started.parse().ok()?,
+        })
+    });
+    parsed.map(Some).ok_or_else(|| {
+        stow_types::stow_error!("{} is not an owner record: {text:?}", path.display())
+    })
+}
+
+/// Remove everything in the session directory `dir` except the record of
+/// its owner: what a cargo that outlived its session leaves to be
+/// refused by.
+///
+/// # Errors
+///
+/// An entry cannot be listed or removed.
+pub fn keep_only_owner(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir).wrap_err_with(|| format!("list {}", dir.display()))? {
+        let entry = entry.wrap_err_with(|| format!("list {}", dir.display()))?;
+        if entry.file_name() == OWNER_FILE {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if entry
+            .file_type()
+            .wrap_err_with(|| format!("stat {}", path.display()))?
+            .is_dir()
+        {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.wrap_err_with(|| format!("remove {}", path.display()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionDir, SessionId};
+    use super::{SessionDir, SessionId, keep_only_owner, recorded_owner};
+    use crate::daemon::owner::CargoOwner;
+
+    #[test]
+    fn a_recorded_owner_survives_the_removal_of_everything_else() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = SessionDir::create(root.path(), SessionId::mint()).expect("create");
+        assert_eq!(recorded_owner(dir.path()).expect("no record"), None);
+        let owner = CargoOwner {
+            pid: 4242,
+            started: 987_654_321,
+        };
+        dir.record_owner(owner).expect("record");
+        std::fs::create_dir_all(dir.path().join("local-build")).expect("marks");
+        std::fs::write(dir.path().join("local-build").join("mark"), b"x").expect("mark");
+        std::fs::write(dir.path().join("stray"), b"x").expect("stray");
+        keep_only_owner(dir.path()).expect("keep only the owner");
+        assert_eq!(recorded_owner(dir.path()).expect("record"), Some(owner));
+        assert_eq!(std::fs::read_dir(dir.path()).expect("list").count(), 1);
+    }
 
     #[test]
     fn an_id_round_trips_through_its_text() {

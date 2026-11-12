@@ -110,3 +110,120 @@ fn every_compiled_unit_is_stored_before_the_build_exits() {
         );
     }
 }
+
+/// How long after its compiler exited a unit's wrapper may exit: the report
+/// and its receipt, and nothing the daemon does with the report. The bound
+/// is generous so a loaded machine does not fail it; storing a unit takes
+/// longer than this only when the wrapper waits for it.
+#[cfg(unix)]
+const WRAPPER_EXIT_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A plain `cargo build` through the wrapper `stow setup` installs: each
+/// locally compiled unit's wrapper exits with its compiler, and the daemon
+/// stores the unit afterwards.
+///
+/// `RUSTC` and `RUSTC_WRAPPER` are shell scripts around the real compiler
+/// and the stow wrapper, each recording when it exited under the number of
+/// the wrapper script that ran it. Unix only: the scripts are `sh`.
+#[cfg(unix)]
+#[test]
+fn a_plain_builds_wrappers_exit_with_their_compilers() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let dir = support::tempdir().expect("temp dir");
+    let cargo_home = support::tempdir().expect("cargo home");
+    write_fixture(dir.path(), cargo_home.path(), FIXTURE_DEPENDENCIES);
+    let tools = support::tempdir().expect("tools");
+    let record = support::tempdir().expect("record");
+    let stow_home = dir.path().join("stow-home");
+
+    // The shipped shape: the runtime under the wrapper's name, with the
+    // runtime link the wrapper starts the daemon from beside it.
+    let stow_wrapper = tools.path().join("stow-rustc-wrapper");
+    symlink(env!("CARGO_BIN_EXE_stow-cli"), &stow_wrapper).expect("link the wrapper");
+    symlink(
+        env!("CARGO_BIN_EXE_stow-cli"),
+        tools.path().join("stow-runtime"),
+    )
+    .expect("link the runtime");
+    let script = |name: &str, body: &str| {
+        let path = tools.path().join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("write the script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the script executable");
+        path
+    };
+    let rustc = script(
+        "recording-rustc",
+        "rustc \"$@\"\nstatus=$?\n\
+         if [ -n \"$STOW_TEST_UNIT\" ]; then : > \"$STOW_TEST_RECORD/rustc-exit-$STOW_TEST_UNIT\"; fi\n\
+         exit $status\n",
+    );
+    let wrapper = script(
+        "recording-wrapper",
+        "STOW_TEST_UNIT=$$ \"$STOW_TEST_STOW_WRAPPER\" \"$@\"\nstatus=$?\n\
+         : > \"$STOW_TEST_RECORD/wrapper-exit-$$\"\nexit $status\n",
+    );
+
+    let cache = support::tempdir().expect("cache dir");
+    let target = support::tempdir().expect("target dir");
+    let mut command = support::cargo_command(&stow_home);
+    support::hermetic_stow_env(&mut command, &refused_url(), cache.path(), &stow_home);
+    command
+        .arg("build")
+        .current_dir(dir.path())
+        .env("CARGO_HOME", cargo_home.path())
+        .env("CARGO_TARGET_DIR", target.path())
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("RUSTC", &rustc)
+        .env("RUSTC_WRAPPER", &wrapper)
+        .env("STOW_TEST_STOW_WRAPPER", &stow_wrapper)
+        .env("STOW_TEST_RECORD", record.path());
+    let output = support::output_after_session(&mut command, &stow_home);
+    let _daemon = support::PrivateDaemon::in_home(&stow_home);
+    assert!(
+        output.status.success(),
+        "the build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let modified = |name: &std::ffi::OsStr| {
+        std::fs::metadata(record.path().join(name))
+            .and_then(|metadata| metadata.modified())
+            .expect("a recorded exit time")
+    };
+    let mut units = 0;
+    for entry in std::fs::read_dir(record.path()).expect("list the record") {
+        let name = entry.expect("entry").file_name();
+        let Some(unit) = name
+            .to_string_lossy()
+            .strip_prefix("wrapper-exit-")
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let compiler_exit = modified(std::ffi::OsStr::new(&format!("rustc-exit-{unit}")));
+        let wrapper_exit = modified(&name);
+        let lag = wrapper_exit
+            .duration_since(compiler_exit)
+            .unwrap_or_else(|_| panic!("unit {unit}: the wrapper exited before its compiler"));
+        assert!(
+            lag < WRAPPER_EXIT_BOUND,
+            "unit {unit}: the wrapper exited {lag:?} after its compiler"
+        );
+        units += 1;
+    }
+    assert!(
+        units >= expected_stored_crates().len(),
+        "only {units} units compiled through a wrapper"
+    );
+
+    // The session has ended, so the daemon's bookkeeping is complete.
+    let stored = stored_crate_names(&cache.path().join("state-v3.sqlite3"));
+    let expected = expected_stored_crates()
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(stored, expected, "the daemon stored every compiled unit");
+}

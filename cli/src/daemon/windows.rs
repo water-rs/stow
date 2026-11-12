@@ -68,7 +68,7 @@ pub fn create_server(name: &Path, first: bool) -> io::Result<NamedPipeServer> {
 }
 
 /// The string form of the SID of the user this process runs as.
-fn current_user_sid() -> io::Result<String> {
+pub fn current_user_sid() -> io::Result<String> {
     let mut token: HANDLE = ptr::null_mut();
     // SAFETY: `token` receives a handle this function closes below.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {

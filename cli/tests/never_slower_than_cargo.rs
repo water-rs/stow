@@ -17,7 +17,7 @@ use stow_cli::wrapper_protocol::{Answer, CompileCommand, Plan, Request};
 
 mod support;
 
-use support::{denied_registry, hermetic_stow_env, sealed_home_env};
+use support::{denied_registry, hermetic_stow_env};
 
 /// An edge that answers the miss-admissions mint with an empty list and
 /// then fails every other call with a 500.
@@ -142,12 +142,11 @@ fn write_probe_crate(dir: &Path, cargo_home: &Path, dependencies: &str) {
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
     // Resolve now, so the build under test is not also a network test.
     // The fetch must share the isolated CARGO_HOME the builds use.
-    let mut fetch = Command::new("cargo");
+    let mut fetch = support::cargo_command(&dir.join("stow-home"));
     fetch
         .arg("fetch")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
-    sealed_home_env(&mut fetch, &dir.join("stow-home"));
     let fetched = fetch.output().expect("run cargo fetch");
     assert!(
         fetched.status.success(),
@@ -546,6 +545,9 @@ fn write_rustc_wrapper_shim(dir: &Path) -> std::path::PathBuf {
         let shim = dir.join("stow-rustc-wrapper");
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stow-cli"), &shim)
             .expect("link rustc wrapper shim");
+        // The wrapper starts the daemon from the runtime link beside it.
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stow-cli"), dir.join("stow-runtime"))
+            .expect("link the runtime");
         shim
     }
 }
@@ -559,7 +561,7 @@ fn cargo_build_in(
     extra_envs: &[(&str, &str)],
     cargo_home: &Path,
 ) -> std::process::Output {
-    let mut command = Command::new("cargo");
+    let mut command = support::cargo_command(&dir.join("stow-home"));
     command
         .arg("build")
         .current_dir(dir)
@@ -573,7 +575,10 @@ fn cargo_build_in(
         .env("CARGO_INCREMENTAL", "0")
         .env_remove("RUST_LOG")
         .envs(extra_envs.iter().copied());
-    command.output().expect("run cargo build")
+    // The daemon's bookkeeping for a plain cargo's session ends after the
+    // wrappers do: wait for it before the caller reads the cache. A build
+    // under a named session has no session of a cargo to wait for.
+    support::output_after_session(&mut command, &dir.join("stow-home"))
 }
 
 /// A remote miss compiles once and stores the outputs locally; every later
@@ -588,6 +593,9 @@ fn a_tripped_circuit_still_serves_local_entries() {
     let cargo_home = support::tempdir().expect("cargo home");
     write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
+    // The wrapper starts the daemon under the build's home; it is stopped
+    // with the test.
+    let _daemon = support::PrivateDaemon::in_home(&dir.path().join("stow-home"));
 
     // Nothing is listening on this port: every remote lookup misses fast.
     let port = {
@@ -690,6 +698,9 @@ fn a_tripped_circuit_still_serves_local_entries() {
 struct StubCensus {
     plans: std::collections::BTreeMap<String, usize>,
     compiled: std::collections::BTreeMap<String, usize>,
+    /// The `Describe` requests the stub received: wrappers it asked for
+    /// their environment, because no session of their cargo existed yet.
+    describes: usize,
     /// Connections accepted but not yet drained to their close — the
     /// count [`drain_stub`] waits out before the census is read.
     open_connections: usize,
@@ -703,6 +714,10 @@ struct StubCensus {
 struct StubDaemon {
     census: std::sync::Mutex<StubCensus>,
     drained: std::sync::Condvar,
+    /// Whether the next plan is answered with a request for the wrapper's
+    /// environment, as the daemon answers the first wrapper of a cargo it
+    /// has no session for. Cleared by that plan: the session exists after.
+    describe_next: std::sync::atomic::AtomicBool,
 }
 
 /// The crate a wrapper frame compiled: `--crate-name`'s value in the
@@ -725,10 +740,11 @@ fn frame_crate_name(request: &Request) -> String {
 /// One stub-daemon connection: plans are told to compile and reports
 /// get a receipt. Every frame is counted.
 #[cfg(unix)]
-fn serve_stub_connection(
-    mut stream: std::os::unix::net::UnixStream,
-    counts: &std::sync::Mutex<StubCensus>,
-) {
+fn serve_stub_connection(mut stream: std::os::unix::net::UnixStream, stub: &StubDaemon) {
+    let counts = &stub.census;
+    // The compile a `Describe` answer is holding while the wrapper sends
+    // its environment.
+    let mut held = None;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
     // The connection's first frame names its role; the stub serves
     // wrappers only.
@@ -752,6 +768,10 @@ fn serve_stub_connection(
         let crate_name = frame_crate_name(&request);
         let answer = match &request {
             Request::Plan(plan) => {
+                // A probe — `-vV`, `--print`, cargo's `___` crate — opens
+                // no session, so the daemon never asks its wrapper for an
+                // environment.
+                let is_unit = !crate_name.is_empty() && crate_name != "___";
                 counts
                     .lock()
                     .expect("frame counts")
@@ -759,10 +779,24 @@ fn serve_stub_connection(
                     .entry(crate_name)
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
-                Answer::Compile(CompileCommand::new(
+                let command = CompileCommand::new(
                     &plan.executable().expect("the plan's executable decodes"),
                     &plan.args().expect("the plan's arguments decode"),
-                ))
+                );
+                if is_unit
+                    && stub
+                        .describe_next
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    held = Some(command);
+                    Answer::Describe
+                } else {
+                    Answer::Compile(command)
+                }
+            }
+            Request::Describe(_) => {
+                counts.lock().expect("frame counts").describes += 1;
+                Answer::Compile(held.take().expect("a Describe answers a held plan"))
             }
             Request::Compiled(_) => {
                 counts
@@ -795,16 +829,21 @@ fn serve_stub_connection(
 /// A daemon that answers every plan with `Compile` and every report
 /// with a receipt, while counting which frames each crate produced. Binds
 /// the socket a wrapper finds under `run_dir`, which is where
-/// `STOW_DAEMON_DIR` points, and returns the count map.
+/// `STOW_DAEMON_DIR` points, and returns the count map. With
+/// `describe_first` the first plan it receives is answered by asking the
+/// wrapper for its environment.
 #[cfg(unix)]
-fn spawn_stub_daemon(run_dir: &Path) -> std::sync::Arc<StubDaemon> {
+fn spawn_stub_daemon(run_dir: &Path, describe_first: bool) -> std::sync::Arc<StubDaemon> {
     use std::os::unix::fs::PermissionsExt as _;
     // The daemon's run directory is private to its user.
     std::fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o700))
         .expect("restrict the stub daemon's run directory");
     let listener = std::os::unix::net::UnixListener::bind(run_dir.join("daemon.sock"))
         .expect("bind stub daemon");
-    let stub = std::sync::Arc::new(StubDaemon::default());
+    let stub = std::sync::Arc::new(StubDaemon {
+        describe_next: std::sync::atomic::AtomicBool::new(describe_first),
+        ..StubDaemon::default()
+    });
     let accept_stub = std::sync::Arc::clone(&stub);
     std::thread::spawn(move || {
         let mut connections = Vec::new();
@@ -818,7 +857,7 @@ fn spawn_stub_daemon(run_dir: &Path) -> std::sync::Arc<StubDaemon> {
             connections.push(std::thread::spawn({
                 let stub = std::sync::Arc::clone(&accept_stub);
                 move || {
-                    serve_stub_connection(stream, &stub.census);
+                    serve_stub_connection(stream, &stub);
                     let mut census = stub.census.lock().expect("frame counts");
                     census.open_connections -= 1;
                     if census.open_connections == 0 {
@@ -914,6 +953,23 @@ fn unreachable_edge_url() -> String {
 #[cfg(unix)]
 #[test]
 fn every_unit_is_one_plan_and_one_report() {
+    assert_one_plan_and_one_report(true);
+}
+
+/// The same census for a plain `cargo build`, whose wrappers name no
+/// session: the first unit's wrapper is asked for its environment exactly
+/// once, and still sends one plan and one report.
+#[cfg(unix)]
+#[test]
+fn every_unit_of_a_plain_cargo_build_is_one_plan_and_one_report() {
+    assert_one_plan_and_one_report(false);
+}
+
+/// Count the frames of a build against a stub daemon. A build with a named
+/// session is the driver's; one without is a plain cargo's, whose first
+/// unit the stub answers by asking for the wrapper's environment.
+#[cfg(unix)]
+fn assert_one_plan_and_one_report(named_session: bool) {
     let dir = support::tempdir().expect("temp dir");
     let cache = support::tempdir().expect("cache dir");
     let cargo_home = support::tempdir().expect("cargo home");
@@ -922,23 +978,27 @@ fn every_unit_is_one_plan_and_one_report() {
     let run_dir = support::tempdir().expect("run dir");
     write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
-    let stub = spawn_stub_daemon(run_dir.path());
+    // The wrapper starts the daemon under the build's home; it is stopped
+    // with the test.
+    let _daemon = support::PrivateDaemon::in_home(&dir.path().join("stow-home"));
+    let stub = spawn_stub_daemon(run_dir.path(), !named_session);
     // A session no driver opened: the stub serves any id.
     let session = "00112233445566778899aabbccddeeff";
 
+    let mut envs = vec![(
+        "STOW_DAEMON_DIR",
+        run_dir.path().to_str().expect("utf-8 path"),
+    )];
+    if named_session {
+        envs.push(("STOW_SESSION", session));
+    }
     let output = cargo_build_in(
         dir.path(),
         &unreachable_edge_url(),
         cache.path(),
         &wrapper,
         &dir.path().join("target"),
-        &[
-            (
-                "STOW_DAEMON_DIR",
-                run_dir.path().to_str().expect("utf-8 path"),
-            ),
-            ("STOW_SESSION", session),
-        ],
+        &envs,
         cargo_home.path(),
     );
     assert!(
@@ -955,7 +1015,7 @@ fn every_unit_is_one_plan_and_one_report() {
     // stream; the build's exit guarantees all frames were sent, and the
     // lock sees them once the stub has drained them.
     drain_stub(run_dir.path(), session, &stub);
-    let (cfg_if_plans, probe_plans, plans, reports, debug) = {
+    let (cfg_if_plans, probe_plans, plans, reports, describes, debug) = {
         let counts = stub.census.lock().expect("frame counts");
         let values = (
             counts.plans.get("cfg_if").copied().unwrap_or(0),
@@ -968,11 +1028,17 @@ fn every_unit_is_one_plan_and_one_report() {
                 .map(|(_, plans)| plans)
                 .sum::<usize>(),
             counts.compiled.values().sum::<usize>(),
+            counts.describes,
             format!("{counts:?}"),
         );
         drop(counts);
         values
     };
+    assert_eq!(
+        describes,
+        usize::from(!named_session),
+        "only a build that names no session is asked for its environment, once: {debug}"
+    );
     assert_eq!(
         cfg_if_plans, 1,
         "a registry unit sends exactly one plan frame: {debug}"
@@ -995,6 +1061,9 @@ fn a_disabled_public_cache_still_serves_local_entries() {
     let cargo_home = support::tempdir().expect("cargo home");
     write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
+    // The wrapper starts the daemon under the build's home; it is stopped
+    // with the test.
+    let _daemon = support::PrivateDaemon::in_home(&dir.path().join("stow-home"));
 
     // Nothing is listening on this port: every remote lookup misses fast.
     let port = {
@@ -1140,8 +1209,7 @@ fn write_empty_crate(dir: &Path) {
 /// The plain cargo build of `dir` into `target_dir` — the baseline both
 /// gates compare stow against.
 fn cargo_baseline(dir: &Path, cargo_home: &Path, target_dir: &Path) -> Command {
-    let mut command = Command::new("cargo");
-    sealed_home_env(&mut command, &dir.join("stow-home"));
+    let mut command = support::cargo_command(&dir.join("stow-home"));
     command
         .arg("build")
         .current_dir(dir)
@@ -1197,6 +1265,47 @@ fn stow_candidate(
     command
 }
 
+/// The build a candidate gate measures against plain cargo: its arguments
+/// are the project directory, the cargo home, the edge URL, a fresh cache
+/// directory and a fresh target directory.
+type Candidate = fn(&Path, &Path, &str, &Path, &Path) -> Command;
+
+/// A plain `cargo build` of `dir` through the rustc wrapper `stow setup`
+/// installs, with the daemon already running as a user's is — the build
+/// every user who ran `stow setup` and nothing else pays for.
+fn plain_candidate(
+    dir: &Path,
+    cargo_home: &Path,
+    edge_url: &str,
+    cache_dir: &Path,
+    target_dir: &Path,
+) -> Command {
+    let shims = dir.join("plain-shims");
+    if !shims.exists() {
+        std::fs::create_dir_all(&shims).expect("create the shim directory");
+        write_rustc_wrapper_shim(&shims);
+    }
+    warm_daemon(edge_url, cache_dir, &dir.join("stow-home"));
+    let wrapper = shims.join(format!("stow-rustc-wrapper{}", wrapper_suffix()));
+    let mut command = support::cargo_command(&dir.join("stow-home"));
+    command
+        .arg("build")
+        .current_dir(dir)
+        .env("CARGO_HOME", cargo_home);
+    hermetic_stow_env(&mut command, edge_url, cache_dir, &dir.join("stow-home"));
+    command
+        .env("RUSTC_WRAPPER", wrapper)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env_remove("RUST_LOG");
+    command
+}
+
+/// The file name suffix [`write_rustc_wrapper_shim`] gives the shim.
+const fn wrapper_suffix() -> &'static str {
+    if cfg!(windows) { ".cmd" } else { "" }
+}
+
 /// stow's in-build `--unit-graph` query must never take the
 /// package-cache lock ahead of the real cargo — when it wins the race,
 /// cargo's own resolve prints this on the user's stderr (stow#608).
@@ -1217,13 +1326,14 @@ fn window_pair(
     dir: &Path,
     cargo_home: &Path,
     edge_url: &str,
+    candidate: Candidate,
 ) -> (std::time::Duration, std::time::Duration) {
     let cargo_target = support::tempdir().expect("cargo target");
     let cargo = window_sample(cargo_baseline(dir, cargo_home, cargo_target.path()));
 
     let stow_cache = support::tempdir().expect("stow cache");
     let stow_target = support::tempdir().expect("stow target");
-    let stow = window_sample(stow_candidate(
+    let stow = window_sample(candidate(
         dir,
         cargo_home,
         edge_url,
@@ -1239,6 +1349,7 @@ fn wall_pair(
     dir: &Path,
     cargo_home: &Path,
     edge_url: &str,
+    candidate: Candidate,
 ) -> (std::time::Duration, std::time::Duration) {
     let cargo_target = support::tempdir().expect("cargo target");
     let (output, cargo) = timed_build(&mut cargo_baseline(dir, cargo_home, cargo_target.path()));
@@ -1250,7 +1361,7 @@ fn wall_pair(
 
     let stow_cache = support::tempdir().expect("stow cache");
     let stow_target = support::tempdir().expect("stow target");
-    let (output, stow) = timed_build(&mut stow_candidate(
+    let (output, stow) = timed_build(&mut candidate(
         dir,
         cargo_home,
         edge_url,
@@ -1295,12 +1406,11 @@ fn write_multi_crate(dir: &Path, cargo_home: &Path) {
     std::fs::create_dir_all(dir.join("src")).expect("create src");
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
     // Resolve now, so the build under test is not also a network test.
-    let mut fetch = Command::new("cargo");
+    let mut fetch = support::cargo_command(&dir.join("stow-home"));
     fetch
         .arg("fetch")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
-    sealed_home_env(&mut fetch, &dir.join("stow-home"));
     let fetched = fetch.output().expect("run cargo fetch");
     assert!(
         fetched.status.success(),
@@ -1582,6 +1692,22 @@ fn window_sample(command: Command) -> std::time::Duration {
 /// artifacts stay all-miss. The same priming covers the startup floor.
 #[test]
 fn an_all_miss_build_is_never_slower_than_cargo() {
+    assert_never_slower_than_cargo(stow_candidate, true);
+}
+
+/// The same gates for a plain `cargo build` through the wrapper `stow setup`
+/// installs, against the daemon a user's login has already started: the
+/// wrapper hands each unit to the build's session and exits with its
+/// compiler, so the build's job slots are as busy as plain cargo's.
+#[test]
+fn a_plain_cargo_all_miss_build_is_never_slower_than_cargo() {
+    assert_never_slower_than_cargo(plain_candidate, false);
+}
+
+/// Run both gates for `candidate` against plain cargo.
+/// `has_precargo_spans` says whether the candidate's build records the
+/// `stow.precargo.*` spans a failed window is diagnosed from.
+fn assert_never_slower_than_cargo(candidate: Candidate, has_precargo_spans: bool) {
     let dir = support::tempdir().expect("temp dir");
     let cargo_home = support::tempdir().expect("cargo home");
     write_multi_crate(dir.path(), cargo_home.path());
@@ -1597,11 +1723,11 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
     let mut cargo_empty_windows = Vec::with_capacity(WINDOW_RUNS);
     let mut stow_empty_windows = Vec::with_capacity(WINDOW_RUNS);
     for _ in 0..WINDOW_RUNS {
-        let (cargo, stow) = window_pair(empty_dir.path(), cargo_home.path(), &edge_url);
+        let (cargo, stow) = window_pair(empty_dir.path(), cargo_home.path(), &edge_url, candidate);
         cargo_empty_windows.push(cargo);
         stow_empty_windows.push(stow);
 
-        let (cargo, stow) = window_pair(dir.path(), cargo_home.path(), &edge_url);
+        let (cargo, stow) = window_pair(dir.path(), cargo_home.path(), &edge_url, candidate);
         cargo_windows.push(cargo);
         stow_windows.push(stow);
     }
@@ -1616,7 +1742,8 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
             empty: &stow_empty_windows,
         },
     );
-    let diagnostic = (!window_comparison.passes()).then(|| {
+    // Only a driver's build has pre-cargo spans to trace.
+    let diagnostic = (!window_comparison.passes() && has_precargo_spans).then(|| {
         serde_json::json!({
             "empty": precargo_diagnostic(empty_dir.path(), cargo_home.path(), &edge_url),
             "project": precargo_diagnostic(dir.path(), cargo_home.path(), &edge_url),
@@ -1638,7 +1765,7 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
         let mut cargo_walls = Vec::with_capacity(TIMED_RUNS);
         let mut stow_walls = Vec::with_capacity(TIMED_RUNS);
         for _ in 0..TIMED_RUNS {
-            let (cargo, stow) = wall_pair(dir.path(), cargo_home.path(), &edge_url);
+            let (cargo, stow) = wall_pair(dir.path(), cargo_home.path(), &edge_url, candidate);
             cargo_walls.push(cargo);
             stow_walls.push(stow);
         }
