@@ -65,6 +65,17 @@ slowdown:
    verification). Re-run with `RUST_LOG=stow_cli=debug` and look at the
    `bundle_digest` the warn line names.
 
+## A plain `cargo build` fails naming the stow daemon
+
+Every compile of a build through stow's wrapper is answered by the per-user
+daemon, so a build that cannot reach it fails at cargo's first probe of the
+compiler, with the endpoint, the run directory and the daemon's pid and log
+in the message. A sandbox must let the process running cargo connect to
+`<run dir>/daemon.sock` (the named pipe on Windows) or start the daemon; see
+[Sandboxes](USAGE.md#sandboxes). `the stow daemon restarted during this
+cargo build` means the daemon was replaced while the build ran, which loses
+the build's in-flight state: run the build again.
+
 ## A unit misses when the index covers it
 
 `stow status` can show the index has rows for the build's dependencies

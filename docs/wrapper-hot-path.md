@@ -17,11 +17,12 @@ Trace this with `STOW_TRACE_FILE=/tmp/stow.json stow check …` and look at the
    `current_thread` since there is at most one concurrent network task;
    every non-wrapper command (`stow check`, `stow build`, `stow predict`,
    the rest) gets `multi_thread`.
-3. **Tracing init** (`should_install_tracing` in `cli/src/lib.rs`). On the
-   wrapper path it installs only when `STOW_TRACE_WRAPPED_COMPILERS` is set
-   to a non-`0` value — `RUST_LOG` alone does not reach wrapped invocations,
-   so hundreds of subscriber builds never run per `cargo build`. Non-wrapper
-   commands always install it.
+3. **Tracing init** (`install_tracing` in `cli/src/lib.rs`). Every process
+   but the daemon installs a subscriber, so a wrapper can print the
+   warnings the daemon returns to it. A wrapper holds it to the default
+   `warn` filter, with no trace file, unless `STOW_TRACE_WRAPPED_COMPILERS`
+   is set to a non-`0` value — `RUST_LOG` alone does not reach wrapped
+   invocations. Non-wrapper commands always read `RUST_LOG`.
 4. **Session lookup** (`SessionLink::from_env` in `cli/src/daemon/client.rs`).
    `STOW_SESSION` names the build's session on the per-user daemon. Without
    it the wrapper's first request finds the session of the cargo that
@@ -36,7 +37,11 @@ The wrapper:
    inside a sandbox — and sends the invocation as one `Plan` request;
 2. exits successfully when the daemon served the unit from the cache, or
    runs the real `rustc` the answer names and reports its result, which the
-   session records.
+   session records. The daemon answers the report with a receipt before
+   it does any bookkeeping, so the wrapper exits as soon as `rustc` has and
+   keeps the build's job slot only as long as the compile;
+3. prints what the daemon logged while deciding the request, at `warn` and
+   above, which it sends ahead of the answer.
 
 Everything else — the build's config, toolchain, serve map, index slice,
 local cache, signature verification and the one connection to the edge —
