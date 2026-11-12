@@ -204,12 +204,11 @@ pub fn sealed_home_env(command: &mut Command, home: &Path) {
     }
     // On Windows every build starts the daemon through the task of its run
     // directory, so a sealed home has its task before any child runs;
-    // [`TempDir`] deletes it with the home. A home [`PrivateDaemon::in_home`]
-    // already prepared has its run directory, and so its task.
+    // [`TempDir`] deletes it with the home. Registering replaces a task
+    // already there (`schtasks /Create /F`), so a home whose task an earlier
+    // daemon's drop deleted, while its run directory stayed, has it again.
     #[cfg(windows)]
-    if !PrivateDaemon::run_dir_of(home).exists() {
-        register_daemon_task(&PrivateDaemon::run_dir_of(home));
-    }
+    register_daemon_task(&PrivateDaemon::run_dir_of(home));
     command
         // Every build starts the user's daemon when none is running: this
         // test's own runs under its home, where [`PrivateDaemon`] finds and
