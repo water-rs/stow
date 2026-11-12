@@ -735,11 +735,13 @@ their own tokens.
 
 ### Repack follow-up
 
-A repack sweep (`build-crate.yml` dispatched with `repack_rustc`, run title
+A repack sweep (`repack.yml` dispatched with `repack_rustc`, run title
 `<rustc>-repack`; see *OCI bundle layout* in `ARCHITECTURE.md`) is
-resumable, and its `repack` job is bound by GitHub's 350-minute job limit.
-`repack-followup.yml` runs on the completion of every `build-crate` run
-and acts only on a `<rustc>-repack` title, dispatching onto `main` with a
+resumable, and its `repack` job, `build-crate.yml`'s called by `repack.yml`
+so that it signs under that file's identity, is bound by GitHub's
+350-minute job limit.
+`repack-followup.yml` runs on the completion of every `repack` run
+(a `build-crate` run creates none) and acts on a `<rustc>-repack` title, dispatching onto `main` with a
 GitHub App installation token (`STOW_APP_ID` / `STOW_APP_PRIVATE_KEY`,
 minted with `actions: write` only, as in `release-plz.yml`). The run's own
 `GITHUB_TOKEN` is not used: GitHub documents that "events triggered by the
@@ -747,7 +749,7 @@ minted with `actions: write` only, as in `release-plz.yml`). The run's own
 run dispatched with it would never trigger the follow-up again and the
 chain would stop after one hop. Its jobs match the triggering workflow on
 the run's `path`, not its `name`, which is the run-name (`<rustc>-repack`)
-for `build-crate.yml`:
+for `repack.yml`:
 
 - Success: `index-publish.yml` for that rustc with `report=true` (the
   fold), then `preheat-cron.yml` with `refresh=true`.
@@ -770,7 +772,7 @@ for `build-crate.yml`:
 - `failure` or `timed_out`: the sweep is dispatched again with
   `repack_rustc` and `repack_concurrency` from `STOW_REPACK_CONCURRENCY`
   (default 32). A `cancelled` run resumes only when its `repack` job
-  (read from the run's jobs API) is `timed_out`, or `cancelled` after
+  (`repack / repack <rustc>` in the run's jobs API) is `timed_out`, or `cancelled` after
   running to within 15 minutes of its 350-minute limit: GitHub's REST
   documentation lists `timed_out` and `cancelled` as job conclusions
   without saying which a `timeout-minutes` expiry reports, so both are

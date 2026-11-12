@@ -47,7 +47,7 @@ use x509_cert::der::{DecodePem as _, Encode as _, EncodePem as _, pem::LineEndin
 
 use crate::client::{RegistryHttp, RegistrySession, Response, SessionRequest};
 use crate::retry::retry_with_backoff;
-use crate::verify::{TrustMaterial, verify_logged_signature, verify_payload_identity};
+use crate::verify::{TrustMaterial, verify_issued_signature, verify_payload_identity};
 
 /// A published manifest and the result of signing its digest.
 #[derive(Debug)]
@@ -202,6 +202,10 @@ struct SignerState {
     http: RegistryHttp,
     trust: Arc<TrustMaterial>,
     services: SigstoreServices,
+    /// The certificate identity every signature made must carry: the one
+    /// readers pin. A certificate Fulcio issues for another identity is an
+    /// error before anything is pushed.
+    certificate_identity: String,
     /// The current key and certificate, behind a lock so concurrent
     /// signers that find it due share a single renewal.
     identity: smol::lock::Mutex<Option<Arc<SigningIdentity>>>,
@@ -230,14 +234,20 @@ impl std::fmt::Debug for SigningIdentity {
 
 impl KeylessSigner {
     /// A signer over `services`, checking every signature it makes against
-    /// `trust` before publishing it.
+    /// `trust` and `certificate_identity` before publishing it.
     #[must_use]
-    pub fn new(http: RegistryHttp, trust: Arc<TrustMaterial>, services: SigstoreServices) -> Self {
+    pub fn new(
+        http: RegistryHttp,
+        trust: Arc<TrustMaterial>,
+        services: SigstoreServices,
+        certificate_identity: &str,
+    ) -> Self {
         Self {
             state: Arc::new(SignerState {
                 http,
                 trust,
                 services,
+                certificate_identity: certificate_identity.to_owned(),
                 identity: smol::lock::Mutex::new(None),
             }),
         }
@@ -252,11 +262,13 @@ impl KeylessSigner {
     pub fn from_env(
         http: RegistryHttp,
         trust: Arc<TrustMaterial>,
+        certificate_identity: &str,
     ) -> stow_types::error::Result<Self> {
         Ok(Self::new(
             http,
             trust,
             SigstoreServices::production_from_env()?,
+            certificate_identity,
         ))
     }
 
@@ -311,8 +323,9 @@ impl KeylessSigner {
     }
 
     /// The signature as a reader will check it: the payload binds
-    /// `reference` at `digest`, and the Rekor bundle, chain and signature
-    /// verify against the trust root.
+    /// `reference` at `digest`, the Rekor bundle, chain and signature
+    /// verify against the trust root, and the certificate carries the
+    /// signer's certificate identity.
     fn check(
         &self,
         layer: &SignatureLayer,
@@ -320,8 +333,9 @@ impl KeylessSigner {
         digest: &str,
     ) -> stow_types::error::Result<()> {
         verify_payload_identity(&layer.payload, reference, digest)?;
-        verify_logged_signature(
+        verify_issued_signature(
             &self.state.trust,
+            &self.state.certificate_identity,
             &SigstoreSignature {
                 payload_path: sigstore_payload_path(0),
                 signature: layer.signature.clone(),
@@ -331,7 +345,7 @@ impl KeylessSigner {
             &layer.payload,
         )
         .wrap_err_with(|| {
-            format!("the signature made for {reference}@{digest} does not verify against the Sigstore trust root")
+            format!("the signature made for {reference}@{digest} does not verify against the Sigstore trust root as certificate identity {}", self.state.certificate_identity)
         })?;
         Ok(())
     }

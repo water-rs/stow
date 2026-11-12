@@ -1,11 +1,11 @@
 name: build-crate
 
 # The webhook completion parses `display_title` back into the run's
-# rustc and task id (`stow_types::records::run_title`). A repack run
-# titles itself `<rustc>-repack`: no scheduler task carries that id, so
-# the completion is an orphan run the scheduler answers with a logged
-# 404, the way it answers any run it never dispatched.
-run-name: ${{ inputs.repack_rustc != '' && format('{0}-repack', inputs.repack_rustc) || format('{0}-{1}', fromJSON(inputs.task).rustc_version, fromJSON(inputs.task).task_id) }}
+# rustc and task id (`stow_types::records::run_title`). A repack sweep is
+# not a run of this workflow: `repack.yml` calls it, and a called
+# workflow's run is the caller's, so no `build-crate` run is ever a repack
+# run.
+run-name: ${{ format('{0}-{1}', fromJSON(inputs.task).rustc_version, fromJSON(inputs.task).task_id) }}
 
 # The scheduler (or `stow-admin preheat manual`) dispatches this workflow on
 # `main` with the whole task as one JSON input. Isolated jobs, two trust levels,
@@ -28,14 +28,21 @@ run-name: ${{ inputs.repack_rustc != '' && format('{0}-repack', inputs.repack_ru
 #             `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` tag).
 #             GHCR is the only record store; the task talks to no edge route.
 #
-#   repack  — dispatched by an operator instead of a task. Compiles
+#   repack  — called by `repack.yml` (an operator's or the follow-up's
+#             dispatch) instead of dispatched with a task. Compiles
 #             nothing: it reads published nodes back from GHCR, verifies
 #             their signatures and every file's hash, repacks nodes still
 #             stored one layer per file into the single-pack layout, and
 #             publishes them and their records under this workflow's
 #             identity (`stow-build repack`). The identity clients trust
 #             is a property of this file on main, so the re-signature has
-#             to come from here and from no other workflow.
+#             to come from here and from no other workflow. It does, as
+#             a reusable workflow: Fulcio's SAN is built from the
+#             token's `job_workflow_ref`, which names the called file
+#             (https://github.com/sigstore/fulcio/blob/main/docs/oidc.md),
+#             and `stow-build repack` refuses to sign under any other
+#             identity (`KeylessSigner`, checked before a signature is
+#             pushed).
 #
 # Completion reaches the scheduler through GitHub itself: `run-name`
 # above stamps `<rustc>-<task_id>`, so the `workflow_run` `completed`
@@ -51,27 +58,35 @@ on:
   workflow_dispatch:
     inputs:
       task:
-        description: JSON-encoded BuildTaskPayload (a build run; unused by a repack run)
+        description: JSON-encoded BuildTaskPayload
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      # The build jobs' `name:` reads `inputs.task` even when they are
+      # skipped, so a call carries the same input at its default.
+      task:
+        description: Unused by a repack call
         required: false
         type: string
         default: '{}'
       repack_rustc:
-        description: Rustc whose published nodes are repacked into the single-pack layout (a repack run)
-        required: false
+        description: Rustc whose published nodes are repacked into the single-pack layout
+        required: true
         type: string
-        default: ''
       repack_concurrency:
         description: Tasks a repack run repacks at once
-        required: false
+        required: true
         type: string
-        default: '4'
 
 permissions: {}
 
-# A repack run serializes per rustc: a second dispatch for the same rustc
-# queues behind the sweep in flight instead of racing it.
+# A task's runs serialize per task. A repack call's group is distinct from
+# `repack.yml`'s own per-rustc group, which already queues a second sweep
+# of one rustc behind the one in flight: the same group on both levels
+# would block the call on its caller.
 concurrency:
-  group: ${{ inputs.repack_rustc != '' && format('repack-{0}', inputs.repack_rustc) || format('build-crate-{0}', fromJSON(inputs.task).task_id) }}
+  group: ${{ inputs.repack_rustc != '' && format('repack-call-{0}', inputs.repack_rustc) || format('build-crate-{0}', fromJSON(inputs.task).task_id) }}
   cancel-in-progress: false
 
 env:

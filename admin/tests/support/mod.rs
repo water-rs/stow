@@ -626,7 +626,7 @@ case "$tool" in
     exit "${STUB_ADMIN_EXIT:-0}";;
   gh)
     # `gh api` answers with the raw REST JSON the scenario plans: a run's
-    # jobs (`STUB_GH_JOBS`), the build-crate run list (`STUB_GH_RUNS`) or the operations run list
+    # jobs (`STUB_GH_JOBS`), the repack run list (`STUB_GH_RUNS`) or the operations run list
     # (`STUB_GH_OPS_RUNS`).
     if [ "${1-}" = api ]; then
       case "$*" in

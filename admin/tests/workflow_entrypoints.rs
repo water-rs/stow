@@ -1071,38 +1071,56 @@ fn build_crate_declarations() {
         .collect();
     assert_eq!(
         triggers,
-        ["workflow_dispatch"],
-        "build-crate.yml is dispatched only: {triggers:?}"
+        ["workflow_dispatch", "workflow_call"],
+        "build-crate.yml is dispatched, or called by repack.yml: {triggers:?}"
     );
-    // A task run carries the payload in `task`; a repack run names its
-    // rustc in `repack_rustc` instead and leaves `task` at its default.
+    // A task run carries the payload in `task`. Only a call names a
+    // rustc to repack: a dispatch cannot start a repack run, which would
+    // be a `build-crate` run `repack-followup.yml` triggers on.
     assert_eq!(
-        at(&wf, "on.workflow_dispatch.inputs.task.default")
+        at(&wf, "on.workflow_dispatch.inputs.task.required")
+            .map(scalar)
+            .as_deref(),
+        Some("true")
+    );
+    assert!(at(&wf, "on.workflow_dispatch.inputs.repack_rustc").is_none());
+    assert!(at(&wf, "on.workflow_dispatch.inputs.repack_concurrency").is_none());
+    assert_eq!(
+        at(&wf, "on.workflow_call.inputs.task.default")
             .map(scalar)
             .as_deref(),
         Some("{}")
     );
-    assert_eq!(
-        at(&wf, "on.workflow_dispatch.inputs.repack_rustc.default")
-            .map(scalar)
-            .as_deref(),
-        Some("")
-    );
+    for input in ["repack_rustc", "repack_concurrency"] {
+        assert_eq!(
+            at(&wf, &format!("on.workflow_call.inputs.{input}.required"))
+                .map(scalar)
+                .as_deref(),
+            Some("true"),
+            "{input}"
+        );
+    }
+}
+
+/// `build-crate.yml`'s per-task `run-name`, concurrency group and the
+/// untrusted build / trusted publish jobs.
+#[test]
+fn build_crate_run_name_concurrency_and_jobs() {
+    let wf = load_workflow("build-crate.yml");
     // Per-task run-name binds the `workflow_run` completion: the
     // scheduler's webhook parses `<rustc>-<task_id>` off `display_title`.
-    // A repack run's `<rustc>-repack` names no task.
     assert_eq!(
         at(&wf, "run-name").map(scalar).as_deref(),
         Some(
-            "${{ inputs.repack_rustc != '' && format('{0}-repack', inputs.repack_rustc) || format('{0}-{1}', fromJSON(inputs.task).rustc_version, fromJSON(inputs.task).task_id) }}"
+            "${{ format('{0}-{1}', fromJSON(inputs.task).rustc_version, fromJSON(inputs.task).task_id) }}"
         )
     );
-    // Per-task concurrency, and one repack sweep per rustc, never
-    // cancelling an earlier run.
+    // Per-task concurrency, never cancelling an earlier run; a repack
+    // call's group differs from `repack.yml`'s, which would block it.
     assert_eq!(
         at(&wf, "concurrency.group").map(scalar).as_deref(),
         Some(
-            "${{ inputs.repack_rustc != '' && format('repack-{0}', inputs.repack_rustc) || format('build-crate-{0}', fromJSON(inputs.task).task_id) }}"
+            "${{ inputs.repack_rustc != '' && format('repack-call-{0}', inputs.repack_rustc) || format('build-crate-{0}', fromJSON(inputs.task).task_id) }}"
         )
     );
     assert_eq!(
@@ -1194,8 +1212,61 @@ fn build_crate_verifies_only_a_candidate_failure() {
     );
 }
 
-/// The operator's repack job runs only in a repack run and republishes
-/// under the builder identity, so it holds the publish job's rights.
+/// `repack.yml` is the only entry to the repack job: dispatched with the
+/// rustc, it calls `build-crate.yml`'s `repack` job (the certificate
+/// identity clients trust is that file), titles itself `<rustc>-repack`,
+/// and serializes per rustc. `repack-followup.yml` triggers on this
+/// workflow alone, so a build run creates no follow-up run.
+#[test]
+fn repack_workflow_calls_the_trusted_builder() {
+    let wf = load_workflow("repack.yml");
+    assert_eq!(at(&wf, "name").map(scalar).as_deref(), Some("repack"));
+    let triggers: Vec<String> = field(&wf, "on")
+        .and_then(serde_yml::Value::as_mapping)
+        .expect("on mapping")
+        .keys()
+        .map(scalar)
+        .collect();
+    assert_eq!(triggers, ["workflow_dispatch"]);
+    assert_eq!(
+        at(&wf, "run-name").map(scalar).as_deref(),
+        Some("${{ format('{0}-repack', inputs.repack_rustc) }}")
+    );
+    assert_eq!(
+        at(&wf, "concurrency.group").map(scalar).as_deref(),
+        Some("${{ format('repack-{0}', inputs.repack_rustc) }}")
+    );
+    assert_eq!(
+        at(&wf, "concurrency.cancel-in-progress")
+            .map(scalar)
+            .as_deref(),
+        Some("false")
+    );
+    assert_eq!(
+        at(&wf, "jobs.repack.uses").map(scalar).as_deref(),
+        Some("./.github/workflows/build-crate.yml")
+    );
+    // The caller grants exactly the called job's rights.
+    let build = load_workflow("build-crate.yml");
+    for permission in ["contents", "packages", "id-token"] {
+        assert_eq!(
+            at(&wf, &format!("jobs.repack.permissions.{permission}")).map(scalar),
+            at(&build, &format!("jobs.repack.permissions.{permission}")).map(scalar),
+            "repack permission {permission}"
+        );
+    }
+    for input in ["repack_rustc", "repack_concurrency"] {
+        assert_eq!(
+            at(&wf, &format!("jobs.repack.with.{input}"))
+                .map(scalar)
+                .as_deref(),
+            Some(format!("${{{{ inputs.{input} }}}}").as_str())
+        );
+    }
+}
+
+/// The repack job runs only in a repack call and republishes under the
+/// builder identity, so it holds the publish job's rights.
 #[test]
 fn build_crate_repack_job() {
     let wf = load_workflow("build-crate.yml");
@@ -1767,7 +1838,7 @@ fn followup_runner<'a>(
         ("github.event.workflow_run.name", title),
         (
             "github.event.workflow_run.path",
-            ".github/workflows/build-crate.yml",
+            ".github/workflows/repack.yml",
         ),
         ("steps.app-token.outputs.token", "test-app-token"),
     ] {
@@ -1819,7 +1890,7 @@ fn job_json(conclusion: &str, minutes: i64) -> String {
     let end = format!("2026-01-01T{:02}:{:02}:00Z", minutes / 60, minutes % 60);
     let start = "2026-01-01T00:00:00Z";
     format!(
-        r#"{{"total_count":2,"jobs":[{{"name":"other","conclusion":"success","started_at":"{start}","completed_at":"{start}"}},{{"name":"repack 1.99.0","conclusion":"{conclusion}","started_at":"{start}","completed_at":"{end}"}}]}}"#,
+        r#"{{"total_count":2,"jobs":[{{"name":"other","conclusion":"success","started_at":"{start}","completed_at":"{start}"}},{{"name":"repack / repack 1.99.0","conclusion":"{conclusion}","started_at":"{start}","completed_at":"{end}"}}]}}"#,
     )
 }
 
@@ -1830,7 +1901,7 @@ fn followup_declarations() {
         at(&wf, "on.workflow_run.workflows")
             .and_then(|s| s.as_sequence())
             .map(|s| s.iter().map(scalar).collect::<Vec<_>>()),
-        Some(vec!["build-crate".to_owned(), "Index publish".to_owned()])
+        Some(vec!["repack".to_owned(), "Index publish".to_owned()])
     );
     assert_eq!(
         at(&wf, "on.workflow_run.types")
@@ -1858,10 +1929,7 @@ fn followup_declarations() {
     );
     // Jobs match the triggering workflow by `path` (the run's `name` is its
     // run-name) and dispatch with an App token scoped to actions:write.
-    for (job, path) in [
-        ("resume", "build-crate.yml"),
-        ("retry", "index-publish.yml"),
-    ] {
+    for (job, path) in [("resume", "repack.yml"), ("retry", "index-publish.yml")] {
         let gate = at(&wf, &format!("jobs.{job}.if"))
             .map(scalar)
             .expect("gate");
@@ -1952,7 +2020,7 @@ fn run_list(runs: &[String]) -> String {
 }
 
 /// A successful `Index publish` completion created at `index_created`,
-/// with the given build-crate and operations run lists.
+/// with the given repack and operations run lists.
 fn retry_runner<'a>(
     scn: &'a Scenario,
     index_created: &str,
@@ -2097,7 +2165,7 @@ fn followup_timeout_resumes_with_the_variable_concurrency() {
         );
         let dispatches = refill_dispatches(&scn);
         assert_eq!(dispatches.len(), 1, "{conclusion}: {dispatches:?}");
-        assert_eq!(dispatches[0].0, "build-crate.yml");
+        assert_eq!(dispatches[0].0, "repack.yml");
         assert_eq!(dispatches[0].1, "main");
         assert_eq!(
             dispatches[0].2,

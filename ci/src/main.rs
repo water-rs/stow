@@ -412,7 +412,11 @@ async fn publish(
     // write spends one budget.
     let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
     let trust = stow_oci::verify::records_trust().await?;
-    let publisher = stow_oci::Publisher::from_env(http, &trust)?;
+    let publisher = stow_oci::Publisher::from_env(
+        http,
+        &trust,
+        stow_types::trusted_builder::CERTIFICATE_IDENTITY,
+    )?;
     let session =
         publisher.session(&stow_types::registry::cache_repository(&task.rustc_version))?;
     // A run whose task's signed records already exist re-tags the

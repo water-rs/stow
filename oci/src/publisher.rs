@@ -40,15 +40,22 @@ impl Publisher {
 
     /// The trusted job's publisher: `GHCR_USERNAME`/`GHCR_TOKEN`, the
     /// `STOW_GHCR_WRITES_PER_MINUTE` budget, and a keyless signer under the
-    /// job's OIDC identity checking its signatures against `trust`.
+    /// job's OIDC identity checking its signatures against `trust` and
+    /// `certificate_identity`, the identity readers pin: a signature under
+    /// any other is never published.
     ///
     /// # Errors
     ///
     /// A credential or the OIDC endpoint is missing from the job
     /// environment, the write rate is malformed, or `trust` is the mock
     /// key.
-    pub fn from_env(http: RegistryHttp, trust: &Trust) -> stow_types::error::Result<Self> {
-        let signer = KeylessSigner::from_env(http.clone(), trust.sigstore()?)?;
+    pub fn from_env(
+        http: RegistryHttp,
+        trust: &Trust,
+        certificate_identity: &str,
+    ) -> stow_types::error::Result<Self> {
+        let signer =
+            KeylessSigner::from_env(http.clone(), trust.sigstore()?, certificate_identity)?;
         Ok(Self::new(
             RegistryCredentials::from_env()?,
             http,
