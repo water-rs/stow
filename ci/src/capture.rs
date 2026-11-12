@@ -728,6 +728,7 @@ async fn prepare_stable_rustc_invocation(
         original_args,
         &identity.c_metadata,
         &identity.extra_filename,
+        original_parsed.extra_filename.is_empty(),
     )?;
     let rewritten_parsed = ParsedRustcArgs::parse(&rewritten_args).map_err(|error| {
         stow_types::stow_error!("parse rewritten rustc wrapper arguments: {error}")
@@ -773,10 +774,20 @@ async fn resolve_dependency_c_metadata_json(
     Ok(Some(serde_json::to_string(&resolved)?))
 }
 
+/// `args` with the stable identity's `-C metadata` and `-C extra-filename`
+/// in place of cargo's.
+///
+/// Cargo's build-unit layout passes no `-C extra-filename` for a build
+/// script, a dylib, a cdylib or an executable: the unit directory keeps
+/// them apart (`use_extra_filename` in cargo's `compilation_files.rs`).
+/// When `cargo_omits_extra_filename`, the stable one is added, so a
+/// published node's file names are the same whichever layout built it;
+/// the outputs are aliased back to the names cargo expects.
 fn rewrite_codegen_identity_args(
     args: &[std::ffi::OsString],
     c_metadata: &str,
     extra_filename: &str,
+    cargo_omits_extra_filename: bool,
 ) -> stow_types::error::Result<Vec<std::ffi::OsString>> {
     let mut rewritten = Vec::with_capacity(args.len());
     let mut iter = args.iter();
@@ -828,6 +839,13 @@ fn rewrite_codegen_identity_args(
             continue;
         }
         rewritten.push(arg.clone());
+    }
+    if cargo_omits_extra_filename && !replaced_extra_filename {
+        rewritten.push(std::ffi::OsString::from("-C"));
+        rewritten.push(std::ffi::OsString::from(format!(
+            "extra-filename={extra_filename}"
+        )));
+        replaced_extra_filename = true;
     }
 
     if !replaced_metadata || !replaced_extra_filename {
@@ -976,9 +994,10 @@ pub async fn detect_rustc_toolchain(
     })
 }
 
-/// Touch cargo's `invoked.timestamp` for a served unit. `package_name` is
-/// the stable identity's crate name — the PACKAGE name the registry
-/// source path carried — because cargo names the fingerprint dir
+/// Touch cargo's `invoked.timestamp` for a served unit, in the fingerprint
+/// directory cargo's layout gives it. `package_name` is the stable
+/// identity's crate name — the PACKAGE name the registry source path
+/// carried — because cargo's shared layout names the fingerprint dir
 /// `<pkg>-<meta>` and a `[lib] name` rename means `parsed.crate_name`
 /// (the lib target name) is not it (stow#578).
 async fn touch_invoked_timestamp_alias(
@@ -988,12 +1007,9 @@ async fn touch_invoked_timestamp_alias(
     let Some(out_dir) = parsed.out_dir.as_ref() else {
         return Ok(());
     };
-    let Some(profile_dir) = out_dir.parent() else {
-        return Ok(());
-    };
-    let fingerprint_dir = profile_dir
-        .join(".fingerprint")
-        .join(format!("{package_name}{}", parsed.extra_filename));
+    let fingerprint_dir = stow_types::cargo_layout::UnitDir::new(out_dir)
+        .map_err(|error| stow_types::stow_error!("touch the unit's invoked.timestamp: {error}"))?
+        .fingerprint_dir(package_name, &parsed.extra_filename);
     let timestamp_path = fingerprint_dir.join("invoked.timestamp");
     smol::unblock(move || {
         std::fs::create_dir_all(&fingerprint_dir).wrap_err_with(|| {
@@ -2276,6 +2292,55 @@ mod tests {
         assert!(error.to_string().contains("extra codegen"), "{error}");
     }
 
+    /// A build script cargo's build-unit layout compiles without
+    /// `-C extra-filename` gets the stable one, so it publishes under the
+    /// same file names as one the shared layout compiled.
+    #[test]
+    fn the_stable_extra_filename_is_added_where_cargo_leaves_it_off() {
+        let argv = |extra_filename: Option<&str>| {
+            let mut argv = [
+                "--crate-name",
+                "build_script_build",
+                "--crate-type",
+                "bin",
+                "--out-dir",
+                "/t/debug/build/zstd-sys/0123456789abcdef/out",
+                "-C",
+                "metadata=fd828ed38da2eccd",
+            ]
+            .map(std::ffi::OsString::from)
+            .to_vec();
+            if let Some(extra_filename) = extra_filename {
+                argv.extend(["-C", extra_filename].map(std::ffi::OsString::from));
+            }
+            argv
+        };
+        for (original, cargo_omits) in [
+            (argv(None), true),
+            (argv(Some("extra-filename=-d1c4311f6644f7fa")), false),
+        ] {
+            let rewritten = super::rewrite_codegen_identity_args(
+                &original,
+                "aaaaaaaaaaaaaaaa",
+                "-aaaaaaaaaaaaaaaa",
+                cargo_omits,
+            )
+            .expect("rewrite");
+            let parsed = ParsedRustcArgs::parse(&rewritten).expect("parse");
+            assert_eq!(parsed.c_metadata.as_deref(), Some("aaaaaaaaaaaaaaaa"));
+            assert_eq!(parsed.extra_filename, "-aaaaaaaaaaaaaaaa");
+        }
+        // An extra-filename the parse saw but the rewrite cannot place is
+        // still refused.
+        super::rewrite_codegen_identity_args(
+            &argv(None),
+            "aaaaaaaaaaaaaaaa",
+            "-aaaaaaaaaaaaaaaa",
+            false,
+        )
+        .expect_err("nothing to replace");
+    }
+
     #[test]
     fn restorable_unit_without_stable_identity_is_fatal() {
         smol::block_on(async {
@@ -2526,6 +2591,41 @@ mod tests {
                     .path()
                     .join("debug/.fingerprint/new_debug_unreachable-0123456789abcdef/invoked.timestamp")
                     .exists()
+            );
+        });
+    }
+
+    /// Cargo's build-unit layout keeps a unit's fingerprint beside its
+    /// `out` directory, named by the unit directory alone.
+    #[test]
+    fn the_timestamp_alias_follows_the_build_unit_layout() {
+        smol::block_on(async {
+            let tempdir = tempdir().expect("tempdir");
+            let unit = tempdir
+                .path()
+                .join("debug/build/new_debug_unreachable/0123456789abcdef");
+            let parsed = parsed_lib("debug_unreachable", unit.join("out"), "-0123456789abcdef");
+
+            super::touch_invoked_timestamp_alias(&parsed, "new_debug_unreachable")
+                .await
+                .expect("touch timestamp");
+
+            assert!(unit.join("fingerprint/invoked.timestamp").exists());
+        });
+    }
+
+    #[test]
+    fn a_served_unit_outside_cargos_layout_is_refused() {
+        smol::block_on(async {
+            let tempdir = tempdir().expect("tempdir");
+            let parsed = parsed_lib("demo", tempdir.path().join("out"), "-0123456789abcdef");
+
+            let error = super::touch_invoked_timestamp_alias(&parsed, "demo")
+                .await
+                .expect_err("no fingerprint directory to touch");
+            assert!(
+                error.to_string().contains("cargo's build-directory layout"),
+                "{error}"
             );
         });
     }

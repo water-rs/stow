@@ -1082,8 +1082,7 @@ fn feed_drive_complete_request(
         hashes.push(stow_types::api::demand_feed_page_hash(&entries)?);
     }
     let manifest = stow_types::api::demand_feed_manifest(&hashes)
-        .map(|hash| hash.to_hex().to_string())
-        .unwrap_or_default();
+        .map_or_default(|hash| hash.to_hex().to_string());
     Ok(stow_types::api::DemandFeedCompleteRequest {
         hour: feed_drive_hour(idx),
         generation: FEED_DRIVE_GENERATION,

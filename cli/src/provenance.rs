@@ -19,17 +19,19 @@
 //! built locally too. Serving one of them from the cache turns a partial
 //! cache into a failed build rather than a slower one.
 //!
-//! The marker names the artifact itself — `<crate name><-C extra-filename>`,
-//! the file stem cargo hands a consumer as the `--extern` path — not the
-//! crate or the `--extern` alias. The alias is only what the consumer calls
-//! the dependency: a manifest rename (`pki_types` for `rustls_pki_types`)
-//! would hide a local build behind the wrong key entirely (stow#733), and
-//! the crate name alone marks more than the unit — a build-script probe
-//! that borrows a real crate's `--crate-name`, or a second feature set or
-//! side of it, would send that crate's consumers local by the dozen
-//! (stow#734). A probe records nothing either way: it carries no
-//! `-C extra-filename`, and no consumer can link an output whose file name
-//! carries no hash.
+//! The marker names the artifact itself — `<crate name>-<unit hash>`, read
+//! off the `--extern` path cargo hands a consumer: the file stem in cargo's
+//! shared `deps` directory, the crate name and the unit directory in its
+//! build-unit layout — not the crate or the `--extern` alias. The alias is
+//! only what the consumer calls the dependency: a manifest rename
+//! (`pki_types` for `rustls_pki_types`) would hide a local build behind the
+//! wrong key entirely (stow#733), and the crate name alone marks more than
+//! the unit — a build-script probe that borrows a real crate's
+//! `--crate-name`, or a second feature set or side of it, would send that
+//! crate's consumers local by the dozen (stow#734). A probe never names
+//! the unit a consumer links: in the shared layout it carries no
+//! `-C extra-filename`, in the build-unit one it writes into its build
+//! script run's directory, whose hash is no library's.
 //!
 //! The markers live in the build's session directory, which only the
 //! process deciding the build's units writes. Cargo runs a unit only after
@@ -40,6 +42,7 @@
 
 use std::path::{Path, PathBuf};
 
+use stow_types::cargo_layout::UnitDir;
 use stow_types::rustc::ParsedExternCrate;
 
 /// Subdirectory of the build's session directory holding one marker per
@@ -50,12 +53,13 @@ const LOCAL_BUILD_DIR: &str = "local-build";
 /// compiled locally for `target` in this build, so artifacts compiled
 /// against it stay off the cache.
 ///
-/// `extra_filename` is the `-C extra-filename` the invocation writes its
-/// outputs with — cargo's own, since the wrapper hands rustc the argv
-/// unchanged — which is what lands in the output file name a consumer's
-/// `--extern` path spells. A unit carrying none writes no hashed output
-/// for a consumer to name — a build-script probe is exactly such a unit —
-/// so it records nothing.
+/// `extra_filename` and `out_dir` are the `-C extra-filename` and
+/// `--out-dir` the invocation writes its outputs with — cargo's own, since
+/// the wrapper hands rustc the argv unchanged — which is what a consumer's
+/// `--extern` path spells. A unit whose outputs carry no unit hash in
+/// either — a shared-layout build-script probe is exactly such a unit, as
+/// is any unit outside cargo's layout — writes nothing a consumer can
+/// name, so it records nothing.
 ///
 /// Silently does nothing when the build has no session directory: there is
 /// no build-wide view to record into.
@@ -64,17 +68,19 @@ pub async fn record_local_build(
     target: &str,
     crate_name: &str,
     extra_filename: &str,
+    out_dir: Option<&Path>,
 ) -> stow_types::error::Result<()> {
-    if extra_filename.is_empty() {
+    let Some(marker) = out_dir.and_then(|out_dir| marker_name(crate_name, extra_filename, out_dir))
+    else {
         return Ok(());
-    }
+    };
     let Some(dir) = session_dir.map(|session_dir| marker_dir(session_dir, target)) else {
         return Ok(());
     };
     async_fs::create_dir_all(&dir)
         .await
         .map_err(|error| stow_types::stow_error!("create {}: {error}", dir.display()))?;
-    let marker = dir.join(marker_name(crate_name, extra_filename));
+    let marker = dir.join(marker);
     async_fs::write(&marker, [])
         .await
         .map_err(|error| stow_types::stow_error!("write {}: {error}", marker.display()))
@@ -123,6 +129,10 @@ fn locally_built_dependency_in(dir: &Path, extern_crates: &[ParsedExternCrate]) 
 /// `None` for a file cargo may hand that nothing this build compiled can
 /// have written: an extension no rustc unit output has, a name with no
 /// `-<16 hex>` extra-filename tail, or no file name at all.
+///
+/// The unit hash comes from cargo's layout: the stem's own tail in the
+/// shared `deps` directory, the unit directory in the build-unit layout,
+/// where a dylib's file name carries none ([`UnitDir::unit_name`]).
 fn artifact_marker_name(path: &Path) -> Option<String> {
     let file_name = path.file_name()?.to_str()?;
     let (stem, extension) = file_name.rsplit_once('.')?;
@@ -131,14 +141,7 @@ fn artifact_marker_name(path: &Path) -> Option<String> {
         "dll" => stem,
         _ => return None,
     };
-    let (crate_name, hash) = stem.rsplit_once('-')?;
-    if crate_name.is_empty()
-        || hash.len() != 16
-        || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return None;
-    }
-    Some(stem.to_owned())
+    UnitDir::new(path.parent()?).ok()?.unit_name(stem)
 }
 
 fn marker_dir(session_dir: &Path, target: &str) -> PathBuf {
@@ -148,10 +151,15 @@ fn marker_dir(session_dir: &Path, target: &str) -> PathBuf {
 /// The marker one locally compiled artifact carries: the crate name in
 /// its rustc spelling (a dash is an underscore in `--crate-name` and in
 /// the output file name, while a caller may still hold the crates.io
-/// spelling) plus the `-C extra-filename` the outputs were written with —
-/// `<crate><extra>`, the file stem a consumer's `--extern` names.
-fn marker_name(crate_name: &str, extra_filename: &str) -> String {
-    format!("{}{}", crate_name.replace('-', "_"), extra_filename)
+/// spelling) plus the unit hash of the outputs `out_dir` holds —
+/// `<crate>-<hash>`, the name [`artifact_marker_name`] reads off a
+/// consumer's `--extern`. `None` for outputs no consumer can name.
+fn marker_name(crate_name: &str, extra_filename: &str, out_dir: &Path) -> Option<String> {
+    UnitDir::new(out_dir).ok()?.unit_name(&format!(
+        "{}{}",
+        crate_name.replace('-', "_"),
+        extra_filename
+    ))
 }
 
 #[cfg(test)]
@@ -221,9 +229,71 @@ mod tests {
     /// the marker's crate part normalizes to it.
     #[test]
     fn the_crate_spelling_normalizes_to_the_file_names() {
+        for out_dir in [
+            "/t/debug/deps",
+            "/t/debug/build/unicode-ident/0123456789abcdef/out",
+        ] {
+            assert_eq!(
+                marker_name(
+                    "unicode-ident",
+                    "-0123456789abcdef",
+                    std::path::Path::new(out_dir)
+                )
+                .as_deref(),
+                Some("unicode_ident-0123456789abcdef"),
+                "{out_dir}"
+            );
+        }
+    }
+
+    /// Cargo's build-unit layout leaves the hash off a dylib's file name:
+    /// the unit directory names it, for the producer and the consumer
+    /// alike, and two units of one crate stay apart.
+    #[tokio::test]
+    async fn a_build_unit_dylib_without_a_hashed_name_is_marked_by_its_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let unit = "/t/debug/build/dyn-dep/0123456789abcdef/out";
+        super::record_local_build(
+            Some(temp.path()),
+            TARGET,
+            "dyn_dep",
+            "",
+            Some(std::path::Path::new(unit)),
+        )
+        .await
+        .expect("record");
+        let dir = marker_dir(temp.path(), TARGET);
+        for (path, found) in [
+            (format!("{unit}/libdyn_dep.so"), true),
+            (format!("{unit}/libdyn_dep.dylib"), true),
+            (format!("{unit}/dyn_dep.dll"), true),
+            (
+                "/t/debug/build/dyn-dep/fedcba9876543210/out/libdyn_dep.so".to_owned(),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                locally_built_dependency_in(&dir, &[extern_crate("dyn_dep", &path)]),
+                found.then(|| "dyn_dep-0123456789abcdef".to_owned()),
+                "{path}"
+            );
+        }
+    }
+
+    /// A build-unit rlib carries the unit hash both in its name and in its
+    /// directory; it is counted once.
+    #[test]
+    fn a_build_unit_rlib_names_its_unit_once() {
+        let (_temp, dir) = build_with_local(&["serde-0123456789abcdef"]);
         assert_eq!(
-            marker_name("unicode-ident", "-0123456789abcdef"),
-            "unicode_ident-0123456789abcdef"
+            locally_built_dependency_in(
+                &dir,
+                &[extern_crate(
+                    "serde",
+                    "/t/debug/build/serde/0123456789abcdef/out/libserde-0123456789abcdef.rmeta"
+                )]
+            ),
+            Some("serde-0123456789abcdef".to_owned())
         );
     }
 
@@ -338,9 +408,22 @@ mod tests {
     #[tokio::test]
     async fn a_unit_without_extra_filename_records_nothing() {
         let temp = tempfile::tempdir().expect("temp dir");
-        super::record_local_build(Some(temp.path()), TARGET, "proc_macro2", "")
+        for out_dir in [
+            // The shared layout's build-script run directory, and a
+            // probe's own temporary directory outside cargo's layout.
+            "/t/debug/build/proc-macro2-0123456789abcdef/out",
+            "/tmp/probe",
+        ] {
+            super::record_local_build(
+                Some(temp.path()),
+                TARGET,
+                "proc_macro2",
+                "",
+                Some(std::path::Path::new(out_dir)),
+            )
             .await
             .expect("record");
+        }
         assert!(
             !marker_dir(temp.path(), TARGET).exists(),
             "a probe-shaped unit left a marker behind"
@@ -357,6 +440,7 @@ mod tests {
             TARGET,
             "rustls-pki-types",
             "-0123456789abcdef",
+            Some(std::path::Path::new("/t/debug/deps")),
         )
         .await
         .expect("record");

@@ -152,7 +152,6 @@ struct TracingGuard {
 /// returns the `Result` prints `Error: {:?}` instead, which escapes the
 /// backslashes of a Windows path and wraps the message in the error type's
 /// internals.
-#[must_use]
 pub fn run() -> std::process::ExitCode {
     match try_run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -551,6 +550,7 @@ async fn record_local_build_mark(
             target,
             &parsed.crate_name,
             &parsed.extra_filename,
+            parsed.out_dir.as_deref(),
         )
         .await,
     );
@@ -744,28 +744,24 @@ async fn reads_manifest_dir(
 }
 
 /// A compiled build script must leave its binary behind for cargo's run
-/// phase to link as `build-script-build`. Cargo creates that alias
-/// itself before it execs the script — stow must not write the alias
-/// too: two writers racing a path that may already be hardlinked to the
-/// source turns `fs::copy`'s truncate into a zeroed shared inode
-/// (stow#347).
+/// phase. In cargo's shared layout cargo links it as `build-script-build`
+/// itself before it execs the script — stow must not write that link too:
+/// two writers racing a path that may already be hardlinked to the source
+/// turns `fs::copy`'s truncate into a zeroed shared inode (stow#347). In
+/// the build-unit layout cargo runs rustc's output where it lies.
 fn check_build_script_output(
     parsed: &rustc_args::ParsedRustcArgs,
     host: &str,
 ) -> stow_types::error::Result<()> {
+    if !parsed.is_build_script() {
+        return Ok(());
+    }
     let Some(source_path) = parsed
         .output_binary_path(host)
         .map_err(stow_types::error::Error::msg)?
     else {
         return Ok(());
     };
-    if parsed
-        .build_script_alias_path(host)
-        .map_err(stow_types::error::Error::msg)?
-        .is_none()
-    {
-        return Ok(());
-    }
     if !source_path.exists() {
         return Err(stow_types::stow_error!(
             "build script output {} does not exist after successful rustc passthrough",
@@ -5351,36 +5347,34 @@ where
     // empty trace (stow#698), and a filter `RUST_LOG` could narrow
     // would do it again. The layer sees stow's crates at `trace` and
     // nothing else.
-    let (chrome_layer, chrome_guard) = trace_file
-        .map(|path| {
-            let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
-                .file(path)
-                .include_args(true)
-                // The daemon's decision spans are opened here as their
-                // records arrive, from whichever task reads them and with
-                // no thread to enter them on: an async trace records a
-                // span from its creation to its close.
-                .trace_style(tracing_chrome::TraceStyle::Async)
-                // A mirrored span is named for the daemon span it copies.
-                .name_fn(Box::new(|event_or_span| match event_or_span {
-                    tracing_chrome::EventOrSpan::Span(span) => span
-                        .extensions()
-                        .get::<crate::daemon::events::MirroredName>()
-                        .map_or_else(|| span.metadata().name().to_owned(), |name| name.0.clone()),
-                    tracing_chrome::EventOrSpan::Event(event) => event.metadata().name().to_owned(),
-                }))
-                .build();
-            (
-                Some(
-                    layer.with_filter(
-                        tracing_subscriber::filter::Targets::new()
-                            .with_target("stow_", tracing::Level::TRACE),
-                    ),
+    let (chrome_layer, chrome_guard) = trace_file.map_or_default(|path| {
+        let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+            .file(path)
+            .include_args(true)
+            // The daemon's decision spans are opened here as their
+            // records arrive, from whichever task reads them and with
+            // no thread to enter them on: an async trace records a
+            // span from its creation to its close.
+            .trace_style(tracing_chrome::TraceStyle::Async)
+            // A mirrored span is named for the daemon span it copies.
+            .name_fn(Box::new(|event_or_span| match event_or_span {
+                tracing_chrome::EventOrSpan::Span(span) => span
+                    .extensions()
+                    .get::<crate::daemon::events::MirroredName>()
+                    .map_or_else(|| span.metadata().name().to_owned(), |name| name.0.clone()),
+                tracing_chrome::EventOrSpan::Event(event) => event.metadata().name().to_owned(),
+            }))
+            .build();
+        (
+            Some(
+                layer.with_filter(
+                    tracing_subscriber::filter::Targets::new()
+                        .with_target("stow_", tracing::Level::TRACE),
                 ),
-                Some(guard),
-            )
-        })
-        .unwrap_or_default();
+            ),
+            Some(guard),
+        )
+    });
 
     (
         tracing_subscriber::registry()

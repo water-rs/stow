@@ -4395,29 +4395,38 @@ checksum = "33"
                 "the cdylib must be linked for ARM64"
             );
             // Cargo keeps a build script, a host artifact, under
-            // `debug/build/<package>-<hash>/` even with `--target`.
-            let build_scripts: Vec<PathBuf> =
-                std::fs::read_dir(target_dir.path().join("debug").join("build"))
-                    .expect("read the build directory")
-                    .map(|entry| entry.expect("build directory entry").path())
-                    .filter(|dir| {
-                        dir.file_name()
+            // `debug/build/` even with `--target`: in
+            // `<package>-<hash>/` in its shared layout, in
+            // `<package>/<hash>/out/` in its build-unit one.
+            fn files_under(dir: &Path, found: &mut Vec<PathBuf>) {
+                for entry in std::fs::read_dir(dir).expect("read a build directory") {
+                    let path = entry.expect("build directory entry").path();
+                    if path.is_dir() {
+                        files_under(&path, found);
+                    } else {
+                        found.push(path);
+                    }
+                }
+            }
+            let build = target_dir.path().join("debug").join("build");
+            let mut build_files = Vec::new();
+            files_under(&build, &mut build_files);
+            let build_scripts: Vec<PathBuf> = build_files
+                .into_iter()
+                .filter(|path| {
+                    let package = path
+                        .strip_prefix(&build)
+                        .ok()
+                        .and_then(|path| path.components().next())
+                        .and_then(|component| component.as_os_str().to_str());
+                    package.is_some_and(|package| package.starts_with("stow-sandbox-probe"))
+                        && path.extension().is_some_and(|extension| extension == "exe")
+                        && path
+                            .file_name()
                             .and_then(|name| name.to_str())
-                            .is_some_and(|name| name.starts_with("stow-sandbox-probe-"))
-                    })
-                    .flat_map(|dir| {
-                        std::fs::read_dir(dir)
-                            .expect("read a build script directory")
-                            .map(|entry| entry.expect("build script entry").path())
-                    })
-                    .filter(|path| {
-                        path.extension().is_some_and(|extension| extension == "exe")
-                            && path
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .is_some_and(|name| name.starts_with("build_script_build-"))
-                    })
-                    .collect();
+                            .is_some_and(|name| name.starts_with("build_script_build"))
+                })
+                .collect();
             assert_eq!(
                 build_scripts.len(),
                 1,

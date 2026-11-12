@@ -1703,7 +1703,7 @@ mod tests {
             );
             assert_eq!(run["id"], task.run_id);
             assert_eq!(body["action"], "completed");
-            assert!(seen.insert(task.task_id.clone()));
+            assert!(seen.insert(task.task_id));
         }
         assert!(lane.take().is_err());
     }

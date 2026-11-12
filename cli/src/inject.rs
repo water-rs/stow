@@ -697,15 +697,20 @@ pub fn place_staged<F>(
 /// `ERROR_SHARING_VIOLATION` from it. See the `MoveFileExW` and
 /// `CreateFileW` documentation, and stow#1472 for the observed failure.
 fn replace_in_flight(error: &std::io::Error) -> bool {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
-        return error.raw_os_error() == i32::try_from(ERROR_ACCESS_DENIED).ok();
-    }
-    #[cfg(not(windows))]
+    error.kind() == std::io::ErrorKind::NotFound || refused_open(error)
+}
+
+/// Whether `error` is Windows refusing to open a file a rename is
+/// replacing (`ERROR_ACCESS_DENIED`).
+#[cfg(windows)]
+fn refused_open(error: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+    error.raw_os_error() == i32::try_from(ERROR_ACCESS_DENIED).ok()
+}
+
+/// No other platform refuses an open during a replace.
+#[cfg(not(windows))]
+const fn refused_open(_error: &std::io::Error) -> bool {
     false
 }
 

@@ -603,8 +603,7 @@ async fn complete_build_task(
             run.conclusion.as_deref().unwrap_or("<none>"),
             run.html_url
                 .as_deref()
-                .map(|url| format!(" ({url})"))
-                .unwrap_or_default()
+                .map_or_default(|url| format!(" ({url})"))
         ));
     }
 

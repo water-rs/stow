@@ -1335,7 +1335,7 @@ fn deploy_edge_applies_triggers_after_promotion() {
     let steps = at(&wf, "jobs.promote.steps")
         .and_then(serde_yml::Value::as_sequence)
         .expect("promote steps");
-    let run_of = |s: &serde_yml::Value| field(s, "run").map(scalar).unwrap_or_default();
+    let run_of = |s: &serde_yml::Value| field(s, "run").map_or_default(scalar);
     let position = |needle: &str| {
         steps
             .iter()

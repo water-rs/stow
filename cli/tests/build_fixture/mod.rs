@@ -601,15 +601,13 @@ pub fn recording_edge() -> (String, RecordedRequests) {
 /// drain has admitted it.
 #[allow(dead_code)] // only the local-only fixtures read the journals
 pub fn journal_files(target_dir: &Path) -> Vec<String> {
-    std::fs::read_dir(target_dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .filter(|name| name.starts_with("stow-misses."))
-                .collect()
-        })
-        .unwrap_or_default()
+    std::fs::read_dir(target_dir).map_or_default(|entries| {
+        entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("stow-misses."))
+            .collect()
+    })
 }
 
 /// Write the stow global config the fixture's child processes read: the

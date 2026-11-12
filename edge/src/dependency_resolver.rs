@@ -596,7 +596,7 @@ fn exact_graph_from_request(
                 profile: dependency.profile,
             })
             .collect::<BTreeSet<_>>();
-        dependency_keys_by_key.insert(key.clone(), dependency_keys);
+        dependency_keys_by_key.insert(key, dependency_keys);
     }
 
     for (node_key, dependency_keys) in &dependency_keys_by_key {
@@ -1239,10 +1239,9 @@ mod tests {
             .map(|member| stow_types::api::SubgraphNode {
                 crate_name: member.package.crate_name.clone(),
                 version: stow_types::identity::CrateVersion::new(member.package.version.clone()),
-                features_json: features
-                    .get(member)
-                    .map(|raw| super::parse_canonical_features_json(raw).expect("features parse"))
-                    .unwrap_or_default(),
+                features_json: features.get(member).map_or_default(|raw| {
+                    super::parse_canonical_features_json(raw).expect("features parse")
+                }),
                 host_side: member.host_side,
                 keys_apart: false,
                 deps: graph

@@ -159,27 +159,47 @@ fn plain_cargo_build(dir: &Path, cargo_home: &Path, target_dir: &Path) -> Output
         .expect("run cargo build")
 }
 
-/// The `build/<pkg>-<hash>/output` files under `target/debug`, keyed by
-/// package name — only a build-script-run unit writes `output`.
+/// The build-script stdout files cargo keeps under `target/debug`, keyed
+/// by package name, in whichever layout the cargo running the test
+/// writes: `build/<pkg>-<hash>/output` in the shared one,
+/// `build/<pkg>/<hash>/run/stdout` in the build-unit one. Only a
+/// build-script-run unit writes one.
 fn build_script_outputs(target_dir: &Path) -> BTreeMap<String, PathBuf> {
     let mut found = BTreeMap::new();
     let build_root = target_dir.join("debug").join("build");
-    for entry in std::fs::read_dir(&build_root)
-        .unwrap_or_else(|error| panic!("read {}: {error}", build_root.display()))
-    {
-        let entry = entry.expect("build dir entry");
-        let output = entry.path().join("output");
-        if !output.is_file() {
-            continue;
+    let entries = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+            .map(|entry| entry.expect("build dir entry").path())
+            .collect::<Vec<_>>()
+    };
+    for entry in entries(&build_root) {
+        let name = entry.file_name().expect("entry name").to_string_lossy();
+        // A shared-layout `<pkg>-<hash>`, or a build-unit `<pkg>` holding
+        // one directory per unit hash.
+        let (package, run_dirs) = match name.rsplit_once('-') {
+            Some((package, hash)) if hash.len() == 16 => (package.to_owned(), vec![entry.clone()]),
+            _ => (name.into_owned(), entries(&entry)),
+        };
+        for run_dir in run_dirs {
+            let out_dir = run_dir.join("out");
+            let unit = stow_types::cargo_layout::UnitDir::new(&out_dir)
+                .unwrap_or_else(|error| panic!("{error}"));
+            let Ok((dirs, file)) = unit.build_script_stdout() else {
+                continue;
+            };
+            let stdout = dirs
+                .iter()
+                .chain([&file])
+                .fold(run_dir, |path, component| path.join(component));
+            if !stdout.is_file() {
+                continue;
+            }
+            assert!(
+                found.insert(package.clone(), stdout).is_none(),
+                "two build-script output files for {package}"
+            );
         }
-        let dir_name = entry.file_name().to_string_lossy().into_owned();
-        let (package, _hash) = dir_name
-            .rsplit_once('-')
-            .unwrap_or_else(|| panic!("build dir {dir_name} has no <pkg>-<hash> shape"));
-        assert!(
-            found.insert(package.to_owned(), output).is_none(),
-            "two build-script output files for {package}"
-        );
     }
     found
 }

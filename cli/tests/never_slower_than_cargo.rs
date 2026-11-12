@@ -733,8 +733,7 @@ fn frame_crate_name(request: &Request) -> String {
     args.iter()
         .position(|arg| arg == "--crate-name")
         .and_then(|index| args.get(index + 1))
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .map_or_default(|name| name.to_string_lossy().into_owned())
 }
 
 /// One stub-daemon connection: plans are told to compile and reports

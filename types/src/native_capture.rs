@@ -29,14 +29,15 @@ use crate::error::Context;
 /// root is opened without following a symlink and every entry is opened
 /// relative to a directory handle, also without following one: nothing the
 /// build planted can lead the host outside the tree. A symlinked `OUT_DIR`,
-/// or a symlinked `output` file, is an error.
+/// or a symlink on the way to the build script's stdout file, is an error.
 ///
 /// # Errors
 ///
-/// A set `OUT_DIR` whose sibling `output` file is missing is an error: cargo
-/// always runs the build script (and writes `output`) before compiling the
-/// crate, so its absence means the directory is not what cargo promised.
-/// Filesystem and UTF-8 failures while walking `OUT_DIR` are likewise errors.
+/// A set `OUT_DIR` outside cargo's layout, or one whose build script's
+/// stdout file is missing, is an error: cargo always runs the build script
+/// (and keeps its stdout) before compiling the crate, so its absence means
+/// the directory is not what cargo promised. Filesystem and UTF-8 failures
+/// while walking `OUT_DIR` are likewise errors.
 pub fn capture_native_artifacts(
     crate_name: &str,
     build_script_out_dir: Option<&Path>,
@@ -44,9 +45,9 @@ pub fn capture_native_artifacts(
     let Some(out_dir) = build_script_out_dir else {
         return Ok(None);
     };
-    let (build_dir, out_dir_name) = open_build_dir(crate_name, out_dir)?;
-    let cargo_directives = read_directives_in(crate_name, &build_dir, out_dir)?;
-    let (static_libs, out_dir_files) = match OutDirRoot::open_in(&build_dir, out_dir_name)? {
+    let run = RunDir::open(crate_name, out_dir)?;
+    let cargo_directives = run.read_directives(crate_name)?;
+    let (static_libs, out_dir_files) = match OutDirRoot::open_in(&run.dir, run.out_dir_name)? {
         Some(root) => root.collect()?,
         None => (Vec::new(), Vec::new()),
     };
@@ -59,63 +60,93 @@ pub fn capture_native_artifacts(
     }))
 }
 
-/// The `cargo:` directive lines the build script that owns `out_dir` wrote
-/// to its `output` file, which sits beside `out_dir`, read without following
-/// a symlink.
+/// The `cargo:` directive lines the build script that ran with `out_dir`
+/// printed, from the stdout file cargo keeps beside `out_dir` in its
+/// layout, read without following a symlink.
 ///
 /// # Errors
 ///
-/// An `out_dir` with no sibling `output` file is an error: cargo always
-/// runs the build script (and writes `output`) before compiling the
-/// crate, so its absence means the directory is not what cargo promised.
+/// An `out_dir` outside cargo's layout, or one whose stdout file is
+/// missing: cargo always runs the build script (and keeps its stdout)
+/// before compiling the crate, so its absence means the directory is not
+/// what cargo promised.
 pub fn read_build_script_directives(
     crate_name: &str,
     out_dir: &Path,
 ) -> crate::error::Result<Vec<String>> {
-    let (build_dir, _) = open_build_dir(crate_name, out_dir)?;
-    read_directives_in(crate_name, &build_dir, out_dir)
+    RunDir::open(crate_name, out_dir)?.read_directives(crate_name)
 }
 
-/// The build dir that holds `out_dir`, as a handle, and `out_dir`'s name in it.
-fn open_build_dir<'a>(
-    crate_name: &str,
-    out_dir: &'a Path,
-) -> crate::error::Result<(Dir, &'a OsStr)> {
-    let build_dir_path = out_dir.parent().ok_or_else(|| {
-        crate::stow_error!(
-            "build script OUT_DIR {} for {crate_name} has no parent build dir",
-            out_dir.display()
-        )
-    })?;
-    let out_dir_name = out_dir.file_name().ok_or_else(|| {
-        crate::stow_error!(
-            "build script OUT_DIR {} for {crate_name} has no directory name",
-            out_dir.display()
-        )
-    })?;
-    let build_dir = Dir::open_ambient_dir(build_dir_path, ambient_authority())
-        .wrap_err_with(|| format!("open build dir {}", build_dir_path.display()))?;
-    Ok((build_dir, out_dir_name))
+/// The directory of one build script run, which holds its `OUT_DIR` and
+/// the file cargo keeps its stdout in.
+struct RunDir<'a> {
+    /// A handle on the directory holding `OUT_DIR`.
+    dir: Dir,
+    /// Its path, for messages.
+    path: &'a Path,
+    /// `OUT_DIR`'s name in it.
+    out_dir_name: &'a OsStr,
+    /// The directories and the file name of the run's stdout under it.
+    stdout: (&'static [&'static str], &'static str),
 }
 
-/// Parse the `output` file in `build_dir`, refusing a symlink.
-fn read_directives_in(
-    crate_name: &str,
-    build_dir: &Dir,
-    out_dir: &Path,
-) -> crate::error::Result<Vec<String>> {
-    let output_path = out_dir.with_file_name("output");
-    let mut output_file = open_regular(build_dir, OsStr::new("output")).map_err(|error| {
-        crate::stow_error!(
-            "build script output file {} for {crate_name} is unreadable or missing: {error}",
-            output_path.display()
-        )
-    })?;
-    let mut raw = String::new();
-    output_file
-        .read_to_string(&mut raw)
-        .wrap_err_with(|| format!("read build script output {}", output_path.display()))?;
-    Ok(parse_build_script_output(&raw))
+impl<'a> RunDir<'a> {
+    /// The run that `out_dir` is the `OUT_DIR` of, placed in cargo's layout.
+    fn open(crate_name: &str, out_dir: &'a Path) -> crate::error::Result<Self> {
+        let stdout = crate::cargo_layout::UnitDir::new(out_dir)
+            .and_then(|unit| unit.build_script_stdout())
+            .map_err(|error| {
+                crate::stow_error!("build script OUT_DIR for {crate_name}: {error}")
+            })?;
+        // A directory the layout places has both.
+        let (Some(path), Some(out_dir_name)) = (out_dir.parent(), out_dir.file_name()) else {
+            return Err(crate::stow_error!(
+                "build script OUT_DIR {} for {crate_name} has no parent build dir",
+                out_dir.display()
+            ));
+        };
+        let dir = Dir::open_ambient_dir(path, ambient_authority())
+            .wrap_err_with(|| format!("open build dir {}", path.display()))?;
+        Ok(Self {
+            dir,
+            path,
+            out_dir_name,
+            stdout,
+        })
+    }
+
+    /// Parse the run's stdout, refusing a symlink in any component.
+    fn read_directives(&self, crate_name: &str) -> crate::error::Result<Vec<String>> {
+        let (parents, name) = self.stdout;
+        let output_path = parents
+            .iter()
+            .chain([&name])
+            .fold(self.path.to_path_buf(), |path, component| {
+                path.join(component)
+            });
+        let unreadable = |error: std::io::Error| {
+            crate::stow_error!(
+                "build script output file {} for {crate_name} is unreadable or missing: {error}",
+                output_path.display()
+            )
+        };
+        let mut held = None::<Dir>;
+        for parent in parents {
+            let next = held
+                .as_ref()
+                .unwrap_or(&self.dir)
+                .open_dir_nofollow(parent)
+                .map_err(unreadable)?;
+            held = Some(next);
+        }
+        let mut output_file = open_regular(held.as_ref().unwrap_or(&self.dir), OsStr::new(name))
+            .map_err(unreadable)?;
+        let mut raw = String::new();
+        output_file
+            .read_to_string(&mut raw)
+            .wrap_err_with(|| format!("read build script output {}", output_path.display()))?;
+        Ok(parse_build_script_output(&raw))
+    }
 }
 
 /// A build script's `OUT_DIR`, held as a directory handle.
@@ -387,31 +418,106 @@ pub fn is_static_library(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use sha2::Digest as _;
 
-    use super::capture_native_artifacts;
+    use super::{capture_native_artifacts, read_build_script_directives};
+    use crate::cargo_layout::Layout;
+
+    /// One build script run of `demo` under `root`, laid out as `layout`
+    /// lays it out: its run directory, holding the stdout file cargo keeps
+    /// (with one directive written) and an `out` directory not yet created.
+    pub(super) fn run_dir(root: &Path, layout: Layout) -> (PathBuf, PathBuf) {
+        let build = root.join("debug").join("build");
+        let (run_dir, stdout) = match layout {
+            Layout::Shared => {
+                let run_dir = build.join("demo-0123456789abcdef");
+                (run_dir.clone(), run_dir.join("output"))
+            }
+            Layout::BuildUnit => {
+                let run_dir = build.join("demo").join("0123456789abcdef");
+                (run_dir.clone(), run_dir.join("run").join("stdout"))
+            }
+        };
+        std::fs::create_dir_all(stdout.parent().expect("stdout parent")).expect("run dir");
+        std::fs::write(
+            &stdout,
+            "cargo:rustc-cfg=demo\ncargo:rerun-if-changed=build.rs\n",
+        )
+        .expect("write stdout");
+        (run_dir, stdout)
+    }
 
     #[test]
     fn nested_out_dir_files_use_slash_separators_on_every_host() {
-        let build_dir = tempfile::tempdir().expect("tempdir");
-        let out_dir = build_dir.path().join("out");
-        std::fs::create_dir_all(out_dir.join("gen")).expect("create out dir");
-        std::fs::write(build_dir.path().join("output"), "cargo:rustc-cfg=demo\n")
-            .expect("write output");
-        std::fs::write(out_dir.join("gen").join("bindings.rs"), "pub fn f() {}\n")
-            .expect("write nested file");
+        for layout in [Layout::Shared, Layout::BuildUnit] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let (run_dir, _) = run_dir(root.path(), layout);
+            let out_dir = run_dir.join("out");
+            std::fs::create_dir_all(out_dir.join("gen")).expect("create out dir");
+            std::fs::write(out_dir.join("gen").join("bindings.rs"), "pub fn f() {}\n")
+                .expect("write nested file");
 
-        let native = capture_native_artifacts("demo", Some(&out_dir))
-            .expect("capture")
-            .expect("out dir present");
-        assert_eq!(
-            native
-                .out_dir_files
-                .iter()
-                .map(|file| file.relative_path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["gen/bindings.rs"]
-        );
+            let native = capture_native_artifacts("demo", Some(&out_dir))
+                .expect("capture")
+                .expect("out dir present");
+            assert_eq!(
+                native
+                    .out_dir_files
+                    .iter()
+                    .map(|file| file.relative_path.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["gen/bindings.rs"],
+                "{layout:?}"
+            );
+            assert_eq!(
+                native.cargo_directives,
+                ["cargo:rustc-cfg=demo"],
+                "{layout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_directives_come_from_the_stdout_cargo_keeps_in_either_layout() {
+        for layout in [Layout::Shared, Layout::BuildUnit] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let (run_dir, stdout) = run_dir(root.path(), layout);
+            let out_dir = run_dir.join("out");
+            std::fs::create_dir(&out_dir).expect("out dir");
+            assert_eq!(
+                read_build_script_directives("demo", &out_dir).expect("directives"),
+                ["cargo:rustc-cfg=demo"],
+                "{layout:?}"
+            );
+
+            std::fs::remove_file(&stdout).expect("remove stdout");
+            let error = read_build_script_directives("demo", &out_dir)
+                .expect_err("a run without its stdout is not what cargo promised");
+            assert!(
+                error.to_string().contains(&stdout.display().to_string()),
+                "{layout:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_out_dir_outside_cargos_layout_is_refused_by_name() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let out_dir = root.path().join("out");
+        std::fs::create_dir(&out_dir).expect("out dir");
+        std::fs::write(root.path().join("output"), "cargo:rustc-cfg=demo\n").expect("output");
+        for error in [
+            read_build_script_directives("demo", &out_dir).expect_err("directives"),
+            capture_native_artifacts("demo", Some(&out_dir)).expect_err("capture"),
+        ] {
+            assert!(
+                error.to_string().contains(&out_dir.display().to_string())
+                    && error.to_string().contains("cargo's build-directory layout"),
+                "{error}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -443,18 +549,49 @@ mod tests {
         use std::path::Path;
 
         use super::super::{OutDirRoot, capture_native_artifacts};
+        use super::run_dir;
+        use crate::cargo_layout::Layout;
 
-        /// A build dir with an `output` file, plus a sibling directory
-        /// outside the tree holding a secret.
+        /// A shared-layout build dir with an `output` file, plus a sibling
+        /// directory outside the tree holding a secret.
         fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
             let root = tempfile::tempdir().expect("tempdir");
-            let build_dir = root.path().join("build").join("demo-1");
-            std::fs::create_dir_all(&build_dir).expect("create build dir");
-            std::fs::write(build_dir.join("output"), "cargo:rustc-cfg=demo\n").expect("output");
+            let (build_dir, _) = run_dir(root.path(), Layout::Shared);
             let outside = root.path().join("outside");
             std::fs::create_dir_all(&outside).expect("create outside");
             std::fs::write(outside.join("secret.a"), "host secret").expect("secret");
             (root, build_dir, outside)
+        }
+
+        #[test]
+        fn a_symlink_on_the_way_to_the_stdout_is_rejected_in_either_layout() {
+            for layout in [Layout::Shared, Layout::BuildUnit] {
+                let root = tempfile::tempdir().expect("tempdir");
+                let (build_dir, stdout) = run_dir(root.path(), layout);
+                std::fs::create_dir(build_dir.join("out")).expect("out dir");
+                let outside = root.path().join("outside");
+                std::fs::create_dir_all(&outside).expect("create outside");
+                std::fs::write(outside.join("stdout"), "cargo:rustc-cfg=planted\n")
+                    .expect("planted");
+                std::fs::write(outside.join("output"), "cargo:rustc-cfg=planted\n")
+                    .expect("planted");
+                // The build-unit layout's `run` directory, or the shared
+                // layout's `output` file, swapped for a link.
+                let swapped = match layout {
+                    Layout::Shared => stdout,
+                    Layout::BuildUnit => stdout.parent().expect("run dir").to_path_buf(),
+                };
+                if swapped.is_dir() {
+                    std::fs::remove_dir_all(&swapped).expect("remove run dir");
+                    symlink(&outside, &swapped).expect("symlink run dir");
+                } else {
+                    std::fs::remove_file(&swapped).expect("remove output");
+                    symlink(outside.join("output"), &swapped).expect("symlink output");
+                }
+
+                capture_native_artifacts("demo", Some(&build_dir.join("out")))
+                    .expect_err("a planted stdout must not be read");
+            }
         }
 
         #[test]

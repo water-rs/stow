@@ -373,7 +373,7 @@ fn exact_graph_from_request(
                 .expect("feature and dependency maps are built together")
                 .extend(dependency_keys);
         } else {
-            feature_json_by_key.insert(key.clone(), features_json.clone());
+            feature_json_by_key.insert(key.clone(), features_json);
             dependency_keys_by_key.insert(key.clone(), dependency_keys);
         }
     }
