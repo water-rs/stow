@@ -64,7 +64,7 @@ pub async fn run(
 ) -> stow_types::error::Result<Sweep> {
     let http = RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
     let trust = stow_oci::verify::records_trust().await?;
-    let publisher = Publisher::from_env(http, &trust)?;
+    let publisher = Publisher::from_env(http, &trust, CERTIFICATE_IDENTITY)?;
     let session = publisher.session(&cache_repository(rustc_version))?;
     let tags = stow_oci::list_records_tags(&session)
         .await

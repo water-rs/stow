@@ -448,6 +448,26 @@ pub fn verify_signature_material(
     })
 }
 
+/// [`verify_signature_material`] pinned to the GitHub Actions issuer: the
+/// check the keyless signer makes of what it is about to publish.
+///
+/// # Errors
+///
+/// As [`verify_signature_material`].
+pub(crate) fn verify_issued_signature(
+    trust: &TrustMaterial,
+    certificate_identity: &str,
+    material: &stow_types::bundle::SigstoreSignature,
+    payload_bytes: &[u8],
+) -> stow_types::error::Result<()> {
+    verify_signature_material(
+        trust,
+        &Identity::new(certificate_identity, TRUSTED_CERT_ISSUER),
+        material,
+        payload_bytes,
+    )
+}
+
 /// Every check [`verify_signature_material`] makes except the identity
 /// pin: the Rekor bundle's SET, the entry binding this signature,
 /// certificate and payload, the Fulcio chain at the log's integrated

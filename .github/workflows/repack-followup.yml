@@ -1,6 +1,6 @@
 name: Repack follow-up
 
-# A repack sweep (`build-crate.yml` dispatched with `repack_rustc`, run
+# A repack sweep (`repack.yml` dispatched with `repack_rustc`, run
 # title `<rustc>-repack`) is resumable and its `repack` job has a hard
 # 350-minute limit, so a registry larger than one job needs several runs.
 # This lane closes the loop on the default branch (`dev`), dispatching
@@ -20,10 +20,10 @@ name: Repack follow-up
 #   then waits for the next publish this lane or an operator dispatched.)
 # - Jobs match the triggering workflow on `workflow_run.path`: the run
 #   object's `name` is the run-name when the workflow sets `run-name`
-#   (`1.99.1-repack` for build-crate.yml), not the workflow name. Only the
+#   (`1.99.1-repack` for repack.yml), not the workflow name. Only the
 #   `on.workflow_run.workflows` filter matches the workflow name.
 #
-# - `resume`, on a completed `build-crate` run titled `<rustc>-repack`:
+# - `resume`, on a completed `repack` run titled `<rustc>-repack`:
 #   - success: dispatch `index-publish.yml` (which folds the repacked
 #     records into the index and reports the slices) and then
 #     `preheat-cron.yml` with `refresh=true` (the queue is otherwise empty
@@ -66,7 +66,7 @@ name: Repack follow-up
 
 on:
   workflow_run:
-    workflows: [build-crate, Index publish]
+    workflows: [repack, Index publish]
     types: [completed]
 
 permissions:
@@ -81,7 +81,7 @@ concurrency:
 
 jobs:
   resume:
-    if: github.event.workflow_run.path == '.github/workflows/build-crate.yml' && endsWith(github.event.workflow_run.display_title, '-repack')
+    if: github.event.workflow_run.path == '.github/workflows/repack.yml' && endsWith(github.event.workflow_run.display_title, '-repack')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -101,8 +101,10 @@ jobs:
           RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           STOW_REPACK_CONCURRENCY: ${{ vars.STOW_REPACK_CONCURRENCY }}
           STOW_REPACK_MAX_RUNS_PER_DAY: ${{ vars.STOW_REPACK_MAX_RUNS_PER_DAY }}
-          # `timeout-minutes` of build-crate.yml's `repack` job, and how
-          # far under it a `cancelled` job still counts as its timeout.
+          # `timeout-minutes` of the `repack` job of build-crate.yml (called
+          # by repack.yml's `repack` job, which a called job's name
+          # prefixes: `repack / repack <rustc>`), and how far under it a
+          # `cancelled` job still counts as its timeout.
           REPACK_JOB_TIMEOUT_MINUTES: "350"
           REPACK_TIMEOUT_SLACK_MINUTES: "15"
         run: |
@@ -127,7 +129,7 @@ jobs:
             cancelled)
               floor=$(( (REPACK_JOB_TIMEOUT_MINUTES - REPACK_TIMEOUT_SLACK_MINUTES) * 60 ))
               kind=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
-                | jq -r --arg name "repack $rustc" --argjson floor "$floor" '
+                | jq -r --arg name "repack / repack $rustc" --argjson floor "$floor" '
                     [.jobs[] | select(.name == $name)] | first // empty
                     | if .conclusion == "timed_out"
                          or (.conclusion == "cancelled"
@@ -155,7 +157,7 @@ jobs:
           since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
           read -r created active < <(
             gh api --paginate \
-              "repos/$GITHUB_REPOSITORY/actions/workflows/build-crate.yml/runs?created=%3E%3D$since&per_page=100" \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/repack.yml/runs?created=%3E%3D$since&per_page=100" \
               | jq -s -r --arg title "$rustc-repack" '
                   [.[].workflow_runs[] | select(.display_title == $title)]
                   | "\(length) \([.[] | select(.status != "completed")] | length)"')
@@ -167,7 +169,7 @@ jobs:
             echo "a '$rustc-repack' run is already queued or running; not dispatching another"
             exit 0
           fi
-          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build-crate.yml/dispatches" "${dispatch_args[@]}" \
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/repack.yml/dispatches" "${dispatch_args[@]}" \
             -f "inputs[repack_rustc]=$rustc" -f "inputs[repack_concurrency]=$concurrency"
 
   retry:
@@ -193,7 +195,7 @@ jobs:
           # Newest repack run per rustc, kept when it succeeded:
           # `<rustc> <completion time>` (the run's `updated_at`).
           repacks=$(gh api --paginate \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/build-crate.yml/runs?created=%3E%3D$since&per_page=100" \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/repack.yml/runs?created=%3E%3D$since&per_page=100" \
             | jq -s -r '
                 [.[].workflow_runs[]
                  | select(.display_title | test("^[0-9]+\\.[0-9]+\\.[0-9]+-repack$"))]
