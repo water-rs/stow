@@ -210,3 +210,35 @@ fn a_retired_daemon_is_succeeded_through_the_task() {
     assert_ne!(pids[1], first, "the successor is a new process");
     assert!(alive(pids[1]), "the successor serves");
 }
+
+/// The body of the child process [`support::retire_onto_in_child`] runs.
+#[test]
+fn retire_onto_child() {
+    support::retire_onto_child_body();
+}
+
+/// What `stow update` asks of the daemon: a running one drains and is
+/// succeeded through the task, and the successor's version is reported; one
+/// that is not running is not started.
+#[test]
+fn retire_onto_succeeds_a_running_daemon_through_the_task_and_starts_none() {
+    let home = support::tempdir().expect("home");
+    let daemon = PrivateDaemon::in_home(home.path());
+    let run_dir = daemon.run_dir().to_owned();
+    assert_eq!(support::retire_onto_in_child(&run_dir, &stow()), "none");
+    assert!(daemon.serving_pids().is_empty(), "nothing was started");
+
+    assert_answered(client(&run_dir), Instant::now());
+    let [first] = daemon.serving_pids()[..] else {
+        panic!("one daemon serves: {:?}", daemon.serving_pids());
+    };
+    let version = env!("CARGO_PKG_VERSION");
+    assert_eq!(
+        support::retire_onto_in_child(&run_dir, &stow()),
+        format!("restarted {version} {version}")
+    );
+    let pids = daemon.serving_pids();
+    assert_eq!(pids.len(), 2, "{:?}", daemon.log_lines("stow daemon"));
+    assert_eq!(pids[0], first);
+    assert_ne!(pids[1], first, "the successor is a new process");
+}

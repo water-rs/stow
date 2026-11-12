@@ -81,6 +81,9 @@ pub use session_env::SessionEnv;
 /// The variable a build's driver exports so its wrappers find the build's
 /// session, and the id it carries.
 pub use daemon::client::STOW_SESSION_ENV;
+/// Replace the running daemon with an installed stow, as `stow update`
+/// does.
+pub use daemon::client::{Restarted, retire_onto};
 /// The daemon's wire protocol, so a peer decoding frames — a stub daemon
 /// standing in for the real one in integration tests — uses the product's
 /// own types instead of reimplementing the format.

@@ -513,6 +513,66 @@ fn kill_hard(pid: u32) {
         .output();
 }
 
+/// The test a test binary lists so that it can run
+/// [`retire_onto_in_child`]'s body in a child of its own: the function reads
+/// the daemon's run directory from the environment, which a test must not
+/// change in its own process.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub const RETIRE_ONTO_CHILD_TEST: &str = "retire_onto_child";
+
+/// What [`RETIRE_ONTO_CHILD_TEST`] runs: `stow_cli::retire_onto` onto the
+/// executable `STOW_TEST_RETIRE_ONTO` names, its outcome printed as one
+/// `RESULT` line. Does nothing when the variable is unset, which is how the
+/// test passes when the test binary runs it as an ordinary test.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn retire_onto_child_body() {
+    let Some(exe) = std::env::var_os("STOW_TEST_RETIRE_ONTO") else {
+        return;
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    match runtime.block_on(stow_cli::retire_onto(Path::new(&exe))) {
+        Ok(Some(restarted)) => println!("RESULT restarted {} {}", restarted.left, restarted.now),
+        Ok(None) => println!("RESULT none"),
+        Err(error) => println!("RESULT error {error:#}"),
+    }
+}
+
+/// Run `stow_cli::retire_onto(exe)` against the daemon of `run_dir` in a
+/// child of this test binary, and return its `RESULT` line without the
+/// marker.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn retire_onto_in_child(run_dir: &Path, exe: &Path) -> String {
+    let output = Command::new(std::env::current_exe().expect("this test binary"))
+        .args([RETIRE_ONTO_CHILD_TEST, "--exact", "--nocapture"])
+        .env("STOW_DAEMON_DIR", run_dir)
+        .env("STOW_TEST_RETIRE_ONTO", exe)
+        .output()
+        .expect("run the child test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("RESULT "))
+        .unwrap_or_else(|| {
+            panic!(
+                "the child printed no result:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+        .to_owned()
+}
+
 /// A temporary directory a test's children use as (or under) their home:
 /// it stops the daemons they started before the directory goes, so no test
 /// leaves one running.

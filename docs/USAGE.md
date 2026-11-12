@@ -368,6 +368,14 @@ shims so they keep resolving to the fresh binary. A binary that was not
 installed by the installer (a `cargo install` or source build has no
 receipt) refuses with the reason instead of clobbering itself.
 
+When the update installs a release and a daemon is running, `stow update`
+restarts it onto the installed stow and prints `restarted the stow daemon:
+<old version> -> <new version>`; builds the daemon holds are served first,
+for up to `STOW_DAEMON_DRAIN_SECS`. A daemon that is not running is not
+started, and an update that finds nothing newer leaves the daemon alone.
+The update fails, naming both versions, when the daemon comes back as a
+stow other than the installed one.
+
 GitHub API calls for the release lookup accept a token from
 `STOW_CLI_GITHUB_TOKEN`, `GITHUB_TOKEN`, or `GH_TOKEN` — only useful
 against rate limits or a private mirror.

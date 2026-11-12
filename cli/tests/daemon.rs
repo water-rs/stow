@@ -405,6 +405,37 @@ fn a_retired_daemon_reexecs_keeping_its_pid_lock_and_endpoint() {
     assert_eq!(fixture.serving_pids(), [pid]);
 }
 
+/// The body of the child process [`support::retire_onto_in_child`] runs.
+#[test]
+fn retire_onto_child() {
+    support::retire_onto_child_body();
+}
+
+/// What `stow update` asks of the daemon: a running one is replaced by the
+/// installed stow and the successor's version is reported; one that is not
+/// running is left alone.
+#[test]
+fn retire_onto_replaces_a_running_daemon_and_starts_none() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        support::retire_onto_in_child(&fixture.run_dir(), &stow()),
+        "none"
+    );
+    assert!(fixture.serving_pids().is_empty(), "nothing was started");
+
+    run_status(&mut fixture.command(&["daemon", "status"]));
+    let [pid] = fixture.serving_pids()[..] else {
+        panic!("one daemon serves: {:?}", fixture.serving_pids());
+    };
+    let version = env!("CARGO_PKG_VERSION");
+    assert_eq!(
+        support::retire_onto_in_child(&fixture.run_dir(), &stow()),
+        format!("restarted {version} {version}")
+    );
+    assert_eq!(fixture.serving_pids(), [pid], "the successor has the pid");
+    assert_eq!(fixture.log_lines("stow daemon process started").len(), 2);
+}
+
 #[test]
 fn a_connect_during_the_exec_is_answered_by_the_new_image() {
     const CLIENTS: usize = 8;

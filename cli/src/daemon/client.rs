@@ -186,6 +186,80 @@ pub async fn connect_starting(exe: PathBuf, settings: Settings) -> Result<Stream
         })
 }
 
+/// A daemon that gave way to the stow installed at its successor's path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restarted {
+    /// The version of the daemon that left.
+    pub left: String,
+    /// The version the daemon that took over reports.
+    pub now: String,
+}
+
+/// Replace the running daemon, if there is one, with `exe`.
+///
+/// An installer just put `exe` in place: the daemon drains and starts it in
+/// its place (on Windows its task does), and this returns once the
+/// successor answers. A daemon that is not running is not started: `None`.
+///
+/// # Errors
+///
+/// The daemon refuses to retire, does not answer, or does not hand over to
+/// a successor within the bound.
+pub async fn retire_onto(exe: &Path) -> Result<Option<Restarted>> {
+    let settings = Settings::from_env()?;
+    let run_dir = run_dir().await?;
+    let log = run_dir.log();
+    let Some(mut stream) = try_open(&run_dir.endpoint(), settings.answer).await? else {
+        return Ok(None);
+    };
+    let mut bytes = encode(&Hello::new(Role::Control, exe))?;
+    bytes.extend(encode(&ControlRequest::Retire {
+        executable: os_bytes::encode(exe.as_os_str()),
+    })?);
+    let describe = || {
+        format!(
+            "ask the stow daemon ({}) to retire onto {}",
+            describe_daemon(&log),
+            exe.display()
+        )
+    };
+    stream.write_all(&bytes).await.wrap_err_with(describe)?;
+    stream.flush().await.wrap_err_with(describe)?;
+    let frame = tokio::time::timeout(settings.answer, read_frame_async(&mut stream))
+        .await
+        .map_err(|_| stow_types::stow_error!("no answer within {} s", settings.answer.as_secs()))
+        .and_then(|read| read)
+        .wrap_err_with(describe)?
+        .ok_or_else(|| {
+            stow_types::stow_error!("the daemon closed the connection without answering")
+        })
+        .wrap_err_with(describe)?;
+    let left = match read_response(&frame)? {
+        Response::Retiring { stow_version, .. } => stow_version,
+        Response::Rejected { reason } => {
+            return Err(stow_types::stow_error!(
+                "the stow daemon ({}) refused to retire onto {}: {reason}",
+                describe_daemon(&log),
+                exe.display()
+            ));
+        }
+        other => {
+            return Err(stow_types::stow_error!(
+                "the stow daemon ({}) answered Retire with {other:?}",
+                describe_daemon(&log)
+            ));
+        }
+    };
+    // The status client replays through the daemon's drain and its
+    // successor's start.
+    let exe = exe.to_owned();
+    let status = smol::unblock(move || status_of(&exe, settings)).await?;
+    Ok(Some(Restarted {
+        left,
+        now: status.stow_version,
+    }))
+}
+
 /// What a daemon made of a wrapper's request.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Exchanged {
