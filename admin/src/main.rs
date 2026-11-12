@@ -850,7 +850,7 @@ async fn dispatch_freeze_switch(
     output: Output,
 ) -> stow_types::error::Result<()> {
     if args.action == DispatchFreezeAction::Status {
-        let switch: DispatchFreeze = edge.get_json("/api/v1/admin/dispatch-freeze").await?;
+        let switch = read_dispatch_freeze(edge).await?;
         return render::emit(output, &switch, render_freeze);
     }
     let enabled = args.action == DispatchFreezeAction::Engage;
@@ -875,11 +875,26 @@ async fn dispatch_freeze_switch(
             let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
             out
         },
-        args.yes.then_some(async move |plan: &DispatchFreeze| {
-            edge.post_json("/api/v1/admin/dispatch-freeze", plan).await
-        }),
+        args.yes
+            .then_some(async move |plan: &DispatchFreeze| write_dispatch_freeze(edge, plan).await),
     )
     .await
+}
+
+/// `GET` the dispatch freeze — shared by `dispatch-freeze status` and
+/// `watchdog clear`.
+pub(crate) async fn read_dispatch_freeze(edge: &Edge) -> stow_types::error::Result<DispatchFreeze> {
+    edge.get_json("/api/v1/admin/dispatch-freeze").await
+}
+
+/// `POST` a freeze transition — shared by `dispatch-freeze engage|clear`
+/// and `watchdog clear`. A clear runs a dispatch pass at once on the
+/// edge, so it only follows the re-enabling of `build-crate.yml`.
+pub(crate) async fn write_dispatch_freeze(
+    edge: &Edge,
+    plan: &DispatchFreeze,
+) -> stow_types::error::Result<DispatchFreeze> {
+    edge.post_json("/api/v1/admin/dispatch-freeze", plan).await
 }
 
 /// `stow-admin dispatch-cap status|set` — read the caps in force or

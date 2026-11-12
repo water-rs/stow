@@ -248,8 +248,13 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    `watchdog.gap` (the previous watchdog run started 45 minutes or more
    ago, set by `STOW_WATCHDOG_RUN_GAP_HOURS`, so a missed periodic
    dispatch is reported after the fact).
-   `stow-admin watchdog clear` disables both scopes the
-   watchdog can enable.
+   `stow-admin watchdog clear` is the single recovery step: it
+   disables both scopes the watchdog can enable, re-enables the
+   workflows the incident recorded, and only then lifts the
+   scheduler's dispatch freeze if engaged (the lift runs a dispatch
+   pass, which needs `build-crate.yml` enabled). If a workflow fails to
+   re-enable the freeze stays engaged and the command exits non-zero;
+   rerun it. `--dry-run` prints the plan.
 
    `<edge host>` is the host of `STOW_EDGE_URL` — the rules follow
    whichever edge they were ensured against. `deploy-edge.yml` runs

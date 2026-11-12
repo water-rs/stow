@@ -188,7 +188,9 @@ needs no edge. See [`ENVIRONMENT.md`](ENVIRONMENT.md).
 `stow-admin watchdog --dry-run` evaluates the watchdog without changing
 state. After correcting the cause of a trip, `stow-admin watchdog clear`
 lifts maintenance rules, re-enables the workflows recorded by the incident,
-and closes the incident with a recovery email. The watchdog never clears
+then lifts the scheduler's dispatch freeze if engaged, and closes the
+incident with a recovery email. It is the single recovery step: a workflow
+that fails to re-enable keeps the freeze engaged and fails the command. The watchdog never clears
 itself. These mutations run through `operations.yml`.
 
 `stow-admin scheduler reset --yes` destroys the scheduler queue and recorded

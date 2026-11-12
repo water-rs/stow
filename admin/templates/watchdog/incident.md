@@ -34,5 +34,6 @@ Watchdog partial failures:
 {% endfor %}
 {% endif %}
 
-The watchdog does not un-trip on its own — recovery is manual:
-`stow-admin watchdog clear`.
+The watchdog does not un-trip on its own — recovery is manual, one step:
+`stow-admin watchdog clear` re-enables the disabled workflows, then lifts the
+scheduler's dispatch freeze if engaged.
