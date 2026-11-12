@@ -262,6 +262,68 @@ pub fn write_global_config(homes: &[&Path], contents: &str) {
     }
 }
 
+/// Longer than the daemon takes to notice an exited cargo and end its
+/// session; a session that never ends fails the test here.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+const SESSION_END_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `command`, a plain `cargo` build through the stow wrappers, to its
+/// end and collect its output; then wait until the daemon under `home` has
+/// ended the session of that cargo ([`PrivateDaemon::wait_session_ended`]),
+/// so the cache and the target directory hold everything the build left.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn output_after_session(command: &mut Command, home: &Path) -> std::process::Output {
+    let child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start cargo");
+    let pid = child.id();
+    let output = child.wait_with_output().expect("wait for cargo");
+    wait_session_ended_in(&PrivateDaemon::run_dir_of(home), pid);
+    output
+}
+
+/// [`PrivateDaemon::wait_session_ended`] over the daemon log in `run_dir`.
+fn wait_session_ended_in(run_dir: &Path, cargo_pid: u32) {
+    // The daemon logs the owner as `pid <pid> started at tick <tick>`.
+    let owner = format!("pid {cargo_pid} started");
+    let logged = |message: &str| {
+        log_lines_in(run_dir, message)
+            .iter()
+            .any(|line| line.contains(&owner))
+    };
+    if !logged("opened a session for a cargo") {
+        return;
+    }
+    let deadline = std::time::Instant::now() + SESSION_END_LIMIT;
+    while !logged("ended a cargo's session") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon never ended the session of cargo {cargo_pid}:\n{}",
+            log_lines_in(run_dir, "").join("\n")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The lines of the daemon log in `run_dir` that contain `needle`.
+fn log_lines_in(run_dir: &Path, needle: &str) -> Vec<String> {
+    std::fs::read_to_string(run_dir.join("daemon.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(needle))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The daemon a test's `stow-cli` runs started under `home`
 /// ([`sealed_home_env`] points `STOW_DAEMON_DIR` there): found by the pids
 /// its own log names, and stopped when this drops, so a test never leaves
@@ -297,12 +359,19 @@ impl PrivateDaemon {
 
     /// The daemon log's lines that contain `needle`.
     pub fn log_lines(&self, needle: &str) -> Vec<String> {
-        std::fs::read_to_string(self.run_dir.join("daemon.log"))
-            .unwrap_or_default()
-            .lines()
-            .filter(|line| line.contains(needle))
-            .map(str::to_owned)
-            .collect()
+        log_lines_in(&self.run_dir, needle)
+    }
+
+    /// Wait until the daemon has ended the session it opened for the cargo
+    /// `cargo_pid`, if it opened one.
+    ///
+    /// A plain build's wrappers exit as soon as their compilers do; the
+    /// session's bookkeeping — the stores, the records, the miss journal —
+    /// completes when the daemon sees the cargo exit, so anything that reads
+    /// the cache after the build waits for this first. A cargo that never
+    /// ran a wrapper has no session, and there is nothing to wait for.
+    pub fn wait_session_ended(&self, cargo_pid: u32) {
+        wait_session_ended_in(&self.run_dir, cargo_pid);
     }
 
     /// The pids of the daemons that bound the endpoint, from their log.

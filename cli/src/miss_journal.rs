@@ -1,11 +1,9 @@
 //! Misses are admitted from a per-target-dir journal: one JSON line per
-//! unit a build compiled locally, appended by whatever saw the compile —
-//! the rustc wrapper under a plain `cargo build`, or the build's daemon
-//! session. A journal is turned into admissions detached from every
-//! build's wall clock: the driver spawns a `stow __drain-misses` child as
-//! soon as cargo exits, and under plain cargo the first wrapper of a
-//! later build does the same for any journal whose cargo exited
-//! (stow#317).
+//! unit a build compiled locally, written by the build's daemon session
+//! when the build ends. A journal is turned into admissions detached from
+//! every build's wall clock: the driver, or the daemon for a plain
+//! `cargo build`, spawns a `stow __drain-misses` child as soon as cargo
+//! exits (stow#317).
 //!
 //! The drain detaches into its own session so a `SIGINT` that kills the
 //! build's process group does not strand a claimed journal; a claim file
@@ -214,12 +212,15 @@ fn journal_path(target_dir: &Path, build: &str) -> PathBuf {
     target_dir.join(format!("{JOURNAL_PREFIX}{build}{JOURNAL_SUFFIX}"))
 }
 
-/// The journal id for a session's build: the session writes the file
-/// complete when the build ends, so the `stow-` mark makes it drainable
-/// without a liveness check. The session's own id names it: one daemon
-/// serves many builds, so nothing about the writing process can.
+/// What every journal's id starts with: each is a session's, written
+/// complete when its build ends, so it is drainable the moment it exists.
+const SESSION_JOURNAL_MARK: &str = "stow-";
+
+/// The journal id for a session's build. The session's own id names it:
+/// one daemon serves many builds, so nothing about the writing process
+/// can.
 fn session_journal_id(session: SessionId) -> String {
-    format!("stow-{session}")
+    format!("{SESSION_JOURNAL_MARK}{session}")
 }
 
 /// Whether a process id still names a live process. `EPERM` means the
@@ -280,20 +281,6 @@ pub fn dead_pid() -> u32 {
     child.id()
 }
 
-/// Whether the journal's writing build has finished: a driver's `stow-*`
-/// file is complete on write, and a cargo pid that no longer names a
-/// live process means its build exited. Anything unanswerable waits —
-/// posting early is harmless only when the writer is actually done.
-fn build_finished(build: &str) -> bool {
-    if build.starts_with("stow-") {
-        return true;
-    }
-    let Ok(pid) = build.parse::<u32>() else {
-        return true;
-    };
-    !process_alive(pid)
-}
-
 /// The pid a `…{DRAIN_CLAIM}<pid>` claim name carries, if any.
 fn claim_pid(file_name: &str) -> Option<u32> {
     file_name
@@ -301,11 +288,10 @@ fn claim_pid(file_name: &str) -> Option<u32> {
         .and_then(|(_, pid)| pid.parse().ok())
 }
 
-/// The journals in `target_dir` ready to post: finished builds' files
-/// and stale claims whose drainer died mid-post (a SIGKILL, or a
-/// `SIGINT` that reached the whole process group before the drain's
-/// own session detached). Reading the directory is the only cost a
-/// wrapper pays for the check, and only target dirs that stow built in
+/// The journals in `target_dir` ready to post: every session's file, each
+/// complete on write, and stale claims whose drainer died mid-post (a
+/// SIGKILL, or a `SIGINT` that reached the whole process group before the
+/// drain's own session detached). Only target dirs that stow built in
 /// carry journals at all.
 fn finished_journals(target_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(target_dir) else {
@@ -317,7 +303,9 @@ fn finished_journals(target_dir: &Path) -> Vec<PathBuf> {
             let name = entry.file_name().to_str()?.to_owned();
             let rest = name.strip_prefix(JOURNAL_PREFIX)?;
             if let Some(build) = rest.strip_suffix(JOURNAL_SUFFIX) {
-                return build_finished(build).then(|| entry.path());
+                return build
+                    .starts_with(SESSION_JOURNAL_MARK)
+                    .then(|| entry.path());
             }
             // A `…jsonl.draining-<dead drainer pid>` claim is
             // reclaimable: its entries were never posted.
@@ -565,28 +553,13 @@ pub async fn drain(target_dir: &Path, state_db: &StateDb) -> stow_types::error::
     // while it held the package-cache lock the user's next command
     // needs (stow#667).
     lower_own_priority();
+    // Every journal is a session's, and its build was counted when the
+    // session ended.
     for journal in prepared {
-        // A journal is one build; a `stow-`-named file is a session's
-        // journal, already counted at the driver's tail — counting it
-        // again would double it.
-        if is_plain_cargo_journal(&journal.journal) {
-            crate::report::bump_build(&config).await;
-        }
         post_journal(&config, journal).await;
     }
     crate::report::maybe_report(&config).await;
     Ok(())
-}
-
-/// Whether the journal file belongs to a plain `cargo` build — its
-/// build token is the parent cargo's pid, so it lacks the `stow-`
-/// prefix `session_journal_id` writes.
-fn is_plain_cargo_journal(journal: &Path) -> bool {
-    journal
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_prefix(JOURNAL_PREFIX))
-        .is_some_and(|rest| !rest.starts_with("stow-"))
 }
 
 /// Drop the drain's scheduling priority for its CPU-only posting
@@ -1349,21 +1322,9 @@ mod tests {
     }
 
     #[test]
-    fn session_journals_are_always_finished() {
-        assert!(build_finished("stow-123"));
-        assert!(!build_finished(&std::process::id().to_string()));
-    }
-
-    #[test]
-    fn a_dead_cargo_pid_makes_its_journal_finished() {
-        assert!(build_finished(&dead_pid().to_string()));
-    }
-
-    #[test]
-    fn a_live_process_is_not_finished() {
+    fn a_live_process_is_alive_and_an_exited_one_is_not() {
         // EPERM would mean the same: an unsignalable process is alive,
-        // never finished.
-        assert!(!build_finished(&std::process::id().to_string()));
+        // never gone.
         assert!(process_alive(std::process::id()));
         assert!(!process_alive(dead_pid()));
     }
@@ -1387,15 +1348,15 @@ mod tests {
         assert_eq!(parsed.unit.externs.len(), 1);
     }
 
+    /// Every journal is a session's, complete on write, so each is listed
+    /// the moment it exists. A journal named by a process id — what an
+    /// older stow wrote for a plain cargo — is not a session's and is left
+    /// alone.
     #[test]
-    fn only_finished_journals_are_listed() {
+    fn only_session_journals_are_listed() {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(journal_path(dir.path(), "stow-1"), "{}\n").expect("write");
-        std::fs::write(
-            journal_path(dir.path(), &std::process::id().to_string()),
-            "{}\n",
-        )
-        .expect("write");
+        std::fs::write(journal_path(dir.path(), &dead_pid().to_string()), "{}\n").expect("write");
         std::fs::write(dir.path().join("unrelated.txt"), "{}\n").expect("write");
         let finished = finished_journals(dir.path());
         assert_eq!(finished, vec![journal_path(dir.path(), "stow-1")]);

@@ -320,7 +320,9 @@ fn wrapper_shim(tools: &Path) -> PathBuf {
 }
 
 /// A plain `cargo build` through the wrapper shim: no `stow` parent, so
-/// the wrapper runs standalone — exactly the post-setup consumer.
+/// the daemon serves it a session of its cargo — exactly the post-setup
+/// consumer. Returns once that session has ended, so the cache holds
+/// everything the build stored.
 #[allow(
     clippy::too_many_arguments,
     reason = "each argument is one distinct build input"
@@ -350,7 +352,7 @@ fn plain_build(
     for (key, value) in envs {
         build.env(key, value);
     }
-    build.output().expect("run cargo build")
+    support::output_after_session(&mut build, home)
 }
 
 #[test]

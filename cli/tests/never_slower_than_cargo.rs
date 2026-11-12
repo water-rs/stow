@@ -576,7 +576,10 @@ fn cargo_build_in(
         .env("CARGO_INCREMENTAL", "0")
         .env_remove("RUST_LOG")
         .envs(extra_envs.iter().copied());
-    command.output().expect("run cargo build")
+    // The daemon's bookkeeping for a plain cargo's session ends after the
+    // wrappers do: wait for it before the caller reads the cache. A build
+    // under a named session has no session of a cargo to wait for.
+    support::output_after_session(&mut command, &dir.join("stow-home"))
 }
 
 /// A remote miss compiles once and stores the outputs locally; every later
@@ -696,6 +699,9 @@ fn a_tripped_circuit_still_serves_local_entries() {
 struct StubCensus {
     plans: std::collections::BTreeMap<String, usize>,
     compiled: std::collections::BTreeMap<String, usize>,
+    /// The `Describe` requests the stub received: wrappers it asked for
+    /// their environment, because no session of their cargo existed yet.
+    describes: usize,
     /// Connections accepted but not yet drained to their close — the
     /// count [`drain_stub`] waits out before the census is read.
     open_connections: usize,
@@ -709,6 +715,10 @@ struct StubCensus {
 struct StubDaemon {
     census: std::sync::Mutex<StubCensus>,
     drained: std::sync::Condvar,
+    /// Whether the next plan is answered with a request for the wrapper's
+    /// environment, as the daemon answers the first wrapper of a cargo it
+    /// has no session for. Cleared by that plan: the session exists after.
+    describe_next: std::sync::atomic::AtomicBool,
 }
 
 /// The crate a wrapper frame compiled: `--crate-name`'s value in the
@@ -731,10 +741,11 @@ fn frame_crate_name(request: &Request) -> String {
 /// One stub-daemon connection: plans are told to compile and reports
 /// get a receipt. Every frame is counted.
 #[cfg(unix)]
-fn serve_stub_connection(
-    mut stream: std::os::unix::net::UnixStream,
-    counts: &std::sync::Mutex<StubCensus>,
-) {
+fn serve_stub_connection(mut stream: std::os::unix::net::UnixStream, stub: &StubDaemon) {
+    let counts = &stub.census;
+    // The compile a `Describe` answer is holding while the wrapper sends
+    // its environment.
+    let mut held = None;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
     // The connection's first frame names its role; the stub serves
     // wrappers only.
@@ -758,6 +769,10 @@ fn serve_stub_connection(
         let crate_name = frame_crate_name(&request);
         let answer = match &request {
             Request::Plan(plan) => {
+                // A probe — `-vV`, `--print`, cargo's `___` crate — opens
+                // no session, so the daemon never asks its wrapper for an
+                // environment.
+                let is_unit = !crate_name.is_empty() && crate_name != "___";
                 counts
                     .lock()
                     .expect("frame counts")
@@ -765,10 +780,24 @@ fn serve_stub_connection(
                     .entry(crate_name)
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
-                Answer::Compile(CompileCommand::new(
+                let command = CompileCommand::new(
                     &plan.executable().expect("the plan's executable decodes"),
                     &plan.args().expect("the plan's arguments decode"),
-                ))
+                );
+                if is_unit
+                    && stub
+                        .describe_next
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    held = Some(command);
+                    Answer::Describe
+                } else {
+                    Answer::Compile(command)
+                }
+            }
+            Request::Describe(_) => {
+                counts.lock().expect("frame counts").describes += 1;
+                Answer::Compile(held.take().expect("a Describe answers a held plan"))
             }
             Request::Compiled(_) => {
                 counts
@@ -785,10 +814,6 @@ fn serve_stub_connection(
             Request::CcPolicy => Answer::CcPolicy { enabled: false },
             Request::CcLookup(_) => Answer::CcMiss,
             Request::CcCompiled(_) => Answer::Received,
-            // The stub is never asked to open a session.
-            Request::Describe(_) => Answer::Failed {
-                message: "the stub daemon opens no session".to_owned(),
-            },
         };
         let frame = stow_cli::protocol::encode(&stow_cli::protocol::Response::Answer(answer))
             .expect("encode answer");
@@ -805,16 +830,21 @@ fn serve_stub_connection(
 /// A daemon that answers every plan with `Compile` and every report
 /// with a receipt, while counting which frames each crate produced. Binds
 /// the socket a wrapper finds under `run_dir`, which is where
-/// `STOW_DAEMON_DIR` points, and returns the count map.
+/// `STOW_DAEMON_DIR` points, and returns the count map. With
+/// `describe_first` the first plan it receives is answered by asking the
+/// wrapper for its environment.
 #[cfg(unix)]
-fn spawn_stub_daemon(run_dir: &Path) -> std::sync::Arc<StubDaemon> {
+fn spawn_stub_daemon(run_dir: &Path, describe_first: bool) -> std::sync::Arc<StubDaemon> {
     use std::os::unix::fs::PermissionsExt as _;
     // The daemon's run directory is private to its user.
     std::fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o700))
         .expect("restrict the stub daemon's run directory");
     let listener = std::os::unix::net::UnixListener::bind(run_dir.join("daemon.sock"))
         .expect("bind stub daemon");
-    let stub = std::sync::Arc::new(StubDaemon::default());
+    let stub = std::sync::Arc::new(StubDaemon {
+        describe_next: std::sync::atomic::AtomicBool::new(describe_first),
+        ..StubDaemon::default()
+    });
     let accept_stub = std::sync::Arc::clone(&stub);
     std::thread::spawn(move || {
         let mut connections = Vec::new();
@@ -828,7 +858,7 @@ fn spawn_stub_daemon(run_dir: &Path) -> std::sync::Arc<StubDaemon> {
             connections.push(std::thread::spawn({
                 let stub = std::sync::Arc::clone(&accept_stub);
                 move || {
-                    serve_stub_connection(stream, &stub.census);
+                    serve_stub_connection(stream, &stub);
                     let mut census = stub.census.lock().expect("frame counts");
                     census.open_connections -= 1;
                     if census.open_connections == 0 {
@@ -924,6 +954,23 @@ fn unreachable_edge_url() -> String {
 #[cfg(unix)]
 #[test]
 fn every_unit_is_one_plan_and_one_report() {
+    assert_one_plan_and_one_report(true);
+}
+
+/// The same census for a plain `cargo build`, whose wrappers name no
+/// session: the first unit's wrapper is asked for its environment exactly
+/// once, and still sends one plan and one report.
+#[cfg(unix)]
+#[test]
+fn every_unit_of_a_plain_cargo_build_is_one_plan_and_one_report() {
+    assert_one_plan_and_one_report(false);
+}
+
+/// Count the frames of a build against a stub daemon. A build with a named
+/// session is the driver's; one without is a plain cargo's, whose first
+/// unit the stub answers by asking for the wrapper's environment.
+#[cfg(unix)]
+fn assert_one_plan_and_one_report(named_session: bool) {
     let dir = support::tempdir().expect("temp dir");
     let cache = support::tempdir().expect("cache dir");
     let cargo_home = support::tempdir().expect("cargo home");
@@ -935,23 +982,24 @@ fn every_unit_is_one_plan_and_one_report() {
     // The wrapper starts the daemon under the build's home; it is stopped
     // with the test.
     let _daemon = support::PrivateDaemon::in_home(&dir.path().join("stow-home"));
-    let stub = spawn_stub_daemon(run_dir.path());
+    let stub = spawn_stub_daemon(run_dir.path(), !named_session);
     // A session no driver opened: the stub serves any id.
     let session = "00112233445566778899aabbccddeeff";
 
+    let mut envs = vec![(
+        "STOW_DAEMON_DIR",
+        run_dir.path().to_str().expect("utf-8 path"),
+    )];
+    if named_session {
+        envs.push(("STOW_SESSION", session));
+    }
     let output = cargo_build_in(
         dir.path(),
         &unreachable_edge_url(),
         cache.path(),
         &wrapper,
         &dir.path().join("target"),
-        &[
-            (
-                "STOW_DAEMON_DIR",
-                run_dir.path().to_str().expect("utf-8 path"),
-            ),
-            ("STOW_SESSION", session),
-        ],
+        &envs,
         cargo_home.path(),
     );
     assert!(
@@ -968,7 +1016,7 @@ fn every_unit_is_one_plan_and_one_report() {
     // stream; the build's exit guarantees all frames were sent, and the
     // lock sees them once the stub has drained them.
     drain_stub(run_dir.path(), session, &stub);
-    let (cfg_if_plans, probe_plans, plans, reports, debug) = {
+    let (cfg_if_plans, probe_plans, plans, reports, describes, debug) = {
         let counts = stub.census.lock().expect("frame counts");
         let values = (
             counts.plans.get("cfg_if").copied().unwrap_or(0),
@@ -981,11 +1029,17 @@ fn every_unit_is_one_plan_and_one_report() {
                 .map(|(_, plans)| plans)
                 .sum::<usize>(),
             counts.compiled.values().sum::<usize>(),
+            counts.describes,
             format!("{counts:?}"),
         );
         drop(counts);
         values
     };
+    assert_eq!(
+        describes,
+        usize::from(!named_session),
+        "only a build that names no session is asked for its environment, once: {debug}"
+    );
     assert_eq!(
         cfg_if_plans, 1,
         "a registry unit sends exactly one plan frame: {debug}"

@@ -101,8 +101,8 @@ libc = "0.2"
 askama = { version = "0.14", default-features = false, features = ["derive", "std"] }
 
 [target.'cfg(windows)'.dependencies]
-# Parent-pid and process-liveness lookups for the miss journal, and the
-# daemon's process table and exit watch.
+# Process-liveness lookups for the miss journal, and the daemon's process
+# table (ToolHelp) and exit watch.
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
