@@ -18,7 +18,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use semver::Version;
 use stow_types::api::{DependencyGraphEntry, ResolvedDependencyGraphEntry, runner_family};
-use stow_types::feature_sets::{FeatureAgreement, smallest_containing_set};
+use stow_types::feature_sets::{
+    ClosureAgreement, ClosureHeld, ClosureKey, closure_members, smallest_containing_set,
+};
 use stow_types::glibc::GlibcVersion;
 use stow_types::identity::{
     CMetadata, CrateName, CrateVersion, DependencyIdentity, FeaturesJson, TargetTriple,
@@ -897,10 +899,12 @@ fn deduplicate_cached_candidate(
 /// node on the miss path it has.
 ///
 /// A serving row joins only when its whole recorded chain agrees with
-/// the build (stow#1470): every target-side row in the chain holds the
-/// set the build requests for its package and the set the chains
-/// accepted so far hold, so a build never holds two sets of one
-/// package. The node's own package is the one that moves, so it is
+/// the build (stow#1470, stow#1487): every target-side row in the chain
+/// holds the set the build requests for its package and the set the
+/// chains accepted so far hold, and the version the build and those
+/// chains hold in its crate's compatibility range, so a build never
+/// holds two sets of one package or two versions cargo would unify. The
+/// node's own package is the one that moves, so its feature set is
 /// exempt from the request but not from those chains. Nodes are taken in
 /// key order, so the outcome is a function of the request and the slice.
 fn add_superset_candidates<'a>(
@@ -933,15 +937,11 @@ fn add_superset_candidates<'a>(
             .push(pool.len());
         pool.push(PoolRow { key, row, features });
     }
-    // What the build asks of each package, and what the chains accepted
-    // so far hold (stow#1470).
-    let mut requested_sets = FeatureAgreement::<PackageKey>::default();
-    for (key, features_json) in key_pairs {
-        if let Ok(features) = serde_json::from_str::<Vec<String>>(features_json) {
-            requested_sets.replace(key.clone(), features);
-        }
-    }
-    let mut pinned = FeatureAgreement::<PackageKey>::default();
+    // What the build asks of each package and each compatibility range,
+    // and what the chains accepted so far hold (stow#1470, stow#1487).
+    let requested_features = requested_features(key_pairs);
+    let requested_sets = requested_agreement(&requested_features);
+    let mut pinned = ClosureAgreement::default();
     let mut added = BTreeSet::<(String, SemanticKey)>::new();
     for key_pair in key_pairs {
         if covered.contains(key_pair) {
@@ -972,14 +972,26 @@ fn add_superset_candidates<'a>(
             if features.as_slice() != serving {
                 continue;
             }
-            // The row's whole recorded chain must agree with the build:
+            // The row's whole recorded chain must agree with the build,
+            // in feature sets and in versions per compatibility range:
             // the node's own package moves, so only the chain's other
-            // packages answer to the request.
-            let chain = chain_sets(&pool, &by_c_metadata, index);
+            // packages answer to the request's feature sets.
+            let chain = chain_members(&pool, &by_c_metadata, index);
+            let moving = |key: &PackageClosureKey<'_>| {
+                matches!(key, ClosureKey::Package { crate_name, version, .. }
+                    if **crate_name == key_pair.0.crate_name && **version == key_pair.0.version)
+            };
             let agrees = requested_sets
-                .disagreement(chain.iter().filter(|(key, _)| **key != key_pair.0).copied())
+                .disagreement(
+                    chain
+                        .iter()
+                        .filter(|(key, _)| !moving(key))
+                        .map(|(key, held)| (key, held)),
+                )
                 .is_none()
-                && pinned.disagreement(chain.iter().copied()).is_none();
+                && pinned
+                    .disagreement(chain.iter().map(|(key, held)| (key, held)))
+                    .is_none();
             if !agrees {
                 continue;
             }
@@ -994,7 +1006,7 @@ fn add_superset_candidates<'a>(
                     .collect(),
             );
             if added.insert((row.c_metadata.as_str().to_owned(), key_pair.clone())) {
-                pinned.hold(chain.iter().copied());
+                pinned.hold(chain.iter().map(|(key, held)| (key, held)));
                 candidates.push(ReachableCandidateRow {
                     semantic_key: key_pair.clone(),
                     row,
@@ -1015,14 +1027,64 @@ struct PoolRow<'a> {
     features: Vec<String>,
 }
 
-/// The package and feature set of every pool row in the recorded chain
-/// of `pool[start]`, itself included. An edge names `c_metadata` alone,
-/// so every row carrying it is a member.
-fn chain_sets<'a>(
+/// A closure key of the superset pass: every pool row and request is
+/// target-side, so the target and side carry nothing.
+type PackageClosureKey<'a> = ClosureKey<&'a CrateName, &'a Version, ()>;
+
+/// What a package holds under a [`PackageClosureKey`].
+type PackageClosureHeld<'a> = ClosureHeld<&'a Version, &'a [String]>;
+
+/// Each requested package with its decoded feature set.
+fn requested_features(
+    key_pairs: &BTreeSet<(PackageKey, String)>,
+) -> Vec<(&PackageKey, Vec<String>)> {
+    key_pairs
+        .iter()
+        .filter_map(|(key, features_json)| {
+            serde_json::from_str::<Vec<String>>(features_json)
+                .ok()
+                .map(|features| (key, features))
+        })
+        .collect()
+}
+
+/// What the build asks of each package and each compatibility range.
+fn requested_agreement<'a>(
+    requested: &'a [(&'a PackageKey, Vec<String>)],
+) -> ClosureAgreement<PackageClosureKey<'a>, PackageClosureHeld<'a>> {
+    let mut agreement = ClosureAgreement::default();
+    for (key, features) in requested {
+        for (closure_key, held) in package_members(key, features) {
+            agreement.replace(closure_key, held);
+        }
+    }
+    agreement
+}
+
+/// The closure members of `key` with `features`: its version under its
+/// crate's compatibility range and its feature set under the package.
+fn package_members<'a>(
+    key: &'a PackageKey,
+    features: &'a [String],
+) -> [(PackageClosureKey<'a>, PackageClosureHeld<'a>); 2] {
+    closure_members(
+        &&key.crate_name,
+        &key.version,
+        &&key.version,
+        (),
+        false,
+        features,
+    )
+}
+
+/// The closure members of every pool row in the recorded chain of
+/// `pool[start]`, itself included. An edge names `c_metadata` alone, so
+/// every row carrying it is a member.
+fn chain_members<'a>(
     pool: &'a [PoolRow<'_>],
     by_c_metadata: &BTreeMap<&str, Vec<usize>>,
     start: usize,
-) -> Vec<(&'a PackageKey, &'a [String])> {
+) -> Vec<(PackageClosureKey<'a>, PackageClosureHeld<'a>)> {
     let mut seen = BTreeSet::new();
     let mut stack = vec![start];
     let mut sets = Vec::new();
@@ -1031,7 +1093,7 @@ fn chain_sets<'a>(
             continue;
         }
         let PoolRow { key, row, features } = &pool[index];
-        sets.push((key, features.as_slice()));
+        sets.extend(package_members(key, features));
         for entry in row.dependency_c_metadata_json.entries() {
             stack.extend(
                 by_c_metadata
@@ -1786,6 +1848,39 @@ mod tests {
             .map(|candidate| candidate.row.crate_name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(served, ["libc"], "cpufeatures must not be served");
+    }
+
+    /// gix-attributes' shape (stow#1487): the slice serves
+    /// gix-attributes from a published set whose recorded chain holds
+    /// smallvec 1.16.5, while the build pins smallvec 1.16.4 — published
+    /// itself. Taking that chain would give the build two versions cargo
+    /// unifies, so gix-attributes stays a miss.
+    #[test]
+    fn a_superset_chain_with_a_compatible_version_is_not_served() {
+        let key_pairs = BTreeSet::from([
+            (key("gix-attributes", "0.34.0"), "[]".to_owned()),
+            (key("smallvec", "1.16.4"), "[]".to_owned()),
+        ]);
+        let rows = vec![
+            row("smallvec", "1.16.4", "1111111111111111", &[], &[]),
+            row("smallvec", "1.16.5", "2222222222222222", &[], &[]),
+            row(
+                "gix-attributes",
+                "0.34.0",
+                "3333333333333333",
+                &["serde"],
+                &[("smallvec", "2222222222222222")],
+            ),
+        ];
+        let reachable =
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows, &[])
+                .unwrap();
+        let served = reachable
+            .candidates
+            .iter()
+            .map(|candidate| candidate.row.crate_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(served, ["smallvec"], "gix-attributes must not be served");
     }
 
     /// The same slice, with the serving chain holding the libc set the

@@ -14,6 +14,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::versioning::{SemverBreakingLine, breaking_line};
+
 /// `true` when `candidate` contains every element of `requested` —
 /// both lists are canonical (strictly sorted, deduplicated), so the
 /// check is one ordered merge.
@@ -82,76 +84,161 @@ pub fn serving_map(family: &BTreeSet<Vec<String>>) -> BTreeMap<Vec<String>, Vec<
         .collect()
 }
 
-/// The one feature set each group holds across a closure (stow#1470).
+/// One rule a closure keeps for a node (stow#1470, stow#1487): each
+/// node answers to both keys, and two nodes of one key must hold the
+/// same [`ClosureHeld`].
 ///
-/// A closure never carries two sets of one `(crate, version, target,
-/// side)`, because the build's wrapper manifest declares each package
-/// version once per side. The group type `G` is the caller's identity
-/// of that tuple. A superset move is accepted only when everything it
-/// splices in agrees with the sets already held, on the submit side
-/// ([`closure_disagreement`]) and the consume side alike.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FeatureAgreement<G> {
-    sets: BTreeMap<G, Vec<String>>,
+/// `C`, `V` and `T` are the caller's handles of a crate name, a version
+/// and a target.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ClosureKey<C, V, T> {
+    /// One version per crate and cargo compatibility range across the
+    /// whole closure, both sides and every target: cargo activates one
+    /// version per `(name, source, compatibility)` for the whole
+    /// resolve, so a closure pinning two versions of one range cannot
+    /// be fetched.
+    Range {
+        /// The crate.
+        crate_name: C,
+        /// Its compatibility range.
+        line: SemverBreakingLine,
+    },
+    /// One feature set per package version, target and side: the
+    /// build's wrapper manifest declares each package version once per
+    /// side.
+    Package {
+        /// The crate.
+        crate_name: C,
+        /// The version.
+        version: V,
+        /// The target the node compiles for.
+        target: T,
+        /// Whether it compiles for the host.
+        host_side: bool,
+    },
 }
 
-impl<G> Default for FeatureAgreement<G> {
+/// What a node holds under a [`ClosureKey`]: its version under a
+/// `Range` key, its feature set under a `Package` key. `F` is the
+/// caller's handle of a canonical feature list, so equal handles are
+/// equal sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosureHeld<V, F> {
+    /// The version a `Range` key holds.
+    Version(V),
+    /// The feature set a `Package` key holds.
+    Features(F),
+}
+
+/// A node's two keys and what it holds under each.
+pub type ClosureMembers<C, V, T, F> = [(ClosureKey<C, V, T>, ClosureHeld<V, F>); 2];
+
+/// A node's two closure members: its version under its crate's range,
+/// and its feature set under its package. `version` is the parsed
+/// version the range is computed from; `handle` is the caller's handle
+/// of it.
+#[must_use]
+pub fn closure_members<C: Clone, V: Clone, T, F>(
+    crate_name: &C,
+    version: &semver::Version,
+    handle: &V,
+    target: T,
+    host_side: bool,
+    features: F,
+) -> ClosureMembers<C, V, T, F> {
+    [
+        (
+            ClosureKey::Range {
+                crate_name: crate_name.clone(),
+                line: breaking_line(version),
+            },
+            ClosureHeld::Version(handle.clone()),
+        ),
+        (
+            ClosureKey::Package {
+                crate_name: crate_name.clone(),
+                version: handle.clone(),
+                target,
+                host_side,
+            },
+            ClosureHeld::Features(features),
+        ),
+    ]
+}
+
+/// The members each key holds across a closure (stow#1470, stow#1487).
+///
+/// The key type `G` is the caller's [`ClosureKey`] and `S` its
+/// [`ClosureHeld`]. A superset move is accepted only when everything it
+/// splices in agrees with the members already held, on the submit side
+/// ([`closure_disagreement`]) and the consume side alike.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosureAgreement<G, S> {
+    held: BTreeMap<G, S>,
+}
+
+impl<G, S> Default for ClosureAgreement<G, S> {
     fn default() -> Self {
         Self {
-            sets: BTreeMap::new(),
+            held: BTreeMap::new(),
         }
     }
 }
 
-impl<G: Ord + Clone> FeatureAgreement<G> {
-    /// The first of `members` whose group is held with another set.
+impl<G: Ord + Clone, S: PartialEq + Clone> ClosureAgreement<G, S> {
+    /// The first of `members` whose group is held with another member.
     #[must_use]
     pub fn disagreement<'a>(
         &self,
-        members: impl IntoIterator<Item = (&'a G, &'a [String])>,
+        members: impl IntoIterator<Item = (&'a G, &'a S)>,
     ) -> Option<&'a G>
     where
         G: 'a,
+        S: 'a,
     {
         members
             .into_iter()
-            .find(|(group, features)| self.sets.get(*group).is_some_and(|held| held != features))
+            .find(|(group, member)| self.held.get(*group).is_some_and(|held| held != *member))
             .map(|(group, _)| group)
     }
 
-    /// Hold `members`' sets. A group already held keeps its set; call
+    /// Hold `members`. A group already held keeps its member; call
     /// [`Self::disagreement`] first when they may differ.
-    pub fn hold<'a>(&mut self, members: impl IntoIterator<Item = (&'a G, &'a [String])>)
+    pub fn hold<'a>(&mut self, members: impl IntoIterator<Item = (&'a G, &'a S)>)
     where
         G: 'a,
+        S: 'a,
     {
-        for (group, features) in members {
-            self.sets
+        for (group, member) in members {
+            self.held
                 .entry(group.clone())
-                .or_insert_with(|| features.to_vec());
+                .or_insert_with(|| member.clone());
         }
     }
 
-    /// Hold `features` for `group`, replacing a set held before.
-    pub fn replace(&mut self, group: G, features: Vec<String>) {
-        self.sets.insert(group, features);
+    /// Hold `member` for `group`, replacing one held before.
+    pub fn replace(&mut self, group: G, member: S) {
+        self.held.insert(group, member);
     }
 }
 
-/// The first group that holds two feature sets inside the dependency
-/// closure of `start` — `None` when the closure agrees.
+/// The first key that holds two members inside the dependency closure
+/// of `start`, with the member met first and the one that disagrees —
+/// `None` when the closure agrees.
 ///
-/// `node` names a
-/// node's group and set — `None` for a node whose group the caller
-/// knows holds one set everywhere — and `dependencies` pushes a node's
-/// direct dependencies; both are the caller's view of its graph. The
-/// set type `S` is the caller's handle of a canonical feature list, so
-/// equal handles are equal sets.
-pub fn closure_disagreement<G: Ord + Clone, S: PartialEq>(
+/// `node` names a node's members — none for a node whose keys the
+/// caller knows hold one member everywhere — and `dependencies` pushes
+/// a node's direct dependencies; both are the caller's view of its
+/// graph. One walk, each node visited once.
+pub fn closure_disagreement<
+    G: Ord + Clone,
+    S: PartialEq + Clone,
+    M: IntoIterator<Item = (G, S)>,
+>(
     start: usize,
-    node: impl Fn(usize) -> Option<(G, S)>,
+    node: impl Fn(usize) -> M,
     dependencies: impl Fn(usize, &mut Vec<usize>),
-) -> Option<G> {
+) -> Option<(G, S, S)> {
     let mut held = BTreeMap::<G, S>::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![start];
@@ -159,12 +246,14 @@ pub fn closure_disagreement<G: Ord + Clone, S: PartialEq>(
         if !seen.insert(index) {
             continue;
         }
-        if let Some((group, features)) = node(index) {
-            match held.get(&group) {
-                Some(existing) if *existing != features => return Some(group),
+        for (key, member) in node(index) {
+            match held.get(&key) {
+                Some(existing) if *existing != member => {
+                    return Some((key, existing.clone(), member));
+                }
                 Some(_) => {}
                 None => {
-                    held.insert(group, features);
+                    held.insert(key, member);
                 }
             }
         }
@@ -173,18 +262,54 @@ pub fn closure_disagreement<G: Ord + Clone, S: PartialEq>(
     None
 }
 
+/// What a disagreeing closure holds twice, for [`disagreement_text`].
+#[derive(Debug, Clone, Copy)]
+pub enum ClosureConflict<'a> {
+    /// Two versions of one compatibility range.
+    Versions([&'a semver::Version; 2]),
+    /// Two feature sets of one package version on one side.
+    FeatureSets {
+        /// The version.
+        version: &'a semver::Version,
+        /// The target the nodes compile for.
+        target: &'a str,
+        /// Whether they compile for the host.
+        host_side: bool,
+    },
+}
+
 /// The package a disagreeing closure holds twice, in the words every
-/// refusal of one uses: `<crate> <version> with two feature sets on the
-/// <side> side for <target>`.
+/// refusal of one uses.
+///
+/// `<crate> <older> and <newer>, two
+/// semver-compatible versions cargo unifies` for a range, `<crate>
+/// <version> with two feature sets on the <side> side for <target>` for
+/// a package.
 #[must_use]
 pub fn disagreement_text(
     crate_name: impl std::fmt::Display,
-    version: impl std::fmt::Display,
-    target: impl std::fmt::Display,
-    host_side: bool,
+    conflict: ClosureConflict<'_>,
 ) -> String {
-    let side = if host_side { "host" } else { "target" };
-    format!("{crate_name} {version} with two feature sets on the {side} side for {target}")
+    match conflict {
+        ClosureConflict::Versions(versions) => {
+            let [older, newer] = if versions[0] <= versions[1] {
+                versions
+            } else {
+                [versions[1], versions[0]]
+            };
+            format!(
+                "{crate_name} {older} and {newer}, two semver-compatible versions cargo unifies"
+            )
+        }
+        ClosureConflict::FeatureSets {
+            version,
+            target,
+            host_side,
+        } => {
+            let side = if host_side { "host" } else { "target" };
+            format!("{crate_name} {version} with two feature sets on the {side} side for {target}")
+        }
+    }
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
 use crate::artifact::{ArtifactKind, RustCrateType};
+use crate::feature_sets::{ClosureHeld, ClosureKey};
 use crate::glibc::GlibcVersion;
 use crate::identity::{
     CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, DependencyIdentity, FeaturesJson,
@@ -4454,6 +4455,98 @@ mod tests {
         assert!(error.to_string().contains("libc 0.2.191"), "{error}");
     }
 
+    /// gix-attributes 0.34.0 (stow#1487): a closure holding smallvec
+    /// 1.16.4 and 1.16.5 cannot be fetched — cargo activates one version
+    /// per compatibility range for the whole resolve, both sides
+    /// included — so the submission is refused naming both versions.
+    #[test]
+    fn a_closure_with_two_compatible_versions_is_rejected() {
+        for host_sides in [[false, false], [true, false], [false, true]] {
+            let submitted = tree(vec![
+                versioned_node("gix-attributes", "0.34.0", &[], false, &[1, 2], "gix"),
+                versioned_node("smallvec", "1.16.4", &[], host_sides[0], &[], "a"),
+                versioned_node("smallvec", "1.16.5", &[], host_sides[1], &[], "b"),
+            ]);
+            let error = submitted
+                .ensure_closure_agreement()
+                .expect_err("two compatible smallvec versions");
+            assert!(
+                error.to_string().contains(
+                    "smallvec 1.16.4 and 1.16.5, two semver-compatible versions cargo unifies"
+                ),
+                "{error}"
+            );
+            let mut trees = vec![submitted];
+            let error = crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &[])
+                .expect_err("substitution refuses it too");
+            assert!(error.to_string().contains("1.16.4 and 1.16.5"), "{error}");
+        }
+    }
+
+    /// Versions on two compatibility ranges coexist, as cargo lets them:
+    /// two majors, two `0.x` minors and two `0.0.x` patches.
+    #[test]
+    fn versions_on_two_compatibility_ranges_agree() {
+        for (older, newer) in [("1.16.5", "2.0.0"), ("0.1.9", "0.2.0"), ("0.0.1", "0.0.2")] {
+            tree(vec![
+                versioned_node("root", "1.0.0", &[], false, &[1, 2], "root"),
+                versioned_node("smallvec", older, &[], false, &[], "a"),
+                versioned_node("smallvec", newer, &[], false, &[], "b"),
+            ])
+            .ensure_closure_agreement()
+            .unwrap_or_else(|error| panic!("{older} beside {newer}: {error}"));
+        }
+    }
+
+    /// The versions `crate_name` holds in `tree`.
+    fn versions_of(tree: &crate::api::SubmissionTree, crate_name: &str) -> BTreeSet<String> {
+        tree.nodes
+            .iter()
+            .filter(|node| node.crate_name.as_str() == crate_name)
+            .map(|node| node.version.to_string())
+            .collect()
+    }
+
+    /// stow#1487: naga's serving set, from another tree, carries
+    /// smallvec 1.16.5 while the root holds smallvec 1.16.4 directly.
+    /// Moving naga would give the root two compatible smallvec
+    /// versions, so naga keeps its own chain.
+    #[test]
+    fn substitution_keeps_a_node_whose_subtree_holds_a_compatible_version() {
+        let mut trees = vec![
+            tree(vec![
+                versioned_node("gix-attributes", "0.34.0", &[], false, &[1, 2], "gix"),
+                versioned_node("naga", "29.0.0", &["spv-out"], false, &[2], "naga-spv"),
+                versioned_node("smallvec", "1.16.4", &[], false, &[], "smallvec-4"),
+            ]),
+            tree(vec![
+                versioned_node(
+                    "naga",
+                    "29.0.0",
+                    &["spv-out", "wgsl-in"],
+                    false,
+                    &[1],
+                    "naga-wgsl",
+                ),
+                versioned_node("smallvec", "1.16.5", &[], false, &[], "smallvec-5"),
+            ]),
+        ];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &[])
+            .expect("substitution");
+        let tree = &trees[0];
+        assert_eq!(
+            versions_of(tree, "smallvec"),
+            BTreeSet::from(["1.16.4".to_owned()]),
+            "smallvec keeps one version"
+        );
+        assert_eq!(
+            sets_of(tree, "naga", false),
+            BTreeSet::from([vec!["spv-out".to_owned()]]),
+            "naga builds its exact set"
+        );
+        tree.ensure_closure_agreement().expect("closure agrees");
+    }
+
     /// A shadow twin edge (stow#506/#722): the row's children include
     /// the host lib and its same-features target twin — two tasks no
     /// `--extern` list names together (stow#919). The task-id join
@@ -5307,29 +5400,31 @@ impl SubmissionTree {
         Ok((piece, bytes))
     }
 
-    /// Reject a tree whose dependency closure holds two feature sets of
-    /// one `(crate, version, target, side)` (stow#1470): the build's
-    /// wrapper manifest declares a package version once per side, so
-    /// such a task can only fail on a runner. Every node's closure is
-    /// covered by the closures of the nodes no other node depends on
-    /// and of the roots, which are the ones walked.
+    /// Reject a tree whose dependency closure holds two members of one
+    /// `(crate, compatibility range, target, side)`: two feature sets of
+    /// one version (stow#1470) — the build's wrapper manifest declares a
+    /// package version once per side — or two versions cargo would unify
+    /// (stow#1487), of which it can select only one. Either way the task
+    /// can only fail on a runner. Every node's closure is covered by the
+    /// closures of the nodes no other node depends on and of the roots,
+    /// which are the ones walked.
     ///
     /// # Errors
-    /// `Error` naming the package a closure holds twice. Dep indexes
-    /// must be in range; the submit path checks that first.
+    /// `Error` naming the package a closure holds twice, with both
+    /// versions. Dep indexes must be in range; the submit path checks
+    /// that first.
     pub fn ensure_closure_agreement(&self) -> crate::error::Result<()> {
-        // A group the whole tree holds one set of cannot disagree inside
-        // any closure; only the contested groups are walked for.
-        let mut first = BTreeMap::<ClosureGroup, &[String]>::new();
-        let mut contested = BTreeSet::<ClosureGroup>::new();
-        for node in &self.nodes {
-            let features = node.features_json.features();
-            match first.entry(closure_group(node)) {
+        // A group the whole tree holds one member of cannot disagree
+        // inside any closure; only the contested groups are walked for.
+        let mut first = BTreeMap::<ClosureGroup<'_>, ClosureMember<'_>>::new();
+        let mut contested = BTreeSet::<ClosureGroup<'_>>::new();
+        for (group, member) in self.nodes.iter().flat_map(closure_members) {
+            match first.entry(group) {
                 std::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(features);
+                    slot.insert(member);
                 }
                 std::collections::btree_map::Entry::Occupied(slot) => {
-                    if *slot.get() != features {
+                    if *slot.get() != member {
                         contested.insert(slot.key().clone());
                     }
                 }
@@ -5338,11 +5433,6 @@ impl SubmissionTree {
         if contested.is_empty() {
             return Ok(());
         }
-        let contested_node = self
-            .nodes
-            .iter()
-            .map(|node| contested.contains(&closure_group(node)))
-            .collect::<Vec<_>>();
         let mut depended_on = vec![false; self.nodes.len()];
         for dep in self.nodes.iter().flat_map(|node| &node.deps) {
             depended_on[*dep as usize] = true;
@@ -5353,22 +5443,27 @@ impl SubmissionTree {
             .map(|&root| root as usize)
             .chain((0..self.nodes.len()).filter(|&index| !depended_on[index]));
         for top in tops {
-            if let Some(group) = self.closure_disagreement(top, &contested_node) {
-                return Err(disagreement_error(&self.nodes[top].task_id, &group));
+            if let Some((group, held, other)) = self.closure_disagreement(top, &contested) {
+                return Err(disagreement_error(
+                    &self.nodes[top].task_id,
+                    &group,
+                    &held,
+                    &other,
+                ));
             }
         }
         Ok(())
     }
 
-    /// The feature set `group` holds in node `start`'s closure, walked
-    /// over this tree's own edges without descending below a node
-    /// `stop` accepts. `stop` sees every node the walk visits.
+    /// The member `group` holds in node `start`'s closure, walked over
+    /// this tree's own edges without descending below a node `stop`
+    /// accepts. `stop` sees every node the walk visits.
     fn closure_set(
         &self,
         start: usize,
-        group: &ClosureGroup,
+        group: &ClosureGroup<'_>,
         mut stop: impl FnMut(usize) -> bool,
-    ) -> Option<&[String]> {
+    ) -> Option<ClosureMember<'_>> {
         let mut found = None;
         let mut seen = std::collections::HashSet::new();
         let mut stack = vec![start];
@@ -5377,8 +5472,8 @@ impl SubmissionTree {
                 continue;
             }
             let node = &self.nodes[index];
-            if closure_group(node) == *group {
-                found = Some(node.features_json.features());
+            if let Some(member) = member_under(closure_members(node), group) {
+                found = Some(member);
             }
             if !stop(index) {
                 stack.extend(node.deps.iter().map(|&dep| dep as usize));
@@ -5387,14 +5482,19 @@ impl SubmissionTree {
         found
     }
 
-    /// The first group holding two feature sets in node `start`'s
-    /// closure.
-    fn closure_disagreement(&self, start: usize, contested: &[bool]) -> Option<ClosureGroup> {
+    /// The first group holding two members in node `start`'s closure,
+    /// with the two members.
+    fn closure_disagreement<'a>(
+        &'a self,
+        start: usize,
+        contested: &BTreeSet<ClosureGroup<'a>>,
+    ) -> Option<(ClosureGroup<'a>, ClosureMember<'a>, ClosureMember<'a>)> {
         crate::feature_sets::closure_disagreement(
             start,
             |index| {
-                let node = &self.nodes[index];
-                contested[index].then(|| (closure_group(node), node.features_json.features()))
+                closure_members(&self.nodes[index])
+                    .into_iter()
+                    .filter(|(group, _)| contested.contains(group))
             },
             |index, stack| stack.extend(self.nodes[index].deps.iter().map(|&dep| dep as usize)),
         )
@@ -5679,26 +5779,46 @@ impl PublishedIndexSlice {
     }
 }
 
-/// The `(crate, version, target, side)` a closure holds one feature
-/// set of (stow#1470).
-type ClosureGroup = (CrateName, CrateVersion, TargetTriple, bool);
+/// A key a closure holds one member of (stow#1470, stow#1487).
+type ClosureGroup<'a> = ClosureKey<&'a CrateName, &'a CrateVersion, &'a TargetTriple>;
 
-fn closure_group(node: &SubmissionNode) -> ClosureGroup {
-    (
-        node.crate_name.clone(),
-        node.version.clone(),
-        node.target.clone(),
+/// What a node holds under a [`ClosureGroup`].
+type ClosureMember<'a> = ClosureHeld<&'a CrateVersion, &'a [String]>;
+
+/// A node's two keys and what it holds under each.
+type ClosureMembers<'a> = [(ClosureGroup<'a>, ClosureMember<'a>); 2];
+
+fn closure_members(node: &SubmissionNode) -> ClosureMembers<'_> {
+    crate::feature_sets::closure_members(
+        &&node.crate_name,
+        node.version.as_semver(),
+        &&node.version,
+        &node.target,
         node.host_side,
+        node.features_json.features(),
     )
 }
 
-fn arena_group(identity: &TaskNodeIdentity) -> ClosureGroup {
-    (
-        identity.crate_name.clone(),
-        identity.version.clone(),
-        identity.target.clone(),
+fn arena_members(identity: &TaskNodeIdentity) -> ClosureMembers<'_> {
+    crate::feature_sets::closure_members(
+        &&identity.crate_name,
+        identity.version.as_semver(),
+        &&identity.version,
+        &identity.target,
         identity.host_side,
+        identity.features_json.features(),
     )
+}
+
+/// The member `members` holds under `group`, if it answers to it.
+fn member_under<'a>(
+    members: ClosureMembers<'a>,
+    group: &ClosureGroup<'_>,
+) -> Option<ClosureMember<'a>> {
+    members
+        .into_iter()
+        .find(|(key, _)| key == group)
+        .map(|(_, member)| member)
 }
 
 fn twin_pair_key(node: &SubmissionNode) -> TwinPairKey {
@@ -5711,11 +5831,45 @@ fn twin_pair_key(node: &SubmissionNode) -> TwinPairKey {
     )
 }
 
-fn disagreement_error(task_id: &str, group: &ClosureGroup) -> crate::error::Error {
-    let (crate_name, version, target, host_side) = group;
+fn disagreement_error(
+    task_id: &str,
+    group: &ClosureGroup<'_>,
+    held: &ClosureMember<'_>,
+    other: &ClosureMember<'_>,
+) -> crate::error::Error {
+    use crate::feature_sets::ClosureConflict;
+    let (crate_name, conflict) = match (group, held, other) {
+        (
+            ClosureKey::Range { crate_name, .. },
+            ClosureHeld::Version(held),
+            ClosureHeld::Version(other),
+        ) => (
+            crate_name,
+            ClosureConflict::Versions([held.as_semver(), other.as_semver()]),
+        ),
+        (
+            ClosureKey::Package {
+                crate_name,
+                version,
+                target,
+                host_side,
+            },
+            ..,
+        ) => (
+            crate_name,
+            ClosureConflict::FeatureSets {
+                version: version.as_semver(),
+                target: target.as_str(),
+                host_side: *host_side,
+            },
+        ),
+        (ClosureKey::Range { .. }, ..) => {
+            unreachable!("a range key holds versions: closure_members pairs them")
+        }
+    };
     stow_error!(
         "the closure of task {task_id} holds {}",
-        crate::feature_sets::disagreement_text(crate_name, version, target, *host_side)
+        crate::feature_sets::disagreement_text(crate_name, conflict)
     )
 }
 
@@ -6038,11 +6192,13 @@ struct Substitution<'a> {
 }
 
 impl Substitution<'_> {
-    /// The moves to block after this round (stow#1470): for every root
-    /// whose substituted closure holds two feature sets of one group,
-    /// the moves reachable from that root whose spliced subtree carries
-    /// a set of the group other than the one the root's own closure
-    /// holds — all of them when the root's own closure has none. A
+    /// The moves to block after this round (stow#1470, stow#1487): for
+    /// every root whose substituted closure holds two members of one
+    /// key — two feature sets of one package, or two versions of one
+    /// compatibility range — the moves reachable from that root whose
+    /// spliced subtree carries a member of the key other than the one
+    /// the root's own closure holds — all of them when the root's own
+    /// closure has none. A
     /// blocked node's twin (same package and set on the other side,
     /// stow#723) is blocked with it, so the pair stays together.
     ///
@@ -6054,7 +6210,7 @@ impl Substitution<'_> {
         for (tree_index, tree) in self.trees.iter().enumerate() {
             for &root in &tree.roots {
                 let image = self.memo[&(tree_index, root as usize)];
-                let Some(group) = self.image_disagreement(image) else {
+                let Some((group, held, other)) = self.image_disagreement(image) else {
                     continue;
                 };
                 let own = tree.closure_set(root as usize, &group, |_| false);
@@ -6078,6 +6234,8 @@ impl Substitution<'_> {
                     return Err(disagreement_error(
                         &tree.nodes[root as usize].task_id,
                         &group,
+                        &held,
+                        &other,
                     ));
                 }
             }
@@ -6110,26 +6268,26 @@ impl Substitution<'_> {
         Ok(fresh)
     }
 
-    /// The first group holding two feature sets in arena node
-    /// `image`'s closure.
-    fn image_disagreement(&self, image: usize) -> Option<ClosureGroup> {
+    /// The first group holding two members in arena node `image`'s
+    /// closure, with the two members.
+    fn image_disagreement(
+        &self,
+        image: usize,
+    ) -> Option<(ClosureGroup<'_>, ClosureMember<'_>, ClosureMember<'_>)> {
         crate::feature_sets::closure_disagreement(
             image,
-            |index| {
-                let identity = &self.arena[index].identity;
-                Some((arena_group(identity), identity.features_json.features()))
-            },
+            |index| arena_members(&self.arena[index].identity),
             |index, stack| stack.extend(self.arena[index].dependencies.iter().copied()),
         )
     }
 
-    /// Whether arena node `image`'s closure holds `group` with a set
-    /// other than `own` (any set when `own` is `None`).
+    /// Whether arena node `image`'s closure holds `group` with a member
+    /// other than `own` (any member when `own` is `None`).
     fn image_holds_other_set(
         &self,
         image: usize,
-        group: &ClosureGroup,
-        own: Option<&[String]>,
+        group: &ClosureGroup<'_>,
+        own: Option<ClosureMember<'_>>,
     ) -> bool {
         let mut seen = std::collections::HashSet::new();
         let mut stack = vec![image];
@@ -6138,8 +6296,8 @@ impl Substitution<'_> {
                 continue;
             }
             let identity = &self.arena[index].identity;
-            if arena_group(identity) == *group
-                && own.is_none_or(|own| own != identity.features_json.features())
+            if member_under(arena_members(identity), group)
+                .is_some_and(|member| own.as_ref().is_none_or(|own| *own != member))
             {
                 return true;
             }

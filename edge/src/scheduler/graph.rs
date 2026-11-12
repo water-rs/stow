@@ -2376,42 +2376,76 @@ impl Graph {
         Ok(MintedPass { claims, refusals })
     }
 
-    /// The package `ix`'s dependency closure holds two feature sets of,
-    /// as the refusal names it — `None` when the closure agrees. One
-    /// walk of the closure the dispatch payload carries: the node and
-    /// every node reachable over its edges, published ones included.
-    /// Interned crate, version and feature ids compare exactly: the
-    /// interner holds one id per string, and a feature set's string is
-    /// its canonical list.
+    /// What `ix`'s dependency closure holds twice, as the refusal names
+    /// it — two feature sets of one package version on one side
+    /// (stow#1470) or two versions of one cargo compatibility range
+    /// (stow#1487) — `None` when the closure agrees. One walk of the
+    /// closure the dispatch payload carries: the node and every node
+    /// reachable over its edges, published ones included, each version
+    /// parsed once per visit for its range. Interned crate, version and
+    /// feature ids compare exactly: the interner holds one id per
+    /// string, and a feature set's string is its canonical list.
     fn closure_disagreement(&self, ix: u32) -> Option<String> {
-        let (crate_name, version, target, host_side) =
-            stow_types::feature_sets::closure_disagreement(
-                ix as usize,
-                |at| {
-                    let node = &self.nodes[at];
-                    Some((
-                        (
-                            node.crate_name,
-                            node.version,
-                            node.target,
-                            node.flags.host(),
-                        ),
-                        node.features,
-                    ))
+        use stow_types::feature_sets::{ClosureConflict, ClosureHeld, ClosureKey};
+        let version_of = |id: u32| {
+            semver::Version::parse(self.intern.at(id))
+                .expect("a stored version was a parsed version at merge")
+        };
+        let (key, held, other) = stow_types::feature_sets::closure_disagreement(
+            ix as usize,
+            |at| {
+                let node = &self.nodes[at];
+                stow_types::feature_sets::closure_members(
+                    &node.crate_name,
+                    &version_of(node.version),
+                    &node.version,
+                    node.target,
+                    node.flags.host(),
+                    node.features,
+                )
+            },
+            |at, stack| {
+                let at = u32::try_from(at).expect("arena indexes fit u32");
+                stack.extend(self.deps_of(at).map(|dep| dep as usize));
+            },
+        )?;
+        let (crate_name, conflict_versions, package) = match (key, held, other) {
+            (
+                ClosureKey::Range { crate_name, .. },
+                ClosureHeld::Version(held),
+                ClosureHeld::Version(other),
+            ) => (crate_name, [version_of(held), version_of(other)], None),
+            (
+                ClosureKey::Package {
+                    crate_name,
+                    version,
+                    target,
+                    host_side,
                 },
-                |at, stack| {
-                    let at = u32::try_from(at).expect("arena indexes fit u32");
-                    stack.extend(self.deps_of(at).map(|dep| dep as usize));
-                },
-            )?;
+                ..,
+            ) => {
+                let version = version_of(version);
+                (
+                    crate_name,
+                    [version.clone(), version],
+                    Some((target, host_side)),
+                )
+            }
+            (ClosureKey::Range { .. }, ..) => {
+                unreachable!("a range key holds versions: closure_members pairs them")
+            }
+        };
+        let conflict = match package {
+            None => ClosureConflict::Versions([&conflict_versions[0], &conflict_versions[1]]),
+            Some((target, host_side)) => ClosureConflict::FeatureSets {
+                version: &conflict_versions[0],
+                target: &self.targets[usize::from(target)].name,
+                host_side,
+            },
+        };
         Some(format!(
             "dependency closure holds {}",
-            stow_types::feature_sets::disagreement_text(
-                self.intern.at(crate_name),
-                self.intern.at(version),
-                &*self.targets[usize::from(target)].name,
-                host_side,
-            )
+            stow_types::feature_sets::disagreement_text(self.intern.at(crate_name), conflict)
         ))
     }
 
@@ -5585,22 +5619,55 @@ mod tests {
         assert!(error.to_string().contains("libc 0.2.191"), "{error}");
     }
 
-    /// A graph where `aes` is ready and its closure holds libc 0.2.191
-    /// twice on the target side, though each submitted tree agreed:
-    /// polyval (published) carries its edge onto the `extra_traits` set
-    /// from the first tree, which `keeper` retains, and the second tree
-    /// names polyval bare beside the other set, with `aes-gcm` waiting
-    /// on `aes`.
-    fn graph_with_a_disagreeing_aes() -> Graph {
-        let libc = |features: &[&str]| {
-            let mut node = sub("libc");
-            node.version = CrateVersion::new(semver::Version::new(0, 2, 191));
-            node.features_json =
-                FeaturesJson::from_sorted(features.iter().map(|f| (*f).to_owned()).collect())
-                    .expect("features");
-            node.task_id = minted_id(&node);
-            node
+    /// stow#1487: a submission whose closure holds smallvec 1.16.4 and
+    /// 1.16.5 is refused at the route, naming both versions.
+    #[test]
+    fn a_closure_with_two_compatible_versions_is_refused_at_submit() {
+        let mut gix = sub("gix-attributes");
+        gix.deps = vec![0, 1];
+        let tree = SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![2],
+            nodes: vec![
+                package("smallvec", semver::Version::new(1, 16, 4), &[]),
+                package("smallvec", semver::Version::new(1, 16, 5), &[]),
+                gix,
+            ],
         };
+        let error = Graph::default().merge(&tree, 0).expect_err("refused");
+        assert!(
+            error.to_string().contains("smallvec 1.16.4 and 1.16.5"),
+            "{error}"
+        );
+    }
+
+    /// The test node `name` at `version` with `features`.
+    fn package(name: &str, version: semver::Version, features: &[&str]) -> SubmissionNode {
+        let mut node = sub(name);
+        node.version = CrateVersion::new(version);
+        node.features_json =
+            FeaturesJson::from_sorted(features.iter().map(|f| (*f).to_owned()).collect())
+                .expect("features");
+        node.task_id = minted_id(&node);
+        node
+    }
+
+    /// The libc 0.2.191 pair of stow#1470: one package version at two
+    /// feature sets.
+    fn two_libc_sets() -> (SubmissionNode, SubmissionNode) {
+        let libc = |features: &[&str]| package("libc", semver::Version::new(0, 2, 191), features);
+        (
+            libc(&["default", "extra_traits", "std"]),
+            libc(&["default", "std"]),
+        )
+    }
+
+    /// A graph where `aes` is ready and its closure holds both `extra`
+    /// and `plain`, though each submitted tree agreed: polyval
+    /// (published) carries its edge onto `extra` from the first tree,
+    /// which `keeper` retains, and the second tree names polyval bare
+    /// beside `plain`, with `aes-gcm` waiting on `aes`.
+    fn graph_with_a_disagreeing_aes(extra: SubmissionNode, plain: SubmissionNode) -> Graph {
         let rows = |node: &SubmissionNode| {
             [UnitKind::Linked, UnitKind::Unlinked].map(|kind| PublishedSliceRow {
                 crate_name: node.crate_name.clone(),
@@ -5615,10 +5682,6 @@ mod tests {
                 node_profile: node.profile,
             })
         };
-        let (extra, plain) = (
-            libc(&["default", "extra_traits", "std"]),
-            libc(&["default", "std"]),
-        );
         let mut polyval = sub("polyval");
         let published: Vec<_> = [&extra, &plain, &polyval]
             .into_iter()
@@ -5669,7 +5732,8 @@ mod tests {
     /// operator retry is refused again rather than dispatched.
     #[test]
     fn a_closure_that_disagrees_in_the_graph_is_refused_at_claim() {
-        let mut graph = graph_with_a_disagreeing_aes();
+        let (extra, plain) = two_libc_sets();
+        let mut graph = graph_with_a_disagreeing_aes(extra, plain);
         let pass = graph
             .claim_nodes(&claim_settings(45, 16), 10_000, u32::MAX)
             .expect("claim");
@@ -5717,6 +5781,57 @@ mod tests {
         assert_eq!(again.refusals.len(), 1);
         assert_eq!(status_of(&graph, "aes"), Some(Status::Failed));
         assert!(graph.attempt_outcomes.is_empty());
+    }
+
+    /// stow#1487: the same shape with smallvec 1.16.4 under polyval and
+    /// 1.16.5 beside it — two versions cargo unifies. The claim refuses
+    /// aes naming both versions, and its dependent blocks.
+    #[test]
+    fn a_closure_with_two_compatible_versions_is_refused_at_claim() {
+        let mut graph = graph_with_a_disagreeing_aes(
+            package("smallvec", semver::Version::new(1, 16, 4), &[]),
+            package("smallvec", semver::Version::new(1, 16, 5), &[]),
+        );
+        let pass = graph
+            .claim_nodes(&claim_settings(45, 16), 10_000, u32::MAX)
+            .expect("claim");
+        let minted = graph
+            .claimed(&pass, &mut graph.test_digest_source())
+            .expect("mint");
+        assert_eq!(
+            minted
+                .claims
+                .iter()
+                .map(|claim| claim.task_id.as_str())
+                .collect::<Vec<_>>(),
+            [id("keeper")],
+            "the agreeing closure dispatches"
+        );
+        let [refusal] = minted.refusals.as_slice() else {
+            panic!("one refusal: {:?}", minted.refusals);
+        };
+        assert_eq!(refusal.task_id, id("aes"));
+        assert_eq!(
+            refusal.error,
+            "dependency closure holds smallvec 1.16.4 and 1.16.5, two semver-compatible versions cargo unifies"
+        );
+        let gcm = graph.node_ix(&id("aes-gcm")).expect("dependent");
+        assert!(graph.node(gcm).flags.blocked(), "the dependent blocks");
+        assert!(graph.attempt_outcomes.is_empty(), "no run, no outcome");
+    }
+
+    /// Two versions on two compatibility ranges are claimed as usual.
+    #[test]
+    fn a_closure_with_two_compatibility_ranges_is_claimed() {
+        let mut graph = graph_with_a_disagreeing_aes(
+            package("smallvec", semver::Version::new(1, 16, 4), &[]),
+            package("smallvec", semver::Version::new(2, 0, 0), &[]),
+        );
+        let pass = graph
+            .claim_nodes(&claim_settings(45, 16), 10_000, u32::MAX)
+            .expect("claim");
+        assert_eq!(pass.claims.len(), 2, "keeper and aes both dispatch");
+        assert_eq!(pass.refusals, [] as [u32; 0]);
     }
 
     /// A → B → C chain (a depends on b, b on c), nodes in leaf order.
