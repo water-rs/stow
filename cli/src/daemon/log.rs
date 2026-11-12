@@ -10,7 +10,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Sender, channel, sync_channel};
 
 use stow_types::error::{Context, Result};
 use tracing_subscriber::fmt::MakeWriter;
@@ -68,11 +68,22 @@ fn open_append(path: &Path) -> Result<File> {
         .wrap_err_with(|| format!("open the daemon log {}", path.display()))
 }
 
+/// What the thread that owns the file is sent.
+#[derive(Debug)]
+enum Message {
+    Record(Vec<u8>),
+    /// Answered once every record sent before it is written.
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
 /// The subscriber's side: every writer it asks for sends its records to
-/// the thread that owns the file.
+/// the thread that owns the file. [`flush`](std::io::Write::flush) waits
+/// until that thread has written everything sent so far, which a process
+/// about to replace its image or exit must do: nothing else carries the
+/// queued records across.
 #[derive(Debug, Clone)]
 pub struct LogWriter {
-    records: Sender<Vec<u8>>,
+    records: Sender<Message>,
 }
 
 impl LogWriter {
@@ -84,16 +95,24 @@ impl LogWriter {
     /// The log cannot be opened or its thread cannot start.
     pub fn open(path: &Path, bound: u64) -> Result<Self> {
         let mut file = RotatingFile::open(path, bound)?;
-        let (records, incoming) = channel::<Vec<u8>>();
+        let (records, incoming) = channel::<Message>();
         std::thread::Builder::new()
             .name("stow-daemon-log".to_owned())
             .spawn(move || {
                 // A failed write ends the thread: the subscriber's sends
                 // then fail and it drops its records, which is all a
                 // daemon with no terminal can do about its own log.
-                while let Ok(record) = incoming.recv() {
-                    if file.write(&record).is_err() {
-                        break;
+                while let Ok(message) = incoming.recv() {
+                    match message {
+                        Message::Record(record) => {
+                            if file.write(&record).is_err() {
+                                break;
+                            }
+                        }
+                        Message::Flush(done) => {
+                            // The waiter may have given up; nothing to do then.
+                            let _ = done.send(());
+                        }
                     }
                 }
             })
@@ -105,13 +124,19 @@ impl LogWriter {
 impl std::io::Write for LogWriter {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         self.records
-            .send(buffer.to_vec())
+            .send(Message::Record(buffer.to_vec()))
             .map_err(|_| std::io::Error::other("the daemon log thread ended"))?;
         Ok(buffer.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        let (done, written) = sync_channel(0);
+        self.records
+            .send(Message::Flush(done))
+            .map_err(|_| std::io::Error::other("the daemon log thread ended"))?;
+        written
+            .recv()
+            .map_err(|_| std::io::Error::other("the daemon log thread ended"))
     }
 }
 
@@ -125,7 +150,8 @@ impl MakeWriter<'_> for LogWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::RotatingFile;
+    use super::{LogWriter, RotatingFile};
+    use std::io::Write as _;
 
     #[test]
     fn crossing_the_bound_rotates_and_keeps_exactly_one_predecessor() {
@@ -178,5 +204,18 @@ mod tests {
             std::fs::read_to_string(dir.path().join("daemon.log.1")).expect("predecessor"),
             "0123456789abc"
         );
+    }
+
+    #[test]
+    fn a_flushed_writer_has_written_every_record_sent_before() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.log");
+        let mut writer = LogWriter::open(&path, 1 << 20).expect("open");
+        for line in 0..200 {
+            writeln!(writer, "record {line}").expect("send");
+        }
+        writer.flush().expect("flush");
+        let log = std::fs::read_to_string(&path).expect("log");
+        assert_eq!(log.lines().count(), 200, "nothing is left queued");
     }
 }

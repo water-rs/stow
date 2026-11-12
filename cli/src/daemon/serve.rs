@@ -146,12 +146,12 @@ pub async fn run(
     #[cfg(unix)] inherited: Option<Inherited>,
 ) -> Result<()> {
     let logs = SessionLogs::default();
-    let run_dir = blocking({
+    let (run_dir, log) = blocking({
         let logs = logs.clone();
         move || {
             let run_dir = RunDir::prepare(RunDir::locate_given(given_dir)?)?;
-            install_logging(&run_dir, &logs)?;
-            Ok(run_dir)
+            let log = install_logging(&run_dir, &logs)?;
+            Ok((run_dir, log))
         }
     })
     .await?;
@@ -220,24 +220,7 @@ pub async fn run(
     #[cfg(unix)]
     {
         let retired = accept_loop(&listener, daemon).await?;
-        tracing::info!(
-            successor = %retired.successor.display(),
-            "drained; replacing this daemon's image with its successor's"
-        );
-        // Only a failed exec returns: the process then exits, which
-        // releases the lock, and the next client starts a daemon.
-        let error = super::retire::exec_into(
-            &retired.successor,
-            run_dir.path(),
-            lock.as_raw_fd(),
-            std::os::fd::AsRawFd::as_raw_fd(&listener),
-        );
-        Err(error).wrap_err_with(|| {
-            format!(
-                "replace the stow daemon with its successor {}",
-                retired.successor.display()
-            )
-        })
+        replace_image(&retired, &run_dir, &lock, &listener, &log).await
     }
     #[cfg(windows)]
     {
@@ -250,8 +233,41 @@ pub async fn run(
             successor = %retired.successor.display(),
             "drained; the pipe and the lock are released for the successor"
         );
+        flush_log(&log).await?;
         Ok(())
     }
+}
+
+/// Replace this daemon's image with its successor's, carrying the lock and
+/// the listener over. Only a failed exec returns: the process then exits,
+/// which releases the lock, and the next client starts a daemon.
+#[cfg(unix)]
+async fn replace_image(
+    retired: &Pending,
+    run_dir: &RunDir,
+    lock: &FileLock,
+    listener: &Listener,
+    log: &LogWriter,
+) -> Result<()> {
+    tracing::info!(
+        successor = %retired.successor.display(),
+        "drained; replacing this daemon's image with its successor's"
+    );
+    // The log's thread dies with the old image: what it has queued, this
+    // drain's own record included, is written first.
+    flush_log(log).await?;
+    let error = super::retire::exec_into(
+        &retired.successor,
+        run_dir.path(),
+        lock.as_raw_fd(),
+        std::os::fd::AsRawFd::as_raw_fd(listener),
+    );
+    Err(error).wrap_err_with(|| {
+        format!(
+            "replace the stow daemon with its successor {}",
+            retired.successor.display()
+        )
+    })
 }
 
 /// The lock of `daemon.lock`: taken without blocking, `None` when another
@@ -425,21 +441,28 @@ async fn notify_ready(
 /// the null device, so nothing it says would otherwise be kept. Events
 /// recorded for a session are also routed to the driver that owns it; that
 /// layer sees every level, and only the log file is filtered.
-fn install_logging(run_dir: &RunDir, logs: &SessionLogs) -> Result<()> {
+/// Wait until the log's thread has written everything queued.
+async fn flush_log(log: &LogWriter) -> Result<()> {
+    let mut log = log.clone();
+    blocking(move || std::io::Write::flush(&mut log).wrap_err("flush the daemon log")).await
+}
+
+fn install_logging(run_dir: &RunDir, logs: &SessionLogs) -> Result<LogWriter> {
     let writer = LogWriter::open(&run_dir.log(), Settings::from_env()?.log_bytes)?;
     // The daemon's environment is cleared, so `RUST_LOG` only reaches it
     // when started by hand; the default is what a log of a long-lived
     // process should carry.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let file = tracing_subscriber::fmt::layer()
-        .with_writer(writer)
+        .with_writer(writer.clone())
         .with_ansi(false)
         .with_filter(filter);
     tracing_subscriber::registry()
         .with(logs.layer())
         .with(file)
         .try_init()
-        .map_err(|error| stow_types::stow_error!("install the daemon log: {error}"))
+        .map_err(|error| stow_types::stow_error!("install the daemon log: {error}"))?;
+    Ok(writer)
 }
 
 fn take_lock(path: &Path) -> Result<Option<FileLock>> {
