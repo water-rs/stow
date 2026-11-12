@@ -17,7 +17,7 @@
 		</Principal>
 	</Principals>
 	<Settings>
-		<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+		<MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>
 		<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
 		<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
 		<AllowHardTerminate>true</AllowHardTerminate>

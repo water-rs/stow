@@ -81,6 +81,9 @@ pub use session_env::SessionEnv;
 /// The variable a build's driver exports so its wrappers find the build's
 /// session, and the id it carries.
 pub use daemon::client::STOW_SESSION_ENV;
+/// Replace the running daemon with an installed stow, as `stow update`
+/// does.
+pub use daemon::client::{Restarted, retire_onto};
 /// The daemon's wire protocol, so a peer decoding frames — a stub daemon
 /// standing in for the real one in integration tests — uses the product's
 /// own types instead of reimplementing the format.
@@ -165,8 +168,9 @@ pub fn run() -> std::process::ExitCode {
 fn try_run() -> stow_types::error::Result<()> {
     // The daemon drops what it inherited before anything of its own is
     // opened, so this runs first.
-    if daemon::is_serving(&process_args()) {
-        daemon::prepare_process()?;
+    let args = process_args();
+    if daemon::is_serving(&args) {
+        daemon::prepare_process(&args)?;
     }
     if let Some(status) = delegate_to_capture()? {
         std::process::exit(status);
@@ -8119,9 +8123,13 @@ mod tests {
                 let request = frame.decode::<WrapperRequest>().expect("a wrapper request");
                 let answer =
                     answer_and_book(&handler, &in_flight, &reports, &mut flight, request).await;
-                write_frame_async(&mut daemon_end, &Response::Answer(answer))
-                    .await
-                    .expect("answer");
+                write_frame_async(
+                    &mut daemon_end,
+                    crate::daemon::protocol::Negotiated::for_tests(),
+                    &Response::Answer(answer),
+                )
+                .await
+                .expect("answer");
             }
             // The reports outlive the connection, still holding the parked
             // bookkeeping.
@@ -8135,6 +8143,7 @@ mod tests {
                 rust_log: None,
             },
             std::time::Duration::from_secs(30),
+            std::path::Path::new("/stow"),
         );
         let status = super::run_decided(&mut conversation, &command)
             .await

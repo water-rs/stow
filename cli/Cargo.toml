@@ -132,7 +132,7 @@ stow-types.workspace = true
 [target.'cfg(windows)'.dev-dependencies]
 # The detached spawn's command-line test splits its line with the system's
 # own parser, `CommandLineToArgvW`.
-windows-sys = { version = "0.60", features = ["Win32_UI_Shell"] }
+windows-sys = { version = "0.60", features = ["Win32_UI_Shell", "Win32_System_IO"] }
 
 [lints]
 workspace = true

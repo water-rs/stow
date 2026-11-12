@@ -83,7 +83,10 @@ client's; a run that hangs without serving is ended with `schtasks /End /TN
 stow-daemon-...`.
 `the stow daemon restarted during this
 cargo build` means the daemon was replaced while the build ran, which loses
-the build's in-flight state: run the build again.
+the build's in-flight state: run the build again. A driver's build (`stow
+build`, `check`, `test`) that was still open when a retiring daemon's drain
+bound ended fails with `the stow daemon is restarting onto <executable>`;
+`STOW_DAEMON_DRAIN_SECS` sets that bound.
 
 ## A unit misses when the index covers it
 

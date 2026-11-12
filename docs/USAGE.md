@@ -332,6 +332,27 @@ authority over the user's cache and the target directories of its builds.
 The output directories a session accepts are derived from the first unit
 of the build; they are not a security boundary.
 
+The daemon outlives the stow that started it, so a newer stow replaces it.
+The daemon retires when a client that opens a session is a newer stow (by
+its version, and a version that is not a semantic version is refused), and
+when stow was installed over the executable the daemon runs. The client
+that found it waits for the successor and makes the same request again, so
+the build that triggered the replacement is not failed; a client that
+cannot get a successor within the drain bound, a start and an answer fails
+naming the daemon. A retiring daemon keeps serving the builds it holds
+(its wrappers and its probes) for up to `STOW_DAEMON_DRAIN_SECS`, answers
+anything that would open a session with a request to retry, and then
+replaces itself with the successor. On Unix the replacement keeps the
+process id, the lock and the listening socket, so connections made during
+it wait in the socket's backlog for the successor. A driver's build still
+open when the bound ends fails, and the message names the restart.
+
+A daemon from a stow that predates retirement (protocol 3 and older) cannot
+be asked to retire: it refuses the newer stow's hello. The client that finds
+it ends that process (builds it holds are lost with it) and starts a daemon
+of its own stow; if the daemon that starts still cannot retire, the client
+fails naming it.
+
 A daemon that restarts while a cargo is building leaves that build without
 the session's in-flight state and its record of locally built crates. The
 new daemon refuses that cargo's wrappers until it exits, so the build fails
@@ -352,6 +373,14 @@ runs it against the recorded prefix — then re-materializes the wrapper
 shims so they keep resolving to the fresh binary. A binary that was not
 installed by the installer (a `cargo install` or source build has no
 receipt) refuses with the reason instead of clobbering itself.
+
+When the update installs a release and a daemon is running, `stow update`
+restarts it onto the installed stow and prints `restarted the stow daemon:
+<old version> -> <new version>`; builds the daemon holds are served first,
+for up to `STOW_DAEMON_DRAIN_SECS`. A daemon that is not running is not
+started, and an update that finds nothing newer leaves the daemon alone.
+The update fails, naming both versions, when the daemon comes back as a
+stow other than the installed one.
 
 GitHub API calls for the release lookup accept a token from
 `STOW_CLI_GITHUB_TOKEN`, `GITHUB_TOKEN`, or `GH_TOKEN` — only useful

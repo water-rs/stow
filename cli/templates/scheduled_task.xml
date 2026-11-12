@@ -20,8 +20,8 @@
 		</Principal>
 	</Principals>
 	<Settings>
-		{#- IgnoreNew (MultipleInstancesPolicy): a run requested while the daemon runs starts nothing; the daemon also takes its own lock. #}
-		<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+		{#- Queue (MultipleInstancesPolicy): a run requested while an instance runs starts when that instance ends, so a client that asks for a run while a retiring daemon is still exiting gets the successor; the daemon takes its own lock, so a queued run that fires while a daemon serves exits at once. #}
+		<MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>
 		{#- A laptop on battery still serves its builds. #}
 		<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
 		<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>

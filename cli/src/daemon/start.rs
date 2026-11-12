@@ -29,7 +29,7 @@ use super::STOW_DAEMON_DIR_ENV;
 #[cfg(unix)]
 use super::detached::{self, Detached};
 use super::notify::{Notification, ReadyListener};
-use super::protocol::{self, ControlRequest, Hello, PROTOCOL, PROTOCOL_FLOOR, Response, Role};
+use super::protocol::{self, ControlRequest, Hello, Response, Role};
 use super::{RunDir, Settings};
 use crate::file_lock::FileLock;
 
@@ -51,8 +51,10 @@ const LONGEST_RECONNECT_PAUSE: Duration = Duration::from_millis(200);
 pub struct StatusReply {
     /// The daemon's stow version.
     pub stow_version: String,
-    /// The protocol number the daemon speaks.
+    /// The newest protocol number the daemon speaks.
     pub protocol: u16,
+    /// The oldest protocol number the daemon speaks.
+    pub floor: u16,
 }
 
 /// A connection to the daemon that has not yet said hello.
@@ -62,6 +64,105 @@ pub struct Connection {
     answer: Duration,
     /// The daemon's log, which an error names with the daemon's pid.
     log: PathBuf,
+    /// The stow runtime executable the hello names.
+    exe: PathBuf,
+}
+
+/// What a daemon answered to a request that would open a session.
+#[derive(Debug, PartialEq, Eq)]
+enum Reply {
+    Status(StatusReply),
+    /// The daemon gives way to another stow and acted on nothing.
+    Retiring {
+        stow_version: String,
+        until: Duration,
+    },
+    /// The daemon speaks a protocol too old to ask to retire and refused
+    /// this stow's hello.
+    TooOld {
+        /// The protocol stamped on its refusal.
+        protocol: u16,
+        /// Why it refused.
+        reason: String,
+        /// The process that serves the connection, when the platform says.
+        pid: Option<u32>,
+    },
+}
+
+/// Waiting for the successor of a daemon that answered
+/// [`Response::Retiring`]: the pauses between replays and the bound on
+/// them.
+///
+/// The bound counts from the first answer: the time the daemon said it had
+/// left to drain, then a start and an answer. A second daemon that gives
+/// way, and is older than this stow, means the replacement did not run this
+/// stow.
+#[derive(Debug)]
+pub struct Succession {
+    /// What the successor is given after the drain ends: to start, and to
+    /// answer.
+    after_drain: Duration,
+    exe: PathBuf,
+    first: Option<(Instant, Instant)>,
+    until: Option<Duration>,
+    pause: Duration,
+}
+
+impl Succession {
+    /// A client running `exe` that waits as `settings` bound.
+    #[must_use]
+    pub fn new(settings: Settings, exe: &Path) -> Self {
+        Self {
+            after_drain: settings.start + settings.answer,
+            exe: exe.to_owned(),
+            first: None,
+            until: None,
+            pause: FIRST_RECONNECT_PAUSE,
+        }
+    }
+
+    /// Account for a daemon of stow `stow_version` that answered `now` that
+    /// it retires within `until`, and return how long to wait before
+    /// replaying the request.
+    ///
+    /// # Errors
+    ///
+    /// The bound ran out, or the replacement is still older than this stow.
+    pub fn retiring(
+        &mut self,
+        now: Instant,
+        stow_version: &str,
+        until: Duration,
+    ) -> Result<Duration> {
+        let (began, deadline) = *self
+            .first
+            .get_or_insert_with(|| (now, now + until + self.after_drain));
+        // A drain that begins later than another's ends is a daemon
+        // that took over and gave way again.
+        let renewed = self.until.is_some_and(|before| until > before);
+        self.until = Some(until);
+        let own = env!("CARGO_PKG_VERSION");
+        if renewed && super::retire::is_newer(stow_version, own).unwrap_or(false) {
+            return Err(stow_types::stow_error!(
+                "the stow daemon was replaced and still runs stow {stow_version}, older than this stow {own} ({}); the executable that starts the daemon is not this stow's{}",
+                self.exe.display(),
+                if cfg!(windows) {
+                    ": run `stow setup` from this stow to register its task"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if now >= deadline {
+            return Err(stow_types::stow_error!(
+                "the stow daemon (stow {stow_version}) did not hand over to its successor within {} s of its first answer that it is retiring",
+                (now - began).as_secs()
+            ));
+        }
+        let pause = self.pause;
+        self.pause = (pause * 2).min(LONGEST_RECONNECT_PAUSE);
+        Ok(pause.min(deadline - now))
+    }
 }
 
 impl Connection {
@@ -71,19 +172,37 @@ impl Connection {
     ///
     /// The daemon does not answer within the answer bound, answers
     /// something else, or refuses the connection.
-    pub fn status(self) -> Result<StatusReply> {
+    fn status_once(self) -> Result<Reply> {
         let answer = self.answer;
-        let log = self.log;
+        let log = &self.log;
         #[cfg(unix)]
-        let reply = exchange(self.stream);
+        let reply = exchange(&self.stream, &self.exe);
         #[cfg(windows)]
-        let reply = with_deadline(answer, move || exchange(self.stream));
-        reply.wrap_err_with(|| {
+        let reply = {
+            let stream = self
+                .stream
+                .try_clone()
+                .wrap_err("share the daemon connection with the exchange thread")?;
+            let exe = self.exe.clone();
+            with_deadline(answer, move || exchange(stream, &exe))
+        };
+        let reply = reply.wrap_err_with(|| {
             format!(
                 "the running stow daemon ({}) did not complete a status exchange within {} s",
-                describe_daemon(&log),
+                describe_daemon(log),
                 answer.as_secs()
             )
+        })?;
+        Ok(match reply {
+            // The process that refused is the one this connection reaches.
+            Reply::TooOld {
+                protocol, reason, ..
+            } => Reply::TooOld {
+                protocol,
+                reason,
+                pid: super::peer::server_pid(&self.stream).ok(),
+            },
+            reply => reply,
         })
     }
 }
@@ -103,27 +222,117 @@ pub fn describe_daemon(log: &Path) -> String {
     format!("pid {pid}, log {}", log.display())
 }
 
-fn exchange<S: Read + Write>(mut stream: S) -> Result<StatusReply> {
-    let mut request = protocol::encode(&Hello::new(Role::Control))?;
+/// Report the daemon's status, replaying the request while the daemon
+/// gives way to a successor: a daemon that answers
+/// [`Response::Retiring`] acted on nothing, so the request is made again to
+/// whichever daemon serves next.
+///
+/// # Errors
+///
+/// The daemon cannot be started or does not answer, refuses this stow, or
+/// does not hand over within the bound ([`Succession`]).
+pub fn status_of(exe: &Path, settings: Settings) -> Result<StatusReply> {
+    let mut succession = Succession::new(settings, exe);
+    let mut ended = None;
+    loop {
+        match connect_or_start(exe, settings)?.status_once()? {
+            Reply::Status(status) => return Ok(status),
+            Reply::TooOld {
+                protocol,
+                reason,
+                pid,
+            } => {
+                ended = end_too_old(ended, protocol, &reason, pid, settings)?;
+            }
+            Reply::Retiring {
+                stow_version,
+                until,
+            } => {
+                let pause = succession.retiring(Instant::now(), &stow_version, until)?;
+                std::thread::sleep(pause);
+            }
+        }
+    }
+}
+
+/// End the daemon at the other end of a connection that refused this
+/// stow's hello in a protocol too old to be asked to retire, so that the
+/// start path starts one of this stow's. A daemon that is ended once and is
+/// found again is not ended a second time: whatever starts it starts an old
+/// stow, and that is the failure.
+///
+/// `ended` is the protocol of the daemon already ended, if any; the result
+/// is what it is now.
+///
+/// # Errors
+///
+/// One was already ended, the platform does not say which process it is,
+/// or it does not exit within the start bound.
+pub fn end_too_old(
+    ended: Option<u16>,
+    protocol: u16,
+    reason: &str,
+    pid: Option<u32>,
+    settings: Settings,
+) -> Result<Option<u16>> {
+    if let Some(first) = ended {
+        return Err(stow_types::stow_error!(
+            "the stow daemon (protocol {protocol}) that started after one of protocol {first} was ended still cannot be asked to retire: {reason}; \
+             what starts the daemon runs a stow older than this one{}",
+            if cfg!(windows) {
+                " (run `stow setup` from this stow to register its task)"
+            } else {
+                ""
+            }
+        ));
+    }
+    let pid = pid.ok_or_else(|| {
+        stow_types::stow_error!(
+            "the stow daemon speaks protocol {protocol}, which cannot be asked to retire ({reason}), and the platform does not say which process it is"
+        )
+    })?;
+    tracing::warn!(
+        pid,
+        protocol,
+        %reason,
+        "the stow daemon is too old to retire; ending it so that this stow starts one"
+    );
+    super::peer::end(pid, settings.start)
+        .wrap_err_with(|| format!("end the stow daemon (pid {pid}, protocol {protocol})"))?;
+    Ok(Some(protocol))
+}
+
+fn exchange<S: Read + Write>(mut stream: S, exe: &Path) -> Result<Reply> {
+    let mut request = protocol::encode(&Hello::new(Role::Control, exe))?;
     request.extend(protocol::encode(&ControlRequest::Status)?);
     stream
         .write_all(&request)
         .and_then(|()| stream.flush())
         .wrap_err("send Hello and Status to the daemon")?;
     let frame = protocol::read_frame(&mut stream)?;
-    if !protocol::speaks(frame.protocol) {
-        return Err(stow_types::stow_error!(
-            "the daemon speaks protocol {}, this stow speaks {PROTOCOL_FLOOR} through {PROTOCOL}",
-            frame.protocol
-        ));
-    }
-    match frame.decode::<Response>()? {
+    match protocol::read_response(&frame)? {
+        Response::Rejected { reason } if !protocol::can_retire(frame.protocol) => {
+            Ok(Reply::TooOld {
+                protocol: frame.protocol,
+                reason,
+                pid: None,
+            })
+        }
         Response::Status {
             stow_version,
             protocol,
-        } => Ok(StatusReply {
+            floor,
+        } => Ok(Reply::Status(StatusReply {
             stow_version,
             protocol,
+            floor,
+        })),
+        Response::Retiring {
+            stow_version,
+            until_millis,
+        } => Ok(Reply::Retiring {
+            stow_version,
+            until: Duration::from_millis(until_millis),
         }),
         Response::Rejected { reason } => Err(stow_types::stow_error!(
             "the daemon refused the connection: {reason}"
@@ -225,6 +434,7 @@ pub fn connect_or_start(exe: &Path, settings: Settings) -> Result<Connection> {
         stream,
         answer: settings.answer,
         log: run_dir.log(),
+        exe: exe.to_owned(),
     };
     if let Attempt::Connected(stream) = try_connect(&endpoint, settings.answer)? {
         return Ok(connected(stream));
@@ -316,7 +526,7 @@ fn open_lock(path: &Path) -> Result<std::fs::File> {
 /// the scheduled task (`scheduled_task`) the path asked for: the
 /// Task Scheduler owns the process, so there is no child to watch, and a
 /// daemon that fails to come up is noticed at the start bound. The run
-/// may also not be this path's: the task ignores a request made while a
+/// may also not be this path's: the task queues a request made while a
 /// run is live, so the path never ends the run.
 #[cfg(unix)]
 struct Started(detached::Child);
@@ -372,10 +582,13 @@ impl Started {
     /// fallback: without the task registered the build fails naming `stow
     /// setup`.
     ///
-    /// The task's instance policy ignores a run requested while one is
-    /// live, and the request succeeds all the same, so a daemon already
-    /// starting (the logon trigger's, say) never hears of this client. The
-    /// wait therefore also asks the endpoint ([`Started::serving`]).
+    /// The task's instance policy queues a run requested while one is
+    /// live, and the queued run exits at once on the daemon's lock, so a
+    /// daemon already starting (the logon trigger's, say) never hears of
+    /// this client. The wait therefore also asks the endpoint
+    /// ([`Started::serving`]). A daemon that is retiring is such a run: it
+    /// has released the pipe and exits, and the queued run is its
+    /// successor.
     fn begin(_exe: &Path, run_dir: &RunDir, _listener: &ReadyListener) -> Result<Self> {
         super::scheduled_task::run(run_dir.path())
             .wrap_err("start the stow daemon through the Task Scheduler")?;
@@ -438,6 +651,7 @@ fn spawn_daemon(exe: &Path, run_dir: &RunDir, notify: &Path) -> Result<detached:
         .chain([
             super::STOW_DAEMON_LOG_BYTES_ENV,
             super::STOW_DAEMON_ANSWER_SECS_ENV,
+            super::STOW_DAEMON_DRAIN_SECS_ENV,
         ])
         .filter_map(|key| std::env::var_os(key).map(|value| (OsString::from(key), value)));
     Detached::new(exe)
@@ -451,4 +665,139 @@ fn spawn_daemon(exe: &Path, run_dir: &RunDir, notify: &Path) -> Result<detached:
         .current_dir(run_dir.path())
         .spawn()
         .wrap_err_with(|| format!("spawn the stow daemon {}", exe.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use super::{LONGEST_RECONNECT_PAUSE, Settings, Succession};
+
+    fn settings() -> Settings {
+        Settings {
+            answer: Duration::from_secs(2),
+            start: Duration::from_secs(8),
+            log_bytes: 1 << 20,
+            drain: Duration::from_secs(5),
+        }
+    }
+
+    fn succession() -> Succession {
+        Succession::new(settings(), Path::new("/stow"))
+    }
+
+    #[test]
+    fn replays_back_off_from_the_first_pause_to_the_longest() {
+        let (mut succession, now) = (succession(), Instant::now());
+        let pauses: Vec<Duration> = (0..8)
+            .map(|_| {
+                succession
+                    .retiring(now, "0.1.0", Duration::from_secs(5))
+                    .expect("within the bound")
+            })
+            .collect();
+        assert_eq!(
+            pauses,
+            [5, 10, 20, 40, 80, 160, 200, 200].map(Duration::from_millis)
+        );
+        assert_eq!(pauses[7], LONGEST_RECONNECT_PAUSE);
+    }
+
+    #[test]
+    fn the_bound_is_the_drain_then_a_start_and_an_answer_from_the_first_answer() {
+        let (mut succession, began) = (succession(), Instant::now());
+        succession
+            .retiring(began, "0.1.0", Duration::from_secs(5))
+            .expect("the first answer");
+        // 5 s of drain, 8 s to start and 2 s to answer.
+        succession
+            .retiring(
+                began + Duration::from_secs(14),
+                "0.1.0",
+                Duration::from_secs(1),
+            )
+            .expect("inside the bound");
+        let error = succession
+            .retiring(
+                began + Duration::from_secs(15),
+                "0.1.0",
+                Duration::from_secs(1),
+            )
+            .expect_err("the bound ran out");
+        assert!(error.to_string().contains("did not hand over"), "{error}");
+    }
+
+    #[test]
+    fn a_pause_never_outlasts_the_bound() {
+        let (mut succession, began) = (succession(), Instant::now());
+        succession
+            .retiring(began, "0.1.0", Duration::from_secs(5))
+            .expect("the first answer");
+        let pause = succession
+            .retiring(
+                began + Duration::from_millis(14_999),
+                "0.1.0",
+                Duration::from_secs(1),
+            )
+            .expect("inside the bound");
+        assert_eq!(pause, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn a_replacement_that_is_still_older_is_named() {
+        let (mut succession, began) = (succession(), Instant::now());
+        succession
+            .retiring(began, "0.1.0", Duration::from_secs(1))
+            .expect("the first answer");
+        let error = succession
+            .retiring(
+                began + Duration::from_secs(1),
+                "0.1.0",
+                Duration::from_secs(5),
+            )
+            .expect_err("a new drain began under an older stow");
+        let error = error.to_string();
+        assert!(
+            error.contains("0.1.0") && error.contains(env!("CARGO_PKG_VERSION")),
+            "{error}"
+        );
+        assert!(error.contains("/stow"), "{error}");
+    }
+
+    #[test]
+    fn a_daemon_too_old_to_retire_is_ended_once_and_only_by_a_known_pid() {
+        use super::end_too_old;
+
+        let error = end_too_old(None, 1, "old", None, settings())
+            .expect_err("no process to end")
+            .to_string();
+        assert!(error.contains("protocol 1"), "{error}");
+
+        let error = end_too_old(Some(1), 1, "old", Some(1), settings())
+            .expect_err("a second daemon of the same kind")
+            .to_string();
+        assert!(
+            error.contains("still cannot be asked to retire") && error.contains("older"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn only_protocols_that_read_retire_can_be_asked() {
+        use crate::daemon::protocol::{RETIRE_SINCE, can_retire};
+
+        assert!(!can_retire(RETIRE_SINCE - 1));
+        assert!(can_retire(RETIRE_SINCE) && can_retire(RETIRE_SINCE + 1));
+    }
+
+    #[test]
+    fn the_time_left_shrinking_is_the_same_daemon_draining() {
+        let (mut succession, began) = (succession(), Instant::now());
+        for left in [5, 4, 3] {
+            succession
+                .retiring(began, "0.1.0", Duration::from_secs(left))
+                .expect("one daemon draining");
+        }
+    }
 }

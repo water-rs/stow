@@ -886,11 +886,14 @@ fn spawn_stub_daemon(run_dir: &Path, describe_first: bool) -> std::sync::Arc<Stu
 fn drain_stub(run_dir: &Path, session: &str, stub: &StubDaemon) {
     let mut probe = std::os::unix::net::UnixStream::connect(run_dir.join("daemon.sock"))
         .expect("connect the drain probe");
-    let hello = stow_cli::protocol::Hello::new(stow_cli::protocol::Role::Wrapper {
-        session: stow_cli::protocol::SessionRef::Id(
-            session.parse().expect("the session id is 32 hex digits"),
-        ),
-    });
+    let hello = stow_cli::protocol::Hello::new(
+        stow_cli::protocol::Role::Wrapper {
+            session: stow_cli::protocol::SessionRef::Id(
+                session.parse().expect("the session id is 32 hex digits"),
+            ),
+        },
+        Path::new(env!("CARGO_BIN_EXE_stow-cli")),
+    );
     let request = Request::Plan(Plan::new(
         std::ffi::OsStr::new("rustc"),
         &[

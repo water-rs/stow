@@ -102,9 +102,12 @@ impl Shared {
         let mut stream = match held {
             Some(stream) => stream,
             None => match connect(self.exe.clone(), self.settings).await {
-                Ok(stream) => {
-                    WrapperStream::new(stream, SessionRef::Id(self.session), self.settings.answer)
-                }
+                Ok(stream) => WrapperStream::new(
+                    stream,
+                    SessionRef::Id(self.session),
+                    self.settings.answer,
+                    &self.exe,
+                ),
                 Err(error) => {
                     return Answer::Failed {
                         message: format!("{error:#}"),

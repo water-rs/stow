@@ -13,13 +13,14 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, WriteHalf};
 use tokio::sync::{oneshot, watch};
 
 use super::events::SpanMirror;
+use super::peer::server_pid;
 use super::protocol::{
-    ControlRequest, Event, Hello, PROTOCOL, PROTOCOL_FLOOR, Response, Role, SessionRef,
-    WrapperRequest, encode, read_frame_async, speaks,
+    ControlRequest, Event, Hello, Response, Role, SessionRef, WrapperRequest, can_retire, encode,
+    read_frame_async, read_response,
 };
 use super::relay::{RELAY_METHOD, RelayBody, RelayCall, mint_connection_id};
 use super::session::{SessionEnd, SessionFacts, SessionId};
-use super::start::{connect_or_start, describe_daemon};
+use super::start::{Succession, describe_daemon, end_too_old, status_of};
 use super::{RunDir, Settings};
 use crate::daemon::session::handler::CONNECTION_DRAIN_BUDGET;
 use crate::daemon::session::os_bytes;
@@ -168,22 +169,14 @@ pub async fn connect(exe: PathBuf, settings: Settings) -> Result<Stream> {
 }
 
 /// Reach the daemon through the start path — which verifies it answers and
-/// speaks a protocol this stow reads — and connect.
+/// admits this stow's protocol — and connect.
 ///
 /// # Errors
 ///
-/// The daemon cannot be started, does not answer, or speaks a protocol
-/// this stow does not.
+/// The daemon cannot be started, does not answer, or refuses this stow.
 pub async fn connect_starting(exe: PathBuf, settings: Settings) -> Result<Stream> {
     let run_dir = run_dir().await?;
-    let status = smol::unblock(move || connect_or_start(&exe, settings)?.status()).await?;
-    if !speaks(status.protocol) {
-        return Err(stow_types::stow_error!(
-            "the running stow daemon ({}) speaks protocol {}, this stow speaks {PROTOCOL_FLOOR} through {PROTOCOL}",
-            describe_daemon(&run_dir.log()),
-            status.protocol
-        ));
-    }
+    smol::unblock(move || status_of(&exe, settings)).await?;
     try_open(&run_dir.endpoint(), settings.answer)
         .await?
         .ok_or_else(|| {
@@ -192,6 +185,102 @@ pub async fn connect_starting(exe: PathBuf, settings: Settings) -> Result<Stream
                 run_dir.endpoint().display()
             )
         })
+}
+
+/// A daemon that gave way to the stow installed at its successor's path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restarted {
+    /// The version of the daemon that left.
+    pub left: String,
+    /// The version the daemon that took over reports.
+    pub now: String,
+}
+
+/// Replace the running daemon, if there is one, with `exe`.
+///
+/// An installer just put `exe` in place: the daemon drains and starts it in
+/// its place (on Windows its task does), and this returns once the
+/// successor answers. A daemon that is not running is not started: `None`.
+///
+/// # Errors
+///
+/// The daemon refuses to retire, does not answer, or does not hand over to
+/// a successor within the bound.
+pub async fn retire_onto(exe: &Path) -> Result<Option<Restarted>> {
+    let settings = Settings::from_env()?;
+    let run_dir = run_dir().await?;
+    let log = run_dir.log();
+    let Some(mut stream) = try_open(&run_dir.endpoint(), settings.answer).await? else {
+        return Ok(None);
+    };
+    let mut bytes = encode(&Hello::new(Role::Control, exe))?;
+    bytes.extend(encode(&ControlRequest::Retire {
+        executable: os_bytes::encode(exe.as_os_str()),
+    })?);
+    let describe = || {
+        format!(
+            "ask the stow daemon ({}) to retire onto {}",
+            describe_daemon(&log),
+            exe.display()
+        )
+    };
+    stream.write_all(&bytes).await.wrap_err_with(describe)?;
+    stream.flush().await.wrap_err_with(describe)?;
+    let frame = tokio::time::timeout(settings.answer, read_frame_async(&mut stream))
+        .await
+        .map_err(|_| stow_types::stow_error!("no answer within {} s", settings.answer.as_secs()))
+        .and_then(|read| read)
+        .wrap_err_with(describe)?
+        .ok_or_else(|| {
+            stow_types::stow_error!("the daemon closed the connection without answering")
+        })
+        .wrap_err_with(describe)?;
+    let left = match read_response(&frame)? {
+        Response::Retiring { stow_version, .. } => stow_version,
+        Response::Rejected { reason } => {
+            return Err(stow_types::stow_error!(
+                "the stow daemon ({}) refused to retire onto {}: {reason}",
+                describe_daemon(&log),
+                exe.display()
+            ));
+        }
+        other => {
+            return Err(stow_types::stow_error!(
+                "the stow daemon ({}) answered Retire with {other:?}",
+                describe_daemon(&log)
+            ));
+        }
+    };
+    // The status client replays through the daemon's drain and its
+    // successor's start.
+    let exe = exe.to_owned();
+    let status = smol::unblock(move || status_of(&exe, settings)).await?;
+    Ok(Some(Restarted {
+        left,
+        now: status.stow_version,
+    }))
+}
+
+/// What a daemon made of a wrapper's request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Exchanged {
+    /// The daemon answered.
+    Answer(Answer),
+    /// The daemon is giving way to another stow and acted on nothing.
+    Retiring {
+        /// The version of the daemon that is leaving.
+        stow_version: String,
+        /// The time it has left to drain.
+        until: Duration,
+    },
+    /// The daemon speaks a protocol too old to ask to retire and refused
+    /// the wrapper's hello.
+    TooOld {
+        /// The protocol stamped on its refusal.
+        protocol: u16,
+        /// Why it refused.
+        reason: String,
+    },
 }
 
 /// A wrapper's conversation with its session: its first request carries
@@ -250,11 +339,13 @@ impl Reach {
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
     /// A conversation over `stream` for `session`, whose daemon answers
-    /// within `answer` or says it is working.
-    pub fn new(stream: S, session: SessionRef, answer: Duration) -> Self {
+    /// within `answer` or says it is working. `executable` is the stow
+    /// runtime executable of this process, which a daemon that must give
+    /// way to it starts.
+    pub fn new(stream: S, session: SessionRef, answer: Duration, executable: &Path) -> Self {
         Self {
             stream,
-            greeting: Some(Hello::new(Role::Wrapper { session })),
+            greeting: Some(Hello::new(Role::Wrapper { session }, executable)),
             answer,
             reach: None,
         }
@@ -274,17 +365,44 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
     /// # Errors
     ///
     /// The daemon closes the connection, goes quiet for longer than the
-    /// answer bound, or refuses the request.
+    /// answer bound, refuses the request, or is giving way to another
+    /// stow: a caller that can reconnect uses [`Self::exchange_replayable`].
     pub async fn exchange(
         &mut self,
         request: &WrapperRequest,
     ) -> std::result::Result<Answer, String> {
+        match self.exchange_replayable(request).await? {
+            Exchanged::Answer(answer) => Ok(answer),
+            Exchanged::Retiring { stow_version, .. } => Err(self.explain(&format!(
+                "the stow daemon (stow {stow_version}) is giving way to another stow and did not serve the request"
+            ))),
+            Exchanged::TooOld { reason, .. } => Err(self.explain(&format!(
+                "the stow daemon refused the request: {reason}"
+            ))),
+        }
+    }
+
+    /// [`Self::exchange`], except that a daemon giving way to another stow
+    /// is reported, not failed: it acted on nothing, so the caller makes
+    /// the same request again on a new connection.
+    ///
+    /// # Errors
+    ///
+    /// The daemon closes the connection, goes quiet for longer than the
+    /// answer bound, or refuses the request.
+    pub async fn exchange_replayable(
+        &mut self,
+        request: &WrapperRequest,
+    ) -> std::result::Result<Exchanged, String> {
         self.converse(request)
             .await
-            .map_err(|failure| match &self.reach {
-                Some(reach) => reach.explain(&failure),
-                None => failure,
-            })
+            .map_err(|failure| self.explain(&failure))
+    }
+
+    fn explain(&self, failure: &str) -> String {
+        self.reach
+            .as_ref()
+            .map_or_else(|| failure.to_owned(), |reach| reach.explain(failure))
     }
 
     async fn send(&mut self, request: &WrapperRequest) -> std::result::Result<(), String> {
@@ -304,7 +422,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
             .map_err(|error| format!("send a request to the stow daemon: {error}"))
     }
 
-    async fn converse(&mut self, request: &WrapperRequest) -> std::result::Result<Answer, String> {
+    async fn converse(
+        &mut self,
+        request: &WrapperRequest,
+    ) -> std::result::Result<Exchanged, String> {
         self.send(request).await?;
         loop {
             let frame = tokio::time::timeout(self.answer, read_frame_async(&mut self.stream))
@@ -319,16 +440,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
                 .ok_or_else(|| {
                     "the stow daemon closed the connection without answering".to_owned()
                 })?;
-            if !speaks(frame.protocol) {
-                return Err(format!(
-                    "the stow daemon speaks protocol {}, this stow speaks {PROTOCOL_FLOOR} through {PROTOCOL}",
-                    frame.protocol
-                ));
-            }
-            match frame
-                .decode::<Response>()
-                .map_err(|error| error.to_string())?
-            {
+            match read_response(&frame).map_err(|error| error.to_string())? {
                 // What the daemon logged while deciding this wrapper's
                 // request, which it carries ahead of the answer.
                 Response::Event(Event::Log(record)) => record_log(&record),
@@ -339,7 +451,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
                     let environment = BuildEnvironment::current()?;
                     self.send(&WrapperRequest::Describe(environment)).await?;
                 }
-                Response::Answer(answer) => return Ok(answer),
+                Response::Answer(answer) => return Ok(Exchanged::Answer(answer)),
+                Response::Retiring {
+                    stow_version,
+                    until_millis,
+                } => {
+                    return Ok(Exchanged::Retiring {
+                        stow_version,
+                        until: Duration::from_millis(until_millis),
+                    });
+                }
+                Response::Rejected { reason } if !can_retire(frame.protocol) => {
+                    return Ok(Exchanged::TooOld {
+                        protocol: frame.protocol,
+                        reason,
+                    });
+                }
                 Response::Rejected { reason } => {
                     return Err(format!("the stow daemon refused the request: {reason}"));
                 }
@@ -394,12 +521,73 @@ pub enum Decision {
     },
 }
 
+/// A conversation with the daemon, with what it takes to start it again
+/// on a new connection: a daemon that gives way to another stow answers
+/// the first request with nothing done, and the wrapper makes it again.
+pub struct DirectConnection {
+    stream: WrapperStream<Stream>,
+    session: SessionRef,
+    exe: PathBuf,
+    settings: Settings,
+    reach: Reach,
+}
+
+impl DirectConnection {
+    async fn exchange(&mut self, request: &WrapperRequest) -> std::result::Result<Answer, String> {
+        let mut succession = Succession::new(self.settings, &self.exe);
+        let mut ended = None;
+        loop {
+            let (stow_version, until) = match self.stream.exchange_replayable(request).await? {
+                Exchanged::Answer(answer) => return Ok(answer),
+                Exchanged::Retiring {
+                    stow_version,
+                    until,
+                } => (stow_version, until),
+                Exchanged::TooOld { protocol, reason } => {
+                    // The daemon at the other end cannot retire: it is
+                    // ended, and the start path starts this stow's.
+                    let pid = server_pid(&self.stream.stream).ok();
+                    let settings = self.settings;
+                    ended =
+                        smol::unblock(move || end_too_old(ended, protocol, &reason, pid, settings))
+                            .await
+                            .map_err(|error| self.reach.explain(&format!("{error:#}")))?;
+                    self.reconnect().await?;
+                    continue;
+                }
+            };
+            let pause = succession
+                .retiring(std::time::Instant::now(), &stow_version, until)
+                .map_err(|error| self.reach.explain(&format!("{error:#}")))?;
+            tokio::time::sleep(pause).await;
+            self.reconnect().await?;
+        }
+    }
+
+    /// A new conversation with whichever daemon serves now, which says
+    /// hello again: the request that follows is the one made before,
+    /// byte for byte.
+    async fn reconnect(&mut self) -> std::result::Result<(), String> {
+        let stream = connect(self.exe.clone(), self.settings)
+            .await
+            .map_err(|error| self.reach.explain(&format!("{error:#}")))?;
+        self.stream = WrapperStream::new(
+            stream,
+            self.session.clone(),
+            self.settings.answer,
+            &self.exe,
+        )
+        .reaching(self.reach.clone());
+        Ok(())
+    }
+}
+
 /// A wrapper's connection to its build's session, kept open across the
 /// plan and the report so the compile's outcome reaches the same
 /// conversation.
 pub enum WrapperConnection {
     /// Straight to the daemon.
-    Direct(WrapperStream<Stream>),
+    Direct(Box<DirectConnection>),
     /// Through the driver's relay inside a sandbox. The client leaves its
     /// slot while a call blocks on the worker thread and is always put
     /// back, so a call never finds it gone.
@@ -458,12 +646,17 @@ impl WrapperConnection {
         let reach = Reach::locate()
             .await
             .map_err(|error| format!("{error:#} ({NO_BUILD_WITHOUT_DAEMON})"))?;
-        let stream = connect(exe, settings)
+        let stream = connect(exe.clone(), settings)
             .await
             .map_err(|error| reach.explain(&format!("{error:#}")))?;
-        Ok(Self::Direct(
-            WrapperStream::new(stream, session, settings.answer).reaching(reach),
-        ))
+        Ok(Self::Direct(Box::new(DirectConnection {
+            stream: WrapperStream::new(stream, session.clone(), settings.answer, &exe)
+                .reaching(reach.clone()),
+            session,
+            exe,
+            settings,
+            reach,
+        })))
     }
 
     /// Whether the build's C/C++ object cache is on.
@@ -555,7 +748,7 @@ impl WrapperConnection {
     /// instead of completing now.
     pub async fn close(self) -> std::result::Result<(), String> {
         match self {
-            Self::Direct(stream) => stream.close().await,
+            Self::Direct(direct) => direct.stream.close().await,
             Self::Relay { client, connection } => {
                 let Some(mut client) = client else {
                     return Ok(());
@@ -580,7 +773,7 @@ impl WrapperConnection {
         request: &WrapperRequest,
     ) -> std::result::Result<Option<Answer>, String> {
         match self {
-            Self::Direct(stream) => stream.exchange(request).await.map(Some),
+            Self::Direct(direct) => direct.exchange(request).await.map(Some),
             Self::Relay { client, connection } => {
                 let mut ipc = client
                     .take()
@@ -726,47 +919,71 @@ impl DaemonSession {
     pub async fn open(exe: PathBuf, facts: SessionFacts, settings: Settings) -> Result<Self> {
         let run_dir = run_dir().await?;
         let log = run_dir.log();
-        let mut stream = connect_starting(exe, settings).await?;
-        let mut bytes = encode(&Hello::new(Role::Control))?;
+        let mut bytes = encode(&Hello::new(Role::Control, &exe))?;
         bytes.extend(encode(&ControlRequest::OpenSession(Box::new(facts)))?);
-        let opened = async {
-            stream
-                .write_all(&bytes)
-                .await
-                .wrap_err("send the session's facts to the daemon")?;
-            stream.flush().await.wrap_err("send the session's facts")?;
-            tokio::time::timeout(settings.answer, read_frame_async(&mut stream))
-                .await
-                .map_err(|_| {
-                    stow_types::stow_error!("no answer within {} s", settings.answer.as_secs())
-                })?
-        }
-        .await
-        .wrap_err_with(|| {
-            format!(
-                "open a session on the stow daemon ({})",
-                describe_daemon(&log)
-            )
-        })?
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "the stow daemon ({}) closed the connection while opening the session",
-                describe_daemon(&log)
-            )
-        })?;
-        let id = match opened.decode::<Response>()? {
-            Response::SessionOpened { session } => session,
-            Response::Rejected { reason } => {
-                return Err(stow_types::stow_error!(
-                    "the stow daemon ({}) refused the session: {reason}",
-                    describe_daemon(&log)
-                ));
+        let mut succession = Succession::new(settings, &exe);
+        let (stream, id) = loop {
+            let mut stream = connect_starting(exe.clone(), settings).await?;
+            let opened = async {
+                stream
+                    .write_all(&bytes)
+                    .await
+                    .wrap_err("send the session's facts to the daemon")?;
+                stream.flush().await.wrap_err("send the session's facts")?;
+                tokio::time::timeout(settings.answer, read_frame_async(&mut stream))
+                    .await
+                    .map_err(|_| {
+                        stow_types::stow_error!("no answer within {} s", settings.answer.as_secs())
+                    })?
             }
-            other => {
-                return Err(stow_types::stow_error!(
-                    "the stow daemon ({}) answered OpenSession with {other:?}",
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "open a session on the stow daemon ({})",
                     describe_daemon(&log)
-                ));
+                )
+            })?
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "the stow daemon ({}) closed the connection while opening the session",
+                    describe_daemon(&log)
+                )
+            })?;
+            match read_response(&opened)? {
+                Response::SessionOpened { session } => break (stream, session),
+                // The daemon is giving way to another stow and acted on
+                // nothing: the same facts go to whichever daemon serves
+                // next.
+                Response::Retiring {
+                    stow_version,
+                    until_millis,
+                } => {
+                    let pause = succession
+                        .retiring(
+                            std::time::Instant::now(),
+                            &stow_version,
+                            Duration::from_millis(until_millis),
+                        )
+                        .wrap_err_with(|| {
+                            format!(
+                                "open a session on the stow daemon ({})",
+                                describe_daemon(&log)
+                            )
+                        })?;
+                    tokio::time::sleep(pause).await;
+                }
+                Response::Rejected { reason } => {
+                    return Err(stow_types::stow_error!(
+                        "the stow daemon ({}) refused the session: {reason}",
+                        describe_daemon(&log)
+                    ));
+                }
+                other => {
+                    return Err(stow_types::stow_error!(
+                        "the stow daemon ({}) answered OpenSession with {other:?}",
+                        describe_daemon(&log)
+                    ));
+                }
             }
         };
         let (read, writer) = tokio::io::split(stream);
@@ -890,7 +1107,7 @@ async fn read_events(
             Ok(None) => break "the daemon closed the control connection".to_owned(),
             Err(error) => break format!("the control connection failed: {error}"),
         };
-        match frame.decode::<Response>() {
+        match read_response(&frame) {
             Ok(Response::Event(Event::ResolutionDone)) => resolution_done.complete(),
             Ok(Response::Event(Event::Log(record))) => record_log(&record),
             Ok(Response::Event(Event::SpanOpened(record))) => spans.opened(&record),
@@ -985,6 +1202,7 @@ mod tests {
                 rust_log: None,
             },
             std::time::Duration::from_secs(5),
+            std::path::Path::new("/stow"),
         )
         .reaching(reach(dir.path()));
         let refusal = super::encode(&super::Response::Rejected {
@@ -1014,6 +1232,7 @@ mod tests {
                 rust_log: None,
             },
             std::time::Duration::from_secs(5),
+            std::path::Path::new("/stow"),
         );
         let daemon = async move {
             // The hello and the held request arrive together.
@@ -1046,6 +1265,54 @@ mod tests {
         };
         let (answer, ()) = tokio::join!(stream.exchange(&super::WrapperRequest::CcPolicy), daemon);
         assert_eq!(answer, Ok(super::Answer::CcMiss));
+    }
+
+    /// A daemon that gives way acted on nothing: the wrapper that can
+    /// reconnect is told so, and one that cannot fails naming the daemon.
+    #[tokio::test]
+    async fn a_daemon_that_gives_way_is_reported_to_the_caller_that_can_replay() {
+        let dir = tempfile::tempdir().expect("dir");
+        let retiring = super::encode(&super::Response::Retiring {
+            stow_version: "0.1.0".to_owned(),
+            until_millis: 2_500,
+        })
+        .expect("encode");
+        for replayable in [true, false] {
+            let (client, mut daemon_end) = tokio::io::duplex(1 << 16);
+            let mut stream = super::WrapperStream::new(
+                client,
+                super::SessionRef::Cargo {
+                    cargo: None,
+                    rust_log: None,
+                },
+                std::time::Duration::from_secs(5),
+                std::path::Path::new("/stow"),
+            )
+            .reaching(reach(dir.path()));
+            tokio::io::AsyncWriteExt::write_all(&mut daemon_end, &retiring)
+                .await
+                .expect("write");
+            if replayable {
+                assert_eq!(
+                    stream
+                        .exchange_replayable(&super::WrapperRequest::CcPolicy)
+                        .await,
+                    Ok(super::Exchanged::Retiring {
+                        stow_version: "0.1.0".to_owned(),
+                        until: std::time::Duration::from_millis(2_500),
+                    })
+                );
+            } else {
+                let error = stream
+                    .exchange(&super::WrapperRequest::CcPolicy)
+                    .await
+                    .expect_err("this caller cannot replay");
+                assert!(
+                    error.contains("giving way") && error.contains("pid 4242"),
+                    "{error}"
+                );
+            }
+        }
     }
 
     #[test]
