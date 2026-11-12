@@ -542,6 +542,10 @@ fn a_build_open_across_a_restart_fails_naming_the_daemon() {
     )
     .expect("retire the daemon");
     assert!(matches!(reply, Response::Retiring { .. }), "{reply:?}");
+    // Nothing but a client starts a successor on Windows, where the daemon
+    // exits and the task runs the next one when asked: the build's own
+    // wrapper is parked in its build script, so a client of its own asks.
+    daemon_status(&project);
     until("the successor never served", || {
         daemon.log_lines("stow daemon serving").len() == 2
     });
