@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/water-rs/stow/compare/stow-types-v0.17.0...stow-types-v0.18.0) - 2026-11-12
+
+### Fixed
+
+- *(scheduler)* refuse a task whose closure disagrees at claim instead of dispatching it ([#1482](https://github.com/water-rs/stow/pull/1482))
+
 ## [0.17.0](https://github.com/water-rs/stow/compare/stow-types-v0.16.0...stow-types-v0.17.0) - 2026-11-12
 
 ### Fixed
