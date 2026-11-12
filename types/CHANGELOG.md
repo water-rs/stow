@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/water-rs/stow/compare/stow-types-v0.16.0...stow-types-v0.17.0) - 2026-11-12
+
+### Fixed
+
+- move a node to its serving feature set only when the spliced subtree agrees ([#1471](https://github.com/water-rs/stow/pull/1471))
+
 ## [0.16.0](https://github.com/water-rs/stow/compare/stow-types-v0.15.1...stow-types-v0.16.0) - 2026-11-11
 
 ### Fixed

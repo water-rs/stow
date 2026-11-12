@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/water-rs/stow/compare/stow-cli-v0.16.0...stow-cli-v0.17.0) - 2026-11-12
+
+### Added
+
+- *(cli)* [**breaking**] replace the daemon in place when stow is upgraded ([#1479](https://github.com/water-rs/stow/pull/1479))
+- *(cli)* [**breaking**] run plain cargo builds as sessions of the daemon and remove standalone mode ([#1476](https://github.com/water-rs/stow/pull/1476))
+- *(cli)* [**breaking**] run stow build, check and test as sessions of the daemon ([#1464](https://github.com/water-rs/stow/pull/1464))
+
+### Fixed
+
+- *(cli)* treat a read racing a replace on Windows as no evidence ([#1473](https://github.com/water-rs/stow/pull/1473))
+- move a node to its serving feature set only when the spliced subtree agrees ([#1471](https://github.com/water-rs/stow/pull/1471))
+
 ## [0.16.0](https://github.com/water-rs/stow/compare/stow-cli-v0.15.1...stow-cli-v0.16.0) - 2026-11-11
 
 ### Added

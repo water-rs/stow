@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/water-rs/stow/compare/stow-oci-v0.16.0...stow-oci-v0.17.0) - 2026-11-12
+
+### Fixed
+
+- *(ci)* create a follow-up run only for a repack run ([#1475](https://github.com/water-rs/stow/pull/1475))
+
 ## [0.15.0](https://github.com/water-rs/stow/compare/stow-oci-v0.14.0...stow-oci-v0.15.0) - 2026-11-10
 
 ### Fixed
