@@ -1135,7 +1135,7 @@ impl TailReplay {
             roots: p.roots,
             nodes: p.nodes,
         };
-        let validated = ValidatedSubmission::new(&tree)?;
+        let validated = ValidatedSubmission::logged(&tree)?;
         let mut needs = PublishedNeeds::default();
         graph.merge_needs(&validated, &mut needs);
         let mut base = read_published(db, &needs).await?;
@@ -1711,6 +1711,189 @@ mod tests {
         );
         assert_eq!(outcome, super::super::graph::FinishOutcome::Applied);
         assert_eq!(restored.status().completed, 1);
+    }
+
+    /// The polyval shape of stow#1470 as a tree an older submit path
+    /// accepted — polyval over libc 0.2.191 with two feature sets on
+    /// the target side, `aes` over polyval, nodes leaf-first — and the
+    /// slice report publishing both libc sets.
+    fn disagreeing_tree() -> (SubmissionTree, SchedulerEvent) {
+        let canonical = |mut node: SubmissionNode| {
+            node.task_id =
+                stow_types::task_graph::canonical_task_id(&stow_types::task_graph::TaskIdFields {
+                    crate_name: node.crate_name.as_str(),
+                    version: &node.version.to_string(),
+                    features_json: &node.features_json.raw(),
+                    target: TARGET,
+                    rustc_version: RUSTC,
+                    dependency_identity: node.dependency_identity.as_str(),
+                    host_side: node.host_side,
+                    profile: node.profile,
+                });
+            node
+        };
+        let libc_sets: [&[&str]; 2] = [&["default", "extra_traits", "std"], &["default", "std"]];
+        let features = |set: &[&str]| {
+            FeaturesJson::from_sorted(set.iter().map(|&feature| feature.to_owned()).collect())
+                .expect("features")
+        };
+        let libc_version = CrateVersion::new(semver::Version::new(0, 2, 191));
+        let libc = |set: &[&str]| {
+            canonical(SubmissionNode {
+                version: libc_version.clone(),
+                features_json: features(set),
+                ..node("libc")
+            })
+        };
+        let polyval = canonical(SubmissionNode {
+            deps: vec![0, 1],
+            ..node("polyval")
+        });
+        let aes = canonical(SubmissionNode {
+            deps: vec![2],
+            ..node("aes")
+        });
+        let tree = SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![3],
+            nodes: vec![libc(libc_sets[0]), libc(libc_sets[1]), polyval, aes],
+        };
+        let rows = libc_sets
+            .iter()
+            .flat_map(|set| {
+                [UnitKind::Linked, UnitKind::Unlinked].map(|kind| PublishedSliceRow {
+                    crate_name: CrateName::parse("libc").expect("crate"),
+                    version: libc_version.clone(),
+                    features_json: features(set),
+                    unit_shape: UnitShape {
+                        side: UnitSide::Target,
+                        invocation: UnitInvocation::Native,
+                        kind,
+                    },
+                    dependency_identity: DependencyIdentity::from_task_ids(["libc"])
+                        .expect("dep identity"),
+                    node_profile: stow_types::node_profile::NodeProfile::Dev,
+                })
+            })
+            .collect();
+        let report = SchedulerEvent::SliceReport {
+            target: TargetTriple::parse(TARGET).expect("target"),
+            rustc_version: WireRustcVersion::parse(RUSTC).expect("rustc"),
+            base_generation: None,
+            generation: 1,
+            part: 0,
+            parts: 1,
+            added: rows,
+            retired: Vec::new(),
+        };
+        (tree, report)
+    }
+
+    /// stow#1481: a `Submit` row logged before the submit path checked
+    /// closure agreement replays as accepted; the claim pass refuses the
+    /// task whose closure holds libc 0.2.191 twice on the target side
+    /// instead of dispatching it, its dependent blocks as a failed
+    /// build's does, no attempt outcome reaches the breaker, and the
+    /// refusal replays from the log and survives the snapshot.
+    #[tokio::test]
+    async fn a_logged_disagreeing_closure_is_refused_at_claim() {
+        let (tree, report) = disagreeing_tree();
+        let (polyval_id, aes_id) = (tree.nodes[2].task_id.clone(), tree.nodes[3].task_id.clone());
+        assert!(
+            ValidatedSubmission::new(&tree).is_err(),
+            "the submit path refuses the tree today"
+        );
+        let db = store().await;
+        let mut graph = Graph::default();
+        // Both libc sets are published, so polyval is ready on arrival.
+        commit_to(&db, &mut graph, &[report], 0).await;
+        let submit: Vec<_> = submission_events(&tree).collect();
+        commit_to(&db, &mut graph, &submit, 0).await;
+        assert_eq!(graph.status().pending, 2, "polyval and aes wait");
+
+        let pass = graph
+            .claim_nodes(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim");
+        let minted = graph
+            .claimed(&pass, &mut graph.test_digest_source())
+            .expect("mint");
+        assert!(minted.claims.is_empty(), "nothing reaches CI");
+        let [refusal] = minted.refusals.as_slice() else {
+            panic!("one refusal: {:?}", minted.refusals);
+        };
+        assert_eq!(refusal.task_id, polyval_id);
+        assert_eq!(
+            refusal.error,
+            format!(
+                "dependency closure holds libc 0.2.191 with two feature sets on the target side for {TARGET}"
+            )
+        );
+        append_events(
+            &db,
+            None,
+            &[SchedulerEvent::ClosuresRefused {
+                refusals: minted.refusals.clone(),
+            }],
+            100,
+        )
+        .await
+        .expect("refusal row");
+
+        let (replayed, _) = restore(&db).await.expect("wake");
+        let covered = write_snapshot(&db, &mut graph, &GraphCell::default(), NOW_MS)
+            .await
+            .expect("snapshot");
+        assert!(covered > 0);
+        let (mut reloaded, _) = restore(&db).await.expect("wake from the snapshot");
+        // A snapshot load replays no `Submit`; the listing mints ids
+        // from the digests the live merge kept.
+        reloaded.adopt_test_store(&graph);
+        let settings = crate::freeze::FreezeSettings {
+            min_outcomes: 1,
+            ..Default::default()
+        };
+        for (label, mut state) in [
+            ("live", graph),
+            ("replayed", replayed),
+            ("reloaded", reloaded),
+        ] {
+            let status = state.status();
+            assert_eq!(
+                (status.failed, status.pending, status.blocked),
+                (1, 1, 1),
+                "{label}: polyval failed, aes blocked behind it"
+            );
+            let failed = state
+                .list(
+                    &stow_types::api::QueueSelector {
+                        status: Some(stow_types::api::QueueTaskStatus::Failed),
+                        ..Default::default()
+                    },
+                    200,
+                )
+                .expect("failed listing");
+            assert_eq!(failed.len(), 1, "{label}");
+            assert_eq!(failed[0].task_id, polyval_id, "{label}");
+            assert_eq!(failed[0].error, refusal.error, "{label}");
+            assert!(
+                state.attempt_outcomes.is_empty(),
+                "{label}: no run, no outcome"
+            );
+            assert!(
+                crate::scheduler::queue::evaluate_freeze_trip(&state, &settings, 200)
+                    .expect("evaluate")
+                    .is_none(),
+                "{label}"
+            );
+            assert!(
+                state
+                    .claim_nodes(&claim_settings(45, 16), 200, u32::MAX)
+                    .expect("claim")
+                    .is_empty(),
+                "{label}: neither task is claimable"
+            );
+            assert!(state.has_task(&aes_id));
+        }
     }
 
     #[tokio::test]
