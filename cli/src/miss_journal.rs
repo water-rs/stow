@@ -214,76 +214,6 @@ fn journal_path(target_dir: &Path, build: &str) -> PathBuf {
     target_dir.join(format!("{JOURNAL_PREFIX}{build}{JOURNAL_SUFFIX}"))
 }
 
-/// The target dir a compile's out dir sits under — cargo lays units out
-/// as `<target>/<profile>/deps`, so the journal lives two levels up.
-/// `None` for an out dir outside that layout (a bare `--out-dir`): the
-/// observation is dropped rather than written somewhere arbitrary.
-#[cfg_attr(not(test), expect(dead_code, reason = "only standalone mode calls it"))]
-fn target_dir_for(out_dir: &Path) -> Option<PathBuf> {
-    if out_dir.file_name() != Some(OsStr::new("deps")) {
-        return None;
-    }
-    out_dir.parent()?.parent().map(Path::to_path_buf)
-}
-
-/// The cargo build a standalone wrapper belongs to: the process that
-/// spawned it. While that pid lives the journal is still being written.
-#[expect(dead_code, reason = "only standalone mode calls it")]
-fn cargo_build() -> String {
-    parent_pid().to_string()
-}
-
-/// The wrapper's parent process id — the cargo that spawned it on every
-/// platform cargo runs it under, so one build journals to one file.
-#[cfg(unix)]
-#[expect(dead_code, reason = "only standalone mode calls it")]
-fn parent_pid() -> u32 {
-    u32::try_from(unsafe { libc::getppid() }).unwrap_or_else(|_| std::process::id())
-}
-
-/// Windows carries no parent-pid in `std`: read it out of the process
-/// snapshot. `None` falls back to the wrapper's own (short-lived) pid —
-/// more journals, same drain.
-#[cfg(windows)]
-#[expect(dead_code, reason = "only standalone mode calls it")]
-fn parent_pid() -> u32 {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPPROCESS,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
-            return std::process::id();
-        }
-        let mut entry: PROCESSENTRY32 = std::mem::zeroed();
-        // A zero size makes Process32First fail, which falls back to
-        // the wrapper's own pid — more journals, same drain.
-        entry.dwSize = u32::try_from(std::mem::size_of::<PROCESSENTRY32>()).unwrap_or_default();
-        let own = GetCurrentProcessId();
-        let mut found = None;
-        if Process32First(snapshot, &raw mut entry) != 0 {
-            loop {
-                if entry.th32ProcessID == own {
-                    found = Some(entry.th32ParentProcessID);
-                    break;
-                }
-                if Process32Next(snapshot, &raw mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snapshot);
-        found.unwrap_or_else(std::process::id)
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn parent_pid() -> u32 {
-    std::process::id()
-}
-
 /// The journal id for a session's build: the session writes the file
 /// complete when the build ends, so the `stow-` mark makes it drainable
 /// without a liveness check. The session's own id names it: one daemon
@@ -486,46 +416,6 @@ fn append_lines(journal: &Path, entries: &[JournalEntry]) -> std::io::Result<()>
     file.write_all(&buffer)
 }
 
-/// Record one locally compiled unit to the standalone build's journal.
-/// The wrapper's whole cost is a single append — the observation rides
-/// the identity the compile already resolved.
-#[expect(dead_code, reason = "only standalone mode calls it")]
-pub fn record_observation(
-    rustc: &OsStr,
-    parsed: &ParsedRustcArgs,
-    build: &LocalBuildArtifact,
-    build_host: &str,
-) {
-    let Some(unit) = observed_unit(parsed, build) else {
-        return;
-    };
-    let Some(out_dir) = parsed.out_dir.as_deref() else {
-        return;
-    };
-    let Some(target_dir) = target_dir_for(out_dir) else {
-        tracing::warn!(
-            out_dir = %out_dir.display(),
-            "compile's out dir is outside cargo's target layout; observation dropped"
-        );
-        return;
-    };
-    let entry = JournalEntry::Unit(UnitLine {
-        rustc: rustc.to_string_lossy().into_owned(),
-        rustc_version: build.rustc_version.clone(),
-        build_host: build_host.to_owned(),
-        consumer_spelled_target: unit.explicit_target.is_some(),
-        // The rustc wrapper has no project context — it cannot name
-        // the build's expanded graph; the build's context sidecar does
-        // (stow#588).
-        expanded_cache_key: String::new(),
-        unit,
-    });
-    let journal = journal_path(&target_dir, &cargo_build());
-    if let Err(error) = append_lines(&journal, &[entry]) {
-        tracing::warn!(error = %error, journal = %journal.display(), "could not journal the compile observation");
-    }
-}
-
 /// The probed build host recorded for a session journal: a host
 /// unit's recorded platform already is the compiling rustc's `host:`
 /// triple (cargo passes it no `--target`); a build without host units
@@ -618,17 +508,6 @@ pub fn journal_session(
     // context the drain re-derives the same graph from (stow#588).
     if let Some(manifest_dir) = consumer.manifest_dir {
         write_consumer_context(&journal, manifest_dir, consumer.key);
-    }
-}
-
-/// Kick the deferred drain for journals left by builds that already
-/// exited — the standalone path's way of admitting misses with no stow
-/// parent process. The check is one directory listing that only finds
-/// files in target dirs stow has built in.
-#[expect(dead_code, reason = "only standalone mode calls it")]
-pub fn drain_finished_builds(out_dir: &Path, env: &SessionEnv) {
-    if let Some(target_dir) = target_dir_for(out_dir) {
-        spawn_drain(&target_dir, env);
     }
 }
 
@@ -954,32 +833,10 @@ struct DrainGroupKey {
     expanded_cache_key: String,
 }
 
-/// The context sidecar one standalone `cargo build` drops next to its
-/// journal: the consumer package's manifest dir, so the drain can
-/// re-derive the build's unit graph after the build exits (stow#588).
+/// The context sidecar a session drops next to its journal: the consumer
+/// package's manifest dir, so the drain can re-derive the build's unit
+/// graph after the build exits (stow#588).
 const CONTEXT_PREFIX: &str = "stow-context.";
-
-/// Every wrapper invocation under the build's root package lands here:
-/// cargo marks it `CARGO_PRIMARY_PACKAGE`, and `CARGO_MANIFEST_DIR` then
-/// names the manifest the user is building — a path dep's or registry
-/// crate's units never qualify (stow#588).
-#[expect(dead_code, reason = "only standalone mode calls it")]
-pub fn note_consumer_context(out_dir: &Path) {
-    if std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none() {
-        return;
-    }
-    let (Some(manifest_dir), Some(target_dir)) = (
-        std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from),
-        target_dir_for(out_dir),
-    ) else {
-        return;
-    };
-    write_consumer_context(
-        &journal_path(&target_dir, &cargo_build()),
-        &manifest_dir,
-        None,
-    );
-}
 
 /// The sidecar's serialized `cache_key` inputs: the owned mirror of
 /// `KeyInputs` the drain hands back to `key_of` (stow#588).
@@ -1144,7 +1001,7 @@ enum MemoMiss {
 /// the store under the build's key. A different key means the project
 /// changed since the build: no build of the project as it now is will
 /// ever store a graph under the recorded key, so the group's units can
-/// never mint and are dropped (stow#674). A standalone build journals
+/// never mint and are dropped (stow#674). A plain cargo's build journals
 /// no key; its re-derivation is the only graph it ever had (stow#588).
 async fn rederive_memoized_graph(
     config: &StowConfig,
@@ -1489,16 +1346,6 @@ mod tests {
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
         }
-    }
-
-    #[test]
-    fn target_dir_resolves_cargo_deps_layout() {
-        assert_eq!(
-            target_dir_for(Path::new("/ws/target/debug/deps")),
-            Some(PathBuf::from("/ws/target"))
-        );
-        assert_eq!(target_dir_for(Path::new("/ws/target")), None);
-        assert_eq!(target_dir_for(Path::new("/custom/out")), None);
     }
 
     #[test]

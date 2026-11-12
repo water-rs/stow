@@ -307,7 +307,7 @@ impl<O: Origin> Session<O> {
             serve_map_ready: Arc::clone(&serve_map_ready),
             policy_ready: Arc::clone(&policy_ready),
             in_flight,
-            registry_sources: std::sync::OnceLock::from(build.registry_sources.clone()),
+            registry_sources: build.registry_sources.clone(),
         };
         let env_cache = WrapperEnvCache::for_session(config.clone(), toolchain);
         let enrichment = if seed.deferred
@@ -1061,6 +1061,33 @@ mod tests {
         assert_eq!(decide(&remote).await, driver_decision);
         driver.end().await.expect("end the driver-built session");
         remote.end().await.expect("end the received session");
+    }
+
+    /// A cargo's session has no driver to tell it the build's graph, ledger
+    /// or fallback.
+    #[tokio::test]
+    async fn an_implicit_sessions_context_carries_no_graph_ledger_or_fallback() {
+        let sessions = tempfile::tempdir().expect("sessions directory");
+        let target = tempfile::tempdir().expect("target directory");
+        let build = facts(target.path(), None).await.build;
+        let session = Session::open_cargo(
+            SessionId::mint(),
+            build,
+            &CacheDirHandles::default(),
+            sessions.path(),
+        )
+        .await
+        .expect("open the cargo's session");
+        assert!(session.ctx.unit_nodes().is_none());
+        assert!(!session.ctx.semantic_fallback_enabled());
+        assert!(
+            session
+                .ctx
+                .prefetch_candidates()
+                .expect("the facts cell is filled")
+                .is_empty()
+        );
+        session.end().await.expect("end the session");
     }
 
     /// The daemon's pid is every session's; each session writes its

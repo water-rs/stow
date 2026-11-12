@@ -1275,7 +1275,7 @@ fn wraps_stow_rustc(config: &cargo_config2::Config) -> bool {
 /// (stow#608) — and, when the configured wrapper is stow's own, the
 /// wrapper cleared: the shim passes `--print` through unchanged so the
 /// answers are identical, while evaluating through it would boot the
-/// whole standalone wrapper — its own rustc probes and state-DB open —
+/// whole wrapper — a daemon round trip and the session's rustc probes —
 /// once per `cfg()` table read. A user-configured wrapper stays: it can
 /// legitimately change rustc's answers.
 ///
@@ -2740,7 +2740,7 @@ mod tests {
     /// stow#608: the evaluation runs the build's rustc, not the rustc
     /// `cargo-config2` would resolve beside `$CARGO` — `build.rustc`
     /// pinned to it — and never through stow's own wrapper, which would
-    /// boot the standalone wrapper once per `cfg()` table read.
+    /// boot the wrapper once per `cfg()` table read.
     #[test]
     fn the_eval_config_runs_the_build_rustc_without_the_wrapper() {
         let fixture = isolated_project("[build]\nrustc-wrapper = \"stow-rustc-wrapper\"\n");

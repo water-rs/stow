@@ -457,9 +457,8 @@ fn must_build_locally(
 /// The decision one rustc invocation gets, with nothing done yet: the
 /// facade has not exited and rustc has not run.
 ///
-/// Splitting the decision from its execution is what lets the same code
-/// answer a facade over its session's socket and run standalone under a
-/// plain `cargo build`.
+/// Splitting the decision from its execution is what lets a session answer
+/// a facade over its socket while the facade runs the compiler itself.
 enum Outcome {
     /// The unit's outputs are in the target directory. The payload is
     /// the artifact-notification lines the deciding process computed —
@@ -479,9 +478,8 @@ pub struct PostCompile {
     /// `None` for an invocation stow could not parse — a probe, or a rustc
     /// command line it does not understand. There is nothing to record.
     parsed: Option<rustc_args::ParsedRustcArgs>,
-    /// The invocation's environment as the deciding process learned it —
-    /// the `Plan`/`Observed` frame's values under a session, this
-    /// process's own under a standalone one.
+    /// The invocation's environment as the session learned it: the
+    /// `Plan` frame's values.
     env: daemon::wrapper::InvocationEnv,
     /// How long the real rustc ran, set once it has: the compile time a later
     /// local hit on the stored unit reports as saved.
@@ -827,10 +825,10 @@ fn wrapped_crate_name(args: &[OsString]) -> Option<String> {
 /// The build-scoped facts a session cannot read from its own
 /// environment: every `STOW_*` variable `run_cargo` sets travels on
 /// cargo's environment to the facades, while the deciding process — the
-/// `stow` that spawned cargo — has only its own. The driver passes them
-/// in by construction; the standalone wrapper rebuilds the same view
-/// from the environment it actually inherits.
-#[derive(Debug, Default)]
+/// daemon — has only its own. A session is built from them: the driver's
+/// by construction, a plain cargo's from the environment its first
+/// wrapper sent.
+#[derive(Debug)]
 pub(crate) struct BuildContext {
     /// The build's session directory, which the local-build provenance
     /// markers live under. `None` records and refuses nothing: there is no
@@ -839,9 +837,8 @@ pub(crate) struct BuildContext {
     /// The crates the build's analysis marked as worth a public lookup.
     /// `None` is "no policy": every unit is allowed.
     pub(crate) allowed: Option<cache_policy::AllowSet>,
-    /// `STOW_PUBLIC_CACHE_TARGET`: the consumer target the driver told
-    /// its wrappers they build for — a fallback for invocations that do
-    /// not spell `--target`.
+    /// The consumer target the build is for — a fallback for invocations
+    /// that do not spell `--target`.
     pub(crate) public_cache_target: Option<String>,
     /// The public cache is off — the remote cache layer being off, or a gate
     /// the driver decided (an unsupported toolchain, a profile the cache
@@ -852,16 +849,15 @@ pub(crate) struct BuildContext {
     /// its own lookups and stores where they happen.
     pub(crate) cache: crate::config::CacheLayers,
     /// The facts the full graph analysis contributes once it lands. A
-    /// session starts the cell empty — the driver's analysis
-    /// runs while cargo builds and commits it — while the standalone
-    /// wrapper's cell is already filled from the environment that
-    /// invoked it (stow#347). Until it is set, the plan path answers as
+    /// driver's session starts the cell empty — its analysis runs while
+    /// cargo builds and commits it — and a plain cargo's is filled with
+    /// nothing (stow#347). Until it is set, the plan path answers as
     /// though the build carried no expanded graph and no prefetch
     /// ledger: semantic fallback off, no candidates.
     pub(crate) analysis: std::sync::Arc<std::sync::OnceLock<AnalysisFacts>>,
     /// The build's serve map: a registry unit it does not cover compiles
-    /// without a lookup. Absent for a build with none (the standalone
-    /// wrapper), which plans every unit through the lookup chain.
+    /// without a lookup. Absent for a build with none (a plain cargo's),
+    /// which plans every unit through the lookup chain.
     pub(crate) serve_map: crate::facade::ServeMapView,
     /// The "the serve map is final" signal a plan for an uncovered unit
     /// waits on while the map is pending — and the "the build's slice
@@ -869,55 +865,25 @@ pub(crate) struct BuildContext {
     /// slice memo's missing-slice read (stow#735) and pending-slice
     /// miss retry (stow#797) wait on: `run_cargo` shares the
     /// enrichment's with the session and completes it itself when no
-    /// fetch is in flight; the standalone wrapper's settles by
-    /// construction — a driver with no pending map answers at once
-    /// (stow#347).
+    /// fetch is in flight; a plain cargo's settles by construction — a
+    /// session with no pending map answers at once (stow#347).
     pub(crate) serve_map_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
     /// The "the cache policy's allow set is committed" signal the plan
     /// path waits on when an invocation's marker is absent
     /// (stow#788): armed pending only while a session's
     /// deferred enrichment still owes the policy directory its coarse
     /// commit, released by the commit itself or by the guard that
-    /// drops with a failed or aborted enrichment. The standalone
-    /// wrapper's settles by construction — no commit is coming.
+    /// drops with a failed or aborted enrichment. A plain cargo's settles
+    /// by construction — no commit is coming.
     pub(crate) policy_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
     /// The build's in-flight local compiles, shared with the session:
     /// a post-compile waits on the ones its `--extern` set names before
-    /// reading their `materialized_outputs` rows (stow#618). The
-    /// standalone wrapper's is empty — its invocations have no other
-    /// connections to order against.
+    /// reading their `materialized_outputs` rows (stow#618).
     pub(crate) in_flight: crate::daemon::session::handler::InFlightUnits,
-    /// How this build tells a crates.io package from another registry's —
-    /// the workspace's `Cargo.lock` for a session, the cargo
-    /// config's source table for the standalone wrapper (stow#1006).
-    /// Lazily resolved for the standalone wrapper: the cargo-config load
-    /// only runs when a registry slot is actually classified, never for
-    /// a path or git unit. A session seeds it with the
-    /// lockfile's answer.
-    pub(crate) registry_sources: std::sync::OnceLock<RegistrySources>,
-}
-
-impl BuildContext {
-    /// The source map this build classifies registry slots against: the
-    /// map the cell was seeded with — the lockfile's for a session —
-    /// else the cargo-config host rule the standalone wrapper
-    /// lives on.
-    ///
-    /// # Errors
-    ///
-    /// The cargo config the standalone rule reads does not load or names
-    /// a source chain cargo itself would reject.
-    pub(crate) async fn registry_sources(&self) -> stow_types::error::Result<&RegistrySources> {
-        if let Some(sources) = self.registry_sources.get() {
-            return Ok(sources);
-        }
-        let span = tracing::Span::current();
-        let env = session_env::SessionEnv::of_this_process()?;
-        let sources =
-            smol::unblock(move || span.in_scope(|| RegistrySources::from_cargo_config(&env)))
-                .await?;
-        Ok(self.registry_sources.get_or_init(|| sources))
-    }
+    /// How this build tells a crates.io package from another registry's
+    /// (stow#1006): every session seeds it from the build's own cargo
+    /// configuration.
+    pub(crate) registry_sources: RegistrySources,
 }
 
 /// The source map a build classifies registry slots against (stow#1006):
@@ -945,7 +911,7 @@ pub(crate) enum RegistrySources {
         /// under — the cargo-config source chain, resolved once.
         crates_io_hosts: std::collections::BTreeSet<String>,
     },
-    /// The registry index-dir hosts a standalone wrapper accepts as
+    /// The registry index-dir hosts a build with no lockfile accepts as
     /// crates.io: `index.crates.io` plus every host the
     /// `source.crates-io.replace-with` chain resolves to, matched by the
     /// URL host against the `<host>-<hash>` directory name.
@@ -1029,7 +995,7 @@ impl RegistrySources {
         })
     }
 
-    /// The index-dir hosts a standalone wrapper accepts as crates.io:
+    /// The index-dir hosts a plain cargo's session accepts as crates.io:
     /// the cargo-config source chain's answer.
     ///
     /// # Errors
@@ -1284,37 +1250,6 @@ pub(crate) struct AnalysisFacts {
 }
 
 impl BuildContext {
-    /// The standalone wrapper's view: no driver told it anything, so it
-    /// holds no graph, no prefetch ledger and no semantic fallback.
-    ///
-    /// # Errors
-    ///
-    /// The cache layers do not load.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only standalone mode calls it"))]
-    fn from_env() -> stow_types::error::Result<Self> {
-        let env = session_env::SessionEnv::of_this_process()?;
-        let cache = crate::config::load_cache_layers(&env)?;
-        Ok(Self {
-            marks_dir: None,
-            allowed: None,
-            public_cache_target: rustc_args::configured_public_cache_target(&env),
-            public_cache_disabled: !cache.reaches_network(),
-            cache,
-            analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
-                semantic_fallback_enabled: false,
-                unit_nodes: None,
-                prefetch_candidates: BTreeMap::new(),
-            })),
-            serve_map: crate::facade::ServeMapView::absent(),
-            serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
-            policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
-            // No session shares a standalone invocation's registry —
-            // the wait finds nothing and returns at once.
-            in_flight: crate::daemon::session::handler::InFlightUnits::default(),
-            registry_sources: std::sync::OnceLock::new(),
-        })
-    }
-
     /// The build's per-side unit node table, once analysis committed
     /// it.
     pub(crate) fn unit_nodes(&self) -> Option<&unit_node::UnitNodeTable> {
@@ -1419,112 +1354,9 @@ async fn delegate_to_daemon(
     Ok(status)
 }
 
-/// Decide and execute in this process: the configuration that has no
-/// session to ask.
-#[expect(dead_code, reason = "only standalone mode calls it")]
-async fn run_rustc_standalone(
-    command: &WrapperCommandArgs,
-    state_db: &StateDb,
-) -> stow_types::error::Result<std::process::ExitStatus> {
-    // Parse the argv once: the probe gate, the journal and the decision
-    // all read the one `ParsedRustcArgs` (stow#608). A non-compile
-    // invocation has nothing for the cache to decide and nothing to
-    // record — the classifier's probe set covers `-vV`, `-V`,
-    // `--version` and every `--print` query (none carry a
-    // `--crate-name`), and cargo's `___` probe crate is no real unit:
-    // run rustc and return its result rather than loading the wrapper
-    // base and opening the state DB for an answer that is never used.
-    let classified = classify_invocation(&command.wrapped_args);
-    let parsed = match classify_or_log(classified, &command.wrapped_args) {
-        Some(parsed) if is_compile_unit(&parsed) => parsed,
-        _ => {
-            return run_passthrough_status(&command.executable, &[], &command.wrapped_args).await;
-        }
-    };
-    let ctx = match BuildContext::from_env() {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            // Malformed driver wiring must not cost a compile: the same
-            // parse failure used to bypass the identity step per call.
-            tracing::warn!(error = %error, "failed to read the build context, compiling the unit as-is");
-            return run_passthrough_status(&command.executable, &[], &command.wrapped_args).await;
-        }
-    };
-    // No session owns this build's misses: the wrappers
-    // journal them, and the first invocation after the journaling cargo
-    // exits kicks the detached drain (stow#317). Checked before the
-    // decision so a fully-served build drains too. Misses exist only to
-    // reach the network, so the local-only and off modes keep none.
-    if !ctx.public_cache_disabled
-        && let Some(out_dir) = parsed.out_dir.as_deref()
-    {
-        if let Ok(env) = session_env::SessionEnv::of_this_process() {
-            miss_journal::drain_finished_builds(out_dir, &env);
-        }
-        miss_journal::note_consumer_context(out_dir);
-    }
-    // The user's own process runs the user's own rustc: the toolchain is
-    // resolved from it through the code a build's driver resolves its own
-    // with. One that cannot be resolved bypasses the cache.
-    let resolved = match session_env::SessionEnv::of_this_process() {
-        Ok(env) => toolchain::BuildToolchain::for_executable(&command.executable, &env).await,
-        Err(error) => Err(error.to_string()),
-    };
-    let toolchain = match resolved {
-        Ok(toolchain) => std::sync::Arc::new(toolchain),
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to resolve the rustc toolchain, bypassing rust cache");
-            return run_passthrough_status(&command.executable, &[], &command.wrapped_args).await;
-        }
-    };
-    let env_cache = WrapperEnvCache::standalone(state_db.clone(), toolchain);
-    match decide_rustc_invocation(
-        parsed,
-        &env_cache,
-        &ctx,
-        &daemon::wrapper::InvocationEnv::current(),
-    )
-    .await
-    {
-        Outcome::Served(notifications) => {
-            write_served_artifact_notifications(&notifications)?;
-            Ok(std::process::ExitStatus::default())
-        }
-        Outcome::Compile(mut post) => {
-            let started = std::time::Instant::now();
-            let status =
-                run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
-            post.compile_time = started.elapsed();
-            let local_base = env_cache.base().await;
-            if let Ok(Some(build)) = finish_rustc_compile(
-                &post,
-                status.success(),
-                local_base.as_deref(),
-                &env_cache,
-                &ctx,
-            )
-            .await
-                && !ctx.public_cache_disabled
-                && let (Some(parsed), Some(base)) = (post.parsed.as_ref(), local_base.as_deref())
-            {
-                miss_journal::record_observation(
-                    &command.executable,
-                    parsed,
-                    &build,
-                    base.host_target(),
-                );
-            }
-            Ok(status)
-        }
-    }
-}
-
 /// Decide one rustc invocation: serve it from the cache, or say it has to
-/// be compiled.
-///
-/// Runs in the session when there is one, and in the wrapper process
-/// itself under a plain `cargo build`. Nothing here exits the process or
-/// runs rustc.
+/// be compiled. Runs in the build's session; nothing here exits the
+/// process or runs rustc.
 async fn decide_rustc_invocation(
     mut parsed: rustc_args::ParsedRustcArgs,
     env_cache: &WrapperEnvCache,
@@ -1927,22 +1759,17 @@ impl WrapperEnvBase {
 }
 
 /// Build-scoped memo for the wrapper environment, over the build's one
-/// toolchain (stow#608). The session owns one for the whole build; a
-/// standalone invocation builds a fresh one and gets exactly the one-shot
-/// behavior it always had.
+/// toolchain (stow#608). The session owns one for the whole build.
 #[derive(Debug)]
 pub(crate) struct WrapperEnvCache {
     /// The build's rustc: the only source of toolchain facts.
     pub(crate) toolchain: std::sync::Arc<toolchain::BuildToolchain>,
-    /// The config the base carries. A build's session sets it to the
-    /// driver's resolved config — the run's cache-layer flags included
-    /// (stow#1007); a standalone invocation loads it from the user's
-    /// config file on first use. `None`: no config, and every invocation
-    /// bypasses.
-    config: std::sync::OnceLock<Option<StowConfig>>,
-    /// The base the driver prepared before cargo started — settled there,
-    /// `None` bypassing the cache for the whole build — or, for a
-    /// standalone invocation, prepared on first use.
+    /// The config the base carries: the build's resolved config, the
+    /// run's cache-layer flags included (stow#1007). `None`: no config,
+    /// and every invocation bypasses.
+    config: Option<StowConfig>,
+    /// The base prepared on first use under `config`, `None` bypassing
+    /// the cache for the whole build.
     base: tokio::sync::OnceCell<Option<std::sync::Arc<WrapperEnvBase>>>,
     /// The verified index slices this build's lookups read — the driver's
     /// fetch can still be in flight when cargo starts, so a miss waits
@@ -1956,9 +1783,6 @@ pub(crate) struct WrapperEnvCache {
     /// step by the build's own recordings — plus the open broadcast an
     /// in-flight download abandons on (stow#977).
     circuit: circuit::BuildCircuit,
-    /// The process's state-database handle, given to the config a
-    /// standalone invocation loads (stow#682).
-    state_db: StateDb,
     /// The resolved commit of each cargo git checkout a git-sourced unit
     /// named — one `gix` read per checkout per build (stow#1006).
     git_commits: std::sync::Mutex<std::collections::HashMap<PathBuf, Option<String>>>,
@@ -2046,49 +1870,20 @@ impl SliceMemo {
 }
 
 impl WrapperEnvCache {
-    /// An empty memo over the rustc this process was invoked for, which
-    /// loads its config from this process's environment on first use and
-    /// hands it `state_db`, and prepares its base then.
-    #[expect(dead_code, reason = "only standalone mode calls it")]
-    fn standalone(state_db: StateDb, toolchain: std::sync::Arc<toolchain::BuildToolchain>) -> Self {
-        Self::with_parts(
-            std::sync::OnceLock::new(),
-            tokio::sync::OnceCell::new(),
-            state_db,
-            toolchain,
-        )
-    }
-
     /// A session's memo: the build's resolved `config`, with the handles
     /// of the process running the session, and its `toolchain`. The base
     /// is prepared on first use under that config. Nothing is loaded from
-    /// the environment — the closed handle fails any such load instead of
-    /// opening a second database.
+    /// the environment.
     pub(crate) fn for_session(
         config: Option<StowConfig>,
-        toolchain: std::sync::Arc<toolchain::BuildToolchain>,
-    ) -> Self {
-        Self::with_parts(
-            std::sync::OnceLock::from(config),
-            tokio::sync::OnceCell::new(),
-            StateDb::closed(),
-            toolchain,
-        )
-    }
-
-    fn with_parts(
-        config: std::sync::OnceLock<Option<StowConfig>>,
-        base: tokio::sync::OnceCell<Option<std::sync::Arc<WrapperEnvBase>>>,
-        state_db: StateDb,
         toolchain: std::sync::Arc<toolchain::BuildToolchain>,
     ) -> Self {
         Self {
             toolchain,
             config,
-            base,
+            base: tokio::sync::OnceCell::new(),
             slices: MemoizedSliceMap::default(),
             circuit: circuit::BuildCircuit::new(),
-            state_db,
             git_commits: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -2131,22 +1926,12 @@ impl WrapperEnvCache {
         commit
     }
 
-    /// The config this cache's base carries: the build's, or this
-    /// process's own loaded once.
-    fn config(&self) -> Option<&StowConfig> {
-        self.config
-            .get_or_init(|| match StowConfig::load(self.state_db.clone()) {
-                Ok(config) => Some(config),
-                Err(error) => {
-                    tracing::warn!(error = %error, "stow config unavailable, bypassing rust cache");
-                    None
-                }
-            })
-            .as_ref()
+    /// The config this cache's base carries: the build's.
+    const fn config(&self) -> Option<&StowConfig> {
+        self.config.as_ref()
     }
 
-    /// The wrapper environment base: the driver's, settled before cargo
-    /// started, or — standalone — prepared once on first use under this
+    /// The wrapper environment base, prepared once on first use under this
     /// cache's config. A `None` means every invocation bypasses — the
     /// wrapper exists to accelerate builds, never to break them.
     pub(crate) async fn base(&self) -> Option<std::sync::Arc<WrapperEnvBase>> {
@@ -2250,9 +2035,9 @@ impl WrapperEnvCache {
 /// The wrapper environment base over `toolchain`: prepare the cache
 /// directories and take the version lease — once for the whole build, on
 /// the driver's own timeline before cargo spawns rather than inside the
-/// first facade's `compiled` (stow#608), or on a standalone wrapper's
-/// first use. `config` is the driver's (whose state-DB pool is reused, so
-/// no second `StowConfig`/pool) or the standalone process's own. Every
+/// first facade's `compiled` (stow#608), or on a plain cargo's session's
+/// first use. `config` is the build's (whose state-DB pool is reused, so
+/// no second `StowConfig`/pool). Every
 /// step can legitimately be unavailable — a cache-side failure costs the
 /// base, never the build — so `None` means "run the real rustc".
 pub(crate) async fn load_wrapper_env_base(
@@ -3228,103 +3013,6 @@ async fn run_cc_session(
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
     Ok(status)
-}
-
-/// Decide and execute in this process: the configuration that has no
-/// session to ask.
-#[expect(dead_code, reason = "only standalone mode calls it")]
-async fn run_cc_standalone(
-    compiler: &cc::ResolvedCompiler,
-    compiler_args: &[OsString],
-    state_db: &StateDb,
-) -> stow_types::error::Result<std::process::ExitStatus> {
-    let config = match StowConfig::load(state_db.clone()) {
-        Ok(config) => config,
-        Err(error) => {
-            tracing::warn!(error = %error, "stow local config unavailable, bypassing C/C++ cache");
-            return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
-        }
-    };
-    if !config.cache.uses_cc_cache() {
-        return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
-    }
-    if let Err(error) = config.ensure_dirs().await {
-        tracing::warn!(error = %error, "failed to prepare stow cache directories, bypassing C/C++ cache");
-        return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
-    }
-
-    let outcome = match cc::try_compile(&config, compiler, compiler_args).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            tracing::warn!(error = %error, "stow C/C++ cache failed, bypassing cache");
-            return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
-        }
-    };
-
-    match outcome {
-        cc::CcOutcome::Passthrough => {
-            run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await
-        }
-        cc::CcOutcome::Hit {
-            cache_key,
-            output_path,
-        } => {
-            log_nonfatal_result(
-                "failed to record C/C++ cache hit stats",
-                stats::record_hit(&config, &format!("cc:{cache_key}")).await,
-            );
-            tracing::info!(
-                cache_key = %cache_key,
-                output_path = %output_path.display(),
-                "served C/C++ compilation from local stow cache"
-            );
-            Ok(std::process::ExitStatus::default())
-        }
-        cc::CcOutcome::Miss {
-            cache_key,
-            cache_path,
-            output_path,
-        } => {
-            let compiler_status = Command::new(&compiler.program)
-                .args(compiler_args)
-                .envs(compiler.env.iter().cloned())
-                .status()
-                .await
-                .wrap_err("failed to spawn wrapped C/C++ compiler")?;
-            if !compiler_status.success() {
-                log_nonfatal_result(
-                    "failed to record C/C++ cache error stats",
-                    stats::record_error(&config, &format!("cc:{cache_key}")).await,
-                );
-                return Ok(compiler_status);
-            }
-
-            if let Err(error) = cc::store_compiled_object(&config, &cache_path, &output_path).await
-            {
-                tracing::warn!(
-                    error = %error,
-                    cache_key = %cache_key,
-                    output_path = %output_path.display(),
-                    "failed to store C/C++ compilation in local stow cache"
-                );
-                log_nonfatal_result(
-                    "failed to record C/C++ cache error stats",
-                    stats::record_error(&config, &format!("cc:{cache_key}")).await,
-                );
-                return Ok(std::process::ExitStatus::default());
-            }
-            log_nonfatal_result(
-                "failed to record C/C++ cache miss stats",
-                stats::record_miss(&config, &format!("cc:{cache_key}")).await,
-            );
-            tracing::info!(
-                cache_key = %cache_key,
-                output_path = %output_path.display(),
-                "stored C/C++ compilation in local stow cache"
-            );
-            Ok(std::process::ExitStatus::default())
-        }
-    }
 }
 
 /// Both public and local-only builds query the same manifest-scoped
@@ -4759,8 +4447,8 @@ async fn build_semantic_fetch_request(
     // The request's feature set is the unit's cargo feature set — the
     // build's own unit graph's node — never the argv `--cfg feature="…"`
     // scan, which a build script's `cargo:rustc-cfg=feature="…"` lines
-    // inflate. No table (the analysis has not landed, or a standalone
-    // wrapper with no graph) means no semantic request; a table that
+    // inflate. No table (the analysis has not landed, or a plain cargo's
+    // session with no graph) means no semantic request; a table that
     // does not hold the unit warns and compiles (stow#615).
     let Some(table) = unit_nodes else {
         return Ok(None);
@@ -5053,8 +4741,8 @@ async fn resolve_local_build_artifact(
     let version = identity.version.clone();
     // The stored row's label is the unit's cargo feature set when the
     // build's unit graph names the unit, the scan otherwise — a unit
-    // that finished before the analysis landed, or a standalone wrapper
-    // with no graph, has no other answer. Both are sound labels for a
+    // that finished before the analysis landed, or a plain cargo's
+    // session with no graph, has no other answer. Both are sound labels for a
     // local row: two units of one crate whose scans agree compiled with
     // the same feature cfgs, so a scan-labelled row still serves exact
     // lookups. The scan only costs semantic matches for a crate whose
@@ -5190,11 +4878,10 @@ async fn detect_unit_source(
 ) -> stow_types::error::Result<Result<UnitSource, UncachedReason>> {
     if let Some(slot) = stow_types::public_cache::detect_registry_package_slot(parsed)? {
         return Ok(
-            if ctx.registry_sources().await?.is_crates_io(
-                &slot.package,
-                &slot.version,
-                &slot.index_dir,
-            ) {
+            if ctx
+                .registry_sources
+                .is_crates_io(&slot.package, &slot.version, &slot.index_dir)
+            {
                 Ok(UnitSource::CratesIo {
                     package: slot.package,
                     version: slot.version,
@@ -5709,7 +5396,9 @@ mod tests {
         let sessions = tempfile::tempdir().expect("sessions directory");
         let session = crate::daemon::session::Session::from_parts_for_tests(
             crate::daemon::session::TestParts {
-                ctx: super::BuildContext::default(),
+                ctx: serve_ctx(&std::sync::Arc::new(
+                    crate::facade::ServeMapSignal::settled(),
+                )),
                 env_cache: super::WrapperEnvCache::for_session(
                     None,
                     crate::toolchain::BuildToolchain::for_tests().await,
@@ -6545,13 +6234,13 @@ mod tests {
         )
     }
 
-    /// The driver's toolchain and a standalone wrapper's, resolved from
-    /// the same rustc by the same code, carry the same facts — the
+    /// The driver's toolchain and a cargo session's, resolved from the
+    /// same rustc by the same code, carry the same facts — the
     /// machine's own host triple (never the consumer target a `--target`
     /// build compiles for) and the same release string — and the base
     /// built over the toolchain reads them from it.
     #[tokio::test]
-    async fn the_driver_and_standalone_toolchains_agree() {
+    async fn the_driver_and_cargo_session_toolchains_agree() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = env_base_test_config(&dir);
         let build_rustc =
@@ -6566,13 +6255,16 @@ mod tests {
         )
         .await
         .expect("the driver's toolchain resolves on a machine with rustc");
-        let standalone =
-            crate::toolchain::BuildToolchain::for_executable(std::ffi::OsStr::new("rustc"), &env)
-                .await
-                .expect("the standalone toolchain resolves on the same rustc");
-        assert_eq!(driver.rustc(), standalone.rustc());
-        assert_eq!(driver.host_target(), standalone.host_target());
-        assert_eq!(driver.release(), standalone.release());
+        let rustc = std::ffi::OsStr::new("rustc");
+        let vv = crate::rustc_args::rustc_vv(rustc, &env)
+            .await
+            .expect("the opener's rustc answers -vV");
+        let opener = crate::toolchain::BuildToolchain::for_opener(rustc, None, &vv, &env)
+            .await
+            .expect("the opener's toolchain resolves on the same rustc");
+        assert_eq!(driver.rustc(), opener.rustc());
+        assert_eq!(driver.host_target(), opener.host_target());
+        assert_eq!(driver.release(), opener.release());
         let driver = std::sync::Arc::new(driver);
         let base = super::load_wrapper_env_base(config, &driver)
             .await
@@ -6798,9 +6490,9 @@ mod tests {
             serve_map_ready: std::sync::Arc::clone(serve_map_ready),
             policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
             in_flight: crate::daemon::session::handler::InFlightUnits::default(),
-            registry_sources: std::sync::OnceLock::from(crate::RegistrySources::CargoConfig(
+            registry_sources: crate::RegistrySources::CargoConfig(
                 std::iter::once("index.crates.io".to_owned()).collect(),
-            )),
+            ),
         }
     }
 
@@ -7207,20 +6899,6 @@ mod tests {
         );
     }
 
-    /// A wrapper with no session has no driver to tell it the build's
-    /// graph, ledger or fallback.
-    #[test]
-    fn a_standalone_context_carries_no_graph_ledger_or_fallback() {
-        let ctx = super::BuildContext::from_env().expect("the standalone context builds");
-        assert!(ctx.unit_nodes().is_none());
-        assert!(!ctx.semantic_fallback_enabled());
-        assert!(
-            ctx.prefetch_candidates()
-                .expect("the facts cell is filled")
-                .is_empty()
-        );
-    }
-
     /// stow#618: a dependent's post-compile bookkeeping must wait for the
     /// bookkeeping of the dependencies it was built against — an
     /// `--extern` whose rows are still being written is a pending write,
@@ -7461,9 +7139,9 @@ mod tests {
                 serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
                 policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
                 in_flight: in_flight.clone(),
-                registry_sources: std::sync::OnceLock::from(crate::RegistrySources::CargoConfig(
+                registry_sources: crate::RegistrySources::CargoConfig(
                     std::iter::once("index.crates.io".to_owned()).collect(),
-                )),
+                ),
             }
         }
 

@@ -215,8 +215,7 @@ pub async fn open_facts(
         // no driver is needed for that.
         refusal_policy: RefusalPolicy::of_this_build(),
         registry_sources,
-        // Standalone wrappers added none either: the session applies the
-        // output remap itself.
+        // No driver adds any: the session applies the output remap itself.
         rustc_extra_args: Vec::new(),
     })
 }

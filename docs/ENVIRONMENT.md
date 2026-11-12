@@ -18,8 +18,8 @@ default, and the purpose.
 | `STOW_MOCK_PUBLIC_KEY_PATH` | _required when `STOW_VERIFY_MODE=mock-key`_ | PEM path the wrapper trusts when verifying mock OCI bundles. |
 | `STOW_CACHE_DIR` | `~/.stow` | Where the local artifact cache + state SQLite live. |
 | `STOW_ARTIFACT_CACHE_MAX_BYTES` | `21474836480` (20 GiB) | Soft cap on the local artifact cache before stow purges old entries. |
-| `STOW_PUBLIC_CACHE_RUSTC_VERSION` | unset | The rustc release `stow check`/`build`/`test`, `stow setup` and a wrapper with no `STOW_SESSION` use instead of probing `rustc -vV`. stow does not set it for its children: a build's session carries its toolchain. |
-| `STOW_PUBLIC_CACHE_TARGET` | unset | Same as above for the target triple. |
+| `STOW_PUBLIC_CACHE_RUSTC_VERSION` | unset | The rustc release `stow check`/`build`/`test` and `stow setup` use instead of probing `rustc -vV`. stow does not set it for its children: a build's session carries its toolchain. |
+| `STOW_PUBLIC_CACHE_TARGET` | unset | The consumer target triple a build's session uses for a unit that spells no `--target`, and that `stow check`/`build`/`test` and `stow setup` use instead of probing `rustc -vV`. For a plain `cargo build`, the session reads it from the environment cargo ran in. |
 | `STOW_TRACE_FILE` | unset | When set, stow writes a Chrome-format trace holding every span and event of stow's own crates whatever `RUST_LOG` is — that variable selects only what the terminal prints. Open in chrome://tracing or perfetto.dev. |
 | `STOW_TRACE_WRAPPED_COMPILERS` | unset | When set, the wrapper emits tracing for every wrapped `rustc` / `cc` invocation (verbose). |
 | `STOW_IDENTITY_TRACE` | unset | Directory the wrapper writes one JSON identity record per `rustc` invocation into — for a build run as a session of the daemon, into a subdirectory named by the session id (`IdentityTraceRecord`: the parsed inputs — target, rustc, emit, crate types, profile, features, dependency `c_metadata` chain — plus the computed compile key and `c_metadata`). The answer to "why did this unit miss" — diff the record for the missing unit against the index row it should have hit. Inert when unset. |

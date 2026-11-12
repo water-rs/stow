@@ -479,19 +479,6 @@ pub fn load_isolation_config(
         .unwrap_or_default())
 }
 
-/// The `[cache]` table of the global config, every layer on when the file or
-/// the table is absent.
-///
-/// # Errors
-///
-/// A config file that exists and cannot be read or parsed.
-#[cfg_attr(not(test), expect(dead_code, reason = "only standalone mode calls it"))]
-pub fn load_cache_layers(env: &SessionEnv) -> stow_types::error::Result<CacheLayers> {
-    Ok(load_user_config(env)?
-        .and_then(|config| config.cache)
-        .unwrap_or_default())
-}
-
 /// The directory the isolation audit logs are written to: the per-user data
 /// directory, apart from the artifact cache, since an audit trail is written
 /// at every cache mode.

@@ -3,8 +3,9 @@
 //! Every fact the cache path needs about rustc — where it is, which file
 //! it is, the host triple it compiles for, its release and the CPU
 //! `native` stands for — is read from the build's own rustc. The driver
-//! resolves a [`BuildToolchain`] before cargo starts; a standalone wrapper
-//! resolves one from its own rustc through the same code. A rustc spelling
+//! resolves a [`BuildToolchain`] before cargo starts; the daemon resolves
+//! one for a plain cargo from the rustc its first wrapper names, through
+//! the same code. A rustc spelling
 //! a request carries is only ever compared against it, never run.
 
 use std::ffi::{OsStr, OsString};
@@ -74,19 +75,6 @@ impl BuildToolchain {
             env,
         )
         .await
-    }
-
-    /// Resolve the toolchain of the rustc a standalone wrapper was invoked
-    /// for: the user's own process runs the user's own rustc, in the
-    /// environment `env` names — its own.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::for_build`].
-    #[cfg_attr(not(test), expect(dead_code, reason = "only standalone mode calls it"))]
-    pub async fn for_executable(executable: &OsStr, env: &SessionEnv) -> Result<Self, String> {
-        let vv = rustc_args::rustc_vv(executable, env).await?;
-        Self::for_opener(executable, None, &vv, env).await
     }
 
     /// Resolve the toolchain of the rustc a build's first wrapper was
@@ -295,14 +283,18 @@ pub struct ToolchainFacts {
 #[cfg(test)]
 impl BuildToolchain {
     /// The test environment's own `rustc`, resolved through `PATH` as a
-    /// standalone wrapper resolves its.
+    /// cargo session resolves its opener's.
     pub async fn for_tests() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::of_the_test_rustc().await)
     }
 
     async fn of_the_test_rustc() -> Self {
         let env = SessionEnv::of_this_process().expect("the test process's environment");
-        Self::for_executable(OsStr::new("rustc"), &env)
+        let rustc = OsStr::new("rustc");
+        let vv = rustc_args::rustc_vv(rustc, &env)
+            .await
+            .expect("the test environment's rustc answers -vV");
+        Self::for_opener(rustc, None, &vv, &env)
             .await
             .expect("resolve the test environment's rustc")
     }
