@@ -5714,8 +5714,8 @@ fn twin_pair_key(node: &SubmissionNode) -> TwinPairKey {
 fn disagreement_error(task_id: &str, group: &ClosureGroup) -> crate::error::Error {
     let (crate_name, version, target, host_side) = group;
     stow_error!(
-        "the closure of task {task_id} holds {crate_name} {version} with two feature sets on the {} side for {target}",
-        if *host_side { "host" } else { "target" }
+        "the closure of task {task_id} holds {}",
+        crate::feature_sets::disagreement_text(crate_name, version, target, *host_side)
     )
 }
 
@@ -6394,6 +6394,17 @@ pub struct DispatchClaim {
     pub attempt: u32,
 }
 
+/// One pending task a dispatch pass refused because its dependency
+/// closure disagrees (stow#1481).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosureRefusal {
+    /// The refused task.
+    pub task_id: String,
+    /// The failure the task settles with, naming the package its
+    /// closure holds twice.
+    pub error: String,
+}
+
 /// One dispatch response binding.
 ///
 /// The run a claim's `workflow_dispatch` returned.
@@ -6562,6 +6573,15 @@ pub enum SchedulerEvent {
     Claims {
         /// The pass's claims, in claim order.
         claims: Vec<DispatchClaim>,
+    },
+    /// One dispatch pass's refusals of pending tasks whose dependency
+    /// closure holds two feature sets of one `(crate, version, target,
+    /// side)` (stow#1481), appended with the pass's `Claims`: each task
+    /// fails without a run, naming the package, and its dependents
+    /// block as a failed build's do.
+    ClosuresRefused {
+        /// The refused tasks, in pass order.
+        refusals: Vec<ClosureRefusal>,
     },
     /// Claims known not to have created a run, returned without an attempt.
     ClaimsRefused {

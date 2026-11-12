@@ -654,6 +654,33 @@ pub struct ClaimedNode {
     attempt: u32,
 }
 
+/// What one claim pass took, before any task id is minted: the nodes it
+/// claimed and the ones it refused for a disagreeing closure
+/// (stow#1481), which settled `failed` in the pass and never reach CI.
+#[derive(Debug, Default)]
+pub struct ClaimPass {
+    claims: Vec<ClaimedNode>,
+    refusals: Vec<u32>,
+}
+
+impl ClaimPass {
+    /// Whether the pass took nothing — nothing to mint or log.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.claims.is_empty() && self.refusals.is_empty()
+    }
+}
+
+/// A claim pass with its task ids minted — the rows its log events
+/// carry.
+#[derive(Debug, Default)]
+pub struct MintedPass {
+    /// The claims, in claim order.
+    pub claims: Vec<Claimed>,
+    /// The refusals, in pass order.
+    pub refusals: Vec<stow_types::api::ClosureRefusal>,
+}
+
 /// A tree whose shape and identity keys have been checked. The borrow
 /// keeps those facts valid across the log append and subsequent merge.
 pub(super) struct ValidatedSubmission<'a> {
@@ -662,7 +689,22 @@ pub(super) struct ValidatedSubmission<'a> {
 }
 
 impl<'a> ValidatedSubmission<'a> {
+    /// A tree arriving at a submit route: its shape and identity, and a
+    /// closure that agrees (stow#1470) — a disagreeing one could only
+    /// fail on a runner.
     pub(super) fn new(tree: &'a SubmissionTree) -> Result<Self, QueueError> {
+        // The shape check first: the agreement walk needs deps in range.
+        let validated = Self::logged(tree)?;
+        tree.ensure_closure_agreement()
+            .map_err(|error| QueueError::Invariant(error.to_string()))?;
+        Ok(validated)
+    }
+
+    /// A tree the log already accepted: its shape and identity only. A
+    /// `Submit` row older than the closure-agreement check may hold a
+    /// disagreeing closure; it replays as accepted, and the claim pass
+    /// refuses the task it carries (stow#1481).
+    pub(super) fn logged(tree: &'a SubmissionTree) -> Result<Self, QueueError> {
         Ok(Self {
             tree,
             ids: Graph::validate_tree(tree)?,
@@ -1660,11 +1702,6 @@ impl Graph {
                 "submission dep index {dep} out of range ({len} nodes)"
             )));
         }
-        // A closure holding two feature sets of one package version on
-        // one side can only fail on a runner (stow#1470): refuse it here,
-        // where every submission passes once.
-        tree.ensure_closure_agreement()
-            .map_err(|error| QueueError::Invariant(error.to_string()))?;
         tree.nodes
             .iter()
             .map(|sub| {
@@ -2269,6 +2306,14 @@ impl Graph {
     /// claims in rank order — the dispatch pass writes ONE `Claims`
     /// event for this set before posting, and ONE `Bindings` row after.
     ///
+    /// A picked node whose dependency closure holds two feature sets of
+    /// one `(crate, version, target, side)` is refused instead
+    /// (stow#1481): the build's wrapper manifest declares a package
+    /// version once per side, so its run could only fail. It settles
+    /// `failed` here and takes the slot it would have claimed for this
+    /// pass, so a pass examines and mints no more nodes than its free
+    /// slots; the pass logs the refusals beside its claims.
+    ///
     /// # Errors
     /// `QueueError::Invariant` when a target has no runner family.
     pub fn claim_nodes(
@@ -2276,29 +2321,36 @@ impl Graph {
         settings: &queue::SchedulerSettings,
         now: i64,
         bound: u32,
-    ) -> Result<Vec<ClaimedNode>, QueueError> {
+    ) -> Result<ClaimPass, QueueError> {
         self.claim_scanned(settings, now, bound, &mut 0)
     }
 
     /// The state slots whose digest rows [`Self::claimed`] mints from.
-    pub fn claim_slots(&self, nodes: &[ClaimedNode]) -> Vec<u32> {
-        nodes.iter().map(|node| self.node(node.ix).state).collect()
+    pub fn claim_slots(&self, pass: &ClaimPass) -> Vec<u32> {
+        pass.claims
+            .iter()
+            .map(|node| node.ix)
+            .chain(pass.refusals.iter().copied())
+            .map(|ix| self.node(ix).state)
+            .collect()
     }
 
-    /// The claims `nodes` name, their task ids minted from `digests`.
-    /// Call it right after the claim that produced `nodes`: a node
-    /// index is stable only until the next compaction.
+    /// The claims and refusals `pass` names, their task ids minted from
+    /// `digests`. Call it right after the claim that produced `pass`: a
+    /// node index is stable only until the next compaction.
     ///
     /// # Errors
-    /// `QueueError::Invariant` when `digests` lacks a claimed node's row
-    /// or holds the row of another occupant of its state slot: a claim is
-    /// logged and posted to CI, so its id must be the node's own.
+    /// `QueueError::Invariant` when `digests` lacks a node's row or
+    /// holds the row of another occupant of its state slot: a claim is
+    /// logged and posted to CI, and a refusal is logged, so each id must
+    /// be the node's own.
     pub fn claimed(
         &self,
-        nodes: &[ClaimedNode],
+        pass: &ClaimPass,
         digests: &mut impl DigestSource,
-    ) -> Result<Vec<Claimed>, QueueError> {
-        nodes
+    ) -> Result<MintedPass, QueueError> {
+        let claims = pass
+            .claims
             .iter()
             .map(|node| {
                 Ok(Claimed {
@@ -2307,7 +2359,104 @@ impl Graph {
                     attempt: node.attempt,
                 })
             })
-            .collect()
+            .collect::<Result<_, QueueError>>()?;
+        let refusals = pass
+            .refusals
+            .iter()
+            .map(|&ix| {
+                Ok(stow_types::api::ClosureRefusal {
+                    task_id: self.mint_owned(ix, digests)?,
+                    error: self
+                        .error_of(ix)
+                        .expect("a refused node holds its refusal")
+                        .to_owned(),
+                })
+            })
+            .collect::<Result<_, QueueError>>()?;
+        Ok(MintedPass { claims, refusals })
+    }
+
+    /// The package `ix`'s dependency closure holds two feature sets of,
+    /// as the refusal names it — `None` when the closure agrees. One
+    /// walk of the closure the dispatch payload carries: the node and
+    /// every node reachable over its edges, published ones included.
+    /// Interned crate, version and feature ids compare exactly: the
+    /// interner holds one id per string, and a feature set's string is
+    /// its canonical list.
+    fn closure_disagreement(&self, ix: u32) -> Option<String> {
+        let (crate_name, version, target, host_side) =
+            stow_types::feature_sets::closure_disagreement(
+                ix as usize,
+                |at| {
+                    let node = &self.nodes[at];
+                    Some((
+                        (
+                            node.crate_name,
+                            node.version,
+                            node.target,
+                            node.flags.host(),
+                        ),
+                        node.features,
+                    ))
+                },
+                |at, stack| {
+                    let at = u32::try_from(at).expect("arena indexes fit u32");
+                    stack.extend(self.deps_of(at).map(|dep| dep as usize));
+                },
+            )?;
+        Some(format!(
+            "dependency closure holds {}",
+            stow_types::feature_sets::disagreement_text(
+                self.intern.at(crate_name),
+                self.intern.at(version),
+                &*self.targets[usize::from(target)].name,
+                host_side,
+            )
+        ))
+    }
+
+    /// Settle `ix` refused for its disagreeing closure: it leaves the
+    /// ready set and any lease, and fails as an exhausted build does.
+    /// A replayed refusal may meet the node in flight — the stale-lease
+    /// return its live pass ran first is not logged.
+    fn refuse_closure(&mut self, ix: u32, error: String, now: i64) {
+        self.remove_ready(ix);
+        self.state_mut(ix).touch(now);
+        self.edit_extra(ix, |extra| {
+            extra.claimed_at = 0;
+            extra.lease_at = 0;
+            extra.run_id = 0;
+            extra.parked = None;
+        });
+        self.settle_failed(ix, Some(error), now);
+    }
+
+    /// The replay of a `ClosuresRefused` row. As a `Claims` replay, a
+    /// refused node may be in flight behind a lease return the live
+    /// pass did not log.
+    fn apply_closure_refusals(&mut self, refusals: &[stow_types::api::ClosureRefusal], now: i64) {
+        for refusal in refusals {
+            if let Some(ix) = self.node_ix(&refusal.task_id)
+                && matches!(
+                    self.node(ix).status,
+                    Status::Pending | Status::Dispatched | Status::Running
+                )
+            {
+                self.refuse_closure(ix, refusal.error.clone(), now);
+            }
+        }
+    }
+
+    /// The terminal failure shared by an exhausted build and a refused
+    /// closure: `failed` with its error, counted in the trailing-day
+    /// tally, and every dependent waiting on it blocked.
+    fn settle_failed(&mut self, ix: u32, error: Option<String>, now: i64) {
+        self.set_status(ix, Status::Failed);
+        self.edit_extra(ix, |extra| extra.error = error.map(Into::into));
+        self.tally_outcome(now, self.node(ix).target, false);
+        for owner in self.dependents_of(ix) {
+            self.refresh_blocked(owner);
+        }
     }
 
     /// [`Self::claim_nodes`], adding the ready entries the pass examined
@@ -2318,7 +2467,7 @@ impl Graph {
         now: i64,
         bound: u32,
         scans: &mut u64,
-    ) -> Result<Vec<ClaimedNode>, QueueError> {
+    ) -> Result<ClaimPass, QueueError> {
         // Stale-lease recovery first: in-flight nodes whose claim
         // outlived the lease return to pending.
         let stale_ms = i64::from(settings.stale_dispatch_minutes) * 60_000;
@@ -2340,7 +2489,7 @@ impl Graph {
             self.refresh_ready(ix);
         }
         if self.freeze.is_some() || self.ci_not_before > now {
-            return Ok(Vec::new());
+            return Ok(ClaimPass::default());
         }
         let (total_free, macos_free) = self.free_slots(settings);
         let total_free = total_free.min(bound);
@@ -2357,9 +2506,9 @@ impl Graph {
         // pass whole, so the pass is linear in the entries it examines
         // (stow#1052).
         let mut cursors: BTreeMap<(bool, ReadyClass), Option<(i64, u32)>> = BTreeMap::new();
-        let mut claimed = Vec::new();
+        let mut pass = ClaimPass::default();
         let mut macos_taken = 0u32;
-        while claimed.len() < total_free as usize {
+        while pass.claims.len() + pass.refusals.len() < total_free as usize {
             let mut best: Option<(Candidate, bool)> = None;
             for (macos, ready) in [(false, &self.ready), (true, &self.ready_macos)] {
                 if macos && macos_taken >= macos_free {
@@ -2410,19 +2559,24 @@ impl Graph {
                     target.name
                 ))
             })?;
-            let generation = self.next_generation + 1;
-            self.mark_claimed(ix, generation, now);
-            self.settling.insert(generation);
             if family_is_macos {
                 macos_taken += 1;
             }
-            claimed.push(ClaimedNode {
+            if let Some(error) = self.closure_disagreement(ix) {
+                self.refuse_closure(ix, error, now);
+                pass.refusals.push(ix);
+                continue;
+            }
+            let generation = self.next_generation + 1;
+            self.mark_claimed(ix, generation, now);
+            self.settling.insert(generation);
+            pass.claims.push(ClaimedNode {
                 ix,
                 generation,
                 attempt: u32::from(self.attempt_of(ix)),
             });
         }
-        Ok(claimed)
+        Ok(pass)
     }
 
     /// The claim transition shared by [`Self::claim`] and the replay of
@@ -2801,13 +2955,7 @@ impl Graph {
             u32::from(extra.attempt)
         });
         if source_failure_verified || attempt > queue::MAX_BUILD_ATTEMPTS {
-            self.set_status(ix, Status::Failed);
-            self.edit_extra(ix, |extra| extra.error = error.map(Into::into));
-            self.tally_outcome(now, target, false);
-            // Dependents waiting on the failed dep become blocked.
-            for owner in self.dependents_of(ix) {
-                self.refresh_blocked(owner);
-            }
+            self.settle_failed(ix, error, now);
         } else {
             self.set_status(ix, Status::Pending);
             let backoff = i64::from(queue::dispatch_backoff_minutes(attempt)) * 60_000;
@@ -3734,6 +3882,9 @@ impl Graph {
                         self.mark_claimed(ix, claim.generation, now);
                     }
                 }
+            }
+            SchedulerEvent::ClosuresRefused { refusals } => {
+                self.apply_closure_refusals(refusals, now);
             }
             SchedulerEvent::ClaimsRefused { claims } => {
                 for claim in claims {
@@ -5023,8 +5174,9 @@ impl Graph {
         now: i64,
         bound: u32,
     ) -> Result<Vec<Claimed>, QueueError> {
-        let nodes = self.claim_nodes(settings, now, bound)?;
-        self.claimed(&nodes, &mut self.test_digest_source())
+        let pass = self.claim_nodes(settings, now, bound)?;
+        self.claimed(&pass, &mut self.test_digest_source())
+            .map(|minted| minted.claims)
     }
 
     pub(crate) fn list(
@@ -5431,6 +5583,140 @@ mod tests {
         };
         let error = Graph::default().merge(&tree, 0).expect_err("refused");
         assert!(error.to_string().contains("libc 0.2.191"), "{error}");
+    }
+
+    /// A graph where `aes` is ready and its closure holds libc 0.2.191
+    /// twice on the target side, though each submitted tree agreed:
+    /// polyval (published) carries its edge onto the `extra_traits` set
+    /// from the first tree, which `keeper` retains, and the second tree
+    /// names polyval bare beside the other set, with `aes-gcm` waiting
+    /// on `aes`.
+    fn graph_with_a_disagreeing_aes() -> Graph {
+        let libc = |features: &[&str]| {
+            let mut node = sub("libc");
+            node.version = CrateVersion::new(semver::Version::new(0, 2, 191));
+            node.features_json =
+                FeaturesJson::from_sorted(features.iter().map(|f| (*f).to_owned()).collect())
+                    .expect("features");
+            node.task_id = minted_id(&node);
+            node
+        };
+        let rows = |node: &SubmissionNode| {
+            [UnitKind::Linked, UnitKind::Unlinked].map(|kind| PublishedSliceRow {
+                crate_name: node.crate_name.clone(),
+                version: node.version.clone(),
+                features_json: node.features_json.clone(),
+                unit_shape: UnitShape {
+                    side: UnitSide::Target,
+                    invocation: UnitInvocation::Native,
+                    kind,
+                },
+                dependency_identity: node.dependency_identity.clone(),
+                node_profile: node.profile,
+            })
+        };
+        let (extra, plain) = (
+            libc(&["default", "extra_traits", "std"]),
+            libc(&["default", "std"]),
+        );
+        let mut polyval = sub("polyval");
+        let published: Vec<_> = [&extra, &plain, &polyval]
+            .into_iter()
+            .flat_map(rows)
+            .collect();
+        let mut graph = Graph::default();
+        graph.apply_slice_report(TARGET, RUSTC, None, 1, &published, &[]);
+        // The first tree commits polyval's edge onto the `extra_traits`
+        // set; `keeper` retains the published polyval.
+        polyval.deps = vec![0];
+        let mut keeper = sub("keeper");
+        keeper.deps = vec![1];
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![2],
+                    nodes: vec![extra, polyval.clone(), keeper],
+                },
+                0,
+            )
+            .expect("an agreeing tree");
+        // The second names polyval bare beside the other set.
+        polyval.deps.clear();
+        let mut aes = sub("aes");
+        aes.deps = vec![0, 1];
+        let mut gcm = sub("aes-gcm");
+        gcm.deps = vec![2];
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![3],
+                    nodes: vec![polyval, plain, aes, gcm],
+                },
+                0,
+            )
+            .expect("the tree agrees on its own edges");
+        assert!(is_ready(&graph, "aes") && is_ready(&graph, "keeper"));
+        graph
+    }
+
+    /// stow#1481: a tree that names a node the graph holds as a bare
+    /// copy agrees on its own, while the graph's closure — through the
+    /// held node's committed edges — holds libc 0.2.191 twice. The claim
+    /// refuses the task without a run, its dependent blocks as a failed
+    /// build's does, no attempt outcome reaches the breaker, and an
+    /// operator retry is refused again rather than dispatched.
+    #[test]
+    fn a_closure_that_disagrees_in_the_graph_is_refused_at_claim() {
+        let mut graph = graph_with_a_disagreeing_aes();
+        let pass = graph
+            .claim_nodes(&claim_settings(45, 16), 10_000, u32::MAX)
+            .expect("claim");
+        let minted = graph
+            .claimed(&pass, &mut graph.test_digest_source())
+            .expect("mint");
+        assert_eq!(
+            minted
+                .claims
+                .iter()
+                .map(|claim| claim.task_id.as_str())
+                .collect::<Vec<_>>(),
+            [id("keeper")],
+            "the agreeing closure dispatches"
+        );
+        let [refusal] = minted.refusals.as_slice() else {
+            panic!("one refusal: {:?}", minted.refusals);
+        };
+        assert_eq!(refusal.task_id, id("aes"));
+        assert_eq!(
+            refusal.error,
+            format!(
+                "dependency closure holds libc 0.2.191 with two feature sets on the target side for {TARGET}"
+            )
+        );
+        assert_eq!(status_of(&graph, "aes"), Some(Status::Failed));
+        assert_eq!(
+            graph.error_of(graph.node_ix(&id("aes")).expect("aes")),
+            Some(refusal.error.as_str())
+        );
+        let gcm = graph.node_ix(&id("aes-gcm")).expect("dependent");
+        assert!(graph.node(gcm).flags.blocked(), "the dependent blocks");
+        assert!(graph.attempt_outcomes.is_empty(), "no run, no outcome");
+        assert_eq!(ready_count(&graph), 0);
+
+        // A retry returns it to pending; the next pass refuses it again.
+        assert_eq!(
+            graph.mutate(stow_types::api::MutationKind::Retry, &[id("aes")], 20_000),
+            1
+        );
+        let again = graph
+            .claim_nodes(&claim_settings(45, 16), 30_000, u32::MAX)
+            .expect("claim");
+        assert!(again.claims.is_empty());
+        assert_eq!(again.refusals.len(), 1);
+        assert_eq!(status_of(&graph, "aes"), Some(Status::Failed));
+        assert!(graph.attempt_outcomes.is_empty());
     }
 
     /// A → B → C chain (a depends on b, b on c), nodes in leaf order.
@@ -6833,7 +7119,8 @@ mod tests {
             .expect("claim");
         let claimed = graph
             .claimed(&claimed, &mut graph.test_digest_source())
-            .expect("mint");
+            .expect("mint")
+            .claims;
         assert_eq!(claimed.len(), 45);
         assert!(
             claimed
@@ -6876,7 +7163,8 @@ mod tests {
             .expect("claim");
         let claimed = graph
             .claimed(&claimed, &mut graph.test_digest_source())
-            .expect("mint");
+            .expect("mint")
+            .claims;
         let darwin = |claim: &Claimed| macos_ids.contains(&claim.task_id);
         assert_eq!(claimed.iter().filter(|claim| darwin(claim)).count(), 2);
         assert_eq!(claimed.len(), 5, "the Linux nodes fill the rest");
@@ -6897,7 +7185,7 @@ mod tests {
         let nodes = graph
             .claim_nodes(&claim_settings(45, 0), 10_000, u32::MAX)
             .expect("claim");
-        let [claim] = nodes.as_slice() else {
+        let [claim] = nodes.claims.as_slice() else {
             panic!("one node claims");
         };
         let slot = graph.node(claim.ix).state;
@@ -6920,7 +7208,11 @@ mod tests {
         let mut digests = Digests::default();
         digests.insert(slot, own);
         assert_eq!(
-            graph.claimed(&nodes, &mut digests).expect("own row").len(),
+            graph
+                .claimed(&nodes, &mut digests)
+                .expect("own row")
+                .claims
+                .len(),
             1
         );
     }
@@ -6952,7 +7244,7 @@ mod tests {
         let claimed = graph
             .claim_scanned(&claim_settings(30, 16), 10_000, u32::MAX, &mut scans)
             .expect("claim");
-        assert_eq!(claimed.len(), 30);
+        assert_eq!(claimed.claims.len(), 30);
         assert!(scans <= 500 + 30 + 30, "scans {scans}");
     }
 
