@@ -27,9 +27,11 @@ use std::net::{TcpListener as Listener, TcpStream as Stream};
 
 use super::RunDir;
 
-/// How often a waiting client looks at its child between notifications. A
-/// daemon that died before notifying is noticed within this, rather than
-/// at the start bound; the notification itself is delivered at once.
+/// How often a waiting client looks at its child, and asks whether a daemon
+/// already answers, between notifications. A daemon that died before
+/// notifying, or one that came up without notifying, is noticed within
+/// this, rather than at the start bound; the notification itself is
+/// delivered at once.
 const CHILD_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The longest line a notification may be: far above `lock-held\n`.
@@ -132,16 +134,23 @@ impl ReadyListener {
     }
 
     /// Wait up to `bound` for the daemon's notification, calling `alive`
-    /// between short intervals so a daemon that died first ends the wait.
+    /// and `serving` between short intervals so a daemon that died first
+    /// ends the wait.
+    ///
+    /// `serving` says whether a daemon already answers at its endpoint,
+    /// which ends the wait as [`Notification::Ready`]: a daemon that began
+    /// starting before this client published its address never notifies
+    /// it, and the start the client asked for is then ignored.
     ///
     /// # Errors
     ///
-    /// `alive` failed, the bound passed, or the notification was
-    /// malformed.
+    /// `alive` or `serving` failed, the bound passed, or the notification
+    /// was malformed.
     pub fn wait(
         self,
         bound: Duration,
         mut alive: impl FnMut() -> Result<()>,
+        mut serving: impl FnMut() -> Result<bool>,
     ) -> Result<Notification> {
         let Self {
             listener,
@@ -165,6 +174,16 @@ impl ReadyListener {
             match receiver.recv_timeout(CHILD_CHECK_INTERVAL) {
                 Ok(delivered) => break delivered,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // A daemon that notifies and then answers is seen at
+                    // its notification first: look for it before probing.
+                    if let Ok(delivered) = receiver.try_recv() {
+                        break delivered;
+                    }
+                    match serving() {
+                        Ok(true) => break Ok(Notification::Ready),
+                        Ok(false) => {}
+                        Err(error) => break Err(error),
+                    }
                     if let Err(error) = alive() {
                         // A daemon that notifies and exits at once — one
                         // that found the lock held — can be seen dead
@@ -261,7 +280,7 @@ mod tests {
             let endpoint = listener.endpoint().to_owned();
             let sender = std::thread::spawn(move || send(&endpoint, notification));
             let received = listener
-                .wait(Duration::from_secs(5), || Ok(()))
+                .wait(Duration::from_secs(5), || Ok(()), || Ok(false))
                 .expect("notification");
             sender.join().expect("join").expect("send");
             assert_eq!(received, notification);
@@ -274,10 +293,69 @@ mod tests {
         let run_dir = RunDir::prepare(dir.path().join("run")).expect("run dir");
         let listener = ReadyListener::bind(&run_dir).expect("bind");
         let error = listener
-            .wait(Duration::from_secs(60), || {
-                Err(stow_types::stow_error!("the daemon exited"))
-            })
+            .wait(
+                Duration::from_secs(60),
+                || Err(stow_types::stow_error!("the daemon exited")),
+                || Ok(false),
+            )
             .expect_err("the child is gone");
         assert!(error.to_string().contains("exited"), "{error}");
+    }
+
+    /// A daemon that began starting before the client published its address
+    /// never notifies it: the client still learns it is serving, long
+    /// before the bound.
+    #[test]
+    fn a_daemon_that_answers_without_notifying_ends_the_wait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = RunDir::prepare(dir.path().join("run")).expect("run dir");
+        let listener = ReadyListener::bind(&run_dir).expect("bind");
+        let started = std::time::Instant::now();
+        let mut probes = 0_u32;
+        let received = listener
+            .wait(
+                Duration::from_secs(60),
+                || Ok(()),
+                || {
+                    probes += 1;
+                    Ok(probes >= 3)
+                },
+            )
+            .expect("the daemon answers");
+        assert_eq!(received, Notification::Ready);
+        assert_eq!(probes, 3);
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    /// A probe that fails ends the wait with its error instead of waiting
+    /// out the bound.
+    #[test]
+    fn a_failing_probe_ends_the_wait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = RunDir::prepare(dir.path().join("run")).expect("run dir");
+        let listener = ReadyListener::bind(&run_dir).expect("bind");
+        let error = listener
+            .wait(
+                Duration::from_secs(60),
+                || Ok(()),
+                || Err(stow_types::stow_error!("the endpoint is unusable")),
+            )
+            .expect_err("the probe failed");
+        assert!(error.to_string().contains("unusable"), "{error}");
+    }
+
+    /// A notification already delivered wins over a probe that would also
+    /// say ready: the daemon's own word is what the client acts on.
+    #[test]
+    fn a_delivered_notification_is_taken_before_the_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = RunDir::prepare(dir.path().join("run")).expect("run dir");
+        let listener = ReadyListener::bind(&run_dir).expect("bind");
+        let endpoint = listener.endpoint().to_owned();
+        send(&endpoint, Notification::LockHeld).expect("send");
+        let received = listener
+            .wait(Duration::from_secs(5), || Ok(()), || Ok(true))
+            .expect("notification");
+        assert_eq!(received, Notification::LockHeld);
     }
 }

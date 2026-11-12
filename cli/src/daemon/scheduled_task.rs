@@ -171,6 +171,9 @@ pub fn register(run_dir: &Path, runtime_executable: &Path) -> Result<String> {
 ///
 /// No task is registered for `run_dir`, which `stow setup` does, or the
 /// scheduler refuses to run it.
+///
+/// The task ignores a request made while an instance runs, and the request
+/// still succeeds: a caller that needs the daemon asks its endpoint too.
 pub fn run(run_dir: &Path) -> Result<()> {
     let name = task_name(run_dir);
     let output = schtasks(&named("/Run", &name))?;
@@ -187,16 +190,6 @@ pub fn run(run_dir: &Path) -> Result<()> {
         "the Task Scheduler would not run the stow daemon's task {name}: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     ))
-}
-
-/// End the running instance of the task that starts the daemon serving
-/// `run_dir`.
-///
-/// # Errors
-///
-/// `schtasks` fails.
-pub fn end(run_dir: &Path) -> Result<()> {
-    checked(&named("/End", &task_name(run_dir)))
 }
 
 /// Remove the task that starts the daemon serving `run_dir`; a running

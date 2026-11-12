@@ -240,7 +240,11 @@ pub fn connect_or_start(exe: &Path, settings: Settings) -> Result<Connection> {
     let listener = ReadyListener::bind(&run_dir)?;
     let mut child = Started::begin(exe, &run_dir, &listener)?;
     let log = run_dir.log();
-    let notification = listener.wait(settings.start, || child.check(&log));
+    let notification = listener.wait(
+        settings.start,
+        || child.check(&log),
+        || Started::serving(&endpoint, settings.answer),
+    );
     let notification = match notification {
         Ok(notification) => notification,
         Err(error) => {
@@ -311,7 +315,9 @@ fn open_lock(path: &Path) -> Result<std::fs::File> {
 /// On Unix it is the child the path spawned. On Windows it is the run of
 /// the scheduled task (`scheduled_task`) the path asked for: the
 /// Task Scheduler owns the process, so there is no child to watch, and a
-/// daemon that fails to come up is noticed at the start bound.
+/// daemon that fails to come up is noticed at the start bound. The run
+/// may also not be this path's: the task ignores a request made while a
+/// run is live, so the path never ends the run.
 #[cfg(unix)]
 struct Started(detached::Child);
 
@@ -333,6 +339,16 @@ impl Started {
         })
     }
 
+    /// Whether a daemon already answers: never asked on Unix, where the
+    /// daemon this path spawned is the one that notifies it.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the one interface of the start path on both platforms"
+    )]
+    const fn serving(_endpoint: &Path, _answer: Duration) -> Result<bool> {
+        Ok(false)
+    }
+
     /// End a daemon that never reported ready.
     fn abandon(mut self) {
         let _ = self.0.kill();
@@ -346,9 +362,7 @@ impl Started {
 }
 
 #[cfg(windows)]
-struct Started {
-    run_dir: std::path::PathBuf,
-}
+struct Started;
 
 #[cfg(windows)]
 impl Started {
@@ -357,12 +371,15 @@ impl Started {
     /// directory ([`ReadyListener::bind`] published it). There is no
     /// fallback: without the task registered the build fails naming `stow
     /// setup`.
+    ///
+    /// The task's instance policy ignores a run requested while one is
+    /// live, and the request succeeds all the same, so a daemon already
+    /// starting (the logon trigger's, say) never hears of this client. The
+    /// wait therefore also asks the endpoint ([`Started::serving`]).
     fn begin(_exe: &Path, run_dir: &RunDir, _listener: &ReadyListener) -> Result<Self> {
         super::scheduled_task::run(run_dir.path())
             .wrap_err("start the stow daemon through the Task Scheduler")?;
-        Ok(Self {
-            run_dir: run_dir.path().to_owned(),
-        })
+        Ok(Self)
     }
 
     /// The scheduler's process is not this path's to watch.
@@ -375,10 +392,26 @@ impl Started {
         Ok(())
     }
 
-    /// Stop the task's run: the daemon did not report ready.
-    fn abandon(self) {
-        let _ = super::scheduled_task::end(&self.run_dir);
+    /// Whether a daemon answers at `endpoint`: it has bound its pipe,
+    /// whichever start brought it up and whether or not it knew this
+    /// client was waiting.
+    fn serving(endpoint: &Path, answer: Duration) -> Result<bool> {
+        Ok(matches!(
+            try_connect(endpoint, answer)?,
+            Attempt::Connected(_)
+        ))
     }
+
+    /// The daemon did not report ready within the bound. The run is left
+    /// alone: the task is shared by every client and the logon trigger, so
+    /// a run this path cannot tell from another's may be a daemon another
+    /// client is waiting for, and a daemon that cannot come up exits and
+    /// releases the task by itself. The failure names the daemon's log.
+    #[allow(
+        clippy::unused_self,
+        reason = "the one interface of the start path on both platforms"
+    )]
+    fn abandon(self) {}
 
     /// Nothing of the scheduler's process to collect.
     #[allow(

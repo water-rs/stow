@@ -76,7 +76,11 @@ in the message. A sandbox must let the process running cargo connect to
 the scheduled task `stow setup` registers: `the stow daemon is not running
 and its scheduled task stow-daemon-... is not registered` means setup has not
 run for this user (or for this `STOW_DAEMON_DIR`), so run `stow setup`.
-`schtasks /Query /TN stow-daemon-...` shows whether the task exists.
+`schtasks /Query /TN stow-daemon-...` shows whether the task exists. A
+client that finds no daemon within `STOW_DAEMON_START_SECS` fails naming the
+daemon's log and leaves the task's run alone, since the run may be another
+client's; a run that hangs without serving is ended with `schtasks /End /TN
+stow-daemon-...`.
 `the stow daemon restarted during this
 cargo build` means the daemon was replaced while the build ran, which loses
 the build's in-flight state: run the build again.
