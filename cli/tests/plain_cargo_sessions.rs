@@ -299,6 +299,149 @@ fn a_wrapper_with_no_cargo_variable_is_owned_by_its_parent() {
     );
 }
 
+/// The layouts cargo writes its build directory in, as the cargo running
+/// the test is told to: cargo 1.100's build-unit layout is its default and
+/// `-Zbuild-dir-new-layout` on an older cargo (`RUSTC_BOOTSTRAP` lets a
+/// stable one take the flag; 1.100 only warns it is stable), and the
+/// shared layout is every older cargo's default and what 1.100's
+/// `__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT` selects.
+#[derive(Debug, Clone, Copy)]
+enum CargoLayout {
+    Shared,
+    BuildUnit,
+}
+
+impl CargoLayout {
+    fn select(self, command: &mut Command) {
+        match self {
+            Self::Shared => {
+                command.env("__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT", "1");
+            }
+            Self::BuildUnit => {
+                command
+                    .env("RUSTC_BOOTSTRAP", "1")
+                    .env_remove("__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT")
+                    .arg("-Zbuild-dir-new-layout");
+            }
+        }
+    }
+
+    /// Whether the rlib of the package `package` lies where this layout
+    /// puts it under `profile`.
+    fn holds_rlib(self, profile: &Path, package: &str) -> bool {
+        let rlib = |dir: &Path| {
+            std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&format!("lib{package}-"))
+                        && entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "rlib")
+                })
+        };
+        match self {
+            Self::Shared => rlib(&profile.join("deps")),
+            Self::BuildUnit => {
+                !profile.join("deps").exists()
+                    && std::fs::read_dir(profile.join("build").join(package))
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .any(|unit| rlib(&unit.path().join("out")))
+            }
+        }
+    }
+}
+
+/// A plain `cargo build` of a crate whose dependency has a build script
+/// succeeds through the wrappers in either of cargo's build-directory
+/// layouts: the daemon opens the session from the first unit's out-dir,
+/// and reads the build script's output where that layout keeps it.
+#[test]
+fn a_plain_build_with_a_build_script_succeeds_in_either_cargo_layout() {
+    for layout in [CargoLayout::Shared, CargoLayout::BuildUnit] {
+        let dir = support::tempdir().expect("temp dir");
+        let cache = support::tempdir().expect("cache dir");
+        let cargo_home = support::tempdir().expect("cargo home");
+        let tools = support::tempdir().expect("tools dir");
+        write_named_crate(dir.path(), "plain");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"plain\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\ngenerated = { path = \"generated\" }\n",
+        )
+        .expect("manifest");
+        std::fs::write(
+            dir.path().join("src").join("lib.rs"),
+            "pub fn one() -> u8 { generated::one() }\n",
+        )
+        .expect("lib");
+        let generated = dir.path().join("generated");
+        write_named_crate(&generated, "generated");
+        std::fs::write(
+            generated.join("build.rs"),
+            r#"fn main() {
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    std::fs::write(out.join("one.rs"), "pub fn one() -> u8 { 1 }\n").expect("write one.rs");
+    println!("cargo:rustc-cfg=generated");
+}
+"#,
+        )
+        .expect("build script");
+        std::fs::write(
+            generated.join("src").join("lib.rs"),
+            "#[cfg(generated)]\ninclude!(concat!(env!(\"OUT_DIR\"), \"/one.rs\"));\n",
+        )
+        .expect("generated lib");
+        let home = dir.path().join("stow-home");
+        support::write_global_config(&[&home], "[cache]\nremote = false\n");
+        let shim = install_shims(tools.path());
+        let daemon = PrivateDaemon::in_home(&home);
+        let target = dir.path().join("target");
+
+        let mut command = cargo_build_command(
+            dir.path(),
+            cargo_home.path(),
+            Some(&shim),
+            cache.path(),
+            &target,
+        );
+        layout.select(&mut command);
+        let output = support::output_after_session(&mut command, &home);
+        assert!(
+            output.status.success(),
+            "{layout:?}: cargo build failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let profile = target.join("debug");
+        for package in ["plain", "generated"] {
+            assert!(
+                layout.holds_rlib(&profile, package),
+                "{layout:?}: no {package} rlib where the layout puts it: {:?}",
+                files_under(&profile)
+            );
+        }
+        assert_eq!(
+            daemon.log_lines("opened a session for a cargo").len(),
+            1,
+            "{layout:?}: the build's first unit opened no session"
+        );
+        for refusal in ["not an output directory", "unreadable or missing"] {
+            assert!(
+                daemon.log_lines(refusal).is_empty(),
+                "{layout:?}: the daemon logged {refusal:?}:\n{}",
+                daemon.log_lines("").join("\n")
+            );
+        }
+    }
+}
+
 /// A build script's C compiler reaches the daemon before any rustc unit of
 /// the build when the build's rustc is not wrapped: the daemon opens the
 /// session from the build script's environment, stores the object, and the
@@ -893,13 +1036,12 @@ fn a_wrapper_that_cannot_reach_the_daemon_fails_naming_it_and_touches_no_cache()
         stderr.contains("stow daemon") && stderr.contains(&run_dir.display().to_string()),
         "the failure does not name the daemon and its run directory:\n{stderr}"
     );
+    // Wherever cargo's layout puts a unit's outputs — `deps` in the shared
+    // layout, `build/<pkg>/<hash>/out` in the build-unit one.
+    let profile = dir.path().join("target").join("debug");
     assert!(
-        !dir.path()
-            .join("target")
-            .join("debug")
-            .join("deps")
-            .exists()
-            || files_under(&dir.path().join("target").join("debug").join("deps"))
+        !profile.exists()
+            || files_under(&profile)
                 .iter()
                 .all(|file| file.extension().is_none_or(|extension| extension != "rlib")),
         "a unit was compiled without the daemon"

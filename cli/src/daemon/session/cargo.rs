@@ -12,6 +12,8 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use stow_types::cargo_layout::UnitDir;
+
 use super::facts::BuildFacts;
 use super::invocation::{OutputRoots, RefusalPolicy};
 use super::{Origin, SessionId};
@@ -319,8 +321,7 @@ async fn toolchain_key(rustc: &OsStr, env: &SessionEnv) -> Option<ToolchainKey> 
 
 /// The directories the build's compiler outputs live under, from the
 /// output directory of the unit that opened the session, by cargo's
-/// layout: `<target>[/<triple>]/<profile>/` holds `deps`, `examples` and
-/// `build/<package>-<hash>[/out]`.
+/// layout: every unit directory lies under `<target>[/<triple>]/<profile>`.
 fn output_roots(opener: &Opener, env: &SessionEnv) -> Result<OutputRoots, String> {
     let (out_dir, target) = match opener {
         Opener::Rustc { args, .. } => (
@@ -338,36 +339,26 @@ fn output_roots(opener: &Opener, env: &SessionEnv) -> Result<OutputRoots, String
         ),
     };
     let out_dir = env.cwd().join(out_dir);
-    let root = target_directory(&out_dir, target.as_deref()).ok_or_else(|| {
-        format!(
-            "{} is not an output directory of cargo's layout (<target>/<profile>/deps or build/<package>)",
-            out_dir.display()
-        )
-    })?;
+    let root = target_directory(&out_dir, target.as_deref())?;
     Ok(OutputRoots::new(root, None))
 }
 
 /// The target directory an output directory of cargo's layout lies in.
-fn target_directory(out_dir: &Path, target: Option<&str>) -> Option<PathBuf> {
-    let name = out_dir.file_name()?;
-    let parent = out_dir.parent()?;
-    let profile = if name == "deps" || name == "examples" {
-        parent
-    } else if parent.file_name()? == "build" {
-        parent.parent()?
-    } else if name == "out" && parent.parent()?.file_name()? == "build" {
-        parent.parent()?.parent()?
-    } else {
-        return None;
-    };
-    let root = profile.parent()?;
+///
+/// # Errors
+///
+/// `out_dir` is not a unit directory of either of cargo's layouts.
+fn target_directory(out_dir: &Path, target: Option<&str>) -> Result<PathBuf, String> {
+    let unit = UnitDir::new(out_dir).map_err(|error| error.to_string())?;
+    let mut root = unit.profile_dir().parent();
     // A unit built `--target <triple>` lives one level further down.
-    match target {
-        Some(triple) if root.file_name() == Some(OsStr::new(triple)) => {
-            root.parent().map(Path::to_path_buf)
-        }
-        _ => Some(root.to_path_buf()),
+    if let Some(triple) = target
+        && root.is_some_and(|root| root.file_name() == Some(OsStr::new(triple)))
+    {
+        root = root.and_then(Path::parent);
     }
+    root.map(Path::to_path_buf)
+        .ok_or_else(|| format!("{} lies in no target directory", out_dir.display()))
 }
 
 /// The value of `--out-dir`, in either spelling.
@@ -405,41 +396,63 @@ mod tests {
     use super::{session_variables, target_directory};
 
     #[test]
-    fn a_units_output_directory_names_its_target_directory() {
+    fn a_units_output_directory_names_its_target_directory_in_either_layout() {
         let target = Path::new("/proj/target");
         for (out_dir, triple) in [
+            // cargo's shared layout.
             ("/proj/target/debug/deps", None),
             ("/proj/target/release-lto/deps", None),
             ("/proj/target/debug/examples", None),
-            ("/proj/target/debug/build/serde-0123abcd", None),
-            ("/proj/target/debug/build/serde-0123abcd/out", None),
+            ("/proj/target/debug/build/serde-0123456789abcdef", None),
+            ("/proj/target/debug/build/serde-0123456789abcdef/out", None),
             (
                 "/proj/target/wasm32-unknown-unknown/debug/deps",
                 Some("wasm32-unknown-unknown"),
             ),
             (
-                "/proj/target/aarch64-apple-darwin/debug/build/cc-1/out",
+                "/proj/target/aarch64-apple-darwin/debug/build/cc-0123456789abcdef/out",
                 Some("aarch64-apple-darwin"),
             ),
             // A host unit of a `--target` build has no triple to strip.
             ("/proj/target/debug/deps", Some("wasm32-unknown-unknown")),
+            // cargo 1.100's build-unit layout: the out-dir its smoke run
+            // refused, every unit's out-dir and a build script's OUT_DIR.
+            (
+                "/proj/target/debug/build/smoke-crate/95898b630903615e/out",
+                None,
+            ),
+            (
+                "/proj/target/release/build/serde/0123456789abcdef/out",
+                None,
+            ),
+            (
+                "/proj/target/aarch64-apple-darwin/debug/build/cc/0123456789abcdef/out",
+                Some("aarch64-apple-darwin"),
+            ),
+            (
+                "/proj/target/debug/build/cc/0123456789abcdef/out",
+                Some("aarch64-apple-darwin"),
+            ),
         ] {
             assert_eq!(
                 target_directory(Path::new(out_dir), triple),
-                Some(PathBuf::from(target)),
+                Ok(PathBuf::from(target)),
                 "{out_dir}"
             );
         }
     }
 
     #[test]
-    fn a_directory_outside_cargos_layout_has_no_target_directory() {
-        for out_dir in ["/tmp/out", "/proj/target", "/", "/proj/target/debug/other"] {
-            assert_eq!(
-                target_directory(Path::new(out_dir), None),
-                None,
-                "{out_dir}"
-            );
+    fn a_directory_outside_cargos_layout_is_refused_by_name() {
+        for out_dir in [
+            "/tmp/out",
+            "/proj/target",
+            "/",
+            "/proj/target/debug/other",
+            "/proj/target/debug/build/serde/0123456789abcdef/fingerprint",
+        ] {
+            let error = target_directory(Path::new(out_dir), None).expect_err(out_dir);
+            assert!(error.contains(out_dir), "{error}");
         }
     }
 

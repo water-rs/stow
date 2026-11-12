@@ -442,26 +442,6 @@ impl ParsedRustcArgs {
         self.output_dynamic_library_path(host)
     }
 
-    /// The `build-script-build` alias cargo creates next to the build script
-    /// binary — named per `host`, the triple the compiling rustc reports —
-    /// or `Ok(None)` when this is not a build script or `--out-dir` is
-    /// absent.
-    ///
-    /// # Errors
-    /// Returns an error when `host` is unparseable.
-    pub fn build_script_alias_path(&self, host: &str) -> Result<Option<PathBuf>, String> {
-        let Some(out_dir) = self.out_dir.as_ref() else {
-            return Ok(None);
-        };
-        if !self.is_build_script() {
-            return Ok(None);
-        }
-        Ok(Some(out_dir.join(format!(
-            "build-script-build{}",
-            executable_suffix(self.target.as_deref().unwrap_or(host))?
-        ))))
-    }
-
     /// The profile this invocation compiles with, absent flags defaulting
     /// to rustc's own values: `opt-level=0`, debug assertions on only at
     /// `opt-level=0`, overflow checks following debug assertions, and
@@ -2191,11 +2171,28 @@ mod tests {
                 "/tmp/out/build_script_build-fbf81822541b190b"
             ))
         );
+
+        // Cargo's build-unit layout passes no `-C extra-filename` for a
+        // build script, and runs rustc's output itself.
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "build_script_build",
+            "--crate-type",
+            "bin",
+            "--out-dir",
+            "/t/debug/build/zstd-sys/fbf81822541b190b/out",
+            "-C",
+            "metadata=e8a2e5854cc9f44b",
+        ]))
+        .expect("parser should succeed");
+        assert!(parsed.is_build_script());
         assert_eq!(
             parsed
-                .build_script_alias_path("aarch64-apple-darwin")
-                .expect("build script alias"),
-            Some(PathBuf::from("/tmp/out/build-script-build"))
+                .output_binary_path("aarch64-apple-darwin")
+                .expect("build script output"),
+            Some(PathBuf::from(
+                "/t/debug/build/zstd-sys/fbf81822541b190b/out/build_script_build"
+            ))
         );
     }
 
@@ -2225,12 +2222,6 @@ mod tests {
             Some(PathBuf::from(
                 "/tmp/out/build_script_build-fbf81822541b190b.exe"
             ))
-        );
-        assert_eq!(
-            parsed
-                .build_script_alias_path("x86_64-pc-windows-msvc")
-                .expect("build script alias"),
-            Some(PathBuf::from("/tmp/out/build-script-build.exe"))
         );
         assert_eq!(
             parsed
