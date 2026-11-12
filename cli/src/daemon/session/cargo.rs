@@ -211,9 +211,9 @@ pub async fn open_facts(
         config: Some(config),
         public_cache_disabled,
         roots,
-        // No driver is left to fail the build after cargo has exited, so a
-        // refused request compiles uncached.
-        refusal_policy: RefusalPolicy::CompileUncached,
+        // A refused request fails its own wrapper, which fails the build:
+        // no driver is needed for that.
+        refusal_policy: RefusalPolicy::of_this_build(),
         registry_sources,
         // Standalone wrappers added none either: the session applies the
         // output remap itself.
