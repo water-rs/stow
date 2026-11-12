@@ -8119,9 +8119,13 @@ mod tests {
                 let request = frame.decode::<WrapperRequest>().expect("a wrapper request");
                 let answer =
                     answer_and_book(&handler, &in_flight, &reports, &mut flight, request).await;
-                write_frame_async(&mut daemon_end, &Response::Answer(answer))
-                    .await
-                    .expect("answer");
+                write_frame_async(
+                    &mut daemon_end,
+                    crate::daemon::protocol::Negotiated::for_tests(),
+                    &Response::Answer(answer),
+                )
+                .await
+                .expect("answer");
             }
             // The reports outlive the connection, still holding the parked
             // bookkeeping.
@@ -8135,6 +8139,7 @@ mod tests {
                 rust_log: None,
             },
             std::time::Duration::from_secs(30),
+            std::path::Path::new("/stow"),
         );
         let status = super::run_decided(&mut conversation, &command)
             .await

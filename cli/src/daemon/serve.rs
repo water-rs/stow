@@ -32,8 +32,9 @@ use super::log::LogWriter;
 use super::notify::{self, Notification};
 use super::owner::{self, CargoOwner, OsProcesses, Processes};
 use super::protocol::{
-    ControlRequest, Event, Frame, Hello, PROTOCOL, PROTOCOL_FLOOR, Response, Role, SessionRef,
-    WrapperRequest, read_frame_async, speaks, write_frame_async,
+    Admission, ControlRequest, Event, Frame, Hello, HelloCore, Negotiated, PROTOCOL,
+    PROTOCOL_FLOOR, Response, Role, SessionRef, WrapperRequest, negotiate, read_frame_async,
+    write_core_async, write_frame_async,
 };
 use super::session::{
     CacheDirHandles, Cargo, Opener, Origin, Session, SessionFacts, SessionId, keep_only_owner,
@@ -386,81 +387,135 @@ where
     let Some(first) = read_frame_async(&mut stream).await? else {
         return Ok(());
     };
-    let hello = match check_hello(&first) {
-        Ok(hello) => hello,
-        Err(reason) => {
+    let (hello, at) = match greet(&first) {
+        Greeting::Admitted(hello, at) => (hello, at),
+        Greeting::Refused { stamp, reason } => {
             tracing::warn!(%reason, "daemon connection refused");
-            return reject(&mut stream, reason).await;
+            return write_core_async(&mut stream, stamp, &Response::Rejected { reason }).await;
         }
     };
     match hello.role {
-        Role::Control => serve_control(stream, &daemon).await,
+        Role::Control => serve_control(stream, &daemon, at).await,
         Role::Wrapper {
             session: SessionRef::Id(id),
-        } => serve_wrapper(stream, &daemon, id).await,
+        } => serve_wrapper(stream, &daemon, at, id).await,
         Role::Wrapper {
             session: SessionRef::Cargo { cargo, rust_log },
-        } => serve_cargo_wrapper(stream, &daemon, peer, cargo, rust_log).await,
+        } => serve_cargo_wrapper(stream, &daemon, at, peer, cargo, rust_log).await,
     }
 }
 
-fn check_hello(first: &Frame) -> std::result::Result<Hello, String> {
-    if !speaks(first.protocol) {
-        return Err(protocol_mismatch(first.protocol));
-    }
-    let hello = first
-        .decode::<Hello>()
-        .map_err(|error| format!("the first frame must be a Hello: {error}"))?;
-    if !speaks(hello.protocol) {
-        return Err(protocol_mismatch(hello.protocol));
-    }
-    tracing::debug!(client_version = %hello.stow_version, "daemon client connected");
-    Ok(hello)
+/// What the daemon made of a connection's first frame.
+enum Greeting {
+    /// A client the daemon serves, and the protocol it serves it at.
+    Admitted(Hello, Negotiated),
+    /// A client the daemon refuses, in a frame stamped `stamp` so that the
+    /// client reads it.
+    Refused { stamp: u16, reason: String },
 }
 
-fn protocol_mismatch(peer: u16) -> String {
+fn greet(first: &Frame) -> Greeting {
+    let core = match first.decode::<HelloCore>() {
+        Ok(core) => core,
+        Err(error) => {
+            return Greeting::Refused {
+                stamp: first.protocol,
+                reason: format!("the first frame must be a Hello: {error}"),
+            };
+        }
+    };
+    if first.protocol != core.protocol {
+        return Greeting::Refused {
+            stamp: first.protocol,
+            reason: format!(
+                "a Hello stamped with protocol {} names protocol {}",
+                first.protocol, core.protocol
+            ),
+        };
+    }
+    match negotiate(&core, &(PROTOCOL_FLOOR..=PROTOCOL)) {
+        Admission::Serve(at) => match first.decode::<Hello>() {
+            Ok(hello) => {
+                tracing::debug!(client_version = %hello.stow_version, "daemon client connected");
+                Greeting::Admitted(hello, at)
+            }
+            Err(error) => Greeting::Refused {
+                stamp: core.protocol,
+                reason: format!(
+                    "the Hello does not decode at protocol {}: {error}",
+                    core.protocol
+                ),
+            },
+        },
+        // The client reads a refusal stamped with the daemon's protocol:
+        // it is inside the range the client states.
+        Admission::Newer => Greeting::Refused {
+            stamp: PROTOCOL,
+            reason: format!(
+                "the client (stow {}) speaks protocols {} through {}, this daemon speaks protocols {PROTOCOL_FLOOR} through {PROTOCOL}",
+                core.stow_version, core.floor, core.protocol
+            ),
+        },
+        Admission::Older { peer, reason } => Greeting::Refused {
+            stamp: peer,
+            reason,
+        },
+    }
+}
+
+/// The refusal of a frame that does not belong to the connection's
+/// negotiated protocol.
+fn foreign_stamp(at: Negotiated, stamp: u16) -> String {
     format!(
-        "the client speaks protocol {peer}, this daemon speaks protocols {PROTOCOL_FLOOR} through {PROTOCOL}"
+        "a frame stamped with protocol {stamp} on a connection negotiated at protocol {}",
+        at.protocol()
     )
 }
 
-async fn reject<S: AsyncWrite + Unpin + Send>(stream: &mut S, reason: String) -> Result<()> {
-    write_frame_async(stream, &Response::Rejected { reason }).await
+async fn reject<S: AsyncWrite + Unpin + Send>(
+    stream: &mut S,
+    at: Negotiated,
+    reason: String,
+) -> Result<()> {
+    write_frame_async(stream, at, &Response::Rejected { reason }).await
 }
 
 /// A driver's connection: status requests, until it opens a session and
 /// the connection becomes the session's.
-async fn serve_control<S, P>(mut stream: S, daemon: &Daemon<P>) -> Result<()>
+async fn serve_control<S, P>(mut stream: S, daemon: &Daemon<P>, at: Negotiated) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     P: Processes,
 {
     while let Some(frame) = read_frame_async(&mut stream).await? {
-        if !speaks(frame.protocol) {
-            return reject(&mut stream, protocol_mismatch(frame.protocol)).await;
+        if !at.admits(frame.protocol) {
+            return reject(&mut stream, at, foreign_stamp(at, frame.protocol)).await;
         }
         match frame.decode::<ControlRequest>() {
             Ok(ControlRequest::Status) => {
                 write_frame_async(
                     &mut stream,
+                    at,
                     &Response::Status {
                         stow_version: env!("CARGO_PKG_VERSION").to_owned(),
                         protocol: PROTOCOL,
+                        floor: PROTOCOL_FLOOR,
                     },
                 )
                 .await?;
             }
             Ok(ControlRequest::OpenSession(facts)) => {
-                return serve_session(stream, daemon, *facts).await;
+                return serve_session(stream, daemon, at, *facts).await;
             }
             Ok(ControlRequest::EndSession) => {
                 return reject(
                     &mut stream,
+                    at,
                     "no session is open on this connection".to_owned(),
                 )
                 .await;
             }
-            Err(error) => return reject(&mut stream, error.to_string()).await,
+            Err(error) => return reject(&mut stream, at, error.to_string()).await,
         }
     }
     Ok(())
@@ -490,7 +545,12 @@ fn interest_of(facts: &SessionFacts) -> LogInterest {
 
 /// Open the session `facts` describe and serve its control connection
 /// until the driver ends the session or goes away.
-async fn serve_session<S, P>(stream: S, daemon: &Daemon<P>, facts: SessionFacts) -> Result<()>
+async fn serve_session<S, P>(
+    stream: S,
+    daemon: &Daemon<P>,
+    at: Negotiated,
+    facts: SessionFacts,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     P: Processes,
@@ -509,7 +569,7 @@ where
         Err(error) => {
             daemon.logs.unregister(id);
             tracing::warn!(%error, "a session could not be opened");
-            return reject(&mut write, format!("{error:#}")).await;
+            return reject(&mut write, at, format!("{error:#}")).await;
         }
     };
     daemon.table.insert(Arc::clone(&session));
@@ -517,9 +577,10 @@ where
     // The answer to `OpenSession` precedes every event the session's tasks
     // have recorded: those wait in `events` until the drive loop forwards
     // them.
-    let answered = write_frame_async(&mut write, &Response::SessionOpened { session: id }).await;
+    let answered =
+        write_frame_async(&mut write, at, &Response::SessionOpened { session: id }).await;
     let driven = match answered {
-        Ok(()) => drive_session(&mut read, &mut write, &session, &mut events).await,
+        Ok(()) => drive_session(&mut read, &mut write, at, &session, &mut events).await,
         Err(error) => Err(error),
     };
     // Removed first, so a wrapper arriving from here on is refused rather
@@ -556,6 +617,7 @@ enum Driven {
 async fn drive_session<R, W>(
     read: &mut R,
     write: &mut W,
+    at: Negotiated,
     session: &Arc<Session>,
     events: &mut mpsc::UnboundedReceiver<Event>,
 ) -> Result<Driven>
@@ -593,8 +655,8 @@ where
                         return Ok::<_, stow_types::error::Error>(Driven::DriverGone);
                     };
                     let frame = frame?;
-                    if !speaks(frame.protocol) {
-                        reject(write, protocol_mismatch(frame.protocol)).await?;
+                    if !at.admits(frame.protocol) {
+                        reject(write, at, foreign_stamp(at, frame.protocol)).await?;
                         return Ok(Driven::DriverGone);
                     }
                     match frame.decode::<ControlRequest>() {
@@ -603,9 +665,9 @@ where
                             // What the session recorded before it ended
                             // reaches the driver ahead of the answer.
                             while let Ok(event) = events.try_recv() {
-                                write_frame_async(write, &Response::Event(event)).await?;
+                                write_frame_async(write, at, &Response::Event(event)).await?;
                             }
-                            write_frame_async(write, &Response::SessionEnded(end)).await?;
+                            write_frame_async(write, at, &Response::SessionEnded(end)).await?;
                             tracing::info!(session = %id, "ended a session");
                             // A driver on Windows may run inside the job
                             // object of a cargo (`cargo stow`) that ends
@@ -620,23 +682,24 @@ where
                         Ok(other) => {
                             reject(
                                 write,
+                                at,
                                 format!("a session's connection takes only EndSession, not {other:?}"),
                             )
                             .await?;
                             return Ok(Driven::DriverGone);
                         }
                         Err(error) => {
-                            reject(write, error.to_string()).await?;
+                            reject(write, at, error.to_string()).await?;
                             return Ok(Driven::DriverGone);
                         }
                     }
                 }
                 Some(event) = events.recv() => {
-                    write_frame_async(write, &Response::Event(event)).await?;
+                    write_frame_async(write, at, &Response::Event(event)).await?;
                 }
                 () = resolution_done.wait(), if !resolution_sent => {
                     resolution_sent = true;
-                    write_frame_async(write, &Response::Event(Event::ResolutionDone)).await?;
+                    write_frame_async(write, at, &Response::Event(Event::ResolutionDone)).await?;
                 }
             }
         }
@@ -654,7 +717,12 @@ where
 
 /// One wrapper's conversation with its session: a request, its answer,
 /// until the wrapper hangs up — which ends a flight it still holds.
-async fn serve_wrapper<S, P>(mut stream: S, daemon: &Daemon<P>, id: SessionId) -> Result<()>
+async fn serve_wrapper<S, P>(
+    mut stream: S,
+    daemon: &Daemon<P>,
+    at: Negotiated,
+    id: SessionId,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     P: Processes,
@@ -662,6 +730,7 @@ where
     let Some(session) = daemon.table.join(id).await else {
         return reject(
             &mut stream,
+            at,
             format!("no session {id}: the stow daemon restarted or the build that opened it ended"),
         )
         .await;
@@ -669,6 +738,7 @@ where
     let span = session.span().clone();
     converse(
         &mut stream,
+        at,
         &session,
         daemon.settings.answer / 2,
         None,
@@ -687,12 +757,15 @@ enum Incoming {
     Refused(String),
 }
 
-async fn read_request<S: AsyncRead + Unpin + Send>(stream: &mut S) -> Result<Incoming> {
+async fn read_request<S: AsyncRead + Unpin + Send>(
+    stream: &mut S,
+    at: Negotiated,
+) -> Result<Incoming> {
     let Some(frame) = read_frame_async(stream).await? else {
         return Ok(Incoming::Closed);
     };
-    if !speaks(frame.protocol) {
-        return Ok(Incoming::Refused(protocol_mismatch(frame.protocol)));
+    if !at.admits(frame.protocol) {
+        return Ok(Incoming::Refused(foreign_stamp(at, frame.protocol)));
     }
     Ok(match frame.decode::<WrapperRequest>() {
         Ok(request) => Incoming::Request(request),
@@ -706,6 +779,7 @@ async fn read_request<S: AsyncRead + Unpin + Send>(stream: &mut S) -> Result<Inc
 /// build's events.
 async fn converse_returning_events<S, P>(
     stream: &mut S,
+    at: Negotiated,
     daemon: &Daemon<P>,
     session: &Arc<Session<Cargo>>,
     first: WrapperRequest,
@@ -722,6 +796,7 @@ where
     let span = tracing::info_span!(parent: session.span(), SESSION_SPAN, session = %route);
     let served = converse(
         stream,
+        at,
         session,
         daemon.settings.answer / 2,
         Some(first),
@@ -739,6 +814,7 @@ where
 /// events `events` collects from it go ahead of each answer.
 async fn converse<S, O>(
     stream: &mut S,
+    at: Negotiated,
     session: &Arc<Session<O>>,
     every: Duration,
     first: Option<WrapperRequest>,
@@ -755,9 +831,9 @@ where
         loop {
             let request = match next.take() {
                 Some(request) => request,
-                None => match read_request(stream).await? {
+                None => match read_request(stream, at).await? {
                     Incoming::Closed => return Ok(()),
-                    Incoming::Refused(reason) => return reject(stream, reason).await,
+                    Incoming::Refused(reason) => return reject(stream, at, reason).await,
                     Incoming::Request(request) => request,
                 },
             };
@@ -769,13 +845,13 @@ where
                 &mut flight,
                 request,
             ));
-            let answer = working_meanwhile(stream, every, answering).await?;
+            let answer = working_meanwhile(stream, at, every, answering).await?;
             if let Some(events) = events.as_mut() {
                 while let Ok(event) = events.try_recv() {
-                    write_frame_async(stream, &Response::Event(event)).await?;
+                    write_frame_async(stream, at, &Response::Event(event)).await?;
                 }
             }
-            write_frame_async(stream, &Response::Answer(answer)).await?;
+            write_frame_async(stream, at, &Response::Answer(answer)).await?;
         }
     }
     .instrument(span)
@@ -788,6 +864,7 @@ where
 /// outlasts that.
 async fn working_meanwhile<S, T>(
     stream: &mut S,
+    at: Negotiated,
     every: Duration,
     work: impl std::future::Future<Output = T>,
 ) -> Result<T>
@@ -799,7 +876,7 @@ where
     loop {
         tokio::select! {
             done = &mut work => return Ok(done),
-            _ = tick.tick() => write_frame_async(stream, &Response::Working).await?,
+            _ = tick.tick() => write_frame_async(stream, at, &Response::Working).await?,
         }
     }
 }
@@ -809,6 +886,7 @@ where
 async fn serve_cargo_wrapper<S, P>(
     mut stream: S,
     daemon: &Daemon<P>,
+    at: Negotiated,
     peer: Option<u32>,
     cargo: Option<Vec<u8>>,
     rust_log: Option<String>,
@@ -823,20 +901,20 @@ where
         tracing::warn!(%reason, "ignoring the wrapper's RUST_LOG for its events");
         LogInterest::of_wrapper(None).expect("the default filter parses")
     });
-    let first = match read_request(&mut stream).await? {
+    let first = match read_request(&mut stream, at).await? {
         Incoming::Closed => return Ok(()),
-        Incoming::Refused(reason) => return reject(&mut stream, reason).await,
+        Incoming::Refused(reason) => return reject(&mut stream, at, reason).await,
         Incoming::Request(request) => request,
     };
     // A probe belongs to no build: it needs neither a cargo nor a session.
     if is_probe(&first) {
-        return serve_probe(stream, first).await;
+        return serve_probe(stream, at, first).await;
     }
     let owner = match owner_of(daemon, peer, cargo).await {
         Ok(owner) => owner,
         Err(reason) => {
             tracing::warn!(%reason, "a wrapper's cargo could not be found");
-            return reject(&mut stream, reason).await;
+            return reject(&mut stream, at, reason).await;
         }
     };
     let every = daemon.settings.answer / 2;
@@ -844,24 +922,26 @@ where
     if slot.is_outlived_daemon() {
         return reject(
             &mut stream,
+            at,
             "the stow daemon restarted during this cargo build: its in-flight state and provenance marks are gone; run the build again".to_owned(),
         )
         .await;
     }
     if let Some(session) = slot.session() {
-        return converse_returning_events(&mut stream, daemon, &session, first, interest).await;
+        return converse_returning_events(&mut stream, at, daemon, &session, first, interest).await;
     }
     // Nothing was settled before cargo started: the wrapper says what it
     // runs in, and the request it was holding is answered once the session
     // is open.
-    write_frame_async(&mut stream, &Response::Answer(Answer::Describe)).await?;
-    let environment = match read_request(&mut stream).await? {
+    write_frame_async(&mut stream, at, &Response::Answer(Answer::Describe)).await?;
+    let environment = match read_request(&mut stream, at).await? {
         Incoming::Closed => return Ok(()),
-        Incoming::Refused(reason) => return reject(&mut stream, reason).await,
+        Incoming::Refused(reason) => return reject(&mut stream, at, reason).await,
         Incoming::Request(WrapperRequest::Describe(environment)) => environment,
         Incoming::Request(other) => {
             return reject(
                 &mut stream,
+                at,
                 format!("the daemon asked for the build's environment, not {other:?}"),
             )
             .await;
@@ -869,17 +949,17 @@ where
     };
     let opener = match Opener::of(&first) {
         Ok(opener) => opener,
-        Err(reason) => return reject(&mut stream, reason).await,
+        Err(reason) => return reject(&mut stream, at, reason).await,
     };
     let opening = slot.open_with(|| open_cargo_session(daemon.clone(), owner, opener, environment));
-    let session = match working_meanwhile(&mut stream, every, opening).await? {
+    let session = match working_meanwhile(&mut stream, at, every, opening).await? {
         Ok(session) => session,
         Err(reason) => {
             tracing::warn!(%owner, %reason, "a cargo's session could not be opened");
-            return reject(&mut stream, reason).await;
+            return reject(&mut stream, at, reason).await;
         }
     };
-    converse_returning_events(&mut stream, daemon, &session, first, interest).await
+    converse_returning_events(&mut stream, at, daemon, &session, first, interest).await
 }
 
 /// The cargo a wrapper connecting from `peer` runs under.
@@ -915,7 +995,7 @@ fn is_probe(request: &WrapperRequest) -> bool {
 
 /// A probe's conversation: told to run what it asked for, and its report
 /// received. No session is opened or touched.
-async fn serve_probe<S>(mut stream: S, first: WrapperRequest) -> Result<()>
+async fn serve_probe<S>(mut stream: S, at: Negotiated, first: WrapperRequest) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -923,9 +1003,9 @@ where
     loop {
         let request = match next.take() {
             Some(request) => request,
-            None => match read_request(&mut stream).await? {
+            None => match read_request(&mut stream, at).await? {
                 Incoming::Closed => return Ok(()),
-                Incoming::Refused(reason) => return reject(&mut stream, reason).await,
+                Incoming::Refused(reason) => return reject(&mut stream, at, reason).await,
                 Incoming::Request(request) => request,
             },
         };
@@ -939,7 +1019,7 @@ where
                 message: format!("a probe's connection takes a plan and its report, not {other:?}"),
             },
         };
-        write_frame_async(&mut stream, &Response::Answer(answer)).await?;
+        write_frame_async(&mut stream, at, &Response::Answer(answer)).await?;
     }
 }
 
@@ -1017,8 +1097,8 @@ mod tests {
     use crate::daemon::events::SessionLogs;
     use crate::daemon::owner::{CargoOwner, Processes};
     use crate::daemon::protocol::{
-        ControlRequest, Hello, PROTOCOL, Response, Role, SessionRef, WrapperRequest, encode,
-        read_frame_async,
+        ControlRequest, Hello, Negotiated, PROTOCOL, PROTOCOL_FLOOR, Response, Role, SessionRef,
+        WrapperRequest, encode, encode_at, read_frame_async,
     };
     use crate::daemon::session::handler::{
         Decision, Flight, Handler, InFlightUnits, Reports, answer_and_book,
@@ -1150,6 +1230,11 @@ mod tests {
         (client, task)
     }
 
+    /// The hello of a client of this build running `/stow`.
+    fn hello(role: Role) -> Hello {
+        Hello::new(role, std::path::Path::new("/stow"))
+    }
+
     async fn send<T: serde::Serialize + Sync>(stream: &mut DuplexStream, message: &T) {
         stream
             .write_all(&encode(message).expect("encode"))
@@ -1187,7 +1272,7 @@ mod tests {
         SessionId,
     ) {
         let (mut control, task) = connect(daemon);
-        send(&mut control, &Hello::new(Role::Control)).await;
+        send(&mut control, &hello(Role::Control)).await;
         send(
             &mut control,
             &ControlRequest::OpenSession(Box::new(facts(target).await)),
@@ -1207,7 +1292,7 @@ mod tests {
         let (mut wrapper, task) = connect(daemon);
         send(
             &mut wrapper,
-            &Hello::new(Role::Wrapper {
+            &hello(Role::Wrapper {
                 session: SessionRef::Id(session),
             }),
         )
@@ -1247,7 +1332,7 @@ mod tests {
         let (mut wrapper, task) = connect(&daemon);
         send(
             &mut wrapper,
-            &Hello::new(Role::Wrapper {
+            &hello(Role::Wrapper {
                 session: SessionRef::Id(id),
             }),
         )
@@ -1272,7 +1357,7 @@ mod tests {
         let (mut wrapper, task) = connect(&daemon);
         send(
             &mut wrapper,
-            &Hello::new(Role::Wrapper {
+            &hello(Role::Wrapper {
                 session: SessionRef::Id(SessionId::mint()),
             }),
         )
@@ -1369,9 +1454,14 @@ mod tests {
         let in_flight = InFlightUnits::default();
         let reports = Reports::default();
         let answering = answer_and_book(&handler, &in_flight, &reports, &mut flight, request);
-        let answer = working_meanwhile(&mut daemon_end, Duration::from_millis(20), answering)
-            .await
-            .expect("answered");
+        let answer = working_meanwhile(
+            &mut daemon_end,
+            Negotiated::for_tests(),
+            Duration::from_millis(20),
+            answering,
+        )
+        .await
+        .expect("answered");
         assert!(matches!(answer, Answer::Compile(_)), "{answer:?}");
         drop(daemon_end);
         let mut working = 0;
@@ -1475,13 +1565,14 @@ mod tests {
     async fn status_after_hello_reports_version_and_protocol() {
         let sessions = tempfile::tempdir().expect("sessions");
         let (mut client, _task) = connect(&daemon(sessions.path()));
-        send(&mut client, &Hello::new(Role::Control)).await;
+        send(&mut client, &hello(Role::Control)).await;
         send(&mut client, &ControlRequest::Status).await;
         assert_eq!(
             receive(&mut client).await,
             Response::Status {
                 stow_version: env!("CARGO_PKG_VERSION").to_owned(),
                 protocol: PROTOCOL,
+                floor: PROTOCOL_FLOOR,
             }
         );
     }
@@ -1497,25 +1588,97 @@ mod tests {
         ));
     }
 
+    /// A client's `Hello` for `protocol`, which also stamps its frame.
+    async fn send_hello_for(client: &mut DuplexStream, protocol: u16) {
+        let hello = Hello {
+            protocol,
+            floor: protocol,
+            stow_version: "9.9.9".to_owned(),
+            ..hello(Role::Control)
+        };
+        client
+            .write_all(&encode_at(protocol, &hello).expect("encode"))
+            .await
+            .expect("write");
+    }
+
+    /// The next frame's stamp and response.
+    async fn receive_stamped(stream: &mut DuplexStream) -> (u16, Response) {
+        let frame = read_frame_async(stream)
+            .await
+            .expect("read")
+            .expect("a frame");
+        (
+            frame.protocol,
+            frame.decode::<Response>().expect("response"),
+        )
+    }
+
     #[tokio::test]
-    async fn a_hello_for_another_protocol_is_rejected_naming_both() {
+    async fn an_older_client_is_refused_naming_both_ranges_in_its_own_protocol() {
         let sessions = tempfile::tempdir().expect("sessions");
         let (mut client, _task) = connect(&daemon(sessions.path()));
-        send(
-            &mut client,
-            &Hello {
-                protocol: PROTOCOL + 1,
-                stow_version: "9.9.9".to_owned(),
-                role: Role::Control,
-            },
-        )
-        .await;
-        let Response::Rejected { reason } = receive(&mut client).await else {
-            panic!("a newer protocol must be rejected");
+        send_hello_for(&mut client, PROTOCOL_FLOOR - 1).await;
+        let (stamp, Response::Rejected { reason }) = receive_stamped(&mut client).await else {
+            panic!("a client below the floor must be rejected");
         };
+        assert_eq!(
+            stamp,
+            PROTOCOL_FLOOR - 1,
+            "the refusal is stamped so the client reads it"
+        );
+        assert!(
+            reason.contains(&(PROTOCOL_FLOOR - 1).to_string())
+                && reason.contains(&PROTOCOL.to_string()),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_newer_client_is_refused_in_the_daemons_protocol() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let (mut client, _task) = connect(&daemon(sessions.path()));
+        send_hello_for(&mut client, PROTOCOL + 1).await;
+        let (stamp, Response::Rejected { reason }) = receive_stamped(&mut client).await else {
+            panic!("a newer client must be rejected");
+        };
+        assert_eq!(stamp, PROTOCOL);
         assert!(
             reason.contains(&(PROTOCOL + 1).to_string()) && reason.contains(&PROTOCOL.to_string()),
             "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hello_whose_frame_is_stamped_with_another_protocol_is_refused() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let (mut client, _task) = connect(&daemon(sessions.path()));
+        client
+            .write_all(&encode_at(PROTOCOL + 1, &hello(Role::Control)).expect("encode"))
+            .await
+            .expect("write");
+        let (_, Response::Rejected { reason }) = receive_stamped(&mut client).await else {
+            panic!("a disagreeing stamp must be rejected");
+        };
+        assert!(reason.contains("stamped"), "{reason}");
+    }
+
+    /// Every frame of a connection is stamped with the protocol its client
+    /// said hello with, so a client of an older protocol in the daemon's
+    /// range could read its replies.
+    #[tokio::test]
+    async fn every_reply_carries_the_protocol_the_connection_negotiated() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let (mut client, _task) = connect(&daemon(sessions.path()));
+        send(&mut client, &hello(Role::Control)).await;
+        send(&mut client, &ControlRequest::Status).await;
+        assert_eq!(receive_stamped(&mut client).await.0, PROTOCOL);
+        send(&mut client, &ControlRequest::EndSession).await;
+        let (stamp, response) = receive_stamped(&mut client).await;
+        assert_eq!(stamp, PROTOCOL);
+        assert!(
+            matches!(response, Response::Rejected { .. }),
+            "{response:?}"
         );
     }
 
@@ -1601,7 +1764,7 @@ mod tests {
         let (mut stream, task) = connect_from(daemon, Some(wrapper));
         send(
             &mut stream,
-            &Hello::new(Role::Wrapper {
+            &hello(Role::Wrapper {
                 session: SessionRef::Cargo {
                     cargo: None,
                     rust_log: None,
@@ -1797,7 +1960,7 @@ mod tests {
         let (mut wrapper, _wrapper_task) = connect(&daemon);
         send(
             &mut wrapper,
-            &Hello::new(Role::Wrapper {
+            &hello(Role::Wrapper {
                 session: SessionRef::Id(id),
             }),
         )
@@ -1821,7 +1984,7 @@ mod tests {
         let (mut wrapper, task) = connect_from(&daemon, Some(99));
         send(
             &mut wrapper,
-            &Hello::new(Role::Wrapper {
+            &hello(Role::Wrapper {
                 session: SessionRef::Cargo {
                     cargo: None,
                     rust_log: None,

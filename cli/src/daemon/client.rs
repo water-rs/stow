@@ -14,8 +14,8 @@ use tokio::sync::{oneshot, watch};
 
 use super::events::SpanMirror;
 use super::protocol::{
-    ControlRequest, Event, Hello, PROTOCOL, PROTOCOL_FLOOR, Response, Role, SessionRef,
-    WrapperRequest, encode, read_frame_async, speaks,
+    ControlRequest, Event, Hello, Response, Role, SessionRef, WrapperRequest, encode,
+    read_frame_async, read_response,
 };
 use super::relay::{RELAY_METHOD, RelayBody, RelayCall, mint_connection_id};
 use super::session::{SessionEnd, SessionFacts, SessionId};
@@ -168,22 +168,14 @@ pub async fn connect(exe: PathBuf, settings: Settings) -> Result<Stream> {
 }
 
 /// Reach the daemon through the start path — which verifies it answers and
-/// speaks a protocol this stow reads — and connect.
+/// admits this stow's protocol — and connect.
 ///
 /// # Errors
 ///
-/// The daemon cannot be started, does not answer, or speaks a protocol
-/// this stow does not.
+/// The daemon cannot be started, does not answer, or refuses this stow.
 pub async fn connect_starting(exe: PathBuf, settings: Settings) -> Result<Stream> {
     let run_dir = run_dir().await?;
-    let status = smol::unblock(move || connect_or_start(&exe, settings)?.status()).await?;
-    if !speaks(status.protocol) {
-        return Err(stow_types::stow_error!(
-            "the running stow daemon ({}) speaks protocol {}, this stow speaks {PROTOCOL_FLOOR} through {PROTOCOL}",
-            describe_daemon(&run_dir.log()),
-            status.protocol
-        ));
-    }
+    smol::unblock(move || connect_or_start(&exe, settings)?.status()).await?;
     try_open(&run_dir.endpoint(), settings.answer)
         .await?
         .ok_or_else(|| {
@@ -250,11 +242,13 @@ impl Reach {
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
     /// A conversation over `stream` for `session`, whose daemon answers
-    /// within `answer` or says it is working.
-    pub fn new(stream: S, session: SessionRef, answer: Duration) -> Self {
+    /// within `answer` or says it is working. `executable` is the stow
+    /// runtime executable of this process, which a daemon that must give
+    /// way to it starts.
+    pub fn new(stream: S, session: SessionRef, answer: Duration, executable: &Path) -> Self {
         Self {
             stream,
-            greeting: Some(Hello::new(Role::Wrapper { session })),
+            greeting: Some(Hello::new(Role::Wrapper { session }, executable)),
             answer,
             reach: None,
         }
@@ -319,16 +313,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
                 .ok_or_else(|| {
                     "the stow daemon closed the connection without answering".to_owned()
                 })?;
-            if !speaks(frame.protocol) {
-                return Err(format!(
-                    "the stow daemon speaks protocol {}, this stow speaks {PROTOCOL_FLOOR} through {PROTOCOL}",
-                    frame.protocol
-                ));
-            }
-            match frame
-                .decode::<Response>()
-                .map_err(|error| error.to_string())?
-            {
+            match read_response(&frame).map_err(|error| error.to_string())? {
                 // What the daemon logged while deciding this wrapper's
                 // request, which it carries ahead of the answer.
                 Response::Event(Event::Log(record)) => record_log(&record),
@@ -399,7 +384,7 @@ pub enum Decision {
 /// conversation.
 pub enum WrapperConnection {
     /// Straight to the daemon.
-    Direct(WrapperStream<Stream>),
+    Direct(Box<WrapperStream<Stream>>),
     /// Through the driver's relay inside a sandbox. The client leaves its
     /// slot while a call blocks on the worker thread and is always put
     /// back, so a call never finds it gone.
@@ -458,12 +443,12 @@ impl WrapperConnection {
         let reach = Reach::locate()
             .await
             .map_err(|error| format!("{error:#} ({NO_BUILD_WITHOUT_DAEMON})"))?;
-        let stream = connect(exe, settings)
+        let stream = connect(exe.clone(), settings)
             .await
             .map_err(|error| reach.explain(&format!("{error:#}")))?;
-        Ok(Self::Direct(
-            WrapperStream::new(stream, session, settings.answer).reaching(reach),
-        ))
+        Ok(Self::Direct(Box::new(
+            WrapperStream::new(stream, session, settings.answer, &exe).reaching(reach),
+        )))
     }
 
     /// Whether the build's C/C++ object cache is on.
@@ -555,7 +540,7 @@ impl WrapperConnection {
     /// instead of completing now.
     pub async fn close(self) -> std::result::Result<(), String> {
         match self {
-            Self::Direct(stream) => stream.close().await,
+            Self::Direct(stream) => (*stream).close().await,
             Self::Relay { client, connection } => {
                 let Some(mut client) = client else {
                     return Ok(());
@@ -726,8 +711,8 @@ impl DaemonSession {
     pub async fn open(exe: PathBuf, facts: SessionFacts, settings: Settings) -> Result<Self> {
         let run_dir = run_dir().await?;
         let log = run_dir.log();
-        let mut stream = connect_starting(exe, settings).await?;
-        let mut bytes = encode(&Hello::new(Role::Control))?;
+        let mut stream = connect_starting(exe.clone(), settings).await?;
+        let mut bytes = encode(&Hello::new(Role::Control, &exe))?;
         bytes.extend(encode(&ControlRequest::OpenSession(Box::new(facts)))?);
         let opened = async {
             stream
@@ -754,7 +739,7 @@ impl DaemonSession {
                 describe_daemon(&log)
             )
         })?;
-        let id = match opened.decode::<Response>()? {
+        let id = match read_response(&opened)? {
             Response::SessionOpened { session } => session,
             Response::Rejected { reason } => {
                 return Err(stow_types::stow_error!(
@@ -890,7 +875,7 @@ async fn read_events(
             Ok(None) => break "the daemon closed the control connection".to_owned(),
             Err(error) => break format!("the control connection failed: {error}"),
         };
-        match frame.decode::<Response>() {
+        match read_response(&frame) {
             Ok(Response::Event(Event::ResolutionDone)) => resolution_done.complete(),
             Ok(Response::Event(Event::Log(record))) => record_log(&record),
             Ok(Response::Event(Event::SpanOpened(record))) => spans.opened(&record),
@@ -985,6 +970,7 @@ mod tests {
                 rust_log: None,
             },
             std::time::Duration::from_secs(5),
+            std::path::Path::new("/stow"),
         )
         .reaching(reach(dir.path()));
         let refusal = super::encode(&super::Response::Rejected {
@@ -1014,6 +1000,7 @@ mod tests {
                 rust_log: None,
             },
             std::time::Duration::from_secs(5),
+            std::path::Path::new("/stow"),
         );
         let daemon = async move {
             // The hello and the held request arrive together.

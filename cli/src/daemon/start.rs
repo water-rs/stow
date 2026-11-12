@@ -29,7 +29,7 @@ use super::STOW_DAEMON_DIR_ENV;
 #[cfg(unix)]
 use super::detached::{self, Detached};
 use super::notify::{Notification, ReadyListener};
-use super::protocol::{self, ControlRequest, Hello, PROTOCOL, PROTOCOL_FLOOR, Response, Role};
+use super::protocol::{self, ControlRequest, Hello, Response, Role};
 use super::{RunDir, Settings};
 use crate::file_lock::FileLock;
 
@@ -51,8 +51,10 @@ const LONGEST_RECONNECT_PAUSE: Duration = Duration::from_millis(200);
 pub struct StatusReply {
     /// The daemon's stow version.
     pub stow_version: String,
-    /// The protocol number the daemon speaks.
+    /// The newest protocol number the daemon speaks.
     pub protocol: u16,
+    /// The oldest protocol number the daemon speaks.
+    pub floor: u16,
 }
 
 /// A connection to the daemon that has not yet said hello.
@@ -62,6 +64,8 @@ pub struct Connection {
     answer: Duration,
     /// The daemon's log, which an error names with the daemon's pid.
     log: PathBuf,
+    /// The stow runtime executable the hello names.
+    exe: PathBuf,
 }
 
 impl Connection {
@@ -75,9 +79,9 @@ impl Connection {
         let answer = self.answer;
         let log = self.log;
         #[cfg(unix)]
-        let reply = exchange(self.stream);
+        let reply = exchange(self.stream, &self.exe);
         #[cfg(windows)]
-        let reply = with_deadline(answer, move || exchange(self.stream));
+        let reply = with_deadline(answer, move || exchange(self.stream, &self.exe));
         reply.wrap_err_with(|| {
             format!(
                 "the running stow daemon ({}) did not complete a status exchange within {} s",
@@ -103,27 +107,23 @@ pub fn describe_daemon(log: &Path) -> String {
     format!("pid {pid}, log {}", log.display())
 }
 
-fn exchange<S: Read + Write>(mut stream: S) -> Result<StatusReply> {
-    let mut request = protocol::encode(&Hello::new(Role::Control))?;
+fn exchange<S: Read + Write>(mut stream: S, exe: &Path) -> Result<StatusReply> {
+    let mut request = protocol::encode(&Hello::new(Role::Control, exe))?;
     request.extend(protocol::encode(&ControlRequest::Status)?);
     stream
         .write_all(&request)
         .and_then(|()| stream.flush())
         .wrap_err("send Hello and Status to the daemon")?;
     let frame = protocol::read_frame(&mut stream)?;
-    if !protocol::speaks(frame.protocol) {
-        return Err(stow_types::stow_error!(
-            "the daemon speaks protocol {}, this stow speaks {PROTOCOL_FLOOR} through {PROTOCOL}",
-            frame.protocol
-        ));
-    }
-    match frame.decode::<Response>()? {
+    match protocol::read_response(&frame)? {
         Response::Status {
             stow_version,
             protocol,
+            floor,
         } => Ok(StatusReply {
             stow_version,
             protocol,
+            floor,
         }),
         Response::Rejected { reason } => Err(stow_types::stow_error!(
             "the daemon refused the connection: {reason}"
@@ -225,6 +225,7 @@ pub fn connect_or_start(exe: &Path, settings: Settings) -> Result<Connection> {
         stream,
         answer: settings.answer,
         log: run_dir.log(),
+        exe: exe.to_owned(),
     };
     if let Attempt::Connected(stream) = try_connect(&endpoint, settings.answer)? {
         return Ok(connected(stream));

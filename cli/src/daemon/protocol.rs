@@ -13,8 +13,32 @@
 //! Status clients are synchronous and std-only (see [`super::start`]) and
 //! the daemon is async, so the encoding and the header parse live here
 //! once and each side only adds its own reads and writes.
+//!
+//! # Versions
+//!
+//! Each side states the protocols it speaks: [`PROTOCOL_FLOOR`] through
+//! [`PROTOCOL`]. A daemon serves every protocol of its range and stamps
+//! each frame it writes with the protocol the connection negotiated
+//! ([`Negotiated`], which only [`negotiate`] builds). A client stamps every
+//! frame with its own [`PROTOCOL`].
+//!
+//! Everything that differs between protocols is decided in this module. A
+//! difference is a plain `fn (Negotiated) -> bool` in the `gates` section
+//! below, named for what it gates and deleted once the floor passes the
+//! protocol that introduced it; no other module compares protocol numbers.
+//!
+//! # The core
+//!
+//! A peer of any version reads the core, whatever number stamps it, because
+//! it is how a newer client reaches an older daemon and how an older client
+//! reads a newer daemon's refusal. These encodings never change: the frame
+//! header, the [`HelloCore`] fields of a [`Hello`], [`ControlRequest::Status`]
+//! and [`Response::Status`] and [`Response::Rejected`]. The golden bytes in
+//! the tests pin each.
 
 use std::io::Read;
+use std::ops::RangeInclusive;
+use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -22,15 +46,16 @@ use stow_types::error::{Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use super::events::{LogRecord, SpanRecord};
-use super::session::{SessionEnd, SessionFacts, SessionId};
+use super::session::{SessionEnd, SessionFacts, SessionId, os_bytes};
 
 /// The protocol number this build speaks. Bumped when a message changes
-/// in a way an older peer cannot read.
-pub const PROTOCOL: u16 = 3;
+/// in a way an older peer cannot read. Protocols 2 and 3 were never
+/// released.
+pub const PROTOCOL: u16 = 4;
 
 /// The oldest protocol number this build still reads. A daemon serves
 /// `PROTOCOL_FLOOR..=PROTOCOL`.
-pub const PROTOCOL_FLOOR: u16 = 2;
+pub const PROTOCOL_FLOOR: u16 = 4;
 
 const LENGTH_BYTES: usize = 4;
 const PROTOCOL_BYTES: usize = 2;
@@ -47,6 +72,76 @@ const MAX_FRAME_BYTES: usize = 64 << 20;
 #[must_use]
 pub const fn speaks(protocol: u16) -> bool {
     PROTOCOL_FLOOR <= protocol && protocol <= PROTOCOL
+}
+
+/// The protocol a connection was negotiated at: what a daemon stamps on
+/// every frame it writes on it.
+///
+/// Only [`negotiate`] builds one, so a daemon cannot write a frame at a
+/// protocol it did not agree on with its client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Negotiated(u16);
+
+impl Negotiated {
+    /// The protocol number.
+    #[must_use]
+    pub const fn protocol(self) -> u16 {
+        self.0
+    }
+
+    /// Whether a client frame stamped `stamp` belongs to this connection:
+    /// a client stamps every frame with the protocol it said hello with.
+    #[must_use]
+    pub const fn admits(self, stamp: u16) -> bool {
+        self.0 == stamp
+    }
+
+    /// The protocol of this build, for a test that plays a daemon.
+    #[cfg(test)]
+    pub(crate) const fn for_tests() -> Self {
+        Self(PROTOCOL)
+    }
+}
+
+/// What a daemon makes of a client's [`HelloCore`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// The client's protocol is in the daemon's range: serve it at that
+    /// protocol.
+    Serve(Negotiated),
+    /// The client speaks a protocol above the daemon's: the daemon is the
+    /// older stow.
+    Newer,
+    /// The client speaks a protocol below the daemon's floor. The daemon
+    /// never downgrades itself for an old client, because two installs
+    /// would fight over the endpoint.
+    Older {
+        /// The protocol the client speaks, which stamps the refusal so the
+        /// client can read it.
+        peer: u16,
+        /// Why, naming both ranges.
+        reason: String,
+    },
+}
+
+/// Decide which protocol, if any, a daemon speaking `ours` serves the
+/// client `core` describes at.
+#[must_use]
+pub fn negotiate(core: &HelloCore, ours: &RangeInclusive<u16>) -> Admission {
+    let (floor, protocol) = (*ours.start(), *ours.end());
+    if core.protocol > protocol {
+        Admission::Newer
+    } else if core.protocol < floor {
+        Admission::Older {
+            peer: core.protocol,
+            reason: format!(
+                "the client (stow {}) speaks protocols {} through {}, this daemon speaks protocols {floor} through {protocol}",
+                core.stow_version, core.floor, core.protocol
+            ),
+        }
+    } else {
+        Admission::Serve(Negotiated(core.protocol))
+    }
 }
 
 /// What a connection is for.
@@ -84,23 +179,47 @@ pub enum SessionRef {
 }
 
 /// The first frame of every connection: who the client is.
+///
+/// The fields before `role` are the [`HelloCore`], which a daemon reads
+/// before it knows what `role` can say at the client's protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
-    /// The protocol the client speaks.
+    /// The newest protocol the client speaks.
     pub protocol: u16,
+    /// The oldest protocol the client speaks.
+    pub floor: u16,
     /// The client's stow version.
     pub stow_version: String,
+    /// The client's runtime executable, OS-encoded: what a daemon that
+    /// must give way to this client starts as its successor.
+    pub executable: Vec<u8>,
     /// What the connection is for.
     pub role: Role,
 }
 
+/// The part of a [`Hello`] that never changes between protocols.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelloCore {
+    /// The newest protocol the client speaks.
+    pub protocol: u16,
+    /// The oldest protocol the client speaks.
+    pub floor: u16,
+    /// The client's stow version.
+    pub stow_version: String,
+    /// The client's runtime executable, OS-encoded.
+    pub executable: Vec<u8>,
+}
+
 impl Hello {
-    /// The hello of this build, for a connection of `role`.
+    /// The hello of this build, for a connection of `role` from the stow
+    /// runtime executable `executable`.
     #[must_use]
-    pub fn new(role: Role) -> Self {
+    pub fn new(role: Role, executable: &Path) -> Self {
         Self {
             protocol: PROTOCOL,
+            floor: PROTOCOL_FLOOR,
             stow_version: env!("CARGO_PKG_VERSION").to_owned(),
+            executable: os_bytes::encode(executable.as_os_str()),
             role,
         }
     }
@@ -151,8 +270,10 @@ pub enum Response {
     Status {
         /// The daemon's stow version.
         stow_version: String,
-        /// The protocol the daemon speaks.
+        /// The newest protocol the daemon speaks.
         protocol: u16,
+        /// The oldest protocol the daemon speaks.
+        floor: u16,
     },
     /// The daemon refused the connection; it closes it after this frame.
     Rejected {
@@ -176,6 +297,15 @@ pub enum Response {
     Answer(crate::daemon::wrapper::Answer),
 }
 
+impl Response {
+    /// Whether this is one of the core responses, which every peer reads
+    /// whatever protocol stamps the frame.
+    #[must_use]
+    pub const fn is_core(&self) -> bool {
+        matches!(self, Self::Status { .. } | Self::Rejected { .. })
+    }
+}
+
 /// One frame as it came off the wire: the protocol number the sender
 /// stamped on it and the undecoded JSON.
 #[derive(Debug)]
@@ -196,7 +326,19 @@ impl Frame {
     }
 }
 
-/// Encode `message` as one frame.
+/// Encode `message` as one frame stamped with this build's [`PROTOCOL`]:
+/// every client frame is.
+///
+/// # Errors
+///
+/// The message does not serialize, or is larger than a frame may be.
+pub fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>> {
+    encode_at(PROTOCOL, message)
+}
+
+/// Encode `message` as one frame stamped `stamp`: a daemon writes at the
+/// protocol its client's connection negotiated, and a test plays a peer of
+/// another version.
 ///
 /// # Errors
 ///
@@ -206,7 +348,7 @@ impl Frame {
 ///
 /// Never in practice: a frame within [`MAX_FRAME_BYTES`] fits its `u32`
 /// length.
-pub fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>> {
+pub fn encode_at<T: Serialize>(stamp: u16, message: &T) -> Result<Vec<u8>> {
     let payload = serde_json::to_vec(message).wrap_err("encode the daemon frame")?;
     let length = payload.len() + PROTOCOL_BYTES;
     if length > MAX_FRAME_BYTES {
@@ -217,9 +359,29 @@ pub fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>> {
     let length = u32::try_from(length).expect("a frame within the limit fits a u32");
     let mut frame = Vec::with_capacity(HEADER_BYTES + payload.len());
     frame.extend_from_slice(&length.to_be_bytes());
-    frame.extend_from_slice(&PROTOCOL.to_be_bytes());
+    frame.extend_from_slice(&stamp.to_be_bytes());
     frame.extend_from_slice(&payload);
     Ok(frame)
+}
+
+/// Decode a daemon's answer. A core response is read whatever protocol
+/// stamps it; anything else only when this build speaks that protocol.
+///
+/// # Errors
+///
+/// The frame is not a response, or is stamped with a protocol this build
+/// does not speak and is not a core response.
+pub fn read_response(frame: &Frame) -> Result<Response> {
+    if speaks(frame.protocol) {
+        return frame.decode();
+    }
+    match frame.decode::<Response>() {
+        Ok(response) if response.is_core() => Ok(response),
+        _ => Err(stow_types::stow_error!(
+            "the stow daemon speaks protocol {}, this stow speaks {PROTOCOL_FLOOR} through {PROTOCOL}",
+            frame.protocol
+        )),
+    }
 }
 
 /// The payload length a header announces, and the protocol it carries.
@@ -253,16 +415,46 @@ pub fn read_frame<R: Read>(reader: &mut R) -> Result<Frame> {
     Ok(Frame { protocol, payload })
 }
 
-/// Write `message` as one frame and flush, on the daemon's side.
+/// Write `message` as one frame stamped `at` and flush, on the daemon's
+/// side.
 ///
 /// # Errors
 ///
 /// The message does not encode or the write fails.
 pub async fn write_frame_async<W: AsyncWrite + Unpin + Send, T: Serialize + Sync>(
     writer: &mut W,
+    at: Negotiated,
     message: &T,
 ) -> Result<()> {
-    let frame = encode(message)?;
+    write_stamped(writer, at.protocol(), message).await
+}
+
+/// Write the core response `response` stamped with the protocol of a peer
+/// that has not been admitted, so the peer reads it.
+///
+/// # Errors
+///
+/// The write fails.
+///
+/// # Panics
+///
+/// In a debug build, when `response` is not a core response: a peer of
+/// another protocol may not read it.
+pub async fn write_core_async<W: AsyncWrite + Unpin + Send>(
+    writer: &mut W,
+    peer: u16,
+    response: &Response,
+) -> Result<()> {
+    debug_assert!(response.is_core(), "{response:?} is not a core response");
+    write_stamped(writer, peer, response).await
+}
+
+async fn write_stamped<W: AsyncWrite + Unpin + Send, T: Serialize + Sync>(
+    writer: &mut W,
+    stamp: u16,
+    message: &T,
+) -> Result<()> {
+    let frame = encode_at(stamp, message)?;
     writer
         .write_all(&frame)
         .await
@@ -300,7 +492,12 @@ pub async fn read_frame_async<R: AsyncRead + Unpin + Send>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlRequest, Hello, PROTOCOL, Response, Role, encode, read_frame};
+    use std::path::Path;
+
+    use super::{
+        Admission, ControlRequest, Hello, HelloCore, PROTOCOL, PROTOCOL_FLOOR, Response, Role,
+        encode, encode_at, negotiate, read_frame, read_response,
+    };
     use crate::daemon::session::SessionFacts;
 
     #[test]
@@ -316,22 +513,177 @@ mod tests {
         assert_eq!(frame, expected);
     }
 
+    /// The bytes of `message` after the frame header.
+    fn json_of<T: serde::Serialize>(message: &T) -> String {
+        String::from_utf8(encode_at(0, message).expect("encode")[6..].to_vec()).expect("utf8")
+    }
+
+    /// The core never changes between protocols, so a peer of any version
+    /// reads it: any change to one of these encodings fails here.
+    #[test]
+    fn the_core_encodings_are_pinned() {
+        assert_eq!(
+            json_of(&Hello {
+                protocol: 4,
+                floor: 4,
+                stow_version: "1.2.3".to_owned(),
+                executable: b"/s".to_vec(),
+                role: Role::Control,
+            }),
+            r#"{"protocol":4,"floor":4,"stow_version":"1.2.3","executable":[47,115],"role":"Control"}"#
+        );
+        assert_eq!(json_of(&ControlRequest::Status), r#"{"request":"Status"}"#);
+        assert_eq!(
+            json_of(&Response::Status {
+                stow_version: "1.2.3".to_owned(),
+                protocol: 4,
+                floor: 4,
+            }),
+            r#"{"response":"Status","stow_version":"1.2.3","protocol":4,"floor":4}"#
+        );
+        // Byte-identical to the refusal of the released 0.16 daemon, which
+        // speaks protocol 1.
+        assert_eq!(
+            json_of(&Response::Rejected {
+                reason: "no".to_owned()
+            }),
+            r#"{"response":"Rejected","reason":"no"}"#
+        );
+    }
+
+    /// An older daemon reads a newer client's protocol and executable even
+    /// when the client's role has variants the daemon does not know.
+    #[test]
+    fn a_hello_decodes_as_its_core_whatever_its_role() {
+        let hello = br#"{"protocol":9,"floor":4,"stow_version":"9.0.0","executable":[47,115],"role":{"Wrapper":{"session":{"Unheard":1}}}}"#;
+        let core: HelloCore = serde_json::from_slice(hello).expect("core");
+        assert_eq!(
+            core,
+            HelloCore {
+                protocol: 9,
+                floor: 4,
+                stow_version: "9.0.0".to_owned(),
+                executable: b"/s".to_vec(),
+            }
+        );
+        assert!(serde_json::from_slice::<Hello>(hello).is_err());
+    }
+
+    fn core_at(protocol: u16, floor: u16) -> HelloCore {
+        HelloCore {
+            protocol,
+            floor,
+            stow_version: "1.0.0".to_owned(),
+            executable: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_client_inside_the_daemons_range_is_served_at_its_own_protocol() {
+        for client in 3..=5 {
+            assert!(
+                matches!(
+                    negotiate(&core_at(client, client), &(3..=5)),
+                    Admission::Serve(at) if at.protocol() == client
+                ),
+                "{client}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_client_above_the_daemons_range_is_newer() {
+        assert_eq!(negotiate(&core_at(6, 4), &(3..=5)), Admission::Newer);
+    }
+
+    #[test]
+    fn a_client_below_the_daemons_floor_is_refused_in_its_own_protocol() {
+        let Admission::Older { peer, reason } = negotiate(&core_at(2, 2), &(3..=5)) else {
+            panic!("a client below the floor is refused");
+        };
+        assert_eq!(peer, 2);
+        assert!(
+            reason.contains("protocols 2 through 2") && reason.contains("protocols 3 through 5"),
+            "{reason}"
+        );
+    }
+
+    /// A daemon writes every frame at the protocol it negotiated, which an
+    /// older client in its range then reads.
+    #[tokio::test]
+    async fn a_daemon_stamps_its_frames_with_the_negotiated_protocol() {
+        let Admission::Serve(at) = negotiate(&core_at(3, 3), &(3..=5)) else {
+            panic!("protocol 3 is in the range");
+        };
+        let mut wire = Vec::new();
+        super::write_frame_async(&mut wire, at, &Response::Working)
+            .await
+            .expect("write");
+        let frame = read_frame(&mut wire.as_slice()).expect("frame");
+        assert_eq!(frame.protocol, 3);
+        assert_eq!(
+            frame.decode::<Response>().expect("response"),
+            Response::Working
+        );
+    }
+
+    /// The daemon of this build serves exactly the protocols it reads.
+    #[test]
+    fn this_builds_range_is_what_it_speaks() {
+        assert!(super::speaks(PROTOCOL) && super::speaks(PROTOCOL_FLOOR));
+        assert!(!super::speaks(PROTOCOL + 1) && !super::speaks(PROTOCOL_FLOOR - 1));
+    }
+
+    /// A frame stamped outside the range decodes only as the core.
+    #[test]
+    fn a_response_stamped_outside_the_range_decodes_only_as_core() {
+        let foreign = PROTOCOL + 1;
+        let read = |response: &Response| {
+            let wire = encode_at(foreign, response).expect("encode");
+            read_response(&read_frame(&mut wire.as_slice()).expect("frame"))
+        };
+        for core in [
+            Response::Rejected {
+                reason: "no".to_owned(),
+            },
+            Response::Status {
+                stow_version: "9.0.0".to_owned(),
+                protocol: foreign,
+                floor: foreign,
+            },
+        ] {
+            assert_eq!(read(&core).expect("a core response"), core);
+        }
+        let error = read(&Response::Working).expect_err("not core");
+        assert!(error.to_string().contains("speaks protocol"), "{error}");
+        let wire = encode_at(PROTOCOL, &Response::Working).expect("encode");
+        assert_eq!(
+            read_response(&read_frame(&mut wire.as_slice()).expect("frame")).expect("in range"),
+            Response::Working
+        );
+    }
+
+    fn hello(role: Role) -> Hello {
+        Hello::new(role, Path::new("/stow"))
+    }
+
     #[test]
     fn frames_round_trip_in_sequence() {
-        let mut wire = encode(&Hello::new(Role::Control)).expect("hello");
+        let mut wire = encode(&hello(Role::Control)).expect("hello");
         wire.extend(
             encode(&Response::Status {
                 stow_version: "1.2.3".to_owned(),
                 protocol: PROTOCOL,
+                floor: PROTOCOL_FLOOR,
             })
             .expect("status"),
         );
         let mut reader = wire.as_slice();
-        let hello = read_frame(&mut reader).expect("first");
-        assert_eq!(hello.protocol, PROTOCOL);
+        let first = read_frame(&mut reader).expect("first");
+        assert_eq!(first.protocol, PROTOCOL);
         assert_eq!(
-            hello.decode::<Hello>().expect("hello"),
-            Hello::new(Role::Control)
+            first.decode::<Hello>().expect("hello"),
+            hello(Role::Control)
         );
         let status = read_frame(&mut reader).expect("second");
         assert_eq!(
@@ -339,6 +691,7 @@ mod tests {
             Response::Status {
                 stow_version: "1.2.3".to_owned(),
                 protocol: PROTOCOL,
+                floor: PROTOCOL_FLOOR,
             }
         );
     }
