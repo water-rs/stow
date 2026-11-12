@@ -41,9 +41,26 @@ impl ToolchainKey {
 #[derive(Debug, Default)]
 pub struct CargoSlot {
     session: OnceCell<Arc<Session<Cargo>>>,
+    /// The cargo outlived the daemon that held its session: what that
+    /// session knew is gone, so this cargo's wrappers are refused.
+    outlived_daemon: bool,
 }
 
 impl CargoSlot {
+    /// The slot of a cargo that outlived the daemon that held its session.
+    fn outlived_daemon() -> Self {
+        Self {
+            session: OnceCell::new(),
+            outlived_daemon: true,
+        }
+    }
+
+    /// Whether the cargo outlived the daemon that held its session.
+    #[must_use]
+    pub const fn is_outlived_daemon(&self) -> bool {
+        self.outlived_daemon
+    }
+
     /// The cargo's session, when it is open.
     #[must_use]
     pub fn session(&self) -> Option<Arc<Session<Cargo>>> {
@@ -82,6 +99,7 @@ enum Command {
         reply: oneshot::Sender<Arc<CargoSlot>>,
     },
     RemoveCargo(CargoOwner),
+    OutlivedDaemon(CargoOwner),
     ToolchainProbe {
         key: ToolchainKey,
         reply: oneshot::Sender<Option<Arc<String>>>,
@@ -126,6 +144,9 @@ impl SessionTable {
                     }
                     Command::RemoveCargo(owner) => {
                         cargos.remove(&owner);
+                    }
+                    Command::OutlivedDaemon(owner) => {
+                        cargos.insert(owner, Arc::new(CargoSlot::outlived_daemon()));
                     }
                     Command::ToolchainProbe { key, reply } => {
                         let _ = reply.send(probes.get(&key).cloned());
@@ -181,6 +202,12 @@ impl SessionTable {
     /// on opens a session of its own.
     pub fn remove_cargo(&self, owner: CargoOwner) {
         self.send(Command::RemoveCargo(owner));
+    }
+
+    /// Record that the cargo `owner` outlived the daemon that held its
+    /// session, so its wrappers are refused until [`Self::remove_cargo`].
+    pub fn outlived_daemon(&self, owner: CargoOwner) {
+        self.send(Command::OutlivedDaemon(owner));
     }
 
     /// The `rustc -vV` answer remembered for `key`.

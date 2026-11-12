@@ -436,3 +436,100 @@ fn a_killed_cargo_ends_its_session_while_its_build_script_lives() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// A daemon that restarts under a running cargo has lost the session's
+/// in-flight state and provenance marks: the new daemon refuses that
+/// cargo's wrappers, so the build fails naming the restart instead of
+/// compiling against marks that no longer exist. Once the cargo has exited
+/// the refusal and its record are gone.
+#[test]
+fn a_cargo_whose_daemon_restarted_is_refused_until_it_exits() {
+    let dir = support::tempdir().expect("temp dir");
+    let cache = support::tempdir().expect("cache dir");
+    let cargo_home = support::tempdir().expect("cargo home");
+    let tools = support::tempdir().expect("tools dir");
+    let rendezvous = support::tempdir().expect("rendezvous");
+    write_crate(dir.path());
+    std::fs::write(
+        dir.path().join("build.rs"),
+        include_str!("fixtures/rendezvous_build.rs"),
+    )
+    .expect("write the build script");
+    support::write_global_config(
+        &[&dir.path().join("stow-home")],
+        "[cache]\nremote = false\n",
+    );
+    let shim = install_shims(tools.path());
+    let daemon = PrivateDaemon::in_home(&dir.path().join("stow-home"));
+
+    let cargo = cargo_build_command(
+        dir.path(),
+        cargo_home.path(),
+        Some(&shim),
+        cache.path(),
+        &dir.path().join("target"),
+    )
+    .env("STOW_TEST_RENDEZVOUS", rendezvous.path())
+    .env("STOW_TEST_BUILD_NAME", "held")
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("start cargo");
+
+    // The script's own compile opened the session before the script ran.
+    let started = rendezvous.path().join("held.started");
+    let deadline = Instant::now() + END_LIMIT;
+    while !started.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the build never reached its script"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(daemon.log_lines("opened a session for a cargo").len(), 1);
+
+    // The daemon dies under the build; the next wrapper starts another.
+    daemon.crash();
+    std::fs::write(rendezvous.path().join("release"), b"").expect("release the script");
+    let output = cargo.wait_with_output().expect("wait for cargo");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the build went on against a restarted daemon:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("the stow daemon restarted during this cargo build"),
+        "the failure does not name the restart:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("daemon.log"),
+        "the failure does not name the daemon's log:\n{stderr}"
+    );
+    assert_eq!(
+        daemon.serving_pids().len(),
+        2,
+        "a second daemon served the cargo's wrappers"
+    );
+
+    // The cargo is gone: nothing refuses it, and nothing of it is kept.
+    wait_for_log(
+        &daemon,
+        "a cargo that outlived the previous daemon has exited",
+    );
+    let sessions = daemon.run_dir().join("sessions");
+    let deadline = Instant::now() + END_LIMIT;
+    while std::fs::read_dir(&sessions)
+        .into_iter()
+        .flatten()
+        .next()
+        .is_some()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the record of the exited cargo is still in {}",
+            sessions.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

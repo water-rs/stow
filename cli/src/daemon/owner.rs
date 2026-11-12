@@ -35,6 +35,10 @@ pub trait Processes: Clone + Send + Sync + 'static {
     ///
     /// As [`ExitWatch::arm`].
     fn watch(&self, owner: CargoOwner) -> Result<BoxFuture<'static, io::Result<()>>, String>;
+
+    /// Whether the process `owner` names is still running: its id is in use
+    /// by a process that started when `owner` did.
+    fn is_running(&self, owner: CargoOwner) -> bool;
 }
 
 /// The processes of the machine this daemon runs on.
@@ -49,6 +53,12 @@ impl Processes for OsProcesses {
     fn watch(&self, owner: CargoOwner) -> Result<BoxFuture<'static, io::Result<()>>, String> {
         let watch = ExitWatch::arm(owner, &OsProcessTable)?;
         Ok(Box::pin(watch.exited()))
+    }
+
+    fn is_running(&self, owner: CargoOwner) -> bool {
+        OsProcessTable
+            .started(owner.pid)
+            .is_ok_and(|started| started == owner.started)
     }
 }
 

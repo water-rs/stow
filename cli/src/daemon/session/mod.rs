@@ -27,11 +27,12 @@ use tracing::Instrument as _;
 
 pub use cargo::{Cargo, Opener, open_facts};
 pub use facts::{BuildFacts, DriverFacts, Seed, SessionFacts};
-pub use id::{SessionDir, SessionId};
+pub use id::{SessionDir, SessionId, keep_only_owner, recorded_owner};
 pub use resources::{CacheDirHandles, Resources};
 
 use crate::cache_policy;
 use crate::config::StowConfig;
+use crate::daemon::owner::CargoOwner;
 use crate::daemon::wrapper::InvocationEnv;
 use crate::session_env::SessionEnv;
 use crate::toolchain::BuildToolchain;
@@ -206,11 +207,14 @@ impl Session<Cargo> {
     /// As [`Session::open`].
     pub(crate) async fn open_cargo(
         id: SessionId,
+        owner: CargoOwner,
         build: BuildFacts,
         handles: &CacheDirHandles,
         sessions: &Path,
     ) -> Result<Arc<Self>> {
-        Self::assemble(id, build, Cargo::default(), handles, sessions).await
+        let session = Self::assemble(id, build, Cargo::default(), handles, sessions).await?;
+        session.dir.record_owner(owner)?;
+        Ok(session)
     }
 
     /// What the build's driver does once cargo has exited, for a build
@@ -1072,6 +1076,7 @@ mod tests {
         let build = facts(target.path(), None).await.build;
         let session = Session::open_cargo(
             SessionId::mint(),
+            CargoOwner { pid: 1, started: 1 },
             build,
             &CacheDirHandles::default(),
             sessions.path(),

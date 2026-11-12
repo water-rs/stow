@@ -36,7 +36,8 @@ use super::protocol::{
     WrapperRequest, read_frame_async, speaks, write_frame_async,
 };
 use super::session::{
-    CacheDirHandles, Cargo, Opener, Origin, Session, SessionFacts, SessionId, open_facts, os_bytes,
+    CacheDirHandles, Cargo, Opener, Origin, Session, SessionFacts, SessionId, keep_only_owner,
+    open_facts, os_bytes, recorded_owner,
 };
 use super::table::SessionTable;
 use super::{RunDir, Settings};
@@ -93,15 +94,21 @@ pub async fn run(ready: Option<PathBuf>) -> Result<()> {
         return Ok(());
     };
     // The lock is held, so no process of a previous daemon is alive: every
-    // session directory under the run directory is a dead build's.
+    // session directory under the run directory is a dead build's. A cargo
+    // that is still running keeps only the record of its owner: its build
+    // lost the session's in-flight state and provenance marks, so its
+    // wrappers are refused until it exits.
     let sessions = run_dir.sessions();
     let swept = blocking({
         let sessions = sessions.clone();
-        move || sweep_sessions(&sessions)
+        move || sweep_sessions(&sessions, &OsProcesses)
     })
     .await?;
-    if swept > 0 {
-        tracing::info!(swept, "removed the sessions a previous daemon left");
+    if swept.removed > 0 {
+        tracing::info!(
+            swept = swept.removed,
+            "removed the sessions a previous daemon left"
+        );
     }
     let endpoint = run_dir.endpoint();
     let listener = bind(&endpoint).await?;
@@ -112,6 +119,9 @@ pub async fn run(ready: Option<PathBuf>) -> Result<()> {
         table: SessionTable::start(),
         processes: OsProcesses,
     };
+    for outlived in swept.outlived {
+        refuse_until_exit(&daemon, outlived);
+    }
     tracing::info!(
         pid = std::process::id(),
         endpoint = %endpoint.display(),
@@ -130,25 +140,82 @@ async fn blocking<T: Send + 'static>(
         .wrap_err("run the daemon's blocking work")?
 }
 
-/// Remove every session directory under `sessions`, returning how many.
-fn sweep_sessions(sessions: &Path) -> Result<usize> {
+/// What a start of the daemon found under the sessions directory.
+#[derive(Debug, Default)]
+struct Swept {
+    /// The session directories removed.
+    removed: usize,
+    /// The cargos still running whose session a previous daemon held.
+    outlived: Vec<Outlived>,
+}
+
+/// A cargo that outlived the daemon that held its session, and the
+/// directory that records it.
+#[derive(Debug)]
+struct Outlived {
+    owner: CargoOwner,
+    dir: PathBuf,
+}
+
+/// Remove every session directory under `sessions`, except the owner
+/// record of a cargo that is still running.
+fn sweep_sessions(sessions: &Path, processes: &impl Processes) -> Result<Swept> {
     let entries = match std::fs::read_dir(sessions) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Swept::default()),
         Err(error) => {
             return Err(error).wrap_err_with(|| format!("list {}", sessions.display()));
         }
     };
-    let mut swept = 0;
+    let mut swept = Swept::default();
     for entry in entries {
         let path = entry
             .wrap_err_with(|| format!("list {}", sessions.display()))?
             .path();
-        std::fs::remove_dir_all(&path)
-            .wrap_err_with(|| format!("remove the dead session {}", path.display()))?;
-        swept += 1;
+        match recorded_owner(&path)? {
+            Some(owner) if processes.is_running(owner) => {
+                keep_only_owner(&path)?;
+                swept.outlived.push(Outlived { owner, dir: path });
+            }
+            _ => {
+                std::fs::remove_dir_all(&path)
+                    .wrap_err_with(|| format!("remove the dead session {}", path.display()))?;
+                swept.removed += 1;
+            }
+        }
     }
     Ok(swept)
+}
+
+/// Refuse the wrappers of `outlived`'s cargo until it exits, then forget it
+/// and remove the record of it.
+fn refuse_until_exit<P: Processes>(daemon: &Daemon<P>, outlived: Outlived) {
+    let Outlived { owner, dir } = outlived;
+    let exited = match daemon.processes.watch(owner) {
+        Ok(exited) => exited,
+        Err(reason) => {
+            // Gone or replaced by another process between the sweep and the
+            // watch: there is nothing left to refuse.
+            tracing::warn!(%owner, %reason, "a cargo that outlived the previous daemon cannot be watched");
+            if let Err(error) = std::fs::remove_dir_all(&dir) {
+                tracing::warn!(%error, dir = %dir.display(), "remove the record of a cargo");
+            }
+            return;
+        }
+    };
+    daemon.table.outlived_daemon(owner);
+    tracing::info!(%owner, "a cargo outlived the previous daemon; refusing its wrappers until it exits");
+    let table = daemon.table.clone();
+    tokio::spawn(async move {
+        if let Err(error) = exited.await {
+            tracing::warn!(%owner, %error, "watching a cargo for its exit failed; no longer refusing it");
+        }
+        table.remove_cargo(owner);
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(%error, dir = %dir.display(), "remove the record of a cargo");
+        }
+        tracing::info!(%owner, "a cargo that outlived the previous daemon has exited");
+    });
 }
 
 /// Send the client that spawned this daemon its notification, when it
@@ -684,6 +751,13 @@ where
     };
     let every = daemon.settings.answer / 2;
     let slot = daemon.table.cargo_slot(owner).await;
+    if slot.is_outlived_daemon() {
+        return reject(
+            &mut stream,
+            "the stow daemon restarted during this cargo build: its in-flight state and provenance marks are gone; run the build again".to_owned(),
+        )
+        .await;
+    }
     if let Some(session) = slot.session() {
         return converse(&mut stream, &session, every, Some(first)).await;
     }
@@ -796,7 +870,7 @@ async fn open_cargo_session<P: Processes>(
     // the open rather than leaving a session nothing ends.
     let exited = daemon.processes.watch(owner)?;
     let id = SessionId::mint();
-    let session = Session::open_cargo(id, build, &handles, &daemon.sessions)
+    let session = Session::open_cargo(id, owner, build, &handles, &daemon.sessions)
         .await
         .map_err(|error| format!("{error:#}"))?;
     tracing::info!(session = %id, %owner, "opened a session for a cargo");
@@ -848,7 +922,7 @@ mod tests {
 
     use tokio::io::{AsyncWriteExt as _, DuplexStream};
 
-    use super::{Daemon, serve_connection, sweep_sessions, working_meanwhile};
+    use super::{Daemon, refuse_until_exit, serve_connection, sweep_sessions, working_meanwhile};
     use crate::daemon::Settings;
     use crate::daemon::events::SessionLogs;
     use crate::daemon::owner::{CargoOwner, Processes};
@@ -935,6 +1009,16 @@ mod tests {
                     .map(|_| ())
                     .map_err(std::io::Error::other)
             }))
+        }
+
+        fn is_running(&self, owner: CargoOwner) -> bool {
+            !self
+                .state
+                .lock()
+                .expect("machine")
+                .exited
+                .get(&owner.pid)
+                .is_some_and(|exited| *exited.borrow())
         }
     }
 
@@ -1222,12 +1306,79 @@ mod tests {
             std::fs::create_dir_all(dir.join("local-build")).expect("session dir");
             std::fs::write(dir.join("local-build").join("mark"), b"x").expect("mark");
         }
-        assert_eq!(sweep_sessions(sessions.path()).expect("sweep"), 2);
+        let machine = Machine::default();
+        let swept = sweep_sessions(sessions.path(), &machine).expect("sweep");
+        assert_eq!(swept.removed, 2);
+        assert!(swept.outlived.is_empty());
         assert_eq!(std::fs::read_dir(sessions.path()).expect("list").count(), 0);
         assert_eq!(
-            sweep_sessions(&sessions.path().join("missing")).expect("a missing directory"),
+            sweep_sessions(&sessions.path().join("missing"), &machine)
+                .expect("a missing directory")
+                .removed,
             0
         );
+    }
+
+    /// A session of a cargo that is still running keeps only the record of
+    /// its owner; the session of one that exited, and a driver's, go.
+    #[tokio::test]
+    async fn a_sweep_keeps_only_the_record_of_a_cargo_that_is_still_running() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let machine = Machine::default();
+        let running = CargoOwner { pid: 7, started: 1 };
+        let gone = CargoOwner { pid: 8, started: 1 };
+        for (name, owner) in [
+            ("running", Some(running)),
+            ("gone", Some(gone)),
+            ("driver", None),
+        ] {
+            let dir = sessions.path().join(name);
+            std::fs::create_dir_all(dir.join("local-build")).expect("session dir");
+            std::fs::write(dir.join("local-build").join("mark"), b"x").expect("mark");
+            if let Some(owner) = owner {
+                std::fs::write(
+                    dir.join("owner"),
+                    format!("{} {}\n", owner.pid, owner.started),
+                )
+                .expect("owner record");
+            }
+        }
+        machine.exit(8);
+
+        let swept = sweep_sessions(sessions.path(), &machine).expect("sweep");
+        assert_eq!(swept.removed, 2);
+        assert_eq!(swept.outlived.len(), 1);
+        let kept = &swept.outlived[0];
+        assert_eq!(kept.owner, running);
+        assert_eq!(
+            std::fs::read_dir(&kept.dir)
+                .expect("list")
+                .map(|entry| entry.expect("entry").file_name())
+                .collect::<Vec<_>>(),
+            [OsString::from("owner")],
+            "the marks are gone, the record stays"
+        );
+
+        // Its wrappers are refused until it exits, and then it is a cargo
+        // like any other.
+        let target = tempfile::tempdir().expect("target");
+        let daemon = Daemon {
+            processes: machine,
+            ..daemon(sessions.path())
+        };
+        let request = unit_request(target.path()).await;
+        let outlived = swept.outlived.into_iter().next().expect("outlived");
+        let dir = outlived.dir.clone();
+        refuse_until_exit(&daemon, outlived);
+        let (_wrapper, _task, refused) = wrapper_of(&daemon, 70, 7, &request).await;
+        let Response::Rejected { reason } = refused else {
+            panic!("a cargo that outlived the daemon is refused: {refused:?}");
+        };
+        assert!(reason.contains("daemon restarted"), "{reason}");
+        daemon.processes.exit(7);
+        until(|| !dir.exists()).await;
+        let (_wrapper, _task, asked) = wrapper_of(&daemon, 71, 7, &request).await;
+        assert_eq!(asked, Response::Answer(Answer::Describe));
     }
 
     #[tokio::test]
