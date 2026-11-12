@@ -77,6 +77,16 @@ enum Reply {
         stow_version: String,
         until: Duration,
     },
+    /// The daemon speaks a protocol too old to ask to retire and refused
+    /// this stow's hello.
+    TooOld {
+        /// The protocol stamped on its refusal.
+        protocol: u16,
+        /// Why it refused.
+        reason: String,
+        /// The process that serves the connection, when the platform says.
+        pid: Option<u32>,
+    },
 }
 
 /// Waiting for the successor of a daemon that answered
@@ -164,17 +174,35 @@ impl Connection {
     /// something else, or refuses the connection.
     fn status_once(self) -> Result<Reply> {
         let answer = self.answer;
-        let log = self.log;
+        let log = &self.log;
         #[cfg(unix)]
-        let reply = exchange(self.stream, &self.exe);
+        let reply = exchange(&self.stream, &self.exe);
         #[cfg(windows)]
-        let reply = with_deadline(answer, move || exchange(self.stream, &self.exe));
-        reply.wrap_err_with(|| {
+        let reply = {
+            let stream = self
+                .stream
+                .try_clone()
+                .wrap_err("share the daemon connection with the exchange thread")?;
+            let exe = self.exe.clone();
+            with_deadline(answer, move || exchange(stream, &exe))
+        };
+        let reply = reply.wrap_err_with(|| {
             format!(
                 "the running stow daemon ({}) did not complete a status exchange within {} s",
-                describe_daemon(&log),
+                describe_daemon(log),
                 answer.as_secs()
             )
+        })?;
+        Ok(match reply {
+            // The process that refused is the one this connection reaches.
+            Reply::TooOld {
+                protocol, reason, ..
+            } => Reply::TooOld {
+                protocol,
+                reason,
+                pid: super::peer::server_pid(&self.stream).ok(),
+            },
+            reply => reply,
         })
     }
 }
@@ -205,9 +233,17 @@ pub fn describe_daemon(log: &Path) -> String {
 /// does not hand over within the bound ([`Succession`]).
 pub fn status_of(exe: &Path, settings: Settings) -> Result<StatusReply> {
     let mut succession = Succession::new(settings, exe);
+    let mut ended = None;
     loop {
         match connect_or_start(exe, settings)?.status_once()? {
             Reply::Status(status) => return Ok(status),
+            Reply::TooOld {
+                protocol,
+                reason,
+                pid,
+            } => {
+                ended = end_too_old(ended, protocol, &reason, pid, settings)?;
+            }
             Reply::Retiring {
                 stow_version,
                 until,
@@ -219,6 +255,53 @@ pub fn status_of(exe: &Path, settings: Settings) -> Result<StatusReply> {
     }
 }
 
+/// End the daemon at the other end of a connection that refused this
+/// stow's hello in a protocol too old to be asked to retire, so that the
+/// start path starts one of this stow's. A daemon that is ended once and is
+/// found again is not ended a second time: whatever starts it starts an old
+/// stow, and that is the failure.
+///
+/// `ended` is the protocol of the daemon already ended, if any; the result
+/// is what it is now.
+///
+/// # Errors
+///
+/// One was already ended, the platform does not say which process it is,
+/// or it does not exit within the start bound.
+pub fn end_too_old(
+    ended: Option<u16>,
+    protocol: u16,
+    reason: &str,
+    pid: Option<u32>,
+    settings: Settings,
+) -> Result<Option<u16>> {
+    if let Some(first) = ended {
+        return Err(stow_types::stow_error!(
+            "the stow daemon (protocol {protocol}) that started after one of protocol {first} was ended still cannot be asked to retire: {reason}; \
+             what starts the daemon runs a stow older than this one{}",
+            if cfg!(windows) {
+                " (run `stow setup` from this stow to register its task)"
+            } else {
+                ""
+            }
+        ));
+    }
+    let pid = pid.ok_or_else(|| {
+        stow_types::stow_error!(
+            "the stow daemon speaks protocol {protocol}, which cannot be asked to retire ({reason}), and the platform does not say which process it is"
+        )
+    })?;
+    tracing::warn!(
+        pid,
+        protocol,
+        %reason,
+        "the stow daemon is too old to retire; ending it so that this stow starts one"
+    );
+    super::peer::end(pid, settings.start)
+        .wrap_err_with(|| format!("end the stow daemon (pid {pid}, protocol {protocol})"))?;
+    Ok(Some(protocol))
+}
+
 fn exchange<S: Read + Write>(mut stream: S, exe: &Path) -> Result<Reply> {
     let mut request = protocol::encode(&Hello::new(Role::Control, exe))?;
     request.extend(protocol::encode(&ControlRequest::Status)?);
@@ -228,6 +311,13 @@ fn exchange<S: Read + Write>(mut stream: S, exe: &Path) -> Result<Reply> {
         .wrap_err("send Hello and Status to the daemon")?;
     let frame = protocol::read_frame(&mut stream)?;
     match protocol::read_response(&frame)? {
+        Response::Rejected { reason } if !protocol::can_retire(frame.protocol) => {
+            Ok(Reply::TooOld {
+                protocol: frame.protocol,
+                reason,
+                pid: None,
+            })
+        }
         Response::Status {
             stow_version,
             protocol,
@@ -673,6 +763,32 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("/stow"), "{error}");
+    }
+
+    #[test]
+    fn a_daemon_too_old_to_retire_is_ended_once_and_only_by_a_known_pid() {
+        use super::end_too_old;
+
+        let error = end_too_old(None, 1, "old", None, settings())
+            .expect_err("no process to end")
+            .to_string();
+        assert!(error.contains("protocol 1"), "{error}");
+
+        let error = end_too_old(Some(1), 1, "old", Some(1), settings())
+            .expect_err("a second daemon of the same kind")
+            .to_string();
+        assert!(
+            error.contains("still cannot be asked to retire") && error.contains("older"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn only_protocols_that_read_retire_can_be_asked() {
+        use crate::daemon::protocol::{RETIRE_SINCE, can_retire};
+
+        assert!(!can_retire(RETIRE_SINCE - 1));
+        assert!(can_retire(RETIRE_SINCE) && can_retire(RETIRE_SINCE + 1));
     }
 
     #[test]

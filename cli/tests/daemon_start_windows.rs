@@ -242,3 +242,29 @@ fn retire_onto_succeeds_a_running_daemon_through_the_task_and_starts_none() {
     assert_eq!(pids[0], first);
     assert_ne!(pids[1], first, "the successor is a new process");
 }
+
+/// The body of the child process [`support::spawn_old_daemon`] starts.
+#[test]
+fn old_daemon_child() {
+    support::old_daemon_child_body();
+}
+
+/// A daemon of a protocol too old to be asked to retire refuses this
+/// stow's hello. The client ends the process at the other end of its pipe
+/// and asks the task for a daemon of this stow.
+#[test]
+fn a_daemon_too_old_to_retire_is_ended_and_the_task_starts_a_new_one() {
+    let home = support::tempdir().expect("home");
+    let daemon = PrivateDaemon::in_home(home.path());
+    let run_dir = daemon.run_dir().to_owned();
+    let (old, reaped) = support::spawn_old_daemon(&run_dir);
+
+    assert_answered(client(&run_dir), Instant::now());
+
+    let status = reaped.join().expect("the old daemon's reaper");
+    assert!(!status.success(), "the old daemon was ended: {status:?}");
+    let [new] = daemon.serving_pids()[..] else {
+        panic!("one daemon serves: {:?}", daemon.serving_pids());
+    };
+    assert_ne!(new, old, "the daemon is a new process");
+}

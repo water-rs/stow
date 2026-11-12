@@ -327,6 +327,38 @@ fn a_replaced_install_serves_the_next_stow_build() {
     assert_replaced_once(&daemon, first);
 }
 
+/// The body of the child process [`support::spawn_old_daemon`] starts.
+#[test]
+fn old_daemon_child() {
+    support::old_daemon_child_body();
+}
+
+/// A daemon of a protocol too old to be asked to retire refuses the
+/// wrapper's hello. The wrapper ends it, starts a daemon of its own stow
+/// and the build succeeds on that one.
+#[test]
+fn a_plain_cargo_build_ends_a_daemon_too_old_to_retire() {
+    let install = Install::new();
+    let project = Project::new();
+    write_crate(project.dir.path());
+    let daemon = PrivateDaemon::in_home(&project.home());
+    let (old, reaped) = support::spawn_old_daemon(&project.run_dir());
+
+    succeeds(project.plain_build(&install, "target-a"), "the build");
+
+    let status = reaped.join().expect("the old daemon's reaper");
+    assert!(!status.success(), "the old daemon was ended: {status:?}");
+    let [new] = daemon.serving_pids()[..] else {
+        panic!("one daemon serves: {:?}", daemon.serving_pids());
+    };
+    assert_ne!(new, old, "the daemon is a new process");
+    assert_eq!(
+        daemon.log_lines("opened a session for a cargo").len(),
+        1,
+        "the build's session is the new daemon's"
+    );
+}
+
 /// Connect to the daemon of `run_dir`.
 #[cfg(unix)]
 fn endpoint(run_dir: &Path) -> std::io::Result<std::os::unix::net::UnixStream> {

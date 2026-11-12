@@ -13,13 +13,14 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, WriteHalf};
 use tokio::sync::{oneshot, watch};
 
 use super::events::SpanMirror;
+use super::peer::server_pid;
 use super::protocol::{
-    ControlRequest, Event, Hello, Response, Role, SessionRef, WrapperRequest, encode,
+    ControlRequest, Event, Hello, Response, Role, SessionRef, WrapperRequest, can_retire, encode,
     read_frame_async, read_response,
 };
 use super::relay::{RELAY_METHOD, RelayBody, RelayCall, mint_connection_id};
 use super::session::{SessionEnd, SessionFacts, SessionId};
-use super::start::{Succession, describe_daemon, status_of};
+use super::start::{Succession, describe_daemon, end_too_old, status_of};
 use super::{RunDir, Settings};
 use crate::daemon::session::handler::CONNECTION_DRAIN_BUDGET;
 use crate::daemon::session::os_bytes;
@@ -272,6 +273,14 @@ pub enum Exchanged {
         /// The time it has left to drain.
         until: Duration,
     },
+    /// The daemon speaks a protocol too old to ask to retire and refused
+    /// the wrapper's hello.
+    TooOld {
+        /// The protocol stamped on its refusal.
+        protocol: u16,
+        /// Why it refused.
+        reason: String,
+    },
 }
 
 /// A wrapper's conversation with its session: its first request carries
@@ -367,6 +376,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
             Exchanged::Retiring { stow_version, .. } => Err(self.explain(&format!(
                 "the stow daemon (stow {stow_version}) is giving way to another stow and did not serve the request"
             ))),
+            Exchanged::TooOld { reason, .. } => Err(self.explain(&format!(
+                "the stow daemon refused the request: {reason}"
+            ))),
         }
     }
 
@@ -449,6 +461,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
                         until: Duration::from_millis(until_millis),
                     });
                 }
+                Response::Rejected { reason } if !can_retire(frame.protocol) => {
+                    return Ok(Exchanged::TooOld {
+                        protocol: frame.protocol,
+                        reason,
+                    });
+                }
                 Response::Rejected { reason } => {
                     return Err(format!("the stow daemon refused the request: {reason}"));
                 }
@@ -517,6 +535,7 @@ pub struct DirectConnection {
 impl DirectConnection {
     async fn exchange(&mut self, request: &WrapperRequest) -> std::result::Result<Answer, String> {
         let mut succession = Succession::new(self.settings, &self.exe);
+        let mut ended = None;
         loop {
             let (stow_version, until) = match self.stream.exchange_replayable(request).await? {
                 Exchanged::Answer(answer) => return Ok(answer),
@@ -524,24 +543,42 @@ impl DirectConnection {
                     stow_version,
                     until,
                 } => (stow_version, until),
+                Exchanged::TooOld { protocol, reason } => {
+                    // The daemon at the other end cannot retire: it is
+                    // ended, and the start path starts this stow's.
+                    let pid = server_pid(&self.stream.stream).ok();
+                    let settings = self.settings;
+                    ended =
+                        smol::unblock(move || end_too_old(ended, protocol, &reason, pid, settings))
+                            .await
+                            .map_err(|error| self.reach.explain(&format!("{error:#}")))?;
+                    self.reconnect().await?;
+                    continue;
+                }
             };
             let pause = succession
                 .retiring(std::time::Instant::now(), &stow_version, until)
                 .map_err(|error| self.reach.explain(&format!("{error:#}")))?;
             tokio::time::sleep(pause).await;
-            // The same request, byte for byte, with the same hello, to
-            // whichever daemon serves now.
-            let stream = connect(self.exe.clone(), self.settings)
-                .await
-                .map_err(|error| self.reach.explain(&format!("{error:#}")))?;
-            self.stream = WrapperStream::new(
-                stream,
-                self.session.clone(),
-                self.settings.answer,
-                &self.exe,
-            )
-            .reaching(self.reach.clone());
+            self.reconnect().await?;
         }
+    }
+
+    /// A new conversation with whichever daemon serves now, which says
+    /// hello again: the request that follows is the one made before,
+    /// byte for byte.
+    async fn reconnect(&mut self) -> std::result::Result<(), String> {
+        let stream = connect(self.exe.clone(), self.settings)
+            .await
+            .map_err(|error| self.reach.explain(&format!("{error:#}")))?;
+        self.stream = WrapperStream::new(
+            stream,
+            self.session.clone(),
+            self.settings.answer,
+            &self.exe,
+        )
+        .reaching(self.reach.clone());
+        Ok(())
     }
 }
 

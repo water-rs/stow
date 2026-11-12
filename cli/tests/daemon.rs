@@ -405,6 +405,39 @@ fn a_retired_daemon_reexecs_keeping_its_pid_lock_and_endpoint() {
     assert_eq!(fixture.serving_pids(), [pid]);
 }
 
+/// The body of the child process [`support::spawn_old_daemon`] starts.
+#[test]
+fn old_daemon_child() {
+    support::old_daemon_child_body();
+}
+
+/// A daemon of a protocol older than any that can retire refuses this
+/// stow's hello. The client ends the process at the other end of its
+/// connection and takes the start path: it is served by a daemon of this
+/// stow, and the old one is gone.
+#[test]
+fn a_daemon_too_old_to_retire_is_ended_and_replaced() {
+    let fixture = Fixture::new();
+    let (old, reaped) = support::spawn_old_daemon(&fixture.run_dir());
+
+    assert_eq!(
+        run_status(&mut fixture.command(&["daemon", "status"])),
+        expected_status(),
+        "the client was served by a daemon of its own stow"
+    );
+
+    let status = reaped.join().expect("the old daemon's reaper");
+    assert!(!status.success(), "the old daemon was ended: {status:?}");
+    let [new] = fixture.serving_pids()[..] else {
+        panic!("one daemon serves: {:?}", fixture.serving_pids());
+    };
+    assert_ne!(
+        u32::try_from(new).expect("a pid"),
+        old,
+        "the daemon is a new process"
+    );
+}
+
 /// The body of the child process [`support::retire_onto_in_child`] runs.
 #[test]
 fn retire_onto_child() {

@@ -573,6 +573,143 @@ pub fn retire_onto_in_child(run_dir: &Path, exe: &Path) -> String {
         .to_owned()
 }
 
+/// The test a test binary lists so that it can run [`old_daemon_child_body`]
+/// in a child of its own.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub const OLD_DAEMON_CHILD_TEST: &str = "old_daemon_child";
+
+/// What [`OLD_DAEMON_CHILD_TEST`] runs: a stand-in for a released daemon of
+/// protocol 1, which serves no `Retire` and refuses a hello of any other
+/// protocol in a frame stamped with its own. It listens at the endpoint of
+/// the run directory `STOW_TEST_OLD_DAEMON_DIR` names, prints `READY`, answers
+/// the first client's hello with that refusal and then holds the connection
+/// until the process is ended. Does nothing when the variable is unset,
+/// which is how the test passes when the test binary runs it as an
+/// ordinary test.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn old_daemon_child_body() {
+    use std::io::Write as _;
+
+    use stow_cli::protocol::{Response, encode_at, read_frame};
+
+    let Some(run_dir) = std::env::var_os("STOW_TEST_OLD_DAEMON_DIR") else {
+        return;
+    };
+    let run_dir = PathBuf::from(run_dir);
+    #[cfg(unix)]
+    let mut connection = {
+        let listener =
+            std::os::unix::net::UnixListener::bind(run_dir.join("daemon.sock")).expect("bind");
+        println!("READY");
+        listener.accept().expect("accept").0
+    };
+    #[cfg(windows)]
+    let mut connection = {
+        use std::os::windows::io::FromRawHandle as _;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+        use windows_sys::Win32::System::Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+            PIPE_WAIT,
+        };
+
+        let name: Vec<u16> = format!(
+            r"\\.\pipe\{}",
+            stow_cli::scheduled_task::task_name(&run_dir)
+        )
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+        // SAFETY: `name` is NUL-terminated and outlives the call; a null
+        // security descriptor gives the pipe the creator's default access.
+        let pipe = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                1 << 16,
+                1 << 16,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert!(pipe != INVALID_HANDLE_VALUE, "create the pipe");
+        println!("READY");
+        // A client that connected before this call makes it fail with
+        // `ERROR_PIPE_CONNECTED`, which is a connection all the same.
+        // SAFETY: `pipe` is the pipe handle created above.
+        unsafe { ConnectNamedPipe(pipe, std::ptr::null_mut()) };
+        // SAFETY: `pipe` is an open handle nothing else owns.
+        unsafe { std::fs::File::from_raw_handle(pipe.cast()) }
+    };
+    read_frame(&mut connection).expect("the client's hello");
+    let refusal = Response::Rejected {
+        reason: "the client speaks protocol 4, this daemon speaks protocols 1 through 1".to_owned(),
+    };
+    connection
+        .write_all(&encode_at(1, &refusal).expect("encode"))
+        .expect("refuse the client");
+    // Held until the client ends this process.
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Start the stand-in of [`old_daemon_child_body`] at the endpoint of
+/// `run_dir`, in a child of this test binary, and return its pid and a
+/// thread that reaps it: the client ends the process, and an unreaped
+/// child would still be there.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn spawn_old_daemon(
+    run_dir: &Path,
+) -> (u32, std::thread::JoinHandle<std::process::ExitStatus>) {
+    use std::io::BufRead as _;
+
+    std::fs::create_dir_all(run_dir).expect("run dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict the run dir");
+    }
+    let mut child = Command::new(std::env::current_exe().expect("this test binary"))
+        .args([OLD_DAEMON_CHILD_TEST, "--exact", "--nocapture"])
+        .env("STOW_TEST_OLD_DAEMON_DIR", run_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the old daemon");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut lines = std::io::BufReader::new(stdout).lines();
+    loop {
+        let line = lines
+            .next()
+            .expect("the old daemon said it was ready")
+            .expect("read its output");
+        if line == "READY" {
+            break;
+        }
+    }
+    let pid = child.id();
+    // `lines` keeps the pipe's read end open, so the child never takes a
+    // broken pipe; it ends with the process.
+    let reaper = std::thread::spawn(move || {
+        let _keep = lines;
+        child.wait().expect("wait for the old daemon")
+    });
+    (pid, reaper)
+}
+
 /// A temporary directory a test's children use as (or under) their home:
 /// it stops the daemons they started before the directory goes, so no test
 /// leaves one running.

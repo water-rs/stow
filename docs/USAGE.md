@@ -347,6 +347,12 @@ process id, the lock and the listening socket, so connections made during
 it wait in the socket's backlog for the successor. A driver's build still
 open when the bound ends fails, and the message names the restart.
 
+A daemon from a stow that predates retirement (protocol 3 and older) cannot
+be asked to retire: it refuses the newer stow's hello. The client that finds
+it ends that process (builds it holds are lost with it) and starts a daemon
+of its own stow; if the daemon that starts still cannot retire, the client
+fails naming it.
+
 A daemon that restarts while a cargo is building leaves that build without
 the session's in-flight state and its record of locally built crates. The
 new daemon refuses that cargo's wrappers until it exits, so the build fails

@@ -39,6 +39,7 @@ pub mod launch_agent;
 mod log;
 mod notify;
 pub mod owner;
+mod peer;
 pub mod protocol;
 pub mod relay;
 mod retire;

@@ -59,6 +59,19 @@ pub const PROTOCOL: u16 = 4;
 /// `PROTOCOL_FLOOR..=PROTOCOL`.
 pub const PROTOCOL_FLOOR: u16 = 4;
 
+/// The first protocol whose daemons give way to a newer stow when asked.
+///
+/// They read [`ControlRequest::Retire`] and answer [`Response::Retiring`].
+/// A daemon of an older protocol refuses this stow's hello and can only be
+/// ended.
+pub const RETIRE_SINCE: u16 = 4;
+
+/// Whether a daemon whose frame was stamped `stamp` can be asked to retire.
+#[must_use]
+pub const fn can_retire(stamp: u16) -> bool {
+    stamp >= RETIRE_SINCE
+}
+
 const LENGTH_BYTES: usize = 4;
 const PROTOCOL_BYTES: usize = 2;
 const HEADER_BYTES: usize = LENGTH_BYTES + PROTOCOL_BYTES;
