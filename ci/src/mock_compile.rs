@@ -230,7 +230,7 @@ pub fn materialize_build_script_run_alias(
     parsed: &ParsedRustcArgs,
     host: &str,
 ) -> stow_types::error::Result<()> {
-    if let Some(alias) = build_script_run_path(parsed, host) {
+    if let Some(alias) = build_script_run_path(parsed, host)? {
         let source = alias.path.with_file_name(format!(
             "{}{}{}",
             parsed.crate_name,
@@ -315,9 +315,18 @@ fn planned_outputs(
 /// reports — `build_script_build-<hash>.exe` for a Windows runner, which
 /// it hard-links to `build-script-build.exe` — but runs it under the
 /// executable suffix cargo itself was built with. On the runner the two
-/// agree; here the stub must also sit where cargo runs it. `None` when
-/// they already agree or `parsed` is no build script.
-fn build_script_run_path(parsed: &ParsedRustcArgs, host: &str) -> Option<PlannedOutput> {
+/// agree; here the stub must also sit where cargo runs it, which cargo's
+/// layout names. `None` when they already agree, `parsed` is no build
+/// script or names no `--out-dir`.
+///
+/// # Errors
+///
+/// The build script's `--out-dir` is no directory cargo compiles a build
+/// script into.
+fn build_script_run_path(
+    parsed: &ParsedRustcArgs,
+    host: &str,
+) -> stow_types::error::Result<Option<PlannedOutput>> {
     let built_for_host = parsed.target.is_none();
     let is_build_script = parsed.crate_name.starts_with("build_script_")
         && parsed
@@ -326,19 +335,29 @@ fn build_script_run_path(parsed: &ParsedRustcArgs, host: &str) -> Option<Planned
             .any(|crate_type| crate_type == "bin")
         && parsed.emit.contains("link");
     let host_suffix = Naming::of(host).exe_suffix;
+    let Some(out_dir) = parsed.out_dir.as_deref() else {
+        return Ok(None);
+    };
     if !built_for_host || !is_build_script || host_suffix == std::env::consts::EXE_SUFFIX {
-        return None;
+        return Ok(None);
     }
-    let mut program = stow_types::cargo_layout::UnitDir::new(parsed.out_dir.as_deref()?)
-        .ok()?
-        .build_script_program(&parsed.crate_name)?
+    let unit = stow_types::cargo_layout::UnitDir::new(out_dir)
+        .map_err(|error| stow_types::stow_error!("mock build script: {error}"))?;
+    let mut program = unit
+        .build_script_program(&parsed.crate_name)
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "mock build script: cargo compiles no build script into {}",
+                out_dir.display()
+            )
+        })?
         .into_os_string();
     program.push(std::env::consts::EXE_SUFFIX);
-    Some(PlannedOutput {
+    Ok(Some(PlannedOutput {
         path: program.into(),
         emit: "link",
         kind: OutputKind::Executable,
-    })
+    }))
 }
 
 /// The platform naming rustc applies to a link output, from the unit's
@@ -647,7 +666,7 @@ mod tests {
             );
             // Cargo runs it under its own executable suffix, not the
             // emulated host's: the stub sits there too.
-            let run = build_script_run_path(&parsed, "x86_64-pc-windows-msvc");
+            let run = build_script_run_path(&parsed, "x86_64-pc-windows-msvc").expect("layout");
             if std::env::consts::EXE_SUFFIX == ".exe" {
                 assert!(run.is_none());
             } else {
@@ -655,7 +674,28 @@ mod tests {
                 assert_eq!(run.path.to_string_lossy(), program);
                 assert!(run.kind == OutputKind::Executable);
             }
-            assert!(build_script_run_path(&parsed, LINUX_HOST).is_none() || cfg!(windows));
+            assert!(
+                build_script_run_path(&parsed, LINUX_HOST)
+                    .expect("layout")
+                    .is_none()
+                    || cfg!(windows)
+            );
+        }
+    }
+
+    /// A build script compiled outside cargo's layout has no run path to
+    /// restore: the mock fails rather than leave cargo without its program.
+    #[test]
+    fn a_build_script_outside_cargos_layout_is_refused() {
+        let host = if cfg!(windows) {
+            LINUX_HOST
+        } else {
+            "x86_64-pc-windows-msvc"
+        };
+        for out_dir in ["/t/build/x", "/t/debug/deps"] {
+            let parsed = ParsedRustcArgs::parse(&build_script_args(out_dir, "-0123456789abcdef"))
+                .expect("parse");
+            assert!(build_script_run_path(&parsed, host).is_err(), "{out_dir}");
         }
     }
 
@@ -681,7 +721,9 @@ mod tests {
             #[cfg(unix)]
             super::make_executable(&source).expect("executable");
             materialize_build_script_run_alias(&parsed, host).expect("run alias");
-            let alias = build_script_run_path(&parsed, host).expect("foreign suffix");
+            let alias = build_script_run_path(&parsed, host)
+                .expect("layout")
+                .expect("foreign suffix");
             assert_eq!(std::fs::read(&alias.path).expect("program bytes"), program);
             #[cfg(unix)]
             {
