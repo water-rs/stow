@@ -26,7 +26,7 @@ use super::session::{SessionEnd, SessionFacts, SessionId};
 
 /// The protocol number this build speaks. Bumped when a message changes
 /// in a way an older peer cannot read.
-pub const PROTOCOL: u16 = 2;
+pub const PROTOCOL: u16 = 3;
 
 /// The oldest protocol number this build still reads. A daemon serves
 /// `PROTOCOL_FLOOR..=PROTOCOL`.
@@ -67,6 +67,16 @@ pub enum Role {
 pub enum SessionRef {
     /// The session a driver opened, by the id the daemon minted.
     Id(SessionId),
+    /// The session of the cargo that started the wrapper: no driver opened
+    /// one, so the daemon finds the cargo from the connection itself and
+    /// opens the session when the cargo's first wrapper describes the
+    /// build.
+    Cargo {
+        /// The wrapper's `CARGO` — the executable of the cargo that
+        /// started it — OS-encoded; absent when the wrapper's environment
+        /// has none.
+        cargo: Option<Vec<u8>>,
+    },
 }
 
 /// The first frame of every connection: who the client is.

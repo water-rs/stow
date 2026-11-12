@@ -218,6 +218,7 @@ fn journal_path(target_dir: &Path, build: &str) -> PathBuf {
 /// as `<target>/<profile>/deps`, so the journal lives two levels up.
 /// `None` for an out dir outside that layout (a bare `--out-dir`): the
 /// observation is dropped rather than written somewhere arbitrary.
+#[cfg_attr(not(test), expect(dead_code, reason = "only standalone mode calls it"))]
 fn target_dir_for(out_dir: &Path) -> Option<PathBuf> {
     if out_dir.file_name() != Some(OsStr::new("deps")) {
         return None;
@@ -227,6 +228,7 @@ fn target_dir_for(out_dir: &Path) -> Option<PathBuf> {
 
 /// The cargo build a standalone wrapper belongs to: the process that
 /// spawned it. While that pid lives the journal is still being written.
+#[expect(dead_code, reason = "only standalone mode calls it")]
 fn cargo_build() -> String {
     parent_pid().to_string()
 }
@@ -234,6 +236,7 @@ fn cargo_build() -> String {
 /// The wrapper's parent process id — the cargo that spawned it on every
 /// platform cargo runs it under, so one build journals to one file.
 #[cfg(unix)]
+#[expect(dead_code, reason = "only standalone mode calls it")]
 fn parent_pid() -> u32 {
     u32::try_from(unsafe { libc::getppid() }).unwrap_or_else(|_| std::process::id())
 }
@@ -242,6 +245,7 @@ fn parent_pid() -> u32 {
 /// snapshot. `None` falls back to the wrapper's own (short-lived) pid —
 /// more journals, same drain.
 #[cfg(windows)]
+#[expect(dead_code, reason = "only standalone mode calls it")]
 fn parent_pid() -> u32 {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -400,19 +404,21 @@ fn finished_journals(target_dir: &Path) -> Vec<PathBuf> {
 /// Spawn the detached drainer for a target dir — but only when a journal
 /// is actually pending, so steady-state invocations pay nothing.
 /// Nobody waits on the child, so posting admissions never sits on a
-/// build's wall clock.
-pub fn spawn_drain(target_dir: &Path) {
+/// build's wall clock. The drain runs in `env`: the environment of the
+/// build whose misses it posts, which is not the spawning process's when
+/// the daemon spawns it.
+pub fn spawn_drain(target_dir: &Path, env: &SessionEnv) {
     if finished_journals(target_dir).is_empty() {
         return;
     }
-    spawn_drain_unconditional(target_dir);
+    spawn_drain_unconditional(target_dir, env);
 }
 
 /// Spawn the detached drainer whether or not a journal is pending — the
 /// day's usage report rides in the same process, and an all-hit build
 /// leaves no journal for [`spawn_drain`] to find (stow#889). The child
 /// exits promptly when it finds nothing to do.
-pub fn spawn_drain_unconditional(target_dir: &Path) {
+pub fn spawn_drain_unconditional(target_dir: &Path, env: &SessionEnv) {
     // Under a shim name `current_exe` is the runtime's role name —
     // `expand_wrapper_role` leaves the `__drain-misses` subcommand
     // untouched regardless of argv[0]'s name.
@@ -449,8 +455,10 @@ pub fn spawn_drain_unconditional(target_dir: &Path) {
         // The chrome trace file is one process's: a second writer
         // truncates it on open and the parent's spans are lost.
         .envs(
-            std::env::vars_os()
-                .filter(|(name, _)| !stow_types::env_name::eq(name, crate::STOW_TRACE_FILE_ENV)),
+            env.environ()
+                .iter()
+                .filter(|(name, _)| !stow_types::env_name::eq(name, crate::STOW_TRACE_FILE_ENV))
+                .cloned(),
         );
     if let Some(stderr) = log_file.as_ref().and_then(|file| file.try_clone().ok()) {
         command = command.stderr(stderr);
@@ -481,6 +489,7 @@ fn append_lines(journal: &Path, entries: &[JournalEntry]) -> std::io::Result<()>
 /// Record one locally compiled unit to the standalone build's journal.
 /// The wrapper's whole cost is a single append — the observation rides
 /// the identity the compile already resolved.
+#[expect(dead_code, reason = "only standalone mode calls it")]
 pub fn record_observation(
     rustc: &OsStr,
     parsed: &ParsedRustcArgs,
@@ -531,13 +540,24 @@ fn recorded_build_host(units: &[ObservedUnit], consumer_target: &str) -> String 
 /// The consumer's recorded build facts a session journal carries:
 /// its manifest directory — the project the drain re-derives the
 /// expanded graph from when the enrichment's memoized store has not
-/// landed — and the inputs `lockfile_graph_cache::key_of` hashes,
-/// serialized into the sidecar so the drain can tell a same-inputs
-/// re-derivation from a project that changed after the build
-/// (stow#588).
+/// landed — and, when a driver analysed the build, the inputs
+/// `lockfile_graph_cache::key_of` hashes, serialized into the sidecar so
+/// the drain can tell a same-inputs re-derivation from a project that
+/// changed after the build (stow#588).
 pub struct JournalConsumer<'a> {
-    pub manifest_dir: &'a Path,
-    pub key: &'a crate::lockfile_graph_cache::KeyInputs<'a>,
+    /// The manifest directory of the package the build was asked for;
+    /// `None` when no unit named it, which leaves the drain no project to
+    /// re-derive from.
+    pub manifest_dir: Option<&'a Path>,
+    /// The rustc version the build's units compiled under.
+    pub rustc_version: &'a str,
+    /// The consumer's target.
+    pub target: &'a str,
+    /// Whether the consumer's cargo invocation spelled `--target`.
+    pub target_given: bool,
+    /// The inputs of the build's expanded-graph key; `None` for a build
+    /// no driver analysed.
+    pub key: Option<&'a crate::lockfile_graph_cache::KeyInputs<'a>>,
 }
 
 /// Write a session's journal: one batch append when the session ends its
@@ -561,17 +581,17 @@ pub fn journal_session(
     // The consumer's flag plus any observed explicit `--target` — the
     // flag covers a build where every observed unit is host-side and
     // none carries the flag itself.
-    let consumer_spelled_target = consumer.key.target_given
+    let consumer_spelled_target = consumer.target_given
         || observations
             .iter()
             .any(|unit| unit.explicit_target.is_some());
-    let build_host = recorded_build_host(observations, consumer.key.target);
+    let build_host = recorded_build_host(observations, consumer.target);
     let mut entries: Vec<JournalEntry> = observations
         .iter()
         .map(|unit| {
             JournalEntry::Unit(UnitLine {
                 rustc: rustc.to_string_lossy().into_owned(),
-                rustc_version: consumer.key.rustc_version.to_owned(),
+                rustc_version: consumer.rustc_version.to_owned(),
                 build_host: build_host.clone(),
                 consumer_spelled_target,
                 expanded_cache_key: expanded_cache_key.to_owned(),
@@ -581,10 +601,10 @@ pub fn journal_session(
         .collect();
     if !inexact_entries.is_empty() {
         entries.push(JournalEntry::Inexact(InexactReport {
-            rustc_version: consumer.key.rustc_version.to_owned(),
-            consumer_spelled_target: consumer.key.target_given,
+            rustc_version: consumer.rustc_version.to_owned(),
+            consumer_spelled_target: consumer.target_given,
             expanded_cache_key: expanded_cache_key.to_owned(),
-            target: consumer.key.target.to_owned(),
+            target: consumer.target.to_owned(),
             entries: inexact_entries.to_vec(),
         }));
     }
@@ -596,16 +616,19 @@ pub fn journal_session(
     // reaches it — a build aborts that analysis when cargo exits, and a
     // fast build's cargo exits first — so the journal also carries the
     // context the drain re-derives the same graph from (stow#588).
-    write_consumer_context(&journal, consumer.manifest_dir, Some(consumer.key));
+    if let Some(manifest_dir) = consumer.manifest_dir {
+        write_consumer_context(&journal, manifest_dir, consumer.key);
+    }
 }
 
 /// Kick the deferred drain for journals left by builds that already
 /// exited — the standalone path's way of admitting misses with no stow
 /// parent process. The check is one directory listing that only finds
 /// files in target dirs stow has built in.
-pub fn drain_finished_builds(out_dir: &Path) {
+#[expect(dead_code, reason = "only standalone mode calls it")]
+pub fn drain_finished_builds(out_dir: &Path, env: &SessionEnv) {
     if let Some(target_dir) = target_dir_for(out_dir) {
-        spawn_drain(&target_dir);
+        spawn_drain(&target_dir, env);
     }
 }
 
@@ -940,6 +963,7 @@ const CONTEXT_PREFIX: &str = "stow-context.";
 /// cargo marks it `CARGO_PRIMARY_PACKAGE`, and `CARGO_MANIFEST_DIR` then
 /// names the manifest the user is building — a path dep's or registry
 /// crate's units never qualify (stow#588).
+#[expect(dead_code, reason = "only standalone mode calls it")]
 pub fn note_consumer_context(out_dir: &Path) {
     if std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none() {
         return;
@@ -1622,8 +1646,11 @@ mod tests {
                 session,
                 OsStr::new("rustc"),
                 &JournalConsumer {
-                    manifest_dir: &project,
-                    key: &key_inputs,
+                    manifest_dir: Some(&project),
+                    rustc_version: key_inputs.rustc_version,
+                    target: key_inputs.target,
+                    target_given: key_inputs.target_given,
+                    key: Some(&key_inputs),
                 },
                 &[unit(&format!("only-{name}"), None)],
                 &target,

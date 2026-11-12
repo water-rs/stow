@@ -38,6 +38,9 @@ fn wrapper_version_output(env: &[(&str, &str)]) -> Vec<u8> {
     // session variables — the sealed home and cleared `STOW_*` keep
     // the developer's `~/.stow` and shell exports out of it (stow#800).
     let home = support::tempdir().expect("home");
+    // The probe is answered by the daemon, which this test starts under
+    // its home and stops with it.
+    let _daemon = support::PrivateDaemon::in_home(home.path());
     hermetic_stow_env(
         &mut command,
         &refused_url(),

@@ -4074,9 +4074,9 @@ async fn admit_build_misses(plan: &CargoRunPlan<'_>, config: &StowConfig) {
     // usage report forces the spawn so the day's deltas still leave the
     // machine through the detached lane (stow#889).
     if report_due {
-        crate::miss_journal::spawn_drain_unconditional(&target_dir);
+        crate::miss_journal::spawn_drain_unconditional(&target_dir, &plan.project.env);
     } else {
-        crate::miss_journal::spawn_drain(&target_dir);
+        crate::miss_journal::spawn_drain(&target_dir, &plan.project.env);
     }
     // One session is one build the install ran — counted here rather
     // than by the journal, whose session files the drain skips to keep
@@ -4907,7 +4907,7 @@ fn percentage(numerator: usize, denominator: usize) -> f64 {
 }
 
 #[derive(Debug, Clone)]
-enum PublicCacheMode {
+pub enum PublicCacheMode {
     Enabled,
     /// The public cache is off for this build. `message` is the warning for a
     /// cause the user did not choose; the remote cache layer being off is the
@@ -4918,7 +4918,7 @@ enum PublicCacheMode {
 }
 
 impl PublicCacheMode {
-    fn for_build(rustc_version: &str, cache: crate::config::CacheLayers) -> Self {
+    pub(crate) fn for_build(rustc_version: &str, cache: crate::config::CacheLayers) -> Self {
         if !cache.reaches_network() {
             return Self::Disabled { message: None };
         }
@@ -4933,7 +4933,7 @@ impl PublicCacheMode {
         }
     }
 
-    const fn is_enabled(&self) -> bool {
+    pub(crate) const fn is_enabled(&self) -> bool {
         matches!(self, Self::Enabled)
     }
 }

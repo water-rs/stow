@@ -328,6 +328,7 @@ pub async fn plan_compile(
 /// The standalone decision, made in the wrapper process itself: look the
 /// key up, record the hit and serve it. A session never calls this —
 /// its daemon owns the lookup and the records.
+#[cfg_attr(not(test), expect(dead_code, reason = "only standalone mode calls it"))]
 pub async fn try_compile(
     config: &StowConfig,
     compiler: &ResolvedCompiler,
@@ -442,6 +443,7 @@ fn expand_response_arg(
 /// `artifact_cache_max_bytes` LRU the rustc entries live under
 /// (stow#980) — and the post-store eviction pass runs against the whole
 /// cache.
+#[cfg_attr(not(test), expect(dead_code, reason = "only standalone mode calls it"))]
 pub async fn store_compiled_object(
     config: &StowConfig,
     cache_path: &Path,
@@ -465,6 +467,7 @@ pub struct StagedCcObject {
 ///
 /// # Errors
 /// A cache path with no key file name, or a clone that fails.
+#[cfg_attr(not(test), expect(dead_code, reason = "only standalone mode calls it"))]
 pub async fn stage_compiled_object(
     cache_path: &Path,
     output_path: &Path,
@@ -791,6 +794,7 @@ impl StagedObject {
     }
 }
 
+#[cfg_attr(not(test), expect(dead_code, reason = "only standalone mode calls it"))]
 fn stage_compiled_object_blocking(
     cache_path: &Path,
     output_path: &Path,
@@ -1203,6 +1207,7 @@ impl ParsedCcInvocation {
 }
 
 #[derive(Debug, Clone)]
+#[expect(dead_code, reason = "only standalone mode uses it")]
 pub enum CcOutcome {
     Passthrough,
     Hit {

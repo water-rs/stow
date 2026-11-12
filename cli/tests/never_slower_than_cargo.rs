@@ -546,6 +546,9 @@ fn write_rustc_wrapper_shim(dir: &Path) -> std::path::PathBuf {
         let shim = dir.join("stow-rustc-wrapper");
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stow-cli"), &shim)
             .expect("link rustc wrapper shim");
+        // The wrapper starts the daemon from the runtime link beside it.
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stow-cli"), dir.join("stow-runtime"))
+            .expect("link the runtime");
         shim
     }
 }
@@ -588,6 +591,9 @@ fn a_tripped_circuit_still_serves_local_entries() {
     let cargo_home = support::tempdir().expect("cargo home");
     write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
+    // The wrapper starts the daemon under the build's home; it is stopped
+    // with the test.
+    let _daemon = support::PrivateDaemon::in_home(&dir.path().join("stow-home"));
 
     // Nothing is listening on this port: every remote lookup misses fast.
     let port = {
@@ -779,6 +785,10 @@ fn serve_stub_connection(
             Request::CcPolicy => Answer::CcPolicy { enabled: false },
             Request::CcLookup(_) => Answer::CcMiss,
             Request::CcCompiled(_) => Answer::Received,
+            // The stub is never asked to open a session.
+            Request::Describe(_) => Answer::Failed {
+                message: "the stub daemon opens no session".to_owned(),
+            },
         };
         let frame = stow_cli::protocol::encode(&stow_cli::protocol::Response::Answer(answer))
             .expect("encode answer");
@@ -922,6 +932,9 @@ fn every_unit_is_one_plan_and_one_report() {
     let run_dir = support::tempdir().expect("run dir");
     write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
+    // The wrapper starts the daemon under the build's home; it is stopped
+    // with the test.
+    let _daemon = support::PrivateDaemon::in_home(&dir.path().join("stow-home"));
     let stub = spawn_stub_daemon(run_dir.path());
     // A session no driver opened: the stub serves any id.
     let session = "00112233445566778899aabbccddeeff";
@@ -995,6 +1008,9 @@ fn a_disabled_public_cache_still_serves_local_entries() {
     let cargo_home = support::tempdir().expect("cargo home");
     write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
+    // The wrapper starts the daemon under the build's home; it is stopped
+    // with the test.
+    let _daemon = support::PrivateDaemon::in_home(&dir.path().join("stow-home"));
 
     // Nothing is listening on this port: every remote lookup misses fast.
     let port = {

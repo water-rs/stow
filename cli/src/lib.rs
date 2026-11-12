@@ -372,8 +372,8 @@ async fn run_cli(
             return Box::pin(cargo_cmd::run("test", command, state_db)).await;
         }
         CliCommand::Daemon(args) => daemon::run(args).await,
-        CliCommand::Rustc(command) => return run_rustc_wrapper(command, state_db).await,
-        CliCommand::Cc(command) => return run_cc_wrapper(command, state_db).await,
+        CliCommand::Rustc(command) => return run_rustc_wrapper(command).await,
+        CliCommand::Cc(command) => return run_cc_wrapper(command).await,
         CliCommand::Predict(command) => Box::pin(cargo_cmd::predict(command, state_db)).await,
         CliCommand::Setup(args) => commands::setup_project(args, state_db).await,
         CliCommand::Update => commands::update_self().await,
@@ -1290,6 +1290,7 @@ impl BuildContext {
     /// # Errors
     ///
     /// The cache layers do not load.
+    #[cfg_attr(not(test), expect(dead_code, reason = "only standalone mode calls it"))]
     fn from_env() -> stow_types::error::Result<Self> {
         let env = session_env::SessionEnv::of_this_process()?;
         let cache = crate::config::load_cache_layers(&env)?;
@@ -1361,29 +1362,20 @@ pub(crate) fn duration_millis(duration: std::time::Duration) -> u64 {
 ///
 /// Parses the command line, asks the build's session on the daemon what to
 /// do with the invocation, and either answers success or runs the real
-/// rustc. When there is no session — a plain `cargo build` through the
-/// `RUSTC_WRAPPER` that `stow setup` writes — it decides in this process
-/// instead. Returns the status this process owes cargo: a served unit's
+/// rustc. A plain `cargo build` through the `RUSTC_WRAPPER` that `stow
+/// setup` writes has no driver, so the daemon serves it a session of its
+/// cargo. Returns the status this process owes cargo: a served unit's
 /// success, or the real rustc's own.
 #[tracing::instrument(name = "stow.wrapper.invoke", skip_all, fields(crate_name, cache_hit))]
 async fn run_rustc_wrapper(
-    mut command: WrapperCommandArgs,
-    state_db: &StateDb,
+    command: WrapperCommandArgs,
 ) -> stow_types::error::Result<std::process::ExitStatus> {
-    // A session the environment names that cannot be reached fails the
-    // build. A wrapper that quietly compiled everything itself would leave
-    // a build that is merely slow, which is the failure mode that hides.
-    if let Some(link) = daemon::client::SessionLink::from_env()
-        .map_err(|error| stow_types::stow_error!("{error}"))?
-    {
-        delegate_to_daemon(&link, &command).await
-    } else {
-        stow_types::rustc::remap_build_output(
-            &mut command.wrapped_args,
-            std::env::var_os("OUT_DIR").as_deref(),
-        );
-        run_rustc_standalone(&command, state_db).await
-    }
+    // A daemon that cannot be reached fails the build. A wrapper that
+    // quietly compiled everything itself would leave a build that is merely
+    // slow, which is the failure mode that hides.
+    let link = daemon::client::SessionLink::from_env()
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    delegate_to_daemon(&link, &command).await
 }
 
 /// Ask the build's session, then do what it says.
@@ -1429,6 +1421,7 @@ async fn delegate_to_daemon(
 
 /// Decide and execute in this process: the configuration that has no
 /// session to ask.
+#[expect(dead_code, reason = "only standalone mode calls it")]
 async fn run_rustc_standalone(
     command: &WrapperCommandArgs,
     state_db: &StateDb,
@@ -1465,7 +1458,9 @@ async fn run_rustc_standalone(
     if !ctx.public_cache_disabled
         && let Some(out_dir) = parsed.out_dir.as_deref()
     {
-        miss_journal::drain_finished_builds(out_dir);
+        if let Ok(env) = session_env::SessionEnv::of_this_process() {
+            miss_journal::drain_finished_builds(out_dir, &env);
+        }
         miss_journal::note_consumer_context(out_dir);
     }
     // The user's own process runs the user's own rustc: the toolchain is
@@ -2054,6 +2049,7 @@ impl WrapperEnvCache {
     /// An empty memo over the rustc this process was invoked for, which
     /// loads its config from this process's environment on first use and
     /// hands it `state_db`, and prepares its base then.
+    #[expect(dead_code, reason = "only standalone mode calls it")]
     fn standalone(state_db: StateDb, toolchain: std::sync::Arc<toolchain::BuildToolchain>) -> Self {
         Self::with_parts(
             std::sync::OnceLock::new(),
@@ -3136,27 +3132,21 @@ fn resolve_cc_compiler(executable: &OsString) -> cc::ResolvedCompiler {
 /// The C/C++ compiler facade. Returns the status this process owes its
 /// caller: success for a served object, else the real compiler's own.
 ///
-/// Under a session the daemon owns the object cache and its records, and
-/// this process never opens the state database. Without one — a plain
-/// `cargo build` through the wrappers `stow setup` writes — it decides in
-/// this process instead.
+/// The session's daemon owns the object cache and its records, and this
+/// process never opens the state database.
 #[tracing::instrument(name = "stow.wrapper.cc_invoke", skip_all)]
 async fn run_cc_wrapper(
     command: WrapperCommandArgs,
-    state_db: &StateDb,
 ) -> stow_types::error::Result<std::process::ExitStatus> {
     #[cfg(not(windows))]
     let compiler = resolve_cc_compiler(&command.executable);
     #[cfg(windows)]
     let compiler = resolve_cc_compiler(&command.executable)?;
-    // A session the environment names that cannot be reached fails the
-    // build, as it does for the rustc facade.
-    match daemon::client::SessionLink::from_env()
-        .map_err(|error| stow_types::stow_error!("{error}"))?
-    {
-        Some(link) => run_cc_session(&link, &compiler, &command.wrapped_args).await,
-        None => run_cc_standalone(&compiler, &command.wrapped_args, state_db).await,
-    }
+    // A daemon that cannot be reached fails the build, as it does for the
+    // rustc facade.
+    let link = daemon::client::SessionLink::from_env()
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    run_cc_session(&link, &compiler, &command.wrapped_args).await
 }
 
 /// Ask the session about the object, then do what it says. The only work
@@ -3242,6 +3232,7 @@ async fn run_cc_session(
 
 /// Decide and execute in this process: the configuration that has no
 /// session to ask.
+#[expect(dead_code, reason = "only standalone mode calls it")]
 async fn run_cc_standalone(
     compiler: &cc::ResolvedCompiler,
     compiler_args: &[OsString],

@@ -476,25 +476,30 @@ fn install_wrapper_shim(tools: &Path) -> PathBuf {
         "stow-rustc-wrapper{}",
         std::env::consts::EXE_SUFFIX
     ));
+    let runtime = tools.join(format!("stow-runtime{}", std::env::consts::EXE_SUFFIX));
     #[cfg(unix)]
-    std::os::unix::fs::symlink(exe, &shim).expect("symlink shim");
+    {
+        std::os::unix::fs::symlink(exe, &shim).expect("symlink shim");
+        std::os::unix::fs::symlink(exe, &runtime).expect("symlink runtime");
+    }
     #[cfg(windows)]
-    std::fs::copy(exe, &shim).expect("copy shim");
+    {
+        std::fs::copy(exe, &shim).expect("copy shim");
+        std::fs::copy(exe, &runtime).expect("copy runtime");
+    }
     shim
 }
 
 /// The `stow setup` path: a plain `cargo build` with `RUSTC_WRAPPER`
-/// pointed at the wrapper shim and no stow parent process. Compiles
-/// journal their observations into `<target>/stow-misses.<cargo
-/// pid>.jsonl`; the first wrapper invocation after that cargo exits
-/// spawns the detached drain that posts the admission (stow#317).
+/// pointed at the wrapper shim and no stow parent process. The daemon's
+/// session of that cargo journals the compiles' observations into the
+/// target directory and, when the cargo exits, spawns the detached drain
+/// that posts the admission (stow#317).
 ///
-/// The test builds once (journals cfg-if's compile), rebuilds after
-/// touching the crate (the new cargo's first wrapper call sees the old
-/// cargo dead and drains its journal), and waits for the enqueue post
-/// the minted admission redeems.
+/// The test builds once and waits for the enqueue post the minted
+/// admission redeems, and for the drain to remove the journal.
 #[test]
-fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
+fn a_plain_cargo_builds_misses_are_drained_when_its_session_ends() {
     let dir = support::tempdir().expect("temp dir");
     let cache = support::tempdir().expect("cache dir");
     let cargo_home = support::tempdir().expect("cargo home");
@@ -506,6 +511,9 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
     // The installed layout is the wrapper shim name pointing at this
     // binary: `WrapperRole::from_program` keys on the name.
     let shim = install_wrapper_shim(tools.path());
+    // The wrapper starts the daemon under the build's home; it is stopped
+    // with the test.
+    let _daemon = support::PrivateDaemon::in_home(&dir.path().join("stow-home"));
 
     let cargo_build = |dir: &Path| {
         let mut command = Command::new("cargo");
@@ -539,35 +547,10 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
         );
     };
 
+    // The daemon ends the build's session when this cargo exits: it writes
+    // the journal of the misses and kicks the detached drain.
     cargo_build(dir.path());
     let target_dir = dir.path().join("target");
-    let journals: Vec<_> = std::fs::read_dir(&target_dir)
-        .expect("read target dir")
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("stow-misses.")
-        })
-        .collect();
-    assert_eq!(
-        journals.len(),
-        1,
-        "expected exactly one miss journal under {target_dir:?}"
-    );
-    let journal = journals[0].path();
-    let observed = std::fs::read_to_string(&journal).expect("read miss journal");
-    assert!(
-        observed.lines().any(|line| line.contains("cfg-if")),
-        "the compiled crate must be journaled: {observed}"
-    );
-
-    // The next build's first wrapper invocation finds the first cargo's
-    // journal finished (its pid is gone) and kicks the detached drain.
-    std::fs::write(dir.path().join("src").join("main.rs"), "fn main() {}\n\n")
-        .expect("touch main.rs");
-    cargo_build(dir.path());
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
     loop {
@@ -592,9 +575,14 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    assert!(
-        !journal.exists(),
-        "the drained journal must be gone: {}",
-        journal.display()
-    );
+    // The enqueue post can land before the drain removes its claim.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    while !drain_finished(&target_dir) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the drained journal is still there{}",
+            drain_diagnostics(&target_dir)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }

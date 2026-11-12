@@ -83,9 +83,34 @@ impl BuildToolchain {
     /// # Errors
     ///
     /// As [`Self::for_build`].
+    #[cfg_attr(not(test), expect(dead_code, reason = "only standalone mode calls it"))]
     pub async fn for_executable(executable: &OsStr, env: &SessionEnv) -> Result<Self, String> {
         let vv = rustc_args::rustc_vv(executable, env).await?;
-        Self::from_probe(executable.to_owned(), executable.to_owned(), None, &vv, env).await
+        Self::for_opener(executable, None, &vv, env).await
+    }
+
+    /// Resolve the toolchain of the rustc a build's first wrapper was
+    /// invoked for, from `vv`, the `rustc -vV` output of that rustc in
+    /// `env`. `workspace_wrapper` is the configured
+    /// `RUSTC_WORKSPACE_WRAPPER`, when there is one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::for_build`].
+    pub async fn for_opener(
+        rustc: &OsStr,
+        workspace_wrapper: Option<PathBuf>,
+        vv: &str,
+        env: &SessionEnv,
+    ) -> Result<Self, String> {
+        Self::from_probe(
+            rustc.to_owned(),
+            rustc.to_owned(),
+            workspace_wrapper,
+            vv,
+            env,
+        )
+        .await
     }
 
     async fn from_probe(

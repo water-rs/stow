@@ -9,16 +9,48 @@
 //!
 //! A process is named by its id and its start time, because an id alone
 //! is reused once its process is gone.
-#![cfg_attr(
-    not(all(test, unix)),
-    expect(
-        dead_code,
-        reason = "the daemon's implicit sessions use it from the next commit"
-    )
-)]
 
 use std::io;
 use std::path::{Path, PathBuf};
+
+use futures_util::future::BoxFuture;
+
+/// What the daemon asks of the machine's processes: which cargo a wrapper
+/// runs under, and when that cargo exits. The daemon's own implementation
+/// is [`OsProcesses`]; its tests stand in a table of made-up processes.
+pub trait Processes: Clone + Send + Sync + 'static {
+    /// The cargo that started the wrapper whose connection came from
+    /// `peer`, as [`owner_of`] finds it. Reads the process table, so
+    /// callers run it off the runtime's workers.
+    ///
+    /// # Errors
+    ///
+    /// As [`owner_of`].
+    fn owner_of(&self, peer: u32, cargo: Option<&Path>) -> Result<CargoOwner, String>;
+
+    /// Watch `owner` for exit: the returned future resolves when it has
+    /// exited.
+    ///
+    /// # Errors
+    ///
+    /// As [`ExitWatch::arm`].
+    fn watch(&self, owner: CargoOwner) -> Result<BoxFuture<'static, io::Result<()>>, String>;
+}
+
+/// The processes of the machine this daemon runs on.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OsProcesses;
+
+impl Processes for OsProcesses {
+    fn owner_of(&self, peer: u32, cargo: Option<&Path>) -> Result<CargoOwner, String> {
+        owner_of(peer, cargo, &OsProcessTable)
+    }
+
+    fn watch(&self, owner: CargoOwner) -> Result<BoxFuture<'static, io::Result<()>>, String> {
+        let watch = ExitWatch::arm(owner, &OsProcessTable)?;
+        Ok(Box::pin(watch.exited()))
+    }
+}
 
 /// A cargo process: its id and the time it started, which together name
 /// it for as long as the machine is up.

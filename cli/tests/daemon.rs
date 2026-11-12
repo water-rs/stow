@@ -81,7 +81,11 @@ fn run_status(command: &mut Command) -> String {
 }
 
 fn expected_status() -> String {
-    format!("version: {}\nprotocol: 2\n", env!("CARGO_PKG_VERSION"))
+    format!(
+        "version: {}\nprotocol: {}\n",
+        env!("CARGO_PKG_VERSION"),
+        stow_cli::protocol::PROTOCOL
+    )
 }
 
 /// Mode bits of `path`.

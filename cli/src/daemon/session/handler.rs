@@ -122,24 +122,48 @@ pub const CONNECTION_DRAIN_BUDGET: Duration = Duration::from_secs(30);
 /// is what waits for it (stow#618, stow#1431).
 #[derive(Debug, Default, Clone)]
 pub struct Reports {
-    tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
+    tasks: Arc<std::sync::Mutex<ReportTasks>>,
+}
+
+#[derive(Debug, Default)]
+struct ReportTasks {
+    running: tokio::task::JoinSet<()>,
+    /// Set when the session's end began draining: nothing more is taken.
+    closed: bool,
 }
 
 impl Reports {
     /// Run `work` as bookkeeping of the session, on the current runtime.
+    /// Work offered after the session's end began is dropped unrun: the
+    /// end has drained what it waits for, and bookkeeping that ran after
+    /// it would write into a build that is over.
     pub fn spawn(&self, work: impl Future<Output = ()> + Send + 'static) {
         let mut tasks = self.tasks.lock().expect("reports mutex");
+        if tasks.closed {
+            return;
+        }
         // Reap the bookkeeping that already ended so the set holds only
         // what still runs.
-        while tasks.try_join_next().is_some() {}
-        tasks.spawn(work);
+        while tasks.running.try_join_next().is_some() {}
+        tasks.running.spawn(work);
     }
 
-    /// Wait for the bookkeeping still running, at most `budget`. Returns
-    /// how many tasks were abandoned (and aborted) at the bound — `0` is a
-    /// clean drain.
+    /// Whether the session's end has begun, after which it answers no
+    /// request.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.tasks.lock().expect("reports mutex").closed
+    }
+
+    /// Close the session to further bookkeeping, then wait for what is
+    /// running, at most `budget`. Returns how many tasks were abandoned
+    /// (and aborted) at the bound — `0` is a clean drain.
     pub async fn drain(&self, budget: Duration) -> usize {
-        let mut tasks = std::mem::take(&mut *self.tasks.lock().expect("reports mutex"));
+        let mut tasks = {
+            let mut tasks = self.tasks.lock().expect("reports mutex");
+            tasks.closed = true;
+            std::mem::take(&mut tasks.running)
+        };
         let drained = tokio::time::timeout(budget, async {
             while let Some(result) = tasks.join_next().await {
                 if let Err(error) = result {
@@ -457,6 +481,14 @@ pub async fn answer_and_book<H: Handler>(
     flight: &mut Option<Flight<H::Pending>>,
     request: Request,
 ) -> Answer {
+    // A wrapper that outlived its cargo reaches a session that has ended:
+    // answering it would run bookkeeping against a directory and a journal
+    // that are gone.
+    if reports.is_closed() {
+        return Answer::Failed {
+            message: "the build's session has ended".to_owned(),
+        };
+    }
     let (answer, work) = answer_request(handler, in_flight, flight, request)
         .await
         .split();
@@ -492,6 +524,9 @@ pub async fn answer_request<H: Handler>(
         }),
         Request::CcLookup(lookup) => answer_cc_lookup(handler, lookup).await,
         Request::CcCompiled(report) => answer_cc_compiled(handler, report).await,
+        Request::Describe(_) => {
+            Reply::failed("the build's session is open, so the daemon asked nothing to describe")
+        }
     }
 }
 

@@ -293,6 +293,18 @@ project's configured rustflags wholesale), so a job on Linux also runs
 plain `stow setup`, which writes the mold selection into the runner's
 `$CARGO_HOME/config.toml`.
 
+### Sandboxes
+
+Every compile of a plain `cargo build` through the wrappers is answered
+by the per-user daemon, which opens a session of that cargo and ends it
+when the cargo exits. The process running cargo must therefore be able
+to connect to `<run dir>/daemon.sock` (the named pipe on Windows), or to
+start the daemon, which needs write access to the run directory. In a
+sandbox that allows neither, the build fails with an error naming the
+endpoint, the run directory and the daemon's pid and log. The run
+directory is `STOW_DAEMON_DIR` when it is set, and the per-user cache
+directory's `stow/run` otherwise.
+
 ## `stow update`
 
 Updates this install to the latest stow-cli release. The shell and

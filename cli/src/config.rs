@@ -485,6 +485,7 @@ pub fn load_isolation_config(
 /// # Errors
 ///
 /// A config file that exists and cannot be read or parsed.
+#[cfg_attr(not(test), expect(dead_code, reason = "only standalone mode calls it"))]
 pub fn load_cache_layers(env: &SessionEnv) -> stow_types::error::Result<CacheLayers> {
     Ok(load_user_config(env)?
         .and_then(|config| config.cache)
