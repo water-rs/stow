@@ -284,12 +284,20 @@ const SESSION_END_LIMIT: std::time::Duration = std::time::Duration::from_secs(60
 /// on a machine with rustup; on Windows the proxy runs the real cargo as its
 /// child instead of replacing itself, so the pid a test holds would not be
 /// the cargo the daemon owns the session for.
+///
+/// Sealed to `home` ([`sealed_home_env`]) from the start. A cargo can run
+/// `rustc -vV` through a wrapper whenever its `CARGO_HOME` configures one,
+/// and the wrapper then reaches the daemon of its `STOW_DAEMON_DIR`; an
+/// unsealed cargo would use the developer's real run directory. Every cargo
+/// a test starts comes from here (`sealed_cargo.rs` fails on any other).
 #[allow(
     dead_code,
     reason = "each test crate compiles this module whole; only some call it"
 )]
-pub fn cargo_command() -> Command {
-    Command::new(env!("CARGO"))
+pub fn cargo_command(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO"));
+    sealed_home_env(&mut command, home);
+    command
 }
 
 /// Run `command`, a plain `cargo` build through the stow wrappers, to its

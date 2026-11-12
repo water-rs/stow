@@ -17,7 +17,7 @@ use stow_cli::wrapper_protocol::{Answer, CompileCommand, Plan, Request};
 
 mod support;
 
-use support::{denied_registry, hermetic_stow_env, sealed_home_env};
+use support::{denied_registry, hermetic_stow_env};
 
 /// An edge that answers the miss-admissions mint with an empty list and
 /// then fails every other call with a 500.
@@ -142,12 +142,11 @@ fn write_probe_crate(dir: &Path, cargo_home: &Path, dependencies: &str) {
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
     // Resolve now, so the build under test is not also a network test.
     // The fetch must share the isolated CARGO_HOME the builds use.
-    let mut fetch = Command::new("cargo");
+    let mut fetch = support::cargo_command(&dir.join("stow-home"));
     fetch
         .arg("fetch")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
-    sealed_home_env(&mut fetch, &dir.join("stow-home"));
     let fetched = fetch.output().expect("run cargo fetch");
     assert!(
         fetched.status.success(),
@@ -562,7 +561,7 @@ fn cargo_build_in(
     extra_envs: &[(&str, &str)],
     cargo_home: &Path,
 ) -> std::process::Output {
-    let mut command = support::cargo_command();
+    let mut command = support::cargo_command(&dir.join("stow-home"));
     command
         .arg("build")
         .current_dir(dir)
@@ -1210,8 +1209,7 @@ fn write_empty_crate(dir: &Path) {
 /// The plain cargo build of `dir` into `target_dir` — the baseline both
 /// gates compare stow against.
 fn cargo_baseline(dir: &Path, cargo_home: &Path, target_dir: &Path) -> Command {
-    let mut command = Command::new("cargo");
-    sealed_home_env(&mut command, &dir.join("stow-home"));
+    let mut command = support::cargo_command(&dir.join("stow-home"));
     command
         .arg("build")
         .current_dir(dir)
@@ -1289,7 +1287,7 @@ fn plain_candidate(
     }
     warm_daemon(edge_url, cache_dir, &dir.join("stow-home"));
     let wrapper = shims.join(format!("stow-rustc-wrapper{}", wrapper_suffix()));
-    let mut command = Command::new("cargo");
+    let mut command = support::cargo_command(&dir.join("stow-home"));
     command
         .arg("build")
         .current_dir(dir)
@@ -1408,12 +1406,11 @@ fn write_multi_crate(dir: &Path, cargo_home: &Path) {
     std::fs::create_dir_all(dir.join("src")).expect("create src");
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
     // Resolve now, so the build under test is not also a network test.
-    let mut fetch = Command::new("cargo");
+    let mut fetch = support::cargo_command(&dir.join("stow-home"));
     fetch
         .arg("fetch")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
-    sealed_home_env(&mut fetch, &dir.join("stow-home"));
     let fetched = fetch.output().expect("run cargo fetch");
     assert!(
         fetched.status.success(),

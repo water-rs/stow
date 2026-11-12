@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod support;
 
-use support::{hermetic_stow_env, sealed_home_env};
+use support::hermetic_stow_env;
 
 const TARGET: &str = "x86_64-unknown-linux-gnu";
 const RUSTC_VERSION: &str = "1.85.0";
@@ -201,12 +201,11 @@ fn write_crate(dir: &Path, cargo_home: &Path) {
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
     // Resolve now, so the build under test is not also a network test.
     // The fetch must share the isolated CARGO_HOME the build uses.
-    let mut fetch = Command::new("cargo");
+    let mut fetch = support::cargo_command(&dir.join("stow-home"));
     fetch
         .arg("fetch")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
-    sealed_home_env(&mut fetch, &dir.join("stow-home"));
     let fetched = fetch.output().expect("run cargo fetch");
     assert!(
         fetched.status.success(),
@@ -516,7 +515,7 @@ fn a_plain_cargo_builds_misses_are_drained_when_its_session_ends() {
     let _daemon = support::PrivateDaemon::in_home(&dir.path().join("stow-home"));
 
     let cargo_build = |dir: &Path| {
-        let mut command = Command::new("cargo");
+        let mut command = support::cargo_command(&dir.join("stow-home"));
         command
             .arg("build")
             .current_dir(dir)
