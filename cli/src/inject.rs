@@ -595,7 +595,9 @@ fn open_served_output(
 ) -> stow_types::error::Result<Option<std::fs::File>> {
     match open_to_read_and_stamp(destination) {
         Ok(found) => Ok(Some(found)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // Another serve's replace of the output in flight leaves nothing to
+        // judge, the same as an absent output: this serve places its own.
+        Err(error) if replace_in_flight(&error) => Ok(None),
         Err(error) => Err(error).wrap_err_with(|| format!("open {}", destination.display())),
     }
 }
@@ -682,8 +684,9 @@ pub fn place_staged<F>(
     Ok(())
 }
 
-/// Whether `error`, from opening or reading a [`place_staged`] destination
-/// without a lock excluding the replace, is the replace in flight rather
+/// Whether `error`, from opening or reading a destination that
+/// [`place_staged`] or [`replace_output`] renames over, without a lock
+/// excluding the replace, is the replace in flight rather
 /// than a fault: the name is absent, or on Windows refused for the
 /// moment the replace holds it.
 ///
