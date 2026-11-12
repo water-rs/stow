@@ -215,6 +215,10 @@ pub struct Reach {
     log: PathBuf,
 }
 
+/// What every failure to reach the daemon says about the build: no wrapper
+/// decides anything on its own.
+const NO_BUILD_WITHOUT_DAEMON: &str = "every compile of a cargo build through stow's wrapper is answered by the stow daemon, so the build cannot run where the daemon cannot be reached";
+
 impl Reach {
     /// The daemon of this user's run directory.
     ///
@@ -236,7 +240,7 @@ impl Reach {
     #[must_use]
     pub fn explain(&self, failure: &str) -> String {
         format!(
-            "{failure} (every compile of a cargo build through stow's wrapper is answered by the stow daemon, so the build cannot run where the daemon cannot be reached; endpoint {}, run directory {}, daemon {})",
+            "{failure} ({NO_BUILD_WITHOUT_DAEMON}; endpoint {}, run directory {}, daemon {})",
             self.endpoint.display(),
             self.run_dir.display(),
             describe_daemon(&self.log)
@@ -325,16 +329,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
                 .decode::<Response>()
                 .map_err(|error| error.to_string())?
             {
-                Response::Working => {}
+                // What the daemon logged while deciding this wrapper's
+                // request, which it carries ahead of the answer.
+                Response::Event(Event::Log(record)) => record_log(&record),
+                // A wrapper keeps no spans of the daemon's and waits on no
+                // resolution.
+                Response::Working | Response::Event(_) => {}
                 Response::Answer(Answer::Describe) => {
                     let environment = BuildEnvironment::current()?;
                     self.send(&WrapperRequest::Describe(environment)).await?;
                 }
                 Response::Answer(answer) => return Ok(answer),
-                // What the daemon logged while deciding this wrapper's
-                // request, which it carries ahead of the answer.
-                Response::Event(Event::Log(record)) => record_log(&record),
-                Response::Event(_) => {}
                 Response::Rejected { reason } => {
                     return Err(format!("the stow daemon refused the request: {reason}"));
                 }
@@ -449,48 +454,16 @@ impl WrapperConnection {
     async fn open_direct(session: SessionRef) -> std::result::Result<Self, String> {
         let exe = runtime_executable()?;
         let settings = Settings::from_env().map_err(|error| error.to_string())?;
+        // With no run directory there is no endpoint, log or pid to name.
         let reach = Reach::locate()
             .await
-            .map_err(|error| format!("{error:#}"))?;
+            .map_err(|error| format!("{error:#} ({NO_BUILD_WITHOUT_DAEMON})"))?;
         let stream = connect(exe, settings)
             .await
             .map_err(|error| reach.explain(&format!("{error:#}")))?;
         Ok(Self::Direct(
             WrapperStream::new(stream, session, settings.answer).reaching(reach),
         ))
-    }
-
-    /// Ask what to do with one rustc invocation.
-    ///
-    /// # Errors
-    ///
-    /// Transport failures, and a daemon that answers with a failure of its
-    /// own.
-    pub async fn plan(
-        &mut self,
-        executable: &std::ffi::OsStr,
-        args: &[OsString],
-    ) -> std::result::Result<Decision, String> {
-        let plan = Plan::new(
-            executable,
-            args,
-            crate::daemon::wrapper::InvocationEnv::current(),
-        );
-        match self
-            .exchange(&WrapperRequest::Plan(plan))
-            .await?
-            .ok_or_else(no_answer)?
-        {
-            Answer::Served(notifications) => Ok(Decision::Served(notifications)),
-            Answer::Compile(command) => Ok(Decision::Compile {
-                executable: command.executable()?,
-                args: command.args()?,
-            }),
-            Answer::Failed { message } => Err(message),
-            other => Err(format!(
-                "the daemon answered a plan with {other:?}, which is not a decision"
-            )),
-        }
     }
 
     /// Whether the build's C/C++ object cache is on.
@@ -569,34 +542,6 @@ impl WrapperConnection {
         }
     }
 
-    /// Report the compile the daemon asked for and wait for its receipt.
-    /// The receipt precedes the daemon's bookkeeping, so the wrapper exits
-    /// as soon as rustc has and its unit is already recorded as exited
-    /// (stow#1431).
-    ///
-    /// # Errors
-    ///
-    /// Transport failures, and a daemon that refuses the report.
-    pub async fn report(
-        &mut self,
-        success: bool,
-        compile_time: Duration,
-    ) -> std::result::Result<(), String> {
-        let report = Compiled {
-            success,
-            compile_millis: crate::duration_millis(compile_time),
-        };
-        match self
-            .exchange(&WrapperRequest::Compiled(report))
-            .await?
-            .ok_or_else(no_answer)?
-        {
-            Answer::Received => Ok(()),
-            Answer::Failed { message } => Err(message),
-            other => Err(format!("the daemon answered a report with {other:?}")),
-        }
-    }
-
     /// End the conversation, which ends the connection's flight on the
     /// daemon. No wrapper leaves through `std::process::exit` with a
     /// connection in hand (stow#682), so a drop releases it too; the close
@@ -655,6 +600,85 @@ impl WrapperConnection {
                 answer
             }
         }
+    }
+}
+
+/// A wrapper's conversation with its session on the daemon, as a rustc
+/// wrapper has it: ask what to do with an invocation, and report the
+/// compile the answer sent it to run. A wrapper's own code is written
+/// against this, so a test can run it over a stream it holds both ends of.
+pub trait Conversation {
+    /// Send `request` and wait for the daemon's answer.
+    ///
+    /// # Errors
+    ///
+    /// The daemon closes the connection, goes quiet for longer than the
+    /// answer bound, or refuses the request.
+    async fn exchange(&mut self, request: &WrapperRequest) -> std::result::Result<Answer, String>;
+
+    /// Ask what to do with one rustc invocation.
+    ///
+    /// # Errors
+    ///
+    /// Transport failures, and a daemon that answers with a failure of its
+    /// own.
+    async fn plan(
+        &mut self,
+        executable: &std::ffi::OsStr,
+        args: &[OsString],
+    ) -> std::result::Result<Decision, String> {
+        let plan = Plan::new(
+            executable,
+            args,
+            crate::daemon::wrapper::InvocationEnv::current(),
+        );
+        match Conversation::exchange(self, &WrapperRequest::Plan(plan)).await? {
+            Answer::Served(notifications) => Ok(Decision::Served(notifications)),
+            Answer::Compile(command) => Ok(Decision::Compile {
+                executable: command.executable()?,
+                args: command.args()?,
+            }),
+            Answer::Failed { message } => Err(message),
+            other => Err(format!(
+                "the daemon answered a plan with {other:?}, which is not a decision"
+            )),
+        }
+    }
+
+    /// Report the compile the daemon asked for and wait for its receipt.
+    /// The receipt precedes the daemon's bookkeeping, so the wrapper exits
+    /// as soon as rustc has and its unit is already recorded as exited
+    /// (stow#1431).
+    ///
+    /// # Errors
+    ///
+    /// Transport failures, and a daemon that refuses the report.
+    async fn report(
+        &mut self,
+        success: bool,
+        compile_time: Duration,
+    ) -> std::result::Result<(), String> {
+        let report = Compiled {
+            success,
+            compile_millis: crate::duration_millis(compile_time),
+        };
+        match Conversation::exchange(self, &WrapperRequest::Compiled(report)).await? {
+            Answer::Received => Ok(()),
+            Answer::Failed { message } => Err(message),
+            other => Err(format!("the daemon answered a report with {other:?}")),
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> Conversation for WrapperStream<S> {
+    async fn exchange(&mut self, request: &WrapperRequest) -> std::result::Result<Answer, String> {
+        Self::exchange(self, request).await
+    }
+}
+
+impl Conversation for WrapperConnection {
+    async fn exchange(&mut self, request: &WrapperRequest) -> std::result::Result<Answer, String> {
+        Self::exchange(self, request).await?.ok_or_else(no_answer)
     }
 }
 

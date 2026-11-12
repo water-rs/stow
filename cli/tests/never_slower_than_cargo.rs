@@ -1267,6 +1267,47 @@ fn stow_candidate(
     command
 }
 
+/// The build a candidate gate measures against plain cargo: its arguments
+/// are the project directory, the cargo home, the edge URL, a fresh cache
+/// directory and a fresh target directory.
+type Candidate = fn(&Path, &Path, &str, &Path, &Path) -> Command;
+
+/// A plain `cargo build` of `dir` through the rustc wrapper `stow setup`
+/// installs, with the daemon already running as a user's is — the build
+/// every user who ran `stow setup` and nothing else pays for.
+fn plain_candidate(
+    dir: &Path,
+    cargo_home: &Path,
+    edge_url: &str,
+    cache_dir: &Path,
+    target_dir: &Path,
+) -> Command {
+    let shims = dir.join("plain-shims");
+    if !shims.exists() {
+        std::fs::create_dir_all(&shims).expect("create the shim directory");
+        write_rustc_wrapper_shim(&shims);
+    }
+    warm_daemon(edge_url, cache_dir, &dir.join("stow-home"));
+    let wrapper = shims.join(format!("stow-rustc-wrapper{}", wrapper_suffix()));
+    let mut command = Command::new("cargo");
+    command
+        .arg("build")
+        .current_dir(dir)
+        .env("CARGO_HOME", cargo_home);
+    hermetic_stow_env(&mut command, edge_url, cache_dir, &dir.join("stow-home"));
+    command
+        .env("RUSTC_WRAPPER", wrapper)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env_remove("RUST_LOG");
+    command
+}
+
+/// The file name suffix [`write_rustc_wrapper_shim`] gives the shim.
+const fn wrapper_suffix() -> &'static str {
+    if cfg!(windows) { ".cmd" } else { "" }
+}
+
 /// stow's in-build `--unit-graph` query must never take the
 /// package-cache lock ahead of the real cargo — when it wins the race,
 /// cargo's own resolve prints this on the user's stderr (stow#608).
@@ -1287,13 +1328,14 @@ fn window_pair(
     dir: &Path,
     cargo_home: &Path,
     edge_url: &str,
+    candidate: Candidate,
 ) -> (std::time::Duration, std::time::Duration) {
     let cargo_target = support::tempdir().expect("cargo target");
     let cargo = window_sample(cargo_baseline(dir, cargo_home, cargo_target.path()));
 
     let stow_cache = support::tempdir().expect("stow cache");
     let stow_target = support::tempdir().expect("stow target");
-    let stow = window_sample(stow_candidate(
+    let stow = window_sample(candidate(
         dir,
         cargo_home,
         edge_url,
@@ -1309,6 +1351,7 @@ fn wall_pair(
     dir: &Path,
     cargo_home: &Path,
     edge_url: &str,
+    candidate: Candidate,
 ) -> (std::time::Duration, std::time::Duration) {
     let cargo_target = support::tempdir().expect("cargo target");
     let (output, cargo) = timed_build(&mut cargo_baseline(dir, cargo_home, cargo_target.path()));
@@ -1320,7 +1363,7 @@ fn wall_pair(
 
     let stow_cache = support::tempdir().expect("stow cache");
     let stow_target = support::tempdir().expect("stow target");
-    let (output, stow) = timed_build(&mut stow_candidate(
+    let (output, stow) = timed_build(&mut candidate(
         dir,
         cargo_home,
         edge_url,
@@ -1652,6 +1695,22 @@ fn window_sample(command: Command) -> std::time::Duration {
 /// artifacts stay all-miss. The same priming covers the startup floor.
 #[test]
 fn an_all_miss_build_is_never_slower_than_cargo() {
+    assert_never_slower_than_cargo(stow_candidate, true);
+}
+
+/// The same gates for a plain `cargo build` through the wrapper `stow setup`
+/// installs, against the daemon a user's login has already started: the
+/// wrapper hands each unit to the build's session and exits with its
+/// compiler, so the build's job slots are as busy as plain cargo's.
+#[test]
+fn a_plain_cargo_all_miss_build_is_never_slower_than_cargo() {
+    assert_never_slower_than_cargo(plain_candidate, false);
+}
+
+/// Run both gates for `candidate` against plain cargo.
+/// `has_precargo_spans` says whether the candidate's build records the
+/// `stow.precargo.*` spans a failed window is diagnosed from.
+fn assert_never_slower_than_cargo(candidate: Candidate, has_precargo_spans: bool) {
     let dir = support::tempdir().expect("temp dir");
     let cargo_home = support::tempdir().expect("cargo home");
     write_multi_crate(dir.path(), cargo_home.path());
@@ -1667,11 +1726,11 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
     let mut cargo_empty_windows = Vec::with_capacity(WINDOW_RUNS);
     let mut stow_empty_windows = Vec::with_capacity(WINDOW_RUNS);
     for _ in 0..WINDOW_RUNS {
-        let (cargo, stow) = window_pair(empty_dir.path(), cargo_home.path(), &edge_url);
+        let (cargo, stow) = window_pair(empty_dir.path(), cargo_home.path(), &edge_url, candidate);
         cargo_empty_windows.push(cargo);
         stow_empty_windows.push(stow);
 
-        let (cargo, stow) = window_pair(dir.path(), cargo_home.path(), &edge_url);
+        let (cargo, stow) = window_pair(dir.path(), cargo_home.path(), &edge_url, candidate);
         cargo_windows.push(cargo);
         stow_windows.push(stow);
     }
@@ -1686,7 +1745,8 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
             empty: &stow_empty_windows,
         },
     );
-    let diagnostic = (!window_comparison.passes()).then(|| {
+    // Only a driver's build has pre-cargo spans to trace.
+    let diagnostic = (!window_comparison.passes() && has_precargo_spans).then(|| {
         serde_json::json!({
             "empty": precargo_diagnostic(empty_dir.path(), cargo_home.path(), &edge_url),
             "project": precargo_diagnostic(dir.path(), cargo_home.path(), &edge_url),
@@ -1708,7 +1768,7 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
         let mut cargo_walls = Vec::with_capacity(TIMED_RUNS);
         let mut stow_walls = Vec::with_capacity(TIMED_RUNS);
         for _ in 0..TIMED_RUNS {
-            let (cargo, stow) = wall_pair(dir.path(), cargo_home.path(), &edge_url);
+            let (cargo, stow) = wall_pair(dir.path(), cargo_home.path(), &edge_url, candidate);
             cargo_walls.push(cargo);
             stow_walls.push(stow);
         }

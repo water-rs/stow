@@ -35,10 +35,14 @@ fn install_shims(tools: &Path) -> PathBuf {
 }
 
 fn write_crate(dir: &Path) {
+    write_named_crate(dir, "plain");
+}
+
+fn write_named_crate(dir: &Path, name: &str) {
     std::fs::create_dir_all(dir.join("src")).expect("src dir");
     std::fs::write(
         dir.join("Cargo.toml"),
-        "[package]\nname = \"plain\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
     )
     .expect("manifest");
     std::fs::write(dir.join("src").join("lib.rs"), "pub fn one() -> u8 { 1 }\n").expect("lib");
@@ -70,13 +74,21 @@ fn cargo_build_command(
     cache: &Path,
     target: &Path,
 ) -> Command {
+    cargo_build_command_in(dir, &dir.join("stow-home"), cargo_home, shim, cache, target)
+}
+
+/// [`cargo_build_command`] with the build's stow home, and so its daemon,
+/// named: two builds of different projects share a daemon by sharing it.
+fn cargo_build_command_in(
+    dir: &Path,
+    home: &Path,
+    cargo_home: &Path,
+    shim: Option<&Path>,
+    cache: &Path,
+    target: &Path,
+) -> Command {
     let mut command = Command::new("cargo");
-    hermetic_stow_env(
-        &mut command,
-        &support::denied_registry(),
-        cache,
-        &dir.join("stow-home"),
-    );
+    hermetic_stow_env(&mut command, &support::denied_registry(), cache, home);
     command
         .arg("build")
         .current_dir(dir)
@@ -588,4 +600,289 @@ fn a_cargo_whose_daemon_restarted_is_refused_until_it_exits() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Every file under `dir`, by path relative to it.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    fn walk(root: &Path, dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, found);
+            } else {
+                found.push(path.strip_prefix(root).expect("under root").to_owned());
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(dir, dir, &mut found);
+    found
+}
+
+/// Whether one of `marks` is the mark of a crate whose name starts with
+/// `prefix`: a mark is `<crate name>-<hash>`.
+fn names_crate(marks: &[PathBuf], prefix: &str) -> bool {
+    marks.iter().any(|mark| {
+        mark.file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(prefix))
+    })
+}
+
+/// A build held inside its build script by the rendezvous fixture.
+struct HeldBuild {
+    dir: support::TempDir,
+    _cache: support::TempDir,
+    rendezvous: support::TempDir,
+    cargo: std::process::Child,
+}
+
+/// Start a plain build of a project named `name` (a crate with a path
+/// dependency, `dep_<name>`, and the rendezvous build script) that holds
+/// inside its script until the test releases it. The dependency compiles
+/// while the script holds, and its mark is the session's record of it.
+fn start_held_build(name: &str, stow_home: &Path, cargo_home: &Path, shim: &Path) -> HeldBuild {
+    let dir = support::tempdir().expect("project dir");
+    let cache = support::tempdir().expect("cache dir");
+    let rendezvous = support::tempdir().expect("rendezvous");
+    let crate_name = name.replace('-', "_");
+    write_named_crate(dir.path(), &crate_name);
+    let dependency = format!("dep_{crate_name}");
+    std::fs::create_dir_all(dir.path().join("dep").join("src")).expect("dependency dir");
+    std::fs::write(
+        dir.path().join("dep").join("Cargo.toml"),
+        format!("[package]\nname = \"{dependency}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    )
+    .expect("dependency manifest");
+    std::fs::write(
+        dir.path().join("dep").join("src").join("lib.rs"),
+        "pub fn two() -> u8 { 2 }\n",
+    )
+    .expect("dependency lib");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\n{dependency} = {{ path = \"dep\" }}\n"
+        ),
+    )
+    .expect("manifest with the dependency");
+    std::fs::write(
+        dir.path().join("build.rs"),
+        include_str!("fixtures/rendezvous_build.rs"),
+    )
+    .expect("write the build script");
+    let cargo = cargo_build_command_in(
+        dir.path(),
+        stow_home,
+        cargo_home,
+        Some(shim),
+        cache.path(),
+        &dir.path().join("target"),
+    )
+    .env("STOW_TEST_RENDEZVOUS", rendezvous.path())
+    .env("STOW_TEST_BUILD_NAME", name)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("start cargo");
+    HeldBuild {
+        dir,
+        _cache: cache,
+        rendezvous,
+        cargo,
+    }
+}
+
+/// The marks of each session directory under `sessions`: every file in it
+/// but the record of its owner.
+fn session_marks(sessions: &Path) -> Vec<Vec<PathBuf>> {
+    std::fs::read_dir(sessions)
+        .expect("the sessions directory")
+        .map(|entry| {
+            let mut marks = files_under(&entry.expect("entry").path());
+            marks.retain(|mark| mark != Path::new("owner"));
+            marks
+        })
+        .collect()
+}
+
+/// Two cargos building different projects at once on one daemon each get a
+/// session of their own: what one records as locally built never lands in
+/// the other's.
+#[test]
+fn two_concurrent_plain_builds_get_two_sessions() {
+    let home = support::tempdir().expect("home");
+    let cargo_home = support::tempdir().expect("cargo home");
+    let tools = support::tempdir().expect("tools dir");
+    let stow_home = home.path().join("stow-home");
+    support::write_global_config(&[&stow_home], "[cache]\nremote = false\n");
+    let shim = install_shims(tools.path());
+    let daemon = PrivateDaemon::in_home(&stow_home);
+
+    let names = ["held-a", "held-b"];
+    let projects: Vec<HeldBuild> = names
+        .iter()
+        .map(|name| start_held_build(name, &stow_home, cargo_home.path(), &shim))
+        .collect();
+
+    // Both builds are inside their scripts, so both sessions are open.
+    for (project, name) in projects.iter().zip(names) {
+        let started = project.rendezvous.path().join(format!("{name}.started"));
+        let deadline = Instant::now() + END_LIMIT;
+        while !started.exists() {
+            assert!(Instant::now() < deadline, "{name} never reached its script");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let sessions = daemon.run_dir().join("sessions");
+    let deadline = Instant::now() + END_LIMIT;
+    let marks = loop {
+        let marks = session_marks(&sessions);
+        if marks.len() == 2 && marks.iter().all(|marks| names_crate(marks, "dep_")) {
+            break marks;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "two sessions with marks never appeared in {}: {marks:?}",
+            sessions.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        daemon.log_lines("opened a session for a cargo").len(),
+        2,
+        "one session for each of the two cargos"
+    );
+    for crate_name in ["dep_held_a", "dep_held_b"] {
+        assert_eq!(
+            marks
+                .iter()
+                .filter(|marks| names_crate(marks, crate_name))
+                .count(),
+            1,
+            "{crate_name} is in exactly one build's session: {marks:?}"
+        );
+    }
+
+    for mut project in projects {
+        std::fs::write(project.rendezvous.path().join("release"), b"").expect("release the script");
+        let cargo_pid = project.cargo.id();
+        let status = project.cargo.wait().expect("wait for cargo");
+        assert!(
+            status.success(),
+            "the build in {} failed",
+            project.dir.path().display()
+        );
+        daemon.wait_session_ended(cargo_pid);
+    }
+    assert_eq!(daemon.serving_pids().len(), 1, "both shared one daemon");
+}
+
+/// A wrapper that cannot reach the daemon, nor start it, fails the build at
+/// cargo's first probe naming the daemon's run directory, and nothing in a
+/// wrapper process opens the cache.
+#[test]
+fn a_wrapper_that_cannot_reach_the_daemon_fails_naming_it_and_touches_no_cache() {
+    let dir = support::tempdir().expect("temp dir");
+    let cache = support::tempdir().expect("cache dir");
+    let cargo_home = support::tempdir().expect("cargo home");
+    let tools = support::tempdir().expect("tools dir");
+    write_crate(dir.path());
+    let shim = install_shims(tools.path());
+    // A run directory that cannot be created: its parent is a file.
+    let blocker = dir.path().join("not-a-directory");
+    std::fs::write(&blocker, b"").expect("write the blocker");
+    let run_dir = blocker.join("run");
+
+    let output = cargo_build_command(
+        dir.path(),
+        cargo_home.path(),
+        Some(&shim),
+        cache.path(),
+        &dir.path().join("target"),
+    )
+    .env("STOW_DAEMON_DIR", &run_dir)
+    .output()
+    .expect("run cargo build");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the build ran without a daemon:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("stow daemon") && stderr.contains(&run_dir.display().to_string()),
+        "the failure does not name the daemon and its run directory:\n{stderr}"
+    );
+    assert!(
+        !dir.path()
+            .join("target")
+            .join("debug")
+            .join("deps")
+            .exists()
+            || files_under(&dir.path().join("target").join("debug").join("deps"))
+                .iter()
+                .all(|file| file.extension().is_none_or(|extension| extension != "rlib")),
+        "a unit was compiled without the daemon"
+    );
+    assert!(
+        files_under(cache.path()).is_empty(),
+        "a wrapper touched the cache: {:?}",
+        files_under(cache.path())
+    );
+}
+
+/// A socket the process may not open is the shape a sandbox's deny takes:
+/// the build fails naming the daemon's endpoint instead of compiling on its
+/// own.
+#[cfg(unix)]
+#[test]
+fn a_socket_this_process_may_not_open_fails_the_build_naming_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // The permission bits of the socket do not bind the superuser.
+    // SAFETY: `geteuid` reads this process's credentials.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = support::tempdir().expect("temp dir");
+    let cache = support::tempdir().expect("cache dir");
+    let cargo_home = support::tempdir().expect("cargo home");
+    let tools = support::tempdir().expect("tools dir");
+    write_crate(dir.path());
+    support::write_global_config(
+        &[&dir.path().join("stow-home")],
+        "[cache]\nremote = false\n",
+    );
+    let shim = install_shims(tools.path());
+    let daemon = PrivateDaemon::in_home(&dir.path().join("stow-home"));
+
+    // A probe starts the daemon, which binds the socket.
+    let probe = wrapper_command(&shim, dir.path(), cache.path())
+        .arg("-vV")
+        .output()
+        .expect("run the wrapper");
+    assert!(probe.status.success(), "the daemon did not start");
+    let socket = daemon.run_dir().join("daemon.sock");
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000))
+        .expect("close the socket to this process");
+
+    let output = cargo_build_command(
+        dir.path(),
+        cargo_home.path(),
+        Some(&shim),
+        cache.path(),
+        &dir.path().join("target"),
+    )
+    .output()
+    .expect("run cargo build");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the build ran without reaching the daemon:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("daemon.sock") && stderr.contains("stow daemon"),
+        "the failure does not name the daemon's endpoint:\n{stderr}"
+    );
 }

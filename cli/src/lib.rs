@@ -1328,6 +1328,23 @@ async fn delegate_to_daemon(
     let mut connection = daemon::client::WrapperConnection::open(link)
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
+    let status = run_decided(&mut connection, command).await?;
+    connection
+        .close()
+        .await
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    Ok(status)
+}
+
+/// What the wrapper does with one invocation over its conversation with the
+/// daemon: ask, then either succeed for a served unit or run the compiler
+/// the answer names and report its result. Returns as soon as the daemon
+/// has received the report: the daemon's bookkeeping for it runs on after
+/// the wrapper has gone.
+async fn run_decided(
+    connection: &mut impl daemon::client::Conversation,
+    command: &WrapperCommandArgs,
+) -> stow_types::error::Result<std::process::ExitStatus> {
     let decision = connection
         .plan(&command.executable, &command.wrapped_args)
         .await
@@ -1338,10 +1355,6 @@ async fn delegate_to_daemon(
     );
     let (executable, args) = match decision {
         daemon::client::Decision::Served(notifications) => {
-            connection
-                .close()
-                .await
-                .map_err(|error| stow_types::stow_error!("{error}"))?;
             write_served_artifact_notifications(&notifications)?;
             return Ok(std::process::ExitStatus::default());
         }
@@ -1354,11 +1367,20 @@ async fn delegate_to_daemon(
         .report(status.success(), compile_time)
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
-    connection
-        .close()
-        .await
-        .map_err(|error| stow_types::stow_error!("{error}"))?;
     Ok(status)
+}
+
+/// The triple a unit's local-build mark is keyed under: its own `--target`,
+/// else the host of the build's rustc. A plain cargo's session has no
+/// configured consumer target, so a unit without `--target` still marks.
+fn compile_target<'a>(
+    parsed: &'a rustc_args::ParsedRustcArgs,
+    env_cache: &'a WrapperEnvCache,
+) -> &'a str {
+    parsed
+        .target
+        .as_deref()
+        .unwrap_or_else(|| env_cache.toolchain.host_target())
 }
 
 /// Decide one rustc invocation: serve it from the cache, or say it has to
@@ -1381,10 +1403,7 @@ async fn decide_rustc_invocation(
             tracing::warn!(error = %error, crate_name = %parsed.crate_name, "failed to detect the unit's source, bypassing the cache");
             return compile(
                 &parsed,
-                parsed
-                    .target
-                    .as_deref()
-                    .or(ctx.public_cache_target.as_deref()),
+                Some(compile_target(&parsed, env_cache)),
                 ctx.marks_dir.as_deref(),
                 invocation_env,
             )
@@ -1400,10 +1419,7 @@ async fn decide_rustc_invocation(
         );
         return compile(
             &parsed,
-            parsed
-                .target
-                .as_deref()
-                .or(ctx.public_cache_target.as_deref()),
+            Some(compile_target(&parsed, env_cache)),
             ctx.marks_dir.as_deref(),
             invocation_env,
         )
@@ -1413,10 +1429,7 @@ async fn decide_rustc_invocation(
     let Some(prepared) = prepare_unit_environment(&parsed, &class, env_cache, ctx).await else {
         return compile(
             &parsed,
-            parsed
-                .target
-                .as_deref()
-                .or(ctx.public_cache_target.as_deref()),
+            Some(compile_target(&parsed, env_cache)),
             ctx.marks_dir.as_deref(),
             invocation_env,
         )
@@ -7975,5 +7988,147 @@ mod tests {
             !terminal_text.contains("an info line"),
             "RUST_LOG=error hides info on the terminal: {terminal_text}"
         );
+    }
+
+    /// A handler that tells every plan to compile and whose bookkeeping
+    /// waits for a latch nobody completes.
+    struct Parked {
+        toolchain: std::sync::Arc<crate::toolchain::BuildToolchain>,
+        roots: crate::daemon::session::invocation::OutputRoots,
+        bookkeeping: crate::Latch,
+    }
+
+    impl crate::daemon::session::handler::Handler for Parked {
+        type Pending = ();
+
+        fn plan(
+            self: &std::sync::Arc<Self>,
+            _invocation: crate::daemon::session::invocation::VerifiedInvocation,
+            _env: crate::daemon::wrapper::InvocationEnv,
+        ) -> impl std::future::Future<Output = crate::daemon::session::handler::Decision<()>> + Send
+        {
+            std::future::ready(crate::daemon::session::handler::Decision::Compile(()))
+        }
+
+        async fn compiled(
+            self: &std::sync::Arc<Self>,
+            (): (),
+            _success: bool,
+            _compile_time: std::time::Duration,
+        ) {
+            self.bookkeeping.wait().await;
+        }
+
+        fn toolchain(
+            self: &std::sync::Arc<Self>,
+        ) -> &std::sync::Arc<crate::toolchain::BuildToolchain> {
+            &self.toolchain
+        }
+
+        fn refusal_policy(
+            self: &std::sync::Arc<Self>,
+        ) -> crate::daemon::session::invocation::RefusalPolicy {
+            crate::daemon::session::invocation::RefusalPolicy::FailBuild
+        }
+
+        fn refused(
+            self: &std::sync::Arc<Self>,
+            _refusal: crate::daemon::session::invocation::Refusal,
+        ) {
+        }
+
+        fn output_roots(
+            self: &std::sync::Arc<Self>,
+        ) -> Option<&crate::daemon::session::invocation::OutputRoots> {
+            Some(&self.roots)
+        }
+    }
+
+    /// A locally compiled unit's wrapper leaves as soon as its compiler has:
+    /// the daemon answers the report with a receipt, and the bookkeeping it
+    /// owes runs on afterwards. Here the bookkeeping never finishes, so the
+    /// wrapper returning at all is the proof it did not wait for it.
+    #[tokio::test]
+    async fn the_wrapper_returns_its_compilers_status_while_bookkeeping_is_parked() {
+        use crate::daemon::protocol::{
+            Response, SessionRef, WrapperRequest, read_frame_async, write_frame_async,
+        };
+        use crate::daemon::session::handler::{Flight, InFlightUnits, Reports, answer_and_book};
+
+        let toolchain = std::sync::Arc::new(crate::toolchain::BuildToolchain::for_tests().await);
+        let bookkeeping = crate::Latch::pending();
+        let project = tempfile::tempdir().expect("project");
+        let handler = std::sync::Arc::new(Parked {
+            toolchain: std::sync::Arc::clone(&toolchain),
+            roots: crate::daemon::session::invocation::OutputRoots::new(
+                project.path().to_owned(),
+                None,
+            ),
+            bookkeeping: bookkeeping.clone(),
+        });
+        let source = project.path().join("lib.rs");
+        std::fs::write(&source, "pub fn one() -> u8 { 1 }\n").expect("source");
+        let command = crate::cli_args::WrapperCommandArgs {
+            executable: toolchain.rustc().as_os_str().to_owned(),
+            wrapped_args: [
+                "--crate-name",
+                "demo",
+                "--crate-type",
+                "lib",
+                "--edition",
+                "2021",
+                "--emit=metadata",
+                "--out-dir",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .chain([
+                project.path().as_os_str().to_owned(),
+                source.into_os_string(),
+            ])
+            .collect(),
+        };
+
+        let (wrapper_end, mut daemon_end) = tokio::io::duplex(1 << 20);
+        let daemon = tokio::spawn(async move {
+            let in_flight = InFlightUnits::default();
+            let reports = Reports::default();
+            let mut flight: Option<Flight<()>> = None;
+            // The first frame is the wrapper's `Hello`.
+            read_frame_async(&mut daemon_end).await.expect("hello");
+            while let Some(frame) = read_frame_async(&mut daemon_end).await.expect("request") {
+                let request = frame.decode::<WrapperRequest>().expect("a wrapper request");
+                let answer =
+                    answer_and_book(&handler, &in_flight, &reports, &mut flight, request).await;
+                write_frame_async(&mut daemon_end, &Response::Answer(answer))
+                    .await
+                    .expect("answer");
+            }
+            // The reports outlive the connection, still holding the parked
+            // bookkeeping.
+            reports
+        });
+
+        let mut conversation = crate::daemon::client::WrapperStream::new(
+            wrapper_end,
+            SessionRef::Cargo {
+                cargo: None,
+                rust_log: None,
+            },
+            std::time::Duration::from_secs(30),
+        );
+        let status = super::run_decided(&mut conversation, &command)
+            .await
+            .expect("the wrapper ran its unit");
+        assert!(status.success(), "rustc compiled the unit");
+        // The daemon holds the unit's bookkeeping, parked, and the wrapper
+        // already has what it owes cargo.
+        bookkeeping.parked(1).await;
+        assert!(!bookkeeping.has_completed());
+
+        conversation.close().await.expect("close");
+        let reports = daemon.await.expect("the daemon's task");
+        bookkeeping.complete();
+        reports.drain(std::time::Duration::from_secs(30)).await;
     }
 }
