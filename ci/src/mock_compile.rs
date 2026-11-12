@@ -329,13 +329,13 @@ fn build_script_run_path(parsed: &ParsedRustcArgs, host: &str) -> Option<Planned
     if !built_for_host || !is_build_script || host_suffix == std::env::consts::EXE_SUFFIX {
         return None;
     }
-    let out_dir = parsed.out_dir.as_deref()?;
+    let mut program = stow_types::cargo_layout::UnitDir::new(parsed.out_dir.as_deref()?)
+        .ok()?
+        .build_script_program(&parsed.crate_name)?
+        .into_os_string();
+    program.push(std::env::consts::EXE_SUFFIX);
     Some(PlannedOutput {
-        path: out_dir.join(format!(
-            "{}{}",
-            parsed.crate_name.replace('_', "-"),
-            std::env::consts::EXE_SUFFIX
-        )),
+        path: program.into(),
         emit: "link",
         kind: OutputKind::Executable,
     })
@@ -444,6 +444,7 @@ fn make_executable(path: &Path) -> stow_types::error::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::path::Path;
 
     use stow_types::rustc::ParsedRustcArgs;
 
@@ -599,83 +600,101 @@ mod tests {
 
     /// A target-less unit — a build script — is named for the emulated
     /// host, so cargo finds the `.exe` it planned for a Windows runner.
-    #[test]
-    fn a_host_unit_is_named_for_the_emulated_host() {
-        let argv = args(&[
+    /// A build script's compile in cargo's shared layout
+    /// (`build/<package>-<hash>`, with `-C extra-filename`) and in its
+    /// build-unit layout (`build/<package>/<hash>/out`, without), as
+    /// `(out dir, extra-filename, the program cargo runs)` under `root`.
+    fn build_script_layouts(root: &str) -> [(String, &'static str, String); 2] {
+        let shared = format!("{root}/debug/build/x-0123456789abcdef");
+        let unit = format!("{root}/debug/build/x/0123456789abcdef/out");
+        [
+            (
+                shared.clone(),
+                "-0123456789abcdef",
+                format!("{shared}/build-script-build"),
+            ),
+            (unit.clone(), "", format!("{unit}/build_script_build")),
+        ]
+    }
+
+    fn build_script_args(out_dir: &str, extra_filename: &str) -> Vec<OsString> {
+        let mut argv = args(&[
             "--crate-name",
             "build_script_build",
             "build.rs",
             "--crate-type",
             "bin",
             "--emit=dep-info,link",
-            "-C",
-            "extra-filename=-aa",
             "--out-dir",
-            "/t/build/x",
+            out_dir,
         ]);
-        let parsed = ParsedRustcArgs::parse(&argv).expect("parse");
-        let outputs = planned_outputs(&parsed, "x86_64-pc-windows-msvc").expect("plan");
-        let link = outputs.last().expect("link output");
-        assert_eq!(
-            link.path.to_string_lossy(),
-            "/t/build/x/build_script_build-aa.exe"
-        );
-        // Cargo runs it under its own executable suffix, not the
-        // emulated host's: the stub sits there too.
-        let run = build_script_run_path(&parsed, "x86_64-pc-windows-msvc");
-        if std::env::consts::EXE_SUFFIX == ".exe" {
-            assert!(run.is_none());
-        } else {
-            let run = run.expect("a run path for a foreign suffix");
-            assert_eq!(run.path.to_string_lossy(), "/t/build/x/build-script-build");
-            assert!(run.kind == OutputKind::Executable);
+        if !extra_filename.is_empty() {
+            argv.extend(args(&["-C", &format!("extra-filename={extra_filename}")]));
         }
-        assert!(build_script_run_path(&parsed, LINUX_HOST).is_none() || cfg!(windows));
+        argv
+    }
+
+    #[test]
+    fn a_host_unit_is_named_for_the_emulated_host() {
+        for (out_dir, extra_filename, program) in build_script_layouts("/t") {
+            let parsed = ParsedRustcArgs::parse(&build_script_args(&out_dir, extra_filename))
+                .expect("parse");
+            let outputs = planned_outputs(&parsed, "x86_64-pc-windows-msvc").expect("plan");
+            let link = outputs.last().expect("link output");
+            assert_eq!(
+                link.path.to_string_lossy(),
+                format!("{out_dir}/build_script_build{extra_filename}.exe")
+            );
+            // Cargo runs it under its own executable suffix, not the
+            // emulated host's: the stub sits there too.
+            let run = build_script_run_path(&parsed, "x86_64-pc-windows-msvc");
+            if std::env::consts::EXE_SUFFIX == ".exe" {
+                assert!(run.is_none());
+            } else {
+                let run = run.expect("a run path for a foreign suffix");
+                assert_eq!(run.path.to_string_lossy(), program);
+                assert!(run.kind == OutputKind::Executable);
+            }
+            assert!(build_script_run_path(&parsed, LINUX_HOST).is_none() || cfg!(windows));
+        }
     }
 
     #[test]
     fn a_restored_build_script_keeps_its_bytes_at_cargos_run_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
         let host = if cfg!(windows) {
             LINUX_HOST
         } else {
             "x86_64-pc-windows-msvc"
         };
-        let argv = args(&[
-            "--crate-name",
-            "build_script_build",
-            "build.rs",
-            "--crate-type",
-            "bin",
-            "--emit=dep-info,link",
-            "-C",
-            "extra-filename=-aa",
-            "--out-dir",
-            dir.path().to_str().expect("path"),
-        ]);
-        let parsed = ParsedRustcArgs::parse(&argv).expect("parse");
-        let source = dir.path().join(format!(
-            "build_script_build-aa{}",
-            Naming::of(host).exe_suffix
-        ));
-        let program = b"#!/bin/sh\nexit 23\n";
-        std::fs::write(&source, program).expect("restored program");
-        #[cfg(unix)]
-        super::make_executable(&source).expect("executable");
-        materialize_build_script_run_alias(&parsed, host).expect("run alias");
-        let alias = build_script_run_path(&parsed, host).expect("foreign suffix");
-        assert_eq!(std::fs::read(&alias.path).expect("program bytes"), program);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            assert_ne!(
-                std::fs::metadata(&alias.path)
-                    .expect("metadata")
-                    .permissions()
-                    .mode()
-                    & 0o111,
-                0,
-            );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_str().expect("path");
+        for (out_dir, extra_filename, _) in build_script_layouts(root) {
+            let parsed = ParsedRustcArgs::parse(&build_script_args(&out_dir, extra_filename))
+                .expect("parse");
+            std::fs::create_dir_all(&out_dir).expect("out dir");
+            let source = Path::new(&out_dir).join(format!(
+                "build_script_build{extra_filename}{}",
+                Naming::of(host).exe_suffix
+            ));
+            let program = b"#!/bin/sh\nexit 23\n";
+            std::fs::write(&source, program).expect("restored program");
+            #[cfg(unix)]
+            super::make_executable(&source).expect("executable");
+            materialize_build_script_run_alias(&parsed, host).expect("run alias");
+            let alias = build_script_run_path(&parsed, host).expect("foreign suffix");
+            assert_eq!(std::fs::read(&alias.path).expect("program bytes"), program);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_ne!(
+                    std::fs::metadata(&alias.path)
+                        .expect("metadata")
+                        .permissions()
+                        .mode()
+                        & 0o111,
+                    0,
+                );
+            }
         }
     }
 }
