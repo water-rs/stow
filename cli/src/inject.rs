@@ -595,7 +595,9 @@ fn open_served_output(
 ) -> stow_types::error::Result<Option<std::fs::File>> {
     match open_to_read_and_stamp(destination) {
         Ok(found) => Ok(Some(found)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // Another serve's replace of the output in flight leaves nothing to
+        // judge, the same as an absent output: this serve places its own.
+        Err(error) if replace_in_flight(&error) => Ok(None),
         Err(error) => Err(error).wrap_err_with(|| format!("open {}", destination.display())),
     }
 }
@@ -682,6 +684,31 @@ pub fn place_staged<F>(
     Ok(())
 }
 
+/// Whether `error`, from opening or reading a destination that
+/// [`place_staged`] or [`replace_output`] renames over, without a lock
+/// excluding the replace, is the replace in flight rather
+/// than a fault: the name is absent, or on Windows refused for the
+/// moment the replace holds it.
+///
+/// `ERROR_ACCESS_DENIED` is what `CreateFileW` returns for a name whose
+/// previous file the replace has marked delete-pending (the NT status
+/// `STATUS_DELETE_PENDING` maps to it); the Rust standard library opens
+/// with every share mode, so a reader never gets
+/// `ERROR_SHARING_VIOLATION` from it. See the `MoveFileExW` and
+/// `CreateFileW` documentation, and stow#1472 for the observed failure.
+fn replace_in_flight(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        return error.raw_os_error() == i32::try_from(ERROR_ACCESS_DENIED).ok();
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 /// Stamp a materialized output with the mtime rustc's own write would
 /// have left: this invocation, not the moment the cache entry was
 /// staged. A reflink shares the source's inode metadata, so without the
@@ -713,11 +740,11 @@ fn materialized_marker_matches(
     }
     let marker_path = materialized_marker_path(output_path)?;
     // Every serve rewrites the marker by renaming over it, which a read
-    // racing it can find absent on Windows (`place_staged`). An absent
-    // marker is no evidence, and the caller hashes the bytes instead.
+    // racing it can find absent or refused on Windows (`place_staged`).
+    // Neither is evidence, and the caller hashes the bytes instead.
     let contents = match std::fs::read_to_string(&marker_path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if replace_in_flight(&error) => return Ok(false),
         Err(error) => {
             return Err(error).wrap_err_with(|| {
                 format!(
@@ -1380,5 +1407,25 @@ mod tests {
 
             assert_eq!(before, after);
         });
+    }
+
+    #[test]
+    fn replace_in_flight_is_absence_and_on_windows_a_refused_open() {
+        assert!(super::replace_in_flight(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!super::replace_in_flight(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!super::replace_in_flight(&std::io::Error::from(
+            std::io::ErrorKind::UnexpectedEof
+        )));
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_DISK_FULL};
+            let os = |code: u32| std::io::Error::from_raw_os_error(code as i32);
+            assert!(super::replace_in_flight(&os(ERROR_ACCESS_DENIED)));
+            assert!(!super::replace_in_flight(&os(ERROR_DISK_FULL)));
+        }
     }
 }
