@@ -523,6 +523,20 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 300,
     },
     DriveBudget {
+        // stow#1481 provisional: the floor claim plus the refusal. A
+        // refused task takes a slot of the pass, so the digest reads
+        // stay at most the dispatch cap (45) in one statement, two rows
+        // read each, and the refusals add ONE `ClosuresRefused` row to
+        // the `Claims` append: 4 + 1 statements, 6 + 2×45 reads. The
+        // host gate measured 3/17/2 against the floor claim's 2/7/1;
+        // the workerd absolute awaits a probe run.
+        name: "alarm pass (closure refusal)",
+        statements: 5,
+        rows_read: 96,
+        rows_written: 6,
+        wall_ms: 3,
+    },
+    DriveBudget {
         name: "GET /dispatch-cap",
         statements: 2,
         rows_read: 4,

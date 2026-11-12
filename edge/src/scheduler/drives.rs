@@ -1346,6 +1346,121 @@ fn feed_event_task_ids() -> Vec<String> {
         .collect()
 }
 
+// ===== The closure refusal (stow#1481) =====
+
+/// The closure-refusal drive's own node family.
+const TAG_REFUSAL: u64 = 15;
+
+/// The rustc of the closure-refusal drive's nodes: no fixture node and
+/// no other drive uses it, so the slice its setup reports and its
+/// cleanup retires is the drive's alone.
+const REFUSAL_RUSTC: &str = "1.88.0";
+
+/// The target of the closure-refusal drive's nodes: the first CI target
+/// built on the Linux family. The fixture holds the macOS family's cap
+/// in flight at some sizes, which leaves a macOS task out of every pass;
+/// the Linux family only has the shared cap, which the fixture's
+/// in-flight rows leave free slots of.
+fn refusal_target() -> Result<&'static str, String> {
+    CI_TARGET_TRIPLES
+        .iter()
+        .copied()
+        .find(|&target| stow_types::api::runner_family(target) == Some(RunnerFamily::Linux))
+        .ok_or_else(|| "no CI target builds on the Linux family".to_owned())
+}
+
+/// A closure-refusal node: crate `name` with `features`, its id the
+/// canonical id of those columns.
+fn refusal_node(
+    name: &str,
+    k: u64,
+    features: &[&str],
+    deps: Vec<u32>,
+) -> Result<stow_types::api::SubmissionNode, String> {
+    let mut node = fixture::named_node(
+        name,
+        DRIVE_SEED + TAG_REFUSAL * 1_000 + k,
+        refusal_target()?,
+        deps,
+    );
+    node.rustc_version = WireRustcVersion::parse(REFUSAL_RUSTC).map_err(text)?;
+    node.features_json =
+        FeaturesJson::from_sorted(features.iter().map(|&feature| feature.to_owned()).collect())
+            .map_err(text)?;
+    node.task_id =
+        stow_types::task_graph::canonical_task_id(&stow_types::task_graph::TaskIdFields {
+            crate_name: node.crate_name.as_str(),
+            version: &node.version.to_string(),
+            features_json: &node.features_json.raw(),
+            target: node.target.as_str(),
+            rustc_version: node.rustc_version.as_str(),
+            dependency_identity: node.dependency_identity.as_str(),
+            host_side: node.host_side,
+            profile: node.profile,
+        });
+    Ok(node)
+}
+
+/// The closure-refusal drive's nodes. `costgate-polyval` is published
+/// with its edge onto `costgate-libc` `[extra]`; `costgate-aes` names it
+/// bare beside `costgate-libc` `[]`, so its own tree agrees while its
+/// closure in the graph holds two sets of one package.
+struct RefusalNodes {
+    extra: stow_types::api::SubmissionNode,
+    plain: stow_types::api::SubmissionNode,
+    polyval: stow_types::api::SubmissionNode,
+    keeper: stow_types::api::SubmissionNode,
+    aes: stow_types::api::SubmissionNode,
+    gcm: stow_types::api::SubmissionNode,
+}
+
+fn refusal_nodes() -> Result<RefusalNodes, String> {
+    Ok(RefusalNodes {
+        extra: refusal_node("costgate-libc", 0, &["extra"], Vec::new())?,
+        plain: refusal_node("costgate-libc", 1, &[], Vec::new())?,
+        polyval: refusal_node("costgate-polyval", 2, &[], Vec::new())?,
+        keeper: refusal_node("costgate-keeper", 3, &[], vec![1])?,
+        aes: refusal_node("costgate-aes", 4, &[], vec![0, 1])?,
+        gcm: refusal_node("costgate-aes-gcm", 5, &[], vec![2])?,
+    })
+}
+
+/// The drive's own slice: the two libc sets and polyval published, or
+/// — `retire` — withdrawn again.
+fn refusal_slice(nodes: &RefusalNodes, retire: bool) -> Result<PublishedSlice, String> {
+    let target = refusal_target()?;
+    let rows: Vec<_> = [&nodes.extra, &nodes.plain, &nodes.polyval]
+        .into_iter()
+        .flat_map(|node| {
+            fixture::node_shapes(node.host_side, target)
+                .into_iter()
+                .map(|unit_shape| stow_types::api::PublishedSliceRow {
+                    dependency_identity: node.dependency_identity.clone(),
+                    crate_name: node.crate_name.clone(),
+                    version: node.version.clone(),
+                    features_json: node.features_json.clone(),
+                    unit_shape,
+                    node_profile: node.profile,
+                })
+        })
+        .collect();
+    let (added, retired) = if retire {
+        (Vec::new(), rows)
+    } else {
+        (rows, Vec::new())
+    };
+    Ok(PublishedSlice {
+        target: TargetTriple::parse(target).map_err(text)?,
+        rustc_version: WireRustcVersion::parse(REFUSAL_RUSTC).map_err(text)?,
+        base_generation: None,
+        generation: 1,
+        part: 0,
+        parts: 1,
+        added,
+        retired,
+    })
+}
+
 // ===== The drive list =====
 
 /// The drives, in budget-table order. Read routes first, then the
@@ -2606,6 +2721,114 @@ pub const DRIVES: &[Drive] = &[
             })
         },
         cleanup: None,
+    },
+    Drive {
+        // A claim pass whose top-ranked ready task has a disagreeing
+        // closure (stow#1481): the pass refuses it in memory — one walk
+        // of its closure — and claims the rest of the free slots. A
+        // refusal takes a slot of the pass, so the digest rows the pass
+        // mints from stay at most the dispatch cap (45), one statement,
+        // two rows read each; the refusals ride ONE `ClosuresRefused`
+        // row in the `Claims` append. Setup publishes the drive's slice
+        // and lands its two trees through the live submit route — the
+        // second ranked first by an operations priority and a submit a
+        // minute back — and cleanup restores the claims, cancels the
+        // drive's tasks and retires its slice.
+        name: "alarm pass (closure refusal)",
+        setup: Some(|db, _shape, settings, ctx| {
+            Box::pin(async move {
+                let nodes = refusal_nodes()?;
+                routes::slice_reports(
+                    ctx.loaded(),
+                    db,
+                    &[refusal_slice(&nodes, false)?],
+                    Some(DRIVE_ACTOR),
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?;
+                let mut polyval = nodes.polyval.clone();
+                polyval.deps = vec![0];
+                let held = SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![2],
+                    nodes: vec![nodes.extra.clone(), polyval, nodes.keeper.clone()],
+                };
+                let bare = SubmissionTree {
+                    source: SubmissionSource::Operations { priority: i64::MAX },
+                    roots: vec![3],
+                    nodes: vec![
+                        nodes.polyval.clone(),
+                        nodes.plain.clone(),
+                        nodes.aes.clone(),
+                        nodes.gcm.clone(),
+                    ],
+                };
+                let (inserted, _) = routes::submit(
+                    ctx.loaded(),
+                    db,
+                    settings,
+                    &[held, bare],
+                    false,
+                    Some(DRIVE_ACTOR),
+                    now_ms() - 60_000,
+                )
+                .await
+                .map_err(text)?;
+                // keeper, aes and aes-gcm; the published nodes are born
+                // published.
+                if inserted != 3 {
+                    return Err(format!("refusal setup inserted {inserted}, expected 3"));
+                }
+                schedule(ctx, db, settings).await
+            })
+        }),
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                let failed = ctx.loaded().with(|graph| graph.status().failed);
+                let claimed = focused_claim_pass(db, settings, ctx).await?;
+                let refused = ctx.loaded().with(|graph| graph.status().failed) - failed;
+                if refused != 1 {
+                    return Err(format!("the pass refused {refused} tasks, expected 1"));
+                }
+                ctx.set_bound(BoundRun {
+                    task: claimed.join(","),
+                    run: 0,
+                });
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let claimed = ctx.bound_run()?.task;
+                let ids = claimed
+                    .split(',')
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                restore_claimed(ctx, db, ids).await?;
+                let nodes = refusal_nodes()?;
+                cancel_submitted(
+                    ctx,
+                    db,
+                    vec![
+                        nodes.keeper.task_id.clone(),
+                        nodes.aes.task_id.clone(),
+                        nodes.gcm.task_id.clone(),
+                    ],
+                )
+                .await?;
+                routes::slice_reports(
+                    ctx.loaded(),
+                    db,
+                    &[refusal_slice(&nodes, true)?],
+                    Some(DRIVE_ACTOR),
+                    now_ms(),
+                )
+                .await
+                .map_err(text)
+            })
+        }),
     },
     Drive {
         // The operator's caps read (stow#1039): one read of state the

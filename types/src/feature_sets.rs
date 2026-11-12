@@ -144,13 +144,15 @@ impl<G: Ord + Clone> FeatureAgreement<G> {
 /// `node` names a
 /// node's group and set — `None` for a node whose group the caller
 /// knows holds one set everywhere — and `dependencies` pushes a node's
-/// direct dependencies; both are the caller's view of its graph.
-pub fn closure_disagreement<'a, G: Ord + Clone>(
+/// direct dependencies; both are the caller's view of its graph. The
+/// set type `S` is the caller's handle of a canonical feature list, so
+/// equal handles are equal sets.
+pub fn closure_disagreement<G: Ord + Clone, S: PartialEq>(
     start: usize,
-    node: impl Fn(usize) -> Option<(G, &'a [String])>,
+    node: impl Fn(usize) -> Option<(G, S)>,
     dependencies: impl Fn(usize, &mut Vec<usize>),
 ) -> Option<G> {
-    let mut held = BTreeMap::<G, &'a [String]>::new();
+    let mut held = BTreeMap::<G, S>::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![start];
     while let Some(index) = stack.pop() {
@@ -169,6 +171,20 @@ pub fn closure_disagreement<'a, G: Ord + Clone>(
         dependencies(index, &mut stack);
     }
     None
+}
+
+/// The package a disagreeing closure holds twice, in the words every
+/// refusal of one uses: `<crate> <version> with two feature sets on the
+/// <side> side for <target>`.
+#[must_use]
+pub fn disagreement_text(
+    crate_name: impl std::fmt::Display,
+    version: impl std::fmt::Display,
+    target: impl std::fmt::Display,
+    host_side: bool,
+) -> String {
+    let side = if host_side { "host" } else { "target" };
+    format!("{crate_name} {version} with two feature sets on the {side} side for {target}")
 }
 
 #[cfg(test)]

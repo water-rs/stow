@@ -758,7 +758,9 @@ pub(super) async fn persist_freeze(
 /// ONE `Claims` event appended before any `workflow_dispatch` posts.
 /// `bound` caps the claim count — a completion's inline pass claims at
 /// most one concurrent POST round (`u32::MAX` claims every free slot).
-/// An empty claim set appends nothing.
+/// The tasks the claim refused for a disagreeing closure (stow#1481)
+/// take slots of the same bound and ride ONE `ClosuresRefused` row in
+/// the same append; they never reach CI. An empty pass appends nothing.
 ///
 /// # Errors
 /// `QueueError::Invariant` when a target has no runner family,
@@ -771,27 +773,43 @@ pub(super) async fn claim_pass(
     bound: u32,
 ) -> Result<Vec<Claimed>, QueueError> {
     graph.with(|graph| graph.set_floor(settings.min_dispatch_value));
-    let nodes = graph.with(|graph| graph.claim_nodes(settings, now, bound))?;
-    if nodes.is_empty() {
+    let pass = graph.with(|graph| graph.claim_nodes(settings, now, bound))?;
+    if pass.is_empty() {
         return Ok(Vec::new());
     }
-    // The claimed nodes' task ids are minted from their digest rows,
-    // read in batched statements right after the claim.
-    let slots = graph.with(|graph| graph.claim_slots(&nodes));
+    // The pass's task ids are minted from their digest rows, read in
+    // batched statements right after the claim.
+    let slots = graph.with(|graph| graph.claim_slots(&pass));
     let mut digests = store::read_digests(db, &slots).await?;
-    let claims = graph.with(|graph| graph.claimed(&nodes, &mut digests))?;
-    let event = SchedulerEvent::Claims {
-        claims: claims
-            .iter()
-            .map(|claim| stow_types::api::DispatchClaim {
-                task_id: claim.task_id.clone(),
-                generation: claim.generation,
-                attempt: claim.attempt,
-            })
-            .collect(),
-    };
-    append(graph, db, None, std::slice::from_ref(&event), now).await?;
-    Ok(claims)
+    let minted = graph.with(|graph| graph.claimed(&pass, &mut digests))?;
+    let mut events = Vec::with_capacity(2);
+    if !minted.refusals.is_empty() {
+        for refusal in &minted.refusals {
+            tracing::warn!(
+                task_id = %refusal.task_id,
+                error = %refusal.error,
+                "refused a task whose closure disagrees"
+            );
+        }
+        events.push(SchedulerEvent::ClosuresRefused {
+            refusals: minted.refusals,
+        });
+    }
+    if !minted.claims.is_empty() {
+        events.push(SchedulerEvent::Claims {
+            claims: minted
+                .claims
+                .iter()
+                .map(|claim| stow_types::api::DispatchClaim {
+                    task_id: claim.task_id.clone(),
+                    generation: claim.generation,
+                    attempt: claim.attempt,
+                })
+                .collect(),
+        });
+    }
+    append(graph, db, None, &events, now).await?;
+    Ok(minted.claims)
 }
 
 /// A dispatch pass's outcome half: ONE `Bindings` row for every
