@@ -307,32 +307,39 @@ fn is_wrapper_invocation() -> bool {
 }
 
 fn should_install_tracing() -> bool {
-    let args = process_args();
-    should_install_tracing_for_args(
-        &args,
-        std::env::var_os("RUST_LOG").as_deref(),
-        std::env::var_os(STOW_TRACE_WRAPPED_COMPILERS_ENV),
-    )
+    should_install_tracing_for_args(&process_args())
 }
 
-fn should_install_tracing_for_args(
-    args: &[OsString],
-    rust_log: Option<&OsStr>,
-    trace_wrapped_compilers: Option<OsString>,
-) -> bool {
+/// Every process but the daemon installs a subscriber. A wrapper needs one
+/// for the warnings the daemon returns to it, which are all its stderr
+/// shows unless it traces ([`wrapper_tracing_requested`]).
+fn should_install_tracing_for_args(args: &[OsString]) -> bool {
     // The daemon logs to its own file, installed once its runtime
     // directory is known.
-    if daemon::is_serving(args) {
-        return false;
+    !daemon::is_serving(args)
+}
+
+/// Whether `STOW_TRACE_WRAPPED_COMPILERS` (`value`) asks for a wrapper's
+/// tracing: set, and not `0`.
+pub(crate) fn wrapper_tracing_requested(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| value != "0")
+}
+
+/// What the subscriber's filter and trace file read from the environment.
+/// A wrapper that is not asked to trace is held to the default filter and
+/// no trace file: hundreds of them run per build, and they print only the
+/// warnings the daemon sends back.
+fn tracing_inputs(
+    is_wrapper: bool,
+    trace_requested: bool,
+    rust_log: Option<String>,
+    trace_file: Option<PathBuf>,
+) -> (Option<String>, Option<PathBuf>) {
+    if is_wrapper && !trace_requested {
+        (None, None)
+    } else {
+        (rust_log, trace_file)
     }
-    let is_wrapper_subcommand = matches!(
-        args.get(1).map(OsString::as_os_str),
-        Some(command) if command == "rustc" || command == "cc"
-    );
-    if is_wrapper_subcommand {
-        return trace_wrapped_compilers.is_some_and(|value| value != "0");
-    }
-    rust_log.is_some() || !is_wrapper_subcommand
 }
 
 #[tracing::instrument(name = "stow.startup", skip_all, fields(subcommand))]
@@ -5294,8 +5301,12 @@ where
     // compiler's. Cargo hashes `rustc -vV` stdout into every unit's
     // `-C metadata`, so a single log line there changes the cache key of
     // every crate in the build on every invocation.
+    //
+    // Colour only for a person's terminal: a wrapper's stderr is cargo's
+    // pipe, which would show the escape codes as text.
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(terminal)
         .with_filter(terminal_filter);
 
@@ -5349,8 +5360,12 @@ where
 }
 
 fn install_tracing() -> TracingGuard {
-    let rust_log = std::env::var("RUST_LOG").ok();
-    let trace_file = std::env::var_os(STOW_TRACE_FILE_ENV).map(PathBuf::from);
+    let (rust_log, trace_file) = tracing_inputs(
+        is_wrapper_invocation(),
+        wrapper_tracing_requested(std::env::var_os(STOW_TRACE_WRAPPED_COMPILERS_ENV).as_deref()),
+        std::env::var("RUST_LOG").ok(),
+        std::env::var_os(STOW_TRACE_FILE_ENV).map(PathBuf::from),
+    );
     let (subscriber, guard) =
         tracing_subscriber_for(rust_log.as_deref(), trace_file, std::io::stderr);
     // `try_init` installs the global default and — `tracing-subscriber`'s
@@ -5368,7 +5383,7 @@ mod tests {
     use super::{
         UnparseableInvocation, cached_rustc_artifact_notifications, classify_invocation,
         expand_wrapper_role, should_install_tracing_for_args, strip_cargo_subcommand_word,
-        tracing_subscriber_for,
+        tracing_inputs, tracing_subscriber_for, wrapper_tracing_requested,
     };
     use crate::rustc_args::ParsedRustcArgs;
 
@@ -5701,61 +5716,44 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_tracing_stays_disabled_under_rust_log_by_default() {
-        assert!(!should_install_tracing_for_args(
-            &args(&["stow", "rustc"]),
-            env_value(Some("debug")).as_deref(),
-            env_value(None),
-        ));
-        assert!(!should_install_tracing_for_args(
-            &args(&["stow", "cc"]),
-            env_value(Some("debug")).as_deref(),
-            env_value(None),
-        ));
+    fn a_wrapper_holds_the_default_filter_unless_asked_to_trace() {
+        let rust_log = || Some("debug".to_owned());
+        let trace_file = || Some(PathBuf::from("/tmp/trace.json"));
+        for is_wrapper_trace_requested in [false, true] {
+            assert_eq!(
+                tracing_inputs(true, is_wrapper_trace_requested, rust_log(), trace_file()),
+                if is_wrapper_trace_requested {
+                    (rust_log(), trace_file())
+                } else {
+                    (None, None)
+                },
+            );
+        }
+        // Every other command reads its environment whatever the variable.
+        assert_eq!(
+            tracing_inputs(false, false, rust_log(), trace_file()),
+            (rust_log(), trace_file())
+        );
     }
 
     #[test]
     fn wrapper_tracing_requires_explicit_opt_in() {
-        assert!(should_install_tracing_for_args(
-            &args(&["stow", "rustc"]),
-            env_value(None).as_deref(),
-            env_value(Some("1")),
-        ));
-        assert!(!should_install_tracing_for_args(
-            &args(&["stow", "rustc"]),
-            env_value(None).as_deref(),
-            env_value(Some("0")),
-        ));
+        assert!(!wrapper_tracing_requested(None));
+        assert!(!wrapper_tracing_requested(env_value(Some("0")).as_deref()));
+        assert!(wrapper_tracing_requested(env_value(Some("1")).as_deref()));
     }
 
     #[test]
-    fn top_level_commands_keep_tracing_behavior() {
-        assert!(should_install_tracing_for_args(
-            &args(&["stow", "check"]),
-            env_value(None).as_deref(),
-            env_value(None),
-        ));
-        assert!(should_install_tracing_for_args(
-            &args(&["stow", "check"]),
-            env_value(Some("debug")).as_deref(),
-            env_value(None),
-        ));
-    }
-
-    #[test]
-    fn the_serving_daemon_installs_its_own_log_not_the_terminal_one() {
-        for rust_log in [None, Some("debug")] {
-            assert!(!should_install_tracing_for_args(
-                &args(&["stow", "daemon", "--ready", "x"]),
-                env_value(rust_log).as_deref(),
-                env_value(None),
-            ));
+    fn every_command_but_the_serving_daemon_installs_tracing() {
+        for command in [["stow", "check"], ["stow", "rustc"], ["stow", "cc"]] {
+            assert!(should_install_tracing_for_args(&args(&command)));
         }
-        assert!(should_install_tracing_for_args(
-            &args(&["stow", "daemon", "status"]),
-            env_value(None).as_deref(),
-            env_value(None),
-        ));
+        assert!(!should_install_tracing_for_args(&args(&[
+            "stow", "daemon", "--ready", "x"
+        ])));
+        assert!(should_install_tracing_for_args(&args(&[
+            "stow", "daemon", "status"
+        ])));
     }
 
     #[test]

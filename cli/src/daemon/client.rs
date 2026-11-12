@@ -331,6 +331,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
                     self.send(&WrapperRequest::Describe(environment)).await?;
                 }
                 Response::Answer(answer) => return Ok(answer),
+                // What the daemon logged while deciding this wrapper's
+                // request, which it carries ahead of the answer.
+                Response::Event(Event::Log(record)) => record_log(&record),
+                Response::Event(_) => {}
                 Response::Rejected { reason } => {
                     return Err(format!("the stow daemon refused the request: {reason}"));
                 }
@@ -415,6 +419,13 @@ impl WrapperConnection {
             SessionLink::Cargo => {
                 Self::open_direct(SessionRef::Cargo {
                     cargo: std::env::var_os("CARGO").map(|cargo| os_bytes::encode(&cargo)),
+                    // A wrapper that does not trace takes the warnings the
+                    // daemon returns to it and nothing more.
+                    rust_log: crate::wrapper_tracing_requested(
+                        std::env::var_os(crate::STOW_TRACE_WRAPPED_COMPILERS_ENV).as_deref(),
+                    )
+                    .then(|| std::env::var("RUST_LOG").ok())
+                    .flatten(),
                 })
                 .await
             }
@@ -945,7 +956,10 @@ mod tests {
         let (client, mut daemon_end) = tokio::io::duplex(1 << 16);
         let mut stream = super::WrapperStream::new(
             client,
-            super::SessionRef::Cargo { cargo: None },
+            super::SessionRef::Cargo {
+                cargo: None,
+                rust_log: None,
+            },
             std::time::Duration::from_secs(5),
         )
         .reaching(reach(dir.path()));
@@ -971,7 +985,10 @@ mod tests {
         let (client, mut daemon_end) = tokio::io::duplex(1 << 20);
         let mut stream = super::WrapperStream::new(
             client,
-            super::SessionRef::Cargo { cargo: None },
+            super::SessionRef::Cargo {
+                cargo: None,
+                rust_log: None,
+            },
             std::time::Duration::from_secs(5),
         );
         let daemon = async move {

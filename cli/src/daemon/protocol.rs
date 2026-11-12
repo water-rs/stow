@@ -76,6 +76,10 @@ pub enum SessionRef {
         /// started it — OS-encoded; absent when the wrapper's environment
         /// has none.
         cargo: Option<Vec<u8>>,
+        /// The `RUST_LOG` directives the wrapper wants the events of its
+        /// requests at, besides the warnings and errors it always gets;
+        /// set only when the wrapper traces (`STOW_TRACE_WRAPPED_COMPILERS`).
+        rust_log: Option<String>,
     },
 }
 

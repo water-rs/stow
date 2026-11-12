@@ -181,6 +181,27 @@ fn wrapper_command(shim: &Path, dir: &Path, cache: &Path) -> Command {
     command
 }
 
+/// The wrapper's command line for the demo crate's lib unit, compiled into
+/// `out_dir`, run with no `CARGO` so its parent owns its session.
+fn lib_unit_command(shim: &Path, dir: &Path, cache: &Path, out_dir: &Path) -> Command {
+    let mut command = wrapper_command(shim, dir, cache);
+    command
+        .args([
+            "--crate-name",
+            "plain",
+            "--edition",
+            "2021",
+            "--crate-type",
+            "lib",
+        ])
+        .args(["--emit=link", "-C", "metadata=0123abcd"])
+        .args(["-C", "extra-filename=-0123abcd", "--out-dir"])
+        .arg(out_dir)
+        .arg(dir.join("src").join("lib.rs"))
+        .env_remove("CARGO");
+    command
+}
+
 /// A probe — `-vV`, `--print` — has nothing to cache and no build to
 /// belong to: the wrapper runs it as the daemon answers, and the daemon
 /// opens no session for it.
@@ -242,20 +263,7 @@ fn a_wrapper_with_no_cargo_variable_is_owned_by_its_parent() {
     let daemon = PrivateDaemon::in_home(&dir.path().join("stow-home"));
 
     let out_dir = dir.path().join("target").join("debug").join("deps");
-    let output = wrapper_command(&shim, dir.path(), cache.path())
-        .args([
-            "--crate-name",
-            "plain",
-            "--edition",
-            "2021",
-            "--crate-type",
-            "lib",
-        ])
-        .args(["--emit=link", "-C", "metadata=0123abcd"])
-        .args(["-C", "extra-filename=-0123abcd", "--out-dir"])
-        .arg(&out_dir)
-        .arg(dir.path().join("src").join("lib.rs"))
-        .env_remove("CARGO")
+    let output = lib_unit_command(&shim, dir.path(), cache.path(), &out_dir)
         .output()
         .expect("run the wrapper");
     assert!(
@@ -435,6 +443,54 @@ fn a_killed_cargo_ends_its_session_while_its_build_script_lives() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// What the daemon logs at `warn` while deciding a plain build's request
+/// reaches that wrapper's stderr, since no driver's terminal carries it: a
+/// unit named for an output directory outside the build's target is refused
+/// and logged, and the wrapper prints the daemon's record of it.
+#[test]
+fn a_plain_builds_refusal_warning_reaches_the_wrappers_stderr() {
+    let dir = support::tempdir().expect("temp dir");
+    let cache = support::tempdir().expect("cache dir");
+    let tools = support::tempdir().expect("tools dir");
+    write_crate(dir.path());
+    support::write_global_config(
+        &[&dir.path().join("stow-home")],
+        "[cache]\nremote = false\n",
+    );
+    let shim = install_shims(tools.path());
+    let _daemon = PrivateDaemon::in_home(&dir.path().join("stow-home"));
+    let deps = |target: &str| dir.path().join(target).join("debug").join("deps");
+
+    let opened = lib_unit_command(&shim, dir.path(), cache.path(), &deps("target"))
+        .output()
+        .expect("run the wrapper");
+    assert!(
+        opened.status.success(),
+        "the opening unit failed:\n{}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&opened.stderr).contains("daemon_target"),
+        "a request the daemon had nothing to warn about printed a record:\n{}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+
+    let refused = lib_unit_command(&shim, dir.path(), cache.path(), &deps("elsewhere"))
+        .output()
+        .expect("run the wrapper");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "a unit outside the build's target directory was served:\n{stderr}"
+    );
+    // The wrapper's own failure message is one line; the daemon's record of
+    // what it logged carries the module that logged it.
+    assert!(
+        stderr.contains("daemon_target=") && stderr.contains("refused a"),
+        "the daemon's warning did not reach the wrapper:\n{stderr}"
+    );
 }
 
 /// A daemon that restarts under a running cargo has lost the session's

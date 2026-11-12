@@ -92,6 +92,10 @@ pub struct LogInterest {
     /// The driver writes a trace file, which records stow's own crates at
     /// every level.
     trace_file: bool,
+    /// Warnings and errors are wanted whatever `rust_log` says: the
+    /// interest of a wrapper, which has no terminal of its own to tell
+    /// otherwise.
+    always_warn: bool,
 }
 
 impl LogInterest {
@@ -110,11 +114,32 @@ impl LogInterest {
                 .parse()
                 .map_err(|error| format!("RUST_LOG `{rust_log}`: {error}"))?,
             trace_file,
+            always_warn: false,
+        })
+    }
+
+    /// The interest of a wrapper of a plain cargo build: every warning and
+    /// error, and what `rust_log` selects besides when the wrapper traces.
+    ///
+    /// # Errors
+    ///
+    /// `rust_log` is not a directive list.
+    pub fn of_wrapper(rust_log: Option<&str>) -> Result<Self, String> {
+        // A wrapper that does not trace asks for nothing beyond the floor.
+        let rust_log = rust_log.unwrap_or("off");
+        Ok(Self {
+            rust_log: rust_log
+                .parse()
+                .map_err(|error| format!("RUST_LOG `{rust_log}`: {error}"))?,
+            trace_file: false,
+            always_warn: true,
         })
     }
 
     fn wants(&self, target: &str, level: tracing::Level) -> bool {
-        self.rust_log.would_enable(target, &level)
+        // `WARN` and `ERROR` order below the more verbose levels.
+        (self.always_warn && level <= tracing::Level::WARN)
+            || self.rust_log.would_enable(target, &level)
             || (self.trace_file && target.starts_with(TRACE_TARGET_PREFIX))
     }
 }
@@ -492,5 +517,50 @@ mod tests {
         assert_eq!(opened[1].parent, Some(opened[0].id));
         // The inner span closes first.
         assert_eq!(closed, [opened[1].id, opened[0].id]);
+    }
+
+    /// A span nested in a session's, with a session name of its own, takes
+    /// the events recorded under it: how one wrapper of a plain build gets
+    /// its request's events while the build's session has no route. A
+    /// wrapper that does not trace gets the warnings and nothing more.
+    #[test]
+    fn a_wrappers_nested_span_takes_its_warnings_and_not_the_debug_detail() {
+        let logs = SessionLogs::default();
+        let build = SessionId::mint();
+        let wrapper = SessionId::mint();
+        let mut wrapper_receiver =
+            logs.register(wrapper, LogInterest::of_wrapper(None).expect("filter"));
+        let subscriber = tracing_subscriber::registry().with(logs.layer());
+        tracing::subscriber::with_default(subscriber, || {
+            let session = tracing::info_span!(SESSION_SPAN, session = %build);
+            let _session = session.enter();
+            // Bookkeeping that runs under the session's own span has no route.
+            tracing::warn!("recorded under the build's span");
+            let nested = tracing::info_span!(parent: &session, SESSION_SPAN, session = %wrapper);
+            let _nested = nested.enter();
+            tracing::debug!("debug detail");
+            tracing::warn!("a warning");
+            tracing::error!("an error");
+        });
+        let mut texts = Vec::new();
+        while let Ok(Event::Log(record)) = wrapper_receiver.try_recv() {
+            texts.push((record.level, record.text));
+        }
+        assert_eq!(
+            texts,
+            [
+                (LogLevel::Warn, "a warning".to_owned()),
+                (LogLevel::Error, "an error".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tracing_wrapper_gets_its_directives_besides_the_warnings() {
+        let interest = LogInterest::of_wrapper(Some("stow_cli=debug,off")).expect("filter");
+        assert!(interest.wants("stow_cli::lib", tracing::Level::DEBUG));
+        assert!(interest.wants("anything", tracing::Level::WARN));
+        assert!(!interest.wants("anything", tracing::Level::INFO));
+        assert!(LogInterest::of_wrapper(Some("stow_cli=nonsense")).is_err());
     }
 }

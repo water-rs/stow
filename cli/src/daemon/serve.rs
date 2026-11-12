@@ -27,7 +27,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, Layer as _};
 
-use super::events::{LogInterest, SessionLogs};
+use super::events::{LogInterest, SESSION_SPAN, SessionLogs};
 use super::log::LogWriter;
 use super::notify::{self, Notification};
 use super::owner::{self, CargoOwner, OsProcesses, Processes};
@@ -374,8 +374,8 @@ where
             session: SessionRef::Id(id),
         } => serve_wrapper(stream, &daemon, id).await,
         Role::Wrapper {
-            session: SessionRef::Cargo { cargo },
-        } => serve_cargo_wrapper(stream, &daemon, peer, cargo).await,
+            session: SessionRef::Cargo { cargo, rust_log },
+        } => serve_cargo_wrapper(stream, &daemon, peer, cargo, rust_log).await,
     }
 }
 
@@ -633,7 +633,16 @@ where
         )
         .await;
     };
-    converse(&mut stream, &session, daemon.settings.answer / 2, None).await
+    let span = session.span().clone();
+    converse(
+        &mut stream,
+        &session,
+        daemon.settings.answer / 2,
+        None,
+        None,
+        span,
+    )
+    .await
 }
 
 /// What a wrapper's connection delivered.
@@ -658,14 +667,50 @@ async fn read_request<S: AsyncRead + Unpin + Send>(stream: &mut S) -> Result<Inc
     })
 }
 
+/// A cargo wrapper's conversation with `session`, whose requests run under
+/// a span of their own: what they log reaches this wrapper as events, as
+/// far as `interest` wants, because no driver's connection carries a plain
+/// build's events.
+async fn converse_returning_events<S, P>(
+    stream: &mut S,
+    daemon: &Daemon<P>,
+    session: &Arc<Session<Cargo>>,
+    first: WrapperRequest,
+    interest: LogInterest,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    P: Processes,
+{
+    // The nearest session span names the route an event goes to, so this
+    // one, nested in the session's own, takes this wrapper's events.
+    let route = SessionId::mint();
+    let mut events = daemon.logs.register(route, interest);
+    let span = tracing::info_span!(parent: session.span(), SESSION_SPAN, session = %route);
+    let served = converse(
+        stream,
+        session,
+        daemon.settings.answer / 2,
+        Some(first),
+        Some(&mut events),
+        span,
+    )
+    .await;
+    daemon.logs.unregister(route);
+    served
+}
+
 /// One wrapper's conversation with `session`: `first` when its request was
 /// already read, then a request and its answer until the wrapper hangs up
-/// — which ends a flight it still holds.
+/// — which ends a flight it still holds. Requests run under `span`; the
+/// events `events` collects from it go ahead of each answer.
 async fn converse<S, O>(
     stream: &mut S,
     session: &Arc<Session<O>>,
     every: Duration,
     first: Option<WrapperRequest>,
+    mut events: Option<&mut mpsc::UnboundedReceiver<Event>>,
+    span: tracing::Span,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -692,10 +737,15 @@ where
                 request,
             ));
             let answer = working_meanwhile(stream, every, answering).await?;
+            if let Some(events) = events.as_mut() {
+                while let Ok(event) = events.try_recv() {
+                    write_frame_async(stream, &Response::Event(event)).await?;
+                }
+            }
             write_frame_async(stream, &Response::Answer(answer)).await?;
         }
     }
-    .instrument(session.span().clone())
+    .instrument(span)
     .await
 }
 
@@ -728,11 +778,18 @@ async fn serve_cargo_wrapper<S, P>(
     daemon: &Daemon<P>,
     peer: Option<u32>,
     cargo: Option<Vec<u8>>,
+    rust_log: Option<String>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     P: Processes,
 {
+    // A `RUST_LOG` the filter parser rejects asks for no more than the
+    // warnings and errors every wrapper gets.
+    let interest = LogInterest::of_wrapper(rust_log.as_deref()).unwrap_or_else(|reason| {
+        tracing::warn!(%reason, "ignoring the wrapper's RUST_LOG for its events");
+        LogInterest::of_wrapper(None).expect("the default filter parses")
+    });
     let first = match read_request(&mut stream).await? {
         Incoming::Closed => return Ok(()),
         Incoming::Refused(reason) => return reject(&mut stream, reason).await,
@@ -759,7 +816,7 @@ where
         .await;
     }
     if let Some(session) = slot.session() {
-        return converse(&mut stream, &session, every, Some(first)).await;
+        return converse_returning_events(&mut stream, daemon, &session, first, interest).await;
     }
     // Nothing was settled before cargo started: the wrapper says what it
     // runs in, and the request it was holding is answered once the session
@@ -789,7 +846,7 @@ where
             return reject(&mut stream, reason).await;
         }
     };
-    converse(&mut stream, &session, every, Some(first)).await
+    converse_returning_events(&mut stream, daemon, &session, first, interest).await
 }
 
 /// The cargo a wrapper connecting from `peer` runs under.
@@ -1512,7 +1569,10 @@ mod tests {
         send(
             &mut stream,
             &Hello::new(Role::Wrapper {
-                session: SessionRef::Cargo { cargo: None },
+                session: SessionRef::Cargo {
+                    cargo: None,
+                    rust_log: None,
+                },
             }),
         )
         .await;
@@ -1729,7 +1789,10 @@ mod tests {
         send(
             &mut wrapper,
             &Hello::new(Role::Wrapper {
-                session: SessionRef::Cargo { cargo: None },
+                session: SessionRef::Cargo {
+                    cargo: None,
+                    rust_log: None,
+                },
             }),
         )
         .await;
