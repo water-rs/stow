@@ -337,7 +337,7 @@ fn plain_build(
     target_dir: &Path,
     envs: &[(&str, &Path)],
 ) -> std::process::Output {
-    let mut build = Command::new("cargo");
+    let mut build = support::cargo_command();
     hermetic_stow_env(&mut build, edge_url, cache_dir, home);
     build
         .arg("build")

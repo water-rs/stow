@@ -167,7 +167,7 @@ fn a_plain_builds_wrappers_exit_with_their_compilers() {
 
     let cache = support::tempdir().expect("cache dir");
     let target = support::tempdir().expect("target dir");
-    let mut command = std::process::Command::new("cargo");
+    let mut command = support::cargo_command();
     support::hermetic_stow_env(&mut command, &refused_url(), cache.path(), &stow_home);
     command
         .arg("build")

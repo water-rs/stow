@@ -137,13 +137,27 @@ struct TracingGuard {
 }
 
 /// Entry point for all three stow binaries: runs the fast paths that
-/// need no runtime, then [`run_command`].
+/// need no runtime, then [`run_command`], and turns a failure into the
+/// process's exit code.
 ///
-/// # Errors
-///
-/// Returns an error when the selected subcommand fails before it can
+/// An error is written to stderr in its `Display` form. A `main` that
+/// returns the `Result` prints `Error: {:?}` instead, which escapes the
+/// backslashes of a Windows path and wraps the message in the error type's
+/// internals.
+#[must_use]
+pub fn run() -> std::process::ExitCode {
+    match try_run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// [`run`] without the report: the selected subcommand fails before it can
 /// produce an exit status.
-pub fn run() -> stow_types::error::Result<()> {
+fn try_run() -> stow_types::error::Result<()> {
     // The daemon drops what it inherited before anything of its own is
     // opened, so this runs first.
     if daemon::is_serving(&process_args()) {

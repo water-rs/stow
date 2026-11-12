@@ -2,6 +2,6 @@
 //! binary as `cargo-stow stow <args>`, and `stow_cli::run()` strips the
 //! repeated subcommand word so both forms parse identically.
 
-fn main() -> stow_types::error::Result<()> {
+fn main() -> std::process::ExitCode {
     stow_cli::run()
 }

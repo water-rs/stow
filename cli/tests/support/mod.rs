@@ -270,6 +270,21 @@ pub fn write_global_config(homes: &[&Path], contents: &str) {
 )]
 const SESSION_END_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// A command that runs the toolchain's own `cargo`, the one that built this
+/// test. A test waits for the session of the cargo it started
+/// ([`PrivateDaemon::wait_session_ended`]), which the daemon opens for the
+/// process cargo names in `CARGO`. `cargo` found on `PATH` is rustup's proxy
+/// on a machine with rustup; on Windows the proxy runs the real cargo as its
+/// child instead of replacing itself, so the pid a test holds would not be
+/// the cargo the daemon owns the session for.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn cargo_command() -> Command {
+    Command::new(env!("CARGO"))
+}
+
 /// Run `command`, a plain `cargo` build through the stow wrappers, to its
 /// end and collect its output; then wait until the daemon under `home` has
 /// ended the session of that cargo ([`PrivateDaemon::wait_session_ended`]),

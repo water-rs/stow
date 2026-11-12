@@ -87,7 +87,7 @@ fn cargo_build_command_in(
     cache: &Path,
     target: &Path,
 ) -> Command {
-    let mut command = Command::new("cargo");
+    let mut command = support::cargo_command();
     hermetic_stow_env(&mut command, &support::denied_registry(), cache, home);
     command
         .arg("build")

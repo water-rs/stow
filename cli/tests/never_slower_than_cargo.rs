@@ -562,7 +562,7 @@ fn cargo_build_in(
     extra_envs: &[(&str, &str)],
     cargo_home: &Path,
 ) -> std::process::Output {
-    let mut command = Command::new("cargo");
+    let mut command = support::cargo_command();
     command
         .arg("build")
         .current_dir(dir)
