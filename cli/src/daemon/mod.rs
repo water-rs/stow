@@ -52,8 +52,6 @@ mod table;
 mod windows;
 pub mod wrapper;
 
-pub use start::connect_or_start;
-
 /// Overrides the runtime directory.
 pub const STOW_DAEMON_DIR_ENV: &str = "STOW_DAEMON_DIR";
 /// How long a connected daemon may take to answer, in seconds.
@@ -432,7 +430,7 @@ async fn status() -> Result<()> {
     let reply = tokio::task::spawn_blocking(|| {
         let exe = std::env::current_exe().wrap_err("resolve the current executable")?;
         let settings = Settings::from_env()?;
-        connect_or_start(&exe, settings)?.status()
+        start::status_of(&exe, settings)
     })
     .await
     .wrap_err("run the daemon status client")??;

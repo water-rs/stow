@@ -36,7 +36,7 @@ use super::protocol::{
     PROTOCOL_FLOOR, Response, Role, SessionRef, WrapperRequest, negotiate, read_frame_async,
     write_core_async, write_frame_async,
 };
-use super::retire::{Busy, Held, Pending, Retirement};
+use super::retire::{Busy, Held, Installed, Pending, Retirement, is_newer};
 use super::session::{
     CacheDirHandles, Cargo, Opener, Origin, Session, SessionFacts, SessionId, keep_only_owner,
     open_facts, os_bytes, recorded_owner,
@@ -72,6 +72,58 @@ struct Daemon<P> {
     retirement: Retirement,
     /// What the daemon holds that giving way would cut.
     busy: Busy,
+    /// The executable this daemon started from, which a later install may
+    /// replace.
+    installed: Arc<Installed>,
+}
+
+/// Who asks a daemon for a session, as far as giving way to it goes.
+#[derive(Debug, Clone)]
+struct Client {
+    stow_version: String,
+    executable: Vec<u8>,
+}
+
+impl Client {
+    fn of(core: &HelloCore) -> Self {
+        Self {
+            stow_version: core.stow_version.clone(),
+            executable: core.executable.clone(),
+        }
+    }
+}
+
+impl<P: Processes> Daemon<P> {
+    /// The answer to a request that would open a session, when this daemon
+    /// must give way before serving it: it is already retiring, the client
+    /// is a newer stow, or stow was installed over this daemon's own
+    /// executable. Nothing of the request is acted on, so the client
+    /// replays it. `None` when the daemon serves the request.
+    async fn give_way(&self, client: &Client) -> std::result::Result<Option<Response>, String> {
+        if let Some(retiring) = self.retirement.reply() {
+            return Ok(Some(retiring));
+        }
+        let successor = if is_newer(env!("CARGO_PKG_VERSION"), &client.stow_version)? {
+            tracing::info!(client_version = %client.stow_version, "a newer stow asks for a session");
+            Some(successor_of(&client.executable)?)
+        } else {
+            let installed = Arc::clone(&self.installed);
+            let replaced = tokio::task::spawn_blocking(move || {
+                installed.replaced().map(|path| path.map(Path::to_owned))
+            })
+            .await
+            .map_err(|error| format!("join the check of the daemon's executable: {error}"))?
+            .map_err(|error| format!("read the daemon's executable: {error}"))?;
+            if replaced.is_some() {
+                tracing::info!("stow was installed over the daemon's executable");
+            }
+            replaced
+        };
+        Ok(successor.and_then(|successor| {
+            self.retirement.begin(successor);
+            self.retirement.reply()
+        }))
+    }
 }
 
 /// The lock and the listening socket of the daemon that replaced its own
@@ -154,6 +206,7 @@ pub async fn run(
         processes: OsProcesses,
         retirement: Retirement::new(settings.drain),
         busy: Busy::default(),
+        installed: Arc::new(Installed::of_current().wrap_err("read this daemon's own executable")?),
     };
     for outlived in swept.outlived {
         refuse_until_exit(&daemon, outlived);
@@ -538,15 +591,43 @@ where
             tracing::warn!(%reason, "daemon connection refused");
             return write_core_async(&mut stream, stamp, &Response::Rejected { reason }).await;
         }
+        Greeting::Newer(core) => {
+            // A client that speaks only protocols this daemon does not: it
+            // is a newer stow, which this daemon gives way to. The client
+            // reads the answer stamped with the daemon's protocol because
+            // it is a core response.
+            let answer = match daemon.give_way(&Client::of(&core)).await {
+                Ok(Some(retiring)) => retiring,
+                Ok(None) => Response::Rejected {
+                    reason: format!(
+                        "the client (stow {}) speaks protocols {} through {}, this daemon speaks protocols {PROTOCOL_FLOOR} through {PROTOCOL}",
+                        core.stow_version, core.floor, core.protocol
+                    ),
+                },
+                Err(reason) => Response::Rejected { reason },
+            };
+            return write_core_async(&mut stream, PROTOCOL, &answer).await;
+        }
+    };
+    let client = Client {
+        stow_version: hello.stow_version,
+        executable: hello.executable,
     };
     match hello.role {
-        Role::Control => serve_control(stream, &daemon, at, request).await,
+        Role::Control => serve_control(stream, &daemon, at, &client, request).await,
         Role::Wrapper {
             session: SessionRef::Id(id),
         } => serve_wrapper(stream, &daemon, at, id, request).await,
         Role::Wrapper {
             session: SessionRef::Cargo { cargo, rust_log },
-        } => serve_cargo_wrapper(stream, &daemon, at, peer, cargo, rust_log, request).await,
+        } => {
+            let wrapper = CargoWrapper {
+                peer,
+                cargo,
+                rust_log,
+            };
+            serve_cargo_wrapper(stream, &daemon, at, &client, wrapper, request).await
+        }
     }
 }
 
@@ -557,6 +638,8 @@ enum Greeting {
     /// A client the daemon refuses, in a frame stamped `stamp` so that the
     /// client reads it.
     Refused { stamp: u16, reason: String },
+    /// A client that speaks only protocols newer than this daemon's.
+    Newer(HelloCore),
 }
 
 fn greet(first: &Frame) -> Greeting {
@@ -592,15 +675,7 @@ fn greet(first: &Frame) -> Greeting {
                 ),
             },
         },
-        // The client reads a refusal stamped with the daemon's protocol:
-        // it is inside the range the client states.
-        Admission::Newer => Greeting::Refused {
-            stamp: PROTOCOL,
-            reason: format!(
-                "the client (stow {}) speaks protocols {} through {}, this daemon speaks protocols {PROTOCOL_FLOOR} through {PROTOCOL}",
-                core.stow_version, core.floor, core.protocol
-            ),
-        },
+        Admission::Newer => Greeting::Newer(core),
         Admission::Older { peer, reason } => Greeting::Refused {
             stamp: peer,
             reason,
@@ -631,6 +706,7 @@ async fn serve_control<S, P>(
     mut stream: S,
     daemon: &Daemon<P>,
     at: Negotiated,
+    client: &Client,
     request: Held,
 ) -> Result<()>
 where
@@ -645,16 +721,16 @@ where
         match frame.decode::<ControlRequest>() {
             Ok(ControlRequest::Status) => {
                 // A status request is a request to open a session as far as
-                // a retiring daemon is concerned: its asker is about to
-                // build.
-                let answer = daemon
-                    .retirement
-                    .reply()
-                    .unwrap_or_else(|| Response::Status {
+                // giving way is concerned: its asker is about to build.
+                let answer = match daemon.give_way(client).await {
+                    Ok(Some(retiring)) => retiring,
+                    Ok(None) => Response::Status {
                         stow_version: env!("CARGO_PKG_VERSION").to_owned(),
                         protocol: PROTOCOL,
                         floor: PROTOCOL_FLOOR,
-                    });
+                    },
+                    Err(reason) => return reject(&mut stream, at, reason).await,
+                };
                 write_frame_async(&mut stream, at, &answer).await?;
                 request = None;
             }
@@ -672,8 +748,12 @@ where
                 request = None;
             }
             Ok(ControlRequest::OpenSession(facts)) => {
-                if let Some(retiring) = daemon.retirement.reply() {
-                    return write_frame_async(&mut stream, at, &retiring).await;
+                match daemon.give_way(client).await {
+                    Ok(Some(retiring)) => {
+                        return write_frame_async(&mut stream, at, &retiring).await;
+                    }
+                    Ok(None) => {}
+                    Err(reason) => return reject(&mut stream, at, reason).await,
                 }
                 let driver = daemon.busy.driver();
                 drop(request.take());
@@ -1102,21 +1182,36 @@ where
     }
 }
 
+/// What a wrapper of a cargo no driver opened a session for says about
+/// itself.
+struct CargoWrapper {
+    /// The process that connected, when the platform says.
+    peer: Option<u32>,
+    /// The wrapper's `CARGO`.
+    cargo: Option<Vec<u8>>,
+    /// The `RUST_LOG` directives it wants its events at.
+    rust_log: Option<String>,
+}
+
 /// A wrapper of a cargo no driver opened a session for: the session of
 /// that cargo, opened by the first of its wrappers to need one.
 async fn serve_cargo_wrapper<S, P>(
     mut stream: S,
     daemon: &Daemon<P>,
     at: Negotiated,
-    peer: Option<u32>,
-    cargo: Option<Vec<u8>>,
-    rust_log: Option<String>,
+    client: &Client,
+    wrapper: CargoWrapper,
     request: Held,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     P: Processes,
 {
+    let CargoWrapper {
+        peer,
+        cargo,
+        rust_log,
+    } = wrapper;
     // A `RUST_LOG` the filter parser rejects asks for no more than the
     // warnings and errors every wrapper gets.
     let interest = LogInterest::of_wrapper(rust_log.as_deref()).unwrap_or_else(|reason| {
@@ -1155,11 +1250,13 @@ where
         drop(request);
         return converse_returning_events(&mut stream, at, daemon, &session, first, interest).await;
     }
-    // A cargo with no session is about to open one, which a retiring
-    // daemon leaves to its successor: nothing of the request is acted on,
-    // so the wrapper replays it.
-    if let Some(retiring) = daemon.retirement.reply() {
-        return write_frame_async(&mut stream, at, &retiring).await;
+    // A cargo with no session is about to open one, which a daemon that
+    // must give way leaves to its successor: nothing of the request is
+    // acted on, so the wrapper replays it.
+    match daemon.give_way(client).await {
+        Ok(Some(retiring)) => return write_frame_async(&mut stream, at, &retiring).await,
+        Ok(None) => {}
+        Err(reason) => return reject(&mut stream, at, reason).await,
     }
     // Nothing was settled before cargo started: the wrapper says what it
     // runs in, and the request it was holding is answered once the session
@@ -1337,7 +1434,7 @@ mod tests {
     use tokio::io::{AsyncWriteExt as _, DuplexStream};
 
     use super::{
-        Busy, Daemon, Retirement, refuse_until_exit, serve_connection, sweep_sessions,
+        Busy, Daemon, Installed, Retirement, refuse_until_exit, serve_connection, sweep_sessions,
         working_meanwhile,
     };
     use crate::daemon::Settings;
@@ -1456,6 +1553,7 @@ mod tests {
             processes: Machine::default(),
             retirement: Retirement::new(DRAIN),
             busy: Busy::default(),
+            installed: Arc::new(Installed::of_current().expect("this test's executable")),
         }
     }
 
@@ -2117,18 +2215,175 @@ mod tests {
         );
     }
 
+    /// A client that speaks only newer protocols is a newer stow: the
+    /// daemon gives way to its executable, and says so in its own protocol,
+    /// which the client reads because the answer is core.
     #[tokio::test]
-    async fn a_newer_client_is_refused_in_the_daemons_protocol() {
+    async fn a_client_of_a_newer_protocol_is_given_way_to() {
         let sessions = tempfile::tempdir().expect("sessions");
-        let (mut client, _task) = connect(&daemon(sessions.path()));
-        send_hello_for(&mut client, PROTOCOL + 1).await;
-        let (stamp, Response::Rejected { reason }) = receive_stamped(&mut client).await else {
-            panic!("a newer client must be rejected");
+        let daemon = daemon(sessions.path());
+        let (mut client, _task) = connect(&daemon);
+        let hello = Hello {
+            protocol: PROTOCOL + 1,
+            floor: PROTOCOL + 1,
+            stow_version: "9.9.9".to_owned(),
+            executable: executable(),
+            ..hello(Role::Control)
         };
+        client
+            .write_all(&encode_at(PROTOCOL + 1, &hello).expect("encode"))
+            .await
+            .expect("write");
+        let (stamp, response) = receive_stamped(&mut client).await;
         assert_eq!(stamp, PROTOCOL);
         assert!(
-            reason.contains(&(PROTOCOL + 1).to_string()) && reason.contains(&PROTOCOL.to_string()),
-            "{reason}"
+            matches!(response, Response::Retiring { .. }),
+            "{response:?}"
+        );
+        assert_eq!(
+            daemon.retirement.pending().expect("retiring").successor,
+            std::path::PathBuf::from(
+                crate::daemon::session::os_bytes::decode(&executable()).expect("decode")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_of_a_newer_protocol_naming_no_executable_is_refused() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let daemon = daemon(sessions.path());
+        let (mut client, _task) = connect(&daemon);
+        send_hello_for(&mut client, PROTOCOL + 1).await;
+        let (stamp, response) = receive_stamped(&mut client).await;
+        assert_eq!(stamp, PROTOCOL);
+        assert!(
+            matches!(response, Response::Rejected { .. }),
+            "{response:?}"
+        );
+        assert!(daemon.retirement.pending().is_none());
+    }
+
+    /// A status request from a client of `stow_version` running
+    /// `executable`.
+    async fn status_from(
+        daemon: &Daemon<Machine>,
+        stow_version: &str,
+        executable: Vec<u8>,
+    ) -> Response {
+        let (mut client, _task) = connect(daemon);
+        let hello = Hello {
+            stow_version: stow_version.to_owned(),
+            executable,
+            ..hello(Role::Control)
+        };
+        send(&mut client, &hello).await;
+        send(&mut client, &ControlRequest::Status).await;
+        receive(&mut client).await
+    }
+
+    #[tokio::test]
+    async fn a_newer_stow_is_given_way_to_at_its_first_request() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let daemon = daemon(sessions.path());
+        for same_or_older in [env!("CARGO_PKG_VERSION"), "0.0.1"] {
+            assert!(
+                matches!(
+                    status_from(&daemon, same_or_older, b"/stow".to_vec()).await,
+                    Response::Status { .. }
+                ),
+                "stow {same_or_older} does not displace this daemon"
+            );
+        }
+        assert!(daemon.retirement.pending().is_none());
+        let newer = semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("version");
+        let newer = semver::Version::new(newer.major, newer.minor, newer.patch + 1).to_string();
+        let Response::Retiring { stow_version, .. } =
+            status_from(&daemon, &newer, executable()).await
+        else {
+            panic!("a newer stow is given way to");
+        };
+        assert_eq!(stow_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            daemon.retirement.pending().expect("retiring").successor,
+            std::path::PathBuf::from(
+                crate::daemon::session::os_bytes::decode(&executable()).expect("decode")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_whose_version_is_not_a_version_is_refused() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let daemon = daemon(sessions.path());
+        let Response::Rejected { reason } = status_from(&daemon, "next", executable()).await else {
+            panic!("an unparsable version is refused");
+        };
+        assert!(reason.contains("next"), "{reason}");
+        assert!(daemon.retirement.pending().is_none());
+    }
+
+    /// The daemon's executable is replaced by an install: the next request
+    /// that opens a session gives way to the file now at its path.
+    #[tokio::test]
+    async fn an_install_over_the_daemons_executable_is_given_way_to() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let installed = tempfile::tempdir().expect("install");
+        let path = installed.path().join("stow");
+        std::fs::copy(std::env::current_exe().expect("exe"), &path).expect("copy");
+        let daemon = Daemon {
+            installed: Arc::new(Installed::of(path.clone()).expect("record")),
+            ..daemon(sessions.path())
+        };
+        assert!(matches!(
+            status_from(&daemon, env!("CARGO_PKG_VERSION"), b"/stow".to_vec()).await,
+            Response::Status { .. }
+        ));
+        let next = installed.path().join("next");
+        std::fs::copy(std::env::current_exe().expect("exe"), &next).expect("copy");
+        std::fs::rename(&next, &path).expect("replace");
+        assert!(matches!(
+            status_from(&daemon, env!("CARGO_PKG_VERSION"), b"/stow".to_vec()).await,
+            Response::Retiring { .. }
+        ));
+        assert_eq!(
+            daemon.retirement.pending().expect("retiring").successor,
+            path
+        );
+    }
+
+    /// A cargo whose first wrapper arrives at a daemon that must give way
+    /// is told so before anything of its request is acted on.
+    #[tokio::test]
+    async fn a_cargo_with_no_session_is_given_way_for_through_its_wrapper() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let target = tempfile::tempdir().expect("target");
+        let daemon = daemon(sessions.path());
+        let newer = semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("version");
+        let newer = semver::Version::new(newer.major, newer.minor, newer.patch + 1).to_string();
+        daemon.processes.start(70, 7);
+        let (mut wrapper, _task) = connect_from(&daemon, Some(70));
+        let hello = Hello {
+            stow_version: newer,
+            executable: executable(),
+            ..hello(Role::Wrapper {
+                session: SessionRef::Cargo {
+                    cargo: None,
+                    rust_log: None,
+                },
+            })
+        };
+        send(&mut wrapper, &hello).await;
+        send(&mut wrapper, &unit_request(target.path()).await).await;
+        assert!(matches!(
+            receive(&mut wrapper).await,
+            Response::Retiring { .. }
+        ));
+        assert_eq!(
+            std::fs::read_dir(sessions.path())
+                .expect("sessions")
+                .count(),
+            0,
+            "no session was opened"
         );
     }
 

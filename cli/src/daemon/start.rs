@@ -68,6 +68,93 @@ pub struct Connection {
     exe: PathBuf,
 }
 
+/// What a daemon answered to a request that would open a session.
+#[derive(Debug, PartialEq, Eq)]
+enum Reply {
+    Status(StatusReply),
+    /// The daemon gives way to another stow and acted on nothing.
+    Retiring {
+        stow_version: String,
+        until: Duration,
+    },
+}
+
+/// Waiting for the successor of a daemon that answered
+/// [`Response::Retiring`]: the pauses between replays and the bound on
+/// them.
+///
+/// The bound counts from the first answer: the time the daemon said it had
+/// left to drain, then a start and an answer. A second daemon that gives
+/// way, and is older than this stow, means the replacement did not run this
+/// stow.
+#[derive(Debug)]
+pub struct Succession {
+    /// What the successor is given after the drain ends: to start, and to
+    /// answer.
+    after_drain: Duration,
+    exe: PathBuf,
+    first: Option<(Instant, Instant)>,
+    until: Option<Duration>,
+    pause: Duration,
+}
+
+impl Succession {
+    /// A client running `exe` that waits as `settings` bound.
+    #[must_use]
+    pub fn new(settings: Settings, exe: &Path) -> Self {
+        Self {
+            after_drain: settings.start + settings.answer,
+            exe: exe.to_owned(),
+            first: None,
+            until: None,
+            pause: FIRST_RECONNECT_PAUSE,
+        }
+    }
+
+    /// Account for a daemon of stow `stow_version` that answered `now` that
+    /// it retires within `until`, and return how long to wait before
+    /// replaying the request.
+    ///
+    /// # Errors
+    ///
+    /// The bound ran out, or the replacement is still older than this stow.
+    pub fn retiring(
+        &mut self,
+        now: Instant,
+        stow_version: &str,
+        until: Duration,
+    ) -> Result<Duration> {
+        let (began, deadline) = *self
+            .first
+            .get_or_insert_with(|| (now, now + until + self.after_drain));
+        // A drain that begins later than another's ends is a daemon
+        // that took over and gave way again.
+        let renewed = self.until.is_some_and(|before| until > before);
+        self.until = Some(until);
+        let own = env!("CARGO_PKG_VERSION");
+        if renewed && super::retire::is_newer(stow_version, own).unwrap_or(false) {
+            return Err(stow_types::stow_error!(
+                "the stow daemon was replaced and still runs stow {stow_version}, older than this stow {own} ({}); the executable that starts the daemon is not this stow's{}",
+                self.exe.display(),
+                if cfg!(windows) {
+                    ": run `stow setup` from this stow to register its task"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if now >= deadline {
+            return Err(stow_types::stow_error!(
+                "the stow daemon (stow {stow_version}) did not hand over to its successor within {} s of its first answer that it is retiring",
+                (now - began).as_secs()
+            ));
+        }
+        let pause = self.pause;
+        self.pause = (pause * 2).min(LONGEST_RECONNECT_PAUSE);
+        Ok(pause.min(deadline - now))
+    }
+}
+
 impl Connection {
     /// Say hello and ask for the daemon's status, in one write.
     ///
@@ -75,7 +162,7 @@ impl Connection {
     ///
     /// The daemon does not answer within the answer bound, answers
     /// something else, or refuses the connection.
-    pub fn status(self) -> Result<StatusReply> {
+    fn status_once(self) -> Result<Reply> {
         let answer = self.answer;
         let log = self.log;
         #[cfg(unix)]
@@ -107,7 +194,32 @@ pub fn describe_daemon(log: &Path) -> String {
     format!("pid {pid}, log {}", log.display())
 }
 
-fn exchange<S: Read + Write>(mut stream: S, exe: &Path) -> Result<StatusReply> {
+/// Report the daemon's status, replaying the request while the daemon
+/// gives way to a successor: a daemon that answers
+/// [`Response::Retiring`] acted on nothing, so the request is made again to
+/// whichever daemon serves next.
+///
+/// # Errors
+///
+/// The daemon cannot be started or does not answer, refuses this stow, or
+/// does not hand over within the bound ([`Succession`]).
+pub fn status_of(exe: &Path, settings: Settings) -> Result<StatusReply> {
+    let mut succession = Succession::new(settings, exe);
+    loop {
+        match connect_or_start(exe, settings)?.status_once()? {
+            Reply::Status(status) => return Ok(status),
+            Reply::Retiring {
+                stow_version,
+                until,
+            } => {
+                let pause = succession.retiring(Instant::now(), &stow_version, until)?;
+                std::thread::sleep(pause);
+            }
+        }
+    }
+}
+
+fn exchange<S: Read + Write>(mut stream: S, exe: &Path) -> Result<Reply> {
     let mut request = protocol::encode(&Hello::new(Role::Control, exe))?;
     request.extend(protocol::encode(&ControlRequest::Status)?);
     stream
@@ -120,10 +232,17 @@ fn exchange<S: Read + Write>(mut stream: S, exe: &Path) -> Result<StatusReply> {
             stow_version,
             protocol,
             floor,
-        } => Ok(StatusReply {
+        } => Ok(Reply::Status(StatusReply {
             stow_version,
             protocol,
             floor,
+        })),
+        Response::Retiring {
+            stow_version,
+            until_millis,
+        } => Ok(Reply::Retiring {
+            stow_version,
+            until: Duration::from_millis(until_millis),
         }),
         Response::Rejected { reason } => Err(stow_types::stow_error!(
             "the daemon refused the connection: {reason}"
@@ -456,4 +575,113 @@ fn spawn_daemon(exe: &Path, run_dir: &RunDir, notify: &Path) -> Result<detached:
         .current_dir(run_dir.path())
         .spawn()
         .wrap_err_with(|| format!("spawn the stow daemon {}", exe.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use super::{LONGEST_RECONNECT_PAUSE, Settings, Succession};
+
+    fn settings() -> Settings {
+        Settings {
+            answer: Duration::from_secs(2),
+            start: Duration::from_secs(8),
+            log_bytes: 1 << 20,
+            drain: Duration::from_secs(5),
+        }
+    }
+
+    fn succession() -> Succession {
+        Succession::new(settings(), Path::new("/stow"))
+    }
+
+    #[test]
+    fn replays_back_off_from_the_first_pause_to_the_longest() {
+        let (mut succession, now) = (succession(), Instant::now());
+        let pauses: Vec<Duration> = (0..8)
+            .map(|_| {
+                succession
+                    .retiring(now, "0.1.0", Duration::from_secs(5))
+                    .expect("within the bound")
+            })
+            .collect();
+        assert_eq!(
+            pauses,
+            [5, 10, 20, 40, 80, 160, 200, 200].map(Duration::from_millis)
+        );
+        assert_eq!(pauses[7], LONGEST_RECONNECT_PAUSE);
+    }
+
+    #[test]
+    fn the_bound_is_the_drain_then_a_start_and_an_answer_from_the_first_answer() {
+        let (mut succession, began) = (succession(), Instant::now());
+        succession
+            .retiring(began, "0.1.0", Duration::from_secs(5))
+            .expect("the first answer");
+        // 5 s of drain, 8 s to start and 2 s to answer.
+        succession
+            .retiring(
+                began + Duration::from_secs(14),
+                "0.1.0",
+                Duration::from_secs(1),
+            )
+            .expect("inside the bound");
+        let error = succession
+            .retiring(
+                began + Duration::from_secs(15),
+                "0.1.0",
+                Duration::from_secs(1),
+            )
+            .expect_err("the bound ran out");
+        assert!(error.to_string().contains("did not hand over"), "{error}");
+    }
+
+    #[test]
+    fn a_pause_never_outlasts_the_bound() {
+        let (mut succession, began) = (succession(), Instant::now());
+        succession
+            .retiring(began, "0.1.0", Duration::from_secs(5))
+            .expect("the first answer");
+        let pause = succession
+            .retiring(
+                began + Duration::from_millis(14_999),
+                "0.1.0",
+                Duration::from_secs(1),
+            )
+            .expect("inside the bound");
+        assert_eq!(pause, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn a_replacement_that_is_still_older_is_named() {
+        let (mut succession, began) = (succession(), Instant::now());
+        succession
+            .retiring(began, "0.1.0", Duration::from_secs(1))
+            .expect("the first answer");
+        let error = succession
+            .retiring(
+                began + Duration::from_secs(1),
+                "0.1.0",
+                Duration::from_secs(5),
+            )
+            .expect_err("a new drain began under an older stow");
+        let error = error.to_string();
+        assert!(
+            error.contains("0.1.0") && error.contains(env!("CARGO_PKG_VERSION")),
+            "{error}"
+        );
+        assert!(error.contains("/stow"), "{error}");
+    }
+
+    #[test]
+    fn the_time_left_shrinking_is_the_same_daemon_draining() {
+        let (mut succession, began) = (succession(), Instant::now());
+        for left in [5, 4, 3] {
+            succession
+                .retiring(began, "0.1.0", Duration::from_secs(left))
+                .expect("one daemon draining");
+        }
+    }
 }

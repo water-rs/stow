@@ -333,7 +333,13 @@ The output directories a session accepts are derived from the first unit
 of the build; they are not a security boundary.
 
 The daemon outlives the stow that started it, so a newer stow replaces it.
-`stow daemon` retires on request: it keeps serving the builds it holds
+The daemon retires when a client that opens a session is a newer stow (by
+its version, and a version that is not a semantic version is refused), and
+when stow was installed over the executable the daemon runs. The client
+that found it waits for the successor and makes the same request again, so
+the build that triggered the replacement is not failed; a client that
+cannot get a successor within the drain bound, a start and an answer fails
+naming the daemon. A retiring daemon keeps serving the builds it holds
 (its wrappers and its probes) for up to `STOW_DAEMON_DRAIN_SECS`, answers
 anything that would open a session with a request to retry, and then
 replaces itself with the successor. On Unix the replacement keeps the

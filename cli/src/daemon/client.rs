@@ -19,7 +19,7 @@ use super::protocol::{
 };
 use super::relay::{RELAY_METHOD, RelayBody, RelayCall, mint_connection_id};
 use super::session::{SessionEnd, SessionFacts, SessionId};
-use super::start::{connect_or_start, describe_daemon};
+use super::start::{Succession, describe_daemon, status_of};
 use super::{RunDir, Settings};
 use crate::daemon::session::handler::CONNECTION_DRAIN_BUDGET;
 use crate::daemon::session::os_bytes;
@@ -175,7 +175,7 @@ pub async fn connect(exe: PathBuf, settings: Settings) -> Result<Stream> {
 /// The daemon cannot be started, does not answer, or refuses this stow.
 pub async fn connect_starting(exe: PathBuf, settings: Settings) -> Result<Stream> {
     let run_dir = run_dir().await?;
-    smol::unblock(move || connect_or_start(&exe, settings)?.status()).await?;
+    smol::unblock(move || status_of(&exe, settings)).await?;
     try_open(&run_dir.endpoint(), settings.answer)
         .await?
         .ok_or_else(|| {
@@ -184,6 +184,20 @@ pub async fn connect_starting(exe: PathBuf, settings: Settings) -> Result<Stream
                 run_dir.endpoint().display()
             )
         })
+}
+
+/// What a daemon made of a wrapper's request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Exchanged {
+    /// The daemon answered.
+    Answer(Answer),
+    /// The daemon is giving way to another stow and acted on nothing.
+    Retiring {
+        /// The version of the daemon that is leaving.
+        stow_version: String,
+        /// The time it has left to drain.
+        until: Duration,
+    },
 }
 
 /// A wrapper's conversation with its session: its first request carries
@@ -268,17 +282,41 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
     /// # Errors
     ///
     /// The daemon closes the connection, goes quiet for longer than the
-    /// answer bound, or refuses the request.
+    /// answer bound, refuses the request, or is giving way to another
+    /// stow: a caller that can reconnect uses [`Self::exchange_replayable`].
     pub async fn exchange(
         &mut self,
         request: &WrapperRequest,
     ) -> std::result::Result<Answer, String> {
+        match self.exchange_replayable(request).await? {
+            Exchanged::Answer(answer) => Ok(answer),
+            Exchanged::Retiring { stow_version, .. } => Err(self.explain(&format!(
+                "the stow daemon (stow {stow_version}) is giving way to another stow and did not serve the request"
+            ))),
+        }
+    }
+
+    /// [`Self::exchange`], except that a daemon giving way to another stow
+    /// is reported, not failed: it acted on nothing, so the caller makes
+    /// the same request again on a new connection.
+    ///
+    /// # Errors
+    ///
+    /// The daemon closes the connection, goes quiet for longer than the
+    /// answer bound, or refuses the request.
+    pub async fn exchange_replayable(
+        &mut self,
+        request: &WrapperRequest,
+    ) -> std::result::Result<Exchanged, String> {
         self.converse(request)
             .await
-            .map_err(|failure| match &self.reach {
-                Some(reach) => reach.explain(&failure),
-                None => failure,
-            })
+            .map_err(|failure| self.explain(&failure))
+    }
+
+    fn explain(&self, failure: &str) -> String {
+        self.reach
+            .as_ref()
+            .map_or_else(|| failure.to_owned(), |reach| reach.explain(failure))
     }
 
     async fn send(&mut self, request: &WrapperRequest) -> std::result::Result<(), String> {
@@ -298,7 +336,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
             .map_err(|error| format!("send a request to the stow daemon: {error}"))
     }
 
-    async fn converse(&mut self, request: &WrapperRequest) -> std::result::Result<Answer, String> {
+    async fn converse(
+        &mut self,
+        request: &WrapperRequest,
+    ) -> std::result::Result<Exchanged, String> {
         self.send(request).await?;
         loop {
             let frame = tokio::time::timeout(self.answer, read_frame_async(&mut self.stream))
@@ -324,7 +365,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> WrapperStream<S> {
                     let environment = BuildEnvironment::current()?;
                     self.send(&WrapperRequest::Describe(environment)).await?;
                 }
-                Response::Answer(answer) => return Ok(answer),
+                Response::Answer(answer) => return Ok(Exchanged::Answer(answer)),
+                Response::Retiring {
+                    stow_version,
+                    until_millis,
+                } => {
+                    return Ok(Exchanged::Retiring {
+                        stow_version,
+                        until: Duration::from_millis(until_millis),
+                    });
+                }
                 Response::Rejected { reason } => {
                     return Err(format!("the stow daemon refused the request: {reason}"));
                 }
@@ -379,12 +429,54 @@ pub enum Decision {
     },
 }
 
+/// A conversation with the daemon, with what it takes to start it again
+/// on a new connection: a daemon that gives way to another stow answers
+/// the first request with nothing done, and the wrapper makes it again.
+pub struct DirectConnection {
+    stream: WrapperStream<Stream>,
+    session: SessionRef,
+    exe: PathBuf,
+    settings: Settings,
+    reach: Reach,
+}
+
+impl DirectConnection {
+    async fn exchange(&mut self, request: &WrapperRequest) -> std::result::Result<Answer, String> {
+        let mut succession = Succession::new(self.settings, &self.exe);
+        loop {
+            let (stow_version, until) = match self.stream.exchange_replayable(request).await? {
+                Exchanged::Answer(answer) => return Ok(answer),
+                Exchanged::Retiring {
+                    stow_version,
+                    until,
+                } => (stow_version, until),
+            };
+            let pause = succession
+                .retiring(std::time::Instant::now(), &stow_version, until)
+                .map_err(|error| self.reach.explain(&format!("{error:#}")))?;
+            tokio::time::sleep(pause).await;
+            // The same request, byte for byte, with the same hello, to
+            // whichever daemon serves now.
+            let stream = connect(self.exe.clone(), self.settings)
+                .await
+                .map_err(|error| self.reach.explain(&format!("{error:#}")))?;
+            self.stream = WrapperStream::new(
+                stream,
+                self.session.clone(),
+                self.settings.answer,
+                &self.exe,
+            )
+            .reaching(self.reach.clone());
+        }
+    }
+}
+
 /// A wrapper's connection to its build's session, kept open across the
 /// plan and the report so the compile's outcome reaches the same
 /// conversation.
 pub enum WrapperConnection {
     /// Straight to the daemon.
-    Direct(Box<WrapperStream<Stream>>),
+    Direct(Box<DirectConnection>),
     /// Through the driver's relay inside a sandbox. The client leaves its
     /// slot while a call blocks on the worker thread and is always put
     /// back, so a call never finds it gone.
@@ -446,9 +538,14 @@ impl WrapperConnection {
         let stream = connect(exe.clone(), settings)
             .await
             .map_err(|error| reach.explain(&format!("{error:#}")))?;
-        Ok(Self::Direct(Box::new(
-            WrapperStream::new(stream, session, settings.answer, &exe).reaching(reach),
-        )))
+        Ok(Self::Direct(Box::new(DirectConnection {
+            stream: WrapperStream::new(stream, session.clone(), settings.answer, &exe)
+                .reaching(reach.clone()),
+            session,
+            exe,
+            settings,
+            reach,
+        })))
     }
 
     /// Whether the build's C/C++ object cache is on.
@@ -540,7 +637,7 @@ impl WrapperConnection {
     /// instead of completing now.
     pub async fn close(self) -> std::result::Result<(), String> {
         match self {
-            Self::Direct(stream) => (*stream).close().await,
+            Self::Direct(direct) => direct.stream.close().await,
             Self::Relay { client, connection } => {
                 let Some(mut client) = client else {
                     return Ok(());
@@ -565,7 +662,7 @@ impl WrapperConnection {
         request: &WrapperRequest,
     ) -> std::result::Result<Option<Answer>, String> {
         match self {
-            Self::Direct(stream) => stream.exchange(request).await.map(Some),
+            Self::Direct(direct) => direct.exchange(request).await.map(Some),
             Self::Relay { client, connection } => {
                 let mut ipc = client
                     .take()
@@ -711,47 +808,71 @@ impl DaemonSession {
     pub async fn open(exe: PathBuf, facts: SessionFacts, settings: Settings) -> Result<Self> {
         let run_dir = run_dir().await?;
         let log = run_dir.log();
-        let mut stream = connect_starting(exe.clone(), settings).await?;
         let mut bytes = encode(&Hello::new(Role::Control, &exe))?;
         bytes.extend(encode(&ControlRequest::OpenSession(Box::new(facts)))?);
-        let opened = async {
-            stream
-                .write_all(&bytes)
-                .await
-                .wrap_err("send the session's facts to the daemon")?;
-            stream.flush().await.wrap_err("send the session's facts")?;
-            tokio::time::timeout(settings.answer, read_frame_async(&mut stream))
-                .await
-                .map_err(|_| {
-                    stow_types::stow_error!("no answer within {} s", settings.answer.as_secs())
-                })?
-        }
-        .await
-        .wrap_err_with(|| {
-            format!(
-                "open a session on the stow daemon ({})",
-                describe_daemon(&log)
-            )
-        })?
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "the stow daemon ({}) closed the connection while opening the session",
-                describe_daemon(&log)
-            )
-        })?;
-        let id = match read_response(&opened)? {
-            Response::SessionOpened { session } => session,
-            Response::Rejected { reason } => {
-                return Err(stow_types::stow_error!(
-                    "the stow daemon ({}) refused the session: {reason}",
-                    describe_daemon(&log)
-                ));
+        let mut succession = Succession::new(settings, &exe);
+        let (stream, id) = loop {
+            let mut stream = connect_starting(exe.clone(), settings).await?;
+            let opened = async {
+                stream
+                    .write_all(&bytes)
+                    .await
+                    .wrap_err("send the session's facts to the daemon")?;
+                stream.flush().await.wrap_err("send the session's facts")?;
+                tokio::time::timeout(settings.answer, read_frame_async(&mut stream))
+                    .await
+                    .map_err(|_| {
+                        stow_types::stow_error!("no answer within {} s", settings.answer.as_secs())
+                    })?
             }
-            other => {
-                return Err(stow_types::stow_error!(
-                    "the stow daemon ({}) answered OpenSession with {other:?}",
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "open a session on the stow daemon ({})",
                     describe_daemon(&log)
-                ));
+                )
+            })?
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "the stow daemon ({}) closed the connection while opening the session",
+                    describe_daemon(&log)
+                )
+            })?;
+            match read_response(&opened)? {
+                Response::SessionOpened { session } => break (stream, session),
+                // The daemon is giving way to another stow and acted on
+                // nothing: the same facts go to whichever daemon serves
+                // next.
+                Response::Retiring {
+                    stow_version,
+                    until_millis,
+                } => {
+                    let pause = succession
+                        .retiring(
+                            std::time::Instant::now(),
+                            &stow_version,
+                            Duration::from_millis(until_millis),
+                        )
+                        .wrap_err_with(|| {
+                            format!(
+                                "open a session on the stow daemon ({})",
+                                describe_daemon(&log)
+                            )
+                        })?;
+                    tokio::time::sleep(pause).await;
+                }
+                Response::Rejected { reason } => {
+                    return Err(stow_types::stow_error!(
+                        "the stow daemon ({}) refused the session: {reason}",
+                        describe_daemon(&log)
+                    ));
+                }
+                other => {
+                    return Err(stow_types::stow_error!(
+                        "the stow daemon ({}) answered OpenSession with {other:?}",
+                        describe_daemon(&log)
+                    ));
+                }
             }
         };
         let (read, writer) = tokio::io::split(stream);
@@ -1033,6 +1154,54 @@ mod tests {
         };
         let (answer, ()) = tokio::join!(stream.exchange(&super::WrapperRequest::CcPolicy), daemon);
         assert_eq!(answer, Ok(super::Answer::CcMiss));
+    }
+
+    /// A daemon that gives way acted on nothing: the wrapper that can
+    /// reconnect is told so, and one that cannot fails naming the daemon.
+    #[tokio::test]
+    async fn a_daemon_that_gives_way_is_reported_to_the_caller_that_can_replay() {
+        let dir = tempfile::tempdir().expect("dir");
+        let retiring = super::encode(&super::Response::Retiring {
+            stow_version: "0.1.0".to_owned(),
+            until_millis: 2_500,
+        })
+        .expect("encode");
+        for replayable in [true, false] {
+            let (client, mut daemon_end) = tokio::io::duplex(1 << 16);
+            let mut stream = super::WrapperStream::new(
+                client,
+                super::SessionRef::Cargo {
+                    cargo: None,
+                    rust_log: None,
+                },
+                std::time::Duration::from_secs(5),
+                std::path::Path::new("/stow"),
+            )
+            .reaching(reach(dir.path()));
+            tokio::io::AsyncWriteExt::write_all(&mut daemon_end, &retiring)
+                .await
+                .expect("write");
+            if replayable {
+                assert_eq!(
+                    stream
+                        .exchange_replayable(&super::WrapperRequest::CcPolicy)
+                        .await,
+                    Ok(super::Exchanged::Retiring {
+                        stow_version: "0.1.0".to_owned(),
+                        until: std::time::Duration::from_millis(2_500),
+                    })
+                );
+            } else {
+                let error = stream
+                    .exchange(&super::WrapperRequest::CcPolicy)
+                    .await
+                    .expect_err("this caller cannot replay");
+                assert!(
+                    error.contains("giving way") && error.contains("pid 4242"),
+                    "{error}"
+                );
+            }
+        }
     }
 
     #[test]

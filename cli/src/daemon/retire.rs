@@ -17,11 +17,9 @@
 //! stops existing. On Windows it releases the pipe and the lock and exits,
 //! and the Task Scheduler's task starts the successor.
 
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -249,6 +247,84 @@ impl Retirement {
     }
 }
 
+/// Whether a client of stow `client` is newer than this daemon of stow
+/// `own`, by semantic versioning.
+///
+/// # Errors
+///
+/// Either version is not a semantic version; the message names it.
+pub fn is_newer(own: &str, client: &str) -> Result<bool, String> {
+    let parse = |version: &str| {
+        semver::Version::parse(version).map_err(|error| {
+            format!("the stow version {version:?} is not a semantic version: {error}")
+        })
+    };
+    Ok(parse(client)? > parse(own)?)
+}
+
+/// A file's identity: the file the path named and when it was last
+/// written. Installing a new binary replaces the file (a different
+/// identity) or rewrites it (a different time).
+#[derive(Debug, PartialEq, Eq)]
+struct ExecutableKey {
+    file: same_file::Handle,
+    modified: SystemTime,
+}
+
+impl ExecutableKey {
+    fn of(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            file: same_file::Handle::from_path(path)?,
+            modified: std::fs::metadata(path)?.modified()?,
+        })
+    }
+}
+
+/// The executable this daemon started from, as it was when it started.
+#[derive(Debug)]
+pub struct Installed {
+    path: PathBuf,
+    key: ExecutableKey,
+}
+
+impl Installed {
+    /// Record the executable of the running process.
+    ///
+    /// # Errors
+    ///
+    /// The process's executable cannot be found or read.
+    pub fn of_current() -> std::io::Result<Self> {
+        Self::of(std::env::current_exe()?)
+    }
+
+    /// Record the executable at `path`.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be read.
+    pub fn of(path: PathBuf) -> std::io::Result<Self> {
+        let key = ExecutableKey::of(&path)?;
+        Ok(Self { path, key })
+    }
+
+    /// The path, when a different file is there now: stow was installed
+    /// over the one this daemon runs. `None` when it is the same file, and
+    /// while no file is there, as between the removal and the arrival of an
+    /// installer's replacement.
+    ///
+    /// # Errors
+    ///
+    /// The path cannot be read for a reason other than being absent.
+    pub fn replaced(&self) -> std::io::Result<Option<&Path>> {
+        match ExecutableKey::of(&self.path) {
+            Ok(now) if now == self.key => Ok(None),
+            Ok(_) => Ok(Some(&self.path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// Replace this process's image with `successor`'s, keeping the lock and
 /// the listening socket: the successor adopts both as `--inherit-lock` and
 /// `--inherit-listener`. Returns only when the exec failed.
@@ -283,10 +359,76 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use super::{Busy, Retirement};
+    use super::{Busy, Installed, Retirement, is_newer};
     use crate::daemon::protocol::Response;
 
     const DRAIN: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn a_client_is_newer_by_semantic_versioning() {
+        assert_eq!(is_newer("0.17.0", "0.17.1"), Ok(true));
+        assert_eq!(is_newer("0.17.0", "0.17.0"), Ok(false));
+        assert_eq!(is_newer("0.17.1", "0.17.0"), Ok(false));
+        assert_eq!(is_newer("0.9.0", "0.10.0"), Ok(true), "not a string order");
+        assert_eq!(is_newer("1.0.0-rc.1", "1.0.0"), Ok(true));
+        assert!(
+            is_newer("0.17.0", "newest")
+                .expect_err("not a version")
+                .contains("newest")
+        );
+    }
+
+    #[test]
+    fn an_installed_executable_is_replaced_by_another_file_at_its_path() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("stow");
+        std::fs::write(&path, b"one").expect("write");
+        let installed = Installed::of(path.clone()).expect("record");
+        assert_eq!(installed.replaced().expect("look"), None);
+
+        // An installer that renames a new file over the old one.
+        let next = dir.path().join("next");
+        std::fs::write(&next, b"two").expect("write");
+        std::fs::rename(&next, &path).expect("rename");
+        assert_eq!(installed.replaced().expect("look"), Some(path.as_path()));
+    }
+
+    #[test]
+    fn an_installed_executable_is_replaced_by_a_rewrite_in_place() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("stow");
+        std::fs::write(&path, b"one").expect("write");
+        let installed = Installed::of(path.clone()).expect("record");
+        let written = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        written
+            .set_modified(
+                std::fs::metadata(&path)
+                    .expect("stat")
+                    .modified()
+                    .expect("mtime")
+                    + Duration::from_secs(5),
+            )
+            .expect("touch");
+        assert_eq!(installed.replaced().expect("look"), Some(path.as_path()));
+    }
+
+    #[test]
+    fn a_path_with_no_file_is_not_a_replacement() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("stow");
+        std::fs::write(&path, b"one").expect("write");
+        let installed = Installed::of(path.clone()).expect("record");
+        std::fs::remove_file(&path).expect("remove");
+        assert_eq!(
+            installed
+                .replaced()
+                .expect("an absent file is no replacement"),
+            None
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn a_daemon_that_is_not_retiring_answers_nothing_special() {
