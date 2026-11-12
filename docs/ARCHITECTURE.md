@@ -1047,6 +1047,8 @@ handed to runners. While frozen, the work-submitting routes
 naming the trigger; the `github/workflow-run` webhook and the task
 completion it forwards stay open so
 in-flight builds still land. Recovery is manual only:
+`stow-admin watchdog clear` re-enables the disabled workflows and then lifts
+the freeze; the underlying
 `POST /api/v1/admin/dispatch-freeze` (`stow-admin dispatch-freeze clear
 --yes`, which dispatches `operations.yml`) lifts the freeze and
 immediately resumes dispatch, while
