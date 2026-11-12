@@ -1356,6 +1356,19 @@ const TAG_REFUSAL: u64 = 15;
 /// cleanup retires is the drive's alone.
 const REFUSAL_RUSTC: &str = "1.88.0";
 
+/// The target of the closure-refusal drive's nodes: the first CI target
+/// built on the Linux family. The fixture holds the macOS family's cap
+/// in flight at some sizes, which leaves a macOS task out of every pass;
+/// the Linux family only has the shared cap, which the fixture's
+/// in-flight rows leave free slots of.
+fn refusal_target() -> Result<&'static str, String> {
+    CI_TARGET_TRIPLES
+        .iter()
+        .copied()
+        .find(|&target| stow_types::api::runner_family(target) == Some(RunnerFamily::Linux))
+        .ok_or_else(|| "no CI target builds on the Linux family".to_owned())
+}
+
 /// A closure-refusal node: crate `name` with `features`, its id the
 /// canonical id of those columns.
 fn refusal_node(
@@ -1367,7 +1380,7 @@ fn refusal_node(
     let mut node = fixture::named_node(
         name,
         DRIVE_SEED + TAG_REFUSAL * 1_000 + k,
-        stow_types::fixture::target_of(101),
+        refusal_target()?,
         deps,
     );
     node.rustc_version = WireRustcVersion::parse(REFUSAL_RUSTC).map_err(text)?;
@@ -1415,7 +1428,7 @@ fn refusal_nodes() -> Result<RefusalNodes, String> {
 /// The drive's own slice: the two libc sets and polyval published, or
 /// — `retire` — withdrawn again.
 fn refusal_slice(nodes: &RefusalNodes, retire: bool) -> Result<PublishedSlice, String> {
-    let target = stow_types::fixture::target_of(101);
+    let target = refusal_target()?;
     let rows: Vec<_> = [&nodes.extra, &nodes.plain, &nodes.polyval]
         .into_iter()
         .flat_map(|node| {
