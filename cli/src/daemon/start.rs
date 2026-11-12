@@ -317,7 +317,7 @@ fn open_lock(path: &Path) -> Result<std::fs::File> {
 /// the scheduled task (`scheduled_task`) the path asked for: the
 /// Task Scheduler owns the process, so there is no child to watch, and a
 /// daemon that fails to come up is noticed at the start bound. The run
-/// may also not be this path's: the task ignores a request made while a
+/// may also not be this path's: the task queues a request made while a
 /// run is live, so the path never ends the run.
 #[cfg(unix)]
 struct Started(detached::Child);
@@ -373,10 +373,13 @@ impl Started {
     /// fallback: without the task registered the build fails naming `stow
     /// setup`.
     ///
-    /// The task's instance policy ignores a run requested while one is
-    /// live, and the request succeeds all the same, so a daemon already
-    /// starting (the logon trigger's, say) never hears of this client. The
-    /// wait therefore also asks the endpoint ([`Started::serving`]).
+    /// The task's instance policy queues a run requested while one is
+    /// live, and the queued run exits at once on the daemon's lock, so a
+    /// daemon already starting (the logon trigger's, say) never hears of
+    /// this client. The wait therefore also asks the endpoint
+    /// ([`Started::serving`]). A daemon that is retiring is such a run: it
+    /// has released the pipe and exits, and the queued run is its
+    /// successor.
     fn begin(_exe: &Path, run_dir: &RunDir, _listener: &ReadyListener) -> Result<Self> {
         super::scheduled_task::run(run_dir.path())
             .wrap_err("start the stow daemon through the Task Scheduler")?;

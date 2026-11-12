@@ -172,8 +172,12 @@ pub fn register(run_dir: &Path, runtime_executable: &Path) -> Result<String> {
 /// No task is registered for `run_dir`, which `stow setup` does, or the
 /// scheduler refuses to run it.
 ///
-/// The task ignores a request made while an instance runs, and the request
-/// still succeeds: a caller that needs the daemon asks its endpoint too.
+/// The task queues a request made while an instance runs: it starts when
+/// that instance ends, which is what lets a client ask for the successor of
+/// a retiring daemon before the Task Scheduler has seen the daemon exit.
+/// The request succeeds either way, so a caller that needs the daemon asks
+/// its endpoint too; a queued run that fires while a daemon serves finds the
+/// lock held and exits.
 pub fn run(run_dir: &Path) -> Result<()> {
     let name = task_name(run_dir);
     let output = schtasks(&named("/Run", &name))?;
