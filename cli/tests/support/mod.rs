@@ -202,6 +202,14 @@ pub fn sealed_home_env(command: &mut Command, home: &Path) {
             .unwrap_or_else(|error| panic!("create {key} dir {}: {error}", dir.display()));
         command.env(key, dir);
     }
+    // On Windows every build starts the daemon through the task of its run
+    // directory, so a sealed home has its task before any child runs;
+    // [`TempDir`] deletes it with the home. A home [`PrivateDaemon::in_home`]
+    // already prepared has its run directory, and so its task.
+    #[cfg(windows)]
+    if !PrivateDaemon::run_dir_of(home).exists() {
+        register_daemon_task(&PrivateDaemon::run_dir_of(home));
+    }
     command
         // Every build starts the user's daemon when none is running: this
         // test's own runs under its home, where [`PrivateDaemon`] finds and
@@ -339,6 +347,18 @@ fn log_lines_in(run_dir: &Path, needle: &str) -> Vec<String> {
         .collect()
 }
 
+/// Register, through the product's own definition, the task that starts
+/// the daemon serving `run_dir`, as `stow setup` does for the user's.
+///
+/// # Panics
+///
+/// When the task cannot be registered.
+#[cfg(windows)]
+fn register_daemon_task(run_dir: &Path) {
+    stow_cli::scheduled_task::register(run_dir, Path::new(env!("CARGO_BIN_EXE_stow-cli")))
+        .unwrap_or_else(|error| panic!("register the daemon's scheduled task: {error}"));
+}
+
 /// The daemon a test's `stow-cli` runs started under `home`
 /// ([`sealed_home_env`] points `STOW_DAEMON_DIR` there): found by the pids
 /// its own log names, and stopped when this drops, so a test never leaves
@@ -375,11 +395,7 @@ impl PrivateDaemon {
     pub fn in_home(home: &Path) -> Self {
         let daemon = Self::at(Self::run_dir_of(home));
         #[cfg(windows)]
-        stow_cli::scheduled_task::register(
-            daemon.run_dir(),
-            Path::new(env!("CARGO_BIN_EXE_stow-cli")),
-        )
-        .unwrap_or_else(|error| panic!("register the daemon's scheduled task: {error}"));
+        register_daemon_task(daemon.run_dir());
         daemon
     }
 
