@@ -697,16 +697,7 @@ pub fn place_staged<F>(
 /// `ERROR_SHARING_VIOLATION` from it. See the `MoveFileExW` and
 /// `CreateFileW` documentation, and stow#1472 for the observed failure.
 fn replace_in_flight(error: &std::io::Error) -> bool {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
-        return error.raw_os_error() == i32::try_from(ERROR_ACCESS_DENIED).ok();
-    }
-    #[cfg(not(windows))]
-    false
+    error.kind() == std::io::ErrorKind::NotFound
 }
 
 /// Stamp a materialized output with the mtime rustc's own write would

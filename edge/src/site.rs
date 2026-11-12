@@ -133,8 +133,7 @@ impl RequestTargetView {
             task_short: target
                 .task_id
                 .as_deref()
-                .map(|id| id.chars().take(TASK_ID_SHORT).collect())
-                .unwrap_or_default(),
+                .map_or_default(|id| id.chars().take(TASK_ID_SHORT).collect()),
             task_url: format!("/api/v1/requests/{request_id}"),
             settled,
         }

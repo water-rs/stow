@@ -357,9 +357,7 @@ impl PullContext {
             (target, rustc_version),
             PrevSlice {
                 index,
-                folded: pulled_folded
-                    .map(|pulled| pulled.tags.into_iter().collect())
-                    .unwrap_or_default(),
+                folded: pulled_folded.map_or_default(|pulled| pulled.tags.into_iter().collect()),
             },
         )))
     }
@@ -662,8 +660,7 @@ fn merge_exports(
         }
         let mut folded: BTreeSet<String> = prev_slice
             .as_ref()
-            .map(|slice| slice.folded.clone())
-            .unwrap_or_default();
+            .map_or_default(|slice| slice.folded.clone());
         if let Some(marks) = new_folded.get(key) {
             folded.extend(marks.iter().cloned());
         }

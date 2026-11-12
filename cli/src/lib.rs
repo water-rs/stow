@@ -152,7 +152,6 @@ struct TracingGuard {
 /// returns the `Result` prints `Error: {:?}` instead, which escapes the
 /// backslashes of a Windows path and wraps the message in the error type's
 /// internals.
-#[must_use]
 pub fn run() -> std::process::ExitCode {
     match try_run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -5348,36 +5347,34 @@ where
     // empty trace (stow#698), and a filter `RUST_LOG` could narrow
     // would do it again. The layer sees stow's crates at `trace` and
     // nothing else.
-    let (chrome_layer, chrome_guard) = trace_file
-        .map(|path| {
-            let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
-                .file(path)
-                .include_args(true)
-                // The daemon's decision spans are opened here as their
-                // records arrive, from whichever task reads them and with
-                // no thread to enter them on: an async trace records a
-                // span from its creation to its close.
-                .trace_style(tracing_chrome::TraceStyle::Async)
-                // A mirrored span is named for the daemon span it copies.
-                .name_fn(Box::new(|event_or_span| match event_or_span {
-                    tracing_chrome::EventOrSpan::Span(span) => span
-                        .extensions()
-                        .get::<crate::daemon::events::MirroredName>()
-                        .map_or_else(|| span.metadata().name().to_owned(), |name| name.0.clone()),
-                    tracing_chrome::EventOrSpan::Event(event) => event.metadata().name().to_owned(),
-                }))
-                .build();
-            (
-                Some(
-                    layer.with_filter(
-                        tracing_subscriber::filter::Targets::new()
-                            .with_target("stow_", tracing::Level::TRACE),
-                    ),
+    let (chrome_layer, chrome_guard) = trace_file.map_or_default(|path| {
+        let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+            .file(path)
+            .include_args(true)
+            // The daemon's decision spans are opened here as their
+            // records arrive, from whichever task reads them and with
+            // no thread to enter them on: an async trace records a
+            // span from its creation to its close.
+            .trace_style(tracing_chrome::TraceStyle::Async)
+            // A mirrored span is named for the daemon span it copies.
+            .name_fn(Box::new(|event_or_span| match event_or_span {
+                tracing_chrome::EventOrSpan::Span(span) => span
+                    .extensions()
+                    .get::<crate::daemon::events::MirroredName>()
+                    .map_or_else(|| span.metadata().name().to_owned(), |name| name.0.clone()),
+                tracing_chrome::EventOrSpan::Event(event) => event.metadata().name().to_owned(),
+            }))
+            .build();
+        (
+            Some(
+                layer.with_filter(
+                    tracing_subscriber::filter::Targets::new()
+                        .with_target("stow_", tracing::Level::TRACE),
                 ),
-                Some(guard),
-            )
-        })
-        .unwrap_or_default();
+            ),
+            Some(guard),
+        )
+    });
 
     (
         tracing_subscriber::registry()

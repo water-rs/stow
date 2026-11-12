@@ -340,8 +340,7 @@ async fn submit_outcome(
     // landing, one line, `dispatched_at` stamped by the edge.
     let elapsed_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or_default()
+        .map_or_default(|elapsed| elapsed.as_secs())
         .saturating_sub(u64::try_from(dispatch.dispatched_at).unwrap_or(0));
     tracing::info!(
         dispatch_to_submit_ms = elapsed_secs.saturating_mul(1000),

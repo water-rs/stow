@@ -199,7 +199,7 @@ pub fn emit_units(
             &mut queue,
             &mut roots,
             member_id,
-            platform.clone(),
+            platform,
             fk,
             side,
             member.library().is_some(),
@@ -224,8 +224,7 @@ pub fn emit_units(
         let pkg = pkg_by_id(pkg_id)?;
         let features: Vec<String> = all_features
             .get(&(pkg_id, fk))
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default();
+            .map_or_default(|set| set.iter().cloned().collect());
         let edges: &[SideEdge] = all_edges.get(&(pkg_id, fk)).map_or(&[], Vec::as_slice);
 
         // Partition dep edges the way cargo's unit construction does:
@@ -292,7 +291,7 @@ pub fn emit_units(
                     run_deps.push(StowDep {
                         key: StowUnitKey {
                             pkg: dep_id.to_spec(),
-                            platform: dep_platform.clone(),
+                            platform: dep_platform,
                             side: dep_side,
                             kind: StowUnitKind::RunBuildScript,
                         },

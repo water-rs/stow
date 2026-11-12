@@ -1967,8 +1967,7 @@ pub fn enabled_optional_dependency_names(
     let package_name = manifest
         .package
         .as_ref()
-        .map(|package| package.name.clone())
-        .unwrap_or_default();
+        .map_or_default(|package| package.name.clone());
     Ok(enabled_optional_deps(&manifest, &package_name, args))
 }
 

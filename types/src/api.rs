@@ -5891,13 +5891,12 @@ fn patch_twin_pair_serving(
                     host_side,
                     key.4,
                 ))
-                .map(|map| {
+                .map_or_default(|map| {
                     map.iter()
                         .filter(|(set, serve)| set == serve)
                         .map(|(set, _)| set.clone())
                         .collect()
                 })
-                .unwrap_or_default()
         };
         let joint = built(true)
             .intersection(&built(false))

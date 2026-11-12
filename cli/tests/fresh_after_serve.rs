@@ -191,7 +191,7 @@ fn build_script_outputs(target_dir: &Path) -> BTreeMap<String, PathBuf> {
             let stdout = dirs
                 .iter()
                 .chain([&file])
-                .fold(run_dir.clone(), |path, component| path.join(component));
+                .fold(run_dir, |path, component| path.join(component));
             if !stdout.is_file() {
                 continue;
             }

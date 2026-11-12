@@ -130,7 +130,7 @@ impl AdmissionCollector {
                     max = MAX_POW_DIFFICULTY,
                     "skipping enqueue admission above maximum difficulty"
                 );
-                self.refused.push(admission.task_id.clone());
+                self.refused.push(admission.task_id);
                 continue;
             }
             self.queued.push(admission);

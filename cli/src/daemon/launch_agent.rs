@@ -94,9 +94,7 @@ impl SystemLaunchctl {
         Err(stow_types::stow_error!(
             "{} {} failed with {}: {}",
             self.program.to_string_lossy(),
-            args.first()
-                .map(|arg| arg.to_string_lossy())
-                .unwrap_or_default(),
+            args.first().map_or_default(|arg| arg.to_string_lossy()),
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         ))

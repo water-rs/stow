@@ -578,7 +578,7 @@ mod tests {
                 // The build-unit layout's `run` directory, or the shared
                 // layout's `output` file, swapped for a link.
                 let swapped = match layout {
-                    Layout::Shared => stdout.clone(),
+                    Layout::Shared => stdout,
                     Layout::BuildUnit => stdout.parent().expect("run dir").to_path_buf(),
                 };
                 if swapped.is_dir() {
