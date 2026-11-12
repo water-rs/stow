@@ -4306,7 +4306,7 @@ mod tests {
                         "cpufeatures",
                         &["std"],
                         &[("libc", "11")],
-                        vec![libc_task_id.clone()],
+                        vec![libc_task_id],
                         "22",
                         false,
                     );
@@ -6059,15 +6059,15 @@ impl Substitution<'_> {
                 };
                 let own = tree.closure_set(root as usize, &group, |_| false);
                 let mut accounted = false;
-                let mut moves = Vec::new();
+                let mut spliced = Vec::new();
                 tree.closure_set(root as usize, &group, |node_index| {
                     let moved = self.moved.contains(&(tree_index, node_index));
                     if moved {
-                        moves.push(node_index);
+                        spliced.push(node_index);
                     }
                     moved
                 });
-                for node_index in moves {
+                for node_index in spliced {
                     let image = self.memo[&(tree_index, node_index)];
                     if self.image_holds_other_set(image, &group, own) {
                         fresh.insert((tree_index, node_index));

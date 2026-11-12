@@ -82,8 +82,9 @@ pub fn serving_map(family: &BTreeSet<Vec<String>>) -> BTreeMap<Vec<String>, Vec<
         .collect()
 }
 
-/// The one feature set each group holds across a closure (stow#1470):
-/// a closure never carries two sets of one `(crate, version, target,
+/// The one feature set each group holds across a closure (stow#1470).
+///
+/// A closure never carries two sets of one `(crate, version, target,
 /// side)`, because the build's wrapper manifest declares each package
 /// version once per side. The group type `G` is the caller's identity
 /// of that tuple. A superset move is accepted only when everything it
@@ -138,7 +139,9 @@ impl<G: Ord + Clone> FeatureAgreement<G> {
 }
 
 /// The first group that holds two feature sets inside the dependency
-/// closure of `start` — `None` when the closure agrees. `node` names a
+/// closure of `start` — `None` when the closure agrees.
+///
+/// `node` names a
 /// node's group and set — `None` for a node whose group the caller
 /// knows holds one set everywhere — and `dependencies` pushes a node's
 /// direct dependencies; both are the caller's view of its graph.

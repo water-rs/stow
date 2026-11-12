@@ -1819,8 +1819,11 @@ mod tests {
             .candidates
             .iter()
             .map(|candidate| (candidate.row.crate_name.as_str(), candidate.superset))
-            .collect::<Vec<_>>();
-        assert_eq!(served, [("cpufeatures", true), ("libc", false)]);
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            served,
+            BTreeSet::from([("cpufeatures", true), ("libc", false)])
+        );
     }
 
     #[test]
