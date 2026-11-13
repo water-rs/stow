@@ -152,6 +152,113 @@ fn ask(run_dir: &Path, request: &ControlRequest) -> (Response, std::fs::File) {
     (response, pipe)
 }
 
+/// Say hello to the daemon as a driver and send `request`, answering what
+/// came back within the start bound, or `None` when the pipe does not
+/// exist: no daemon serves. A connection that closes without a frame is an
+/// error.
+fn try_ask(run_dir: &Path, request: &ControlRequest) -> Result<Option<Response>, String> {
+    /// `ERROR_PIPE_BUSY`: every instance of the pipe is serving a client.
+    const PIPE_BUSY: i32 = 231;
+    let deadline = Instant::now() + Duration::from_secs(START_SECS);
+    let mut pipe = loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pipe_of(run_dir))
+        {
+            Ok(pipe) => break pipe,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.raw_os_error() == Some(PIPE_BUSY) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(format!("connect to the daemon's pipe: {error}")),
+        }
+    };
+    let mut bytes = stow_cli::protocol::encode(&Hello::new(Role::Control, &stow()))
+        .map_err(|error| error.to_string())?;
+    bytes.extend(stow_cli::protocol::encode(request).map_err(|error| error.to_string())?);
+    pipe.write_all(&bytes).map_err(|error| error.to_string())?;
+    let mut reading = pipe.try_clone().map_err(|error| error.to_string())?;
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let answer = stow_cli::protocol::read_frame(&mut reading)
+            .and_then(|frame| stow_cli::protocol::read_response(&frame));
+        let _ = sender.send(answer.map_err(|error| error.to_string()));
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(START_SECS))
+        .map_err(|error| format!("no answer: {error}"))?
+        .map(Some)
+}
+
+/// Clients that connect all through a retirement, up to the moment its
+/// drain ends and the daemon exits, each get a frame: a client that reaches
+/// the pipe as the daemon stops serving is answered, never hung up on, and
+/// once the pipe is gone it finds no daemon.
+#[test]
+fn clients_connecting_as_the_drain_ends_are_answered() {
+    /// Clients hammering the pipe at once.
+    const CLIENTS: usize = 8;
+    let home = support::tempdir().expect("home");
+    let daemon = PrivateDaemon::in_home(home.path());
+    let run_dir = daemon.run_dir().to_owned();
+    assert_answered(client(&run_dir), Instant::now());
+    let [first] = daemon.serving_pids()[..] else {
+        panic!("one daemon serves: {:?}", daemon.serving_pids());
+    };
+
+    let hammers: Vec<_> = (0..CLIENTS)
+        .map(|_| {
+            let run_dir = run_dir.clone();
+            std::thread::spawn(move || {
+                let mut answered = 0_usize;
+                while let Some(response) = try_ask(&run_dir, &ControlRequest::Status)? {
+                    assert!(
+                        matches!(
+                            response,
+                            Response::Status { .. } | Response::Retiring { .. }
+                        ),
+                        "{response:?}"
+                    );
+                    answered += 1;
+                }
+                Ok::<_, String>(answered)
+            })
+        })
+        .collect();
+
+    let retiring = try_ask(
+        &run_dir,
+        &ControlRequest::Retire {
+            executable: stow()
+                .as_os_str()
+                .encode_wide()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+        },
+    )
+    .expect("the retirement is answered")
+    .expect("the daemon serves");
+    assert!(
+        matches!(retiring, Response::Retiring { .. }),
+        "{retiring:?}"
+    );
+
+    for hammer in hammers {
+        let answered = hammer
+            .join()
+            .expect("a client thread")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a client was not answered: {error}\n{:?}",
+                    daemon.log_lines("stow daemon")
+                )
+            });
+        assert!(answered > 0, "a client was never answered");
+    }
+    assert!(!alive(first), "the retired daemon exited");
+}
+
 /// Whether the process `pid` is running.
 fn alive(pid: u32) -> bool {
     let listed = Command::new("tasklist.exe")
