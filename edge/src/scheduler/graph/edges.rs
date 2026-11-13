@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use orx_split_vec::PinnedVec;
+use orx_split_vec::{Collection, PinnedVec};
 
 use super::arena::Arena;
 use crate::errors::QueueError;
@@ -59,6 +59,15 @@ impl Edges {
         self.flags.push(required | if met { MET } else { 0 });
         self.overlay.insert((dep, owner));
         Ok(at)
+    }
+
+    /// Size the arrays for a load of `edges` edges over `nodes` nodes:
+    /// the forward arrays and the reverse index's owners and offsets.
+    pub(super) fn reserve(&mut self, edges: usize, nodes: usize) {
+        self.dep.reserve_maximum_concurrent_capacity(edges);
+        self.flags.reserve_maximum_concurrent_capacity(edges);
+        self.owners.reserve_maximum_concurrent_capacity(edges);
+        self.offsets.reserve_maximum_concurrent_capacity(nodes + 1);
     }
 
     /// Append an edge from a snapshot row; the reverse index is
@@ -185,11 +194,42 @@ impl Edges {
             + self.owners.capacity() * size_of::<u32>()
     }
 
-    /// Heap bytes the arrays hold.
+    /// Heap bytes of the overlay's B-tree.
+    pub(super) fn overlay_bytes(&self) -> usize {
+        super::occupancy::btree_bytes(self.overlay.len(), size_of::<(u32, u32)>())
+    }
+
+    /// Heap bytes the arrays and the overlay hold.
     #[cfg(test)]
     pub(super) fn heap_bytes(&self) -> usize {
-        self.array_bytes() + self.overlay.len() * 2 * size_of::<(u32, u32)>()
+        self.array_bytes() + self.overlay_bytes()
     }
+
+    /// Edges whose dep's published shapes already cover them.
+    pub(super) fn met_count(&self) -> usize {
+        self.flags.iter().filter(|&&flags| flags & MET != 0).count()
+    }
+
+    /// How the reverse index's edges spread over their deps.
+    pub(super) fn fan_in(&self) -> FanIn {
+        let mut summary = FanIn::default();
+        let mut previous = 0;
+        for &end in &self.offsets {
+            let held = end - previous;
+            previous = end;
+            summary.dependencies += usize::from(held > 0);
+            summary.max = summary.max.max(held);
+        }
+        summary
+    }
+}
+
+/// The reverse index's fan-in: how many deps own at least one edge onto
+/// them, and the most edges onto one.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct FanIn {
+    pub(super) dependencies: usize,
+    pub(super) max: u32,
 }
 
 #[cfg(test)]
