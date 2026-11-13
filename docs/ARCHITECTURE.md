@@ -267,7 +267,7 @@ The handler resolves the requested version (newest non-prerelease,
 non-yanked release when the body omits it) and the current stable rustc,
 then hands the request to the scheduler's `POST /requests` — the
 request record (`requests` table) is born `accepted` and dispatched
-there to `resolve-request.yml` on `main` through the same GitHub App
+there to `resolve-request.yml` on the edge's release tag through the same GitHub App
 `workflow_dispatch` arm `dispatch_task` uses for `build-crate.yml`.
 `resolve-request.yml` runs `stow-admin request resolve`: `stow-resolver`
 expands the crate's dependency closure over crates.io metadata — normal
@@ -486,11 +486,12 @@ layer is the zstd-compressed JSON `ArtifactIndex` (media type
 foreign version — and a `row_count` checked against the decoded body.
 
 `.github/workflows/index-publish.yml` is dispatch-only: scheduled and
-`workflow_run` workflows run on the default branch (`dev`), whose
-identity the CLI rejects, so `index-publish-cron.yml` dispatches it on
-`main` after every completed `build-crate` run (a ten-minute schedule is
-the backstop; GitHub delivers those ticks hours apart), and its first
-step refuses any other ref. A run does one `stow-admin index export
+`workflow_run` workflows run on the default branch, whose identity the
+CLI rejects, so `index-publish-cron.yml` dispatches it on the release tag
+of the completed `build-crate` run after every such run (the edge Cron
+Trigger's ten-minute dispatch, on the edge's own release tag, is the
+backstop), and its first step refuses any ref that is not a release tag
+(`refs/tags/v<MAJOR.MINOR.PATCH>`). A run does one `stow-admin index export
 --out-dir --rustc-version` pass scoped to one rustc — the completed
 run's `<rustc>-<task_id>` title names it, and the pass pulls and
 verifies the published `index`/`folded` pair per `(target, rustc)`
@@ -511,8 +512,8 @@ manifest carries it as the `dev.stow.index.content-sha256` annotation,
 and an equal annotation skips the push (and the signature, when its
 `.sig` tag is present; a missing one is signed in place) — an unchanged slice
 never churns the tag. Pushed indexes are signed keyless under
-`index-publish.yml@refs/heads/main`
-(`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`), the same
+`index-publish.yml@refs/tags/v<MAJOR.MINOR.PATCH>`
+(`stow_types::trusted_builder::TrustedWorkflow::INDEX`), the same
 Fulcio chain the CLI verifies for artifact bundles.
 
 The scheduler holds each reported slice's generation. A delta report
@@ -580,7 +581,7 @@ charges whoever arrives next for a backlog everyone built — which is why
 
 
 ```
-              GitHub Actions: build-crate.yml @ refs/heads/main  ← root of trust
+         GitHub Actions: build-crate.yml @ refs/tags/v<semver>  ← root of trust
    ┌──────────────────────────────┐        ┌──────────────────────────────┐
    │ build job (untrusted)        │ upload │ publish job (trusted)        │
    │ contents: read, no secrets   │──────► │ packages: write, id-token    │
@@ -630,10 +631,10 @@ What each hop is allowed to do:
 |---|---|---|
 | stow CLI (`cli/`) | GHCR: signed `index.*` slices (anonymous pull); edge: bundle blobs streamed through `GET /api/v1/bundles/{rustc_version}/{digest}`, `/api/v1/admissions` + `/api/v1/enqueue` responses | local cache only |
 | edge worker (`edge/`) | crates.io, GHCR, Analytics Engine SQL API | scheduler queue (enqueue submits only); `stow_cache_misses` Analytics Engine points (every miss) |
-| scheduler DO | its in-memory graph, restored from the SQLite snapshot and event log | its SQLite event log and snapshots; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
+| scheduler DO | its in-memory graph, restored from the SQLite snapshot and event log | its SQLite event log and snapshots; GitHub `workflow_dispatch` of `build-crate.yml` on the edge's own release tag |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — keyless signing) | GHCR objects (bundles + `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifacts); sigstore signatures |
-| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-v2-<rustc>`; the scheduler's published membership via `/api/v1/admin/index/published` when its `report` input is set |
+| `index-publish.yml` (dispatched on a release tag by `index-publish-cron.yml`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-v2-<rustc>`; the scheduler's published membership via `/api/v1/admin/index/published` when its `report` input is set |
 
 The edge's remaining crates.io reads are the request route's version and
 rustc lookups, the site pickers (`crates/search`, `crates/{name}/versions`,
@@ -722,8 +723,8 @@ claims read), or any credential GitHub would accept a
 push from on the repo (probed via the `git-receive-pack` ref
 advertisement — uniform across user tokens, fine-grained PATs, and
 installation tokens). The second shape only reads. A mutating route
-admits only the OIDC token of a workflow on its own list, run at
-`refs/heads/main`, so an operator — untrusted — mutates only by
+admits only the OIDC token of a workflow on its own list, run at the
+edge's own release tag (`refs/tags/v<version>`), so an operator — untrusted — mutates only by
 dispatching `.github/workflows/operations.yml`, which leaves a run under
 their account; the token's `actor` is recorded on the first scheduler
 log row the request appends and on a manual freeze record
@@ -756,11 +757,25 @@ certificate therefore cannot sign anything after that certificate expires.
 >
 > **Completion binding.** GitHub's `workflow_run` webhook is HMAC-signed
 > with `STOW_GITHUB_WEBHOOK_SECRET`, which only GitHub and the edge hold;
-> the edge accepts a completion only for a `build-crate.yml` run on `main`
-> whose `display_title` parses as `<rustc>-<task_id>`, and the
+> the edge accepts a completion only for a `build-crate.yml` run on a release
+> tag (`v<MAJOR.MINOR.PATCH>`) whose `display_title` parses as `<rustc>-<task_id>`, and the
 > scheduler resolves the task only after
 > the records artifact
 > its publish job pushed verifies in GHCR — a forged "success" cannot mint catalog rows.
+>
+> **Release-tag identity.** The signing identity is a workflow file at a
+> release tag, never a branch: every reader (the CLI, `stow-admin`, the
+> repack and re-sign sweeps) accepts a certificate whose subject is the
+> pinned workflow's URL followed by `@refs/tags/v` and a strict
+> `MAJOR.MINOR.PATCH` (`stow_types::trusted_builder::TrustedWorkflow`), and
+> the edge admits an operator mutation only from a run at its own tag. A
+> release tag exists only for a certified commit plus its version bump: a
+> ruleset lets only the release App create `v*` tags, and that App's job
+> runs only after `scripts/release-resolve.sh` checked that the commit is
+> one commit on a parent the release gate marked `Certified`
+> ([`DEPLOYMENT.md`](DEPLOYMENT.md#releases)). Each deployed edge
+> dispatches production workflows on its own tag, so production workflow
+> code always comes from the release the edge was built from.
 
 ## Local artifact cache
 
@@ -869,7 +884,8 @@ Four workflows keep it warm:
   priority signal.
 - `demand-feed.yml` (hourly, five past the hour, plus manual) is the
   demand ledger's input lane (stow#523): one job pulls the signed
-  `stow-admin` toolchain of `main`'s merge-queue head — the command
+  `stow-admin` toolchain published for the run's own commit (the
+  release's) — the command
   ships with this change, so ticks fail visibly until a toolchain
   carrying it exists — and runs `stow-admin scheduler demand-feed`
   under the job's OIDC identity inside a 25-minute deadline. The pass
@@ -954,16 +970,16 @@ unauthorized POSTs short-circuit before deserialization.
 | POST `/api/v1/build-report` | none | `BuildReport` | 204 | One install's daily usage counters — at most one report per install per UTC day, one `stow_events` `build` point per accepted report |
 | GET `/api/v1/bundles/{rustc_version}/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Byte fetch — the only artifact-serving route; the `{rustc_version}` segment names the artifact's GHCR package and the `sha256:<64 hex>` segment is the index row's `bundle_digest`, served from GHCR behind Workers Cache |
 | GET `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | — | `DispatchFreeze` | Read the dispatch freeze: flag plus the stored record (what tripped it, whether the alert got out) |
-| POST `/api/v1/admin/dispatch-freeze` | Bearer: `operations.yml` OIDC on `main` | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|engage\|clear`) |
+| POST `/api/v1/admin/dispatch-freeze` | Bearer: `operations.yml` OIDC on the edge's release tag | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|engage\|clear`) |
 | GET `/api/v1/admin/dispatch-cap` | Bearer: repo-workflow OIDC or push user | — | `DispatchCaps` | The dispatch caps in force plus the operator setting behind them (stow#1039) |
-| POST `/api/v1/admin/dispatch-cap` | Bearer: `operations.yml` OIDC on `main` | `DispatchCapSet` | `DispatchCaps` | The operator's `set` — replaces the cap bindings at claim time until the next `set` (`stow-admin dispatch-cap status\|set`) |
+| POST `/api/v1/admin/dispatch-cap` | Bearer: `operations.yml` OIDC on the edge's release tag | `DispatchCapSet` | `DispatchCaps` | The operator's `set` — replaces the cap bindings at claim time until the next `set` (`stow-admin dispatch-cap status\|set`) |
 | GET `/api/v1/admin/memory-line` | Bearer: repo-workflow OIDC or push user | — | `MemoryLines` | The scheduler graph's memory lines in force plus the operator setting behind them; answers without waking the graph (stow#1501) |
-| POST `/api/v1/admin/memory-line` | Bearer: `operations.yml` OIDC on `main` | `MemoryLineSet` | `MemoryLines` | The operator's `set` — replaces the memory-line bindings until the next `set` (`stow-admin memory-line status\|set`) |
+| POST `/api/v1/admin/memory-line` | Bearer: `operations.yml` OIDC on the edge's release tag | `MemoryLineSet` | `MemoryLines` | The operator's `set` — replaces the memory-line bindings until the next `set` (`stow-admin memory-line status\|set`) |
 | GET `/api/v1/admin/release-priority` | Bearer: repo-workflow OIDC or push user | — | `ReleasePriority` | The multiplier release-profile nodes rank under plus the operator setting behind it (stow#1012) |
-| POST `/api/v1/admin/release-priority` | Bearer: `operations.yml` OIDC on `main` | `ReleasePrioritySet` | `ReleasePriority` | The operator's `set` — the multiplier in force until the next `set` (`stow-admin release-priority status\|set`) |
+| POST `/api/v1/admin/release-priority` | Bearer: `operations.yml` OIDC on the edge's release tag | `ReleasePrioritySet` | `ReleasePriority` | The operator's `set` — the multiplier in force until the next `set` (`stow-admin release-priority status\|set`) |
 | GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes — `stow-admin status` |
 | GET `/api/v1/admin/queue?task_ids=…&status=&target=&rustc=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
-| POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: `operations.yml` OIDC on `main` | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |
+| POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: `operations.yml` OIDC on the edge's release tag | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |
 | GET `/api/v1/admin/coverage/{crate_name}?version=&target=` | Bearer: repo-workflow OIDC or push user | — | `CrateCoverage` | Per-CI-target servable identities for one crate — `coverage` |
 | GET `/api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<ArtifactRecord>` | Bounded catalog listing (≤1000) — the prune preview |
 | GET `/api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}` | Bearer: repo-workflow OIDC or push user | — | `ArtifactInspection` | Catalog row plus the bundle's OCI manifest from GHCR — `artifacts inspect` |
@@ -972,20 +988,20 @@ unauthorized POSTs short-circuit before deserialization.
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestStatus` | Human request: admit and dispatch a `resolve-request.yml` run that enqueues the crate's closure on every CI target in the human lane |
 | GET `/api/v1/requests/{request_id}` | none | — | `CrateRequestStatus` | Live request record: `accepted` → `resolving` → `enqueued`/`failed` plus per-target states |
 | GET `/requests/{request_id}` | none | — | HTML | The same `CrateRequestStatus` rendered as a page, the link the request form returns |
-| POST `/api/v1/scheduler/requests/{request_id}/outcome` | Bearer: `resolve-request.yml` OIDC on `main` | `RequestOutcomeReport` | `CrateRequestStatus` | The `resolve-request.yml` job's submission — enqueues the resolved tasks and settles the request record |
+| POST `/api/v1/scheduler/requests/{request_id}/outcome` | Bearer: `resolve-request.yml` OIDC on the edge's release tag | `RequestOutcomeReport` | `CrateRequestStatus` | The `resolve-request.yml` job's submission — enqueues the resolved tasks and settles the request record |
 | GET `/api/v1/crates/search?q=&limit=` | none | — | `CrateSearchResponse` | crates.io search, proxied for the request form's completions; query must be ≥2 chars, limit clamps to 1–25 (default 10), response cached 5 min |
 | GET `/api/v1/crates/{crate_name}/versions` | none | — | `CrateVersionsResponse` | Published, non-yanked versions newest-first — the form's version picker; cached 10 min |
 | GET `/api/v1/crates/{crate_name}/versions/{version}/features` | none | — | `CrateFeaturesResponse` | Every selectable feature, `default` first — the form's feature checkboxes; cached 10 min |
-| POST `/api/v1/scheduler/tasks/submit` | Bearer: `operations.yml`, `preheat-admin.yml` or `preheat-missed.yml` OIDC on `main` | `Vec<SubmissionTree>` | `SchedulerSubmitResponse` | Submit one task batch |
-| POST `/api/v1/scheduler/tasks/submit-ids` | Bearer: `operations.yml` or `preheat-admin.yml` OIDC on `main` | `SubmitTaskIdsRequest` | `SubmitTaskIdsResponse` | Submit stored subgraphs by task id — `preheat projects submit` |
-| POST `/api/v1/admin/scheduler/reset` | Bearer: `operations.yml` OIDC on `main` | — | `SchedulerResetReport` | Drop and recreate the scheduler store — `scheduler reset` |
-| POST `/api/v1/admin/scheduler/demand`, `…/demand-feed/{query\|begin\|page\|complete\|cleanup\|deliver}` | Bearer: `operations.yml` or `demand-feed.yml` OIDC on `main` | demand-feed request types | demand-feed reports | The demand ledger's input lane — `scheduler demand-feed` |
-| POST `/api/v1/admin/index/published` | Bearer: `index-publish.yml` OIDC on `main` | `PublishedRunReport` | `OkResponse` | One body of a publish run's slice membership (a large full report arrives as several, in order) — `index report`, `index reconcile` |
+| POST `/api/v1/scheduler/tasks/submit` | Bearer: `operations.yml`, `preheat-admin.yml` or `preheat-missed.yml` OIDC on the edge's release tag | `Vec<SubmissionTree>` | `SchedulerSubmitResponse` | Submit one task batch |
+| POST `/api/v1/scheduler/tasks/submit-ids` | Bearer: `operations.yml` or `preheat-admin.yml` OIDC on the edge's release tag | `SubmitTaskIdsRequest` | `SubmitTaskIdsResponse` | Submit stored subgraphs by task id — `preheat projects submit` |
+| POST `/api/v1/admin/scheduler/reset` | Bearer: `operations.yml` OIDC on the edge's release tag | — | `SchedulerResetReport` | Drop and recreate the scheduler store — `scheduler reset` |
+| POST `/api/v1/admin/scheduler/demand`, `…/demand-feed/{query\|begin\|page\|complete\|cleanup\|deliver}` | Bearer: `operations.yml` or `demand-feed.yml` OIDC on the edge's release tag | demand-feed request types | demand-feed reports | The demand ledger's input lane — `scheduler demand-feed` |
+| POST `/api/v1/admin/index/published` | Bearer: `index-publish.yml` OIDC on the edge's release tag | `PublishedRunReport` | `OkResponse` | One body of a publish run's slice membership (a large full report arrives as several, in order) — `index report`, `index reconcile` |
 | POST `/api/v1/github/workflow-run` | `X-Hub-Signature-256` HMAC (`STOW_GITHUB_WEBHOOK_SECRET`) | GitHub `workflow_run` webhook payload | `OkResponse` | GitHub reports a `build-crate.yml` run completed; the edge parses `display_title` (`<rustc>-<task_id>`) → task id and forwards the run's identity to the scheduler's `POST /tasks/complete-run`; the alarm's resolution completes the task only once the records artifact its publish job pushed verifies in GHCR |
-| GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection — lane depths for `stow-admin status --watch` (stow#853); `Cache-Control: no-store` |
+| GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection — lane depths for `stow-admin status --watch` (stow#853) and the edge's `release_tag`, the ref `stow-admin` dispatches `operations.yml` on; `Cache-Control: no-store` |
 | GET `/api/v1/scheduler/health` | none | — | `SchedulerHealth` | Uncached liveness for uptime monitors (stow#860): worker/scheduler verdict, dispatch-freeze state and last `workflow_run` delivery age; any unhealthy component answers 503, all under `Cache-Control: no-store` |
 
-Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub identity in the extractor, before the body is parsed. Rows marked `repo-workflow OIDC or push user` are reads; the other authenticated rows name the workflows whose OIDC token, run on `main`, may call them.
+Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub identity in the extractor, before the body is parsed. Rows marked `repo-workflow OIDC or push user` are reads; the other authenticated rows name the workflows whose OIDC token, run on the edge's release tag, may call them.
 
 Every `/api/v1/` path sits behind the zone rate-limit rule documented in
 [`DEPLOYMENT.md`](DEPLOYMENT.md#one-time-cloudflare-setup) — 60 requests
@@ -1126,5 +1142,7 @@ is unset or malformed.
   Perfetto.
 * `stow-build serve --listen 127.0.0.1:7000` starts the dev-only local
   dispatch endpoint (`ci/src/local_server.rs`), the same one
-  `scripts/mock-e2e.sh` uses; production CI never invokes it.
+  `scripts/mock-e2e.sh` uses; production CI never invokes it. Given
+  `STOW_MOCK_GIT_ROOT` it also serves the mock GitHub the release flow runs
+  against (`ci/src/local_release.rs`, `scripts/release-flow-e2e.sh`).
 * `stow-mock-registry` provides an OCI v2 + cosign-compatible local registry.

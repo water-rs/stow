@@ -79,11 +79,12 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    `stow-admin index published-rustcs`, which probes every stable
    release `static.rust-lang.org/manifests.txt` lists for a published
    `stow-cache-v2-<rustc>` package through the registry's anonymous tag
-   listing, then dispatches `index-publish.yml` on `main` with
-   `report=true` for each rustc found (not `full`: a reset leaves the
-   slices in GHCR as they were) and `preheat-cron.yml` on `main` with
-   `refresh=true`, which submits the wave although the day's marker
-   exists. A failed probe, dispatch or an empty enumeration fails the
+   listing, then dispatches `index-publish.yml` on the run's own
+   release tag with `report=true` for each rustc found (not `full`: a
+   reset leaves the slices in GHCR as they were) and `preheat-cron.yml`
+   on that tag with `refresh=true`, which submits the wave although a
+   preheat run already succeeded that UTC day (the once-a-day check
+   reads this workflow's successful runs across refs). A failed probe, dispatch or an empty enumeration fails the
    run, which the watchdog reports as `operations.failed`. A stored record
    whose shape changes — the dispatch freeze's manual trigger carries
    its `actor` — is part of that schema, so a deploy that changes one is
@@ -292,11 +293,16 @@ The #450 watchdog remains the outer circuit.
 
 ## Automated deploys
 
-`.github/workflows/deploy-edge.yml` deploys a tested commit only: on a
-green `Test` run of a `main` push (`workflow_run`), and on
-`workflow_dispatch`, which takes the commit `sha` (verified to have a
-completed green `Test` run via `gh run list --commit`) plus
-`canary_share` (default `5`).
+`.github/workflows/deploy-edge.yml` deploys a release only. It has one
+trigger, `workflow_dispatch` with `canary_share` (default `5`), and
+`toolchain-publish.yml` is what dispatches it: that workflow runs on the
+release tag push (`v<semver>`), publishes the signed toolchain for every
+platform, and then dispatches `deploy-edge.yml` on the same tag. The
+`prepare` job refuses any other ref, and a tag that is not
+`v<workspace version>` at the commit it points to. The deployed commit is
+the release PR's head commit — the certified commit plus the version bump
+(see [Releases](#releases)) — so nothing merged to `main` after a
+certification reaches the edge, and a push to `main` deploys nothing.
 
 No job waits: the deploy is four jobs, and the observation windows are
 GitHub environment wait timers, which hold no runner. Operator setup
@@ -307,6 +313,11 @@ GitHub environment wait timers, which hold no runner. Operator setup
 - `deploy-promoted` — wait timer `15` minutes (the `promoted-verdict`
   job's delay after promotion; the analytics datasets settle on the
   promoted DO workload window meanwhile).
+
+Both environments limit their deployment branches and tags to release
+tags: *Deployment branches and tags → Selected branches and tags*, one
+tag rule, `v*`. The jobs run on the release tag the deploy was dispatched
+on, which no branch rule admits.
 
 Change a window by editing that environment's wait timer; the verdict
 reads the window's bounds from timestamps, so nothing else moves.
@@ -414,10 +425,11 @@ skyzen deploy --provider cloudflare --manifest edge/Skyzen.toml
 
 ## CI runner (GitHub Actions)
 
-Trusted builds are `.github/workflows/build-crate.yml` on `main` of
-`water-rs/stow`. The scheduler dispatches it with `workflow_dispatch`
-(`ref: main`, one `task` input carrying the JSON `BuildTaskPayload`) —
-one task is one run — and the workflow stays the signing identity;
+Trusted builds are `.github/workflows/build-crate.yml` on a release tag
+of `water-rs/stow`. The scheduler dispatches it with `workflow_dispatch`
+(`ref: v<version>`, the deployed edge's own release tag, one `task` input
+carrying the JSON `BuildTaskPayload`) — one task is one run — and the
+workflow stays the signing identity;
 the runner is picked from the task's target (`ubuntu-latest`,
 `macos-26`, `windows-latest`). Add a target by extending the
 `runs-on` map in `build-crate.yml`.
@@ -460,8 +472,13 @@ the run's rustc and task id.
 
 `GHCR_TOKEN` is the job's own `GITHUB_TOKEN` (`packages: write`), and
 the publish stage signs with the job's OIDC identity, so the certificate subject is
-`https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/heads/main`
-— the identity `stow_types::trusted_builder` pins and the CLI verifies.
+`https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/tags/v<MAJOR.MINOR.PATCH>`
+— the identity `stow_types::trusted_builder` pins and the CLI verifies:
+the workflow file's exact URL, a `refs/tags/v` ref and a strict three-part
+version, never a branch, a pre-release tag or another crate's tag. Only the
+release workflow can create such a tag (a ruleset protects `refs/tags/v*`,
+see [Release tag protection](#release-tag-protection)), so a signature under
+it means the commit the tag points to went through the release flow.
 
 `index-publish.yml` (the artifact-index lane) folds the signed
 records artifacts into per-`(target, rustc)` slices and pushes them to
@@ -524,19 +541,22 @@ build dispatch uses (stow#1121 moved the last of them over). `edge/Skyzen.toml` 
 `[cloudflare.triggers] crons` and the `STOW_PERIODIC_WORKFLOWS` var maps each
 cron expression to the workflow entries due when it fires. All UTC:
 
-| Cron | Workflow | Branch |
-| --- | --- | --- |
-| `*/15 * * * *` | `watchdog.yml` | `main` |
-| `17 0 * * *` | `preheat-cron.yml` | `main` |
-| `*/10 * * * *` | `index-publish-cron.yml` (also runs on `workflow_run`) | `dev` |
-| `5 * * * *` | `demand-feed.yml` (its OIDC identity is admitted on `main` only) | `main` |
-| `0 13 * * *` | `build-failure-digest.yml` | `dev` |
-| `0 7 * * *` | `test.yml` (the nightly run, every leg) and `release-gate.yml` (the nightly gate; its `nightly-report` job runs only on a dispatch by `stow-ci[bot]`, the App) | `dev` |
-| `30 5 * * 1` | `preheat-projects.yml` (its PR opens against the checked-out branch) | `dev` |
-| `0 6 * * 1` | `preheat-missed.yml` (its OIDC identity is admitted on `main` only) | `main` |
+| Cron | Workflow |
+| --- | --- |
+| `*/15 * * * *` | `watchdog.yml` |
+| `17 0 * * *` | `preheat-cron.yml` |
+| `*/10 * * * *` | `index-publish-cron.yml` (also runs on `workflow_run`) |
+| `5 * * * *` | `demand-feed.yml` |
+| `0 13 * * *` | `build-failure-digest.yml` |
+| `0 7 * * *` | `release-gate.yml` (the nightly certification: on the release tag it only runs the trampoline job, which dispatches the certification on `main` with `nightly=true` and `test.yml` on `main`; see [Releases](#releases)) |
+| `30 5 * * 1` | `preheat-projects.yml` (it checks out `main` and its PR opens against `main`) |
+| `0 6 * * 1` | `preheat-missed.yml` |
 
-An entry is a bare file name (dispatched on `main`) or
-`{"workflow": "test.yml", "ref": "dev"}`. The Worker's `scheduled` handler looks the
+An entry is a bare file name, dispatched on the deployed edge's own
+release tag (`v<version>`, the workspace version the Worker was built
+with); a periodic entry names no ref, and the production workflows run
+the code of the release the edge was built from. The Worker's
+`scheduled` handler looks the
 event's cron up in that map and posts one `workflow_dispatch` per due
 workflow through the scheduler object (`POST /periodic/dispatch`),
 concurrently under a bound of four. To change a cadence, edit the cron
@@ -579,7 +599,9 @@ in the repo settings:
 - **Active:** on
 
 The route acts only on `build-crate.yml` and `resolve-request.yml` runs
-on `main`, and forwards only the deliveries the scheduler consumes (see
+dispatched on a release tag (`head_branch` is `v<MAJOR.MINOR.PATCH>`; any
+release tag, since a run the previous release dispatched still completes
+after a deploy), and forwards only the deliveries the scheduler consumes (see
 `AGENTS.md`, Architecture). On a build run's `completed` it parses
 `display_title` into the run's rustc and task id and forwards the run's outcome to the scheduler's
 `POST /tasks/complete-run`. A `success` conclusion counts only once the
@@ -647,11 +669,13 @@ GitHub identity (`edge/src/github_auth.rs`). Two shapes authenticate:
 
 Both shapes read. **Only a workflow's OIDC token mutates**: each
 mutating route names the workflow files that may call it, and admits a
-token only when its `ref` is `refs/heads/main` and both its
-`workflow_ref` and `job_workflow_ref` are one listed file at
-`refs/heads/main` — a user token, another ref's copy of a listed
-workflow, a listed workflow reached as a reusable workflow, and any
-other workflow are refused with `401`. Every run is admitted on its
+token only when its `ref` is `refs/tags/<the edge's own release tag>` and
+both its `workflow_ref` and `job_workflow_ref` are one listed file at that
+tag — a user token, another ref's copy of a listed workflow (a branch, or
+another release's tag), a listed workflow reached as a reusable workflow,
+and any other workflow are refused with `401`. A new deploy therefore
+changes what the edge admits: runs of the previous release's tag stop
+mutating when the new release is promoted. Every run is admitted on its
 first attempt only: a re-run carries the original run's `actor`, so
 admitting it would attribute one person's mutation to another. A failed
 lane recovers by dispatching a fresh run, never by re-running jobs. The
@@ -682,14 +706,17 @@ or `push:<login>` — is recorded in the worker log on each write.
 
 Operators are untrusted, and no credential on an operator's machine
 mutates the edge: every mutation runs in `.github/workflows/operations.yml`
-on `main`, so it leaves a GitHub Actions run under the dispatcher's
-account. The run's OIDC token is the only credential the operator
+on the deployed edge's release tag, so it leaves a GitHub Actions run under
+the dispatcher's account. `stow-admin` reads that tag from the `release_tag`
+field of the scheduler status the edge serves
+(`GET /api/v1/scheduler/status`) and dispatches on it. The run's OIDC token is the only credential the operator
 routes above accept.
 
 Setup (once per repository): under Settings → Environments create
-`operations` and limit its deployment branches to `main` (*Deployment
-branches and tags → Selected branches and tags*). The workflow's job runs
-in that environment, so a run of any other ref cannot start. It reads the
+`operations` and limit its deployment branches and tags to release tags
+(*Deployment branches and tags → Selected branches and tags*, one tag
+rule, `v*`). The workflow's job runs in that environment, so a run of a
+branch cannot start. It reads the
 repository variables `STOW_EDGE_URL`, `STOW_OIDC_AUDIENCE`,
 `CF_ACCOUNT_ID` and `CF_ZONE_ID` and the secrets `CLOUDFLARE_API_TOKEN`
 and `CF_ANALYTICS_TOKEN` (see the secrets above and
@@ -713,8 +740,8 @@ soon as GitHub creates the run, follows it every 10 seconds, and succeeds
 only when the run concludes `success`; it gives up after 75 minutes (the
 job's own limit is 60). Runs queue in one concurrency group, so mutations
 never race, and the run name is `stow-admin <argv> (by <login>)`. The
-tool comes from the signed toolchain of `main`'s head, the same pull
-`watchdog.yml` makes.
+tool comes from the signed toolchain published for the run's own commit
+(the release's), the same pull `watchdog.yml` makes.
 
 What the operator needs:
 
@@ -741,7 +768,7 @@ resumable, and its `repack` job, `build-crate.yml`'s called by `repack.yml`
 so that it signs under that file's identity, is bound by GitHub's
 350-minute job limit.
 `repack-followup.yml` runs on the completion of every `repack` run
-(a `build-crate` run creates none) and acts on a `<rustc>-repack` title, dispatching onto `main` with a
+(a `build-crate` run creates none) and acts on a `<rustc>-repack` title, dispatching onto the release tag the completed run ran on with a
 GitHub App installation token (`STOW_APP_ID` / `STOW_APP_PRIVATE_KEY`,
 minted with `actions: write` only, as in `release-plz.yml`). The run's own
 `GITHUB_TOKEN` is not used: GitHub documents that "events triggered by the
@@ -889,46 +916,185 @@ GitHub refuses self-service deletion then.
 configuration lives in `dist-workspace.toml` and only the `stow-cli`
 package is distributed (the other binary crates are internal tooling).
 
-The flow:
+A release is a certified commit plus its version bump, and nothing else
+ships. The flow:
 
-1. Changes land on `dev`. On every push to `dev`, `release-plz.yml`
-   runs `release-plz release-pr`: it opens (or updates) a release PR
-   against `dev` with the version bump and changelog. That PR merges
-   like any other change.
-2. A `dev` → `main` PR promotes `dev` to `main` (`main` accepts pull
-   requests from `dev` only). On the push to `main`, `release-plz.yml`
-   runs `release-plz release`: every crate whose version is not yet on
-   crates.io is published over OIDC trusted publishing and tagged
-   `<crate>-vX.Y.Z` (`stow-types-v*`, `stow-shim-v*`, `stow-oci-v*`,
-   `stow-cli-v*`);
-   only the `stow-cli-v*` tag starts a cargo-dist build.
-3. The tag push triggers `release.yml` (cargo-dist), which builds
-   `stow-cli` for `x86_64-unknown-linux-gnu`,
-   `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, and
-   `x86_64-pc-windows-msvc`, then creates the
+1. **Certification.** `release-gate.yml` runs only by dispatch. The
+   nightly is the edge's Cron Trigger (`0 7 * * *` UTC): it dispatches the
+   workflow on the edge's release tag, where only the `trampoline` job
+   runs — it dispatches `release-gate.yml` on `main` with `nightly=true`
+   and `test.yml` on `main` (which keeps the caches saved from `main`'s ref
+   fresh). A day-time release is certified by name:
+
+   ```sh
+   gh workflow run release-gate.yml --ref main -f sha=<commit>
+   ```
+
+   (an empty `sha` certifies `main`'s head). Every leg runs on the named
+   commit: the mock end-to-end, the release flow (below), the traffic-cost
+   and preheat-cost tests, the production wave and the monthly projection,
+   and `Release gate` joins them. A failed nightly files or updates the
+   `nightly` issue and opens nothing; a pass closes it.
+2. **Release PR.** A passed gate runs the `release-pr` job, which runs
+   `scripts/release-pr.sh <sha>`: the certified commit X is checked out as
+   `main`, `release-plz release-pr` opens the release PR from it with the
+   App's token — its head H is X plus the version bump and changelog, one
+   commit, against `main` — and then the `Certified` commit status is set
+   on X with the run's own `GITHUB_TOKEN`, so its creator is
+   `github-actions[bot]`.
+3. **Release.** Merging the release PR (a merge commit; `main` takes no
+   other kind) pushes to `main` and starts `release-plz.yml`. Its
+   `release` job runs `scripts/release-resolve.sh` on the pushed commit,
+   which finds the merged PR from a `release-plz-*` branch opened by the
+   App and takes its head H — never the merge commit, so commits merged to
+   `main` after the certification are not in the release. It fails the job
+   unless the merge's second parent is H, H has exactly one parent X, and X
+   carries a `Certified` success status created by `github-actions[bot]`;
+   a push that merges no release PR releases nothing. The job then checks
+   out H and runs `release-plz release`: every crate whose version is not
+   yet on crates.io is published over OIDC trusted publishing and tagged at
+   H with the release App's token. The `stow-cli` tag is `v<version>`; the
+   other crates' are `oci/v<version>`, `shim/v<version>` and
+   `types/v<version>`, which no workflow triggers on. The crates.io trusted
+   publisher entry of each published crate names `release-plz.yml`; leave
+   its environment empty or `release`.
+4. **Everything else runs from the tag `v<version>`.** Its push triggers
+   `release.yml` (cargo-dist), which builds `stow-cli` for
+   `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+   `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`, then creates the
    GitHub Release and attaches the archives, the shell and PowerShell
-   installers, and `sha256` checksums.
+   installers, and `sha256` checksums; and `toolchain-publish.yml`, which
+   publishes the signed toolchain for H and then dispatches
+   `deploy-edge.yml` on the tag (see
+   [Automated deploys](#automated-deploys)). The deployed edge dispatches
+   every production workflow on that tag, and the builder and index
+   workflows sign under it.
 
-Required GitHub App configuration:
+`scripts/release-flow-e2e.sh` runs steps 2 and 3 on the mock stack
+(`MOCK.md`) as the release gate's `release-flow` leg, so a change to
+release-plz, to either script or to the mock that breaks the flow fails
+the certification before the release it would have gated. Until `dev` is
+retired (stow#1516), `pr-base-gate.yml` admits `release-plz-*` branches
+into `main` besides `dev`.
+
+Required GitHub App configuration — two Apps, so the identity that can
+open a release PR is not the one that can create a release tag:
 
 | Kind | Name | Value |
 |---|---|---|
-| variable | `STOW_APP_ID` | the GitHub App's ID |
-| secret | `STOW_APP_PRIVATE_KEY` | the GitHub App's private key (PEM) |
+| variable | `STOW_APP_ID` | the GitHub App's ID — opens the release PR |
+| secret | `STOW_APP_PRIVATE_KEY` | that App's private key (PEM) |
+| variable of the `release` environment | `STOW_RELEASE_APP_ID` | the release App's ID — creates the release tags |
+| secret of the `release` environment | `STOW_RELEASE_APP_PRIVATE_KEY` | the release App's private key (PEM) |
 
-The App is installed on `water-rs/stow` with **Contents: Read and
+The first App is installed on `water-rs/stow` with **Contents: Read and
 write** and **Pull requests: Read and write** (plus **Actions: Read and
-write**, which the scheduler uses — see issue #33).
+write**, which the scheduler uses — see issue #33). The release App is a
+separate App installed on `water-rs/stow` with **Contents: Read and write**
+only: it is the one identity the tag ruleset below lets create `v*`
+tags.
 
-Both `release-plz.yml` jobs mint an installation token for the App and
-use it for checkout and release-plz rather than the default
-`GITHUB_TOKEN`: pull requests opened and tags pushed with `GITHUB_TOKEN`
-never trigger other workflows, so the release PR's checks would never
-run and the cargo-dist release run would never start; the App token does
-trigger them, and it expires in an hour. release-plz creates the tag
-but not the GitHub Release (`git_release_enable = false` in
-`release-plz.toml`) — cargo-dist owns the release so it can attach the
-artifacts.
+The `release-pr` job (in `release-gate.yml`) mints an installation token
+for the first App and uses it for checkout and release-plz rather than the
+default `GITHUB_TOKEN`: pull requests opened with `GITHUB_TOKEN` never
+trigger other workflows, so the release PR's checks would never run; the
+App token does trigger them, and it expires in an hour. The `release` job
+of `release-plz.yml` mints a token for the release App for the same reason
+on the tag: a tag pushed with `GITHUB_TOKEN` starts no run, so the
+cargo-dist, toolchain and deploy runs would never start; a tag created
+with an App token does start them. release-plz creates the tag but not the
+GitHub Release (`git_release_enable = false` in `release-plz.toml`) —
+cargo-dist owns the release so it can attach the artifacts.
+
+### Release tag protection
+
+The release tags are the root of trust: a signature under
+`…@refs/tags/v<MAJOR.MINOR.PATCH>` is accepted by every reader, and the
+edge dispatches production workflows on, and admits mutations from, its own
+tag. Operator setup (once per repository), under Settings:
+
+- **Environment `release`** — *Deployment branches and tags → Selected
+  branches and tags*, one branch rule, `main`. It holds
+  `STOW_RELEASE_APP_ID` and `STOW_RELEASE_APP_PRIVATE_KEY` (above), so the
+  release App's key is readable by no run of any other ref. Only the
+  `release` job of `release-plz.yml` uses it.
+- **Tag ruleset** — Rules → Rulesets → *New tag ruleset*, enforcement
+  *Active*, target `refs/tags/v*` (include pattern `v*`), rules *Restrict
+  creations*, *Restrict updates* and *Restrict deletions*. The bypass list
+  holds the release App and nothing else, *Always*: no person, role or
+  other App can create, move or delete a release tag, and a release tag
+  is therefore only ever created by a job that passed `release-resolve.sh`.
+- **Environments `operations`, `deploy-canary` and `deploy-promoted`** —
+  limited to release tags: *Selected branches and tags*, one tag rule,
+  `v*` (see [Operator mutations](#operator-mutations) and
+  [Automated deploys](#automated-deploys)). `deploy-canary` and
+  `deploy-promoted` are created with their wait timers; `operations` is
+  created as before, with this deployment rule.
+- **The `main` ruleset** requires the checks `PR source gate`, `CI gate`
+  and `installable release`. `Release gate` and `toolchain gate` are not
+  required: certification is the dispatched `release-gate.yml`, and the
+  toolchain is published by the tag's `toolchain-publish.yml`, so a merge
+  to `main` waits for neither.
+
+### The switching release and the one-time re-sign
+
+The release that first signs under a release tag is a migration: records,
+nodes and index slices published before it carry the
+`…@refs/heads/main` identity, which readers no longer accept, so a CLI of
+this release serves nothing from them until they are re-signed (CLIs
+released earlier trust only the old identity and stop hitting the cache).
+The operator's procedure, in order:
+
+1. Complete the setup above: the release App, the `release` environment,
+   the tag ruleset, the environment tag rules and the `main` ruleset
+   change.
+2. Engage the dispatch freeze, so the old edge dispatches no builds that
+   would sign under `refs/heads/main` during the switch:
+
+   ```sh
+   stow-admin dispatch-freeze engage --yes
+   ```
+
+3. Merge the code onto `main`, then certify and release its head:
+
+   ```sh
+   gh workflow run release-gate.yml --ref main -f sha=<main head>
+   ```
+
+   The gate opens the release PR; merging it tags `v<version>`, which
+   starts cargo-dist, the toolchain publish and the edge deploy.
+4. When the deploy has promoted, re-sign each rustc whose repository holds
+   records signed before the switch (`stow-admin index published-rustcs`
+   lists them), on the new tag. For each rustc, first the records and
+   nodes, then the index slices:
+
+   ```sh
+   gh workflow run resign.yml --ref v<version> -f rustc=<rustc> -f concurrency=<n>
+   gh workflow run index-publish.yml --ref v<version> \
+       -f rustc_version=<rustc> -f resign=true -f report=true
+   ```
+
+   `resign.yml` runs `stow-build resign` inside `build-crate.yml`'s job
+   (so the signature's identity is `build-crate.yml` on the tag): every
+   tag of the rustc's package is classified first and an unknown tag fails
+   the run before anything is written; each records artifact and `built-`
+   marker is re-signed in place, every task's live nodes are republished
+   with a bundle carrying the new signature (the bundle digest changes), and
+   one new records artifact per changed task carries the new rows.
+   `index-publish.yml` with `resign: true` runs `stow-admin index resign`,
+   which signs each `index.*` and `folded.*` slice under the new identity at
+   the same digest, and then the normal export folds the new records.
+   `concurrency` bounds the tasks re-signed at once; choose it from the
+   rustc's record count and the Sigstore public-good instance's rate limits
+   (the registry side is bounded by `STOW_GHCR_WRITES_PER_MINUTE`). Both
+   runs verify under the old identity before signing and are rerun-safe: a
+   rerun skips what already verifies under the new one, so an interrupted
+   or rate-limited run is dispatched again unchanged.
+5. Clear the freeze (`stow-admin dispatch-freeze clear --yes`) once every
+   rustc's runs have finished, and record the runs' counts on stow#1515
+   (`stow-build resign` prints the sweep's counts as JSON).
+   `resign.yml`, `stow-build resign` and `stow-admin index resign` are
+   removed by the following release (stow#1517).
 
 ## What deploys do NOT include
 

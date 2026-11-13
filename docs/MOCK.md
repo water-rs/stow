@@ -41,10 +41,11 @@ failure. Every port it binds is an environment override —
 values as defaults, so a second run can share the machine by shifting
 the set (the edge bundle's loopback URLs are rendered to match at
 `skyzen build` time). CI runs it in the release gate (`mock-e2e` in
-`.github/workflows/release-gate.yml`) — on demand, nightly on `dev`,
-and on every pull request and merge group into `main` — which is what
-keeps the trusted build path — dispatch → build → publish → CLI cache
-hit — continuously tested on a clean runner.
+`.github/workflows/release-gate.yml`) — on every certification, that
+is the nightly on `main`'s head and a dispatch naming a commit; a pull
+request runs only `Test` — which is what keeps the trusted build path —
+dispatch → build → publish → CLI cache hit — continuously tested on a
+clean runner.
 
 ## Traffic cost
 
@@ -181,6 +182,44 @@ Durable Object, bills at most 0.128 GB-s for each second of a 31-day
 month: 342,835.2 GB-s. The table reports that ceiling as the duration usage and judges it
 against the full 400,000 GB-s allowance; the 80% line is held at run
 time by the watchdog signal `cf.do.duration_gb_s`.
+
+## Release flow
+
+`scripts/release-flow-e2e.sh` runs the release flow
+([`DEPLOYMENT.md`](DEPLOYMENT.md#releases)) with no GitHub: `stow-build
+serve` also answers the GitHub REST and GraphQL endpoints release-plz and
+the two release scripts call, under `/api/v3/` and `/api/graphql` (the
+paths release-plz uses for an `http://` repository URL that is not
+github.com), over one bare git repository per `owner/repo` under the
+directory `STOW_MOCK_GIT_ROOT` names — pull requests, commit statuses,
+branch and tag refs, annotated tags and the `createCommitOnBranch`
+mutation (`ci/src/local_release.rs`). A request authenticates as
+`Authorization: Bearer mock-token:<login>` and acts as that login, which
+is how the PR's author and a status's creator are told apart. The server
+is the dispatch server too and still asks for its usual settings; the
+release flow only has to supply them.
+
+The script seeds a throwaway crate with a released `v0.1.0` and a feature
+commit since, and then:
+
+1. runs `scripts/release-pr.sh` at the head X: asserts the release PR is
+   the App's, against `main`, one commit on X, and that X carries a
+   `Certified` success status created by `github-actions[bot]`;
+2. lands a commit on `main` after the certification and merges the PR
+   (merge commit, the only method the mock allows, as `main`'s ruleset);
+3. runs `scripts/release-resolve.sh` on the merge, which must name the PR's
+   head H, then `release-plz release` (`git_only`) checked out at H:
+   asserts tag `v<bumped version>` is at H, H's parent is X, and the later
+   commit is not in the release;
+4. opens a second release PR, pushes one more commit to its branch and
+   merges it: `release-resolve.sh` must fail, because the head's parent
+   carries no `Certified` status.
+
+It needs `release-plz`, `git` 2.38 or newer, `curl` and `jq` on `PATH`.
+CI runs it as the release gate's `release-flow` leg; locally,
+`STOW_GATE_BIN_DIR` may name a directory holding a built `stow-build`
+instead of building the production tools. The variables are in
+[`ENVIRONMENT.md`](ENVIRONMENT.md#scriptsrelease-flow-e2esh).
 
 ## Prerequisites
 
