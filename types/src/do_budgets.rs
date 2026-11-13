@@ -406,23 +406,24 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
     },
     DriveBudget {
         // stow#1501: the overflow path of a one-part tree — one backlog
-        // insert and two tally upserts, no read (the tree goes in
-        // verbatim): measured 4 statements, 0 rows read, 3 written. A
+        // insert and two tally upserts (the tree goes in verbatim):
+        // measured on workerd 4 statements, 1 row read, 6 written. A
         // larger tree adds one insert per body-limit part.
         name: "POST /tasks/submit (backlogged)",
         statements: 8,
         rows_read: 2,
-        rows_written: 6,
+        rows_written: 12,
         wall_ms: 400,
     },
     DriveBudget {
         // stow#1501: one one-part entry — head read, keyed published
-        // read, the merge's append, the delete and the tally upserts:
-        // measured 7 statements, 2 rows read, 5 written. Bounded per
+        // read, the merge's append and digest upsert, the delete and the
+        // tally upserts, each write billing the row it reads: measured
+        // on workerd 7 statements, 8 rows read, 5 written. Bounded per
         // pass by one request body of stored text.
         name: "backlog admission",
         statements: 14,
-        rows_read: 6,
+        rows_read: 16,
         rows_written: 10,
         wall_ms: 400,
     },
