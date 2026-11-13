@@ -872,7 +872,7 @@ fn run_response(state: &LocalServerState, run_id: u64) -> Response {
             "html_url": run.html_url,
             "path": run.path,
             "event": "workflow_dispatch",
-            "head_branch": stow_types::trusted_builder::BRANCH,
+            "head_branch": stow_types::trusted_builder::RELEASE_TAG,
             "triggering_actor": {"login": run.triggering_actor_login},
         }),
         StatusCode::OK,
@@ -943,7 +943,7 @@ async fn list_workflow_runs(
                 "html_url": run.html_url,
                 "path": run.path,
                 "event": "workflow_dispatch",
-                "head_branch": stow_types::trusted_builder::BRANCH,
+                "head_branch": stow_types::trusted_builder::RELEASE_TAG,
                 "triggering_actor": {"login": run.triggering_actor_login},
             })
         })
@@ -2142,7 +2142,7 @@ async fn post_workflow_run(
             "path": format!(".github/workflows/{}", run.workflow_file),
             "event": "workflow_dispatch",
             "display_title": run.display_title,
-            "head_branch": stow_types::trusted_builder::BRANCH,
+            "head_branch": stow_types::trusted_builder::RELEASE_TAG,
             "conclusion": run.conclusion,
             "html_url": run.html_url,
             "head_repository": {"full_name": stow_types::trusted_builder::REPOSITORY},

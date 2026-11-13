@@ -396,7 +396,9 @@ async fn marker_signature_verified(
             manifest_digest,
             &signature,
             &material.payload_bytes,
-            stow_types::trusted_builder::CERTIFICATE_IDENTITY,
+            &stow_oci::verify::ReleaseIdentity::new(
+                stow_types::trusted_builder::TrustedWorkflow::BUILD,
+            ),
         )
         .is_ok()
     }))
@@ -415,7 +417,7 @@ async fn publish(
     let publisher = stow_oci::Publisher::from_env(
         http,
         &trust,
-        stow_types::trusted_builder::CERTIFICATE_IDENTITY,
+        stow_types::trusted_builder::TrustedWorkflow::BUILD,
     )?;
     let session =
         publisher.session(&stow_types::registry::cache_repository(&task.rustc_version))?;

@@ -239,19 +239,19 @@ fixture's `STOW_GITHUB_WEBHOOK_SECRET`. `stow-admin index report` then
 tells the scheduler which identities each published slice serves.
 
 The edge's mutating routes take only a workflow's OIDC token run on
-`main`, so the mock registry is also the GitHub Actions OIDC issuer:
+the edge's own release tag, so the mock registry is also the GitHub Actions OIDC issuer:
 `serve` publishes its key set at `/.well-known/jwks` (the edge fetches
 it through `STOW_GITHUB_API_URL`, never the real GitHub), and
 `oidc-token` signs a token for one workflow run:
 
 ```sh
 target/release/stow-mock-registry oidc-token --workflow operations.yml \
-    [--ref refs/heads/main] [--actor <login>] [--lifetime-secs 600]
+    [--ref refs/tags/v<version>] [--actor <login>] [--lifetime-secs 600]
 ```
 
 `--workflow` names the file under `.github/workflows/` that the route
 lists (`operations.yml`, `demand-feed.yml`, `index-publish.yml`, …);
-`--ref` defaults to `refs/heads/main`, `--actor` to `stow-mock-operator`,
+`--ref` defaults to `refs/tags/` and the release tag of the build, `--actor` to `stow-mock-operator`,
 and `--lifetime-secs` to 600 — a real token lives minutes and
 `stow-admin` re-mints it per request, so a script handing one token to a
 long lane sets the lane's length. The token goes in `GH_TOKEN` (or

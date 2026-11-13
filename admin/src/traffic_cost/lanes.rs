@@ -401,7 +401,7 @@ pub(super) fn workflow_delivery_body(
         "workflow_run": {
             "display_title": title,
             "event": "workflow_dispatch",
-            "head_branch": stow_types::trusted_builder::BRANCH,
+            "head_branch": stow_types::trusted_builder::RELEASE_TAG,
             "path": format!(
                 ".github/workflows/{}",
                 workflow
@@ -1354,7 +1354,7 @@ mod tests {
             );
             assert_eq!(
                 body["workflow_run"]["head_branch"],
-                stow_types::trusted_builder::BRANCH
+                stow_types::trusted_builder::RELEASE_TAG
             );
             assert_eq!(
                 body["workflow_run"]["conclusion"].as_str(),

@@ -726,7 +726,9 @@ pub async fn published_slice(
         &index.repository.reference(&tag),
         &manifest_digest,
         &materials,
-        stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY,
+        &stow_oci::verify::ReleaseIdentity::new(
+            stow_types::trusted_builder::TrustedWorkflow::INDEX,
+        ),
     )?;
     let index = crate::index_cmd::decode_published_slice(&reference, rustc_version, &blob)?;
     if index.header.target.as_str() != target.as_str()

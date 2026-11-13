@@ -23,17 +23,28 @@ use rcgen::{
 use sha2::Digest as _;
 use sigstore::cosign::bundle::Payload as RekorPayload;
 use sigstore::crypto::{CosignVerificationKey, Signature, SigningScheme};
+use stow_oci::verify::ReleaseIdentity;
 use stow_types::bundle::{
     SIGSTORE_BUNDLE_ANNOTATION, SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE,
     SIGSTORE_SIGNATURE_ANNOTATION, sigstore_signature_tag,
 };
-use stow_types::trusted_builder::{CERTIFICATE_IDENTITY, CERTIFICATE_ISSUER};
+use stow_types::trusted_builder::{CERTIFICATE_ISSUER, TrustedWorkflow};
 use stow_types::upload_plan::PlannedArtifact;
 
 use super::{RegistryProbe, push_session, serve_probe_registry, test_plan};
 
+/// The exact subject the mock Fulcio issues: the build workflow at a
+/// release tag, which the signer's self-check requires.
+const CERTIFICATE_IDENTITY: &str =
+    "https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/tags/v1.2.3";
+
+/// What the readers pin: the build workflow at any release tag.
+fn reader_identity() -> ReleaseIdentity {
+    ReleaseIdentity::new(TrustedWorkflow::BUILD)
+}
+
 /// The OIDC token's subject — Fulcio's proof-of-possession challenge.
-const SUBJECT: &str = "repo:water-rs/stow:ref:refs/heads/main";
+const SUBJECT: &str = "repo:water-rs/stow:ref:refs/tags/v1.2.3";
 /// The bearer the mock OIDC endpoint takes.
 const REQUEST_TOKEN: &str = "mock-request-token";
 /// The mock Rekor's log id.
@@ -453,7 +464,7 @@ impl Stack {
             &reference,
             &plan.oci_reference,
             digest,
-            CERTIFICATE_IDENTITY,
+            &reader_identity(),
         )
         .await
     }
@@ -545,7 +556,7 @@ async fn a_certificate_for_another_identity_is_never_published() {
     let session = stack.session(&unbounded());
     let reference = session.reference("wrong-identity").expect("reference");
     let digest = stow_types::registry::sha256_digest(b"manifest");
-    let other = "https://github.com/water-rs/stow/.github/workflows/repack.yml@refs/heads/main";
+    let other = "https://github.com/water-rs/stow/.github/workflows/repack.yml@refs/tags/v1.2.3";
     let signer = stow_oci::KeylessSigner::new(
         stack.http.clone(),
         stack.sigstore.trust(),
@@ -594,7 +605,7 @@ async fn signing_returns_the_verified_published_material() {
         &reference.to_string(),
         &digest,
         &[material],
-        CERTIFICATE_IDENTITY,
+        &reader_identity(),
     )
     .expect("returned material verifies");
 }
@@ -878,7 +889,7 @@ async fn independent_publishers_recover_without_re_signing() {
                 &reference,
                 &published_records.oci_reference,
                 &published_records.manifest_digest,
-                CERTIFICATE_IDENTITY,
+                &reader_identity(),
             )
             .await?;
             let digest = &outcome.published_by_reference[&plan.oci_reference].oci_digest;
