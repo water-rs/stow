@@ -62,10 +62,16 @@ impl Fixture {
         self.daemon.log_lines(needle)
     }
 
-    /// The pids of the daemons that bound the endpoint, from their log.
+    /// [`PrivateDaemon::wait_log_lines`] of the daemon of this fixture.
+    fn wait_log_lines(&self, needle: &str, at_least: usize) -> Vec<String> {
+        self.daemon.wait_log_lines(needle, at_least)
+    }
+
+    /// The pids of the daemons that bound the endpoint, from their log,
+    /// once the first has logged that it serves.
     fn serving_pids(&self) -> Vec<libc::pid_t> {
         self.daemon
-            .serving_pids()
+            .wait_serving_pids()
             .into_iter()
             .map(|pid| libc::pid_t::try_from(pid).expect("a logged pid fits pid_t"))
             .collect()
@@ -113,7 +119,12 @@ fn status_round_trips_through_an_owner_only_runtime_directory() {
         run_status(&mut fixture.command(&["daemon", "status"])),
         expected_status()
     );
-    assert_eq!(fixture.log_lines("stow daemon process started").len(), 1);
+    assert_eq!(
+        fixture
+            .wait_log_lines("stow daemon process started", 1)
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -189,7 +200,9 @@ fn clients_that_find_the_daemon_down_start_exactly_one() {
         assert_eq!(String::from_utf8_lossy(&output.stdout), expected_status());
     }
     assert_eq!(
-        fixture.log_lines("stow daemon process started").len(),
+        fixture
+            .wait_log_lines("stow daemon process started", 1)
+            .len(),
         1,
         "one daemon process was spawned for {CLIENTS} clients"
     );
@@ -362,6 +375,10 @@ fn retire_and_wait(fixture: &Fixture) {
             Ok(Response::Status { .. })
         )
     });
+    // The successor's reply can reach this test before its records are in
+    // the log, which a daemon writes from a thread.
+    fixture.wait_log_lines("stow daemon serving", 2);
+    fixture.wait_log_lines("stow daemon process started", 2);
 }
 
 #[test]
@@ -398,7 +415,7 @@ fn a_retired_daemon_reexecs_keeping_its_pid_lock_and_endpoint() {
     assert!(second.status.success(), "{second:?}");
     assert_eq!(
         fixture
-            .log_lines("another stow daemon holds the lock")
+            .wait_log_lines("another stow daemon holds the lock", 1)
             .len(),
         1
     );
@@ -454,7 +471,10 @@ fn retire_onto_replaces_a_running_daemon_and_starts_none() {
         support::retire_onto_in_child(&fixture.run_dir(), &stow()),
         "none"
     );
-    assert!(fixture.serving_pids().is_empty(), "nothing was started");
+    assert!(
+        fixture.log_lines("stow daemon serving").is_empty(),
+        "nothing was started"
+    );
 
     run_status(&mut fixture.command(&["daemon", "status"]));
     let [pid] = fixture.serving_pids()[..] else {
@@ -465,8 +485,14 @@ fn retire_onto_replaces_a_running_daemon_and_starts_none() {
         support::retire_onto_in_child(&fixture.run_dir(), &stow()),
         format!("restarted {version} {version}")
     );
+    fixture.wait_log_lines("stow daemon serving", 2);
     assert_eq!(fixture.serving_pids(), [pid], "the successor has the pid");
-    assert_eq!(fixture.log_lines("stow daemon process started").len(), 2);
+    assert_eq!(
+        fixture
+            .wait_log_lines("stow daemon process started", 2)
+            .len(),
+        2
+    );
 }
 
 #[test]
@@ -504,7 +530,12 @@ fn a_connect_during_the_exec_is_answered_by_the_new_image() {
         .map(|client| client.join().expect("a client"))
         .sum();
     assert!(answered > 0, "the new image answered");
-    assert_eq!(fixture.log_lines("stow daemon process started").len(), 2);
+    assert_eq!(
+        fixture
+            .wait_log_lines("stow daemon process started", 2)
+            .len(),
+        2
+    );
 }
 
 #[test]

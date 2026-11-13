@@ -64,7 +64,7 @@ fn a_client_finds_a_daemon_that_was_already_starting() {
     let started = Instant::now();
     assert_answered(client(&run_dir), started);
     assert_eq!(
-        daemon.serving_pids().len(),
+        daemon.wait_serving_pids().len(),
         1,
         "a daemon was started twice or ended:\n{:?}",
         daemon.log_lines("stow daemon")
@@ -72,7 +72,7 @@ fn a_client_finds_a_daemon_that_was_already_starting() {
 
     // Still serving: a second client finds the same daemon.
     assert_answered(client(&run_dir), Instant::now());
-    assert_eq!(daemon.serving_pids().len(), 1);
+    assert_eq!(daemon.wait_serving_pids().len(), 1);
 }
 
 /// Clients that all find no daemon share one start: every one reaches it
@@ -89,7 +89,7 @@ fn concurrent_first_clients_share_one_daemon() {
         assert_answered(client, started);
     }
     assert_eq!(
-        daemon.serving_pids().len(),
+        daemon.wait_serving_pids().len(),
         1,
         "{:?}",
         daemon.log_lines("stow daemon")
@@ -173,7 +173,7 @@ fn a_retired_daemon_is_succeeded_through_the_task() {
     let daemon = PrivateDaemon::in_home(home.path());
     let run_dir = daemon.run_dir().to_owned();
     assert_answered(client(&run_dir), Instant::now());
-    let [first] = daemon.serving_pids()[..] else {
+    let [first] = daemon.wait_serving_pids()[..] else {
         panic!("one daemon serves: {:?}", daemon.serving_pids());
     };
 
@@ -204,6 +204,7 @@ fn a_retired_daemon_is_succeeded_through_the_task() {
 
     assert_answered(client(&run_dir), Instant::now());
     drop(connection);
+    daemon.wait_log_lines("stow daemon serving", 2);
     let pids = daemon.serving_pids();
     assert_eq!(pids.len(), 2, "{:?}", daemon.log_lines("stow daemon"));
     assert_eq!(pids[0], first);
@@ -229,7 +230,7 @@ fn retire_onto_succeeds_a_running_daemon_through_the_task_and_starts_none() {
     assert!(daemon.serving_pids().is_empty(), "nothing was started");
 
     assert_answered(client(&run_dir), Instant::now());
-    let [first] = daemon.serving_pids()[..] else {
+    let [first] = daemon.wait_serving_pids()[..] else {
         panic!("one daemon serves: {:?}", daemon.serving_pids());
     };
     let version = env!("CARGO_PKG_VERSION");
@@ -237,6 +238,7 @@ fn retire_onto_succeeds_a_running_daemon_through_the_task_and_starts_none() {
         support::retire_onto_in_child(&run_dir, &stow()),
         format!("restarted {version} {version}")
     );
+    daemon.wait_log_lines("stow daemon serving", 2);
     let pids = daemon.serving_pids();
     assert_eq!(pids.len(), 2, "{:?}", daemon.log_lines("stow daemon"));
     assert_eq!(pids[0], first);
@@ -263,7 +265,7 @@ fn a_daemon_too_old_to_retire_is_ended_and_the_task_starts_a_new_one() {
 
     let status = reaped.join().expect("the old daemon's reaper");
     assert!(!status.success(), "the old daemon was ended: {status:?}");
-    let [new] = daemon.serving_pids()[..] else {
+    let [new] = daemon.wait_serving_pids()[..] else {
         panic!("one daemon serves: {:?}", daemon.serving_pids());
     };
     assert_ne!(new, old, "the daemon is a new process");

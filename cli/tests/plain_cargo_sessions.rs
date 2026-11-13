@@ -136,12 +136,12 @@ fn a_plain_cargo_build_gets_a_session_that_ends_with_its_cargo() {
         &dir.path().join("target"),
     );
 
-    let opened = daemon.log_lines("opened a session for a cargo");
+    let opened = daemon.wait_log_lines("opened a session for a cargo", 1);
     assert_eq!(opened.len(), 1, "one session for one cargo: {opened:?}");
     // The cargo has exited, so its session ends by itself.
     wait_for_log(&daemon, "ended a cargo's session");
     assert_eq!(
-        daemon.serving_pids().len(),
+        daemon.wait_serving_pids().len(),
         1,
         "the first wrapper started one daemon"
     );
@@ -172,11 +172,13 @@ fn two_builds_get_two_sessions_on_one_daemon() {
     }
 
     assert_eq!(
-        daemon.log_lines("opened a session for a cargo").len(),
+        daemon
+            .wait_log_lines("opened a session for a cargo", 2)
+            .len(),
         2,
         "each cargo has its own session"
     );
-    assert_eq!(daemon.serving_pids().len(), 1, "both share one daemon");
+    assert_eq!(daemon.wait_serving_pids().len(), 1, "both share one daemon");
 }
 
 /// The wrapper's own command line for a rustc invocation: what cargo runs,
@@ -248,7 +250,7 @@ fn a_probe_is_answered_without_a_session() {
     }
 
     assert_eq!(
-        daemon.serving_pids().len(),
+        daemon.wait_serving_pids().len(),
         1,
         "the first probe started the daemon"
     );
@@ -290,7 +292,7 @@ fn a_wrapper_with_no_cargo_variable_is_owned_by_its_parent() {
     );
 
     // This test process started the wrapper, so it owns the session.
-    let opened = daemon.log_lines("opened a session for a cargo");
+    let opened = daemon.wait_log_lines("opened a session for a cargo", 1);
     assert_eq!(opened.len(), 1, "one session: {opened:?}");
     assert!(
         opened[0].contains(&format!("pid {} started", std::process::id())),
@@ -428,7 +430,9 @@ fn a_plain_build_with_a_build_script_succeeds_in_either_cargo_layout() {
             );
         }
         assert_eq!(
-            daemon.log_lines("opened a session for a cargo").len(),
+            daemon
+                .wait_log_lines("opened a session for a cargo", 1)
+                .len(),
             1,
             "{layout:?}: the build's first unit opened no session"
         );
@@ -501,18 +505,24 @@ fn main() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(
-            daemon.log_lines("opened a session for a cargo").len(),
+            daemon
+                .wait_log_lines("opened a session for a cargo", round + 1)
+                .len(),
             round + 1,
             "each build's C compiler opened the session of its cargo"
         );
     }
     assert!(
-        !daemon.log_lines("stored C/C++ compilation").is_empty(),
+        !daemon
+            .wait_log_lines("stored C/C++ compilation", 1)
+            .is_empty(),
         "the first build's object was never stored:\n{}",
         daemon.log_lines("").join("\n")
     );
     assert!(
-        !daemon.log_lines("served C/C++ compilation").is_empty(),
+        !daemon
+            .wait_log_lines("served C/C++ compilation", 1)
+            .is_empty(),
         "the second build's object was not served from the cache:\n{}",
         daemon.log_lines("").join("\n")
     );
@@ -650,7 +660,7 @@ fn a_killed_cargo_ends_its_session_while_its_build_script_lives() {
 #[test]
 fn a_daemon_started_for_a_build_outlives_the_cargo_killed_under_it() {
     let mut build = ScriptBuild::start();
-    let started = build.daemon.serving_pids();
+    let started = build.daemon.wait_serving_pids();
     assert_eq!(
         started.len(),
         1,
@@ -671,7 +681,7 @@ fn a_daemon_started_for_a_build_outlives_the_cargo_killed_under_it() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        build.daemon.serving_pids(),
+        build.daemon.wait_serving_pids(),
         started,
         "the daemon that served the build ended with its cargo:\n{}",
         build.daemon.log_lines("").join("\n")
@@ -777,7 +787,12 @@ fn a_cargo_whose_daemon_restarted_is_refused_until_it_exits() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(daemon.log_lines("opened a session for a cargo").len(), 1);
+    assert_eq!(
+        daemon
+            .wait_log_lines("opened a session for a cargo", 1)
+            .len(),
+        1
+    );
 
     // The daemon dies under the build; the next wrapper starts another.
     daemon.crash();
@@ -796,6 +811,7 @@ fn a_cargo_whose_daemon_restarted_is_refused_until_it_exits() {
         stderr.contains("daemon.log"),
         "the failure does not name the daemon's log:\n{stderr}"
     );
+    daemon.wait_log_lines("stow daemon serving", 2);
     assert_eq!(
         daemon.serving_pids().len(),
         2,
@@ -972,7 +988,9 @@ fn two_concurrent_plain_builds_get_two_sessions() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(
-        daemon.log_lines("opened a session for a cargo").len(),
+        daemon
+            .wait_log_lines("opened a session for a cargo", 2)
+            .len(),
         2,
         "one session for each of the two cargos"
     );
@@ -998,7 +1016,11 @@ fn two_concurrent_plain_builds_get_two_sessions() {
         );
         daemon.wait_session_ended(cargo_pid);
     }
-    assert_eq!(daemon.serving_pids().len(), 1, "both shared one daemon");
+    assert_eq!(
+        daemon.wait_serving_pids().len(),
+        1,
+        "both shared one daemon"
+    );
 }
 
 /// A wrapper that cannot reach the daemon, nor start it, fails the build at
