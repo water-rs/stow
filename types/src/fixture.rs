@@ -211,14 +211,18 @@ fn target_count() -> u32 {
 /// selector reads a size-invariant cardinality at every size.
 pub const CRATE_NAME_ROWS: u32 = 50;
 
-/// A fixture node's crate name and version. `(crate, version)` is
-/// injective in `n` at any size — `n / 20000` carries the quotient in
-/// the version and `n % 500` its low digits.
+/// A fixture node's crate name and version.
+///
+/// `(crate, version)` is injective in `n` at any size — `n % 500` picks
+/// the major and `n / 20000` the minor. One name's [`CRATE_NAME_ROWS`] consecutive
+/// nodes sit on distinct majors, so no fixture closure holds two
+/// semver-compatible versions of one crate, which no real resolve
+/// produces and the scheduler refuses (stow#1487).
 #[must_use]
 pub fn crate_identity(n: u32) -> (String, String) {
     (
         format!("crate{}", n / CRATE_NAME_ROWS),
-        format!("1.{}.{}", n / 20000, n % 500),
+        format!("{}.{}.0", n % 500 + 1, n / 20000),
     )
 }
 
