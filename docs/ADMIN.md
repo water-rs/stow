@@ -7,7 +7,8 @@ table). Commands that take `--yes` require it before applying their plan;
 
 Run outside GitHub Actions, the mutating commands — `scheduler reset`,
 `scheduler demand-feed`, `queue retry|cancel|promote|purge`,
-`dispatch-freeze engage|clear`, `dispatch-cap set`, `release-priority set`, `submit`,
+`dispatch-freeze engage|clear`, `dispatch-cap set`, `release-priority set`,
+`memory-line set`, `submit`,
 `maintenance`, `watchdog`
 (not `--dry-run`), and the `preheat` lanes under `--yes` — do not call
 the edge or Cloudflare themselves: they dispatch
@@ -59,6 +60,19 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   `stow-admin release-priority set --percent N` replaces it until the
   next `set` — there is no clear and no expiry, no ceiling is checked,
   and the new value re-ranks queued release nodes at the next claim.
+- `stow-admin memory-line status` — the scheduler graph's memory lines
+  in force (normal line, small line and small increment, in resident
+  bytes) and whether they are the deploy bindings
+  (`STOW_SCHEDULER_MEMORY_LINE`, `STOW_SCHEDULER_SMALL_MEMORY_LINE`,
+  `STOW_SCHEDULER_SMALL_INCREMENT_BYTES`) or the operator setting.
+  `stow-admin memory-line set --normal N --small N --small-increment N --yes`
+  replaces all three until the next `set` — there is no clear and no
+  expiry, and no bound is checked. The setting is stored outside the
+  graph, so both commands work while the graph is too large to wake:
+  raising `--small` above the graph's size is how it wakes again
+  (`stow-admin scheduler reset --yes` is the other way, and drops the
+  queue and the backlog). Admission and the wake apply the new lines
+  from the next request on.
 - `stow-admin submit --crate-name X --version 1.2.3 --features-json '["default"]' --target aarch64-apple-darwin --rustc-version 1.91.1 --yes`
   — enqueue one specific build task.
 - `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`

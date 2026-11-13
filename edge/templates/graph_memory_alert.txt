@@ -1,0 +1,8 @@
+The stow scheduler cannot load its graph: it needs {{ needed }} bytes and the
+small-submission memory line (STOW_SCHEDULER_SMALL_MEMORY_LINE) is {{ budget }}
+bytes.
+
+Every scheduler route and the alarm fail with a graph-exceeds-budget error
+until the graph fits. Raise the line only below the Durable Object's 128 MB
+isolate limit, or reset the store (stow-admin scheduler reset --yes) and let
+the lanes refill it.

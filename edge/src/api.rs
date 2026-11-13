@@ -401,6 +401,37 @@ pub async fn set_release_priority(
     Ok(Json(stored))
 }
 
+/// GET /api/v1/admin/memory-line
+///
+/// The scheduler graph's memory lines in force — the operator setting
+/// behind them when `stow-admin memory-line set` wrote one, the deploy
+/// bindings otherwise (stow#1501). Answers while the graph cannot wake.
+pub async fn get_memory_line(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::MemoryLines>, GetArtifactError> {
+    Ok(Json(scheduler_client::get_memory_lines(&scheduler).await?))
+}
+
+/// POST /api/v1/admin/memory-line
+///
+/// The operator's `set` — the memory lines in force until the next
+/// `set`; no bound is checked.
+pub async fn set_memory_line(
+    Mutator { caller, actor, .. }: Mutator<OperatorRoute>,
+    Json(set): Json<stow_types::api::MemoryLineSet>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::MemoryLines>, GetArtifactError> {
+    let stored = scheduler_client::set_memory_lines(&scheduler, &set, &actor).await?;
+    tracing::warn!(
+        normal = stored.normal_line_bytes,
+        small = stored.small_line_bytes,
+        %caller,
+        "memory lines set via admin endpoint"
+    );
+    Ok(Json(stored))
+}
+
 /// POST /`api/v1/admin/index/published`
 ///
 /// The index-publish path's report that this run's slices went live,

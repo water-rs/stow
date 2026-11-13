@@ -46,6 +46,7 @@ mod digests;
 mod edges;
 mod index;
 mod node;
+mod occupancy;
 mod published;
 mod snapshot;
 mod sparse;
@@ -57,6 +58,7 @@ use edges::Edges;
 use index::{Interner, IxTable, Priorities, hash_of};
 pub use node::RunCompletion;
 use node::{Extra, FIRST_ATTEMPT, Flags, Lane, NO_STATE, Node, State, Status};
+pub(super) use occupancy::{ResidentCounts, Room};
 pub use published::{
     Fetched, PublishedNeeds, PublishedRow, PublishedSource, ReadSource, slice_column,
 };
@@ -458,6 +460,9 @@ pub struct Graph {
     /// The node arena. Indexes are stable between compactions and
     /// compactions keep creation order.
     nodes: Arena<Node>,
+    /// Edges of the freed nodes in `nodes`: what the next compaction
+    /// drops from the edge arrays along with them (stow#1501).
+    free_edges: usize,
     /// Derived queue-state candidates; published and free nodes have no entry.
     /// Rebuilt with the identity indexes after loading or renumbering nodes.
     by_status: [fixedbitset::FixedBitSet; Status::COUNT],
@@ -599,6 +604,14 @@ pub struct Graph {
     /// memory only: the probe ledger reports it so a reader can tell a
     /// reload, which drops every ledger booking since the snapshot.
     pub woken_at_ms: i64,
+    /// The submissions the backlog holds (stow#1501): in memory only,
+    /// read from `store_meta` at the wake and moved with every write
+    /// to the table, so the status reads and the admission pass never
+    /// scan it.
+    pub(super) backlog: super::backlog::Tally,
+    /// The backlog head the last admission pass found too large, so a
+    /// pass reads it again only once the room it needed exists.
+    pub(super) backlog_blocked: Option<super::backlog::Blocked>,
     /// The fixture size the budget probe last seeded this store at —
     /// `None` until a seed runs. It rides the snapshot head so `rearm`
     /// and the probe read it from the graph: a `store_meta` row would
@@ -1344,6 +1357,7 @@ impl Graph {
         while let Some(ix) = work.pop() {
             debug_assert_eq!(self.node(ix).status, Status::Published);
             self.set_status(ix, Status::Free);
+            self.free_edges += usize::from(self.node(ix).edges_len);
             for edge in self.edge_range(ix) {
                 let dep = self.edges.dep(edge);
                 let held = self.node_mut(dep);
@@ -1435,6 +1449,7 @@ impl Graph {
             .map(|&ix| remap[ix as usize])
             .collect::<BTreeSet<_>>();
         self.counts[Status::Free.index()] = 0;
+        self.free_edges = 0;
         for target in &mut self.targets {
             target.counts[Status::Free.index()] = 0;
         }
@@ -1491,7 +1506,7 @@ impl Graph {
 }
 
 /// Freed nodes below which a compaction is never worth its pass.
-const COMPACT_FLOOR: usize = 1_024;
+pub(super) const COMPACT_FLOOR: usize = 1_024;
 
 /// Merge, publish and the claim gate.
 impl Graph {
@@ -2376,42 +2391,76 @@ impl Graph {
         Ok(MintedPass { claims, refusals })
     }
 
-    /// The package `ix`'s dependency closure holds two feature sets of,
-    /// as the refusal names it — `None` when the closure agrees. One
-    /// walk of the closure the dispatch payload carries: the node and
-    /// every node reachable over its edges, published ones included.
-    /// Interned crate, version and feature ids compare exactly: the
-    /// interner holds one id per string, and a feature set's string is
-    /// its canonical list.
+    /// What `ix`'s dependency closure holds twice, as the refusal names
+    /// it — two feature sets of one package version on one side
+    /// (stow#1470) or two versions of one cargo compatibility range
+    /// (stow#1487) — `None` when the closure agrees. One walk of the
+    /// closure the dispatch payload carries: the node and every node
+    /// reachable over its edges, published ones included, each version
+    /// parsed once per visit for its range. Interned crate, version and
+    /// feature ids compare exactly: the interner holds one id per
+    /// string, and a feature set's string is its canonical list.
     fn closure_disagreement(&self, ix: u32) -> Option<String> {
-        let (crate_name, version, target, host_side) =
-            stow_types::feature_sets::closure_disagreement(
-                ix as usize,
-                |at| {
-                    let node = &self.nodes[at];
-                    Some((
-                        (
-                            node.crate_name,
-                            node.version,
-                            node.target,
-                            node.flags.host(),
-                        ),
-                        node.features,
-                    ))
+        use stow_types::feature_sets::{ClosureConflict, ClosureHeld, ClosureKey};
+        let version_of = |id: u32| {
+            semver::Version::parse(self.intern.at(id))
+                .expect("a stored version was a parsed version at merge")
+        };
+        let (key, held, other) = stow_types::feature_sets::closure_disagreement(
+            ix as usize,
+            |at| {
+                let node = &self.nodes[at];
+                stow_types::feature_sets::closure_members(
+                    &node.crate_name,
+                    &version_of(node.version),
+                    &node.version,
+                    node.target,
+                    node.flags.host(),
+                    node.features,
+                )
+            },
+            |at, stack| {
+                let at = u32::try_from(at).expect("arena indexes fit u32");
+                stack.extend(self.deps_of(at).map(|dep| dep as usize));
+            },
+        )?;
+        let (crate_name, conflict_versions, package) = match (key, held, other) {
+            (
+                ClosureKey::Range { crate_name, .. },
+                ClosureHeld::Version(held),
+                ClosureHeld::Version(other),
+            ) => (crate_name, [version_of(held), version_of(other)], None),
+            (
+                ClosureKey::Package {
+                    crate_name,
+                    version,
+                    target,
+                    host_side,
                 },
-                |at, stack| {
-                    let at = u32::try_from(at).expect("arena indexes fit u32");
-                    stack.extend(self.deps_of(at).map(|dep| dep as usize));
-                },
-            )?;
+                ..,
+            ) => {
+                let version = version_of(version);
+                (
+                    crate_name,
+                    [version.clone(), version],
+                    Some((target, host_side)),
+                )
+            }
+            (ClosureKey::Range { .. }, ..) => {
+                unreachable!("a range key holds versions: closure_members pairs them")
+            }
+        };
+        let conflict = match package {
+            None => ClosureConflict::Versions([&conflict_versions[0], &conflict_versions[1]]),
+            Some((target, host_side)) => ClosureConflict::FeatureSets {
+                version: &conflict_versions[0],
+                target: &self.targets[usize::from(target)].name,
+                host_side,
+            },
+        };
         Some(format!(
             "dependency closure holds {}",
-            stow_types::feature_sets::disagreement_text(
-                self.intern.at(crate_name),
-                self.intern.at(version),
-                &*self.targets[usize::from(target)].name,
-                host_side,
-            )
+            stow_types::feature_sets::disagreement_text(self.intern.at(crate_name), conflict)
         ))
     }
 
@@ -3576,75 +3625,6 @@ impl Graph {
         (live as u64, self.edges.len() as u64, self.published_ids)
     }
 
-    /// Occupancy and allocated buffer sizes, with the Wasm linear memory
-    /// the isolate holds (wasm32 only). `accounted_storage_bytes` sums
-    /// the `*_storage_bytes` and index fields below. It excludes map
-    /// overhead, side allocations and transient memory; it is not a
-    /// total.
-    pub(super) fn trace_occupancy(&self, drive: &str, phase: &str, boundary: &str) {
-        let node_storage_bytes = self.nodes.capacity() * size_of::<Node>();
-        let state_storage_bytes = self.states.capacity() * size_of::<State>();
-        let free_state_storage_bytes = self.free_states.heap_bytes();
-        let demand_storage_bytes = self.demand.heap_bytes();
-        let intern_storage_bytes = self.intern.heap_bytes();
-        let priority_storage_bytes = self.priorities.heap_bytes();
-        let task_id_index_bytes = self.ids.heap_bytes();
-        let identity_index_bytes = self.idents.heap_bytes();
-        let edge_array_storage_bytes = self.edges.array_bytes();
-        let published_overlay_bytes = self.published.heap_bytes();
-        let extra_storage_bytes = self.extras.capacity() * size_of::<(u32, Extra)>();
-        let accounted_storage_bytes = node_storage_bytes
-            + state_storage_bytes
-            + free_state_storage_bytes
-            + demand_storage_bytes
-            + intern_storage_bytes
-            + priority_storage_bytes
-            + task_id_index_bytes
-            + identity_index_bytes
-            + edge_array_storage_bytes
-            + published_overlay_bytes
-            + extra_storage_bytes;
-        tracing::info!(
-            drive,
-            phase,
-            boundary,
-            graph_loaded = true,
-            retained_nodes = self.nodes.len() - self.counts[Status::Free.index()] as usize,
-            node_slots = self.nodes.len(),
-            node_capacity = self.nodes.capacity(),
-            node_fragments = self.nodes.fragments().len(),
-            node_storage_bytes,
-            active_states = self.states.len() - self.free_states.len(),
-            state_slots = self.states.len(),
-            state_capacity = self.states.capacity(),
-            state_fragments = self.states.fragments().len(),
-            state_storage_bytes,
-            free_state_slots = self.free_states.len(),
-            free_state_storage_bytes,
-            demand_storage_bytes,
-            intern_storage_bytes,
-            ready_entries = self.ready_sets().map(BTreeSet::len).sum::<usize>(),
-            ready_classes = self.ready.len() + self.ready_macos.len(),
-            priority_values = self.priorities.len(),
-            priority_storage_bytes,
-            task_id_index_bytes,
-            identity_index_bytes,
-            dependency_edges = self.edges.len(),
-            edge_array_storage_bytes,
-            published_identities = self.published_ids,
-            published_overlay_entries = self.published.len(),
-            published_overlay_bytes,
-            pending_age_entries = self.pending_ages.len(),
-            extra_entries = self.extras.len(),
-            extra_capacity = self.extras.capacity(),
-            extra_entry_bytes = size_of::<(u32, Extra)>(),
-            extra_storage_bytes,
-            accounted_storage_bytes,
-            wasm_linear_bytes = super::memory::linear_bytes(),
-            "budget graph occupancy"
-        );
-    }
-
     /// The miss lane's pending depth, which `STOW_MAX_QUEUE_PENDING`
     /// gates: work other lanes queued is not the miss lane's to bound.
     pub const fn miss_pending_depth(&self) -> u32 {
@@ -4573,6 +4553,7 @@ impl Graph {
     pub fn admin_status_with(
         &self,
         now: i64,
+        settings: &queue::SchedulerSettings,
         digests: &mut impl DigestSource,
     ) -> Result<stow_types::api::AdminStatus, QueueError> {
         let status = self.status();
@@ -4641,6 +4622,14 @@ impl Graph {
             in_flight,
             targets,
             dispatch_frozen: self.freeze.is_some(),
+            memory: stow_types::api::AdminMemory {
+                resident_bytes: self.resident_bytes(),
+                normal_line_bytes: settings.memory_line_bytes,
+                small_line_bytes: settings.small_memory_line_bytes,
+                wasm_linear_bytes: super::memory::linear_bytes(),
+                backlog_entries: self.backlog.entries(),
+                backlog_bytes: self.backlog.bytes(),
+            },
             index_slices: self
                 .slice_generations()
                 .into_iter()
@@ -4741,6 +4730,20 @@ pub struct GraphCell {
     /// Set by the wake, cleared by the one request that runs the
     /// post-wake CI status reconcile.
     reconcile_due: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether this isolate already alerted that its graph exceeds the
+    /// memory line.
+    #[cfg(target_arch = "wasm32")]
+    exceeded_alerted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The last wake that found the graph over the memory line: the
+    /// bytes it needed (zero while none failed) and the line. Only a
+    /// reset changes a store no route can wake, so a later wake under
+    /// the same line fails with it before reading a row — a scheduler
+    /// over its line costs each request nothing, not a snapshot load.
+    oversize: std::sync::Arc<[std::sync::atomic::AtomicU64; 2]>,
+    /// The operator's memory lines as the store holds them, once this
+    /// isolate read the `memory_line` row. Kept beside the graph, never
+    /// in it: the wake reads the line it loads under from here.
+    memory_line: std::sync::Arc<std::sync::Mutex<super::memory_line::Cached>>,
     /// The isolate's cached GitHub App installation token.
     tokens: crate::github_app::TokenCache,
     /// The isolate's billed-but-unsettled row counts — see [`Unsettled`].
@@ -4860,9 +4863,50 @@ impl GraphCell {
         self.reconcile_due
             .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
+    /// Take the duty to alert that the graph exceeds its memory line —
+    /// `true` for the first failed wake of this isolate only, so a
+    /// scheduler that keeps failing sends one alert, not one per route.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn take_exceeded_alert(&self) -> bool {
+        !self
+            .exceeded_alerted
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+    /// The error a wake under `budget` fails with without reading the
+    /// store: the last failed wake's, while `budget` is no larger than
+    /// the line it failed against.
+    pub(crate) fn oversized(&self, budget: u64) -> Option<QueueError> {
+        let needed = self.oversize[0].load(std::sync::atomic::Ordering::Relaxed);
+        let line = self.oversize[1].load(std::sync::atomic::Ordering::Relaxed);
+        (needed != 0 && budget <= line).then_some(QueueError::GraphExceedsBudget { needed, budget })
+    }
+    /// Remember a wake that found the graph needs `needed` bytes against
+    /// the line `budget`.
+    pub(crate) fn record_oversize(&self, needed: u64, budget: u64) {
+        self.oversize[1].store(budget, std::sync::atomic::Ordering::Relaxed);
+        self.oversize[0].store(needed, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// What this isolate knows of the stored memory-line setting.
+    pub(crate) fn memory_line(&self) -> super::memory_line::Cached {
+        self.memory_line
+            .lock()
+            .expect("memory line poisoned")
+            .clone()
+    }
+    /// Keep `setting` as the store's memory-line row.
+    pub(crate) fn set_memory_line(&self, setting: Option<stow_types::api::MemoryLineSetting>) {
+        *self.memory_line.lock().expect("memory line poisoned") =
+            super::memory_line::Cached::Read(setting);
+    }
     /// Drop the in-memory graph — the operator reset: the next
     /// request wakes from the (reset) store.
     pub(crate) fn clear(&self) {
+        self.oversize[0].store(0, std::sync::atomic::Ordering::Relaxed);
+        *self.memory_line.lock().expect("memory line poisoned") =
+            super::memory_line::Cached::Unread;
+        #[cfg(target_arch = "wasm32")]
+        self.exceeded_alerted
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         *self.graph.lock().expect("graph cell poisoned") = Graph::default();
         self.loaded
             .store(false, std::sync::atomic::Ordering::Release);
@@ -5189,7 +5233,11 @@ impl Graph {
         &self,
         now: i64,
     ) -> Result<stow_types::api::AdminStatus, QueueError> {
-        self.admin_status_with(now, &mut self.test_digest_source())
+        self.admin_status_with(
+            now,
+            &queue::SchedulerSettings::default(),
+            &mut self.test_digest_source(),
+        )
     }
 
     pub(crate) fn select_ids(
@@ -5583,22 +5631,55 @@ mod tests {
         assert!(error.to_string().contains("libc 0.2.191"), "{error}");
     }
 
-    /// A graph where `aes` is ready and its closure holds libc 0.2.191
-    /// twice on the target side, though each submitted tree agreed:
-    /// polyval (published) carries its edge onto the `extra_traits` set
-    /// from the first tree, which `keeper` retains, and the second tree
-    /// names polyval bare beside the other set, with `aes-gcm` waiting
-    /// on `aes`.
-    fn graph_with_a_disagreeing_aes() -> Graph {
-        let libc = |features: &[&str]| {
-            let mut node = sub("libc");
-            node.version = CrateVersion::new(semver::Version::new(0, 2, 191));
-            node.features_json =
-                FeaturesJson::from_sorted(features.iter().map(|f| (*f).to_owned()).collect())
-                    .expect("features");
-            node.task_id = minted_id(&node);
-            node
+    /// stow#1487: a submission whose closure holds smallvec 1.16.4 and
+    /// 1.16.5 is refused at the route, naming both versions.
+    #[test]
+    fn a_closure_with_two_compatible_versions_is_refused_at_submit() {
+        let mut gix = sub("gix-attributes");
+        gix.deps = vec![0, 1];
+        let tree = SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![2],
+            nodes: vec![
+                package("smallvec", semver::Version::new(1, 16, 4), &[]),
+                package("smallvec", semver::Version::new(1, 16, 5), &[]),
+                gix,
+            ],
         };
+        let error = Graph::default().merge(&tree, 0).expect_err("refused");
+        assert!(
+            error.to_string().contains("smallvec 1.16.4 and 1.16.5"),
+            "{error}"
+        );
+    }
+
+    /// The test node `name` at `version` with `features`.
+    fn package(name: &str, version: semver::Version, features: &[&str]) -> SubmissionNode {
+        let mut node = sub(name);
+        node.version = CrateVersion::new(version);
+        node.features_json =
+            FeaturesJson::from_sorted(features.iter().map(|f| (*f).to_owned()).collect())
+                .expect("features");
+        node.task_id = minted_id(&node);
+        node
+    }
+
+    /// The libc 0.2.191 pair of stow#1470: one package version at two
+    /// feature sets.
+    fn two_libc_sets() -> (SubmissionNode, SubmissionNode) {
+        let libc = |features: &[&str]| package("libc", semver::Version::new(0, 2, 191), features);
+        (
+            libc(&["default", "extra_traits", "std"]),
+            libc(&["default", "std"]),
+        )
+    }
+
+    /// A graph where `aes` is ready and its closure holds both `extra`
+    /// and `plain`, though each submitted tree agreed: polyval
+    /// (published) carries its edge onto `extra` from the first tree,
+    /// which `keeper` retains, and the second tree names polyval bare
+    /// beside `plain`, with `aes-gcm` waiting on `aes`.
+    fn graph_with_a_disagreeing_aes(extra: SubmissionNode, plain: SubmissionNode) -> Graph {
         let rows = |node: &SubmissionNode| {
             [UnitKind::Linked, UnitKind::Unlinked].map(|kind| PublishedSliceRow {
                 crate_name: node.crate_name.clone(),
@@ -5613,10 +5694,6 @@ mod tests {
                 node_profile: node.profile,
             })
         };
-        let (extra, plain) = (
-            libc(&["default", "extra_traits", "std"]),
-            libc(&["default", "std"]),
-        );
         let mut polyval = sub("polyval");
         let published: Vec<_> = [&extra, &plain, &polyval]
             .into_iter()
@@ -5667,7 +5744,8 @@ mod tests {
     /// operator retry is refused again rather than dispatched.
     #[test]
     fn a_closure_that_disagrees_in_the_graph_is_refused_at_claim() {
-        let mut graph = graph_with_a_disagreeing_aes();
+        let (extra, plain) = two_libc_sets();
+        let mut graph = graph_with_a_disagreeing_aes(extra, plain);
         let pass = graph
             .claim_nodes(&claim_settings(45, 16), 10_000, u32::MAX)
             .expect("claim");
@@ -5715,6 +5793,57 @@ mod tests {
         assert_eq!(again.refusals.len(), 1);
         assert_eq!(status_of(&graph, "aes"), Some(Status::Failed));
         assert!(graph.attempt_outcomes.is_empty());
+    }
+
+    /// stow#1487: the same shape with smallvec 1.16.4 under polyval and
+    /// 1.16.5 beside it — two versions cargo unifies. The claim refuses
+    /// aes naming both versions, and its dependent blocks.
+    #[test]
+    fn a_closure_with_two_compatible_versions_is_refused_at_claim() {
+        let mut graph = graph_with_a_disagreeing_aes(
+            package("smallvec", semver::Version::new(1, 16, 4), &[]),
+            package("smallvec", semver::Version::new(1, 16, 5), &[]),
+        );
+        let pass = graph
+            .claim_nodes(&claim_settings(45, 16), 10_000, u32::MAX)
+            .expect("claim");
+        let minted = graph
+            .claimed(&pass, &mut graph.test_digest_source())
+            .expect("mint");
+        assert_eq!(
+            minted
+                .claims
+                .iter()
+                .map(|claim| claim.task_id.as_str())
+                .collect::<Vec<_>>(),
+            [id("keeper")],
+            "the agreeing closure dispatches"
+        );
+        let [refusal] = minted.refusals.as_slice() else {
+            panic!("one refusal: {:?}", minted.refusals);
+        };
+        assert_eq!(refusal.task_id, id("aes"));
+        assert_eq!(
+            refusal.error,
+            "dependency closure holds smallvec 1.16.4 and 1.16.5, two semver-compatible versions cargo unifies"
+        );
+        let gcm = graph.node_ix(&id("aes-gcm")).expect("dependent");
+        assert!(graph.node(gcm).flags.blocked(), "the dependent blocks");
+        assert!(graph.attempt_outcomes.is_empty(), "no run, no outcome");
+    }
+
+    /// Two versions on two compatibility ranges are claimed as usual.
+    #[test]
+    fn a_closure_with_two_compatibility_ranges_is_claimed() {
+        let mut graph = graph_with_a_disagreeing_aes(
+            package("smallvec", semver::Version::new(1, 16, 4), &[]),
+            package("smallvec", semver::Version::new(2, 0, 0), &[]),
+        );
+        let pass = graph
+            .claim_nodes(&claim_settings(45, 16), 10_000, u32::MAX)
+            .expect("claim");
+        assert_eq!(pass.claims.len(), 2, "keeper and aes both dispatch");
+        assert_eq!(pass.refusals, [] as [u32; 0]);
     }
 
     /// A → B → C chain (a depends on b, b on c), nodes in leaf order.
@@ -6141,7 +6270,7 @@ mod tests {
     /// plan — every row of every dirty span, in key order.
     fn round_trip(graph: &Graph) -> Graph {
         let plan = graph.snapshot_plan().expect("plan");
-        let mut loader = SnapshotLoader::default();
+        let mut loader = SnapshotLoader::new(u64::MAX);
         for span in plan.spans {
             let mut encoder = graph.snapshot_encoder(span);
             let mut sub = 0i64;
@@ -6415,6 +6544,80 @@ mod tests {
             before.encode_dispatch_task().expect("encode before"),
             after.encode_dispatch_task().expect("encode after")
         );
+    }
+
+    /// stow#1501: the records published nodes free count as room once
+    /// a compaction would drop them. A merge that fits only that way
+    /// compacts first, and the compacted graph holds exactly the
+    /// figure the room was judged against.
+    #[test]
+    fn the_room_counts_what_a_compaction_would_reclaim() {
+        let mut graph = Graph::default();
+        let mut nodes: Vec<_> = (0..9_000).map(|n| sub(&format!("l{n}"))).collect();
+        for n in 0..1_000u32 {
+            let mut dependent = sub(&format!("d{n}"));
+            dependent.deps = vec![n];
+            nodes.push(dependent);
+        }
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![],
+                    nodes,
+                },
+                0,
+            )
+            .expect("merge");
+        // 600 dependents and their leaves publish: 1,200 freed records
+        // and 600 edges, under the eighth the graph compacts at itself.
+        let rows: Vec<_> = (0..600)
+            .flat_map(|n| [format!("l{n}"), format!("d{n}")])
+            .flat_map(|name| {
+                [
+                    published_row(&name, UnitKind::Linked),
+                    published_row(&name, UnitKind::Unlinked),
+                ]
+            })
+            .collect();
+        let live = graph.slice_generation(TARGET, RUSTC);
+        graph.apply_slice_report(
+            TARGET,
+            RUSTC,
+            live,
+            live.map_or(1, |live| live + 1),
+            &rows,
+            &[],
+        );
+        assert_eq!(graph.counts[Status::Free.index()], 1_200);
+        assert_eq!(graph.free_edges, 600);
+
+        let reusable = Room::of(&graph).reusable_resident();
+        let resident = graph.resident_bytes();
+        assert!(reusable < resident, "{reusable} < {resident}");
+        let growth = occupancy::Growth {
+            nodes: 1,
+            stateful: 1,
+            ..occupancy::Growth::default()
+        };
+        let lines = |line: u64| queue::SchedulerSettings {
+            memory_line_bytes: line,
+            small_memory_line_bytes: line,
+            ..queue::SchedulerSettings::default()
+        };
+        // No room even after a compaction: nothing is planned.
+        let mut room = Room::of(&graph);
+        assert!(room.take(&lines(reusable), growth).is_err());
+        assert!(!room.compact());
+        // Room only after one: the merge fits and plans it.
+        let settings = lines(reusable + 4_096);
+        assert!(!settings.admits(resident, 1), "no room without it");
+        let mut room = Room::of(&graph);
+        assert_eq!(room.take(&settings, growth), Ok(()));
+        assert!(room.compact());
+        graph.compact();
+        assert_eq!(graph.resident_bytes(), reusable);
+        assert_eq!(graph.free_edges, 0);
     }
 
     #[test]
@@ -6861,6 +7064,109 @@ mod tests {
             roots: vec![0],
             nodes: vec![sub(name)],
         }
+    }
+
+    /// The occupancy line counts every structure the graph holds, and a
+    /// resident-bytes formula over the snapshot head's counts tracks it
+    /// at the density production wakes at (stow#1501): 5.9 edges per
+    /// node, 92% of nodes with queue state and the rest retained as
+    /// published.
+    #[test]
+    fn accounted_occupancy_matches_the_resident_formula_at_production_density() {
+        const NODES: u32 = 24_000;
+        let names: Vec<String> = (0..NODES).map(|n| format!("crate-{n}")).collect();
+        let mut graph = Graph::default();
+        let nodes: Vec<SubmissionNode> = (0..NODES)
+            .map(|n| {
+                let mut node = sub(&names[n as usize]);
+                // A fiftieth of the nodes are leaves and the rest depend
+                // on their six predecessors: 5.88 edges per node.
+                if n % 50 != 0 {
+                    node.deps = (n.saturating_sub(6)..n).collect();
+                }
+                node
+            })
+            .collect();
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![],
+                    nodes,
+                },
+                0,
+            )
+            .expect("merge");
+        let rows: Vec<_> = (0..NODES)
+            .filter(|n| n % 12 == 6)
+            .flat_map(|n| {
+                [
+                    published_row(&names[n as usize], UnitKind::Linked),
+                    published_row(&names[n as usize], UnitKind::Unlinked),
+                ]
+            })
+            .collect();
+        graph.apply_slice_report(TARGET, RUSTC, None, 1, &rows, &[]);
+        graph.compact();
+        // What a wake holds: the graph decoded from its snapshot rows.
+        let graph = round_trip(&graph);
+
+        let held = graph.occupancy();
+        let (live, edges, _) = graph.sizes();
+        let live = usize::try_from(live).expect("live nodes fit usize");
+        let edges = usize::try_from(edges).expect("edges fit usize");
+        let states = graph.states.len();
+        let active = states - graph.free_states.len();
+        let text: usize = names.iter().map(String::len).sum::<usize>()
+            + "1.0.0".len()
+            + FeaturesJson::default().raw().len();
+        let ready = graph.ready_sets().map(BTreeSet::len).sum::<usize>();
+        let counts = ResidentCounts {
+            nodes: live,
+            states,
+            edges,
+            strings: graph.intern.len(),
+            text,
+            ready,
+        };
+        assert_eq!(
+            counts,
+            ResidentCounts {
+                text: graph.intern.text_len(),
+                ..graph.resident_counts()
+            },
+            "the graph's own counts are the head's"
+        );
+        let expected = occupancy::resident_bytes(&counts);
+        let accounted = held.accounted();
+        eprintln!(
+            "occupancy: {live} nodes {edges} edges {states} states: accounted {accounted} B \
+             ({} B/node), formula {expected} B; {held:?}",
+            accounted / live
+        );
+        // The head's counts sized both indexes exactly, once.
+        let exact = (live * 8).div_ceil(7) * size_of::<u32>();
+        assert_eq!((held.task_id_index, held.identity_index), (exact, exact));
+        assert!(
+            (580..600).contains(&(edges * 100 / live)),
+            "{edges} edges over {live} nodes"
+        );
+        assert!(
+            (90..94).contains(&(active * 100 / live)),
+            "{active} states over {live} nodes"
+        );
+        for (name, bytes) in [
+            ("ready queues", held.ready),
+            ("status bitsets", held.by_status),
+            ("pending index", held.pending_index),
+            ("edge arrays", held.edge_array),
+        ] {
+            assert!(bytes > 0, "{name} are counted");
+        }
+        assert!(
+            accounted.abs_diff(expected) * 100 < expected,
+            "formula {expected} B against accounted {accounted} B"
+        );
     }
 
     /// stow#879: the rank is `priority × time waited`. A 30× request

@@ -169,6 +169,10 @@ pub fn traced(
             crate::ReleasePriorityCommand::Set(a) if a.yes => &[],
             _ => return None,
         },
+        crate::Command::MemoryLine(a) => match &a.command {
+            crate::MemoryLineCommand::Set(a) if a.yes => &[],
+            _ => return None,
+        },
         crate::Command::Submit(a) if a.yes => &[],
         crate::Command::Maintenance(_) => &[],
         crate::Command::Watchdog(a) if !a.dry_run => &[],

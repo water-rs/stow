@@ -961,10 +961,10 @@ pub fn mark_running(graph: &mut Graph, shape: FixtureShape, now: i64) {
 }
 
 /// Empty the store's graph tables — the probe's wipe. A `DELETE`,
-/// never DDL: the schema belongs to `POST /reset`. The fourth table,
-/// `meter`, deliberately stays: the seed's own snapshot checkpoint
-/// rewrites it (`seq = 0`, the fresh graph's totals plus the isolate's
-/// unsettled counts), so the probe's day totals restart at the seed.
+/// never DDL: the schema belongs to `POST /reset`. The `meter` table
+/// deliberately stays: the seed's own snapshot checkpoint rewrites it
+/// (`seq = 0`, the fresh graph's totals plus the isolate's unsettled
+/// counts), so the probe's day totals restart at the seed.
 ///
 /// # Errors
 /// `QueueError::Sql` when a delete fails.
@@ -975,6 +975,8 @@ pub async fn wipe(db: &DurableDb) -> Result<(), QueueError> {
         "store_meta",
         "node_digests",
         "published",
+        "backlog",
+        "memory_line",
     ] {
         db.query(&format!("DELETE FROM {table}"))
             .execute()
@@ -1005,6 +1007,9 @@ pub async fn seed(
     // The installed graph goes first: building the fixture beside it
     // would hold two graphs at once.
     cell.clear();
+    // The wipe left no `memory_line` row, so the cell knows the setting
+    // as a wake of this store would: the drives price a resident graph.
+    cell.set_memory_line(None);
     tracing::info!(rows = shape.queue_rows, "fixture seed: store wiped");
     let mut graph = build(shape, settings, now, Stored(db)).await?;
     tracing::info!(nodes = graph.sizes().0, "fixture seed: graph built");

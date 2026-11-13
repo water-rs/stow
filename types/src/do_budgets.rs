@@ -405,6 +405,29 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
+        // stow#1501: the overflow path of a one-part tree — one backlog
+        // insert and two tally upserts (the tree goes in verbatim):
+        // measured on workerd 4 statements, 1 row read, 6 written. A
+        // larger tree adds one insert per body-limit part.
+        name: "POST /tasks/submit (backlogged)",
+        statements: 8,
+        rows_read: 2,
+        rows_written: 12,
+        wall_ms: 400,
+    },
+    DriveBudget {
+        // stow#1501: one one-part entry — head read, keyed published
+        // read, the merge's append and digest upsert, the delete and the
+        // tally upserts, each write billing the row it reads: measured
+        // on workerd 7 statements, 8 rows read, 5 written. Bounded per
+        // pass by one request body of stored text.
+        name: "backlog admission",
+        statements: 14,
+        rows_read: 16,
+        rows_written: 10,
+        wall_ms: 400,
+    },
+    DriveBudget {
         // stow#1378: as the operations lane — one fresh node; stow#1379:
         // and its one keyed published read, one key named and none found.
         name: "POST /tasks/submit (preheat)",
@@ -572,6 +595,25 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         rows_read: 5,
         rows_written: 5,
         wall_ms: 400,
+    },
+    DriveBudget {
+        // stow#1501: the `memory_line` row, read once per isolate (the
+        // cold read priced here), and no wake: measured 1 statement,
+        // 0 rows read (no row before a set), 0 written.
+        name: "GET /memory-line",
+        statements: 2,
+        rows_read: 2,
+        rows_written: 1,
+        wall_ms: 300,
+    },
+    DriveBudget {
+        // stow#1501: one upsert of the `memory_line` row, no graph
+        // read: measured 1 statement, 0 rows read, 1 written.
+        name: "POST /memory-line",
+        statements: 2,
+        rows_read: 2,
+        rows_written: 2,
+        wall_ms: 300,
     },
     DriveBudget {
         name: "POST /tasks/complete-run (success)",

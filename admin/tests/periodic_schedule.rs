@@ -91,6 +91,11 @@ fn production_drives_every_periodic_workflow_at_its_cadence_and_branch() {
     }
 }
 
+/// The driven workflows that also keep their own `schedule` (stow#1501):
+/// the watchdog watches the edge, so a clock that does not run on the
+/// edge must also start it.
+const TWO_CLOCKS: [&str; 1] = ["watchdog.yml"];
+
 #[test]
 fn a_driven_workflow_accepts_dispatch() {
     for manifest in ["edge/Skyzen.toml", "edge/Skyzen.mock.toml"] {
@@ -111,8 +116,9 @@ fn a_driven_workflow_accepts_dispatch() {
                     workflow.as_str()
                 );
                 assert!(
-                    !triggers.contains_key("schedule"),
-                    "{}: the Cron Trigger is its only clock, so it carries no `schedule`",
+                    TWO_CLOCKS.contains(&workflow.as_str()) == triggers.contains_key("schedule"),
+                    "{}: the Cron Trigger is its only clock, so it carries no `schedule`, \
+                     unless it is listed in TWO_CLOCKS, which carries one",
                     workflow.as_str()
                 );
             }

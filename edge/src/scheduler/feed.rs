@@ -526,6 +526,9 @@ mod tests {
             max_queue_pending: 2_000,
             human_daily_task_budget: 2_000,
             min_dispatch_value: 0,
+            memory_line_bytes: crate::scheduler::queue::DEFAULT_MEMORY_LINE,
+            small_memory_line_bytes: crate::scheduler::queue::DEFAULT_SMALL_MEMORY_LINE,
+            small_increment_bytes: crate::scheduler::queue::DEFAULT_SMALL_INCREMENT_BYTES,
         }
     }
 
