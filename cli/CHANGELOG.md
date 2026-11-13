@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0](https://github.com/water-rs/stow/compare/stow-cli-v0.19.0...stow-cli-v0.20.0) - 2026-11-13
+
+### Fixed
+
+- refuse a closure holding two semver-compatible versions of one crate ([#1488](https://github.com/water-rs/stow/pull/1488))
+- *(cli)* answer a client that reaches the Windows pipe as the drain ends ([#1499](https://github.com/water-rs/stow/pull/1499))
+
 ## [0.19.0](https://github.com/water-rs/stow/compare/stow-cli-v0.18.0...stow-cli-v0.19.0) - 2026-11-12
 
 ### Fixed
