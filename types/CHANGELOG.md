@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0](https://github.com/water-rs/stow/compare/stow-types-v0.19.0...stow-types-v0.20.0) - 2026-11-13
+
+### Added
+
+- *(scheduler)* [**breaking**] bound the graph's memory with incremental lines and an overflow backlog ([#1506](https://github.com/water-rs/stow/pull/1506))
+
+### Fixed
+
+- refuse a closure holding two semver-compatible versions of one crate ([#1488](https://github.com/water-rs/stow/pull/1488))
+
 ## [0.19.0](https://github.com/water-rs/stow/compare/stow-types-v0.18.0...stow-types-v0.19.0) - 2026-11-12
 
 ### Fixed
