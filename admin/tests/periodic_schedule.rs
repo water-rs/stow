@@ -122,8 +122,9 @@ fn a_driven_workflow_accepts_dispatch() {
 /// A workflow that is also a push / pull request / merge group workflow
 /// once ran its full legs on `github.event_name == 'schedule'`; once the
 /// edge dispatches it, no job may still wait for an event that never
-/// comes. The nightly-only paths of `release-gate.yml` tell the edge's
-/// dispatch from a manual one by the App's bot login instead.
+/// comes. `release-gate.yml` tells the edge's tag dispatch from a
+/// certification by `github.ref_type`, and the nightly certification by its
+/// `nightly` input.
 #[test]
 fn a_driven_workflow_never_branches_on_the_schedule_event() {
     let (_, schedule) = manifest_schedule("edge/Skyzen.toml");

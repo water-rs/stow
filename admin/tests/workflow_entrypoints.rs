@@ -1969,7 +1969,7 @@ fn followup_declarations() {
         let mint = &steps[0];
         assert_eq!(
             mint.uses.as_deref(),
-            job_steps(&load_workflow("release-plz.yml"), "release-pr")[0]
+            job_steps(&load_workflow("release-gate.yml"), "release-pr")[0]
                 .uses
                 .as_deref()
         );
@@ -2293,25 +2293,43 @@ fn followup_ignores_non_repack_titles() {
 }
 
 // ---------------------------------------------------------------------------
-// release-gate.yml: the nightly tick is the App's dispatch (stow#1121)
+// release-gate.yml: the nightly certification (stow#1121)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn release_gate_nightly_is_the_apps_dispatch() {
+fn release_gate_nightly_is_a_trampoline_into_main() {
     let wf = load_workflow("release-gate.yml");
     // The cadence is the edge Cron Trigger's, pinned by
-    // `periodic_schedule.rs`; the workflow carries no `schedule`.
+    // `periodic_schedule.rs`; the workflow carries no `schedule`, and the
+    // merge queue and pull requests no longer run it.
     assert!(at(&wf, "on.schedule").is_none());
+    assert!(at(&wf, "on.pull_request").is_none());
+    assert!(at(&wf, "on.merge_group").is_none());
     assert!(at(&wf, "on.workflow_dispatch").is_some());
-    // The App's dispatch carries no inputs, so the nightly report is told
-    // from an operator's manual dispatch by the dispatching identity.
+    // The edge dispatches it on its release tag with no inputs: that run
+    // only dispatches the certification and the cache refresh on main.
+    assert_eq!(
+        at(&wf, "jobs.trampoline.if").map(scalar).as_deref(),
+        Some("github.ref_type == 'tag'")
+    );
+    let trampoline = job_steps(&wf, "trampoline");
+    let run = trampoline[0].run.as_deref().expect("trampoline run");
+    assert!(
+        run.contains("gh workflow run release-gate.yml --ref main -f nightly=true"),
+        "{run}"
+    );
+    assert!(run.contains("gh workflow run test.yml --ref main"), "{run}");
+    // The report is the certification's `nightly=true` run.
     assert_eq!(
         at(&wf, "jobs.nightly-report.if").map(scalar).as_deref(),
-        Some(
-            "always() && github.event_name == 'workflow_dispatch' && github.triggering_actor == 'stow-ci[bot]'"
-        )
+        Some("always() && inputs.nightly")
     );
-    // Every leg runs on any dispatch, the nightly's included.
+    // Every leg needs `tools`, which skips on the trampoline's tag run and
+    // is otherwise unconditional, the nightly's included.
+    assert_eq!(
+        at(&wf, "jobs.tools.if").map(scalar).as_deref(),
+        Some("github.ref_type != 'tag'")
+    );
     for job in [
         "mock-e2e",
         "traffic-cost",
@@ -2319,10 +2337,11 @@ fn release_gate_nightly_is_the_apps_dispatch() {
         "production-wave",
         "projection",
     ] {
-        let condition = at(&wf, &format!("jobs.{job}.if")).map(scalar).expect(job);
-        assert!(
-            condition.starts_with("github.event_name == 'workflow_dispatch' ||"),
-            "{job}"
-        );
+        assert!(at(&wf, &format!("jobs.{job}.if")).is_none(), "{job}");
     }
+    // A passed gate opens the release PR from the certified commit.
+    assert_eq!(
+        at(&wf, "jobs.release-pr.if").map(scalar).as_deref(),
+        Some("needs.gate.result == 'success'")
+    );
 }
