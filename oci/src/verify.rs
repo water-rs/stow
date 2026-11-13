@@ -15,7 +15,9 @@ use base64::Engine as _;
 use rustls_pki_types::{TrustAnchor, UnixTime};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sigstore::bundle::verify::policy::{Identity, VerificationPolicy};
+use sigstore::bundle::verify::policy::{
+    OIDCIssuer, PolicyError, PolicyResult, SingleX509ExtPolicy, VerificationPolicy,
+};
 use sigstore::cosign::bundle::Bundle as RekorBundle;
 use sigstore::cosign::payload::SimpleSigning;
 #[cfg(feature = "mock-verify")]
@@ -25,10 +27,67 @@ use sigstore::crypto::{CosignVerificationKey, Signature};
 use sigstore::trust::TrustRoot;
 use sigstore_trust_root::{TrustedRoot, TufConfig};
 use stow_types::error::Context;
+use stow_types::trusted_builder::TrustedWorkflow;
 use x509_cert::Certificate;
 use x509_cert::der::{DecodePem, Encode};
+use x509_cert::ext::pkix::SubjectAltName;
+use x509_cert::ext::pkix::name::GeneralName;
 
 const TRUSTED_CERT_ISSUER: &str = stow_types::trusted_builder::CERTIFICATE_ISSUER;
+
+/// The identity a stow reader pins: a certificate issued by GitHub Actions
+/// whose subject is `workflow` at some release tag.
+///
+/// sigstore's `Identity` matches one exact subject, and its `AnyOf`
+/// combinator fails when any child fails, so neither can express "this
+/// workflow at any release tag". The check is the workflow's prefix match
+/// ([`TrustedWorkflow::matches`]): `…@refs/tags/v` and a strict
+/// `MAJOR.MINOR.PATCH`, nothing before, between or after.
+#[derive(Debug, Clone, Copy)]
+pub struct ReleaseIdentity {
+    workflow: TrustedWorkflow,
+}
+
+impl ReleaseIdentity {
+    /// The identity of `workflow` at any release tag.
+    #[must_use]
+    pub const fn new(workflow: TrustedWorkflow) -> Self {
+        Self { workflow }
+    }
+
+    /// The workflow whose release-tag runs this identity accepts.
+    #[must_use]
+    pub const fn workflow(&self) -> TrustedWorkflow {
+        self.workflow
+    }
+}
+
+impl VerificationPolicy for ReleaseIdentity {
+    fn verify(&self, cert: &x509_cert::Certificate) -> PolicyResult {
+        OIDCIssuer::new(TRUSTED_CERT_ISSUER).verify(cert)?;
+        let san: SubjectAltName = match cert.tbs_certificate.get() {
+            Ok(Some((_, san))) => san,
+            _ => return Err(PolicyError::ExtensionNotFound),
+        };
+        let uris: Vec<&str> = san
+            .0
+            .iter()
+            .filter_map(|name| match name {
+                GeneralName::UniformResourceIdentifier(uri) => Some(uri.as_str()),
+                _ => None,
+            })
+            .collect();
+        if uris.iter().any(|uri| self.workflow.matches(uri)) {
+            return Ok(());
+        }
+        Err(PolicyError::ExtensionCheckFailed {
+            extension: "SubjectAltName".to_owned(),
+            expected: format!("{}<MAJOR>.<MINOR>.<PATCH>", self.workflow.san_prefix()),
+            actual: uris.join(", "),
+        })
+    }
+}
+
 const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
 const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 
@@ -46,7 +105,7 @@ pub fn verify_material(
     oci_digest: &str,
     material: &stow_types::bundle::SigstoreSignature,
     payload_bytes: &[u8],
-    certificate_identity: &str,
+    policy: &dyn VerificationPolicy,
 ) -> stow_types::error::Result<()> {
     match trust {
         Trust::GithubCi(trust) => verify_signature_material_github_ci(
@@ -55,7 +114,7 @@ pub fn verify_material(
             payload_bytes,
             oci_reference,
             oci_digest,
-            certificate_identity,
+            policy,
         ),
         #[cfg(feature = "mock-verify")]
         Trust::MockKey(public_key_path) => verify_signature_material_mock_key(
@@ -101,7 +160,7 @@ pub fn verify_materials(
     oci_reference: &str,
     oci_digest: &str,
     materials: &[stow_types::bundle::BundleSignatureMaterial],
-    certificate_identity: &str,
+    policy: &dyn VerificationPolicy,
 ) -> stow_types::error::Result<()> {
     if materials.is_empty() {
         return Err(stow_types::stow_error!(
@@ -128,7 +187,7 @@ pub fn verify_materials(
             oci_digest,
             &signature,
             &material.payload_bytes,
-            certificate_identity,
+            policy,
         ) {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
@@ -174,7 +233,7 @@ impl Trust {
 }
 
 /// Verify `material` — signature, Rekor entry binding, Fulcio chain at
-/// integrated time — and pin its certificate to `certificate_identity`.
+/// integrated time — and require its certificate to satisfy `policy`.
 ///
 /// # Errors
 ///
@@ -186,7 +245,7 @@ pub fn verify_signature_material_github_ci(
     payload_bytes: &[u8],
     oci_reference: &str,
     oci_digest: &str,
-    certificate_identity: &str,
+    policy: &dyn VerificationPolicy,
 ) -> stow_types::error::Result<()> {
     if material.certificate_pem == "mock-local" {
         return Err(stow_types::stow_error!(
@@ -194,8 +253,7 @@ pub fn verify_signature_material_github_ci(
         ));
     }
     let payload_bytes = verify_payload_identity(payload_bytes, oci_reference, oci_digest)?;
-    let identity_policy = Identity::new(certificate_identity, TRUSTED_CERT_ISSUER);
-    verify_signature_material(trust, &identity_policy, material, payload_bytes)
+    verify_signature_material(trust, policy, material, payload_bytes)
 }
 
 #[cfg(feature = "mock-verify")]
@@ -438,7 +496,7 @@ fn trust_cache_dir() -> stow_types::error::Result<std::path::PathBuf> {
 /// mismatch, or a bad signature all error.
 pub fn verify_signature_material(
     trust: &TrustMaterial,
-    identity_policy: &Identity,
+    identity_policy: &dyn VerificationPolicy,
     material: &stow_types::bundle::SigstoreSignature,
     payload_bytes: &[u8],
 ) -> stow_types::error::Result<()> {
@@ -448,21 +506,22 @@ pub fn verify_signature_material(
     })
 }
 
-/// [`verify_signature_material`] pinned to the GitHub Actions issuer: the
-/// check the keyless signer makes of what it is about to publish.
+/// [`verify_signature_material`] pinned to the exact subject `san` under
+/// the GitHub Actions issuer: the check the keyless signer makes of what
+/// it is about to publish.
 ///
 /// # Errors
 ///
 /// As [`verify_signature_material`].
 pub(crate) fn verify_issued_signature(
     trust: &TrustMaterial,
-    certificate_identity: &str,
+    san: &str,
     material: &stow_types::bundle::SigstoreSignature,
     payload_bytes: &[u8],
 ) -> stow_types::error::Result<()> {
     verify_signature_material(
         trust,
-        &Identity::new(certificate_identity, TRUSTED_CERT_ISSUER),
+        &sigstore::bundle::verify::policy::Identity::new(san, TRUSTED_CERT_ISSUER),
         material,
         payload_bytes,
     )
@@ -755,15 +814,18 @@ mod tests {
         verify_signature_material_github_ci,
     };
 
-    const CERTIFICATE_IDENTITY: &str = stow_types::trusted_builder::CERTIFICATE_IDENTITY;
+    const CERTIFICATE_IDENTITY: &str =
+        "https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/tags/v1.2.3";
     const CERTIFICATE_ISSUER: &str = super::TRUSTED_CERT_ISSUER;
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, CustomExtension,
         ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
         PublicKeyData as _, SanType,
     };
-    use sigstore::bundle::verify::policy::Identity;
     use sigstore::cosign::bundle::{Bundle as RekorBundle, Payload as RekorPayload};
+    use stow_types::trusted_builder::TrustedWorkflow;
+
+    use super::ReleaseIdentity;
     use sigstore::crypto::{CosignVerificationKey, SigningScheme};
 
     const FULCIO_OIDC_ISSUER_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 57264, 1, 1];
@@ -890,6 +952,15 @@ mod tests {
 
         /// A Fulcio-shaped leaf for `identity`, valid for `NOT_BEFORE..=NOT_AFTER`.
         fn issue_leaf(ca: &CertifiedIssuer<'static, KeyPair>, identity: &str) -> Leaf {
+            Self::issue_leaf_from(ca, identity, CERTIFICATE_ISSUER)
+        }
+
+        /// [`Self::issue_leaf`] with the OIDC issuer extension `issuer`.
+        fn issue_leaf_from(
+            ca: &CertifiedIssuer<'static, KeyPair>,
+            identity: &str,
+            issuer: &str,
+        ) -> Leaf {
             let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
             let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
             params.subject_alt_names = vec![SanType::URI(identity.try_into().unwrap())];
@@ -897,7 +968,7 @@ mod tests {
             params.extended_key_usages = vec![ExtendedKeyUsagePurpose::CodeSigning];
             params.custom_extensions = vec![CustomExtension::from_oid_content(
                 FULCIO_OIDC_ISSUER_OID,
-                CERTIFICATE_ISSUER.as_bytes().to_vec(),
+                issuer.as_bytes().to_vec(),
             )];
             params.not_before = time::OffsetDateTime::from_unix_timestamp(NOT_BEFORE).unwrap();
             params.not_after = time::OffsetDateTime::from_unix_timestamp(NOT_AFTER).unwrap();
@@ -917,7 +988,7 @@ mod tests {
         fn impostor_leaf(&self) -> Leaf {
             Self::issue_leaf(
                 &self.ca,
-                "https://github.com/someone-else/stow/.github/workflows/build-crate.yml@refs/heads/main",
+                "https://github.com/someone-else/stow/.github/workflows/build-crate.yml@refs/tags/v1.2.3",
             )
         }
 
@@ -1012,9 +1083,60 @@ mod tests {
             material: &SigstoreSignature,
             payload: &[u8],
         ) -> stow_types::error::Result<()> {
-            let policy = Identity::new(CERTIFICATE_IDENTITY, CERTIFICATE_ISSUER);
+            let policy = ReleaseIdentity::new(TrustedWorkflow::BUILD);
             verify_signature_material(&self.trust, &policy, material, payload)
         }
+    }
+
+    /// Whether a leaf issued for `identity` by `issuer` passes the build
+    /// workflow's release identity.
+    fn build_identity_accepts(identity: &str, issuer: &str) -> bool {
+        let sigstore = MiniSigstore::new();
+        let leaf = MiniSigstore::issue_leaf_from(&sigstore.ca, identity, issuer);
+        let payload = b"payload";
+        let material = sigstore.material_from(&leaf, payload, NOT_BEFORE + 30);
+        sigstore.verify(&material, payload).is_ok()
+    }
+
+    const BUILD: &str = "https://github.com/water-rs/stow/.github/workflows/build-crate.yml";
+
+    #[test]
+    fn a_release_tag_run_of_the_workflow_is_accepted() {
+        for tag in ["v1.2.3", "v0.0.0", "v10.20.30"] {
+            assert!(
+                build_identity_accepts(&format!("{BUILD}@refs/tags/{tag}"), CERTIFICATE_ISSUER),
+                "{tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_off_a_release_tag_is_rejected() {
+        for identity in [
+            format!("{BUILD}@refs/heads/main"),
+            format!("{BUILD}@refs/tags/stow-cli-v1.2.3"),
+            format!("{BUILD}@refs/tags/oci/v1.2.3"),
+            format!("{BUILD}@refs/tags/v1.2"),
+            format!("{BUILD}@refs/tags/v1.2.3x"),
+            format!("{BUILD}@refs/tags/v1.2.3-rc.1"),
+            format!("{BUILD}@refs/tags/v01.2.3"),
+            "https://github.com/water-rs/stow/.github/workflows/index-publish.yml@refs/tags/v1.2.3"
+                .to_owned(),
+            format!("{BUILD}.bak@refs/tags/v1.2.3"),
+        ] {
+            assert!(
+                !build_identity_accepts(&identity, CERTIFICATE_ISSUER),
+                "{identity}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_release_tag_run_under_another_issuer_is_rejected() {
+        assert!(!build_identity_accepts(
+            &format!("{BUILD}@refs/tags/v1.2.3"),
+            "https://accounts.example.com"
+        ));
     }
 
     #[test]
@@ -1214,7 +1336,7 @@ mod tests {
             b"payload",
             "ghcr.io/water-rs/stow-cache-v2-1.91.1:demo.artifact",
             "sha256:demo",
-            CERTIFICATE_IDENTITY,
+            &ReleaseIdentity::new(TrustedWorkflow::BUILD),
         )
         .expect_err("mock-local must fail in github-ci mode");
         let message = error.to_string();
@@ -1265,7 +1387,7 @@ mod tests {
             expected,
             &digest,
             &materials,
-            CERTIFICATE_IDENTITY,
+            &ReleaseIdentity::new(TrustedWorkflow::BUILD),
         )
         .expect("the layer binding the expected reference verifies");
     }
@@ -1283,7 +1405,7 @@ mod tests {
             "ghcr.io/water-rs/stow-cache-v2-1.98.1:folded.aarch64-apple-darwin.1.98.1",
             &digest,
             &materials,
-            CERTIFICATE_IDENTITY,
+            &ReleaseIdentity::new(TrustedWorkflow::BUILD),
         )
         .expect_err("a signature naming another tag must not satisfy this one");
         let message = error.to_string();

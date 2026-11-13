@@ -41,7 +41,7 @@ fn is_packed(manifest: &OciImageManifest) -> bool {
 /// as a build's publish does.
 ///
 /// The node is trusted only after: the manifest hashes to the record's
-/// `oci_digest`, a signature under `certificate_identity` binds it to the
+/// `oci_digest`, a signature whose certificate satisfies `policy` binds it to the
 /// record's `oci_reference`, the config blob hashes to the manifest's
 /// config digest, every layer hashes to its descriptor, and every
 /// decompressed file hashes to the SHA-256 the signed config records.
@@ -53,7 +53,7 @@ fn is_packed(manifest: &OciImageManifest) -> bool {
 pub async fn repack_record<S, Fut>(
     session: &RegistrySession,
     trust: &Trust,
-    certificate_identity: &str,
+    policy: &(impl sigstore::bundle::verify::policy::VerificationPolicy + Sync),
     record: &ArtifactRecord,
     sign: &S,
 ) -> stow_types::error::Result<Option<ArtifactRecord>>
@@ -80,7 +80,7 @@ where
         &by_digest,
         oci_reference,
         &manifest_digest,
-        certificate_identity,
+        policy,
     )
     .await
     .wrap_err_with(|| format!("verify the signature of {oci_reference}"))?;
