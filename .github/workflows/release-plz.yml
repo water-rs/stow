@@ -1,72 +1,68 @@
 name: Release
 
-# release-plz runs as two commands, one per branch, because `main` only
-# accepts pull requests from `dev` (pr-base-gate.yml): the release PR with
-# the version bump and changelog is opened against `dev` and reaches `main`
-# through the ordinary dev -> main promotion; the push to `main` then
-# publishes and tags.
+# A release ships the release PR's head commit: the certified commit plus
+# release-plz's version bump (release-gate.yml opens the PR from a commit that
+# passed the gate and sets its `Certified` status). The merge of that PR into
+# `main` starts this workflow; `release` resolves the PR's head commit H,
+# requires H to be exactly one commit on a certified parent, checks H out and
+# lets release-plz publish the crates and push the release tags at H. Nothing
+# merged to `main` after the certification is in H, so nothing ships
+# uncertified. Any other push to `main` releases nothing.
 on:
   push:
-    branches: [dev, main]
+    branches: [main]
 
 permissions: {}
 
 concurrency: release-plz-${{ github.ref_name }}
 
 jobs:
-  release-pr:
-    name: Release PR
-    if: github.ref_name == 'dev'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      # The App installation token lets the release PR's own checks run:
-      # pull requests opened with the workflow's default GITHUB_TOKEN never
-      # trigger other workflows.
-      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        id: app-token
-        with:
-          app-id: ${{ vars.STOW_APP_ID }}
-          private-key: ${{ secrets.STOW_APP_PRIVATE_KEY }}
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token }}
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          toolchain: stable
-      - uses: MarcoIeni/release-plz-action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5.139
-        with:
-          command: release-pr
-        env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-
   release:
     name: Release
-    if: github.ref_name == 'main'
     runs-on: ubuntu-latest
+    # The release App's key lives in this environment, which admits `main`
+    # only, and only the release App may create the protected `v*` tags.
+    environment: release
     permissions:
-      contents: write
-      pull-requests: read
-      id-token: write
+      contents: read
+      pull-requests: read # the PR a pushed commit merged
+      statuses: read # the Certified status
+      id-token: write # crates.io trusted publishing
     steps:
-      # Mint a short-lived installation token for the stow GitHub App.
-      # Tags pushed with the workflow's default GITHUB_TOKEN never trigger
-      # other workflows, so the `stow-cli-v*` tag release-plz pushes would
-      # never start the cargo-dist release run; an App installation token
-      # does trigger them, and it expires in an hour.
+      # Identifies the App that opens release PRs; the token reads nothing
+      # but the App's own metadata.
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        id: app-token
+        id: pr-app
         with:
           app-id: ${{ vars.STOW_APP_ID }}
           private-key: ${{ secrets.STOW_APP_PRIVATE_KEY }}
+          permission-metadata: read
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+      - name: Resolve the certified release commit
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_PR_AUTHOR: ${{ steps.pr-app.outputs.app-slug }}[bot]
+        run: scripts/release-resolve.sh "$GITHUB_SHA"
+      # The tag is created with the release App's token: the `v*` tag ruleset
+      # admits that App alone, and a tag created by an App installation token
+      # (unlike GITHUB_TOKEN) starts the dist, toolchain and deploy runs.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: release-app
+        if: steps.resolve.outputs.head != ''
+        with:
+          app-id: ${{ vars.STOW_RELEASE_APP_ID }}
+          private-key: ${{ secrets.STOW_RELEASE_APP_PRIVATE_KEY }}
+      - name: Check out the release commit
+        if: steps.resolve.outputs.head != ''
+        env:
+          RELEASE_HEAD: ${{ steps.resolve.outputs.head }}
+        run: git checkout --detach "$RELEASE_HEAD"
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        if: steps.resolve.outputs.head != ''
         with:
           toolchain: stable
       # Mint a short-lived crates.io token from the GitHub OIDC identity
@@ -76,10 +72,12 @@ jobs:
       # until the first `cargo publish` bootstrap lands it.
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: crates-io-auth
+        if: steps.resolve.outputs.head != ''
         continue-on-error: true
       - uses: MarcoIeni/release-plz-action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5.139
+        if: steps.resolve.outputs.head != ''
         with:
           command: release
         env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.release-app.outputs.token }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
