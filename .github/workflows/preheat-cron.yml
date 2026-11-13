@@ -75,10 +75,10 @@ jobs:
           RUSTC_VERSION: ${{ steps.channel.outputs.version }}
         run: |
           set -euo pipefail
-          # The wave talks to the edge deployed from main, so its
-          # stow-admin is built from main too (#973).
+          # The wave talks to the edge deployed from this release tag, so
+          # its stow-admin is built from the same tag (#973).
           gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/preheat-admin.yml/dispatches" \
-            -f ref=main -f "inputs[rustc_version]=$RUSTC_VERSION" \
+            -f ref="$GITHUB_REF_NAME" -f "inputs[rustc_version]=$RUSTC_VERSION" \
             -f 'inputs[projects]=true'
           echo "$RUSTC_VERSION ${{ steps.channel.outputs.day }}" > .preheat-marker
       - name: Record the wave marker

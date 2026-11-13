@@ -28,6 +28,14 @@ use support::{
     scalar, set_path, step_output, substitute,
 };
 
+/// The release tag a dispatched run executes on (`GITHUB_REF_NAME`).
+const RUN_TAG: &str = "v0.20.0";
+
+/// The release tag of the `workflow_run` a follow-up lane reacts to
+/// (`workflow_run.head_branch`), different from [`RUN_TAG`] so a dispatch
+/// that reads the wrong source is caught.
+const TRIGGER_TAG: &str = "v0.19.0";
+
 /// The channel fixture `preheat-cron`/`preheat-missed` resolve —
 /// `edge/tests/fixtures` carries the real manifest shape (decorated
 /// `version = "1.98.1 (hash date)"` reduced to `1.98.1`).
@@ -96,6 +104,8 @@ fn apply_dispatch_defaults(ctx: &mut Val, wf: &serde_yml::Value) {
 fn base_env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     let mut env = BTreeMap::from([
         ("GITHUB_REPOSITORY".to_owned(), "water-rs/stow".to_owned()),
+        // A dispatched run's own ref name: the release tag it runs on.
+        ("GITHUB_REF_NAME".to_owned(), RUN_TAG.to_owned()),
         ("STUB_DATE".to_owned(), CHANNEL_FIXTURE_DAY.to_owned()),
         (
             "STUB_CHANNEL_TOML".to_owned(),
@@ -324,6 +334,10 @@ fn cron_cache_miss_dispatches_admin_once() {
     assert_eq!(gh.len(), 1, "{gh:?}");
     let dispatch = gh_dispatch(&gh[0]);
     assert_eq!(dispatch.workflow, "preheat-admin.yml");
+    assert_eq!(
+        dispatch.reference, RUN_TAG,
+        "the wave runs on this release tag"
+    );
     let fields = dispatch.inputs;
     assert_eq!(
         fields,
@@ -977,6 +991,15 @@ fn index_runner<'a>(
         "github.event.workflow_run.display_title",
         run_title.map_or(Val::Null, |t| Val::Str(t.to_owned())),
     );
+    set_path(
+        &mut ctx,
+        "github.event.workflow_run.head_branch",
+        if event == "workflow_run" {
+            Val::Str(TRIGGER_TAG.to_owned())
+        } else {
+            Val::Null
+        },
+    );
     run_job(scn, &wf, "dispatch", ctx, base_env(&[]))
 }
 
@@ -985,15 +1008,15 @@ fn index_publish_completion_forwards_title_rustc() {
     let scn = Scenario::new();
     let runner = index_runner(&scn, "workflow_run", Some("1.98.1-a1b2c3d4e5f6"));
     assert_eq!(
-        runner.outcome_of("Dispatch index-publish on main"),
+        runner.outcome_of("Dispatch index-publish on the release tag"),
         &Outcome::Ran(0)
     );
     let gh = scn.calls_of("gh");
     assert_eq!(gh.len(), 1, "{gh:?}");
     let dispatch = gh_dispatch(&gh[0]);
     assert_eq!(dispatch.workflow, "index-publish.yml");
-    // The signing identity lives on main only.
-    assert_eq!(dispatch.reference, "main");
+    // The signing identity is the release tag of the completed build run.
+    assert_eq!(dispatch.reference, TRIGGER_TAG);
     let fields = dispatch.inputs;
     assert_eq!(
         fields.get("report").map(String::as_str),
@@ -1017,7 +1040,7 @@ fn index_publish_cron_trigger_and_manual_carry_no_rustc() {
     let scn = Scenario::new();
     let runner = index_runner(&scn, event, None);
     assert_eq!(
-        runner.outcome_of("Dispatch index-publish on main"),
+        runner.outcome_of("Dispatch index-publish on the release tag"),
         &Outcome::Ran(0)
     );
     let gh = scn.calls_of("gh");
@@ -1029,7 +1052,8 @@ fn index_publish_cron_trigger_and_manual_carry_no_rustc() {
         "{event} forwarded a rustc: {fields:?}"
     );
     assert_eq!(fields.get("report").map(String::as_str), Some("true"));
-    assert_eq!(dispatch.reference, "main");
+    // A dispatched tick publishes on its own release tag.
+    assert_eq!(dispatch.reference, RUN_TAG);
 }
 
 #[test]
@@ -1040,7 +1064,7 @@ fn index_publish_title_with_extra_dashes_keeps_rustc_prefix() {
     let scn = Scenario::new();
     let runner = index_runner(&scn, "workflow_run", Some("1.99.0-task-9f8e7d-extra"));
     assert_eq!(
-        runner.outcome_of("Dispatch index-publish on main"),
+        runner.outcome_of("Dispatch index-publish on the release tag"),
         &Outcome::Ran(0)
     );
     let gh = scn.calls_of("gh");
@@ -1613,7 +1637,7 @@ fn operations_reset_refills_every_published_rustc_and_forces_a_preheat() {
     let report = |rustc: &str| {
         (
             "index-publish.yml".to_owned(),
-            "main".to_owned(),
+            RUN_TAG.to_owned(),
             BTreeMap::from([
                 ("report".to_owned(), "true".to_owned()),
                 ("rustc_version".to_owned(), rustc.to_owned()),
@@ -1627,7 +1651,7 @@ fn operations_reset_refills_every_published_rustc_and_forces_a_preheat() {
             report("1.99.1"),
             (
                 "preheat-cron.yml".to_owned(),
-                "main".to_owned(),
+                RUN_TAG.to_owned(),
                 BTreeMap::from([("refresh".to_owned(), "true".to_owned())]),
             ),
         ]
@@ -1832,6 +1856,7 @@ fn followup_runner<'a>(
     );
     for (key, value) in [
         ("github.event.workflow_run.display_title", title),
+        ("github.event.workflow_run.head_branch", TRIGGER_TAG),
         ("github.event.workflow_run.conclusion", conclusion),
         ("github.event.workflow_run.id", "4242"),
         // The run object's `name` is the run-name, as in production.
@@ -1990,7 +2015,7 @@ fn followup_success_publishes_the_index_then_refreshes_the_preheat() {
         [
             (
                 "index-publish.yml".to_owned(),
-                "main".to_owned(),
+                TRIGGER_TAG.to_owned(),
                 BTreeMap::from([
                     ("report".to_owned(), "true".to_owned()),
                     ("rustc_version".to_owned(), "1.99.0".to_owned()),
@@ -1998,7 +2023,7 @@ fn followup_success_publishes_the_index_then_refreshes_the_preheat() {
             ),
             (
                 "preheat-cron.yml".to_owned(),
-                "main".to_owned(),
+                TRIGGER_TAG.to_owned(),
                 BTreeMap::from([("refresh".to_owned(), "true".to_owned())])
             ),
         ]
@@ -2042,6 +2067,7 @@ fn retry_runner<'a>(
         ),
         ("steps.app-token.outputs.token", "test-app-token"),
         ("github.event.workflow_run.conclusion", "success"),
+        ("github.event.workflow_run.head_branch", TRIGGER_TAG),
         ("github.event.workflow_run.created_at", index_created),
     ] {
         set_path(&mut ctx, key, Val::Str(value.to_owned()));
@@ -2067,7 +2093,7 @@ fn retry_dispatches(scn: &Scenario) -> Vec<String> {
     for (workflow, reference, _) in &dispatches {
         assert_eq!(
             (workflow.as_str(), reference.as_str()),
-            ("operations.yml", "main")
+            ("operations.yml", TRIGGER_TAG)
         );
     }
     dispatches
@@ -2166,7 +2192,7 @@ fn followup_timeout_resumes_with_the_variable_concurrency() {
         let dispatches = refill_dispatches(&scn);
         assert_eq!(dispatches.len(), 1, "{conclusion}: {dispatches:?}");
         assert_eq!(dispatches[0].0, "repack.yml");
-        assert_eq!(dispatches[0].1, "main");
+        assert_eq!(dispatches[0].1, TRIGGER_TAG);
         assert_eq!(
             dispatches[0].2,
             BTreeMap::from([

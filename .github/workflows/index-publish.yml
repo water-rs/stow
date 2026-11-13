@@ -11,11 +11,11 @@ name: Index publish
 # companion listing every records tag already folded, both on the
 # rustc's `ghcr.io/water-rs/stow-cache-v2-<rustc>` package) and
 # signed keyless under this
-# workflow's identity on `main`
-# (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`).
+# workflow's identity on a release tag
+# (`stow_types::trusted_builder`).
 # A `schedule` or `workflow_run` trigger would run on the default branch
-# (`dev`) and sign under an identity the CLI rejects, so this workflow is
-# dispatch-only: `index-publish-cron.yml` dispatches it on `main` after
+# and sign under an identity the CLI rejects, so this workflow is
+# dispatch-only: `index-publish-cron.yml` dispatches it on a release tag after
 # every completed `build-crate` run (and on a schedule as backstop), and
 # the first step refuses any other ref.
 #
@@ -67,11 +67,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Refuse to sign under any identity but main
-        if: github.ref != 'refs/heads/main'
+      - name: Refuse to sign under any identity but a release tag
+        env:
+          REF: ${{ github.ref }}
         run: |
-          echo "::error::index-publish signs under refs/heads/main only; dispatched on ${{ github.ref }}"
-          exit 1
+          if [[ ! "$REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::index-publish signs under a release tag only; dispatched on $REF"
+            exit 1
+          fi
       # A local action resolves from the workspace, so its directory has
       # to be checked out; nothing else in the tree is needed.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -79,8 +82,8 @@ jobs:
           sparse-checkout: .github/actions
           persist-credentials: false
       # stow-admin is pulled, not compiled: toolchain-publish.yml builds
-      # and cosign-signs it once per platform on main's merge queue, and
-      # this run is on main so its own sha is that artifact's tag — the
+      # and cosign-signs it once per platform on a release tag, and
+      # this run is on that tag so its own sha is the artifact's tag — the
       # same pull deploy-edge.yml and watchdog.yml make. An absent
       # artifact or a failed verify fails the step; there is no
       # source-build fallback.
@@ -170,7 +173,7 @@ jobs:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
           # stow-admin mints a fresh Actions OIDC JWT for every edge
           # request under this audience; the index route admits only this
-          # workflow's runs on main.
+          # workflow's runs on a release tag.
           STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}

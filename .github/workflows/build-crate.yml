@@ -8,7 +8,7 @@ name: build-crate
 run-name: ${{ format('{0}-{1}', fromJSON(inputs.task).rustc_version, fromJSON(inputs.task).task_id) }}
 
 # The scheduler (or `stow-admin preheat manual`) dispatches this workflow on
-# `main` with the whole task as one JSON input. Isolated jobs, two trust levels,
+# the deployed edge's release tag with the whole task as one JSON input. Isolated jobs, two trust levels,
 # and no Cloudflare dependency at all (stow#455):
 #
 #   build   — compiles third-party code. Read-only token, no secrets,
@@ -35,7 +35,7 @@ run-name: ${{ format('{0}-{1}', fromJSON(inputs.task).rustc_version, fromJSON(in
 #             stored one layer per file into the single-pack layout, and
 #             publishes them and their records under this workflow's
 #             identity (`stow-build repack`). The identity clients trust
-#             is a property of this file on main, so the re-signature has
+#             is a property of this file on a release tag, so the re-signature has
 #             to come from here and from no other workflow. It does, as
 #             a reusable workflow: Fulcio's SAN is built from the
 #             token's `job_workflow_ref`, which names the called file
@@ -49,7 +49,7 @@ run-name: ${{ format('{0}-{1}', fromJSON(inputs.task).rustc_version, fromJSON(in
 # webhook the edge receives carries both in `display_title` — no
 # completion POST from a runner, no failure-report job.
 #
-# The certificate identity clients trust is this file on refs/heads/main
+# The certificate identity clients trust is this file on `refs/tags/v<semver>`
 # (stow_types::trusted_builder): Fulcio's SAN for a reusable workflow is
 # (stow_types::trusted_builder); dispatching any other ref produces artifacts
 # no client accepts.
@@ -249,7 +249,7 @@ jobs:
           persist-credentials: false
       # This job executes only a binary trusted CI built from this commit:
       # the action pulls the toolchain artifact by manifest digest and
-      # cosign-verifies it against toolchain-publish.yml's merge-queue
+      # cosign-verifies it against toolchain-publish.yml's release-tag
       # identity bound to `github.sha` — cryptographic provenance the
       # compile-in-job path it replaces never had (stow#431).
       - uses: ./.github/actions/stow-toolchain

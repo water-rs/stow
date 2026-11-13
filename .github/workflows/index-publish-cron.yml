@@ -1,17 +1,17 @@
 name: Index publish cron
 
-# `workflow_run` workflows run on the default branch (`dev`), but the
-# artifact index must be signed under
-# `index-publish.yml@refs/heads/main`
-# (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`), so this
-# lane only ticks: it dispatches `index-publish.yml` on `main`, the same
-# way `preheat-cron.yml` dispatches the admin lane.
+# `workflow_run` workflows run on the default branch, but the artifact
+# index must be signed under `index-publish.yml@refs/tags/v<semver>`
+# (`stow_types::trusted_builder`), so this lane only ticks: it
+# dispatches `index-publish.yml` on the release tag of the build run
+# that completed (a `workflow_run` tick) or on its own tag (a dispatched
+# tick), the same way `preheat-cron.yml` dispatches the admin lane.
 #
 # The tick is event-driven: every completed `build-crate` run — the only
 # thing that lands records in GHCR — dispatches a publish, so a newly
 # pushed records artifact reaches the index within one publish run. The
 # edge Cron Trigger is the backstop for a `workflow_run` event GitHub
-# failed to deliver (`*/10 * * * *`, dispatched on `dev` through
+# failed to deliver (`*/10 * * * *`, dispatched on the edge's release tag through
 # `STOW_PERIODIC_WORKFLOWS`, stow#1121): GitHub's own `schedule`
 # delivered those ticks hours apart, so it cannot be the primary trigger.
 
@@ -44,15 +44,22 @@ jobs:
       # A `workflow_run` tick also forwards the rustc the completed run's
       # `<rustc>-<task_id>` title names; a Cron Trigger or manual tick leaves
       # the input empty and index-publish takes the stable channel.
-      - name: Dispatch index-publish on main
+      - name: Dispatch index-publish on the release tag
         env:
           GH_TOKEN: ${{ github.token }}
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
           EVENT_NAME: ${{ github.event_name }}
           RUN_TITLE: ${{ github.event.workflow_run.display_title }}
+          # A tag-triggered run's `head_branch` is the tag name.
+          RUN_REF: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
-          args=(--method POST -f ref=main)
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            ref="$RUN_REF"
+          else
+            ref="$GITHUB_REF_NAME"
+          fi
+          args=(--method POST -f "ref=$ref")
           if [ -n "$STOW_EDGE_URL" ]; then
             args+=(-f 'inputs[report]=true')
           fi
