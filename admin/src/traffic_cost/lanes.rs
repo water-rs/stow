@@ -103,8 +103,13 @@ pub struct LaneArgs {
     #[arg(long, requires = "index_publish_token_file")]
     pub index_publish_rustc: Option<String>,
     /// Mock resolve-request.yml OIDC token for the complete human lifecycle lane.
-    #[arg(long, requires_all = ["webhook_secret", "index_publish_rustc"])]
+    #[arg(long, requires_all = ["webhook_secret", "stable_rustc"])]
     pub resolve_token_file: Option<PathBuf>,
+    /// The stable rustc the edge's channel manifest names: the toolchain
+    /// a human request resolves under, which the human lifecycle lane
+    /// requests and settles.
+    #[arg(long, requires = "resolve_token_file")]
+    pub stable_rustc: Option<String>,
 }
 
 /// A response that takes this long under the mock stack is a stall,
@@ -1141,9 +1146,9 @@ fn human_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<Vec<L
                 .clone()
                 .ok_or("human lifecycle needs --webhook-secret")?,
             token_file.clone(),
-            args.index_publish_rustc
+            args.stable_rustc
                 .as_deref()
-                .ok_or("human lifecycle needs --index-publish-rustc")?,
+                .ok_or("human lifecycle needs --stable-rustc")?,
         )?),
         expected: ok2xx,
     }])
@@ -1289,6 +1294,7 @@ mod tests {
             index_publish_token_file: Some("index-publish-token".into()),
             index_publish_rustc: Some("1.99.1".to_owned()),
             resolve_token_file: Some("resolve-token".into()),
+            stable_rustc: Some("1.99.1".to_owned()),
         }
     }
 
