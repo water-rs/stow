@@ -1,8 +1,6 @@
 name: Watchdog
 
-# The external incident watchdog (stow#450): every 15 minutes (dispatched
-# by the edge Worker's Cron Trigger, stow#1100; GitHub's own `schedule`
-# skipped most ticks) it reads
+# The external incident watchdog (stow#450): every 15 minutes it reads
 # the Cloudflare usage/health signals, the build-pipeline failure rate,
 # the scheduler queue, the liveness of preheat and builds, failed
 # operations runs and a missed watchdog dispatch, and the public
@@ -17,7 +15,17 @@ name: Watchdog
 # apply, a notification that did not land). Recovery is manual:
 # `stow-admin watchdog clear` un-trips — the watchdog never un-trips on
 # its own.
+#
+# Two independent clocks start it (stow#1501): the edge Worker's Cron
+# Trigger dispatches it (stow#1100), kept because GitHub's own `schedule`
+# skipped most ticks, and the `schedule` below, so the watchdog still
+# runs when the edge is the broken part — it exists to catch exactly
+# that, and the edge's alarm and cron share the isolate whose memory it
+# reports. Two runs close together are harmless: every reading is a
+# read and the incident issue is kept idempotently.
 on:
+  schedule:
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
