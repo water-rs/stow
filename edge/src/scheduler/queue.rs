@@ -88,6 +88,30 @@ pub const DEFAULT_MAX_QUEUE_PENDING: u32 = 2_000;
 /// scheduler accepts per UTC day.
 pub const DEFAULT_HUMAN_DAILY_TASK_BUDGET: u32 = 2_000;
 
+/// A Durable Object isolate's memory limit — JavaScript heap and Wasm
+/// together — as Cloudflare publishes it: 128 MB.
+/// <https://developers.cloudflare.com/durable-objects/platform/limits/>
+const ISOLATE_MEMORY_BYTES: u64 = 128_000_000;
+
+/// Default for `STOW_SCHEDULER_SMALL_MEMORY_LINE`: the resident graph
+/// up to which a small submission goes straight in. It leaves the
+/// 110 MB to 128 MB of [`ISOLATE_MEMORY_BYTES`] for what the resident
+/// formula does not count: the transient memory of loading and
+/// admitting a batch, the JavaScript heap and allocator fragmentation
+/// (production held 15.6 MB of linear memory above the bytes its
+/// occupancy line accounted for, stow#1501).
+pub const DEFAULT_SMALL_MEMORY_LINE: u64 = ISOLATE_MEMORY_BYTES - 18_000_000;
+
+/// Default for `STOW_SCHEDULER_MEMORY_LINE`: the resident graph up to
+/// which any submission goes straight in, 10 MB under the
+/// small-submission line.
+pub const DEFAULT_MEMORY_LINE: u64 = DEFAULT_SMALL_MEMORY_LINE - 10_000_000;
+
+/// Default for `STOW_SCHEDULER_SMALL_INCREMENT_BYTES`: the most a
+/// submission may add to the graph and still go straight in between
+/// the two lines, 64 KiB.
+pub const DEFAULT_SMALL_INCREMENT_BYTES: u64 = 64 * 1024;
+
 /// Whether the scheduler dispatches at all, and the in-flight bound when
 /// it does.
 ///
@@ -124,7 +148,8 @@ impl Dispatch {
 /// `STOW_MAX_CONCURRENT_MACOS_JOBS`, `STOW_DISPATCH_MIN_AGE_MINUTES`,
 /// `STOW_STALE_DISPATCH_MINUTES`, `STOW_MAX_QUEUE_PENDING`,
 /// `STOW_HUMAN_DAILY_TASK_BUDGET`, `STOW_MIN_DISPATCH_VALUE`,
-/// `STOW_MIN_DISPATCH_VALUE`).
+/// `STOW_SCHEDULER_MEMORY_LINE`, `STOW_SCHEDULER_SMALL_MEMORY_LINE`,
+/// `STOW_SCHEDULER_SMALL_INCREMENT_BYTES`).
 ///
 /// Defaults match production; the local mock lowers `dispatch` via `vars`
 /// because miniflare's workerd OOMs under parallel complete
@@ -155,6 +180,33 @@ pub struct SchedulerSettings {
     /// stamps on each wake. A changed binding takes effect on the next
     /// [`crate::scheduler::graph::Graph::set_floor`] call.
     pub min_dispatch_value: i64,
+    /// The resident-graph bytes up to which any submission's increment
+    /// goes straight into the graph (`STOW_SCHEDULER_MEMORY_LINE`).
+    /// Operators are trusted: no ceiling applies.
+    pub memory_line_bytes: u64,
+    /// The resident-graph bytes up to which a submission whose
+    /// increment is within [`Self::small_increment_bytes`] goes straight
+    /// in (`STOW_SCHEDULER_SMALL_MEMORY_LINE`). A graph larger than
+    /// this fails to wake.
+    pub small_memory_line_bytes: u64,
+    /// The largest increment that counts as small
+    /// (`STOW_SCHEDULER_SMALL_INCREMENT_BYTES`).
+    pub small_increment_bytes: u64,
+}
+
+impl SchedulerSettings {
+    /// Whether a submission adding `increment` bytes to a graph holding
+    /// `resident` goes straight in. One that adds nothing always does:
+    /// it only re-ranks nodes the graph holds. Otherwise the whole
+    /// increment must stay under the normal line, or a small one under
+    /// the small-submission line. What fails both waits in the backlog.
+    #[must_use]
+    pub const fn admits(&self, resident: u64, increment: u64) -> bool {
+        increment == 0
+            || resident.saturating_add(increment) <= self.memory_line_bytes
+            || (increment <= self.small_increment_bytes
+                && resident.saturating_add(increment) <= self.small_memory_line_bytes)
+    }
 }
 
 impl Default for SchedulerSettings {
@@ -167,6 +219,9 @@ impl Default for SchedulerSettings {
             max_queue_pending: DEFAULT_MAX_QUEUE_PENDING,
             human_daily_task_budget: DEFAULT_HUMAN_DAILY_TASK_BUDGET,
             min_dispatch_value: DEFAULT_MIN_DISPATCH_VALUE,
+            memory_line_bytes: DEFAULT_MEMORY_LINE,
+            small_memory_line_bytes: DEFAULT_SMALL_MEMORY_LINE,
+            small_increment_bytes: DEFAULT_SMALL_INCREMENT_BYTES,
         }
     }
 }
@@ -1016,6 +1071,39 @@ fn u64_to_u32(value: u64, field: &'static str) -> Result<u32, QueueError> {
 #[cfg(test)]
 mod tests {
     use super::seconds_until_utc_midnight;
+
+    /// The two lines and the small increment: nothing goes in past the
+    /// small line, only a small increment between the lines, and an
+    /// increment of nothing always does.
+    #[test]
+    fn the_memory_lines_admit_by_increment() {
+        let settings = super::SchedulerSettings {
+            memory_line_bytes: 100,
+            small_memory_line_bytes: 110,
+            small_increment_bytes: 4,
+            ..super::SchedulerSettings::default()
+        };
+        assert!(settings.admits(60, 40), "up to the normal line");
+        assert!(
+            !settings.admits(60, 41),
+            "past it, too large for the small line"
+        );
+        assert!(
+            settings.admits(100, 4),
+            "a small increment up to the small line"
+        );
+        assert!(settings.admits(106, 4));
+        assert!(!settings.admits(107, 4), "past the small line");
+        assert!(!settings.admits(100, 5), "between the lines, not small");
+        assert!(
+            settings.admits(500, 0),
+            "nothing to add goes in at any size"
+        );
+        let defaults = super::SchedulerSettings::default();
+        assert_eq!(defaults.memory_line_bytes, 100_000_000);
+        assert_eq!(defaults.small_memory_line_bytes, 110_000_000);
+        assert_eq!(defaults.small_increment_bytes, 65_536);
+    }
 
     #[test]
     fn resolve_admission_waits_without_writing_and_keeps_live_dedup() {

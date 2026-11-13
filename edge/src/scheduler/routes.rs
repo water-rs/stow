@@ -14,9 +14,10 @@ use stow_types::api::{
     MutationKind, QueueSelector, SchedulerEvent, SubmissionTree, SubmitTaskIdEntry,
 };
 
+use super::backlog;
 use super::graph::{
-    Claimed, FinishOutcome, Graph, GraphCell, LoadedGraph, PublishedNeeds, ReadSource, Reads,
-    RootProbe, StartOutcome, ValidatedSubmission, Wanted,
+    Claimed, Fetched, FinishOutcome, Graph, GraphCell, LoadedGraph, PublishedNeeds, ReadSource,
+    Reads, RootProbe, StartOutcome, ValidatedSubmission, Wanted,
 };
 use super::queue::{self, AlarmPlan, SchedulerSettings};
 use super::store;
@@ -103,12 +104,6 @@ async fn append(
     Ok(())
 }
 
-fn changing_submission<'a>(
-    (tree, changes): (&'a SubmissionTree, &bool),
-) -> Option<store::SubmissionParts<'a>> {
-    changes.then(|| store::submission_events(tree))
-}
-
 /// Append the `Submit` parts of every tree that changes the graph in
 /// one turn, then merge each into it; returns the brand-new nodes. A
 /// tree that would change nothing — a resubmission of nodes already
@@ -122,6 +117,7 @@ fn changing_submission<'a>(
 /// # Errors
 /// `QueueError::Sql` on a failed read or append, `QueueError::Invariant`
 /// when a tree is malformed.
+#[cfg(test)]
 pub(super) async fn commit_trees(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
@@ -129,39 +125,72 @@ pub(super) async fn commit_trees(
     actor: Option<&str>,
     now: i64,
 ) -> Result<(u32, Vec<String>), QueueError> {
-    let validated = trees
-        .iter()
-        .map(ValidatedSubmission::new)
-        .collect::<Result<Vec<_>, _>>()?;
-    let changing = graph.with(|graph| {
-        validated
-            .iter()
-            .map(|tree| graph.merge_changes(tree))
-            .collect::<Vec<_>>()
-    });
+    let validated = validate_trees(trees)?;
+    let mut base = read_base(graph, db, &validated).await?;
+    let all: Vec<usize> = (0..trees.len()).collect();
+    merge_trees(graph, db, trees, &validated, &all, &mut base, actor, now).await
+}
+
+fn validate_trees(trees: &[SubmissionTree]) -> Result<Vec<ValidatedSubmission<'_>>, QueueError> {
+    trees.iter().map(ValidatedSubmission::new).collect()
+}
+
+/// The published rows the merges of `validated` consult, read in
+/// batched statements before anything is appended or mutated.
+async fn read_base(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+    validated: &[ValidatedSubmission<'_>],
+) -> Result<Fetched, QueueError> {
     let needs = graph.with(|graph| {
         let mut needs = PublishedNeeds::default();
-        for tree in &validated {
+        for tree in validated {
             graph.merge_needs(tree, &mut needs);
         }
         needs
     });
-    let mut base = store::read_published(db, &needs).await?;
-    let events = trees
-        .iter()
-        .zip(&changing)
-        .filter_map(changing_submission)
-        .flatten();
-    append(graph, db, actor, events, now).await?;
+    store::read_published(db, &needs).await
+}
+
+/// Append the `Submit` parts of the trees at `fit` and merge them,
+/// the rest of [`commit_trees`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pieces one turn of a submit holds: the store, the trees, their checks and the clock"
+)]
+async fn merge_trees(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+    trees: &[SubmissionTree],
+    validated: &[ValidatedSubmission<'_>],
+    fit: &[usize],
+    base: &mut Fetched,
+    actor: Option<&str>,
+    now: i64,
+) -> Result<(u32, Vec<String>), QueueError> {
+    let changing = graph.with(|graph| {
+        fit.iter()
+            .map(|&at| graph.merge_changes(&validated[at]))
+            .collect::<Vec<_>>()
+    });
+    let mut parts = Vec::new();
+    for (&at, &changes) in fit.iter().zip(&changing) {
+        if changes {
+            parts.push(store::submission_events(&trees[at]));
+        }
+    }
+    append(graph, db, actor, parts.into_iter().flatten(), now).await?;
     let (inserted, unpublished, fresh) = graph.with(|graph| {
-        validated.iter().try_fold(
+        fit.iter().try_fold(
             (0u32, Vec::new(), Vec::new()),
-            |(inserted, mut unpublished, mut fresh), tree| {
-                graph.merge_validated(tree, now, &mut base).map(|report| {
-                    unpublished.extend(report.unpublished);
-                    fresh.extend(report.digests);
-                    (inserted.saturating_add(report.inserted), unpublished, fresh)
-                })
+            |(inserted, mut unpublished, mut fresh), &at| {
+                graph
+                    .merge_validated(&validated[at], now, base)
+                    .map(|report| {
+                        unpublished.extend(report.unpublished);
+                        fresh.extend(report.digests);
+                        (inserted.saturating_add(report.inserted), unpublished, fresh)
+                    })
             },
         )
     })?;
@@ -170,6 +199,143 @@ pub(super) async fn commit_trees(
     store::write_digests(db, &fresh).await?;
     Ok((inserted, unpublished))
 }
+
+/// What a submit did with its trees.
+#[derive(Debug, Default)]
+pub(super) struct Submitted {
+    /// Brand-new queue rows the merged trees inserted.
+    pub inserted: u32,
+    /// The merged trees' nodes no published mask covers. A backlogged
+    /// tree reports none until it is admitted.
+    pub unpublished: Vec<String>,
+    /// Indexes of the trees stored in the backlog.
+    pub backlogged: Vec<usize>,
+}
+
+/// Land `trees` the way a submit does: each tree whose increment the
+/// memory lines admit merges into the graph, the rest go whole into the
+/// backlog (stow#1501). A submission is never refused for memory.
+///
+/// The increment is what the merge would add to the resident bytes, by
+/// the same formula the wake checks (`Graph::merge_growth`); trees are
+/// judged in order, each against the graph the earlier fitting ones
+/// leave. The published rows of every tree are read in one batch, and
+/// the merged trees append their parts in one turn before the merge.
+///
+/// # Errors
+/// As [`commit_trees`], and `QueueError::Sql` on a failed backlog write.
+pub(super) async fn submit_trees(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    trees: &[SubmissionTree],
+    actor: Option<&str>,
+    now: i64,
+) -> Result<Submitted, QueueError> {
+    let validated = validate_trees(trees)?;
+    let mut base = read_base(graph, db, &validated).await?;
+    let (fit, backlogged) = graph.with(|graph| -> Result<_, QueueError> {
+        let mut counts = graph.resident_counts();
+        let mut vacant = graph.vacant_states();
+        let (mut fit, mut backlogged) = (Vec::new(), Vec::new());
+        for (at, tree) in validated.iter().enumerate() {
+            let growth = graph.merge_growth(tree, &mut base)?;
+            let after = counts.grown(growth, vacant);
+            let resident = counts.bytes();
+            let increment = after.bytes().saturating_sub(resident);
+            if settings.admits(resident, increment) {
+                fit.push(at);
+                counts = after;
+                vacant -= vacant.min(growth.stateful);
+            } else {
+                backlogged.push(at);
+            }
+        }
+        Ok((fit, backlogged))
+    })?;
+    let (inserted, unpublished) =
+        merge_trees(graph, db, trees, &validated, &fit, &mut base, actor, now).await?;
+    for &at in &backlogged {
+        backlog::push(graph, db, &trees[at], actor).await?;
+    }
+    Ok(Submitted {
+        inserted,
+        unpublished,
+        backlogged,
+    })
+}
+
+/// One admission pass over the backlog: while the head entry of the
+/// first non-empty lane fits the memory lines at its increment now,
+/// merge it whole and delete its rows, until the pass has moved
+/// [`ADMIT_PASS_BYTES`] of stored text or the head does not fit. Lanes
+/// admit in priority order, FIFO within one, and a head that does not
+/// fit holds back every lane behind it, so a small preheat entry never
+/// starves a large human one.
+///
+/// Returns the entries admitted. Run by completions and the alarm,
+/// when a freed state or a compaction may have made room.
+///
+/// # Errors
+/// `QueueError::Sql`/`Invariant` on a failed read or write, a corrupt
+/// entry, or a tree the graph refuses.
+pub(super) async fn admit_backlog(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    now: i64,
+) -> Result<u32, QueueError> {
+    let mut admitted = 0u32;
+    let mut moved = 0u64;
+    // A graph at the small line has room for nothing the admission
+    // rule could add: skip the read.
+    while moved < ADMIT_PASS_BYTES
+        && graph.with(|graph| graph.resident_bytes()) < settings.small_memory_line_bytes
+    {
+        let Some(lane) = graph.with(|graph| graph.backlog.first_lane()) else {
+            break;
+        };
+        let Some(entry) = backlog::head(db, lane).await? else {
+            return Err(QueueError::Invariant(format!(
+                "the backlog tally holds a {lane:?} entry the table does not"
+            )));
+        };
+        let trees = std::slice::from_ref(&entry.tree);
+        let validated = [ValidatedSubmission::logged(&entry.tree)?];
+        let mut base = read_base(graph, db, &validated).await?;
+        let fits = graph.with(|graph| -> Result<bool, QueueError> {
+            let counts = graph.resident_counts();
+            let growth = graph.merge_growth(&validated[0], &mut base)?;
+            let resident = counts.bytes();
+            let after = counts.grown(growth, graph.vacant_states()).bytes();
+            Ok(settings.admits(resident, after.saturating_sub(resident)))
+        })?;
+        if !fits {
+            break;
+        }
+        merge_trees(
+            graph,
+            db,
+            trees,
+            &validated,
+            &[0],
+            &mut base,
+            entry.actor.as_deref(),
+            now,
+        )
+        .await?;
+        backlog::remove(graph, db, &entry).await?;
+        moved += entry.bytes();
+        admitted += 1;
+    }
+    Ok(admitted)
+}
+
+/// The stored text one admission pass moves at most: the request body
+/// limit, the batch the memory lines' transient allowance is sized for
+/// (`queue::DEFAULT_SMALL_MEMORY_LINE`), so a pass costs what one
+/// submit does.
+const ADMIT_PASS_BYTES: u64 = stow_types::api::REQUEST_BODY_LIMIT_BYTES as u64;
 
 /// A pure read of the graph that mints task ids and checks published
 /// masks. It runs twice: against [`Wanted`] to name the state slots it
@@ -233,11 +399,12 @@ impl DigestRead for ListTasks<'_> {
 }
 
 /// The occupancy status of [`admin_status`].
-struct AdminStatus {
+struct AdminStatus<'a> {
     now: i64,
+    settings: &'a SchedulerSettings,
 }
 
-impl DigestRead for AdminStatus {
+impl DigestRead for AdminStatus<'_> {
     type Output = stow_types::api::AdminStatus;
 
     fn read<D: ReadSource>(
@@ -245,7 +412,7 @@ impl DigestRead for AdminStatus {
         graph: &Graph,
         digests: &mut D,
     ) -> Result<Self::Output, QueueError> {
-        graph.admin_status_with(self.now, digests)
+        graph.admin_status_with(self.now, self.settings, digests)
     }
 }
 
@@ -366,7 +533,7 @@ pub(super) async fn submit(
     enforce_pending_cap: bool,
     actor: Option<&str>,
     now: i64,
-) -> Result<(u32, Vec<String>), QueueError> {
+) -> Result<Submitted, QueueError> {
     if enforce_pending_cap {
         let incoming: u64 = trees
             .iter()
@@ -380,7 +547,7 @@ pub(super) async fn submit(
             });
         }
     }
-    commit_trees(graph, db, trees, actor, now).await
+    submit_trees(graph, db, settings, trees, actor, now).await
 }
 
 /// `POST /tasks/submit/ids`: the promote lane. The entries append as
@@ -720,12 +887,13 @@ pub(super) async fn snapshot(
 pub(super) async fn wake_graph<'a>(
     db: &DurableDb,
     cell: &'a GraphCell,
+    budget: u64,
     now_ms: i64,
 ) -> Result<LoadedGraph<'a>, QueueError> {
     if let Some(loaded) = cell.loaded() {
         return Ok(loaded);
     }
-    let mut graph = store::wake(db, cell, now_ms).await?;
+    let mut graph = store::wake(db, cell, budget, now_ms).await?;
     graph.woken_at_ms = now_ms;
     Ok(cell.install(graph))
 }
@@ -838,6 +1006,24 @@ pub(super) async fn settle_dispatch(
     Ok(())
 }
 
+/// The status a request root reports while its tree waits in the
+/// backlog: pending on the human lane, with no position yet.
+fn backlogged_status(node: &stow_types::api::SubmissionNode) -> stow_types::api::RequestStatus {
+    stow_types::api::RequestStatus {
+        task_id: node.task_id.clone(),
+        crate_name: node.crate_name.clone(),
+        version: node.version.clone(),
+        features_json: node.features_json.clone(),
+        target: node.target.clone(),
+        rustc_version: node.rustc_version.clone(),
+        lane: stow_types::api::TaskLane::Human,
+        status: stow_types::api::QueueTaskStatus::Pending,
+        human_lane_position: None,
+        preserve_lockfile: node.preserve_lockfile,
+        blocked_by: None,
+    }
+}
+
 /// `POST /requests/{id}/outcome`: merge the report's trees (their
 /// `Submit` parts append first), then settle the record. `queued_before`
 /// is probed on the pre-merge graph so a root's `was_queued` reads what
@@ -849,6 +1035,7 @@ pub(super) async fn settle_dispatch(
 pub(super) async fn request_outcome(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
+    settings: &SchedulerSettings,
     request_id: &str,
     report: &stow_types::api::RequestOutcomeReport,
     actor: Option<&str>,
@@ -862,16 +1049,28 @@ pub(super) async fn request_outcome(
                 .filter(|&task_id| graph.with(|graph| graph.has_task(task_id)))
                 .cloned()
                 .collect();
-            commit_trees(graph, db, trees, actor, now).await?;
+            let submitted = submit_trees(graph, db, settings, trees, actor, now).await?;
             // The post-enqueue probe the per-target invariant reads.
             let ids: Vec<String> = roots
                 .iter()
                 .filter_map(|root| root.task_id.clone())
                 .collect();
-            (
-                queued_before,
-                with_digests(graph, db, &RootsProbe { ids: &ids, now }).await?,
-            )
+            let mut probe = with_digests(graph, db, &RootsProbe { ids: &ids, now }).await?;
+            // A root whose tree waits in the backlog is queued work the
+            // graph does not hold yet: it reports as a pending
+            // human-lane row with no position.
+            for node in submitted
+                .backlogged
+                .iter()
+                .flat_map(|&at| &trees[at].nodes)
+                .filter(|node| ids.contains(&node.task_id))
+            {
+                probe
+                    .statuses
+                    .entry(node.task_id.clone())
+                    .or_insert_with(|| backlogged_status(node));
+            }
+            (queued_before, probe)
         } else {
             Default::default()
         };
@@ -1066,9 +1265,10 @@ pub(super) async fn list_tasks(
 pub(super) async fn admin_status(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
+    settings: &SchedulerSettings,
     now: i64,
 ) -> Result<stow_types::api::AdminStatus, QueueError> {
-    with_digests(graph, db, &AdminStatus { now }).await
+    with_digests(graph, db, &AdminStatus { now, settings }).await
 }
 
 /// `GET /requests/{id}`: the record's live status, its stored roots
@@ -1118,7 +1318,7 @@ mod eviction_tests {
 
     /// What a woken Durable Object holds: the store replayed.
     async fn wake(db: &DurableDb) -> GraphCell {
-        let (graph, _) = store::restore(db).await.expect("load");
+        let (graph, _) = store::restore(db, u64::MAX).await.expect("load");
         let cell = GraphCell::default();
         cell.install(graph);
         cell
@@ -1570,7 +1770,7 @@ mod inline_dispatch_tests {
 
     /// What a woken Durable Object holds: the store replayed.
     async fn wake(db: &DurableDb) -> GraphCell {
-        let (graph, _) = store::restore(db).await.expect("load");
+        let (graph, _) = store::restore(db, u64::MAX).await.expect("load");
         let cell = GraphCell::default();
         cell.install(graph);
         cell
@@ -2149,7 +2349,7 @@ mod attribution_tests {
     }
 
     async fn woken(db: &DurableDb) -> GraphCell {
-        let (graph, _) = store::restore(db).await.expect("load");
+        let (graph, _) = store::restore(db, u64::MAX).await.expect("load");
         let cell = GraphCell::default();
         cell.install(graph);
         cell
@@ -2362,10 +2562,10 @@ mod miss_cap_tests {
         assert!(cell.with(|graph| graph.status().pending) > settings.max_queue_pending);
 
         let miss = tree(SubmissionSource::CacheMiss, FIRST_ROW + 100, 3);
-        let (inserted, _) = submit(cell, &db, &settings, &[miss], true, None, HOST_NOW_MS)
+        let admitted = submit(cell, &db, &settings, &[miss], true, None, HOST_NOW_MS)
             .await
             .expect("a miss is admitted under a preheat backlog");
-        assert_eq!(inserted, 3);
+        assert_eq!(admitted.inserted, 3);
         assert_eq!(cell.with(|graph| graph.miss_pending_depth()), 3);
 
         let over = tree(SubmissionSource::CacheMiss, FIRST_ROW + 200, 1);
@@ -2427,7 +2627,7 @@ mod snapshot_trigger_tests {
         assert_eq!(unpublished.len(), 6);
         let before = tail_bytes(&db).await;
         assert!(before > 0);
-        let (replayed, _) = store::restore(&db).await.expect("load");
+        let (replayed, _) = store::restore(&db, u64::MAX).await.expect("load");
         assert_eq!(replayed.status().pending, 4);
         let replay_owner = GraphCell::default();
         let replay_cell = replay_owner.install(replayed);
@@ -2494,7 +2694,7 @@ mod snapshot_trigger_tests {
             }
             assert!(snapshots >= 1, "{nodes}-node turns never snapshotted");
             // A wake of this store replays that tail into the same graph.
-            let (woken, events) = store::restore(&db).await.expect("load");
+            let (woken, events) = store::restore(&db, u64::MAX).await.expect("load");
             eprintln!("tail events {events} bytes {}", tail_bytes(&db).await);
             assert_eq!(woken.sizes(), cell.with(|graph| graph.sizes()));
             eprintln!("{nodes}-node submissions: widest tail {widest} B, {snapshots} snapshots");
@@ -2525,11 +2725,402 @@ mod snapshot_trigger_tests {
         );
         assert_eq!(tail_bytes(&db).await, 0);
         drop(wave);
-        let (woken, events) = store::restore(&db).await.expect("load");
+        let (woken, events) = store::restore(&db, u64::MAX).await.expect("load");
         assert_eq!(events, 0);
         assert_eq!(woken.sizes().0, u64::from(WAVE));
         let heap = woken.heap_bytes();
         eprintln!("woken wave graph: {heap} B of arenas for {WAVE} nodes");
         assert!(heap < 128 << 20);
+    }
+}
+
+/// The memory lines and the backlog (stow#1501).
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+    use crate::scheduler::backlog::Lane;
+    use crate::scheduler::drives::HOST_NOW_MS;
+    use crate::scheduler::fixture;
+    use crate::scheduler::graph::{GraphCell, PublishedNeeds};
+    use crate::scheduler::test_db;
+    use stow_types::api::SubmissionSource;
+
+    /// Fixture rows far outside the seeded range, so every node is new.
+    const FIRST_ROW: u32 = 7_000_000;
+
+    /// `nodes` nodes from row `first`, each depending on the one before.
+    fn chain(source: SubmissionSource, first: u32, nodes: u32) -> SubmissionTree {
+        SubmissionTree {
+            source,
+            roots: vec![0],
+            nodes: (0..nodes)
+                .map(|k| {
+                    let deps = if k == 0 { Vec::new() } else { vec![k - 1] };
+                    fixture::fixture_node(first + k, deps)
+                })
+                .collect(),
+        }
+    }
+
+    /// Lines no increment fits under: everything waits.
+    fn full() -> SchedulerSettings {
+        SchedulerSettings {
+            memory_line_bytes: 0,
+            small_memory_line_bytes: 0,
+            ..SchedulerSettings::default()
+        }
+    }
+
+    fn live() -> GraphCell {
+        let owner = GraphCell::default();
+        owner.install(Graph::default());
+        owner
+    }
+
+    async fn put(
+        cell: LoadedGraph<'_>,
+        db: &DurableDb,
+        settings: &SchedulerSettings,
+        trees: &[SubmissionTree],
+    ) -> Submitted {
+        submit_trees(cell, db, settings, trees, None, HOST_NOW_MS)
+            .await
+            .expect("submit")
+    }
+
+    fn nodes_held(cell: LoadedGraph<'_>) -> u64 {
+        cell.with(|graph| graph.sizes().0)
+    }
+
+    /// The `Submit` parts the log holds, as `(source, first node)`.
+    async fn log_sources(db: &DurableDb) -> Vec<(SubmissionSource, String)> {
+        store::log_page(db, 0, 1_000)
+            .await
+            .expect("log")
+            .into_iter()
+            .filter_map(|(_, logged)| match logged.event {
+                SchedulerEvent::Submit {
+                    source,
+                    part: 0,
+                    nodes,
+                    ..
+                } => Some((source, nodes[0].task_id.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The increment the merge predicts is what it adds: nodes, edges,
+    /// strings, text and states exactly, ready entries as an upper
+    /// bound.
+    #[tokio::test]
+    async fn the_predicted_growth_is_what_a_merge_adds() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = live();
+        let cell = owner.loaded().expect("loaded");
+        // Hold some nodes first, so the strings the tree shares with
+        // them are not new.
+        commit_trees(
+            cell,
+            &db,
+            &[chain(SubmissionSource::Preheat, FIRST_ROW, 30)],
+            None,
+            1,
+        )
+        .await
+        .expect("first");
+        let tree = chain(SubmissionSource::CacheMiss, FIRST_ROW + 20, 60);
+        let before = cell.with(|graph| graph.resident_counts());
+        let vacant = cell.with(|graph| graph.vacant_states());
+        let growth = cell.with(|graph| {
+            let validated = ValidatedSubmission::new(&tree).expect("valid");
+            graph
+                .merge_growth(&validated, &mut PublishedNeeds::default())
+                .expect("growth")
+        });
+        // Rows 20..30 are held already.
+        assert_eq!(growth.nodes, 50);
+        commit_trees(cell, &db, &[tree], None, 2)
+            .await
+            .expect("merge");
+        let after = cell.with(|graph| graph.resident_counts());
+        let predicted = before.grown(growth, vacant);
+        assert_eq!(
+            (
+                after.nodes,
+                after.states,
+                after.edges,
+                after.strings,
+                after.text
+            ),
+            (
+                predicted.nodes,
+                predicted.states,
+                predicted.edges,
+                predicted.strings,
+                predicted.text
+            )
+        );
+        assert!(after.ready <= predicted.ready);
+    }
+
+    /// What fits merges; what does not is stored whole and the graph
+    /// is untouched. A submission that adds nothing merges whatever the
+    /// occupancy, and a small one goes in between the lines.
+    #[tokio::test]
+    async fn an_overflowing_tree_is_backlogged_and_a_resubmission_is_not() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = live();
+        let cell = owner.loaded().expect("loaded");
+        let tree = chain(SubmissionSource::Preheat, FIRST_ROW, 40);
+
+        let waiting = put(cell, &db, &full(), std::slice::from_ref(&tree)).await;
+        assert_eq!(waiting.backlogged, [0]);
+        assert_eq!(waiting.inserted, 0);
+        assert_eq!(nodes_held(cell), 0);
+        assert_eq!(
+            log_sources(&db).await,
+            [] as [(stow_types::api::SubmissionSource, std::string::String); 0]
+        );
+        let tally = cell.with(|graph| graph.backlog);
+        assert_eq!((tally.entries(), tally.lane_entries(Lane::Preheat)), (1, 1));
+        assert!(tally.bytes() > 0);
+
+        let merged = put(
+            cell,
+            &db,
+            &SchedulerSettings::default(),
+            std::slice::from_ref(&tree),
+        )
+        .await;
+        assert_eq!(merged.backlogged, [] as [usize; 0]);
+        assert_eq!(merged.inserted, 40);
+
+        // The same tree again adds nothing: it merges though no
+        // increment fits the lines.
+        let again = put(cell, &db, &full(), std::slice::from_ref(&tree)).await;
+        assert_eq!(again.backlogged, [] as [usize; 0]);
+        assert_eq!(again.inserted, 0);
+
+        // Between the lines: the normal line sits at the graph's size,
+        // so only a small increment goes in.
+        let resident = cell.with(|graph| graph.resident_bytes());
+        let lines = SchedulerSettings {
+            memory_line_bytes: resident,
+            small_memory_line_bytes: resident + (1 << 20),
+            small_increment_bytes: 64 * 1024,
+            ..SchedulerSettings::default()
+        };
+        let small = chain(SubmissionSource::CacheMiss, FIRST_ROW + 1_000, 3);
+        assert_eq!(
+            put(cell, &db, &lines, &[small]).await.backlogged,
+            [] as [usize; 0]
+        );
+        let large = chain(SubmissionSource::CacheMiss, FIRST_ROW + 2_000, 2_000);
+        assert_eq!(put(cell, &db, &lines, &[large]).await.backlogged, [0]);
+    }
+
+    /// Admission runs the human lane first, then operations, the CLI and
+    /// preheat, each lane first in first out.
+    #[tokio::test]
+    async fn admission_follows_the_entry_point_priority() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = live();
+        let cell = owner.loaded().expect("loaded");
+        let at = |k: u32| FIRST_ROW + 100 * k;
+        let arrivals = [
+            chain(SubmissionSource::Preheat, at(0), 2),
+            chain(SubmissionSource::CacheMiss, at(1), 2),
+            chain(SubmissionSource::InexactHit, at(2), 2),
+            chain(SubmissionSource::Operations { priority: 9 }, at(3), 2),
+            chain(SubmissionSource::HumanRequest, at(4), 2),
+            chain(SubmissionSource::Preheat, at(5), 2),
+        ];
+        for tree in &arrivals {
+            assert_eq!(
+                put(cell, &db, &full(), std::slice::from_ref(tree))
+                    .await
+                    .backlogged,
+                [0]
+            );
+        }
+        assert_eq!(cell.with(|graph| graph.backlog.entries()), 6);
+
+        let admitted = admit_backlog(cell, &db, &SchedulerSettings::default(), HOST_NOW_MS)
+            .await
+            .expect("admit");
+        assert_eq!(admitted, 6);
+        let order: Vec<_> = log_sources(&db)
+            .await
+            .into_iter()
+            .map(|(_, first)| first)
+            .collect();
+        let expected: Vec<_> = [4, 3, 1, 2, 0, 5]
+            .into_iter()
+            .map(|k| arrivals[k].nodes[0].task_id.clone())
+            .collect();
+        assert_eq!(order, expected);
+        assert_eq!(cell.with(|graph| graph.backlog.entries()), 0);
+        assert_eq!(cell.with(|graph| graph.backlog.bytes()), 0);
+        let rows = db
+            .query("SELECT COUNT(*) FROM backlog")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count");
+        assert_eq!(rows, 0);
+    }
+
+    /// A tree stored in several parts is admitted whole or not at all.
+    #[tokio::test]
+    async fn a_multi_part_tree_is_admitted_whole() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = live();
+        let cell = owner.loaded().expect("loaded");
+        // Three parts of `SUBMIT_PART_NODES` nodes at most.
+        let tree = chain(SubmissionSource::HumanRequest, FIRST_ROW, 2_500);
+        assert_eq!(
+            put(cell, &db, &full(), std::slice::from_ref(&tree))
+                .await
+                .backlogged,
+            [0]
+        );
+        let parts = db
+            .query("SELECT COUNT(*) FROM backlog")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count");
+        assert_eq!(parts, 3);
+
+        // Room for part of it: nothing merges, the entry stays whole.
+        let some = SchedulerSettings {
+            memory_line_bytes: 200 * 1024,
+            small_memory_line_bytes: 200 * 1024,
+            ..SchedulerSettings::default()
+        };
+        assert_eq!(
+            admit_backlog(cell, &db, &some, HOST_NOW_MS)
+                .await
+                .expect("admit"),
+            0
+        );
+        assert_eq!(nodes_held(cell), 0);
+        assert_eq!(cell.with(|graph| graph.backlog.entries()), 1);
+
+        let admitted = admit_backlog(cell, &db, &SchedulerSettings::default(), HOST_NOW_MS)
+            .await
+            .expect("admit");
+        assert_eq!(admitted, 1);
+        assert_eq!(nodes_held(cell), 2_500);
+        // Its three parts landed in the log, so a wake rebuilds it.
+        let (woken, _) = store::restore(&db, u64::MAX).await.expect("wake");
+        assert_eq!(woken.sizes().0, 2_500);
+    }
+
+    /// Nodes merge by task id whether they arrive from the graph or the
+    /// backlog: a tree in the backlog whose nodes the graph took in the
+    /// meantime, or that the backlog holds twice, adds each node once.
+    #[tokio::test]
+    async fn nodes_merge_by_task_id_across_the_graph_and_the_backlog() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = live();
+        let cell = owner.loaded().expect("loaded");
+        let tree = chain(SubmissionSource::Preheat, FIRST_ROW, 25);
+        put(cell, &db, &full(), std::slice::from_ref(&tree)).await;
+        put(cell, &db, &full(), std::slice::from_ref(&tree)).await;
+        assert_eq!(cell.with(|graph| graph.backlog.entries()), 2);
+        // A different entry point lands the same nodes straight away.
+        let miss = SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            ..tree.clone()
+        };
+        assert_eq!(
+            put(cell, &db, &SchedulerSettings::default(), &[miss])
+                .await
+                .inserted,
+            25
+        );
+        assert_eq!(nodes_held(cell), 25);
+
+        let admitted = admit_backlog(cell, &db, &SchedulerSettings::default(), HOST_NOW_MS)
+            .await
+            .expect("admit");
+        assert_eq!(admitted, 2);
+        assert_eq!(nodes_held(cell), 25);
+    }
+
+    /// A graph over the line fails its wake with the named error before
+    /// its rows decode, and the backlog's tally survives a wake.
+    #[tokio::test]
+    async fn a_graph_over_the_line_fails_to_wake_by_name() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = live();
+        let cell = owner.loaded().expect("loaded");
+        commit_trees(
+            cell,
+            &db,
+            &[chain(SubmissionSource::Preheat, FIRST_ROW, 3_000)],
+            None,
+            1,
+        )
+        .await
+        .expect("merge");
+        put(
+            cell,
+            &db,
+            &full(),
+            &[chain(SubmissionSource::Preheat, FIRST_ROW + 5_000, 5)],
+        )
+        .await;
+        let needed = cell.with(|graph| graph.resident_bytes());
+        snapshot(cell, &db, HOST_NOW_MS).await.expect("snapshot");
+
+        let error = store::restore(&db, needed / 2)
+            .await
+            .expect_err("over the line");
+        assert!(
+            matches!(error, QueueError::GraphExceedsBudget { budget, .. } if budget == needed / 2),
+            "{error}"
+        );
+        let (woken, _) = store::restore(&db, needed).await.expect("within the line");
+        assert_eq!(woken.sizes().0, 3_000);
+        let held = cell.with(|graph| graph.backlog);
+        assert_eq!(woken.backlog, held);
+        assert_eq!(held.entries(), 1);
+    }
+
+    /// The operator view reports the resident bytes, the lines and the
+    /// backlog.
+    #[tokio::test]
+    async fn the_admin_status_reports_the_memory_and_the_backlog() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = live();
+        let cell = owner.loaded().expect("loaded");
+        commit_trees(
+            cell,
+            &db,
+            &[chain(SubmissionSource::Preheat, FIRST_ROW, 100)],
+            None,
+            1,
+        )
+        .await
+        .expect("merge");
+        put(
+            cell,
+            &db,
+            &full(),
+            &[chain(SubmissionSource::Preheat, FIRST_ROW + 500, 5)],
+        )
+        .await;
+        let memory = cell.with(|graph| graph.admin_status(2).expect("status").memory);
+        assert_eq!(
+            memory.resident_bytes,
+            cell.with(|graph| graph.resident_bytes())
+        );
+        assert!(memory.resident_bytes > 0);
+        let defaults = SchedulerSettings::default();
+        assert_eq!(memory.normal_line_bytes, defaults.memory_line_bytes);
+        assert_eq!(memory.small_line_bytes, defaults.small_memory_line_bytes);
+        assert_eq!(memory.backlog_entries, 1);
+        assert!(memory.backlog_bytes > 0);
     }
 }

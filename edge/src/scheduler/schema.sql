@@ -47,6 +47,26 @@ CREATE TABLE IF NOT EXISTS published (
     mask INTEGER NOT NULL,
     PRIMARY KEY (slice, key)
 ) WITHOUT ROWID;
+-- `backlog` (stow#1501) holds the submissions the graph's memory lines
+-- had no room for, verbatim: one row per `Submit` part of a tree, in
+-- the JSON the event log would hold it as, so admitting an entry
+-- appends its rows to `event_log` unchanged. `seq` is the arrival
+-- order and an entry's parts are consecutive; `lane` ranks the entry
+-- points for admission (0 the human lane, 1 operations, 2 the CLI's
+-- misses, 3 preheat) and FIFO holds within one lane by `seq`. `parts`
+-- is the entry's part count, on every row; `actor` is the verified
+-- run behind the first part's request. The count and bytes of the
+-- entries held live in `store_meta` (`backlog_entries_<lane>` and
+-- `backlog_bytes`), moved in the turn that writes or deletes the rows.
+CREATE TABLE IF NOT EXISTS backlog (
+    seq INTEGER PRIMARY KEY,
+    lane INTEGER NOT NULL,
+    part INTEGER NOT NULL,
+    parts INTEGER NOT NULL,
+    actor TEXT,
+    event TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS backlog_lane ON backlog(lane, seq);
 CREATE TABLE IF NOT EXISTS meter (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     day TEXT NOT NULL,

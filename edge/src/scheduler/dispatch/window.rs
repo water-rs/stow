@@ -241,7 +241,7 @@ mod tests {
         let until = HOST_NOW_MS + if primary { 62_000 } else { 60_000 };
         assert!(graph.with(|graph| graph.ci_waiting(until - 1)));
         let recovered_owner = graph::GraphCell::default();
-        let recovered = routes::wake_graph(&db, &recovered_owner, HOST_NOW_MS)
+        let recovered = routes::wake_graph(&db, &recovered_owner, u64::MAX, HOST_NOW_MS)
             .await
             .expect("replay");
         assert!(recovered.with(|graph| graph.ci_waiting(until - 1)));
@@ -280,7 +280,7 @@ mod tests {
                     .is_empty()
             );
         }
-        let (loaded, _) = store::restore(&db).await.expect("load");
+        let (loaded, _) = store::restore(&db, u64::MAX).await.expect("load");
         assert!(loaded.ci_waiting(until - 1));
     }
 

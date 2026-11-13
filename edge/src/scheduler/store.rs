@@ -920,9 +920,9 @@ struct SnapshotRow {
 /// rebuilt graph — its meter carries the checkpointed day totals and
 /// covered `seq` — and the snapshot watermark the log tail starts
 /// after.
-async fn load(db: &DurableDb) -> Result<(Graph, i64), QueueError> {
+async fn load(db: &DurableDb, budget: u64) -> Result<(Graph, i64), QueueError> {
     let seq = watermark(db).await?;
-    let mut loader = SnapshotLoader::default();
+    let mut loader = SnapshotLoader::new(budget);
     let mut key = -1i64;
     let limit = i64::try_from(STATEMENT_ROWS).expect("statement rows fit i64");
     loop {
@@ -979,9 +979,11 @@ async fn load(db: &DurableDb) -> Result<(Graph, i64), QueueError> {
 ///
 /// # Errors
 /// `QueueError::Sql`/`QueueError::Invariant` on a failed read or
-/// corrupt row.
-pub async fn restore(db: &DurableDb) -> Result<(Graph, u64), QueueError> {
-    let (mut graph, seq) = load(db).await?;
+/// corrupt row, `QueueError::GraphExceedsBudget` when the graph needs
+/// more than `budget` resident bytes.
+pub async fn restore(db: &DurableDb, budget: u64) -> Result<(Graph, u64), QueueError> {
+    let (mut graph, seq) = load(db, budget).await?;
+    graph.ensure_within(budget)?;
     graph.trace_occupancy("scheduler wake", "snapshot loaded", "observation");
     let mut replay = TailReplay::default();
     let mut after = seq;
@@ -994,17 +996,23 @@ pub async fn restore(db: &DurableDb) -> Result<(Graph, u64), QueueError> {
         }
         rows += u64::try_from(page.len()).expect("page length fits u64");
         replay.feed(db, &mut graph, page).await?;
+        // A tail that grows the graph past the line stops the replay at
+        // the page that crossed it, rather than at the isolate's limit.
+        graph.ensure_within(budget)?;
         if done {
             break;
         }
     }
     replay.finish(db, &mut graph).await?;
+    graph.ensure_within(budget)?;
+    graph.backlog = super::backlog::load_tally(db).await?;
     graph.trace_occupancy("scheduler wake", "log tail replayed", "observation");
     Ok((graph, rows))
 }
 
 /// The wake sequence `ensure_graph` and the `wake` drive share —
-/// [`restore`] the snapshot plus log tail, then write the wake
+/// [`restore`] the snapshot plus log tail within `budget` resident
+/// bytes, then write the wake
 /// checkpoint: the restored totals, plus the isolate's unsettled counts
 /// (this operation's own reads among them), plus the checkpoint UPDATE
 /// itself — before any non-storage await opens the input gate
@@ -1014,8 +1022,13 @@ pub async fn restore(db: &DurableDb) -> Result<(Graph, u64), QueueError> {
 /// # Errors
 /// `QueueError::Sql`/`QueueError::Invariant` on a failed read or
 /// checkpoint write.
-pub async fn wake(db: &DurableDb, cell: &GraphCell, now_ms: i64) -> Result<Graph, QueueError> {
-    let (graph, _) = restore(db).await?;
+pub async fn wake(
+    db: &DurableDb,
+    cell: &GraphCell,
+    budget: u64,
+    now_ms: i64,
+) -> Result<Graph, QueueError> {
+    let (graph, _) = restore(db, budget).await?;
     checkpoint_meter(db, &graph.meter, cell, graph.meter.seq, now_ms).await?;
     Ok(graph)
 }
@@ -1378,7 +1391,7 @@ mod tests {
         );
 
         // Forced eviction: reload from the store only.
-        let (mut restored, replayed) = restore(&db).await.expect("load");
+        let (mut restored, replayed) = restore(&db, u64::MAX).await.expect("load");
         assert_eq!(replayed, 0, "snapshot covered the whole log");
         restored.adopt_test_store(&graph);
         assert_eq!(restored.status(), graph.status());
@@ -1480,7 +1493,7 @@ mod tests {
         assert!(covered3 > covered2);
 
         // The wake reads every chunk set and replays nothing.
-        let (mut restored, replayed) = restore(&db).await.expect("load");
+        let (mut restored, replayed) = restore(&db, u64::MAX).await.expect("load");
         assert_eq!(replayed, 0);
         restored.adopt_test_store(&graph);
         assert_eq!(restored.status(), graph.status());
@@ -1681,7 +1694,7 @@ mod tests {
         .await
         .expect("claims row");
 
-        let (mut restored, _) = restore(&db).await.expect("wake");
+        let (mut restored, _) = restore(&db, u64::MAX).await.expect("wake");
         // The claim replays as dispatched-unbound — no dispatch is lost
         // and nothing re-dispatches.
         assert_eq!(restored.status().dispatched, 1);
@@ -1839,12 +1852,14 @@ mod tests {
         .await
         .expect("refusal row");
 
-        let (replayed, _) = restore(&db).await.expect("wake");
+        let (replayed, _) = restore(&db, u64::MAX).await.expect("wake");
         let covered = write_snapshot(&db, &mut graph, &GraphCell::default(), NOW_MS)
             .await
             .expect("snapshot");
         assert!(covered > 0);
-        let (mut reloaded, _) = restore(&db).await.expect("wake from the snapshot");
+        let (mut reloaded, _) = restore(&db, u64::MAX)
+            .await
+            .expect("wake from the snapshot");
         // A snapshot load replays no `Submit`; the listing mints ids
         // from the digests the live merge kept.
         reloaded.adopt_test_store(&graph);
@@ -1936,7 +1951,7 @@ mod tests {
         append_events(&db, None, &events, 0)
             .await
             .expect("deliveries");
-        let (restored, _) = restore(&db).await.expect("wake");
+        let (restored, _) = restore(&db, u64::MAX).await.expect("wake");
         assert_eq!(restored.status().completed, 1);
     }
 
@@ -2007,7 +2022,7 @@ mod tests {
                 .await
                 .expect("snapshot with parked completion");
             drop(graph);
-            let (mut restored, replayed) = restore(&db).await.expect("wake");
+            let (mut restored, replayed) = restore(&db, u64::MAX).await.expect("wake");
             assert_eq!(replayed, 0, "completion is in the snapshot");
             assert!(restored.bind(&id("solo"), generation, 909, 4));
             assert_eq!(restored.status().completed, u32::from(success));
@@ -2034,7 +2049,7 @@ mod tests {
         append_events(&db, None, &events[..1], 0)
             .await
             .expect("part 0");
-        let (restored, _) = restore(&db).await.expect("wake");
+        let (restored, _) = restore(&db, u64::MAX).await.expect("wake");
         assert_eq!(restored.sizes().0, 0, "the unacknowledged submit dropped");
     }
 
@@ -2068,7 +2083,7 @@ mod tests {
         append_events(&db, None, &dropped[..1], 0)
             .await
             .expect("part 0 of the truncated submit");
-        let (restored, replayed) = restore(&db).await.expect("wake");
+        let (restored, replayed) = restore(&db, u64::MAX).await.expect("wake");
         assert_eq!(replayed, u64::from(LOG_PAGE_ROWS) + 2);
         assert_eq!(
             restored.sizes().0,
@@ -2105,7 +2120,7 @@ mod tests {
 
         // A wake re-counts what it replays: each appended row bills
         // one written row plus its `RETURNING` read (stow#931).
-        let (restored, replayed) = restore(&db).await.expect("load");
+        let (restored, replayed) = restore(&db, u64::MAX).await.expect("load");
         assert_eq!(replayed, 3);
         assert_eq!(restored.meter.rows_written, 3);
         assert_eq!(restored.meter.rows_read, 3);
@@ -2144,7 +2159,7 @@ mod tests {
         .await
         .expect("append");
         assert!(appended.seq > covered);
-        let (_, replayed) = restore(&db).await.expect("load");
+        let (_, replayed) = restore(&db, u64::MAX).await.expect("load");
         assert_eq!(replayed, 1);
     }
 
@@ -2236,7 +2251,7 @@ mod tests {
         use crate::scheduler::meter::Meter;
         let cell = GraphCell::default();
         let (metered, meter) = Meter::wrap(db.clone(), &cell);
-        let mut graph = wake(&metered, &cell, now_ms).await.expect("wake");
+        let mut graph = wake(&metered, &cell, u64::MAX, now_ms).await.expect("wake");
         graph.woken_at_ms = now_ms;
         let loaded = cell.install(graph);
         meter.settle(loaded, now_ms);

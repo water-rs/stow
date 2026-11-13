@@ -42,7 +42,8 @@ use serde::{Deserialize, Serialize};
 use super::index::hash_of;
 use super::node::{Extra, Flags, NO_STATE, Node, State, Status};
 use super::{
-    AttemptOutcome, FeedSession, Graph, IdKey, PublishedRow, RequestRecord, SliceId, StagedSlice,
+    AttemptOutcome, FeedSession, Graph, IdKey, PublishedRow, RequestRecord, ResidentCounts,
+    SliceId, StagedSlice,
 };
 use crate::errors::QueueError;
 
@@ -326,6 +327,8 @@ struct SnapshotHead {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct SectionLens {
     intern: usize,
+    /// Bytes of the interned text.
+    text: usize,
     nodes: usize,
     /// The state slab's length, vacant slots included: the vacant ones
     /// are the slots no node names, and the next allocation takes the
@@ -941,10 +944,9 @@ impl Graph {
     /// and the id and identity tables take their final size, which the
     /// rebuild after the load then reuses.
     ///
-    /// The head carries no byte length for the interned text, so that
-    /// buffer still grows as its rows decode.
+    /// The interned text and its offsets take their exact sizes too.
     fn presize(&mut self, lens: &SectionLens) {
-        self.intern.reserve_exact(lens.intern);
+        self.intern.reserve_exact(lens.intern, lens.text);
         self.nodes.reserve_maximum_concurrent_capacity(lens.nodes);
         self.states.reserve_maximum_concurrent_capacity(lens.states);
         self.edges.reserve(lens.edges, lens.nodes);
@@ -955,6 +957,7 @@ impl Graph {
     fn section_lens(&self) -> SectionLens {
         SectionLens {
             intern: self.intern.len(),
+            text: self.intern.text_len(),
             nodes: self.nodes.len(),
             states: self.states.len(),
             edges: self.edges.len(),
@@ -978,13 +981,25 @@ impl Graph {
 /// A wake's graph under construction: rows apply in key order — `meta`
 /// first, then each kind's ranges and buckets — then [`Self::finish`]
 /// rebuilds the derived state.
-#[derive(Default)]
 pub struct SnapshotLoader {
     graph: Graph,
     lens: Option<SectionLens>,
+    /// The most bytes the loaded graph may need: the head's counts are
+    /// checked against it before anything is allocated for the rows.
+    budget: u64,
 }
 
 impl SnapshotLoader {
+    /// A loader for a graph of at most `budget` resident bytes.
+    #[must_use]
+    pub fn new(budget: u64) -> Self {
+        Self {
+            graph: Graph::default(),
+            lens: None,
+            budget,
+        }
+    }
+
     /// Decode one row into the graph.
     ///
     /// # Errors
@@ -1000,7 +1015,7 @@ impl SnapshotLoader {
         }
         let graph = &mut self.graph;
         match kind {
-            ChunkKind::Meta => Self::apply_head(graph, &mut self.lens, payload),
+            ChunkKind::Meta => Self::apply_head(graph, &mut self.lens, payload, self.budget),
             ChunkKind::Intern => decode_items(kind, payload, |s: String| {
                 graph.intern.load(&s);
                 Ok(())
@@ -1156,11 +1171,28 @@ impl SnapshotLoader {
         graph: &mut Graph,
         lens: &mut Option<SectionLens>,
         payload: &str,
+        budget: u64,
     ) -> Result<(), QueueError> {
         if lens.is_some() {
             return Err(QueueError::Invariant("snapshot carries two heads".into()));
         }
         let head: SnapshotHead = serde_json::from_str(payload).map_err(|e| encode_error(&e))?;
+        // The least the graph needs: the head does not count the ready
+        // queues, so they are left out, and the check after the load
+        // adds them. A graph over the line here is certain to be over it
+        // then, and fails before its rows are decoded.
+        let needed = ResidentCounts {
+            nodes: head.lens.nodes,
+            states: head.lens.states,
+            edges: head.lens.edges,
+            strings: head.lens.intern,
+            text: head.lens.text,
+            ready: 0,
+        }
+        .bytes();
+        if needed > budget {
+            return Err(QueueError::GraphExceedsBudget { needed, budget });
+        }
         graph.next_generation = head.next_generation;
         graph.meter.ops = head.meter_ops;
         graph.seeded_rows = head.seeded_rows;

@@ -405,6 +405,28 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
+        // stow#1501: the overflow path of a one-part tree — one backlog
+        // insert and two tally upserts, no read (the tree goes in
+        // verbatim): measured 4 statements, 0 rows read, 3 written. A
+        // larger tree adds one insert per body-limit part.
+        name: "POST /tasks/submit (backlogged)",
+        statements: 8,
+        rows_read: 2,
+        rows_written: 6,
+        wall_ms: 400,
+    },
+    DriveBudget {
+        // stow#1501: one one-part entry — head read, keyed published
+        // read, the merge's append, the delete and the tally upserts:
+        // measured 7 statements, 2 rows read, 5 written. Bounded per
+        // pass by one request body of stored text.
+        name: "backlog admission",
+        statements: 14,
+        rows_read: 6,
+        rows_written: 10,
+        wall_ms: 400,
+    },
+    DriveBudget {
         // stow#1378: as the operations lane — one fresh node; stow#1379:
         // and its one keyed published read, one key named and none found.
         name: "POST /tasks/submit (preheat)",

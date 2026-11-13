@@ -58,6 +58,7 @@ use edges::Edges;
 use index::{Interner, IxTable, Priorities, hash_of};
 pub use node::RunCompletion;
 use node::{Extra, FIRST_ATTEMPT, Flags, Lane, NO_STATE, Node, State, Status};
+pub(super) use occupancy::ResidentCounts;
 pub use published::{
     Fetched, PublishedNeeds, PublishedRow, PublishedSource, ReadSource, slice_column,
 };
@@ -600,6 +601,11 @@ pub struct Graph {
     /// memory only: the probe ledger reports it so a reader can tell a
     /// reload, which drops every ledger booking since the snapshot.
     pub woken_at_ms: i64,
+    /// The submissions the backlog holds (stow#1501): in memory only,
+    /// read from `store_meta` at the wake and moved with every write
+    /// to the table, so the status reads and the admission pass never
+    /// scan it.
+    pub(super) backlog: super::backlog::Tally,
     /// The fixture size the budget probe last seeded this store at —
     /// `None` until a seed runs. It rides the snapshot head so `rearm`
     /// and the probe read it from the graph: a `store_meta` row would
@@ -4539,6 +4545,7 @@ impl Graph {
     pub fn admin_status_with(
         &self,
         now: i64,
+        settings: &queue::SchedulerSettings,
         digests: &mut impl DigestSource,
     ) -> Result<stow_types::api::AdminStatus, QueueError> {
         let status = self.status();
@@ -4607,6 +4614,14 @@ impl Graph {
             in_flight,
             targets,
             dispatch_frozen: self.freeze.is_some(),
+            memory: stow_types::api::AdminMemory {
+                resident_bytes: self.resident_bytes(),
+                normal_line_bytes: settings.memory_line_bytes,
+                small_line_bytes: settings.small_memory_line_bytes,
+                wasm_linear_bytes: super::memory::linear_bytes(),
+                backlog_entries: self.backlog.entries(),
+                backlog_bytes: self.backlog.bytes(),
+            },
             index_slices: self
                 .slice_generations()
                 .into_iter()
@@ -4707,6 +4722,10 @@ pub struct GraphCell {
     /// Set by the wake, cleared by the one request that runs the
     /// post-wake CI status reconcile.
     reconcile_due: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether this isolate already alerted that its graph exceeds the
+    /// memory line.
+    #[cfg(target_arch = "wasm32")]
+    exceeded_alerted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The isolate's cached GitHub App installation token.
     tokens: crate::github_app::TokenCache,
     /// The isolate's billed-but-unsettled row counts — see [`Unsettled`].
@@ -4825,6 +4844,15 @@ impl GraphCell {
     pub(crate) fn take_reconcile(&self) -> bool {
         self.reconcile_due
             .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Take the duty to alert that the graph exceeds its memory line —
+    /// `true` for the first failed wake of this isolate only, so a
+    /// scheduler that keeps failing sends one alert, not one per route.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn take_exceeded_alert(&self) -> bool {
+        !self
+            .exceeded_alerted
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
     }
     /// Drop the in-memory graph — the operator reset: the next
     /// request wakes from the (reset) store.
@@ -5155,7 +5183,11 @@ impl Graph {
         &self,
         now: i64,
     ) -> Result<stow_types::api::AdminStatus, QueueError> {
-        self.admin_status_with(now, &mut self.test_digest_source())
+        self.admin_status_with(
+            now,
+            &queue::SchedulerSettings::default(),
+            &mut self.test_digest_source(),
+        )
     }
 
     pub(crate) fn select_ids(
@@ -6188,7 +6220,7 @@ mod tests {
     /// plan — every row of every dirty span, in key order.
     fn round_trip(graph: &Graph) -> Graph {
         let plan = graph.snapshot_plan().expect("plan");
-        let mut loader = SnapshotLoader::default();
+        let mut loader = SnapshotLoader::new(u64::MAX);
         for span in plan.spans {
             let mut encoder = graph.snapshot_encoder(span);
             let mut sub = 0i64;
@@ -6910,37 +6942,6 @@ mod tests {
         }
     }
 
-    /// What a graph of `nodes` nodes holds at production density, by
-    /// formula: the counts a snapshot head records (nodes, state slots,
-    /// edges, interned strings) and the interned text.
-    fn resident_bytes(
-        nodes: usize,
-        states: usize,
-        edges: usize,
-        strings: usize,
-        text: usize,
-        ready: usize,
-    ) -> usize {
-        // An arena allocates whole fragments of 1024 records.
-        let arena = |records: usize, record: usize| records.div_ceil(1024) * 1024 * record;
-        // An index holds its ids at seven eighths full, sized exactly.
-        let table = |entries: usize| (entries * 8).div_ceil(7).max(8) * size_of::<u32>();
-        arena(nodes, size_of::<Node>())
-            + arena(states, size_of::<State>())
-            + states.div_ceil(8)
-            // The text grows by doubling, the offsets are sized by the head.
-            + text.next_power_of_two()
-            + strings * size_of::<u32>()
-            + table(strings)
-            + 2 * table(nodes)
-            + arena(edges, size_of::<u32>())
-            + arena(edges, size_of::<u8>())
-            + arena(edges, size_of::<u32>())
-            + arena(nodes + 1, size_of::<u32>())
-            + nodes.div_ceil(8)
-            + occupancy::btree_bytes(ready, size_of::<(i64, u32)>())
-    }
-
     /// The occupancy line counts every structure the graph holds, and a
     /// resident-bytes formula over the snapshot head's counts tracks it
     /// at the density production wakes at (stow#1501): 5.9 edges per
@@ -6996,7 +6997,23 @@ mod tests {
             + "1.0.0".len()
             + FeaturesJson::default().raw().len();
         let ready = graph.ready_sets().map(BTreeSet::len).sum::<usize>();
-        let expected = resident_bytes(live, states, edges, graph.intern.len(), text, ready);
+        let counts = ResidentCounts {
+            nodes: live,
+            states,
+            edges,
+            strings: graph.intern.len(),
+            text,
+            ready,
+        };
+        assert_eq!(
+            counts,
+            ResidentCounts {
+                text: graph.intern.text_len(),
+                ..graph.resident_counts()
+            },
+            "the graph's own counts are the head's"
+        );
+        let expected = occupancy::resident_bytes(&counts);
         let accounted = held.accounted();
         eprintln!(
             "occupancy: {live} nodes {edges} edges {states} states: accounted {accounted} B \

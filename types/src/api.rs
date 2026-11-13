@@ -3276,6 +3276,32 @@ pub struct AdminStatus {
     /// reported — what `stow-admin index report --reconcile` compares
     /// the published slices against.
     pub index_slices: Vec<AdminIndexSlice>,
+    /// What the scheduler's graph holds against the Durable Object's
+    /// memory limit (stow#1501).
+    pub memory: AdminMemory,
+}
+
+/// The scheduler's resident graph against its memory lines, inside
+/// [`AdminStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AdminMemory {
+    /// Bytes the graph holds, by the formula over its node, state, edge
+    /// and string counts the admission decision uses.
+    pub resident_bytes: u64,
+    /// The normal line (`STOW_SCHEDULER_MEMORY_LINE`): any submission's
+    /// increment goes straight in up to it.
+    pub normal_line_bytes: u64,
+    /// The small-submission line (`STOW_SCHEDULER_SMALL_MEMORY_LINE`):
+    /// a submission whose increment is within the small increment goes
+    /// straight in up to it, and a graph larger than it fails to wake.
+    pub small_line_bytes: u64,
+    /// Bytes of Wasm linear memory the isolate holds; absent off
+    /// wasm32.
+    pub wasm_linear_bytes: Option<u64>,
+    /// Submissions held in the backlog, each a whole tree.
+    pub backlog_entries: u32,
+    /// Bytes of the backlog's stored submissions.
+    pub backlog_bytes: u64,
 }
 
 /// One reported index slice inside [`AdminStatus`].

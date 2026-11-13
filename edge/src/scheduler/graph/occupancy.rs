@@ -100,6 +100,96 @@ fn staged_bytes(staged: &StagedSlice) -> usize {
             .sum::<usize>()
 }
 
+/// The counts the resident-bytes formula reads: the ones a snapshot
+/// head records, the interned text and the ready entries. Every one is
+/// held as a count, so a graph's footprint is known in O(1) per event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::scheduler) struct ResidentCounts {
+    /// Node slots, freed ones included until the next compaction.
+    pub(in crate::scheduler) nodes: usize,
+    /// State slots, vacant ones included.
+    pub(in crate::scheduler) states: usize,
+    /// Dependency edges.
+    pub(in crate::scheduler) edges: usize,
+    /// Interned strings.
+    pub(in crate::scheduler) strings: usize,
+    /// Bytes of interned text.
+    pub(in crate::scheduler) text: usize,
+    /// Entries of the ready queues.
+    pub(in crate::scheduler) ready: usize,
+}
+
+/// What a merge adds to the structures [`resident_bytes`] counts,
+/// against the graph as it stands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::scheduler) struct Growth {
+    /// Nodes no live node holds the id of.
+    pub(in crate::scheduler) nodes: usize,
+    /// Of those, the ones that take queue state (the rest are born
+    /// published).
+    pub(in crate::scheduler) stateful: usize,
+    /// Dependency edges of the new nodes.
+    pub(in crate::scheduler) edges: usize,
+    /// Strings the interner does not hold yet.
+    pub(in crate::scheduler) strings: usize,
+    /// Bytes of those strings.
+    pub(in crate::scheduler) text: usize,
+}
+
+impl ResidentCounts {
+    /// The bytes these counts hold, by [`resident_bytes`].
+    pub(in crate::scheduler) fn bytes(&self) -> u64 {
+        u64::try_from(resident_bytes(self)).expect("resident bytes fit u64")
+    }
+
+    /// These counts after a merge of `growth`: a new state takes a
+    /// vacant slot before it grows the slab, and each stateful node
+    /// may enter the ready queue.
+    pub(in crate::scheduler) const fn grown(self, growth: Growth, vacant_states: usize) -> Self {
+        Self {
+            nodes: self.nodes + growth.nodes,
+            states: self.states + growth.stateful.saturating_sub(vacant_states),
+            edges: self.edges + growth.edges,
+            strings: self.strings + growth.strings,
+            text: self.text + growth.text,
+            ready: self.ready + growth.stateful,
+        }
+    }
+}
+
+/// What a graph of `counts` holds, by formula: every arena, index and
+/// queue sized from the counts a snapshot head records, the interned
+/// text and the ready entries. It tracks the occupancy line to within
+/// a percent at the density production wakes at (the test pins it).
+pub(in crate::scheduler) fn resident_bytes(counts: &ResidentCounts) -> usize {
+    let ResidentCounts {
+        nodes,
+        states,
+        edges,
+        strings,
+        text,
+        ready,
+    } = *counts;
+    // An arena allocates whole fragments of 1024 records.
+    let arena = |records: usize, record: usize| records.div_ceil(1024) * 1024 * record;
+    // An index holds its ids at seven eighths full, sized exactly.
+    let table = |entries: usize| (entries * 8).div_ceil(7).max(8) * size_of::<u32>();
+    arena(nodes, size_of::<Node>())
+        + arena(states, size_of::<State>())
+        + states.div_ceil(8)
+        // The text grows by doubling, the offsets are sized by the head.
+        + text.next_power_of_two()
+        + strings * size_of::<u32>()
+        + table(strings)
+        + 2 * table(nodes)
+        + arena(edges, size_of::<u32>())
+        + arena(edges, size_of::<u8>())
+        + arena(edges, size_of::<u32>())
+        + arena(nodes + 1, size_of::<u32>())
+        + nodes.div_ceil(8)
+        + btree_bytes(ready, size_of::<(i64, u32)>())
+}
+
 /// Heap bytes by structure. [`Self::accounted`] is their sum.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Occupancy {
@@ -196,6 +286,98 @@ impl Graph {
             staged_slices: self.staged_slices.values().map(staged_bytes).sum::<usize>()
                 + map_bytes::<super::SliceId, StagedSlice>(self.staged_slices.len()),
         }
+    }
+
+    /// The counts [`resident_bytes`] reads, held now. Constant time
+    /// but for the ready queues, one per rank-operand class.
+    pub(in crate::scheduler) fn resident_counts(&self) -> ResidentCounts {
+        ResidentCounts {
+            nodes: self.nodes.len(),
+            states: self.states.len(),
+            edges: self.edges.len(),
+            strings: self.intern.len(),
+            text: self.intern.text_len(),
+            ready: self.ready_sets().map(BTreeSet::len).sum(),
+        }
+    }
+
+    /// Bytes the graph holds, by [`resident_bytes`].
+    pub(in crate::scheduler) fn resident_bytes(&self) -> u64 {
+        self.resident_counts().bytes()
+    }
+
+    /// Fail unless the graph's resident bytes are within `budget`.
+    ///
+    /// # Errors
+    /// `QueueError::GraphExceedsBudget` past it.
+    pub(in crate::scheduler) fn ensure_within(
+        &self,
+        budget: u64,
+    ) -> Result<(), crate::errors::QueueError> {
+        let needed = self.resident_bytes();
+        if needed > budget {
+            return Err(crate::errors::QueueError::GraphExceedsBudget { needed, budget });
+        }
+        Ok(())
+    }
+
+    /// Vacant state slots a new state takes before the slab grows.
+    pub(in crate::scheduler) const fn vacant_states(&self) -> usize {
+        self.free_states.len()
+    }
+
+    /// What merging `validated` would add to the counted structures,
+    /// without changing the graph. Nodes the graph already holds cost
+    /// nothing: a merge into one only re-ranks it, in place. A new node
+    /// costs its record, its slots in the two indexes and its edges
+    /// (kept until a compaction even when it is born published and
+    /// released at once), a queue state and a ready entry when it is
+    /// not published, and the strings the interner does not hold. The
+    /// merge's other additions are constants: a priority value in the
+    /// pool, a pending-age key per merge instant and a target or rustc
+    /// id (at most 256 each), and one B-tree entry per human-lane node.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` when `base` lacks a row the merge reads.
+    pub(in crate::scheduler) fn merge_growth(
+        &self,
+        validated: &super::ValidatedSubmission<'_>,
+        base: &mut impl super::PublishedSource,
+    ) -> Result<Growth, crate::errors::QueueError> {
+        let super::ValidatedSubmission { tree, ids } = validated;
+        let mut growth = Growth::default();
+        let mut seen = std::collections::HashSet::new();
+        let mut strings = std::collections::HashSet::new();
+        for (sub, keys) in tree.nodes.iter().zip(ids) {
+            if self.find_key(keys.key).is_some() || !seen.insert(keys.key) {
+                continue;
+            }
+            growth.nodes += 1;
+            growth.edges += sub.deps.len();
+            let explicit =
+                sub.explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart;
+            let published = self.published_mask(&keys.key, base, || {
+                self.slice_lookup(sub.target.as_str(), sub.rustc_version.as_str())
+            })?;
+            // A target the graph has not held has no mask yet: assume
+            // the node takes a state.
+            let own = self.target_lookup(sub.target.as_str()).map(|target| {
+                self.targets[usize::from(target)].own_masks[usize::from(sub.host_side)]
+                    [usize::from(explicit)]
+            });
+            if own.is_none_or(|own| published & own != own) {
+                growth.stateful += 1;
+            }
+            let version = sub.version.to_string();
+            let features = sub.features_json.raw();
+            for text in [sub.crate_name.as_str(), version.as_str(), features.as_str()] {
+                if self.intern.get(text).is_none() && strings.insert(text.to_owned()) {
+                    growth.strings += 1;
+                    growth.text += text.len();
+                }
+            }
+        }
+        Ok(growth)
     }
 
     /// Occupancy and allocated buffer sizes, with the Wasm linear memory
