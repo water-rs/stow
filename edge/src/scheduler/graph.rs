@@ -46,6 +46,7 @@ mod digests;
 mod edges;
 mod index;
 mod node;
+mod occupancy;
 mod published;
 mod snapshot;
 mod sparse;
@@ -3574,75 +3575,6 @@ impl Graph {
     pub fn sizes(&self) -> (u64, u64, u64) {
         let live = self.nodes.len() - self.counts[Status::Free.index()] as usize;
         (live as u64, self.edges.len() as u64, self.published_ids)
-    }
-
-    /// Occupancy and allocated buffer sizes, with the Wasm linear memory
-    /// the isolate holds (wasm32 only). `accounted_storage_bytes` sums
-    /// the `*_storage_bytes` and index fields below. It excludes map
-    /// overhead, side allocations and transient memory; it is not a
-    /// total.
-    pub(super) fn trace_occupancy(&self, drive: &str, phase: &str, boundary: &str) {
-        let node_storage_bytes = self.nodes.capacity() * size_of::<Node>();
-        let state_storage_bytes = self.states.capacity() * size_of::<State>();
-        let free_state_storage_bytes = self.free_states.heap_bytes();
-        let demand_storage_bytes = self.demand.heap_bytes();
-        let intern_storage_bytes = self.intern.heap_bytes();
-        let priority_storage_bytes = self.priorities.heap_bytes();
-        let task_id_index_bytes = self.ids.heap_bytes();
-        let identity_index_bytes = self.idents.heap_bytes();
-        let edge_array_storage_bytes = self.edges.array_bytes();
-        let published_overlay_bytes = self.published.heap_bytes();
-        let extra_storage_bytes = self.extras.capacity() * size_of::<(u32, Extra)>();
-        let accounted_storage_bytes = node_storage_bytes
-            + state_storage_bytes
-            + free_state_storage_bytes
-            + demand_storage_bytes
-            + intern_storage_bytes
-            + priority_storage_bytes
-            + task_id_index_bytes
-            + identity_index_bytes
-            + edge_array_storage_bytes
-            + published_overlay_bytes
-            + extra_storage_bytes;
-        tracing::info!(
-            drive,
-            phase,
-            boundary,
-            graph_loaded = true,
-            retained_nodes = self.nodes.len() - self.counts[Status::Free.index()] as usize,
-            node_slots = self.nodes.len(),
-            node_capacity = self.nodes.capacity(),
-            node_fragments = self.nodes.fragments().len(),
-            node_storage_bytes,
-            active_states = self.states.len() - self.free_states.len(),
-            state_slots = self.states.len(),
-            state_capacity = self.states.capacity(),
-            state_fragments = self.states.fragments().len(),
-            state_storage_bytes,
-            free_state_slots = self.free_states.len(),
-            free_state_storage_bytes,
-            demand_storage_bytes,
-            intern_storage_bytes,
-            ready_entries = self.ready_sets().map(BTreeSet::len).sum::<usize>(),
-            ready_classes = self.ready.len() + self.ready_macos.len(),
-            priority_values = self.priorities.len(),
-            priority_storage_bytes,
-            task_id_index_bytes,
-            identity_index_bytes,
-            dependency_edges = self.edges.len(),
-            edge_array_storage_bytes,
-            published_identities = self.published_ids,
-            published_overlay_entries = self.published.len(),
-            published_overlay_bytes,
-            pending_age_entries = self.pending_ages.len(),
-            extra_entries = self.extras.len(),
-            extra_capacity = self.extras.capacity(),
-            extra_entry_bytes = size_of::<(u32, Extra)>(),
-            extra_storage_bytes,
-            accounted_storage_bytes,
-            wasm_linear_bytes = super::memory::linear_bytes(),
-            "budget graph occupancy"
-        );
     }
 
     /// The miss lane's pending depth, which `STOW_MAX_QUEUE_PENDING`
