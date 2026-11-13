@@ -575,6 +575,8 @@ const TAG_OPS: u64 = 7;
 const TAG_PREHEAT: u64 = 8;
 const TAG_INEXACT: u64 = 9;
 const TAG_SNAPSHOT: u64 = 10;
+const TAG_BACKLOG_SUBMIT: u64 = 16;
+const TAG_BACKLOG_ADMIT: u64 = 17;
 /// The snapshot drive's setup bindings' run ids — its own range, clear
 /// of the host pass's and the run drives'.
 const SNAPSHOT_RUN_BASE: u64 = 7_000_000_000;
@@ -624,7 +626,59 @@ async fn submit(
     )
     .await
     .map_err(text)
-    .map(|(inserted, _unpublished)| inserted)
+    .map(|submitted| submitted.inserted)
+}
+
+/// Submit one preheat node under lines of zero, so the graph has no
+/// room and the tree is backlogged.
+async fn backlog_submit(
+    ctx: &DriveContext,
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    tag: u64,
+) -> Result<(), String> {
+    let full = SchedulerSettings {
+        memory_line_bytes: 0,
+        small_memory_line_bytes: 0,
+        ..*settings
+    };
+    let submitted = routes::submit(
+        ctx.loaded(),
+        db,
+        &full,
+        &[source_tree(
+            SubmissionSource::Preheat,
+            "costgate-backlog",
+            tag,
+        )],
+        false,
+        Some(DRIVE_ACTOR),
+        now_ms(),
+    )
+    .await
+    .map_err(text)?;
+    if submitted.backlogged.len() == 1 && submitted.inserted == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "backlogged submit inserted {} and backlogged {}, expected 0 and 1",
+            submitted.inserted,
+            submitted.backlogged.len()
+        ))
+    }
+}
+
+/// Admit whatever the backlog drives left, then cancel the node.
+async fn drain_backlog(
+    ctx: &DriveContext,
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    tag: u64,
+) -> Result<(), String> {
+    routes::admit_backlog(ctx.loaded(), db, settings)
+        .await
+        .map_err(text)?;
+    cancel_submitted(ctx, db, vec![source_node_id("costgate-backlog", tag)]).await
 }
 
 async fn submit_expect(
@@ -1505,9 +1559,9 @@ pub const DRIVES: &[Drive] = &[
         // dispatch cap at any population.
         name: "GET /admin/status",
         setup: None,
-        run: |db, _shape, _settings, ctx| {
+        run: |db, _shape, settings, ctx| {
             Box::pin(async move {
-                routes::admin_status(ctx.loaded(), db, now_ms())
+                routes::admin_status(ctx.loaded(), db, settings, now_ms())
                     .await
                     .map(|_| ())
                     .map_err(text)
@@ -1877,6 +1931,7 @@ pub const DRIVES: &[Drive] = &[
                 routes::request_outcome(
                     ctx.loaded(),
                     db,
+                    settings,
                     DRIVE_REQUEST_ID,
                     &request_report(shape),
                     Some(DRIVE_ACTOR),
@@ -2276,6 +2331,41 @@ pub const DRIVES: &[Drive] = &[
                 )
                 .await
             })
+        }),
+    },
+    Drive {
+        // stow#1501: a submission the memory lines have no room for goes
+        // verbatim into the backlog — one row per part plus the tally.
+        name: "POST /tasks/submit (backlogged)",
+        setup: None,
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move { backlog_submit(ctx, db, settings, TAG_BACKLOG_SUBMIT).await })
+        },
+        cleanup: Some(|db, _shape, settings, ctx| {
+            Box::pin(async move { drain_backlog(ctx, db, settings, TAG_BACKLOG_SUBMIT).await })
+        }),
+    },
+    Drive {
+        // stow#1501: the pass a completion or the alarm runs — it reads
+        // the head entry, merges it and deletes it.
+        name: "backlog admission",
+        setup: Some(|db, _shape, settings, ctx| {
+            Box::pin(async move { backlog_submit(ctx, db, settings, TAG_BACKLOG_ADMIT).await })
+        }),
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                let admitted = routes::admit_backlog(ctx.loaded(), db, settings)
+                    .await
+                    .map_err(text)?;
+                if admitted == 1 {
+                    Ok(())
+                } else {
+                    Err(format!("backlog admission admitted {admitted}, expected 1"))
+                }
+            })
+        },
+        cleanup: Some(|db, _shape, settings, ctx| {
+            Box::pin(async move { drain_backlog(ctx, db, settings, TAG_BACKLOG_ADMIT).await })
         }),
     },
     Drive {
@@ -2763,7 +2853,7 @@ pub const DRIVES: &[Drive] = &[
                         nodes.gcm.clone(),
                     ],
                 };
-                let (inserted, _) = routes::submit(
+                let inserted = routes::submit(
                     ctx.loaded(),
                     db,
                     settings,
@@ -2773,7 +2863,8 @@ pub const DRIVES: &[Drive] = &[
                     now_ms() - 60_000,
                 )
                 .await
-                .map_err(text)?;
+                .map_err(text)?
+                .inserted;
                 // keeper, aes and aes-gcm; the published nodes are born
                 // published.
                 if inserted != 3 {
@@ -2978,6 +3069,57 @@ pub const DRIVES: &[Drive] = &[
                 routes::snapshot(ctx.loaded(), db, now_ms())
                     .await
                     .map_err(text)
+            })
+        }),
+    },
+    Drive {
+        // The memory lines in force (stow#1501): the `memory_line` row,
+        // read once per isolate, over the bindings. No wake.
+        name: "GET /memory-line",
+        setup: None,
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                routes::memory_lines(db, ctx.loaded().cell(), settings)
+                    .await
+                    .map_err(text)?;
+                Ok(())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // The operator's `set` (stow#1501): one upsert of the
+        // `memory_line` row and no graph read. The seed stores no row,
+        // so the cleanup deletes it and the cell forgets it.
+        name: "POST /memory-line",
+        setup: None,
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                routes::set_memory_lines(
+                    db,
+                    ctx.loaded().cell(),
+                    settings,
+                    stow_types::api::MemoryLineSet {
+                        normal_line_bytes: settings.memory_line_bytes,
+                        small_line_bytes: settings.small_memory_line_bytes,
+                        small_increment_bytes: settings.small_increment_bytes,
+                    },
+                    DRIVE_ACTOR,
+                    "2026-01-01T00:00:00.000Z".to_owned(),
+                )
+                .await
+                .map_err(text)?;
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                db.query("DELETE FROM memory_line")
+                    .execute()
+                    .await
+                    .map_err(text)?;
+                ctx.loaded().cell().set_memory_line(None);
+                Ok(())
             })
         }),
     },
@@ -3399,6 +3541,7 @@ pub const DRIVES: &[Drive] = &[
                     routes::request_outcome(
                         ctx.loaded(),
                         db,
+                        settings,
                         DISPATCH_REQUEST_ID,
                         &report,
                         Some(DRIVE_ACTOR),
@@ -3817,9 +3960,9 @@ pub const DRIVES: &[Drive] = &[
                 Ok(())
             })
         }),
-        run: |db, _shape, _settings, ctx| {
+        run: |db, _shape, settings, ctx| {
             Box::pin(async move {
-                routes::wake_graph(db, &ctx.graph, now_ms())
+                routes::wake_graph(db, &ctx.graph, settings.small_memory_line_bytes, now_ms())
                     .await
                     .map_err(text)?;
                 Ok(())

@@ -58,6 +58,7 @@ use edges::Edges;
 use index::{Interner, IxTable, Priorities, hash_of};
 pub use node::RunCompletion;
 use node::{Extra, FIRST_ATTEMPT, Flags, Lane, NO_STATE, Node, State, Status};
+pub(super) use occupancy::{ResidentCounts, Room};
 pub use published::{
     Fetched, PublishedNeeds, PublishedRow, PublishedSource, ReadSource, slice_column,
 };
@@ -459,6 +460,9 @@ pub struct Graph {
     /// The node arena. Indexes are stable between compactions and
     /// compactions keep creation order.
     nodes: Arena<Node>,
+    /// Edges of the freed nodes in `nodes`: what the next compaction
+    /// drops from the edge arrays along with them (stow#1501).
+    free_edges: usize,
     /// Derived queue-state candidates; published and free nodes have no entry.
     /// Rebuilt with the identity indexes after loading or renumbering nodes.
     by_status: [fixedbitset::FixedBitSet; Status::COUNT],
@@ -600,6 +604,14 @@ pub struct Graph {
     /// memory only: the probe ledger reports it so a reader can tell a
     /// reload, which drops every ledger booking since the snapshot.
     pub woken_at_ms: i64,
+    /// The submissions the backlog holds (stow#1501): in memory only,
+    /// read from `store_meta` at the wake and moved with every write
+    /// to the table, so the status reads and the admission pass never
+    /// scan it.
+    pub(super) backlog: super::backlog::Tally,
+    /// The backlog head the last admission pass found too large, so a
+    /// pass reads it again only once the room it needed exists.
+    pub(super) backlog_blocked: Option<super::backlog::Blocked>,
     /// The fixture size the budget probe last seeded this store at —
     /// `None` until a seed runs. It rides the snapshot head so `rearm`
     /// and the probe read it from the graph: a `store_meta` row would
@@ -1345,6 +1357,7 @@ impl Graph {
         while let Some(ix) = work.pop() {
             debug_assert_eq!(self.node(ix).status, Status::Published);
             self.set_status(ix, Status::Free);
+            self.free_edges += usize::from(self.node(ix).edges_len);
             for edge in self.edge_range(ix) {
                 let dep = self.edges.dep(edge);
                 let held = self.node_mut(dep);
@@ -1436,6 +1449,7 @@ impl Graph {
             .map(|&ix| remap[ix as usize])
             .collect::<BTreeSet<_>>();
         self.counts[Status::Free.index()] = 0;
+        self.free_edges = 0;
         for target in &mut self.targets {
             target.counts[Status::Free.index()] = 0;
         }
@@ -1492,7 +1506,7 @@ impl Graph {
 }
 
 /// Freed nodes below which a compaction is never worth its pass.
-const COMPACT_FLOOR: usize = 1_024;
+pub(super) const COMPACT_FLOOR: usize = 1_024;
 
 /// Merge, publish and the claim gate.
 impl Graph {
@@ -4539,6 +4553,7 @@ impl Graph {
     pub fn admin_status_with(
         &self,
         now: i64,
+        settings: &queue::SchedulerSettings,
         digests: &mut impl DigestSource,
     ) -> Result<stow_types::api::AdminStatus, QueueError> {
         let status = self.status();
@@ -4607,6 +4622,14 @@ impl Graph {
             in_flight,
             targets,
             dispatch_frozen: self.freeze.is_some(),
+            memory: stow_types::api::AdminMemory {
+                resident_bytes: self.resident_bytes(),
+                normal_line_bytes: settings.memory_line_bytes,
+                small_line_bytes: settings.small_memory_line_bytes,
+                wasm_linear_bytes: super::memory::linear_bytes(),
+                backlog_entries: self.backlog.entries(),
+                backlog_bytes: self.backlog.bytes(),
+            },
             index_slices: self
                 .slice_generations()
                 .into_iter()
@@ -4707,6 +4730,20 @@ pub struct GraphCell {
     /// Set by the wake, cleared by the one request that runs the
     /// post-wake CI status reconcile.
     reconcile_due: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether this isolate already alerted that its graph exceeds the
+    /// memory line.
+    #[cfg(target_arch = "wasm32")]
+    exceeded_alerted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The last wake that found the graph over the memory line: the
+    /// bytes it needed (zero while none failed) and the line. Only a
+    /// reset changes a store no route can wake, so a later wake under
+    /// the same line fails with it before reading a row — a scheduler
+    /// over its line costs each request nothing, not a snapshot load.
+    oversize: std::sync::Arc<[std::sync::atomic::AtomicU64; 2]>,
+    /// The operator's memory lines as the store holds them, once this
+    /// isolate read the `memory_line` row. Kept beside the graph, never
+    /// in it: the wake reads the line it loads under from here.
+    memory_line: std::sync::Arc<std::sync::Mutex<super::memory_line::Cached>>,
     /// The isolate's cached GitHub App installation token.
     tokens: crate::github_app::TokenCache,
     /// The isolate's billed-but-unsettled row counts — see [`Unsettled`].
@@ -4826,9 +4863,50 @@ impl GraphCell {
         self.reconcile_due
             .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
+    /// Take the duty to alert that the graph exceeds its memory line —
+    /// `true` for the first failed wake of this isolate only, so a
+    /// scheduler that keeps failing sends one alert, not one per route.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn take_exceeded_alert(&self) -> bool {
+        !self
+            .exceeded_alerted
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+    /// The error a wake under `budget` fails with without reading the
+    /// store: the last failed wake's, while `budget` is no larger than
+    /// the line it failed against.
+    pub(crate) fn oversized(&self, budget: u64) -> Option<QueueError> {
+        let needed = self.oversize[0].load(std::sync::atomic::Ordering::Relaxed);
+        let line = self.oversize[1].load(std::sync::atomic::Ordering::Relaxed);
+        (needed != 0 && budget <= line).then_some(QueueError::GraphExceedsBudget { needed, budget })
+    }
+    /// Remember a wake that found the graph needs `needed` bytes against
+    /// the line `budget`.
+    pub(crate) fn record_oversize(&self, needed: u64, budget: u64) {
+        self.oversize[1].store(budget, std::sync::atomic::Ordering::Relaxed);
+        self.oversize[0].store(needed, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// What this isolate knows of the stored memory-line setting.
+    pub(crate) fn memory_line(&self) -> super::memory_line::Cached {
+        self.memory_line
+            .lock()
+            .expect("memory line poisoned")
+            .clone()
+    }
+    /// Keep `setting` as the store's memory-line row.
+    pub(crate) fn set_memory_line(&self, setting: Option<stow_types::api::MemoryLineSetting>) {
+        *self.memory_line.lock().expect("memory line poisoned") =
+            super::memory_line::Cached::Read(setting);
+    }
     /// Drop the in-memory graph — the operator reset: the next
     /// request wakes from the (reset) store.
     pub(crate) fn clear(&self) {
+        self.oversize[0].store(0, std::sync::atomic::Ordering::Relaxed);
+        *self.memory_line.lock().expect("memory line poisoned") =
+            super::memory_line::Cached::Unread;
+        #[cfg(target_arch = "wasm32")]
+        self.exceeded_alerted
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         *self.graph.lock().expect("graph cell poisoned") = Graph::default();
         self.loaded
             .store(false, std::sync::atomic::Ordering::Release);
@@ -5155,7 +5233,11 @@ impl Graph {
         &self,
         now: i64,
     ) -> Result<stow_types::api::AdminStatus, QueueError> {
-        self.admin_status_with(now, &mut self.test_digest_source())
+        self.admin_status_with(
+            now,
+            &queue::SchedulerSettings::default(),
+            &mut self.test_digest_source(),
+        )
     }
 
     pub(crate) fn select_ids(
@@ -6188,7 +6270,7 @@ mod tests {
     /// plan — every row of every dirty span, in key order.
     fn round_trip(graph: &Graph) -> Graph {
         let plan = graph.snapshot_plan().expect("plan");
-        let mut loader = SnapshotLoader::default();
+        let mut loader = SnapshotLoader::new(u64::MAX);
         for span in plan.spans {
             let mut encoder = graph.snapshot_encoder(span);
             let mut sub = 0i64;
@@ -6462,6 +6544,80 @@ mod tests {
             before.encode_dispatch_task().expect("encode before"),
             after.encode_dispatch_task().expect("encode after")
         );
+    }
+
+    /// stow#1501: the records published nodes free count as room once
+    /// a compaction would drop them. A merge that fits only that way
+    /// compacts first, and the compacted graph holds exactly the
+    /// figure the room was judged against.
+    #[test]
+    fn the_room_counts_what_a_compaction_would_reclaim() {
+        let mut graph = Graph::default();
+        let mut nodes: Vec<_> = (0..9_000).map(|n| sub(&format!("l{n}"))).collect();
+        for n in 0..1_000u32 {
+            let mut dependent = sub(&format!("d{n}"));
+            dependent.deps = vec![n];
+            nodes.push(dependent);
+        }
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![],
+                    nodes,
+                },
+                0,
+            )
+            .expect("merge");
+        // 600 dependents and their leaves publish: 1,200 freed records
+        // and 600 edges, under the eighth the graph compacts at itself.
+        let rows: Vec<_> = (0..600)
+            .flat_map(|n| [format!("l{n}"), format!("d{n}")])
+            .flat_map(|name| {
+                [
+                    published_row(&name, UnitKind::Linked),
+                    published_row(&name, UnitKind::Unlinked),
+                ]
+            })
+            .collect();
+        let live = graph.slice_generation(TARGET, RUSTC);
+        graph.apply_slice_report(
+            TARGET,
+            RUSTC,
+            live,
+            live.map_or(1, |live| live + 1),
+            &rows,
+            &[],
+        );
+        assert_eq!(graph.counts[Status::Free.index()], 1_200);
+        assert_eq!(graph.free_edges, 600);
+
+        let reusable = Room::of(&graph).reusable_resident();
+        let resident = graph.resident_bytes();
+        assert!(reusable < resident, "{reusable} < {resident}");
+        let growth = occupancy::Growth {
+            nodes: 1,
+            stateful: 1,
+            ..occupancy::Growth::default()
+        };
+        let lines = |line: u64| queue::SchedulerSettings {
+            memory_line_bytes: line,
+            small_memory_line_bytes: line,
+            ..queue::SchedulerSettings::default()
+        };
+        // No room even after a compaction: nothing is planned.
+        let mut room = Room::of(&graph);
+        assert!(room.take(&lines(reusable), growth).is_err());
+        assert!(!room.compact());
+        // Room only after one: the merge fits and plans it.
+        let settings = lines(reusable + 4_096);
+        assert!(!settings.admits(resident, 1), "no room without it");
+        let mut room = Room::of(&graph);
+        assert_eq!(room.take(&settings, growth), Ok(()));
+        assert!(room.compact());
+        graph.compact();
+        assert_eq!(graph.resident_bytes(), reusable);
+        assert_eq!(graph.free_edges, 0);
     }
 
     #[test]
@@ -6910,37 +7066,6 @@ mod tests {
         }
     }
 
-    /// What a graph of `nodes` nodes holds at production density, by
-    /// formula: the counts a snapshot head records (nodes, state slots,
-    /// edges, interned strings) and the interned text.
-    fn resident_bytes(
-        nodes: usize,
-        states: usize,
-        edges: usize,
-        strings: usize,
-        text: usize,
-        ready: usize,
-    ) -> usize {
-        // An arena allocates whole fragments of 1024 records.
-        let arena = |records: usize, record: usize| records.div_ceil(1024) * 1024 * record;
-        // An index holds its ids at seven eighths full, sized exactly.
-        let table = |entries: usize| (entries * 8).div_ceil(7).max(8) * size_of::<u32>();
-        arena(nodes, size_of::<Node>())
-            + arena(states, size_of::<State>())
-            + states.div_ceil(8)
-            // The text grows by doubling, the offsets are sized by the head.
-            + text.next_power_of_two()
-            + strings * size_of::<u32>()
-            + table(strings)
-            + 2 * table(nodes)
-            + arena(edges, size_of::<u32>())
-            + arena(edges, size_of::<u8>())
-            + arena(edges, size_of::<u32>())
-            + arena(nodes + 1, size_of::<u32>())
-            + nodes.div_ceil(8)
-            + occupancy::btree_bytes(ready, size_of::<(i64, u32)>())
-    }
-
     /// The occupancy line counts every structure the graph holds, and a
     /// resident-bytes formula over the snapshot head's counts tracks it
     /// at the density production wakes at (stow#1501): 5.9 edges per
@@ -6996,7 +7121,23 @@ mod tests {
             + "1.0.0".len()
             + FeaturesJson::default().raw().len();
         let ready = graph.ready_sets().map(BTreeSet::len).sum::<usize>();
-        let expected = resident_bytes(live, states, edges, graph.intern.len(), text, ready);
+        let counts = ResidentCounts {
+            nodes: live,
+            states,
+            edges,
+            strings: graph.intern.len(),
+            text,
+            ready,
+        };
+        assert_eq!(
+            counts,
+            ResidentCounts {
+                text: graph.intern.text_len(),
+                ..graph.resident_counts()
+            },
+            "the graph's own counts are the head's"
+        );
+        let expected = occupancy::resident_bytes(&counts);
         let accounted = held.accounted();
         eprintln!(
             "occupancy: {live} nodes {edges} edges {states} states: accounted {accounted} B \

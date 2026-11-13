@@ -7,6 +7,9 @@
 //! `object` is the Durable Object glue.
 
 mod activity;
+/// The submissions the graph's memory lines had no room for, stored
+/// whole until completions free room (stow#1501).
+pub mod backlog;
 /// The hourly demand feed's durable hour/page state machine —
 /// backend-abstracted like `queue` so it host-tests on every target.
 pub mod feed;
@@ -16,6 +19,10 @@ pub mod feed;
 /// order. `object.rs`'s submit routes, delivery routes and dispatch
 /// pass consume it (stow#878 stage 4–6).
 pub mod graph;
+/// The alert a wake raises when the graph exceeds its memory line.
+pub mod graph_alert;
+/// The operator's memory lines, stored outside the graph (stow#1501).
+pub mod memory_line;
 pub mod meter;
 pub mod queue;
 /// The graph-and-store cores of the routes, shared by the Durable

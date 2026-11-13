@@ -1528,6 +1528,57 @@ pub struct ReleasePrioritySetting {
     pub actor: String,
 }
 
+/// The scheduler graph's memory lines (stow#1501) — wire shape of
+/// `GET`/`POST /api/v1/admin/memory-line` and of the scheduler object's
+/// `/memory-line` routes.
+///
+/// Up to the normal line any submission's increment goes straight into
+/// the graph; up to the small line one within the small increment does;
+/// what fits neither waits in the backlog, and a graph larger than the
+/// small line fails to wake. The deploy bindings
+/// `STOW_SCHEDULER_MEMORY_LINE`, `STOW_SCHEDULER_SMALL_MEMORY_LINE` and
+/// `STOW_SCHEDULER_SMALL_INCREMENT_BYTES` apply until the first `set`;
+/// the setting lives outside the graph, so it reads and sets while the
+/// graph cannot wake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MemoryLines {
+    /// The operator setting in force — absent until the first `set`,
+    /// when the deploy bindings apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setting: Option<MemoryLineSetting>,
+    /// The normal line in force, in resident bytes.
+    pub normal_line_bytes: u64,
+    /// The small-submission line in force, in resident bytes.
+    pub small_line_bytes: u64,
+    /// The largest increment that counts as small, in resident bytes.
+    pub small_increment_bytes: u64,
+}
+
+/// What an operator's `memory-line set` wrote — `POST`'s request body.
+/// No bound is checked: the operator is trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MemoryLineSet {
+    /// The normal line, in resident bytes.
+    pub normal_line_bytes: u64,
+    /// The small-submission line, in resident bytes.
+    pub small_line_bytes: u64,
+    /// The largest increment that counts as small, in resident bytes.
+    pub small_increment_bytes: u64,
+}
+
+/// The operator setting a `set` stored — the scheduler store's
+/// `memory_line` row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MemoryLineSetting {
+    /// The lines the set named.
+    #[serde(flatten)]
+    pub lines: MemoryLineSet,
+    /// ISO 8601 timestamp of the set.
+    pub set_at: String,
+    /// The verified `actor` claim of the operations run that set it.
+    pub actor: String,
+}
+
 /// One component's health as `GET /api/v1/scheduler/health` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -3276,6 +3327,32 @@ pub struct AdminStatus {
     /// reported — what `stow-admin index report --reconcile` compares
     /// the published slices against.
     pub index_slices: Vec<AdminIndexSlice>,
+    /// What the scheduler's graph holds against the Durable Object's
+    /// memory limit (stow#1501).
+    pub memory: AdminMemory,
+}
+
+/// The scheduler's resident graph against its memory lines, inside
+/// [`AdminStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AdminMemory {
+    /// Bytes the graph holds, by the formula over its node, state, edge
+    /// and string counts the admission decision uses.
+    pub resident_bytes: u64,
+    /// The normal line (`STOW_SCHEDULER_MEMORY_LINE`): any submission's
+    /// increment goes straight in up to it.
+    pub normal_line_bytes: u64,
+    /// The small-submission line (`STOW_SCHEDULER_SMALL_MEMORY_LINE`):
+    /// a submission whose increment is within the small increment goes
+    /// straight in up to it, and a graph larger than it fails to wake.
+    pub small_line_bytes: u64,
+    /// Bytes of Wasm linear memory the isolate holds; absent off
+    /// wasm32.
+    pub wasm_linear_bytes: Option<u64>,
+    /// Submissions held in the backlog, each a whole tree.
+    pub backlog_entries: u32,
+    /// Bytes of the backlog's stored submissions.
+    pub backlog_bytes: u64,
 }
 
 /// One reported index slice inside [`AdminStatus`].

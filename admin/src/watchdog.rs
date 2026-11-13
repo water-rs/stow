@@ -386,6 +386,18 @@ const SIGNALS: &[Signal] = &[
         unit: "stalled",
         effect: Effect::Alert,
     },
+    // The scheduler graph's resident bytes against the small-submission
+    // line (stow#1501). The line is an operator setting the scheduler
+    // reports, so the reading brings its own threshold, 80% of it.
+    Signal {
+        id: "scheduler.memory",
+        label: "scheduler graph resident bytes against 80% of the small-submission line",
+        window: Window::Last(HOUR),
+        min_sample: 1,
+        threshold: 0.0,
+        unit: "bytes",
+        effect: Effect::Alert,
+    },
     // The two liveness signals: a pipeline that does nothing raises no
     // failure, so each judges the absence. Their levels are operator
     // settings ([`LivenessLevels`]), so the table carries `0.0` and each
@@ -1074,6 +1086,7 @@ impl Watcher<'_> {
         );
         Ok(vec![
             stalled_builds,
+            memory_reading(&status.memory),
             Reading {
                 signal: signal("pipeline.oldest_pending"),
                 threshold: None,
@@ -1111,7 +1124,7 @@ impl Watcher<'_> {
     // ----- workflow history -----
 
     /// `watchdog.gap` and `operations.failed`. The newest completed
-    /// watchdog run that finished `success` or `failure` is one REST read
+    /// dispatched watchdog run that finished `success` or `failure` is one REST read
     /// (the run in progress is not completed, so it is never its own
     /// predecessor). The `operations.yml` runs are then enumerated over
     /// the closed created-window that can hold a run concluding after the
@@ -1119,10 +1132,13 @@ impl Watcher<'_> {
     /// covered however many successes fill it, with no page size to
     /// outgrow; the failed conclusions are kept in code.
     async fn history_readings(&self, levels: &HistoryLevels) -> Result<Vec<Reading>, String> {
+        // Only dispatched runs: the edge's Cron Trigger dispatches the
+        // watchdog, and the workflow's own `schedule` runs would fill
+        // the gap a missed dispatch leaves (stow#1501).
         let watchdogs = recent_runs(
             self.gh_token,
             WATCHDOG_WORKFLOW,
-            "&status=completed",
+            "&status=completed&event=workflow_dispatch",
             WATCHDOG_HISTORY_PAGE,
         )
         .await?;
@@ -1570,6 +1586,36 @@ fn age_hours(now: OffsetDateTime, at: OffsetDateTime) -> f64 {
     #[allow(clippy::cast_precision_loss)]
     let secs = (now - at).whole_seconds().max(0) as f64;
     secs / 3600.0
+}
+
+/// Share of the small-submission line at which `scheduler.memory`
+/// alerts (stow#1501).
+const MEMORY_ALERT_PERCENT: f64 = 80.0;
+
+/// `scheduler.memory`: the graph's resident bytes against 80% of the
+/// small-submission line the scheduler reports.
+fn memory_reading(memory: &stow_types::api::AdminMemory) -> Reading {
+    #[allow(clippy::cast_precision_loss)]
+    let (resident, line) = (memory.resident_bytes as f64, memory.small_line_bytes as f64);
+    let mut evidence = vec![
+        format!("resident_bytes={}", memory.resident_bytes),
+        format!("normal_line_bytes={}", memory.normal_line_bytes),
+        format!("small_line_bytes={}", memory.small_line_bytes),
+        format!(
+            "backlog={} entries, {} bytes",
+            memory.backlog_entries, memory.backlog_bytes
+        ),
+    ];
+    if let Some(linear) = memory.wasm_linear_bytes {
+        evidence.push(format!("wasm_linear_bytes={linear}"));
+    }
+    Reading {
+        signal: signal("scheduler.memory"),
+        threshold: Some(line * MEMORY_ALERT_PERCENT / 100.0),
+        sample: 1,
+        value: resident,
+        evidence,
+    }
 }
 
 /// `pipeline.preheat_stale`: the age of the newest successful preheat
@@ -5022,6 +5068,28 @@ mod tests {
         assert_eq!(verdict_of(&loose), Verdict::Clear);
         // It alerts and never trips.
         let decision = decide(&[stale], &[]);
+        assert!(decision.incident);
+        assert_eq!(decision.tripped, [] as [usize; 0]);
+        assert_eq!(decision.alerting.len(), 1);
+    }
+
+    /// stow#1501: the graph alerts at 80% of the small-submission line,
+    /// whatever the operator set it to, and never trips.
+    #[test]
+    fn scheduler_memory_alerts_at_eighty_percent_of_the_small_line() {
+        let memory = |resident_bytes| stow_types::api::AdminMemory {
+            resident_bytes,
+            normal_line_bytes: 100_000_000,
+            small_line_bytes: 110_000_000,
+            wasm_linear_bytes: None,
+            backlog_entries: 2,
+            backlog_bytes: 4096,
+        };
+        let below = memory_reading(&memory(87_999_999));
+        assert_eq!(verdict_of(&below), Verdict::Clear);
+        let at = memory_reading(&memory(88_000_000));
+        assert_eq!(verdict_of(&at), Verdict::Breach);
+        let decision = decide(&[at], &[]);
         assert!(decision.incident);
         assert_eq!(decision.tripped, [] as [usize; 0]);
         assert_eq!(decision.alerting.len(), 1);

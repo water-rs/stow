@@ -193,6 +193,11 @@ impl Interner {
         self.ends.len()
     }
 
+    /// Bytes of interned text.
+    pub(super) const fn text_len(&self) -> usize {
+        self.text.len()
+    }
+
     pub(super) fn at(&self, id: u32) -> &str {
         slice(&self.text, &self.ends, id)
     }
@@ -232,9 +237,11 @@ impl Interner {
         self.push(value);
     }
 
-    /// Size the offset array for `strings` strings.
-    pub(super) fn reserve_exact(&mut self, strings: usize) {
+    /// Size the offset array for `strings` strings and the text for
+    /// `text` bytes.
+    pub(super) fn reserve_exact(&mut self, strings: usize, text: usize) {
         self.ends.reserve_exact(strings);
+        self.text.reserve_exact(text);
     }
 
     /// Build the lookup table over the loaded strings.

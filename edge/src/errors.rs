@@ -154,6 +154,20 @@ pub enum QueueError {
     /// reported exhausted while no dispatched/running row exists).
     #[error("queue invariant violated: {0}")]
     Invariant(String),
+    /// The graph a wake loads is larger than the Durable Object's
+    /// memory line: the scheduler cannot serve from it. Every route and
+    /// the alarm fail with this named error rather than a `RangeError`
+    /// out of an exhausted isolate.
+    #[error(
+        "scheduler graph needs {needed} bytes but the memory line is {budget} bytes \
+         (STOW_SCHEDULER_SMALL_MEMORY_LINE)"
+    )]
+    GraphExceedsBudget {
+        /// Bytes the graph's counts need.
+        needed: u64,
+        /// The small-submission line, the most a graph may hold.
+        budget: u64,
+    },
     /// Numeric overflow when packing a queue field.
     #[error("queue numeric overflow on `{field}`: {value}")]
     Overflow {

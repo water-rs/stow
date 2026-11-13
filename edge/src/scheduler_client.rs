@@ -17,6 +17,7 @@ const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/pu
 const SCHEDULER_FREEZE_URL: &str = "https://scheduler.internal/dispatch-freeze";
 const SCHEDULER_DISPATCH_CAP_URL: &str = "https://scheduler.internal/dispatch-cap";
 const SCHEDULER_RELEASE_PRIORITY_URL: &str = "https://scheduler.internal/release-priority";
+const SCHEDULER_MEMORY_LINE_URL: &str = "https://scheduler.internal/memory-line";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
 const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
 const SCHEDULER_RESET_URL: &str = "https://scheduler.internal/reset";
@@ -269,6 +270,24 @@ pub async fn set_release_priority(
     actor: &str,
 ) -> Result<stow_types::api::ReleasePriority, SchedulerClientError> {
     post_json_as(namespace, SCHEDULER_RELEASE_PRIORITY_URL, set, actor).await
+}
+
+/// The scheduler graph's memory lines in force and the operator setting
+/// behind them (stow#1501).
+pub async fn get_memory_lines(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::MemoryLines, SchedulerClientError> {
+    get_json(namespace, SCHEDULER_MEMORY_LINE_URL).await
+}
+
+/// The operator's `memory-line set` — in force until the next `set`;
+/// the object answers the lines it now applies.
+pub async fn set_memory_lines(
+    namespace: &CfDurableNamespace,
+    set: &stow_types::api::MemoryLineSet,
+    actor: &str,
+) -> Result<stow_types::api::MemoryLines, SchedulerClientError> {
+    post_json_as(namespace, SCHEDULER_MEMORY_LINE_URL, set, actor).await
 }
 
 /// The operator view behind `stow-admin status`.

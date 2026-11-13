@@ -154,12 +154,17 @@ pub async fn run(
     // nobody seeded has none to measure — wake the graph rather than
     // read `store_meta`, a billed statement outside every checkpoint
     // (stow#931).
-    let queue_rows = super::routes::wake_graph(db, graph, super::object::now_ms())
-        .await?
-        .with(|graph| graph.seeded_rows)
-        .ok_or_else(|| {
-            QueueError::Invariant("no fixture was seeded — seed before measuring".to_owned())
-        })?;
+    let queue_rows = super::routes::wake_graph(
+        db,
+        graph,
+        settings.small_memory_line_bytes,
+        super::object::now_ms(),
+    )
+    .await?
+    .with(|graph| graph.seeded_rows)
+    .ok_or_else(|| {
+        QueueError::Invariant("no fixture was seeded — seed before measuring".to_owned())
+    })?;
     let shape = FixtureShape { queue_rows };
     // Every run starts from the canonical graph: reseeding restores
     // what earlier runs, passes and the callback lane moved.

@@ -18,7 +18,7 @@ use crate::freeze::{self, FreezeSettings};
 use crate::github_app;
 use crate::scheduler::meter::{self, Meter, MeterGuard};
 use crate::scheduler::queue::SchedulerSettings;
-use crate::scheduler::{budget, fixture};
+use crate::scheduler::{budget, fixture, graph_alert};
 use crate::scheduler::{dispatch, feed, graph, queue, routes, store};
 
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
@@ -29,6 +29,9 @@ const STOW_STALE_DISPATCH_MINUTES_BINDING: &str = "STOW_STALE_DISPATCH_MINUTES";
 const STOW_MAX_QUEUE_PENDING_BINDING: &str = "STOW_MAX_QUEUE_PENDING";
 const STOW_HUMAN_DAILY_TASK_BUDGET_BINDING: &str = "STOW_HUMAN_DAILY_TASK_BUDGET";
 const STOW_MIN_DISPATCH_VALUE_BINDING: &str = "STOW_MIN_DISPATCH_VALUE";
+const STOW_SCHEDULER_MEMORY_LINE_BINDING: &str = "STOW_SCHEDULER_MEMORY_LINE";
+const STOW_SCHEDULER_SMALL_MEMORY_LINE_BINDING: &str = "STOW_SCHEDULER_SMALL_MEMORY_LINE";
+const STOW_SCHEDULER_SMALL_INCREMENT_BYTES_BINDING: &str = "STOW_SCHEDULER_SMALL_INCREMENT_BYTES";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
@@ -55,7 +58,9 @@ fn route_error(error: QueueError) -> Error {
         QueueError::QueueFull { .. } | QueueError::HumanDailyBudgetExhausted { .. } => {
             StatusCode::TOO_MANY_REQUESTS
         }
-        QueueError::Sql(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        QueueError::Sql(_) | QueueError::GraphExceedsBudget { .. } => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
         QueueError::CiRateLimited => StatusCode::SERVICE_UNAVAILABLE,
     };
     to_error(error).set_status(status)
@@ -72,13 +77,23 @@ async fn ensure_graph<'a>(
     db: &DurableDb,
     cell: &'a graph::GraphCell,
 ) -> Result<graph::LoadedGraph<'a>> {
-    let loaded = routes::wake_graph(db, cell, now_ms())
+    // The wake loads under the small line in force: the operator's
+    // `memory-line set` when one is stored, the binding before it.
+    let setting = super::memory_line::current(db, cell)
         .await
         .map_err(to_error)?;
+    let settings = binding_settings(env)?.with_memory_line(setting.as_ref());
+    let loaded =
+        match routes::wake_graph(db, cell, settings.small_memory_line_bytes, now_ms()).await {
+            Ok(loaded) => loaded,
+            Err(error @ QueueError::GraphExceedsBudget { .. }) => {
+                return Err(graph_exceeds_budget(env, cell, error).await);
+            }
+            Err(error) => return Err(to_error(error)),
+        };
     // The admission floor is a deploy binding, never persisted: every
     // wake plan and claim reads the one stamped here.
-    let floor = binding_settings(env)?.min_dispatch_value;
-    loaded.with(|graph| graph.set_floor(floor));
+    loaded.with(|graph| graph.set_floor(settings.min_dispatch_value));
     if !loaded.with(|graph| graph.ci_waiting(now_ms())) && cell.take_reconcile() {
         // The CI `status` listing is the truth for runs a snapshot's
         // eviction could have orphaned (claims whose bindings never
@@ -104,17 +119,60 @@ async fn ensure_graph<'a>(
     Ok(loaded)
 }
 
+/// One backlog admission pass (stow#1501). A failure loses nothing —
+/// the entries stay stored — so it is logged and the next completion
+/// or alarm retries it.
+async fn admit_backlog(
+    graph: graph::LoadedGraph<'_>,
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) {
+    match routes::admit_backlog(graph, db, settings).await {
+        Ok(0) => {}
+        Ok(admitted) => tracing::info!(admitted, "backlog entries admitted"),
+        Err(error) => tracing::error!(%error, "backlog admission failed"),
+    }
+}
+
+/// A wake found the graph larger than the memory line: raise the
+/// alert (once per isolate) and answer with the named error, which
+/// every route and the alarm return until the graph fits.
+async fn graph_exceeds_budget(env: &WasmEnv, cell: &graph::GraphCell, error: QueueError) -> Error {
+    tracing::error!(%error, "scheduler graph exceeds its memory line");
+    if let QueueError::GraphExceedsBudget { needed, budget } = error
+        && cell.take_exceeded_alert()
+    {
+        let outcome = match graph_alert::render(needed, budget) {
+            Ok(draft) => freeze::AlertSink::opened(&EdgeAlerter::new(env.as_js()), &draft).await,
+            Err(error) => freeze::notify_failed(None, format!("render the memory alert: {error}")),
+        };
+        tracing::error!(notify = %freeze::summarize_notify(&outcome), "memory line alert");
+    }
+    route_error(error)
+}
+
 /// The settings a request or the alarm runs under: the deploy
 /// bindings, with the operator's stored `dispatch-cap set` replacing
-/// their caps (stow#1039). The one place the stored setting enters the
-/// caps — every claim, free-slot count, reconcile gate and status view
+/// their caps (stow#1039) and the stored `memory-line set` their memory
+/// lines (stow#1501). The one place the stored settings enter — every
+/// claim, free-slot count, reconcile gate, admission and status view
 /// downstream reads only the settings it is handed, so a caller that
 /// passes its own (a budget drive) stays authoritative. Taking the
-/// loaded graph makes the order a type fact: the setting is read after
-/// the wake has replayed it.
+/// loaded graph makes the order a type fact: the dispatch cap is read
+/// after the wake has replayed it, and the memory lines after
+/// `ensure_graph` read their row into the cell.
 fn scheduler_settings(env: &WasmEnv, graph: graph::LoadedGraph<'_>) -> Result<SchedulerSettings> {
     let bindings = binding_settings(env)?;
-    Ok(graph.with(|graph| bindings.with_dispatch_cap(graph.dispatch_cap())))
+    let super::memory_line::Cached::Read(memory_line) = graph.cell().memory_line() else {
+        return Err(to_error(QueueError::Invariant(
+            "settings read before the wake read the memory-line row".to_owned(),
+        )));
+    };
+    Ok(graph.with(|graph| {
+        bindings
+            .with_dispatch_cap(graph.dispatch_cap())
+            .with_memory_line(memory_line.as_ref())
+    }))
 }
 
 /// The deploy bindings alone, with no operator setting applied — for
@@ -162,7 +220,26 @@ fn binding_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
         .unwrap_or(defaults.human_daily_task_budget),
         min_dispatch_value: read_optional_i64_binding(env, STOW_MIN_DISPATCH_VALUE_BINDING)?
             .unwrap_or(defaults.min_dispatch_value),
+        memory_line_bytes: read_optional_bytes_binding(env, STOW_SCHEDULER_MEMORY_LINE_BINDING)?
+            .unwrap_or(defaults.memory_line_bytes),
+        small_memory_line_bytes: read_optional_bytes_binding(
+            env,
+            STOW_SCHEDULER_SMALL_MEMORY_LINE_BINDING,
+        )?
+        .unwrap_or(defaults.small_memory_line_bytes),
+        small_increment_bytes: read_optional_bytes_binding(
+            env,
+            STOW_SCHEDULER_SMALL_INCREMENT_BYTES_BINDING,
+        )?
+        .unwrap_or(defaults.small_increment_bytes),
     })
+}
+
+/// An optional byte-count binding: a nonnegative decimal integer, read
+/// as the `i64` helper reads it.
+fn read_optional_bytes_binding(env: &WasmEnv, binding_name: &str) -> Result<Option<u64>> {
+    Ok(read_optional_i64_binding(env, binding_name)?
+        .map(|bytes| u64::try_from(bytes).expect("the i64 reader refuses a negative value")))
 }
 
 /// The trip thresholds the failure-rate window and the cost budgets are
@@ -302,6 +379,10 @@ impl Scheduler {
                 "/release-priority"
                     .at(read_release_priority)
                     .post(write_release_priority),
+                // The operator's memory lines (stow#1501): reached from
+                // `GET`/`POST /api/v1/admin/memory-line`, and served
+                // without a wake.
+                "/memory-line".at(read_memory_line).post(write_memory_line),
                 // The edge's health probe (stow#860): one read of held
                 // state, reached from `GET /api/v1/scheduler/health`.
                 "/health".at(health),
@@ -722,7 +803,11 @@ async fn submit(
     // human lanes arrive through their own bound — and every tree's
     // Submit parts land in one turn before the merge: the single
     // transaction the ack follows.
-    let (inserted, unpublished_ids) = routes::submit(
+    let routes::Submitted {
+        inserted,
+        unpublished: unpublished_ids,
+        backlogged,
+    } = routes::submit(
         graph,
         db,
         &settings,
@@ -733,6 +818,12 @@ async fn submit(
     )
     .await
     .map_err(route_error)?;
+    if !backlogged.is_empty() {
+        tracing::warn!(
+            trees = backlogged.len(),
+            "submission stored in the backlog: the memory lines are full"
+        );
+    }
     // The first pass after a submit stays the alarm's (stow#940):
     // submitted rows sit behind the dispatch min-age gate, so an
     // inline pass would claim nothing now — the submit answers once
@@ -866,6 +957,9 @@ pub(super) async fn complete_run_pass(
             return Ok(Vec::new());
         }
     }
+    // A completion may have freed room under the memory lines: admit
+    // what waits in the backlog before claiming.
+    admit_backlog(graph, db, &settings).await;
     // The completion freed a slot, so this request claims one
     // concurrent round inline — never the status reconcile: its
     // listing calls plus a POST round could carry the webhook past
@@ -954,7 +1048,8 @@ async fn admin_status(
     db: DurableDb,
 ) -> Result<Json<stow_types::api::AdminStatus>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
-    let status = routes::admin_status(graph, &db, now_ms())
+    let settings = scheduler_settings(&env, graph)?;
+    let status = routes::admin_status(graph, &db, &settings, now_ms())
         .await
         .map_err(to_error)?;
     Ok(Json(status))
@@ -1279,9 +1374,18 @@ pub(super) async fn request_outcome_pass(
     actor: &str,
 ) -> Result<(stow_types::api::CrateRequestStatus, Vec<String>)> {
     let graph = ensure_graph(env, db, graph).await?;
-    let status = routes::request_outcome(graph, db, request_id, report, Some(actor), now_ms())
-        .await
-        .map_err(route_error)?;
+    let settings = scheduler_settings(env, graph)?;
+    let status = routes::request_outcome(
+        graph,
+        db,
+        &settings,
+        request_id,
+        report,
+        Some(actor),
+        now_ms(),
+    )
+    .await
+    .map_err(route_error)?;
     // The enqueue's human-lane rows are eligible at once, so this
     // request fans them out itself; the pass ends before the response
     // (stow#444).
@@ -1574,6 +1678,51 @@ async fn write_release_priority(
     .map_err(to_error)?;
     tracing::warn!(percent = set.percent, actor = %actor.0, "release priority set by operator");
     Ok(Json(graph.with(|graph| graph.release_priority_view())))
+}
+
+/// `GET /memory-line` — the memory lines in force and the operator
+/// setting behind them (stow#1501). No wake: it answers while the
+/// graph cannot load.
+async fn read_memory_line(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::MemoryLines>> {
+    let view = routes::memory_lines(&db, &graph, &binding_settings(&env)?)
+        .await
+        .map_err(to_error)?;
+    Ok(Json(view))
+}
+
+/// `POST /memory-line` — the operator's `set`: the `memory_line` row
+/// written, in force from the next decision on. No wake and no graph
+/// read, so a set that raises the small line is what lets a graph the
+/// old line refused wake.
+async fn write_memory_line(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+    actor: Actor,
+    Json(set): Json<stow_types::api::MemoryLineSet>,
+) -> Result<Json<stow_types::api::MemoryLines>> {
+    let view = routes::set_memory_lines(
+        &db,
+        &graph,
+        &binding_settings(&env)?,
+        set,
+        &actor.0,
+        iso_now(),
+    )
+    .await
+    .map_err(to_error)?;
+    tracing::warn!(
+        normal = set.normal_line_bytes,
+        small = set.small_line_bytes,
+        small_increment = set.small_increment_bytes,
+        actor = %actor.0,
+        "memory lines set by operator"
+    );
+    Ok(Json(view))
 }
 
 /// `Date#toISOString` — the timestamp format the record and alert
@@ -1927,6 +2076,9 @@ async fn dispatch_pending(
     graph: &graph::GraphCell,
 ) -> Result<Vec<String>> {
     let graph = ensure_graph(env, db, graph).await?;
+    let settings = scheduler_settings(env, graph)?;
+    // Admission is a graph merge, not a dispatch: it runs frozen too.
+    admit_backlog(graph, db, &settings).await;
     // The dispatch freeze gates here and inside `claim`
     // — the enqueue side never consults it, so misses keep arriving and
     // stay pending for the first pass after a human lifts the freeze. It
@@ -1936,7 +2088,6 @@ async fn dispatch_pending(
         tracing::info!("dispatch frozen — skipping dispatch pass");
         return Ok(Vec::new());
     }
-    let settings = scheduler_settings(env, graph)?;
     dispatch_pass(
         graph.cell(),
         env,

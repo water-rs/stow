@@ -1,0 +1,12 @@
+<!doctype html>
+<html>
+<body style="font-family: system-ui, sans-serif; color: #1a1a1a; line-height: 1.5">
+<p><strong>The stow scheduler cannot load its graph.</strong> It needs
+{{ needed }} bytes and the small-submission memory line
+(<code>STOW_SCHEDULER_SMALL_MEMORY_LINE</code>) is {{ budget }} bytes.</p>
+<p>Every scheduler route and the alarm fail with a graph-exceeds-budget error
+until the graph fits. Raise the line only below the Durable Object's 128 MB
+isolate limit, or reset the store (<code>stow-admin scheduler reset --yes</code>)
+and let the lanes refill it.</p>
+</body>
+</html>
