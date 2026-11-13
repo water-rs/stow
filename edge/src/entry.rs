@@ -87,7 +87,7 @@ struct SchedulerDispatcher(SendWrapper<CfDurableNamespace>);
 impl crate::periodic::Dispatcher for SchedulerDispatcher {
     fn dispatch(
         &self,
-        request: &stow_types::periodic::PeriodicWorkflow,
+        request: &stow_types::periodic::WorkflowFile,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send {
         let request = request.clone();
         async move {

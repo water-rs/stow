@@ -1911,7 +1911,7 @@ async fn periodic_dispatch(
     State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
-    Json(request): Json<stow_types::periodic::PeriodicWorkflow>,
+    Json(request): Json<stow_types::periodic::WorkflowFile>,
 ) -> Result<Json<OkResponse>> {
     periodic_dispatch_pass(&graph, &env, &db, &request).await?;
     Ok(Json(OkResponse { ok: true }))
@@ -1924,7 +1924,7 @@ pub(super) async fn periodic_dispatch_pass(
     graph: &graph::GraphCell,
     env: &WasmEnv,
     db: &DurableDb,
-    request: &stow_types::periodic::PeriodicWorkflow,
+    request: &stow_types::periodic::WorkflowFile,
 ) -> Result<()> {
     let graph = ensure_graph(env, db, graph).await?;
     routes::require_ci_ready(graph, now_ms()).map_err(route_error)?;
@@ -1934,7 +1934,7 @@ pub(super) async fn periodic_dispatch_pass(
         dispatch::retain_ci_limit(graph, db, &error, now_ms())
             .await
             .map_err(route_error)?;
-        tracing::error!(%error, workflow = request.workflow.as_str(), dispatch_ref = request.dispatch_ref.as_str(), "periodic dispatch failed");
+        tracing::error!(%error, workflow = request.as_str(), "periodic dispatch failed");
         return Err(to_error(error).set_status(StatusCode::BAD_GATEWAY));
     }
     Ok(())

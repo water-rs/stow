@@ -60,8 +60,16 @@ pub const RELEASE_REF_PREFIX: &str = "refs/tags/v";
 
 /// A release tag: `v` followed by a strict `MAJOR.MINOR.PATCH`, with no
 /// pre-release, build metadata, leading zero or extra component.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(transparent)]
 pub struct ReleaseTag(String);
+
+impl<'de> serde::Deserialize<'de> for ReleaseTag {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let tag = String::deserialize(deserializer)?;
+        tag.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 /// A string that is not a [`ReleaseTag`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

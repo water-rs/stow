@@ -16,7 +16,6 @@ const PERIODIC_EVENTS = new Set([
 	"index-publish-cron",
 	"demand-feed",
 	"build-failure-digest",
-	"test",
 	"release-gate",
 	"preheat-projects",
 	"preheat-missed",

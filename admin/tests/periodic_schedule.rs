@@ -47,41 +47,34 @@ fn every_declared_cron_is_mapped_and_every_mapping_is_declared() {
     }
 }
 
-/// Every periodic cron with the workflows it drives and the branch each
-/// is dispatched on: the six moved by stow#1121 keep the branch their
-/// `schedule` ran on (`dev`), except `demand-feed.yml` and
-/// `preheat-missed.yml`, whose OIDC identity the edge admits on `main`
-/// only; the first two entries were already dispatched on `main`. The
-/// nightly `0 7 * * *` tick drives two workflows.
-const PRODUCTION: [(&str, &[&str], &str); 8] = [
-    ("*/15 * * * *", &["watchdog.yml"], "main"),
-    ("17 0 * * *", &["preheat-cron.yml"], "main"),
-    ("*/10 * * * *", &["index-publish-cron.yml"], "dev"),
-    ("5 * * * *", &["demand-feed.yml"], "main"),
-    ("0 13 * * *", &["build-failure-digest.yml"], "dev"),
-    ("0 7 * * *", &["test.yml", "release-gate.yml"], "dev"),
-    ("30 5 * * 1", &["preheat-projects.yml"], "dev"),
-    ("0 6 * * 1", &["preheat-missed.yml"], "main"),
+/// Every periodic cron with the workflows it drives; every one is
+/// dispatched on the edge's own release tag, which no entry names. The
+/// nightly `0 7 * * *` tick drives `release-gate.yml` alone: it
+/// dispatches the nightly certification and `test.yml` on `main` itself.
+const PRODUCTION: [(&str, &[&str]); 8] = [
+    ("*/15 * * * *", &["watchdog.yml"]),
+    ("17 0 * * *", &["preheat-cron.yml"]),
+    ("*/10 * * * *", &["index-publish-cron.yml"]),
+    ("5 * * * *", &["demand-feed.yml"]),
+    ("0 13 * * *", &["build-failure-digest.yml"]),
+    ("0 7 * * *", &["release-gate.yml"]),
+    ("30 5 * * 1", &["preheat-projects.yml"]),
+    ("0 6 * * 1", &["preheat-missed.yml"]),
 ];
 
 #[test]
-fn production_drives_every_periodic_workflow_at_its_cadence_and_branch() {
+fn production_drives_every_periodic_workflow_at_its_cadence() {
     for manifest in ["edge/Skyzen.toml", "edge/Skyzen.mock.toml"] {
         let (_, schedule) = manifest_schedule(manifest);
-        for (cron, files, branch) in PRODUCTION {
+        for (cron, files) in PRODUCTION {
             let due = schedule
                 .due(cron)
                 .unwrap_or_else(|error| panic!("{manifest}: {error}"));
-            let driven: Vec<&str> = due.iter().map(|entry| entry.workflow.as_str()).collect();
+            let driven: Vec<&str> = due
+                .iter()
+                .map(stow_types::periodic::WorkflowFile::as_str)
+                .collect();
             assert_eq!(driven, files, "{manifest}: {cron}");
-            for entry in due {
-                assert_eq!(
-                    entry.dispatch_ref.as_str(),
-                    branch,
-                    "{manifest}: {}",
-                    entry.workflow.as_str()
-                );
-            }
         }
         assert_eq!(
             schedule.crons().count(),
@@ -102,7 +95,7 @@ fn a_driven_workflow_accepts_dispatch() {
         let (_, schedule) = manifest_schedule(manifest);
         for cron in schedule.crons() {
             for entry in schedule.due(cron).expect("mapped cron") {
-                let workflow = &entry.workflow;
+                let workflow = entry;
                 let text = repo_file(&format!(".github/workflows/{}", workflow.as_str()));
                 let document: serde_yml::Value = serde_yml::from_str(&text)
                     .unwrap_or_else(|error| panic!("{}: {error}", workflow.as_str()));
@@ -136,11 +129,11 @@ fn a_driven_workflow_never_branches_on_the_schedule_event() {
     let (_, schedule) = manifest_schedule("edge/Skyzen.toml");
     for cron in schedule.crons() {
         for entry in schedule.due(cron).expect("mapped cron") {
-            let text = repo_file(&format!(".github/workflows/{}", entry.workflow.as_str()));
+            let text = repo_file(&format!(".github/workflows/{}", entry.as_str()));
             assert!(
                 !text.contains("'schedule'"),
                 "{}: branches on the `schedule` event",
-                entry.workflow.as_str()
+                entry.as_str()
             );
         }
     }

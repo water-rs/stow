@@ -18,7 +18,7 @@ use std::future::Future;
 
 use askama::Template;
 use futures_util::StreamExt as _;
-use stow_types::periodic::{PeriodicSchedule, PeriodicWorkflow};
+use stow_types::periodic::{PeriodicSchedule, WorkflowFile};
 
 use crate::freeze::{AlertDraft, AlertSink, summarize_channel};
 
@@ -33,10 +33,7 @@ pub const PERIODIC_INCIDENT_KEY: &str = "periodic-dispatch";
 /// Where a due workflow is dispatched.
 pub trait Dispatcher: Sync {
     /// Dispatch `workflow` on the branch its schedule entry names.
-    fn dispatch(
-        &self,
-        workflow: &PeriodicWorkflow,
-    ) -> impl Future<Output = Result<(), String>> + Send;
+    fn dispatch(&self, workflow: &WorkflowFile) -> impl Future<Output = Result<(), String>> + Send;
 }
 
 /// One workflow that was not dispatched, or the tick itself when
@@ -108,7 +105,7 @@ pub async fn run_tick<D: Dispatcher, S: AlertSink + Sync>(
                         .await
                         .err()
                         .map(|error| Failure {
-                            workflow: workflow.workflow.as_str().to_owned(),
+                            workflow: workflow.as_str().to_owned(),
                             error,
                         })
                 })
@@ -149,7 +146,8 @@ mod tests {
 
     use super::*;
 
-    const SCHEDULE: &str = r#"{"*/15 * * * *":["watchdog.yml"],"17 0 * * *":["preheat-cron.yml",{"workflow":"other.yml","ref":"dev"}]}"#;
+    const SCHEDULE: &str =
+        r#"{"*/15 * * * *":["watchdog.yml"],"17 0 * * *":["preheat-cron.yml","other.yml"]}"#;
 
     /// Records dispatch order and in-flight overlap; fails the named
     /// workflows.
@@ -190,19 +188,18 @@ mod tests {
     impl Dispatcher for Recorder {
         fn dispatch(
             &self,
-            workflow: &PeriodicWorkflow,
+            workflow: &WorkflowFile,
         ) -> impl Future<Output = Result<(), String>> + Send {
             self.record(workflow)
         }
     }
 
     impl Recorder {
-        async fn record(&self, workflow: &PeriodicWorkflow) -> Result<(), String> {
-            self.started.lock().unwrap().push(format!(
-                "{}@{}",
-                workflow.workflow.as_str(),
-                workflow.dispatch_ref.as_str()
-            ));
+        async fn record(&self, workflow: &WorkflowFile) -> Result<(), String> {
+            self.started
+                .lock()
+                .unwrap()
+                .push(workflow.as_str().to_owned());
             {
                 let mut gauge = self.in_flight.lock().unwrap();
                 gauge.0 += 1;
@@ -210,7 +207,7 @@ mod tests {
             }
             YieldOnce(false).await;
             self.in_flight.lock().unwrap().0 -= 1;
-            if self.failing.contains(&workflow.workflow.as_str()) {
+            if self.failing.contains(&workflow.as_str()) {
                 Err("HTTP 422".to_owned())
             } else {
                 Ok(())
@@ -246,7 +243,7 @@ mod tests {
             .expect("tick");
         let mut started = recorder.started.lock().unwrap().clone();
         started.sort();
-        assert_eq!(started, ["other.yml@dev", "preheat-cron.yml@main"]);
+        assert_eq!(started, ["other.yml", "preheat-cron.yml"]);
         assert_eq!(
             recorder.in_flight.lock().unwrap().1,
             2,
@@ -261,7 +258,7 @@ mod tests {
         run_tick(&schedule(), "*/15 * * * *", &recorder, &mailbox)
             .await
             .expect("tick");
-        assert_eq!(*recorder.started.lock().unwrap(), ["watchdog.yml@main"]);
+        assert_eq!(*recorder.started.lock().unwrap(), ["watchdog.yml"]);
     }
 
     #[tokio::test]
@@ -284,7 +281,7 @@ mod tests {
                 .started
                 .lock()
                 .unwrap()
-                .contains(&"preheat-cron.yml@main".to_owned())
+                .contains(&"preheat-cron.yml".to_owned())
         );
         let sent = mailbox.0.lock().unwrap().clone();
         assert_eq!(sent.len(), 1);
