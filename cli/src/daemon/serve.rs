@@ -605,10 +605,22 @@ async fn accept_loop(mut listener: Listener, daemon: Daemon<OsProcesses>) -> Res
                 // instance, which dropping it would hang up unanswered.
                 // Opening it as a client claims it: success means no
                 // client holds it, and busy means one does, which is
-                // served like any other.
+                // served like any other. Returning drops the connections
+                // still being served, so the ones admitted here are
+                // answered first, with the claim held so no other arrives.
                 loop {
                     match ClientOptions::new().open(&listener.name) {
-                        Ok(_claimed) => return Ok(pending),
+                        Ok(_claimed) => {
+                            if tokio::time::timeout(daemon.settings.answer, daemon.busy.settled())
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "a request admitted as the drain ended outlasted its answer bound"
+                                );
+                            }
+                            return Ok(pending);
+                        }
                         Err(error) if error.raw_os_error() == Some(PIPE_BUSY) => {
                             listener
                                 .server

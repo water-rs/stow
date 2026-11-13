@@ -130,7 +130,7 @@ impl Busy {
 
     /// Resolves when no request and no driver's session is held: what must
     /// still finish once the drivers have been cut.
-    async fn settled(&self) {
+    pub(super) async fn settled(&self) {
         self.until(|counts| counts.settled()).await;
     }
 }
