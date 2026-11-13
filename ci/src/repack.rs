@@ -112,7 +112,7 @@ pub async fn run(
 /// The `records-*` tags of `rustc_version` grouped by task, each group
 /// newest build first — the reverse of the order the index fold applies
 /// them in.
-fn tasks_newest_first<'a>(
+pub fn tasks_newest_first<'a>(
     tags: &'a [String],
     rustc_version: &WireRustcVersion,
 ) -> Vec<Vec<&'a str>> {

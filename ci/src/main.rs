@@ -34,6 +34,7 @@ mod mock_compile;
 mod object_arch;
 mod plan;
 mod repack;
+mod resign;
 mod rlib_members;
 mod runners;
 mod shapes;
@@ -105,6 +106,22 @@ enum Stage {
         #[arg(long)]
         concurrency: std::num::NonZeroUsize,
     },
+    /// The one-time re-sign of one rustc's repository: every records
+    /// artifact, `built-` marker and node signed under the old branch
+    /// identity gains a signature under this run's release-tag identity,
+    /// and each task whose nodes were republished gets a new records
+    /// artifact naming their new bundles. Rerun-safe: what already
+    /// verifies under the new identity is left alone. Index slices are
+    /// re-signed by `stow-admin index resign`.
+    Resign {
+        /// The rustc whose repository is re-signed.
+        #[arg(long)]
+        rustc_version: String,
+        /// Tasks re-signed at once; the registry side is bounded by
+        /// `STOW_GHCR_WRITES_PER_MINUTE` and Sigstore's rate limits.
+        #[arg(long)]
+        concurrency: std::num::NonZeroUsize,
+    },
     /// Print `true` or `false` — whether the dispatched task's signed
     /// records already exist under its `built-<rustc>-<task_id hash>`
     /// marker (stow#877). `build-crate.yml` runs this before the
@@ -148,6 +165,10 @@ fn main() -> stow_types::error::Result<()> {
             rustc_version,
             concurrency,
         } => tokio_runtime()?.block_on(repack_stage(&rustc_version, concurrency.get())),
+        Stage::Resign {
+            rustc_version,
+            concurrency,
+        } => tokio_runtime()?.block_on(resign_stage(&rustc_version, concurrency.get())),
         Stage::RecordsExist => tokio_runtime()?.block_on(records_exist_stage()),
         Stage::Serve { listen } => tokio_runtime()?.block_on(serve_stage(listen)),
     }
@@ -259,6 +280,16 @@ async fn repack_stage(rustc_version: &str, concurrency: usize) -> stow_types::er
     Ok(())
 }
 
+/// The `build-crate.yml` re-sign job: re-sign one rustc's repository and
+/// print the run's counts as JSON.
+async fn resign_stage(rustc_version: &str, concurrency: usize) -> stow_types::error::Result<()> {
+    let rustc_version = stow_types::identity::WireRustcVersion::parse(rustc_version)
+        .map_err(|error| stow_types::stow_error!("--rustc-version: {error}"))?;
+    let sweep = resign::run(&rustc_version, concurrency, build_run_from_env()?).await?;
+    println!("{}", serde_json::to_string(&sweep)?);
+    Ok(())
+}
+
 /// The `build-crate.yml` early-exit check: `true` on stdout when the
 /// task's `built-<rustc>-<task_id hash>` marker names a records
 /// manifest carrying the task-id annotation — the dispatch is a
@@ -321,7 +352,17 @@ async fn published_manifest(
     // marker's manifest must carry a records signature bound to the
     // pinned builder identity — an unverifiable marker means build
     // normally (stow#877).
-    if !marker_signature_verified(session, trust, &reference, &manifest_digest).await? {
+    let build_identity =
+        stow_oci::verify::ReleaseIdentity::new(stow_types::trusted_builder::TrustedWorkflow::BUILD);
+    if !marker_signature_verified(
+        session,
+        trust,
+        &reference,
+        &manifest_digest,
+        &build_identity,
+    )
+    .await?
+    {
         return Ok(None);
     }
     // A signed marker proves a build ran, not that it published the whole
@@ -366,6 +407,7 @@ async fn marker_signature_verified(
     trust: &stow_oci::verify::Trust,
     reference: &stow_oci::Reference,
     manifest_digest: &str,
+    policy: &(impl stow_oci::resign::VerificationPolicy + Sync),
 ) -> stow_types::error::Result<bool> {
     let Ok(materials) =
         stow_oci::pull_signature_materials(session, reference, manifest_digest).await
@@ -396,9 +438,7 @@ async fn marker_signature_verified(
             manifest_digest,
             &signature,
             &material.payload_bytes,
-            &stow_oci::verify::ReleaseIdentity::new(
-                stow_types::trusted_builder::TrustedWorkflow::BUILD,
-            ),
+            policy,
         )
         .is_ok()
     }))

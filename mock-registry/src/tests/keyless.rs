@@ -23,11 +23,14 @@ use rcgen::{
 use sha2::Digest as _;
 use sigstore::cosign::bundle::Payload as RekorPayload;
 use sigstore::crypto::{CosignVerificationKey, Signature, SigningScheme};
+use stow_oci::resign::Identities;
 use stow_oci::verify::ReleaseIdentity;
 use stow_types::bundle::{
     SIGSTORE_BUNDLE_ANNOTATION, SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE,
     SIGSTORE_SIGNATURE_ANNOTATION, sigstore_signature_tag,
 };
+use stow_types::identity::WireRustcVersion;
+use stow_types::records::{BuildRecords, BuildRun};
 use stow_types::trusted_builder::{CERTIFICATE_ISSUER, TrustedWorkflow};
 use stow_types::upload_plan::PlannedArtifact;
 
@@ -104,6 +107,9 @@ struct Sigstore {
     /// empty body, as Rekor answered at the `Location` of a `409` before
     /// its read path served the entry.
     unreadable_reads: usize,
+    /// The subject the issued certificates carry; a test sets it before a
+    /// signer it builds asks for its certificate.
+    identity: String,
     certificates: usize,
     /// Entry reads Rekor answered, served or not.
     reads: usize,
@@ -137,6 +143,7 @@ impl MockSigstore {
             fulcio_refusal: None,
             lose_answers: 0,
             unreadable_reads: 0,
+            identity: CERTIFICATE_IDENTITY.to_owned(),
             certificates: 0,
             reads: 0,
             entries: BTreeMap::new(),
@@ -242,7 +249,7 @@ async fn signing_cert(State(state): Shared, headers: HeaderMap, body: Bytes) -> 
     assert_eq!(spki.len(), P256_SPKI_PREFIX_LEN + 65, "a P-256 key");
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
     params.subject_alt_names = vec![SanType::URI(
-        CERTIFICATE_IDENTITY.try_into().expect("identity URI"),
+        state.identity.as_str().try_into().expect("identity URI"),
     )];
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::CodeSigning];
@@ -417,6 +424,19 @@ impl Stack {
             trust,
             self.sigstore.services(),
             CERTIFICATE_IDENTITY,
+        )
+    }
+
+    /// A signer whose certificates carry `identity`: the services issue
+    /// that subject from now on.
+    fn signer_as(&self, identity: &str) -> stow_oci::KeylessSigner {
+        self.sigstore
+            .with(|state| state.identity = identity.to_owned());
+        stow_oci::KeylessSigner::new(
+            self.http.clone(),
+            self.sigstore.trust(),
+            self.sigstore.services(),
+            identity,
         )
     }
 
@@ -1000,4 +1020,365 @@ async fn a_signature_the_trust_root_rejects_is_never_pushed() {
         "{message}"
     );
     assert_eq!(stack.writes(), 2, "no signature or manifest write");
+}
+
+// ---- the one-time re-sign from the branch identity to a release tag ----
+
+/// The subject the build workflow signed under before the release-tag
+/// switch.
+const OLD_IDENTITY: &str =
+    "https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/heads/main";
+
+/// The policy the old signatures verify under.
+fn old_identity() -> stow_oci::resign::ExactIdentity {
+    stow_oci::resign::ExactIdentity::new(OLD_IDENTITY, CERTIFICATE_ISSUER)
+}
+
+/// A task of two nodes signed under the old identity: its signed records,
+/// and the rows they name.
+struct OldTask {
+    tag: String,
+    manifest_digest: String,
+    rows: Vec<stow_types::api::ArtifactRecord>,
+    plans: Vec<PlannedArtifact>,
+}
+
+impl Stack {
+    async fn publish_old_task(&self, session: &stow_oci::RegistrySession) -> OldTask {
+        let old_signer = self.signer_as(OLD_IDENTITY);
+        let sign = |reference: String, digest: String| {
+            let (signer, session) = (&old_signer, session);
+            async move { signer.sign(session, &reference, &digest).await }
+        };
+        let plans = vec![plan(&self.root, 0), plan(&self.root, 1)];
+        let outcome = stow_oci::push_artifacts_with(session, &plans, &sign)
+            .await
+            .expect("a build publishes");
+        let rows = stow_types::upload_plan::build_artifact_records(
+            &plans,
+            &outcome.published_by_reference,
+            &plans
+                .iter()
+                .map(|plan| (plan.oci_reference.clone(), None))
+                .collect(),
+        )
+        .expect("records");
+        let rustc = WireRustcVersion::parse(super::RUSTC).expect("rustc");
+        let pushed = stow_oci::push_records_with(
+            session,
+            &rustc,
+            "serde-1.0.0-task",
+            BuildRun {
+                run_id: 1,
+                run_attempt: 1,
+            },
+            &BuildRecords {
+                artifacts: rows.clone(),
+                local_programs: Vec::new(),
+            },
+            &sign,
+        )
+        .await
+        .expect("records publish");
+        OldTask {
+            tag: pushed.tag,
+            manifest_digest: pushed.manifest_digest,
+            rows,
+            plans,
+        }
+    }
+
+    /// Whether the manifest under `tag` verifies under `policy` as a
+    /// reader checks it.
+    async fn tag_verifies(
+        &self,
+        session: &stow_oci::RegistrySession,
+        tag: &str,
+        digest: &str,
+        policy: &(impl stow_oci::resign::VerificationPolicy + Sync),
+    ) -> bool {
+        let reference = session.reference(tag).expect("reference");
+        stow_oci::verify_artifact_signature(
+            session,
+            &stow_oci::verify::Trust::GithubCi(self.sigstore.trust()),
+            &reference,
+            &reference.to_string(),
+            digest,
+            policy,
+        )
+        .await
+        .is_ok()
+    }
+}
+
+/// Whether the bundle `row` names verifies under the new identity or,
+/// when `new_identity` is false, the old one.
+async fn bundle_verifies(
+    session: &stow_oci::RegistrySession,
+    trust: &stow_oci::verify::Trust,
+    row: &stow_types::api::ArtifactRecord,
+    new_identity: bool,
+) -> bool {
+    if new_identity {
+        stow_oci::resign::bundle_verifies(session, trust, row, &reader_identity()).await
+    } else {
+        stow_oci::resign::bundle_verifies(session, trust, row, &old_identity()).await
+    }
+    .expect("the bundle reads")
+}
+
+/// A task's records and nodes signed under the old identity verify under
+/// the new one only after the re-sign: the records gain a signature, each
+/// node is republished with a bundle carrying the new signature alone, and
+/// a new records artifact names the new bundles. A rerun writes nothing.
+#[tokio::test]
+async fn a_task_signed_under_the_old_identity_resigns_under_the_new_one() {
+    let stack = Stack::new().await;
+    let session = stack.session(&unbounded());
+    let trust = stow_oci::verify::Trust::GithubCi(stack.sigstore.trust());
+    let rustc = WireRustcVersion::parse(super::RUSTC).expect("rustc");
+    let task = stack.publish_old_task(&session).await;
+
+    assert!(
+        !stack
+            .tag_verifies(
+                &session,
+                &task.tag,
+                &task.manifest_digest,
+                &reader_identity()
+            )
+            .await,
+        "the old records do not verify under the release-tag identity"
+    );
+    assert!(
+        stack
+            .tag_verifies(&session, &task.tag, &task.manifest_digest, &old_identity())
+            .await
+    );
+
+    let new_signer = stack.signer_as(CERTIFICATE_IDENTITY);
+    let sign = |reference: String, digest: String| {
+        let (signer, session) = (&new_signer, &session);
+        async move { signer.sign(session, &reference, &digest).await }
+    };
+    let resigned = stow_oci::resign::resign_task(
+        &session,
+        &trust,
+        &rustc,
+        &[task.tag.as_str()],
+        Identities {
+            old: &old_identity(),
+            new: &reader_identity(),
+        },
+        BuildRun {
+            run_id: 2,
+            run_attempt: 1,
+        },
+        &sign,
+    )
+    .await
+    .expect("the task re-signs");
+    assert_eq!(
+        (
+            resigned.records_signed,
+            resigned.records_already,
+            resigned.nodes_republished,
+            resigned.nodes_already
+        ),
+        (1, 0, 2, 0)
+    );
+    assert!(
+        stack
+            .tag_verifies(
+                &session,
+                &task.tag,
+                &task.manifest_digest,
+                &reader_identity()
+            )
+            .await,
+        "the old records artifact now verifies under the new identity"
+    );
+
+    let published = resigned.published.expect("a new records artifact");
+    assert!(
+        stack
+            .tag_verifies(
+                &session,
+                &published.tag,
+                &published.manifest_digest,
+                &reader_identity()
+            )
+            .await
+    );
+    let new_rows = stow_oci::pull_records_by_tag(&session, &published.tag)
+        .await
+        .expect("new records")
+        .records
+        .artifacts;
+    assert_eq!(new_rows.len(), task.rows.len());
+    for (old_row, new_row) in task.rows.iter().zip(&new_rows) {
+        assert_eq!(
+            new_row.oci_digest, old_row.oci_digest,
+            "the node is the same"
+        );
+        assert_ne!(new_row.bundle_digest, old_row.bundle_digest);
+        let node = task
+            .plans
+            .iter()
+            .find(|plan| plan.oci_reference == new_row.oci_reference)
+            .expect("plan");
+        stack
+            .verify(&session, node, &new_row.oci_digest)
+            .await
+            .expect("the node verifies under the new identity");
+        let verifies = |row, new_identity| bundle_verifies(&session, &trust, row, new_identity);
+        assert!(verifies(new_row, true).await);
+        assert!(!verifies(new_row, false).await);
+        assert!(verifies(old_row, false).await);
+        assert!(!verifies(old_row, true).await);
+    }
+
+    // A rerun over every records tag the repository now holds finds all of
+    // it done.
+    let writes = stack.writes();
+    let rerun = stow_oci::resign::resign_task(
+        &session,
+        &trust,
+        &rustc,
+        &[published.tag.as_str(), task.tag.as_str()],
+        Identities {
+            old: &old_identity(),
+            new: &reader_identity(),
+        },
+        BuildRun {
+            run_id: 3,
+            run_attempt: 1,
+        },
+        &sign,
+    )
+    .await
+    .expect("the rerun");
+    assert_eq!(
+        (
+            rerun.records_signed,
+            rerun.records_already,
+            rerun.nodes_republished,
+            rerun.nodes_already
+        ),
+        (0, 2, 0, 2)
+    );
+    assert!(rerun.published.is_none());
+    assert_eq!(stack.writes(), writes, "a rerun writes nothing");
+}
+
+/// An index slice signed under the old identity gains a signature at the
+/// same digest, a signature of any other identity is refused, and a rerun
+/// writes nothing.
+#[tokio::test]
+async fn an_index_slice_signed_under_the_old_identity_resigns_under_the_new_one() {
+    let stack = Stack::new().await;
+    let session = stack.session(&unbounded());
+    let trust = stow_oci::verify::Trust::GithubCi(stack.sigstore.trust());
+    let tag = stow_types::index::index_tag(super::TARGET, super::RUSTC);
+    let reference = session.reference(&tag).expect("reference");
+
+    let layer = b"an index slice".to_vec();
+    let layer_digest = stow_types::registry::sha256_digest(&layer);
+    let config = b"{}".to_vec();
+    let config_digest = stow_types::registry::sha256_digest(&config);
+    session
+        .push_blob(&layer_digest, &layer)
+        .await
+        .expect("layer");
+    session
+        .push_blob(&config_digest, &config)
+        .await
+        .expect("config");
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": stow_types::bundle::OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+        "config": {
+            "mediaType": stow_types::index::STOW_INDEX_CONFIG_MEDIA_TYPE,
+            "digest": config_digest,
+            "size": config.len(),
+        },
+        "layers": [{
+            "mediaType": stow_types::index::STOW_INDEX_MEDIA_TYPE,
+            "digest": layer_digest,
+            "size": layer.len(),
+        }],
+    }))
+    .expect("manifest");
+    let session = &session;
+    let sign_as = |identity: &str| {
+        let signer = stack.signer_as(identity);
+        move |reference: String, digest: String| {
+            let signer = signer.clone();
+            async move { signer.sign(session, &reference, &digest).await }
+        }
+    };
+    let signed_by_other =
+        sign_as("https://github.com/water-rs/stow/.github/workflows/other.yml@refs/heads/main");
+    let digest = stow_oci::put_signed_manifest(session, &reference, &manifest, |digest| {
+        signed_by_other(reference.to_string(), digest)
+    })
+    .await
+    .expect("publish")
+    .digest;
+
+    let resign = |sign| {
+        let (trust, reference, digest) = (&trust, &reference, &digest);
+        async move {
+            stow_oci::resign::resign_manifest(
+                session,
+                trust,
+                reference,
+                &reference.to_string(),
+                digest,
+                Identities {
+                    old: &old_identity(),
+                    new: &reader_identity(),
+                },
+                &sign,
+            )
+            .await
+        }
+    };
+    let error = resign(sign_as(CERTIFICATE_IDENTITY))
+        .await
+        .expect_err("a signature of another identity is not re-signed");
+    assert!(format!("{error:?}").contains("old identity"), "{error:?}");
+    assert!(
+        !stack
+            .tag_verifies(session, &tag, &digest, &reader_identity())
+            .await
+    );
+
+    // The same manifest signed under the old identity re-signs.
+    sign_as(OLD_IDENTITY)(reference.to_string(), digest.clone())
+        .await
+        .expect("old signature");
+    assert_eq!(
+        resign(sign_as(CERTIFICATE_IDENTITY))
+            .await
+            .expect("re-signs"),
+        stow_oci::resign::Resigned::Signed
+    );
+    assert!(
+        stack
+            .tag_verifies(session, &tag, &digest, &reader_identity())
+            .await
+    );
+    let pulled = stow_oci::pull_index(session, super::TARGET, super::RUSTC)
+        .await
+        .expect("pull")
+        .expect("published");
+    assert_eq!(pulled.manifest_digest, digest, "the slice is untouched");
+
+    let writes = stack.writes();
+    assert_eq!(
+        resign(sign_as(CERTIFICATE_IDENTITY)).await.expect("rerun"),
+        stow_oci::resign::Resigned::Already
+    );
+    assert_eq!(stack.writes(), writes, "a rerun writes nothing");
 }

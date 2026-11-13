@@ -30,6 +30,11 @@ name: Index publish
 on:
   workflow_dispatch:
     inputs:
+      resign:
+        description: "Re-sign the scoped rustc's published slices under this release tag's identity before the export (the one-time run of stow#1515; rerun-safe)"
+        required: false
+        default: false
+        type: boolean
       report:
         description: "Report the published slices to the edge's scheduler (the repository's STOW_EDGE_URL)"
         required: false
@@ -109,6 +114,17 @@ jobs:
               | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
           fi
           echo "RUSTC_VERSION=$rustc_version" >> "$GITHUB_ENV"
+      # The one-time re-sign of the slices signed before the release-tag
+      # switch (stow#1515): the export below verifies each previous slice
+      # under the release-tag identity, so the slices gain it first.
+      - name: Re-sign the published slices
+        if: inputs.resign
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          stow-admin index resign --rustc-version "$RUSTC_VERSION"
       # A published generation the scheduler never received — the report
       # of an earlier run failed, or that run died between a slice's
       # index and folded tags — is reported in full before this run's

@@ -8376,6 +8376,7 @@ dependencies = [
  "smol",
  "stow-shim",
  "stow-types",
+ "tar",
  "time",
  "tokio",
  "tracing",

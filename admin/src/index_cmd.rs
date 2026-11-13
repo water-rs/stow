@@ -111,6 +111,11 @@ pub enum IndexCommand {
     /// list `index-publish.yml` iterates, read from the binary so the
     /// workflow never carries its own copy.
     Targets,
+    /// The one-time re-sign of a rustc's published `index`/`folded`
+    /// slices from the branch identity to this run's release-tag
+    /// identity; `index-publish.yml` runs it with `resign: true`. A rerun
+    /// writes nothing.
+    Resign(crate::index_resign::IndexResignArgs),
     /// Resolve the public hit leaderboard's bundle digests to crate
     /// identities through the signed index slices (stow#889) — the
     /// edge keeps no identity store, so the offline join lives here.
@@ -262,6 +267,7 @@ pub async fn run(
             render::emit_line(&CI_TARGET_TRIPLES.join("\n"));
             Ok(())
         }
+        IndexCommand::Resign(args) => crate::index_resign::run(args).await,
         IndexCommand::Join(args) => index_join(args).await,
     }
 }

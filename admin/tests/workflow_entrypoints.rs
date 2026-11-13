@@ -1115,12 +1115,30 @@ fn build_crate_declarations() {
             .as_deref(),
         Some("{}")
     );
-    for input in ["repack_rustc", "repack_concurrency"] {
+    // A call names the rustc of exactly one of the operator runs; a task
+    // call leaves both empty.
+    assert!(at(&wf, "on.workflow_dispatch.inputs.resign_rustc").is_none());
+    assert!(at(&wf, "on.workflow_dispatch.inputs.resign_concurrency").is_none());
+    for input in [
+        "repack_rustc",
+        "repack_concurrency",
+        "resign_rustc",
+        "resign_concurrency",
+    ] {
         assert_eq!(
             at(&wf, &format!("on.workflow_call.inputs.{input}.required"))
                 .map(scalar)
                 .as_deref(),
-            Some("true"),
+            Some("false"),
+            "{input}"
+        );
+    }
+    for input in ["repack_rustc", "resign_rustc"] {
+        assert_eq!(
+            at(&wf, &format!("on.workflow_call.inputs.{input}.default"))
+                .map(scalar)
+                .as_deref(),
+            Some(""),
             "{input}"
         );
     }
@@ -1144,7 +1162,7 @@ fn build_crate_run_name_concurrency_and_jobs() {
     assert_eq!(
         at(&wf, "concurrency.group").map(scalar).as_deref(),
         Some(
-            "${{ inputs.repack_rustc != '' && format('repack-call-{0}', inputs.repack_rustc) || format('build-crate-{0}', fromJSON(inputs.task).task_id) }}"
+            "${{ inputs.repack_rustc != '' && format('repack-call-{0}', inputs.repack_rustc) || inputs.resign_rustc != '' && format('resign-call-{0}', inputs.resign_rustc) || format('build-crate-{0}', fromJSON(inputs.task).task_id) }}"
         )
     );
     assert_eq!(
@@ -1200,7 +1218,9 @@ fn build_crate_run_name_concurrency_and_jobs() {
     );
     assert_eq!(
         at(&wf, "jobs.publish.if").map(scalar).as_deref(),
-        Some("inputs.repack_rustc == '' && needs.build.result == 'success'")
+        Some(
+            "inputs.repack_rustc == '' && inputs.resign_rustc == '' && needs.build.result == 'success'"
+        )
     );
 }
 
@@ -1231,7 +1251,7 @@ fn build_crate_verifies_only_a_candidate_failure() {
     assert_eq!(
         at(&wf, "jobs.verify-failure.if").map(scalar).as_deref(),
         Some(
-            "always() && inputs.repack_rustc == '' && needs.build.result == 'failure' && needs.build.outputs.failure-candidate != ''"
+            "always() && inputs.repack_rustc == '' && inputs.resign_rustc == '' && needs.build.result == 'failure' && needs.build.outputs.failure-candidate != ''"
         )
     );
 }
@@ -1311,6 +1331,62 @@ fn build_crate_repack_job() {
             "repack job permission {permission}"
         );
     }
+}
+
+/// `resign.yml` is the only entry to the re-sign job, as `repack.yml` is to
+/// the repack job: dispatched on a release tag with the rustc, it calls
+/// `build-crate.yml`'s `resign` job, titles itself `<rustc>-resign`, and
+/// serializes per rustc.
+#[test]
+fn resign_workflow_calls_the_trusted_builder() {
+    let wf = load_workflow("resign.yml");
+    assert_eq!(at(&wf, "name").map(scalar).as_deref(), Some("resign"));
+    let triggers: Vec<String> = field(&wf, "on")
+        .and_then(serde_yml::Value::as_mapping)
+        .expect("on mapping")
+        .keys()
+        .map(scalar)
+        .collect();
+    assert_eq!(triggers, ["workflow_dispatch"]);
+    assert_eq!(
+        at(&wf, "run-name").map(scalar).as_deref(),
+        Some("${{ format('{0}-resign', inputs.rustc) }}")
+    );
+    assert_eq!(
+        at(&wf, "concurrency.group").map(scalar).as_deref(),
+        Some("${{ format('resign-{0}', inputs.rustc) }}")
+    );
+    assert_eq!(
+        at(&wf, "jobs.resign.uses").map(scalar).as_deref(),
+        Some("./.github/workflows/build-crate.yml")
+    );
+    assert_eq!(
+        at(&wf, "jobs.resign.if").map(scalar).as_deref(),
+        Some("startsWith(github.ref, 'refs/tags/v')")
+    );
+    let build = load_workflow("build-crate.yml");
+    for permission in ["contents", "packages", "id-token"] {
+        assert_eq!(
+            at(&wf, &format!("jobs.resign.permissions.{permission}")).map(scalar),
+            at(&build, &format!("jobs.resign.permissions.{permission}")).map(scalar),
+            "resign permission {permission}"
+        );
+    }
+    for (input, source) in [
+        ("resign_rustc", "rustc"),
+        ("resign_concurrency", "concurrency"),
+    ] {
+        assert_eq!(
+            at(&wf, &format!("jobs.resign.with.{input}"))
+                .map(scalar)
+                .as_deref(),
+            Some(format!("${{{{ inputs.{source} }}}}").as_str())
+        );
+    }
+    assert_eq!(
+        at(&build, "jobs.resign.if").map(scalar).as_deref(),
+        Some("inputs.resign_rustc != ''")
+    );
 }
 
 /// The five entrypoints' every job runs on a Linux runner — the
