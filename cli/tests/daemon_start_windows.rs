@@ -207,9 +207,14 @@ fn clients_connecting_as_the_drain_ends_are_answered() {
         panic!("one daemon serves: {:?}", daemon.serving_pids());
     };
 
+    // Each client reports its first answer, so the retirement starts only
+    // once every one of them is connecting: a client that first reached the
+    // pipe after the daemon left would prove nothing.
+    let (first_answer, first_answers) = mpsc::channel();
     let hammers: Vec<_> = (0..CLIENTS)
         .map(|_| {
             let run_dir = run_dir.clone();
+            let first_answer = first_answer.clone();
             std::thread::spawn(move || {
                 let mut answered = 0_usize;
                 while let Some(response) = try_ask(&run_dir, &ControlRequest::Status)? {
@@ -220,12 +225,20 @@ fn clients_connecting_as_the_drain_ends_are_answered() {
                         ),
                         "{response:?}"
                     );
+                    if answered == 0 {
+                        let _ = first_answer.send(());
+                    }
                     answered += 1;
                 }
                 Ok::<_, String>(answered)
             })
         })
         .collect();
+    for _ in 0..CLIENTS {
+        first_answers
+            .recv_timeout(Duration::from_secs(START_SECS))
+            .expect("every client is answered before the retirement");
+    }
 
     let retiring = try_ask(
         &run_dir,
