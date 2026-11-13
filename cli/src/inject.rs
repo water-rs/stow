@@ -1120,6 +1120,74 @@ mod tests {
         });
     }
 
+    /// Cargo's build-unit layout compiles a build script into its unit's
+    /// `out` with no `-C extra-filename` and runs it from there under
+    /// its bare crate name: the bundle's stable-named executable is
+    /// served at exactly that path.
+    #[test]
+    fn a_build_script_is_served_where_the_build_unit_layout_runs_it() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let cache_dir = tempdir.path().join("cache-entry");
+            std::fs::create_dir_all(cache_dir.join("files")).expect("cache files dir");
+            let image = b"#!/bin/sh\nexit 0\n";
+            let bundle_file = "build_script_build-0123abcd";
+            std::fs::write(cache_dir.join("files").join(bundle_file), image).expect("image");
+            let mut bundle = semantic_test_bundle(cache_dir, tempdir.path(), bundle_file);
+            bundle.outputs = vec![ArtifactBundleFile {
+                file_name: bundle_file.to_owned(),
+                media_type: stow_types::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE.to_owned(),
+                sha256: hex::encode(sha2::Sha256::digest(image)),
+            }];
+            bundle.kind = ArtifactKind::BuildScript;
+            bundle.crate_types = vec![stow_types::artifact::RustCrateType::Bin];
+
+            let out_dir = tempdir
+                .path()
+                .join("target/debug/build/itoa/0123456789abcdef/out");
+            let args = [
+                "--crate-name",
+                "build_script_build",
+                "--edition=2021",
+                "/root/.cargo/registry/src/index.crates.io-0123abcd/itoa-1.0.18/build.rs",
+                "--crate-type",
+                "bin",
+                "--emit=dep-info,link",
+                "-C",
+                "metadata=fedcba9876543210",
+                "--out-dir",
+                out_dir.to_str().expect("utf8"),
+            ]
+            .map(std::ffi::OsString::from);
+            let parsed = ParsedRustcArgs::parse(&args).expect("parse build script");
+            assert!(parsed.is_build_script());
+            assert_eq!(parsed.extra_filename, "");
+
+            write_artifacts(
+                &parsed,
+                &bundle,
+                "aarch64-apple-darwin",
+                OutputDirWriters::StowOnly,
+            )
+            .await
+            .expect("serve the build script");
+
+            let program = stow_types::cargo_layout::UnitDir::new(&out_dir)
+                .expect("a build-unit out dir")
+                .build_script_program("build_script_build")
+                .expect("the program cargo runs");
+            assert_eq!(program, out_dir.join("build_script_build"));
+            let metadata = std::fs::symlink_metadata(&program).expect("served file");
+            assert!(metadata.is_file(), "a real file, not a link");
+            assert_eq!(std::fs::read(&program).expect("read"), image);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(metadata.permissions().mode() & 0o111, 0o111);
+            }
+        });
+    }
+
     #[test]
     fn accepts_semantic_bundle_file_name_mismatch() {
         smol::block_on(async {

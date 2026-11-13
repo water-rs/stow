@@ -140,7 +140,7 @@ enum Command {
     /// The Traffic cost test's pieces: Worker CPU per lane, the
     /// peak-concurrency drive, and the projection against the
     /// allowance (`scripts/traffic-cost.sh`).
-    TrafficCost(traffic_cost::TrafficCostArgs),
+    TrafficCost(Box<traffic_cost::TrafficCostArgs>),
     /// The human request lane's Actions leg: `request resolve` turns an
     /// admitted request's dispatch input into its outcome report.
     Request(request::RequestArgs),
@@ -356,7 +356,7 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
         }
         Command::Index(args) => index_cmd::run(args, &*store).await,
         Command::LaunchModel(args) => launch_model::run(args, output).await,
-        Command::TrafficCost(args) => traffic_cost::run(args, output, &*store).await,
+        Command::TrafficCost(args) => traffic_cost::run(*args, output, &*store).await,
         Command::Request(args) => request::run(args, output, &*store).await,
         Command::Submit(args) => submit_command(&Edge::connect(&*store)?, args, output).await,
         Command::Deploy(args) => deploy::run(args, output).await,

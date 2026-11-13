@@ -90,6 +90,9 @@ LOCAL_CI_ADDR="127.0.0.1:${STOW_TRAFFIC_LOCAL_CI_PORT:-28124}"
 EDGE_URL="http://127.0.0.1:${EDGE_PORT}"
 SCHEDULER_URL="${EDGE_URL}/api/v1/scheduler"
 INSPECTOR_URL=
+# The stable rustc the edge's pinned channel manifest names, which a
+# human request resolves under; the runtime reports it once ready.
+STABLE_RUSTC=
 READY_DEADLINE="${STOW_E2E_READY_DEADLINE:-600}"
 SIZES="${STOW_TRAFFIC_SIZES:-100000 480000}"
 DURATION_SECS="${STOW_TRAFFIC_DURATION_SECS:-1800}"
@@ -415,6 +418,7 @@ start_edge() {
     wait_for "edge inspector target" "$READY_DEADLINE" "$EDGE_PID" \
         test -s "$INSPECTOR_URL_FILE"
     INSPECTOR_URL="$(jq -er '.inspector' "$INSPECTOR_URL_FILE")"
+    STABLE_RUSTC="$(jq -er '.stable_rustc' "$INSPECTOR_URL_FILE")"
 }
 
 # Resident set size of the edge process tree, logged at segment
@@ -554,6 +558,7 @@ LANE_ARGS=(
     --resolve-token-file "$RESOLVE_TOKEN_FILE"
     --index-publish-token-file "$INDEX_PUBLISH_TOKEN_FILE"
     --index-publish-rustc "$(rustc --version | awk '{print $2}')"
+    --stable-rustc "$STABLE_RUSTC"
     --model "$REPO_ROOT/launch-model.toml"
     --queue-rows "$SMALL"
     --rustc "$RUSTC_VERSION"

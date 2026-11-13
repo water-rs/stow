@@ -817,6 +817,29 @@ fn stable_output_name<'a>(
     }
 }
 
+/// The outputs of `record` a node's bundle carries — its stable-named
+/// ones — and the paths of the copies under the names cargo asked for.
+///
+/// Those copies are the build's own: cargo's shared layout names them
+/// with this invocation's unit hash, its build-unit layout leaves a
+/// build script's, dylib's or executable's bare. Shipping them would make
+/// one node's bundle depend on the layout that built it, and a consumer
+/// is served at the names its own cargo asks for. They still name files
+/// this unit owns.
+fn bundled_outputs(record: &CapturedRustcArtifact) -> (Vec<&CapturedRustcOutput>, Vec<PathBuf>) {
+    let (bundled, aliases): (Vec<_>, Vec<_>) = record
+        .outputs
+        .iter()
+        .partition(|output| stable_output_name(record, output).is_some());
+    (
+        bundled,
+        aliases
+            .into_iter()
+            .map(|alias| alias.path.clone())
+            .collect(),
+    )
+}
+
 /// One phase×invocation's view of the task's own unit: the crates.io
 /// lib units of that phase's graph (for dep-owner attribution) and the
 /// own unit's lib-dep keys — the unit the wrapper's own-crate edge
@@ -1239,9 +1262,10 @@ async fn build_scanned_artifact(
     let build_script = artifact.artifact_kind == ArtifactKind::BuildScript;
     let resolved_artifact = resolve_artifact(cx, artifact_index)?;
     let dependencies = resolved_artifact.dependencies.clone();
-    let mut outputs = Vec::with_capacity(artifact.captured.outputs.len());
+    let (bundled, cargo_alias_paths) = bundled_outputs(&artifact.captured);
+    let mut outputs = Vec::with_capacity(bundled.len());
     let mut artifact_size = 0u64;
-    for output in &artifact.captured.outputs {
+    for output in bundled {
         let source_path = output
             .snapshot_path
             .clone()
@@ -1291,6 +1315,7 @@ async fn build_scanned_artifact(
             artifact.package.crate_types.clone()
         },
         outputs,
+        cargo_alias_paths,
         // The shape the publisher's gate checks: the task's own side, the
         // invocation spelling the collector stamped on the capture, and
         // the emit set's link membership.
@@ -1985,7 +2010,12 @@ pub struct ScannedArtifact {
     pub compile_millis: u64,
     pub kind: ArtifactKind,
     pub crate_types: Vec<RustCrateType>,
+    /// The stable-named outputs the node's bundle carries.
     pub outputs: Vec<ScannedArtifactOutput>,
+    /// The copies of [`Self::outputs`] under the names cargo asked rustc
+    /// for, where those differ: files this unit owns that no bundle
+    /// carries.
+    pub cargo_alias_paths: Vec<PathBuf>,
     /// The unit shape the builder knows by construction — the task's own
     /// side, the invocation spelling the collector stamped, and the emit
     /// set's link membership.
@@ -2805,6 +2835,37 @@ mod tests {
             },
         ];
         capture
+    }
+
+    /// A build script compiled in cargo's shared layout and in its
+    /// build-unit one bundles the same file: the stable-named output.
+    /// The copy under cargo's name — hashed in the shared layout, bare in
+    /// the build-unit one — stays a path the unit owns.
+    #[test]
+    fn a_build_script_bundles_the_same_output_in_either_layout() {
+        let shared = build_script_capture(
+            "zstd-sys",
+            "2.0.16",
+            "/tmp/w/target",
+            UnitInvocation::Native,
+        );
+        let mut build_unit = shared.clone();
+        let unit_out = "/tmp/w/target/debug/build/zstd-sys/0123456789abcdef/out";
+        build_unit.out_dir = PathBuf::from(unit_out);
+        build_unit.outputs[0].path =
+            PathBuf::from(format!("{unit_out}/build_script_build-aaaaaaaaaaaaaaaa"));
+        build_unit.outputs[1].path = PathBuf::from(format!("{unit_out}/build_script_build"));
+
+        let names = |record: &CapturedRustcArtifact| {
+            let (bundled, aliases) = super::bundled_outputs(record);
+            assert_eq!(aliases, [record.outputs[1].path.clone()]);
+            bundled
+                .iter()
+                .map(|output| output.path.file_name().expect("file name").to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&shared), ["build_script_build-aaaaaaaaaaaaaaaa"]);
+        assert_eq!(names(&build_unit), names(&shared));
     }
 
     /// One build script compiled under the native and the `--target`

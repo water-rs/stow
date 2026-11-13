@@ -75,6 +75,11 @@ const origins = ["STOW_LOCAL_CI_URL", "GHCR_BASE_URL", "STOW_GITHUB_API_URL", "S
 		if (url.hostname !== "127.0.0.1") throw new Error(`${name} is not a mock loopback URL`);
 		return url.origin;
 	});
+const external = await externalBindings();
+// The stable rustc the egress's pinned channel manifest names: the one the
+// Worker resolves a human request under, so a drive of that lifecycle
+// names the same toolchain.
+const stableRustc = Bun.TOML.parse(external.STABLE_MANIFEST).pkg.rustc.version.split(" ")[0];
 const miniflare = new Miniflare(convertV4MiniflareOptions({
 	host: "127.0.0.1",
 	port: Number(values.port),
@@ -91,7 +96,7 @@ const miniflare = new Miniflare(convertV4MiniflareOptions({
 			modulesRoot: import.meta.dirname,
 			compatibilityDate: workerOptions.compatibilityDate,
 			unsafeInspectorProxy: false,
-			bindings: { ...await externalBindings(), LOOPBACK_ORIGINS: JSON.stringify([...new Set(origins)]) },
+			bindings: { ...external, LOOPBACK_ORIGINS: JSON.stringify([...new Set(origins)]) },
 		},
 	],
 }));
@@ -108,7 +113,8 @@ try {
 	if (!response.ok) throw new Error(`Inspector listing: HTTP ${response.status}`);
 	const targets = (await response.json()).filter((target) => target.id === `core:user:${config.name}`);
 	if (targets.length !== 1) throw new Error(`Inspector has ${targets.length} targets for ${config.name}`);
-	const ready = { main: builtMain, modulesRoot, modules, url, inspector: targets[0].webSocketDebuggerUrl };
+	const ready = { main: builtMain, modulesRoot, modules, url, inspector: targets[0].webSocketDebuggerUrl,
+		stable_rustc: stableRustc };
 	const temporary = values["ready-file"] + ".pending";
 	await writeFile(temporary, JSON.stringify(ready));
 	await rename(temporary, values["ready-file"]);

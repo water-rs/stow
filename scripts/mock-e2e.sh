@@ -1962,11 +1962,14 @@ RUST_LOG=stow_cli=info fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DI
     || die "fresh build-script consumer failed — see $LOG_DIR/build-script-fresh.log"
 grep 'Fresh serde_core v1.0.229' "$LOG_DIR/build-script-fresh.log" >/dev/null \
     || die "Cargo did not keep the restored build script fresh"
+# Cargo runs a build script as `build-script-build` in the old layout and
+# as `out/build_script_build` in cargo 1.100's build-unit layout.
+script_run='Running .*(build-script-build|/out/build_script_build)'
 for stage in remote local; do
-    runs="$(grep -c 'Running .*build-script-build' "$LOG_DIR/build-script-$stage.log" || true)"
+    runs="$(grep -cE "$script_run" "$LOG_DIR/build-script-$stage.log" || true)"
     [ "$runs" -eq 1 ] || die "$stage script restore ran the script $runs times instead of once"
 done
-if grep -q 'Running .*build-script-build' "$LOG_DIR/build-script-fresh.log"; then
+if grep -qE "$script_run" "$LOG_DIR/build-script-fresh.log"; then
     die "Cargo reran the fresh build script"
 fi
 echo "[mock-e2e] OK — build script served remotely and locally, then kept fresh by Cargo"
