@@ -3,7 +3,7 @@ name: toolchain-publish
 # Every build-crate dispatch used to compile stow-build and stow-cli on
 # the runner that also builds the task's crate — up to ~17 minutes per
 # run, once per target leg of the wave. This workflow compiles them once
-# per main commit per host platform and publishes the toolchain (stow-build,
+# per release tag per host platform and publishes the toolchain (stow-build,
 # stow-cli, and on Linux and macOS stow-admin) to GHCR as a digest-addressed,
 # cosign-signed OCI artifact; build-crate and the deploy/watchdog jobs pull it
 # by `github.sha` instead of compiling or hunting Test-run artifacts
@@ -14,14 +14,14 @@ name: toolchain-publish
 # is the one binary that links stow-resolver — cargo itself — which
 # dominates a cold release build, so the Windows leg leaves it out.
 #
-# It runs on `merge_group`, not `push`: GitHub fast-forwards `main` to the
-# merge-group head it tested, so `github.sha` here is exactly the future
-# main sha — the tag `<sha>-<platform>` is what a build-crate dispatch
-# looks up, and the artifact exists before `main` moves. The signing
-# identity is `…/toolchain-publish.yml@refs/heads/gh-readonly-queue/main/…`,
-# a ref only GitHub's merge queue can create, and consumers additionally
-# pin the signature's workflow-sha extension to their own `github.sha` —
-# provenance at least as strong as the source build it replaces.
+# It runs on a release tag push (`v<semver>`), so `github.sha` here is the
+# release PR's head commit — the tag `<sha>-<platform>` is what a
+# production workflow dispatched on that tag looks up. The signing identity
+# is `…/toolchain-publish.yml@refs/tags/v<semver>`, a ref only the release
+# workflow can create (a ruleset protects `refs/tags/v*`), and consumers
+# additionally pin the signature's workflow-sha extension to their own
+# `github.sha` — provenance at least as strong as the source build it
+# replaces.
 #
 # GHCR/OCI rather than release assets: the manifest digest makes the pull
 # itself the digest verification (a release asset would need a sidecar
@@ -32,29 +32,19 @@ name: toolchain-publish
 # both directions go through the oras CLI — stow-oci is a library whose
 # own host is the artifact being fetched.
 #
-# `toolchain gate` is the required status check for `main`. It must
-# report on both events a required check sees: `merge_group` (the commit
-# the queue tests) and `pull_request` (a PR cannot enter the queue until
-# its required checks are green). The matrix legs only run on
-# `merge_group` — nothing is published for a PR — and the gate treats a
-# skipped leg as success, so the same check name reports green on the PR
-# and green on the queued commit.
+# Once every platform leg has published, the `deploy` job dispatches
+# deploy-edge.yml on the same tag: the edge deploys only from a release, and
+# only after the toolchain its verdict jobs pull exists.
 
 on:
-  merge_group:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  push:
+    tags: ['v[0-9]*']
 
 permissions: {}
 
 jobs:
   toolchain:
     name: publish stow toolchain (${{ matrix.key }})
-    # Only the merge queue publishes: its head sha is the future main sha
-    # consumers look up; a pull_request run exists only so the required
-    # `toolchain gate` check reports on PRs.
-    if: github.event_name == 'merge_group'
     strategy:
       fail-fast: false
       matrix:
@@ -109,30 +99,24 @@ jobs:
             "stow-toolchain.tar.gz:application/vnd.oci.image.layer.v1.tar+gzip"
           digest="$(oras manifest fetch --descriptor "$ref" | jq -r .digest)"
           # Sign by digest: the signature attests these exact bytes came
-          # from this workflow under the merge queue — the identity the
+          # from this workflow on this release tag — the identity the
           # consumer pins.
           cosign sign --yes "ghcr.io/water-rs/stow-toolchain@${digest}"
           echo "published ${ref} digest ${digest}"
 
-  # One aggregate check so the merge queue can require every platform leg
-  # with a single rule — the legs fan out into three check names.
-  gate:
-    name: toolchain gate
+  # Deploys the edge from this release once every platform's toolchain is
+  # published; the dispatched run's ref is the tag, so its jobs pull the
+  # toolchain this workflow just signed.
+  deploy:
+    name: deploy the edge
     needs: toolchain
-    if: always()
     runs-on: ubuntu-latest
-    permissions: {}
+    permissions:
+      actions: write # dispatch deploy-edge.yml
+    timeout-minutes: 5
     steps:
-      - name: Every leg succeeded
+      - name: Dispatch deploy-edge on this tag
         env:
-          NEEDS: ${{ toJSON(needs) }}
-          EVENT: ${{ github.event_name }}
-        run: |
-          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          # On pull_request the legs are skipped by design; on
-          # merge_group every leg must have published.
-          if [ "$EVENT" = merge_group ]; then
-            echo "$NEEDS" | jq -e '[.[].result] | all(. == "success")' > /dev/null
-          else
-            echo "$NEEDS" | jq -e '[.[].result] | all(. == "skipped")' > /dev/null
-          fi
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run deploy-edge.yml --ref "$GITHUB_REF_NAME"
