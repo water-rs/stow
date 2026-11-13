@@ -78,13 +78,23 @@ fn validate_bundle_config_identity(config: &ArtifactBlobConfig) -> Result<(), Bu
     // outputs instead: every artifact rustc writes is
     // `lib?<name>-<metadata>.<ext>`, so the outputs themselves name the
     // one lib name a bundle may hold.
+    //
+    // Every output carries the stable identity's name and nothing else:
+    // the name cargo asked the builder's rustc for is that build's own,
+    // hashed per invocation in cargo's shared layout and bare in its
+    // build-unit one, so shipping it would make one node's bundle depend
+    // on the layout that built it. A consumer is served at the names its
+    // own cargo asks for.
     let mut lib_name = None::<String>;
-    let mut saw_canonical_rlib = false;
-    let mut saw_canonical_rmeta = false;
-    let mut saw_canonical_dynamic = false;
-    let mut saw_canonical_executable = false;
+    let mut file_names = std::collections::BTreeSet::new();
 
     for output in &config.outputs {
+        if !file_names.insert(output.file_name.as_str()) {
+            return Err(BundleSchemaError(format!(
+                "bundle output {} appears twice",
+                output.file_name
+            )));
+        }
         let (stem, kind) = classify_bundle_output(config, output)?;
         match &lib_name {
             Some(name) if *name != stem => {
@@ -97,17 +107,12 @@ fn validate_bundle_config_identity(config: &ArtifactBlobConfig) -> Result<(), Bu
             None => lib_name = Some(stem.clone()),
         }
         let canonical_stem = format!("lib{stem}{extra}", extra = config.extra_filename);
-        match kind {
+        let canonical = match kind {
             BundleOutputKind::Executable => {
-                saw_canonical_executable |=
-                    output.file_name == canonical_executable_name(config, &stem);
+                output.file_name == canonical_executable_name(config, &stem)
             }
-            BundleOutputKind::Rlib => {
-                saw_canonical_rlib |= output.file_name == format!("{canonical_stem}.rlib");
-            }
-            BundleOutputKind::Rmeta => {
-                saw_canonical_rmeta |= output.file_name == format!("{canonical_stem}.rmeta");
-            }
+            BundleOutputKind::Rlib => output.file_name == format!("{canonical_stem}.rlib"),
+            BundleOutputKind::Rmeta => output.file_name == format!("{canonical_stem}.rmeta"),
             BundleOutputKind::Dynamic => {
                 // Dynamic output names are platform-shaped: unix takes
                 // `lib<crate><extra>.{so,dylib}`, Windows takes
@@ -117,54 +122,15 @@ fn validate_bundle_config_identity(config: &ArtifactBlobConfig) -> Result<(), Bu
                 } else {
                     format!("{canonical_stem}.")
                 };
-                saw_canonical_dynamic |= output.file_name.starts_with(&prefix);
+                output.file_name.starts_with(&prefix)
             }
+        };
+        if !canonical {
+            return Err(BundleSchemaError(format!(
+                "bundle output {} is not named for stable metadata {}",
+                output.file_name, config.c_metadata
+            )));
         }
-    }
-
-    if config
-        .outputs
-        .iter()
-        .any(|output| output.media_type == STOW_RLIB_MEDIA_TYPE)
-        && !saw_canonical_rlib
-    {
-        return Err(BundleSchemaError(format!(
-            "bundle is missing canonical rlib output for stable metadata {}",
-            config.c_metadata
-        )));
-    }
-    if config
-        .outputs
-        .iter()
-        .any(|output| output.media_type == STOW_RMETA_MEDIA_TYPE)
-        && !saw_canonical_rmeta
-    {
-        return Err(BundleSchemaError(format!(
-            "bundle is missing canonical rmeta output for stable metadata {}",
-            config.c_metadata
-        )));
-    }
-    if config.outputs.iter().any(|output| {
-        output.media_type == STOW_DYLIB_MEDIA_TYPE
-            || output.media_type == STOW_PROC_MACRO_MEDIA_TYPE
-    }) && !saw_canonical_dynamic
-    {
-        return Err(BundleSchemaError(format!(
-            "bundle is missing canonical dynamic output for stable metadata {}",
-            config.c_metadata
-        )));
-    }
-
-    if config
-        .outputs
-        .iter()
-        .any(|output| output.media_type == STOW_BUILD_SCRIPT_MEDIA_TYPE)
-        && !saw_canonical_executable
-    {
-        return Err(BundleSchemaError(format!(
-            "bundle is missing canonical executable output for stable metadata {}",
-            config.c_metadata
-        )));
     }
 
     Ok(())
@@ -236,9 +202,8 @@ fn malformed_output(file_name: &str) -> BundleSchemaError {
 
 /// Parse `<name>-<metadata>` from an artifact body: `<name>` is the lib
 /// name (rustc's `--crate-name`, a crate identifier), `<metadata>` the
-/// 16-hex `-C metadata` of whichever identity cargo handed that
-/// invocation — the stable identity on the canonical outputs, cargo's
-/// ephemeral one on the aliased copies shipped beside them.
+/// 16-hex `-C metadata`, which the caller then holds to the stable
+/// identity's.
 fn artifact_stem(body: &str, file_name: &str) -> Result<String, BundleSchemaError> {
     let (name, metadata) = body
         .rsplit_once('-')
@@ -473,12 +438,7 @@ mod tests {
     #[test]
     fn validate_bundle_schema_accepts_stable_bundle_with_canonical_output_names() {
         let bytes = bundle_bytes(stable_config(vec![
-            bundle_file("libproc_macro2-57f123ce754eb51b.rlib", STOW_RLIB_MEDIA_TYPE),
             bundle_file("libproc_macro2-df1c5df8d44a9ede.rlib", STOW_RLIB_MEDIA_TYPE),
-            bundle_file(
-                "libproc_macro2-57f123ce754eb51b.rmeta",
-                STOW_RMETA_MEDIA_TYPE,
-            ),
             bundle_file(
                 "libproc_macro2-df1c5df8d44a9ede.rmeta",
                 STOW_RMETA_MEDIA_TYPE,
@@ -486,6 +446,43 @@ mod tests {
         ]));
 
         validate_bundle_schema(&bytes).unwrap();
+    }
+
+    /// The copy of an output under the name cargo asked the builder for
+    /// is that build's own, never part of a node: hashed per invocation
+    /// in cargo's shared layout, bare in its build-unit one.
+    #[test]
+    fn validate_bundle_schema_rejects_cargos_names_beside_the_canonical_ones() {
+        let shared = stable_config(vec![
+            bundle_file("libproc_macro2-df1c5df8d44a9ede.rlib", STOW_RLIB_MEDIA_TYPE),
+            bundle_file("libproc_macro2-57f123ce754eb51b.rlib", STOW_RLIB_MEDIA_TYPE),
+        ]);
+        let mut build_unit = stable_config(vec![
+            bundle_file(
+                "build_script_build-df1c5df8d44a9ede",
+                crate::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE,
+            ),
+            bundle_file(
+                "build_script_build",
+                crate::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE,
+            ),
+        ]);
+        build_unit.kind = ArtifactKind::BuildScript;
+        build_unit.crate_types = vec![RustCrateType::Bin];
+        for config in [shared, build_unit] {
+            assert!(validate_bundle_schema(&bundle_bytes(config)).is_err());
+        }
+    }
+
+    #[test]
+    fn validate_bundle_schema_rejects_an_output_named_twice() {
+        let bytes = bundle_bytes(stable_config(vec![
+            bundle_file("libproc_macro2-df1c5df8d44a9ede.rlib", STOW_RLIB_MEDIA_TYPE),
+            bundle_file("libproc_macro2-df1c5df8d44a9ede.rlib", STOW_RLIB_MEDIA_TYPE),
+        ]));
+
+        let error = validate_bundle_schema(&bytes).expect_err("a repeated output must fail");
+        assert!(error.to_string().contains("appears twice"), "{error}");
     }
 
     #[test]
@@ -540,23 +537,19 @@ mod tests {
 
         let error = validate_bundle_schema(&bytes).expect_err("a wrong extra_filename must fail");
         assert!(
-            error.to_string().contains("missing canonical rlib output"),
+            error
+                .to_string()
+                .contains("is not named for stable metadata df1c5df8d44a9ede"),
             "{error}"
         );
     }
 
     #[test]
     fn validate_bundle_schema_accepts_a_build_script_executable() {
-        let mut config = stable_config(vec![
-            bundle_file(
-                "build_script_build-df1c5df8d44a9ede",
-                crate::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE,
-            ),
-            bundle_file(
-                "build_script_build-57f123ce754eb51b",
-                crate::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE,
-            ),
-        ]);
+        let mut config = stable_config(vec![bundle_file(
+            "build_script_build-df1c5df8d44a9ede",
+            crate::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE,
+        )]);
         config.kind = ArtifactKind::BuildScript;
         config.crate_types = vec![RustCrateType::Bin];
         validate_bundle_schema(&bundle_bytes(config)).unwrap();

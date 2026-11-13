@@ -3524,16 +3524,10 @@ pub(crate) async fn prune_materialized_aliases_for_cached_closure(
         return Ok(None);
     }
 
-    let mut keep_original_file_names = BTreeSet::new();
     let mut closure_compile_keys = BTreeSet::new();
-    let mut closure_crates = BTreeSet::from([canonical_crate_name(&cached_bundle.crate_name)]);
-    let mut closure_visited = BTreeSet::new();
-    collect_dependency_closure_file_names(
+    collect_dependency_closure_compile_keys(
         &cached_bundle,
         &bundles_by_compile_key,
-        &mut closure_visited,
-        &mut keep_original_file_names,
-        &mut closure_crates,
         &mut closure_compile_keys,
     )?;
 
@@ -3862,22 +3856,20 @@ async fn cache_verified_downloaded_bundle(
     verify::store_downloaded_bundle_with_trust_marker(config, request, bundle).await
 }
 
-fn collect_dependency_closure_file_names(
+/// Every compile key in `bundle`'s dependency closure, each of whose
+/// bundles `bundles_by_compile_key` must already hold.
+fn collect_dependency_closure_compile_keys(
     bundle: &artifact_cache::CachedArtifactBundle,
     bundles_by_compile_key: &BTreeMap<String, artifact_cache::CachedArtifactBundle>,
-    visited: &mut BTreeSet<String>,
-    keep_original_file_names: &mut BTreeSet<String>,
-    closure_crates: &mut BTreeSet<String>,
     closure_compile_keys: &mut BTreeSet<String>,
 ) -> stow_types::error::Result<()> {
     let dependencies = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
         &bundle.dependency_compile_keys_json,
     )?;
     for dependency in dependencies {
-        if !visited.insert(dependency.compile_key.clone()) {
+        if !closure_compile_keys.insert(dependency.compile_key.clone()) {
             continue;
         }
-        closure_compile_keys.insert(dependency.compile_key.clone());
         let dependency_bundle = bundles_by_compile_key
             .get(&dependency.compile_key)
             .ok_or_else(|| {
@@ -3887,16 +3879,9 @@ fn collect_dependency_closure_file_names(
                     dependency.crate_name
                 )
             })?;
-        closure_crates.insert(canonical_crate_name(&dependency_bundle.crate_name));
-        for output in &dependency_bundle.outputs {
-            keep_original_file_names.insert(output.file_name.clone());
-        }
-        collect_dependency_closure_file_names(
+        collect_dependency_closure_compile_keys(
             dependency_bundle,
             bundles_by_compile_key,
-            visited,
-            keep_original_file_names,
-            closure_crates,
             closure_compile_keys,
         )?;
     }
