@@ -935,6 +935,23 @@ impl Graph {
         }
     }
 
+    /// Size every arena and index for the counts the head records, so
+    /// the rows that follow never grow a buffer: the arenas reserve
+    /// their fragment tables, the offset array of the interner is exact,
+    /// and the id and identity tables take their final size, which the
+    /// rebuild after the load then reuses.
+    ///
+    /// The head carries no byte length for the interned text, so that
+    /// buffer still grows as its rows decode.
+    fn presize(&mut self, lens: &SectionLens) {
+        self.intern.reserve_exact(lens.intern);
+        self.nodes.reserve_maximum_concurrent_capacity(lens.nodes);
+        self.states.reserve_maximum_concurrent_capacity(lens.states);
+        self.edges.reserve(lens.edges, lens.nodes);
+        self.ids.clear_for(lens.nodes);
+        self.idents.clear_for(lens.nodes);
+    }
+
     fn section_lens(&self) -> SectionLens {
         SectionLens {
             intern: self.intern.len(),
@@ -1173,7 +1190,7 @@ impl SnapshotLoader {
         }
         graph.outcome_hours = head.outcome_hours.into_iter().collect();
         graph.last_run_update_ms = head.last_run_update_ms;
-        graph.intern.reserve_exact(head.lens.intern);
+        graph.presize(&head.lens);
         graph.published_ids = head.published_ids;
         *lens = Some(head.lens);
         Ok(())

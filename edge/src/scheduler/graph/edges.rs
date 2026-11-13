@@ -61,6 +61,15 @@ impl Edges {
         Ok(at)
     }
 
+    /// Size the arrays for a load of `edges` edges over `nodes` nodes:
+    /// the forward arrays and the reverse index's owners and offsets.
+    pub(super) fn reserve(&mut self, edges: usize, nodes: usize) {
+        self.dep.reserve_maximum_concurrent_capacity(edges);
+        self.flags.reserve_maximum_concurrent_capacity(edges);
+        self.owners.reserve_maximum_concurrent_capacity(edges);
+        self.offsets.reserve_maximum_concurrent_capacity(nodes + 1);
+    }
+
     /// Append an edge from a snapshot row; the reverse index is
     /// rebuilt after the load.
     pub(super) fn load(&mut self, dep: u32, flags: u8) {

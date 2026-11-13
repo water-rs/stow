@@ -6888,6 +6888,9 @@ mod tests {
              ({} B/node), formula {expected} B; {held:?}",
             accounted / live
         );
+        // The head's counts sized both indexes exactly, once.
+        let exact = (live * 8).div_ceil(7) * size_of::<u32>();
+        assert_eq!((held.task_id_index, held.identity_index), (exact, exact));
         assert!(
             (580..600).contains(&(edges * 100 / live)),
             "{edges} edges over {live} nodes"
