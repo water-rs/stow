@@ -6808,8 +6808,8 @@ mod tests {
     ) -> usize {
         // An arena allocates whole fragments of 1024 records.
         let arena = |records: usize, record: usize| records.div_ceil(1024) * 1024 * record;
-        let table =
-            |entries: usize| (entries * 10 / 7 + 1).next_power_of_two().max(16) * size_of::<u32>();
+        // An index holds its ids at seven eighths full, sized exactly.
+        let table = |entries: usize| (entries * 8).div_ceil(7).max(8) * size_of::<u32>();
         arena(nodes, size_of::<Node>())
             + arena(states, size_of::<State>())
             + states.div_ceil(8)

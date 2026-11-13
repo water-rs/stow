@@ -15,9 +15,28 @@ pub(super) fn hash_of<T: Hash + ?Sized>(value: &T) -> u64 {
     hasher.finish()
 }
 
+/// The most slots in use, in eighths of the array.
+const LOAD_EIGHTHS: usize = 7;
+
+/// Slots below which a table never shrinks its probe room.
+const MIN_SLOTS: usize = 8;
+
+/// The slot count that holds `entries` ids at the full load.
+const fn slots_for(entries: usize) -> usize {
+    let slots = (entries * 8).div_ceil(LOAD_EIGHTHS);
+    if slots < MIN_SLOTS { MIN_SLOTS } else { slots }
+}
+
 /// An open-addressing multimap from a hash to `u32` ids: linear
-/// probing over a power-of-two slot array kept under 70% full. It
-/// closes deleted probe-chain holes, so a probe ends at the first free slot.
+/// probing over a slot array of any length kept at most seven eighths
+/// full. A hash maps to its first slot by range reduction (its low 32
+/// bits scaled by the length, Lemire's fastrange), so the length is
+/// exact rather than a power of two.
+///
+/// The table holds exactly the ids `0..n`, inserted in order, and the
+/// caller can hash any of them again. That makes growth a rebuild from
+/// the ids: the old array is freed before the larger one is allocated,
+/// so the two are never resident together.
 #[derive(Debug, Default)]
 pub(super) struct IxTable {
     slots: Vec<u32>,
@@ -25,11 +44,15 @@ pub(super) struct IxTable {
 }
 
 impl IxTable {
-    /// Clear the table and reuse its buffer for `entries` ids.
+    /// Clear the table and size it exactly for `entries` ids, reusing
+    /// the buffer when it is large enough.
     pub(super) fn clear_for(&mut self, entries: usize) {
-        let wanted = (entries * 10 / 7 + 1).next_power_of_two().max(16);
+        let wanted = slots_for(entries);
+        if wanted > self.slots.capacity() {
+            self.slots = Vec::new();
+        }
+        self.slots.clear();
         self.slots.resize(wanted, EMPTY);
-        self.slots.fill(EMPTY);
         self.used = 0;
     }
 
@@ -42,15 +65,20 @@ impl IxTable {
         }
     }
 
-    /// Insert `id` under `hash`; `rehash` recomputes the hash of an id
-    /// already held, for the doubling.
+    /// Insert `id` under `hash`; ids arrive in order, `0, 1, 2, ...`.
+    /// `rehash` recomputes the hash of an id already held, for growth.
     pub(super) fn insert(&mut self, hash: u64, id: u32, rehash: impl Fn(u32) -> u64) {
         debug_assert_ne!(id, EMPTY, "the free-slot marker is not an id");
-        if (self.used + 1) * 10 > self.slots.len() * 7 {
-            let grown = (self.slots.len() * 2).max(16);
-            let old = std::mem::replace(&mut self.slots, vec![EMPTY; grown]);
+        debug_assert_eq!(id as usize, self.used, "ids are inserted in order");
+        if (self.used + 1) * 8 > self.slots.len() * LOAD_EIGHTHS {
+            // A quarter more room than the ids held now, so a stream of
+            // inserts pays one rebuild per quarter of growth.
+            let held = u32::try_from(self.used).expect("held ids fit u32");
+            let wanted = slots_for(self.used + 1 + (self.used + 1) / 4);
+            self.slots = Vec::new();
+            self.slots = vec![EMPTY; wanted];
             self.used = 0;
-            for held in old.into_iter().filter(|&held| held != EMPTY) {
+            for held in 0..held {
                 self.place(rehash(held), held);
             }
         }
@@ -58,10 +86,9 @@ impl IxTable {
     }
 
     fn place(&mut self, hash: u64, id: u32) {
-        let mask = self.slots.len() - 1;
         let mut at = probe_start(hash, self.slots.len());
         while self.slots[at] != EMPTY {
-            at = (at + 1) & mask;
+            at = next_slot(at, self.slots.len());
         }
         self.slots[at] = id;
         self.used += 1;
@@ -69,15 +96,23 @@ impl IxTable {
 
     /// Heap bytes the slot array holds.
     pub(super) const fn heap_bytes(&self) -> usize {
-        self.slots.len() * size_of::<u32>()
+        self.slots.capacity() * size_of::<u32>()
     }
 }
 
-/// Where a hash's probe run starts in a power-of-two array of `len`
-/// slots (`0` for the empty array).
+/// Where a hash's probe run starts in an array of `len` slots (`0` for
+/// the empty array): the low 32 bits of the hash scaled into `0..len`.
+/// Callers hash to 32 bits at most (an id key's first four bytes), and
+/// ids are `u32`, so `len` stays below 2^32 and the product fits.
 fn probe_start(hash: u64, len: usize) -> usize {
-    let mask = u64::try_from(len.saturating_sub(1)).expect("slot count fits u64");
-    usize::try_from(hash & mask).expect("a masked hash is a slot index")
+    let len = u64::try_from(len).expect("slot count fits u64");
+    usize::try_from(((hash & u64::from(u32::MAX)) * len) >> 32)
+        .expect("a reduced hash is a slot index")
+}
+
+/// The slot after `at`, wrapping at the end of the array.
+const fn next_slot(at: usize, len: usize) -> usize {
+    if at + 1 == len { 0 } else { at + 1 }
 }
 
 /// The ids of one probe run.
@@ -94,7 +129,7 @@ impl Iterator for Candidates<'_> {
         if id == EMPTY {
             return None;
         }
-        self.at = (self.at + 1) & (self.slots.len() - 1);
+        self.at = next_slot(self.at, self.slots.len());
         Some(id)
     }
 }
@@ -273,6 +308,35 @@ mod tests {
                 let expected: Vec<_> = (0..count).filter(|&id| hash(id) == key).collect();
                 assert_eq!(actual, expected);
             }
+        }
+    }
+
+    #[test]
+    fn tables_are_sized_exactly_and_grow_by_rebuilding_from_the_ids() {
+        let hash = |id: u32| super::hash_of(&id);
+        let mut table = IxTable::default();
+        table.clear_for(1_000);
+        assert_eq!(table.slots.len(), 1_143, "one slot per 7/8 of an entry");
+        assert_eq!(table.heap_bytes(), 1_143 * 4);
+        let start = table.slots.as_ptr();
+        for id in 0..1_000 {
+            table.insert(hash(id), id, hash);
+        }
+        assert_eq!(table.slots.as_ptr(), start, "a sized table never moves");
+        // Growth rebuilds from the ids with a quarter more room, and
+        // every id stays reachable through its own probe run.
+        for id in 1_000..5_000 {
+            table.insert(hash(id), id, hash);
+            assert!(table.used * 8 <= table.slots.len() * 7);
+        }
+        assert!(!table.slots.len().is_power_of_two());
+        assert_eq!(
+            table.heap_bytes(),
+            table.slots.len() * 4,
+            "no spare capacity"
+        );
+        for id in 0..5_000 {
+            assert!(table.candidates(hash(id)).any(|held| held == id), "id {id}");
         }
     }
 
