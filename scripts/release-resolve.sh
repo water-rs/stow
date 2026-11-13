@@ -16,14 +16,23 @@
 # Environment:
 #   GITHUB_REPOSITORY  owner/name of the repository
 #   GH_TOKEN           token with contents, pull-requests and statuses read
+#   GITHUB_API_URL     the REST API root, as Actions sets it
 #   RELEASE_PR_AUTHOR  login of the App that opens release PRs, `<slug>[bot]`
 #   GITHUB_OUTPUT      step output file
 set -euo pipefail
 
 pushed="${1:?usage: release-resolve.sh <pushed-sha>}"
-: "${GITHUB_REPOSITORY:?}" "${GH_TOKEN:?}" "${RELEASE_PR_AUTHOR:?}" "${GITHUB_OUTPUT:?}"
+: "${GITHUB_REPOSITORY:?}" "${GH_TOKEN:?}" "${RELEASE_PR_AUTHOR:?}" "${GITHUB_OUTPUT:?}" "${GITHUB_API_URL:?}"
 
-prs="$(gh api "repos/$GITHUB_REPOSITORY/commits/$pushed/pulls" \
+# GET of a repository API path; fails on a non-2xx answer.
+api() {
+  curl -fsS \
+    --header "Authorization: Bearer $GH_TOKEN" \
+    --header "Accept: application/vnd.github+json" \
+    "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/$1"
+}
+
+prs="$(api "commits/$pushed/pulls" \
   | jq -c --arg author "$RELEASE_PR_AUTHOR" '
       [.[] | select(.head.ref | startswith("release-plz-"))
            | select(.user.login == $author)
@@ -42,22 +51,30 @@ head="$(jq -r '.[0].head.sha' <<<"$prs")"
 
 # main takes merge commits only, so the second parent of the pushed commit is
 # the PR's head: nothing was added to or dropped from the PR in the merge.
-second="$(gh api "repos/$GITHUB_REPOSITORY/commits/$pushed" --jq '.parents[1].sha // empty')"
+second="$(api "commits/$pushed" | jq -r '.parents[1].sha // empty')"
 if [ "$second" != "$head" ]; then
   echo "::error::$pushed does not merge the release PR head $head (second parent: ${second:-none})" >&2
   exit 1
 fi
 
-parents="$(gh api "repos/$GITHUB_REPOSITORY/commits/$head" --jq '[.parents[].sha]')"
+parents="$(api "commits/$head" | jq -c '[.parents[].sha]')"
 if [ "$(jq 'length' <<<"$parents")" -ne 1 ]; then
   echo "::error::release PR head $head must have exactly one parent (the certified commit); parents: $parents" >&2
   exit 1
 fi
 certified="$(jq -r '.[0]' <<<"$parents")"
 
-ok="$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$certified/statuses" \
-  | jq -s '[.[][] | select(.context == "Certified" and .state == "success"
-                           and .creator.login == "github-actions[bot]")] | length')"
+# Newest first, 100 a page; every page is read, the Certified status may be
+# on any of them.
+ok=0
+page=1
+while :; do
+  rows="$(api "commits/$certified/statuses?per_page=100&page=$page")"
+  ok=$((ok + $(jq '[.[] | select(.context == "Certified" and .state == "success"
+                                 and .creator.login == "github-actions[bot]")] | length' <<<"$rows")))
+  [ "$(jq 'length' <<<"$rows")" -lt 100 ] && break
+  page=$((page + 1))
+done
 if [ "$ok" -eq 0 ]; then
   echo "::error::$certified, the parent of release PR head $head, has no Certified success status from github-actions[bot]" >&2
   exit 1

@@ -28,6 +28,7 @@ mod context_tests;
 mod dep_scan;
 mod failure;
 mod handle_copy;
+mod local_release;
 mod local_server;
 #[cfg(feature = "mock-compile")]
 mod mock_compile;
@@ -55,6 +56,9 @@ const GITHUB_RUN_ATTEMPT_ENV: &str = "GITHUB_RUN_ATTEMPT";
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
 const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
+/// The directory of bare `<owner>/<repo>.git` repositories the dev server's
+/// mock GitHub serves the release flow from (stow#1514); unset serves none.
+const STOW_MOCK_GIT_ROOT_ENV: &str = "STOW_MOCK_GIT_ROOT";
 const STOW_GITHUB_WEBHOOK_SECRET_ENV: &str = "STOW_GITHUB_WEBHOOK_SECRET";
 const GITHUB_APP_SLUG_ENV: &str = "GITHUB_APP_SLUG";
 /// `mock_compile::STOW_BUILD_MOCK_COMPILE_ENV`, named here for the refusal
@@ -650,6 +654,10 @@ async fn serve_stage(listen: std::net::SocketAddr) -> stow_types::error::Result<
         env_required(GITHUB_APP_SLUG_ENV)?,
         runners,
     );
+    let state = match std::env::var_os(STOW_MOCK_GIT_ROOT_ENV) {
+        Some(root) => state.with_release_forge(root.into()),
+        None => state,
+    };
     local_server::serve(listen, state).await
 }
 
