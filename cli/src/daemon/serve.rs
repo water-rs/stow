@@ -554,7 +554,9 @@ async fn bind(endpoint: &Path) -> Result<Listener> {
 
 /// Serve until a retirement has drained, and return it. On Unix the
 /// listener is the caller's, which keeps it open: connections that arrive
-/// from here on wait in its backlog for the successor.
+/// from here on wait in its backlog for the successor. On Windows the
+/// listener ends with this call, after any client already on its spare
+/// instance has been accepted.
 ///
 /// A connection holds the daemon busy from the moment it is accepted, so a
 /// drain that ends never leaves one accepted and unanswered.
@@ -584,6 +586,9 @@ async fn accept_loop(listener: &Listener, daemon: Daemon<OsProcesses>) -> Result
 /// successor.
 #[cfg(windows)]
 async fn accept_loop(mut listener: Listener, daemon: Daemon<OsProcesses>) -> Result<Pending> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    /// `ERROR_PIPE_BUSY`: the instance already has a client on it.
+    const PIPE_BUSY: i32 = 231;
     let mut connections = JoinSet::new();
     let drained = daemon
         .retirement
@@ -593,20 +598,67 @@ async fn accept_loop(mut listener: Listener, daemon: Daemon<OsProcesses>) -> Res
         tokio::select! {
             connected = listener.server.connect() => {
                 connected.wrap_err("accept a daemon connection")?;
-                let request = daemon.busy.request();
-                // The next instance exists before the connected one is
-                // served, so the name never has a moment with none to
-                // connect to.
-                let next = super::windows::create_server(&listener.name, false)
-                    .wrap_err("create the next daemon pipe instance")?;
-                let connected = std::mem::replace(&mut listener.server, next);
-                let peer = peer_of(owner::peer_pid(&connected));
-                connections.spawn(serve_connection(connected, peer, daemon.clone(), request));
-                reap(&mut connections);
+                admit(&mut listener, &daemon, &mut connections)?;
             }
-            pending = &mut drained => return Ok(pending),
+            pending = &mut drained => {
+                // A client can already have connected to the spare
+                // instance, which dropping it would hang up unanswered.
+                // Opening it as a client claims it: success means no
+                // client holds it, and busy means one does, which is
+                // served like any other. Returning drops the connections
+                // still being served, so the ones admitted here are
+                // answered first, with the claim held so no other arrives.
+                loop {
+                    match ClientOptions::new().open(&listener.name) {
+                        Ok(_claimed) => {
+                            if tokio::time::timeout(daemon.settings.answer, daemon.busy.settled())
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "a request admitted as the drain ended outlasted its answer bound"
+                                );
+                            }
+                            return Ok(pending);
+                        }
+                        Err(error) if error.raw_os_error() == Some(PIPE_BUSY) => {
+                            listener
+                                .server
+                                .connect()
+                                .await
+                                .wrap_err("accept a daemon connection")?;
+                            admit(&mut listener, &daemon, &mut connections)?;
+                        }
+                        Err(error) => {
+                            return Err(error).wrap_err_with(|| {
+                                format!("claim the daemon pipe {}", listener.name.display())
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+/// Serve the client connected to the listener's instance: hold the daemon
+/// busy for it, replace the instance, and spawn its connection.
+#[cfg(windows)]
+fn admit(
+    listener: &mut Listener,
+    daemon: &Daemon<OsProcesses>,
+    connections: &mut JoinSet<Result<()>>,
+) -> Result<()> {
+    let request = daemon.busy.request();
+    // The next instance exists before the connected one is served, so the
+    // name never has a moment with none to connect to.
+    let next = super::windows::create_server(&listener.name, false)
+        .wrap_err("create the next daemon pipe instance")?;
+    let connected = std::mem::replace(&mut listener.server, next);
+    let peer = peer_of(owner::peer_pid(&connected));
+    connections.spawn(serve_connection(connected, peer, daemon.clone(), request));
+    reap(connections);
+    Ok(())
 }
 
 /// The process on the other end of a connection, when the platform says.
