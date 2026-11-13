@@ -1192,8 +1192,7 @@ impl Watcher<'_> {
             let trigger = transition
                 .trigger
                 .as_ref()
-                .map(|trigger| format!(" — {}", crate::summarize_trigger(trigger)))
-                .unwrap_or_default();
+                .map_or_default(|trigger| format!(" — {}", crate::summarize_trigger(trigger)));
             evidence.push(format!(
                 "{:?} at {}{}",
                 transition.event, transition.at, trigger

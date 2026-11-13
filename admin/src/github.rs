@@ -946,8 +946,7 @@ mod tests {
             } else {
                 self.script
                     .get(page - 1)
-                    .map(|ids| ids.iter().map(|id| FakeRow { id: *id }).collect())
-                    .unwrap_or_default()
+                    .map_or_default(|ids| ids.iter().map(|id| FakeRow { id: *id }).collect())
             };
             let total_count = self
                 .declared

@@ -420,6 +420,42 @@ impl PrivateDaemon {
         log_lines_in(&self.run_dir, needle)
     }
 
+    /// The daemon log's lines that contain `needle`, once there are at
+    /// least `at_least` of them.
+    ///
+    /// The daemon writes its log from a thread fed over a channel, so a
+    /// reply can reach a client before the records logged ahead of it are in
+    /// the file: a test waits for the record it asserts on.
+    ///
+    /// # Panics
+    ///
+    /// When the daemon has not logged them within [`SESSION_END_LIMIT`].
+    pub fn wait_log_lines(&self, needle: &str, at_least: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + SESSION_END_LIMIT;
+        loop {
+            let lines = self.log_lines(needle);
+            if lines.len() >= at_least {
+                return lines;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon never logged {at_least} lines containing {needle:?}:\n{}",
+                self.log_lines("").join("\n")
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// [`Self::serving_pids`], once the daemon has logged that it serves.
+    ///
+    /// # Panics
+    ///
+    /// When it has not within [`SESSION_END_LIMIT`].
+    pub fn wait_serving_pids(&self) -> Vec<u32> {
+        self.wait_log_lines("stow daemon serving", 1);
+        self.serving_pids()
+    }
+
     /// Wait until the daemon has ended the session it opened for the cargo
     /// `cargo_pid`, if it opened one.
     ///

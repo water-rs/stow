@@ -2731,8 +2731,7 @@ impl Graph {
             let task_id = run
                 .title
                 .split_once('-')
-                .map(|(_, task_id)| task_id)
-                .unwrap_or_default();
+                .map_or_default(|(_, task_id)| task_id);
             if let Some(ix) = self.node_ix(task_id)
                 && self.node(ix).status.in_flight()
             {
@@ -4030,8 +4029,7 @@ impl Graph {
                                     update
                                         .run_url
                                         .as_deref()
-                                        .map(|url| format!(" ({url})"))
-                                        .unwrap_or_default()
+                                        .map_or_default(|url| format!(" ({url})"))
                                 ),
                             });
                         }

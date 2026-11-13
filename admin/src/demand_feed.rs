@@ -427,9 +427,8 @@ async fn stage_and_freeze(
             summary.rows
         ));
     }
-    let manifest_hash = demand_feed_manifest(&page_hashes)
-        .map(|hash| hash.to_hex().to_string())
-        .unwrap_or_default();
+    let manifest_hash =
+        demand_feed_manifest(&page_hashes).map_or_default(|hash| hash.to_hex().to_string());
     edge.post_unit(
         &format!("{FEED_ROUTE}/complete"),
         &DemandFeedCompleteRequest {

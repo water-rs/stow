@@ -127,13 +127,18 @@ fn validate_dependency_graph(
         {
             ensure_reconcilable_duplicate_compile_key(&scanned[existing], artifact)?;
         }
-        for output in &artifact.outputs {
-            if let Some(existing) = output_owner_by_path.insert(output.path.clone(), index)
+        for path in artifact
+            .outputs
+            .iter()
+            .map(|output| &output.path)
+            .chain(&artifact.cargo_alias_paths)
+        {
+            if let Some(existing) = output_owner_by_path.insert(path.clone(), index)
                 && existing != index
             {
                 return Err(stow_types::stow_error!(
                     "output path {} is claimed by both {} and {}",
-                    output.path.display(),
+                    path.display(),
                     scanned[existing].crate_name,
                     artifact.crate_name
                 ));
@@ -806,6 +811,7 @@ mod tests {
                 )),
                 source_path: output_path,
             }],
+            cargo_alias_paths: Vec::new(),
             build_script_out_dir: None,
             native: None,
         }

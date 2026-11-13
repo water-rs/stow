@@ -588,11 +588,7 @@ fn resolve_link_from(
     let rustflags = config.rustflags(target);
     let linker = config.linker(target);
     let probe_failed = rustflags.is_err() || linker.is_err();
-    let rustflags = rustflags
-        .ok()
-        .flatten()
-        .map(|flags| flags.flags)
-        .unwrap_or_default();
+    let rustflags = rustflags.ok().flatten().map_or_default(|flags| flags.flags);
     let linker = rustflags_linker(&rustflags).or_else(|| {
         linker.ok().flatten().and_then(|path| {
             path.file_name()
@@ -879,8 +875,7 @@ fn probe_witnesses(probe: &MoldProbe, path: Option<&OsStr>) -> Vec<FileWitness> 
         } => {
             let mut dirs: Vec<PathBuf> = compiler_path
                 .as_ref()
-                .map(|path| std::env::split_paths(path).collect())
-                .unwrap_or_default();
+                .map_or_default(|path| std::env::split_paths(path).collect());
             dirs.extend(b_dirs.iter().cloned());
             if let Some(path) = path {
                 dirs.extend(std::env::split_paths(path));
@@ -1407,8 +1402,7 @@ pub fn rustflags_value(item: &toml_edit::Item) -> Vec<String> {
             .collect();
     }
     item.as_str()
-        .map(|flags| flags.split_whitespace().map(str::to_owned).collect())
-        .unwrap_or_default()
+        .map_or_default(|flags| flags.split_whitespace().map(str::to_owned).collect())
 }
 
 /// Remove the entries [`write_linker_selection`] owns from a rustflag
@@ -1854,8 +1848,7 @@ mod tests {
             .config()
             .rustflags(target)
             .expect("resolve rustflags")
-            .map(|flags| flags.flags)
-            .unwrap_or_default()
+            .map_or_default(|flags| flags.flags)
     }
 
     /// Cargo joins a `target.<triple>` table's rustflags with every

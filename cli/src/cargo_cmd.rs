@@ -1503,7 +1503,7 @@ fn predict_from_inputs(
         .flatten()
         .flat_map(|slice| slice.index.local_programs.iter().cloned())
         .collect::<Vec<_>>();
-    let rows = slice.map(|slice| slice.index.rows).unwrap_or_default();
+    let rows = slice.map_or_default(|slice| slice.index.rows);
     let mut map = tracing::debug_span!("stow.precargo.serve_map_build").in_scope(|| {
         build_serve_map(
             project,
@@ -1711,7 +1711,7 @@ fn build_serve_map(
             }
         }
         if Some(unit_target.as_str()) == host_target.as_deref() && host_known.contains(&pair) {
-            host.insert(pair.clone());
+            host.insert(pair);
         }
     }
     serve_map_wildcards(

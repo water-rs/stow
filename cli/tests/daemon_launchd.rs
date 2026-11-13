@@ -198,7 +198,9 @@ fn a_daemon_launchd_runs_keeps_its_job_and_process_across_a_retire() {
     assert_eq!(daemon.serving_pids(), [job], "the successor has the pid");
     assert_eq!(agent.pid(), Some(job), "launchd still runs that process");
     assert_eq!(
-        daemon.log_lines("stow daemon process started").len(),
+        daemon
+            .wait_log_lines("stow daemon process started", 2)
+            .len(),
         2,
         "no second daemon started:\n{}",
         daemon.log_lines("").join("\n")

@@ -1050,8 +1050,7 @@ where
                 () = retirement.cut() => {
                     let successor = retirement
                         .pending()
-                        .map(|pending| pending.successor.display().to_string())
-                        .unwrap_or_default();
+                        .map_or_default(|pending| pending.successor.display().to_string());
                     reject(
                         write,
                         at,

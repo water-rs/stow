@@ -494,7 +494,7 @@ fn covered_slice_nodes(
             profile: row.node_profile,
         };
         shapes
-            .entry((identity, dependency_identity.clone()))
+            .entry((identity, dependency_identity))
             .or_default()
             .insert(shape);
     }

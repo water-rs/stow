@@ -578,9 +578,7 @@ mod tests {
             .iter()
             .map(|entries| demand_feed_page_hash(entries).expect("entries serialize"))
             .collect();
-        demand_feed_manifest(&page_hashes)
-            .map(|hash| hash.to_hex().to_string())
-            .unwrap_or_default()
+        demand_feed_manifest(&page_hashes).map_or_default(|hash| hash.to_hex().to_string())
     }
 
     fn complete(

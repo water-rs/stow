@@ -63,6 +63,18 @@ fn a_served_build_prints_cargo_output_and_the_summary_only() {
     let dir = support::tempdir().expect("temp dir");
     let cargo_home = support::tempdir().expect("cargo home");
     write_fixture(dir.path(), cargo_home.path(), FIXTURE_DEPENDENCIES);
+    // Every dependency is used, so cargo's own `unused_dependencies`
+    // lint (cargo 1.100) prints nothing this test would have to tell
+    // apart from stow's output.
+    std::fs::write(
+        dir.path().join("src").join("main.rs"),
+        "cfg_if::cfg_if! { if #[cfg(unix)] { const UNIX: bool = true; } \
+         else { const UNIX: bool = false; } }\n\
+         fn main() {\n    \
+         let _ = (UNIX, itoa::Buffer::new().format(1).len(), ryu::Buffer::new().format(1.0).len());\n    \
+         let _ = unicode_ident::is_xid_start('a');\n}\n",
+    )
+    .expect("write main.rs");
     stow_setup_in(dir.path(), cargo_home.path());
     let edge_url = refused_url();
     let registry_url = refused_url();

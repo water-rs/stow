@@ -162,12 +162,12 @@ fn one_daemon_serves_two_concurrent_builds_and_neither_sees_the_others_session()
     let beta_session = session_of(rendezvous.path(), "beta");
     assert_ne!(alpha_session, beta_session, "two builds share one session");
     assert_eq!(
-        daemon.log_lines("stow daemon serving").len(),
+        daemon.wait_log_lines("stow daemon serving", 1).len(),
         1,
         "the builds started more than one daemon"
     );
     assert_eq!(
-        daemon.log_lines("opened a session").len(),
+        daemon.wait_log_lines("opened a session", 2).len(),
         2,
         "the daemon opened a session per build"
     );
@@ -223,7 +223,7 @@ fn one_daemon_serves_two_concurrent_builds_and_neither_sees_the_others_session()
     assert_eq!(alpha.stored_crates(), ["cfg-if"]);
     assert_eq!(beta.stored_crates(), ["unicode-ident"]);
     assert_eq!(
-        daemon.log_lines("ended a session").len(),
+        daemon.wait_log_lines("ended a session", 2).len(),
         2,
         "every session ended with its build"
     );
@@ -252,7 +252,7 @@ fn a_build_that_starts_the_daemon_closes_its_output_when_it_exits() {
         "the build failed:\n{}",
         stderr_of(&output)
     );
-    let pids = daemon.serving_pids();
+    let pids = daemon.wait_serving_pids();
     assert_eq!(pids.len(), 1, "the build started one daemon");
 
     // That daemon still serves: a status request reaches it and starts no
@@ -286,7 +286,7 @@ fn a_build_whose_daemon_dies_fails_naming_it() {
 
     let build = spawn(project.build(daemon.run_dir(), rendezvous.path()));
     session_of(rendezvous.path(), "lone");
-    let pids = daemon.serving_pids();
+    let pids = daemon.wait_serving_pids();
     assert_eq!(pids.len(), 1, "one daemon serves the build");
     daemon.crash();
 

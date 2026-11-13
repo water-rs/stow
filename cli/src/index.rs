@@ -700,11 +700,11 @@ struct LockedSlice<Mode> {
 }
 
 /// The lock mode readers share.
-enum Shared {}
+struct Shared;
 
 /// The lock mode a commit holds, excluding every reader and every other
 /// commit.
-enum Exclusive {}
+struct Exclusive;
 
 impl<Mode> LockedSlice<Mode> {
     fn open_lock(dir: &Path) -> std::io::Result<std::fs::File> {
