@@ -1124,7 +1124,7 @@ impl Watcher<'_> {
     // ----- workflow history -----
 
     /// `watchdog.gap` and `operations.failed`. The newest completed
-    /// watchdog run that finished `success` or `failure` is one REST read
+    /// dispatched watchdog run that finished `success` or `failure` is one REST read
     /// (the run in progress is not completed, so it is never its own
     /// predecessor). The `operations.yml` runs are then enumerated over
     /// the closed created-window that can hold a run concluding after the
@@ -1132,10 +1132,13 @@ impl Watcher<'_> {
     /// covered however many successes fill it, with no page size to
     /// outgrow; the failed conclusions are kept in code.
     async fn history_readings(&self, levels: &HistoryLevels) -> Result<Vec<Reading>, String> {
+        // Only dispatched runs: the edge's Cron Trigger dispatches the
+        // watchdog, and the workflow's own `schedule` runs would fill
+        // the gap a missed dispatch leaves (stow#1501).
         let watchdogs = recent_runs(
             self.gh_token,
             WATCHDOG_WORKFLOW,
-            "&status=completed",
+            "&status=completed&event=workflow_dispatch",
             WATCHDOG_HISTORY_PAGE,
         )
         .await?;
