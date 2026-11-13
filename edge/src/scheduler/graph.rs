@@ -6795,6 +6795,121 @@ mod tests {
         }
     }
 
+    /// What a graph of `nodes` nodes holds at production density, by
+    /// formula: the counts a snapshot head records (nodes, state slots,
+    /// edges, interned strings) and the interned text.
+    fn resident_bytes(
+        nodes: usize,
+        states: usize,
+        edges: usize,
+        strings: usize,
+        text: usize,
+        ready: usize,
+    ) -> usize {
+        // An arena allocates whole fragments of 1024 records.
+        let arena = |records: usize, record: usize| records.div_ceil(1024) * 1024 * record;
+        let table =
+            |entries: usize| (entries * 10 / 7 + 1).next_power_of_two().max(16) * size_of::<u32>();
+        arena(nodes, size_of::<Node>())
+            + arena(states, size_of::<State>())
+            + states.div_ceil(8)
+            // The text grows by doubling, the offsets are sized by the head.
+            + text.next_power_of_two()
+            + strings * size_of::<u32>()
+            + table(strings)
+            + 2 * table(nodes)
+            + arena(edges, size_of::<u32>())
+            + arena(edges, size_of::<u8>())
+            + arena(edges, size_of::<u32>())
+            + arena(nodes + 1, size_of::<u32>())
+            + nodes.div_ceil(8)
+            + occupancy::btree_bytes(ready, size_of::<(i64, u32)>())
+    }
+
+    /// The occupancy line counts every structure the graph holds, and a
+    /// resident-bytes formula over the snapshot head's counts tracks it
+    /// at the density production wakes at (stow#1501): 5.9 edges per
+    /// node, 92% of nodes with queue state and the rest retained as
+    /// published.
+    #[test]
+    fn accounted_occupancy_matches_the_resident_formula_at_production_density() {
+        const NODES: u32 = 24_000;
+        let names: Vec<String> = (0..NODES).map(|n| format!("crate-{n}")).collect();
+        let mut graph = Graph::default();
+        let nodes: Vec<SubmissionNode> = (0..NODES)
+            .map(|n| {
+                let mut node = sub(&names[n as usize]);
+                // A fiftieth of the nodes are leaves and the rest depend
+                // on their six predecessors: 5.88 edges per node.
+                if n % 50 != 0 {
+                    node.deps = (n.saturating_sub(6)..n).collect();
+                }
+                node
+            })
+            .collect();
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![],
+                    nodes,
+                },
+                0,
+            )
+            .expect("merge");
+        let rows: Vec<_> = (0..NODES)
+            .filter(|n| n % 12 == 6)
+            .flat_map(|n| {
+                [
+                    published_row(&names[n as usize], UnitKind::Linked),
+                    published_row(&names[n as usize], UnitKind::Unlinked),
+                ]
+            })
+            .collect();
+        graph.apply_slice_report(TARGET, RUSTC, None, 1, &rows, &[]);
+        graph.compact();
+        // What a wake holds: the graph decoded from its snapshot rows.
+        let graph = round_trip(&graph);
+
+        let held = graph.occupancy();
+        let (live, edges, _) = graph.sizes();
+        let live = usize::try_from(live).expect("live nodes fit usize");
+        let edges = usize::try_from(edges).expect("edges fit usize");
+        let states = graph.states.len();
+        let active = states - graph.free_states.len();
+        let text: usize = names.iter().map(String::len).sum::<usize>()
+            + "1.0.0".len()
+            + FeaturesJson::default().raw().len();
+        let ready = graph.ready_sets().map(BTreeSet::len).sum::<usize>();
+        let expected = resident_bytes(live, states, edges, graph.intern.len(), text, ready);
+        let accounted = held.accounted();
+        eprintln!(
+            "occupancy: {live} nodes {edges} edges {states} states: accounted {accounted} B \
+             ({} B/node), formula {expected} B; {held:?}",
+            accounted / live
+        );
+        assert!(
+            (580..600).contains(&(edges * 100 / live)),
+            "{edges} edges over {live} nodes"
+        );
+        assert!(
+            (90..94).contains(&(active * 100 / live)),
+            "{active} states over {live} nodes"
+        );
+        for (name, bytes) in [
+            ("ready queues", held.ready),
+            ("status bitsets", held.by_status),
+            ("pending index", held.pending_index),
+            ("edge arrays", held.edge_array),
+        ] {
+            assert!(bytes > 0, "{name} are counted");
+        }
+        assert!(
+            accounted.abs_diff(expected) * 100 < expected,
+            "formula {expected} B against accounted {accounted} B"
+        );
+    }
+
     /// stow#879: the rank is `priority × time waited`. A 30× request
     /// waiting 2 minutes ties a 1× miss waiting an hour — the tie
     /// falls to the older `first_requested` (the miss), and a second
