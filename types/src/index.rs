@@ -5,7 +5,7 @@
 //! row (a pushed bundle) for one target triple and one stable rustc,
 //! ordered by `c_metadata`. The CLI downloads the slice its build needs,
 //! verifies the cosign signature against
-//! [`crate::trusted_builder::INDEX_CERTIFICATE_IDENTITY`], and computes
+//! [`crate::trusted_builder::TrustedWorkflow::INDEX`], and computes
 //! hits, semver-compatible upgrades and misses locally — the dependency
 //! graph never leaves the machine.
 //!
