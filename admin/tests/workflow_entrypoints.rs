@@ -225,85 +225,48 @@ fn cron_declarations() {
         "preheat-cron cancels in progress — concurrent ticks possible: {cancel:?}"
     );
 
-    // The marker cache is keyed on resolved channel output — version
-    // AND day — over the same file the save step writes.
+    // The once-per-day marker is the runs list of this workflow across
+    // refs, not an `actions/cache` entry: a cache saved on one release
+    // tag is not readable from another tag's runs.
     let steps = job_steps(&wf, "preheat");
+    assert!(
+        steps.iter().all(|s| !s
+            .uses
+            .as_deref()
+            .is_some_and(|u| u.starts_with("actions/cache"))),
+        "preheat-cron keeps a marker in actions/cache"
+    );
     let marker = steps
         .iter()
         .find(|s| s.id.as_deref() == Some("marker"))
         .expect("marker step");
-    assert_eq!(
-        marker.uses.as_deref(),
-        Some("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
-    );
-    assert_eq!(
-        marker.with.get("path").map(String::as_str),
-        Some(".preheat-marker")
-    );
-    let key_template = marker.with.get("key").expect("marker key");
-    assert_eq!(
-        key_template,
-        "preheat-${{ steps.channel.outputs.version }}-${{ steps.channel.outputs.day }}"
-    );
-    let save = steps
-        .iter()
-        .find(|s| {
-            s.uses
-                .as_deref()
-                .is_some_and(|u| u.starts_with("actions/cache/save"))
-        })
-        .expect("save step");
-    assert_eq!(save.with.get("key"), Some(key_template));
-    assert_eq!(save.with.get("path"), marker.with.get("path"));
+    assert!(marker.uses.is_none(), "the marker step runs a command");
 }
 
-#[test]
-fn cron_marker_key_binds_version_and_day() {
-    let template = "preheat-${{ steps.channel.outputs.version }}-${{ steps.channel.outputs.day }}";
-    let resolve = |version: &str, day: &str| {
-        let mut ctx = Val::context();
-        set_path(
-            &mut ctx,
-            "steps.channel.outputs.version",
-            Val::Str(version.to_owned()),
-        );
-        set_path(
-            &mut ctx,
-            "steps.channel.outputs.day",
-            Val::Str(day.to_owned()),
-        );
-        substitute(template, &ctx, Status::Ok)
-    };
-    let a = resolve("1.98.1", "2026-10-08");
-    assert_eq!(a, "preheat-1.98.1-2026-10-08");
-    // A moved stable channel or a new UTC day both produce a cache
-    // miss — each re-dispatches.
-    assert_ne!(a, resolve("1.99.0", "2026-10-08"));
-    assert_ne!(a, resolve("1.98.1", "2026-10-09"));
-}
+/// What `gh api .../preheat-cron.yml/runs` answers: the count of successful
+/// runs created today.
+const NO_RUN_TODAY: &str = r#"{"total_count":0,"workflow_runs":[]}"#;
+const RUN_TODAY: &str = r#"{"total_count":1,"workflow_runs":[{"id":1}]}"#;
 
 #[test]
-fn cron_cache_miss_dispatches_admin_once() {
+fn cron_without_a_run_today_dispatches_admin_once() {
     let wf = preheat_cron();
     let scn = Scenario::new();
-    let mut runner = support::Runner::new(&scn, actions_ctx(), base_env(&[]));
-    // The actions/cache restore step answered "miss" — what the engine
-    // would have set `steps.marker.outputs.cache-hit` to.
-    runner.seed_output("marker", "cache-hit", "false");
+    let mut runner = support::Runner::new(
+        &scn,
+        actions_ctx(),
+        base_env(&[("STUB_GH_RUNS", NO_RUN_TODAY)]),
+    );
     runner.run_job(&wf, "preheat");
 
     assert_eq!(
-        runner.outcome_of("Check whether this version already preheated today"),
-        &Outcome::Declared
+        runner.outcome_of("Check whether a preheat already succeeded today"),
+        &Outcome::Ran(0)
     );
     assert_eq!(runner.outcome_of("Already preheated"), &Outcome::Skipped);
     assert_eq!(
         runner.outcome_of("Dispatch the preheat wave"),
         &Outcome::Ran(0)
-    );
-    assert_eq!(
-        runner.outcome_of("Record the wave marker"),
-        &Outcome::Declared
     );
     assert_eq!(runner.status(), Status::Ok);
 
@@ -331,8 +294,26 @@ fn cron_cache_miss_dispatches_admin_once() {
     // Exactly one dispatch: preheat-admin.yml with the same rustc and
     // the projects lane enabled.
     let gh = scn.calls_of("gh");
-    assert_eq!(gh.len(), 1, "{gh:?}");
-    let dispatch = gh_dispatch(&gh[0]);
+    assert_eq!(gh.len(), 2, "{gh:?}");
+    // The query reads this workflow's successful runs created today,
+    // across refs.
+    let query = &gh[0].argv;
+    assert!(
+        query
+            .iter()
+            .any(|a| a == "repos/water-rs/stow/actions/workflows/preheat-cron.yml/runs"),
+        "{query:?}"
+    );
+    assert!(query.iter().any(|a| a == "status=success"), "{query:?}");
+    assert!(
+        query
+            .iter()
+            .any(|a| a == &format!("created=>={CHANNEL_FIXTURE_DAY}")),
+        "{query:?}"
+    );
+    let (query, dispatch_call) = (&gh[0], &gh[1]);
+    assert_eq!(query.env.get("GH_TOKEN").map(String::as_str), Some("<set>"));
+    let dispatch = gh_dispatch(dispatch_call);
     assert_eq!(dispatch.workflow, "preheat-admin.yml");
     assert_eq!(
         dispatch.reference, RUN_TAG,
@@ -350,26 +331,24 @@ fn cron_cache_miss_dispatches_admin_once() {
         ])
     );
     assert_eq!(
-        gh[0].env.get("GH_REPO").map(String::as_str),
+        dispatch_call.env.get("GH_REPO").map(String::as_str),
         Some("water-rs/stow")
     );
-    assert_eq!(gh[0].env.get("GH_TOKEN").map(String::as_str), Some("<set>"));
-
-    // The run step itself wrote the marker the cache save uploads.
-    let marker = scn.workdir().join(".preheat-marker");
-    let body = std::fs::read_to_string(&marker).expect(".preheat-marker written");
     assert_eq!(
-        body.trim(),
-        format!("{CHANNEL_FIXTURE_VERSION} {CHANNEL_FIXTURE_DAY}")
+        dispatch_call.env.get("GH_TOKEN").map(String::as_str),
+        Some("<set>")
     );
 }
 
 #[test]
-fn cron_cache_hit_skips_dispatch_and_save() {
+fn cron_a_run_today_skips_the_dispatch() {
     let wf = preheat_cron();
     let scn = Scenario::new();
-    let mut runner = support::Runner::new(&scn, actions_ctx(), base_env(&[]));
-    runner.seed_output("marker", "cache-hit", "true");
+    let mut runner = support::Runner::new(
+        &scn,
+        actions_ctx(),
+        base_env(&[("STUB_GH_RUNS", RUN_TODAY)]),
+    );
     runner.run_job(&wf, "preheat");
 
     assert_eq!(runner.outcome_of("Already preheated"), &Outcome::Ran(0));
@@ -377,27 +356,21 @@ fn cron_cache_hit_skips_dispatch_and_save() {
         runner.outcome_of("Dispatch the preheat wave"),
         &Outcome::Skipped
     );
-    assert_eq!(
-        runner.outcome_of("Record the wave marker"),
-        &Outcome::Skipped
-    );
     assert_eq!(runner.status(), Status::Ok);
-    assert!(scn.calls_of("gh").is_empty(), "{:?}", scn.calls());
-    assert!(
-        !scn.workdir().join(".preheat-marker").exists(),
-        "a cache hit wrote a marker"
-    );
+    // Only the query: nothing is dispatched.
+    let gh = scn.calls_of("gh");
+    assert_eq!(gh.len(), 1, "{gh:?}");
+    assert!(!is_dispatch(&gh[0]), "{gh:?}");
 }
 
-/// `refresh` (a scheduler reset's refill) dispatches although the day's
-/// marker exists, and saves nothing: the restored entry is the marker.
+/// `refresh` (a scheduler reset's refill) dispatches although a run
+/// already succeeded today.
 #[test]
-fn cron_refresh_dispatches_on_a_cache_hit() {
+fn cron_refresh_dispatches_after_a_run_today() {
     let wf = preheat_cron();
     let scn = Scenario::new();
     let ctx = with_inputs(actions_ctx(), &[("refresh", Val::Bool(true))]);
-    let mut runner = support::Runner::new(&scn, ctx, base_env(&[]));
-    runner.seed_output("marker", "cache-hit", "true");
+    let mut runner = support::Runner::new(&scn, ctx, base_env(&[("STUB_GH_RUNS", RUN_TODAY)]));
     runner.run_job(&wf, "preheat");
 
     assert_eq!(runner.status(), Status::Ok, "{:?}", runner.outcomes);
@@ -406,22 +379,25 @@ fn cron_refresh_dispatches_on_a_cache_hit() {
         runner.outcome_of("Dispatch the preheat wave"),
         &Outcome::Ran(0)
     );
-    assert_eq!(
-        runner.outcome_of("Record the wave marker"),
-        &Outcome::Skipped
-    );
     let gh = scn.calls_of("gh");
-    assert_eq!(gh.len(), 1, "{gh:?}");
-    assert_eq!(gh_dispatch(&gh[0]).workflow, "preheat-admin.yml");
+    assert_eq!(gh.len(), 2, "{gh:?}");
+    assert_eq!(gh_dispatch(&gh[1]).workflow, "preheat-admin.yml");
 }
 
+/// A failed dispatch fails the run, so no successful run exists for the
+/// day's next tick to find.
 #[test]
-fn cron_failed_dispatch_writes_no_marker() {
+fn cron_failed_dispatch_fails_the_run() {
     let wf = preheat_cron();
     let scn = Scenario::new();
-    let mut runner =
-        support::Runner::new(&scn, actions_ctx(), base_env(&[("STUB_TOOL_EXIT", "1")]));
-    runner.seed_output("marker", "cache-hit", "false");
+    let mut runner = support::Runner::new(
+        &scn,
+        actions_ctx(),
+        base_env(&[
+            ("STUB_GH_RUNS", NO_RUN_TODAY),
+            ("STUB_FAIL_RE", "/dispatches"),
+        ]),
+    );
     runner.run_job(&wf, "preheat");
 
     let outcome = runner.outcome_of("Dispatch the preheat wave");
@@ -430,11 +406,7 @@ fn cron_failed_dispatch_writes_no_marker() {
         "{outcome:?}"
     );
     assert_eq!(runner.status(), Status::Failed);
-    assert_eq!(scn.calls_of("gh").len(), 1);
-    assert!(
-        !scn.workdir().join(".preheat-marker").exists(),
-        "a failed dispatch still wrote the success marker"
-    );
+    assert_eq!(scn.calls_of("gh").len(), 2);
 }
 
 // ---------------------------------------------------------------------------

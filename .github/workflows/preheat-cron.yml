@@ -10,11 +10,13 @@ name: Preheat the public cache
 # lists move as crates publish. The release half is the newreleases.io
 # webhook — its delivery reaches the edge, and the scheduler dispatches
 # `preheat-admin.yml` for it (stow#880). This lane is the other half: a
-# once-per-UTC-day refresh for the moving lists. The marker is an
-# actions/cache entry keyed by version and day, which makes a same-day
-# re-run a no-op unless dispatched with `refresh` (a scheduler reset's
-# refill, stow#1094). The edge Worker's Cron Trigger dispatches this
-# workflow once a day at 00:17 UTC, off the top of the hour (stow#1100;
+# once-per-UTC-day refresh for the moving lists. The marker is a
+# successful run of this workflow created on the UTC day, which makes a
+# same-day re-run a no-op unless dispatched with `refresh` (a scheduler
+# reset's refill, stow#1094). The runs list is read, not an actions/cache
+# entry: every release tag runs this workflow, and a cache saved on one
+# tag is not readable from another tag's runs. The edge Worker's Cron
+# Trigger dispatches this workflow once a day at 00:17 UTC, off the top of the hour (stow#1100;
 # GitHub's own `schedule` skipped ticks); the newreleases.io wake covers
 # a new stable rustc in between, and a manual dispatch the same day is
 # that no-op.
@@ -54,18 +56,31 @@ jobs:
             | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
-      - name: Check whether this version already preheated today
+      - name: Check whether a preheat already succeeded today
         id: marker
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .preheat-marker
-          key: preheat-${{ steps.channel.outputs.version }}-${{ steps.channel.outputs.day }}
-      - name: Already preheated
-        if: steps.marker.outputs.cache-hit == 'true' && !inputs.refresh
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          DAY: ${{ steps.channel.outputs.day }}
         run: |
-          echo "rustc ${{ steps.channel.outputs.version }} already preheated on ${{ steps.channel.outputs.day }}"
+          set -euo pipefail
+          # Runs of this workflow across every ref: each release tag runs
+          # it, and a cache entry saved on one tag is not readable from
+          # another tag's runs, so the runs list is the marker. The
+          # current run is in progress and never counts.
+          count="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/preheat-cron.yml/runs" \
+            -f status=success -f "created=>=$DAY" -f per_page=1 | jq -r '.total_count')"
+          if [ "$count" -gt 0 ]; then
+            echo "done=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "done=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Already preheated
+        if: steps.marker.outputs.done == 'true' && !inputs.refresh
+        run: |
+          echo "a preheat already succeeded on ${{ steps.channel.outputs.day }}"
       - name: Dispatch the preheat wave
-        if: steps.marker.outputs.cache-hit != 'true' || inputs.refresh
+        if: steps.marker.outputs.done != 'true' || inputs.refresh
         env:
           # `gh` resolves the repository from the checkout's git remote,
           # and this job has no checkout — without GH_REPO every dispatch
@@ -80,10 +95,3 @@ jobs:
           gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/preheat-admin.yml/dispatches" \
             -f ref="$GITHUB_REF_NAME" -f "inputs[rustc_version]=$RUSTC_VERSION" \
             -f 'inputs[projects]=true'
-          echo "$RUSTC_VERSION ${{ steps.channel.outputs.day }}" > .preheat-marker
-      - name: Record the wave marker
-        if: steps.marker.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .preheat-marker
-          key: preheat-${{ steps.channel.outputs.version }}-${{ steps.channel.outputs.day }}
