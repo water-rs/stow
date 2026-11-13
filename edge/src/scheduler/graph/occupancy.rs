@@ -155,6 +155,112 @@ impl ResidentCounts {
             ready: self.ready + growth.stateful,
         }
     }
+
+    /// These counts once a compaction dropped `freed` node records and
+    /// their edges.
+    const fn compacted(self, freed: Freed) -> Self {
+        Self {
+            nodes: self.nodes - freed.nodes,
+            edges: self.edges - freed.edges,
+            ..self
+        }
+    }
+}
+
+/// The freed node records a compaction would drop, and their edges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::scheduler) struct Freed {
+    nodes: usize,
+    edges: usize,
+}
+
+/// The room the memory lines leave a run of merges, judged by
+/// increment (stow#1501).
+///
+/// A completion frees a node's queue state at once — the next new
+/// state takes the vacant slot, which [`ResidentCounts::grown`]
+/// counts — but a freed node record and its edges stay in their arenas
+/// until a compaction squeezes them out, which the graph runs on its
+/// own only once they are an eighth of the arena, and at every
+/// snapshot. So the room is judged twice: against the counts the graph
+/// holds, and, when that fails and at least `COMPACT_FLOOR` freed
+/// records wait, against the counts a compaction would leave; a merge
+/// that fits only the second way compacts the graph first
+/// ([`Self::compact`]). Admission therefore sees every byte a merge
+/// can reuse, and the graph's own compaction policy is unchanged:
+/// each forced compaction drops at least `COMPACT_FLOOR` records and
+/// admits the merge that needed it.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::scheduler) struct Room {
+    counts: ResidentCounts,
+    vacant_states: usize,
+    /// What a compaction would drop, while none is planned.
+    freed: Option<Freed>,
+    compact: bool,
+}
+
+impl Room {
+    /// The room `graph` leaves now.
+    pub(in crate::scheduler) fn of(graph: &Graph) -> Self {
+        let nodes = graph.counts[Status::Free.index()] as usize;
+        Self {
+            counts: graph.resident_counts(),
+            vacant_states: graph.vacant_states(),
+            freed: (nodes >= super::COMPACT_FLOOR).then_some(Freed {
+                nodes,
+                edges: graph.free_edges,
+            }),
+            compact: false,
+        }
+    }
+
+    /// The resident bytes the judgement starts from: the counts held,
+    /// less what a compaction would drop when one could run.
+    pub(in crate::scheduler) fn reusable_resident(&self) -> u64 {
+        self.freed
+            .map_or(self.counts, |freed| self.counts.compacted(freed))
+            .bytes()
+    }
+
+    /// Take a merge of `growth` when the lines admit its increment,
+    /// compacting first (on paper; [`Self::compact`] says whether the
+    /// graph must) when only a compaction makes room. `Err` carries the
+    /// increment against the most room the graph can make.
+    pub(in crate::scheduler) fn take(
+        &mut self,
+        settings: &crate::scheduler::queue::SchedulerSettings,
+        growth: Growth,
+    ) -> Result<(), u64> {
+        let judge = |counts: ResidentCounts| {
+            let after = counts.grown(growth, self.vacant_states);
+            let resident = counts.bytes();
+            let increment = after.bytes().saturating_sub(resident);
+            (settings.admits(resident, increment), after, increment)
+        };
+        let (fits, after, increment) = judge(self.counts);
+        let (fits, after, increment) = match self.freed {
+            Some(freed) if !fits => {
+                let judged = judge(self.counts.compacted(freed));
+                if judged.0 {
+                    self.freed = None;
+                    self.compact = true;
+                }
+                judged
+            }
+            _ => (fits, after, increment),
+        };
+        if !fits {
+            return Err(increment);
+        }
+        self.counts = after;
+        self.vacant_states -= self.vacant_states.min(growth.stateful);
+        Ok(())
+    }
+
+    /// Whether the merges taken need the graph compacted first.
+    pub(in crate::scheduler) const fn compact(&self) -> bool {
+        self.compact
+    }
 }
 
 /// What a graph of `counts` holds, by formula: every arena, index and
@@ -337,19 +443,31 @@ impl Graph {
     /// pool, a pending-age key per merge instant and a target or rustc
     /// id (at most 256 each), and one B-tree entry per human-lane node.
     ///
+    /// The task ids the merge would report unpublished — a held node
+    /// that has not published, a new one that takes a state — are
+    /// pushed onto `unpublished`, as [`Graph::merge_validated`] reports
+    /// them.
+    ///
     /// # Errors
     /// `QueueError::Invariant` when `base` lacks a row the merge reads.
     pub(in crate::scheduler) fn merge_growth(
         &self,
         validated: &super::ValidatedSubmission<'_>,
         base: &mut impl super::PublishedSource,
+        unpublished: &mut Vec<String>,
     ) -> Result<Growth, crate::errors::QueueError> {
         let super::ValidatedSubmission { tree, ids } = validated;
         let mut growth = Growth::default();
         let mut seen = std::collections::HashSet::new();
         let mut strings = std::collections::HashSet::new();
         for (sub, keys) in tree.nodes.iter().zip(ids) {
-            if self.find_key(keys.key).is_some() || !seen.insert(keys.key) {
+            if let Some(ix) = self.find_key(keys.key) {
+                if self.node(ix).status != Status::Published {
+                    unpublished.push(sub.task_id.clone());
+                }
+                continue;
+            }
+            if !seen.insert(keys.key) {
                 continue;
             }
             growth.nodes += 1;
@@ -359,14 +477,24 @@ impl Graph {
             let published = self.published_mask(&keys.key, base, || {
                 self.slice_lookup(sub.target.as_str(), sub.rustc_version.as_str())
             })?;
-            // A target the graph has not held has no mask yet: assume
-            // the node takes a state.
-            let own = self.target_lookup(sub.target.as_str()).map(|target| {
-                self.targets[usize::from(target)].own_masks[usize::from(sub.host_side)]
-                    [usize::from(explicit)]
-            });
-            if own.is_none_or(|own| published & own != own) {
+            // A target the graph has not held yet has its masks by the
+            // same rule the merge derives them with.
+            let own = self.target_lookup(sub.target.as_str()).map_or_else(
+                || {
+                    super::node_published_mask(
+                        sub.host_side,
+                        sub.target.as_str(),
+                        sub.explicit_spelling,
+                    )
+                },
+                |target| {
+                    self.targets[usize::from(target)].own_masks[usize::from(sub.host_side)]
+                        [usize::from(explicit)]
+                },
+            );
+            if published & own != own {
                 growth.stateful += 1;
+                unpublished.push(sub.task_id.clone());
             }
             let version = sub.version.to_string();
             let features = sub.features_json.raw();

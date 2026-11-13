@@ -107,6 +107,17 @@ impl Tally {
     }
 }
 
+/// The head entry the last admission pass could not fit: its lane and
+/// the increment it needed against the most room the graph could make.
+/// In memory only — a wake re-reads the head once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Blocked {
+    /// The lane whose head it is.
+    pub lane: Lane,
+    /// The bytes the entry would have added.
+    pub increment: u64,
+}
+
 #[derive(skyzen::FromRow)]
 struct MetaRow {
     key: String,

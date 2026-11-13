@@ -17,7 +17,7 @@ use stow_types::api::{
 use super::backlog;
 use super::graph::{
     Claimed, Fetched, FinishOutcome, Graph, GraphCell, LoadedGraph, PublishedNeeds, ReadSource,
-    Reads, RootProbe, StartOutcome, ValidatedSubmission, Wanted,
+    Reads, Room, RootProbe, StartOutcome, ValidatedSubmission, Wanted,
 };
 use super::queue::{self, AlarmPlan, SchedulerSettings};
 use super::store;
@@ -205,8 +205,10 @@ async fn merge_trees(
 pub(super) struct Submitted {
     /// Brand-new queue rows the merged trees inserted.
     pub inserted: u32,
-    /// The merged trees' nodes no published mask covers. A backlogged
-    /// tree reports none until it is admitted.
+    /// The nodes no published mask covers, of the merged trees and of
+    /// the backlogged ones alike: a backlogged tree's are judged
+    /// against the graph and the published rows the submit read, so
+    /// the edge's miss log counts its misses once, at the submit.
     pub unpublished: Vec<String>,
     /// Indexes of the trees stored in the backlog.
     pub backlogged: Vec<usize>,
@@ -219,8 +221,9 @@ pub(super) struct Submitted {
 /// The increment is what the merge would add to the resident bytes, by
 /// the same formula the wake checks (`Graph::merge_growth`); trees are
 /// judged in order, each against the graph the earlier fitting ones
-/// leave. The published rows of every tree are read in one batch, and
-/// the merged trees append their parts in one turn before the merge.
+/// leave, and against the room a compaction would make ([`Room`]). The
+/// published rows of every tree are read in one batch, and the merged
+/// trees append their parts in one turn before the merge.
 ///
 /// # Errors
 /// As [`commit_trees`], and `QueueError::Sql` on a failed backlog write.
@@ -234,30 +237,30 @@ pub(super) async fn submit_trees(
 ) -> Result<Submitted, QueueError> {
     let validated = validate_trees(trees)?;
     let mut base = read_base(graph, db, &validated).await?;
-    let (fit, backlogged) = graph.with(|graph| -> Result<_, QueueError> {
-        let mut counts = graph.resident_counts();
-        let mut vacant = graph.vacant_states();
-        let (mut fit, mut backlogged) = (Vec::new(), Vec::new());
+    let (fit, backlogged, waiting) = graph.with(|graph| -> Result<_, QueueError> {
+        let mut room = Room::of(graph);
+        let (mut fit, mut backlogged, mut waiting) = (Vec::new(), Vec::new(), Vec::new());
         for (at, tree) in validated.iter().enumerate() {
-            let growth = graph.merge_growth(tree, &mut base)?;
-            let after = counts.grown(growth, vacant);
-            let resident = counts.bytes();
-            let increment = after.bytes().saturating_sub(resident);
-            if settings.admits(resident, increment) {
+            let mut unpublished = Vec::new();
+            let growth = graph.merge_growth(tree, &mut base, &mut unpublished)?;
+            if room.take(settings, growth).is_ok() {
                 fit.push(at);
-                counts = after;
-                vacant -= vacant.min(growth.stateful);
             } else {
                 backlogged.push(at);
+                waiting.extend(unpublished);
             }
         }
-        Ok((fit, backlogged))
+        if room.compact() {
+            graph.compact();
+        }
+        Ok((fit, backlogged, waiting))
     })?;
-    let (inserted, unpublished) =
+    let (inserted, mut unpublished) =
         merge_trees(graph, db, trees, &validated, &fit, &mut base, actor, now).await?;
     for &at in &backlogged {
         backlog::push(graph, db, &trees[at], actor).await?;
     }
+    unpublished.extend(waiting);
     Ok(Submitted {
         inserted,
         unpublished,
@@ -271,10 +274,19 @@ pub(super) async fn submit_trees(
 /// [`ADMIT_PASS_BYTES`] of stored text or the head does not fit. Lanes
 /// admit in priority order, FIFO within one, and a head that does not
 /// fit holds back every lane behind it, so a small preheat entry never
-/// starves a large human one.
+/// starves a large human one. Every entry is one request body at most,
+/// far under the normal line, so a held-back head fits once completions
+/// free its increment; only work that never frees (failed or frozen
+/// nodes) can hold it, and the memory alert reports that graph.
 ///
-/// Returns the entries admitted. Run by completions and the alarm,
-/// when a freed state or a compaction may have made room.
+/// The room counts what a compaction would reclaim ([`Room`]). A head
+/// that does not fit is remembered with the increment it needed
+/// (`Graph::backlog_blocked`), and a later pass reads it again only once
+/// that room exists or a higher lane's entry heads the backlog, so a
+/// blocked backlog costs a completion no read.
+///
+/// Returns the entries admitted. Run by completions, slice reports and
+/// the alarm, when a published node or a compaction may have made room.
 ///
 /// # Errors
 /// `QueueError::Sql`/`Invariant` on a failed read or write, a corrupt
@@ -287,14 +299,19 @@ pub(super) async fn admit_backlog(
 ) -> Result<u32, QueueError> {
     let mut admitted = 0u32;
     let mut moved = 0u64;
-    // A graph at the small line has room for nothing the admission
-    // rule could add: skip the read.
-    while moved < ADMIT_PASS_BYTES
-        && graph.with(|graph| graph.resident_bytes()) < settings.small_memory_line_bytes
-    {
+    while moved < ADMIT_PASS_BYTES {
         let Some(lane) = graph.with(|graph| graph.backlog.first_lane()) else {
             break;
         };
+        let still_blocked = graph.with(|graph| {
+            graph.backlog_blocked.is_some_and(|blocked| {
+                let resident = Room::of(graph).reusable_resident();
+                blocked.lane == lane && !settings.admits(resident, blocked.increment)
+            })
+        });
+        if still_blocked {
+            break;
+        }
         let Some(entry) = backlog::head(db, lane).await? else {
             return Err(QueueError::Invariant(format!(
                 "the backlog tally holds a {lane:?} entry the table does not"
@@ -304,11 +321,21 @@ pub(super) async fn admit_backlog(
         let validated = [ValidatedSubmission::logged(&entry.tree)?];
         let mut base = read_base(graph, db, &validated).await?;
         let fits = graph.with(|graph| -> Result<bool, QueueError> {
-            let counts = graph.resident_counts();
-            let growth = graph.merge_growth(&validated[0], &mut base)?;
-            let resident = counts.bytes();
-            let after = counts.grown(growth, graph.vacant_states()).bytes();
-            Ok(settings.admits(resident, after.saturating_sub(resident)))
+            let mut room = Room::of(graph);
+            let growth = graph.merge_growth(&validated[0], &mut base, &mut Vec::new())?;
+            match room.take(settings, growth) {
+                Ok(()) => {
+                    graph.backlog_blocked = None;
+                    if room.compact() {
+                        graph.compact();
+                    }
+                    Ok(true)
+                }
+                Err(increment) => {
+                    graph.backlog_blocked = Some(backlog::Blocked { lane, increment });
+                    Ok(false)
+                }
+            }
         })?;
         if !fits {
             break;
@@ -893,7 +920,17 @@ pub(super) async fn wake_graph<'a>(
     if let Some(loaded) = cell.loaded() {
         return Ok(loaded);
     }
-    let mut graph = store::wake(db, cell, budget, now_ms).await?;
+    if let Some(error) = cell.oversized(budget) {
+        return Err(error);
+    }
+    let mut graph = match store::wake(db, cell, budget, now_ms).await {
+        Ok(graph) => graph,
+        Err(QueueError::GraphExceedsBudget { needed, budget }) => {
+            cell.record_oversize(needed, budget);
+            return Err(QueueError::GraphExceedsBudget { needed, budget });
+        }
+        Err(error) => return Err(error),
+    };
     graph.woken_at_ms = now_ms;
     Ok(cell.install(graph))
 }
@@ -2832,17 +2869,26 @@ mod backlog_tests {
         let tree = chain(SubmissionSource::CacheMiss, FIRST_ROW + 20, 60);
         let before = cell.with(|graph| graph.resident_counts());
         let vacant = cell.with(|graph| graph.vacant_states());
+        let mut predicted_unpublished = Vec::new();
         let growth = cell.with(|graph| {
             let validated = ValidatedSubmission::new(&tree).expect("valid");
             graph
-                .merge_growth(&validated, &mut PublishedNeeds::default())
+                .merge_growth(
+                    &validated,
+                    &mut PublishedNeeds::default(),
+                    &mut predicted_unpublished,
+                )
                 .expect("growth")
         });
         // Rows 20..30 are held already.
         assert_eq!(growth.nodes, 50);
-        commit_trees(cell, &db, &[tree], None, 2)
+        let (_, unpublished) = commit_trees(cell, &db, &[tree], None, 2)
             .await
             .expect("merge");
+        assert_eq!(
+            predicted_unpublished, unpublished,
+            "the growth names the misses the merge reports"
+        );
         let after = cell.with(|graph| graph.resident_counts());
         let predicted = before.grown(growth, vacant);
         assert_eq!(
@@ -2877,6 +2923,11 @@ mod backlog_tests {
         let waiting = put(cell, &db, &full(), std::slice::from_ref(&tree)).await;
         assert_eq!(waiting.backlogged, [0]);
         assert_eq!(waiting.inserted, 0);
+        assert_eq!(
+            waiting.unpublished.len(),
+            40,
+            "a backlogged tree names its misses at the submit"
+        );
         assert_eq!(nodes_held(cell), 0);
         assert_eq!(
             log_sources(&db).await,
@@ -3086,6 +3137,89 @@ mod backlog_tests {
         let held = cell.with(|graph| graph.backlog);
         assert_eq!(woken.backlog, held);
         assert_eq!(held.entries(), 1);
+    }
+
+    /// A head that does not fit is read once: later passes leave the
+    /// table alone until the room it needed exists. The rows are
+    /// deleted behind the tally's back, so a read would fail.
+    #[tokio::test]
+    async fn a_blocked_head_is_read_again_only_once_its_room_exists() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = live();
+        let cell = owner.loaded().expect("loaded");
+        let tree = chain(SubmissionSource::Preheat, FIRST_ROW, 40);
+        put(cell, &db, &full(), std::slice::from_ref(&tree)).await;
+        assert_eq!(
+            admit_backlog(cell, &db, &full(), HOST_NOW_MS)
+                .await
+                .expect("pass"),
+            0
+        );
+        let blocked = cell
+            .with(|graph| graph.backlog_blocked)
+            .expect("the head is remembered");
+        assert_eq!(blocked.lane, Lane::Preheat);
+        assert!(blocked.increment > 0);
+        db.query("DELETE FROM backlog")
+            .execute()
+            .await
+            .expect("delete");
+        assert_eq!(
+            admit_backlog(cell, &db, &full(), HOST_NOW_MS)
+                .await
+                .expect("no read while blocked"),
+            0
+        );
+        let error = admit_backlog(cell, &db, &SchedulerSettings::default(), HOST_NOW_MS)
+            .await
+            .expect_err("room exists: the head is read");
+        assert!(matches!(error, QueueError::Invariant(_)), "{error}");
+    }
+
+    /// A wake that finds the graph over the line is remembered: the
+    /// next wake under that line fails without a statement, and a reset
+    /// or a larger line reads the store again.
+    #[tokio::test]
+    async fn a_wake_over_the_line_is_remembered_until_a_reset() {
+        let (db, statements) = test_db::counting_memory_db().await.expect("db");
+        let ran = || statements.lock().expect("log").len();
+        let owner = live();
+        let cell = owner.loaded().expect("loaded");
+        commit_trees(
+            cell,
+            &db,
+            &[chain(SubmissionSource::Preheat, FIRST_ROW, 3_000)],
+            None,
+            1,
+        )
+        .await
+        .expect("merge");
+        let needed = cell.with(|graph| graph.resident_bytes());
+        snapshot(cell, &db, HOST_NOW_MS).await.expect("snapshot");
+
+        let woken = GraphCell::default();
+        let over = |woke: Result<LoadedGraph<'_>, QueueError>| {
+            matches!(woke, Err(QueueError::GraphExceedsBudget { .. }))
+        };
+        assert!(
+            over(wake_graph(&db, &woken, needed / 2, HOST_NOW_MS).await),
+            "over the line"
+        );
+        let before = ran();
+        assert!(
+            over(wake_graph(&db, &woken, needed / 4, HOST_NOW_MS).await),
+            "remembered under a smaller line"
+        );
+        assert_eq!(ran(), before, "answered without a statement");
+        // A reset forgets it: the store is read again.
+        woken.clear();
+        assert!(over(wake_graph(&db, &woken, needed / 2, HOST_NOW_MS).await));
+        assert!(ran() > before);
+        // So does a larger line.
+        let loaded = wake_graph(&db, &woken, needed, HOST_NOW_MS)
+            .await
+            .expect("within the larger line");
+        assert_eq!(loaded.with(|graph| graph.sizes().0), 3_000);
     }
 
     /// The operator view reports the resident bytes, the lines and the

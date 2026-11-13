@@ -58,7 +58,7 @@ use edges::Edges;
 use index::{Interner, IxTable, Priorities, hash_of};
 pub use node::RunCompletion;
 use node::{Extra, FIRST_ATTEMPT, Flags, Lane, NO_STATE, Node, State, Status};
-pub(super) use occupancy::ResidentCounts;
+pub(super) use occupancy::{ResidentCounts, Room};
 pub use published::{
     Fetched, PublishedNeeds, PublishedRow, PublishedSource, ReadSource, slice_column,
 };
@@ -460,6 +460,9 @@ pub struct Graph {
     /// The node arena. Indexes are stable between compactions and
     /// compactions keep creation order.
     nodes: Arena<Node>,
+    /// Edges of the freed nodes in `nodes`: what the next compaction
+    /// drops from the edge arrays along with them (stow#1501).
+    free_edges: usize,
     /// Derived queue-state candidates; published and free nodes have no entry.
     /// Rebuilt with the identity indexes after loading or renumbering nodes.
     by_status: [fixedbitset::FixedBitSet; Status::COUNT],
@@ -606,6 +609,9 @@ pub struct Graph {
     /// to the table, so the status reads and the admission pass never
     /// scan it.
     pub(super) backlog: super::backlog::Tally,
+    /// The backlog head the last admission pass found too large, so a
+    /// pass reads it again only once the room it needed exists.
+    pub(super) backlog_blocked: Option<super::backlog::Blocked>,
     /// The fixture size the budget probe last seeded this store at —
     /// `None` until a seed runs. It rides the snapshot head so `rearm`
     /// and the probe read it from the graph: a `store_meta` row would
@@ -1351,6 +1357,7 @@ impl Graph {
         while let Some(ix) = work.pop() {
             debug_assert_eq!(self.node(ix).status, Status::Published);
             self.set_status(ix, Status::Free);
+            self.free_edges += usize::from(self.node(ix).edges_len);
             for edge in self.edge_range(ix) {
                 let dep = self.edges.dep(edge);
                 let held = self.node_mut(dep);
@@ -1442,6 +1449,7 @@ impl Graph {
             .map(|&ix| remap[ix as usize])
             .collect::<BTreeSet<_>>();
         self.counts[Status::Free.index()] = 0;
+        self.free_edges = 0;
         for target in &mut self.targets {
             target.counts[Status::Free.index()] = 0;
         }
@@ -1498,7 +1506,7 @@ impl Graph {
 }
 
 /// Freed nodes below which a compaction is never worth its pass.
-const COMPACT_FLOOR: usize = 1_024;
+pub(super) const COMPACT_FLOOR: usize = 1_024;
 
 /// Merge, publish and the claim gate.
 impl Graph {
@@ -4726,6 +4734,12 @@ pub struct GraphCell {
     /// memory line.
     #[cfg(target_arch = "wasm32")]
     exceeded_alerted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The last wake that found the graph over the memory line: the
+    /// bytes it needed (zero while none failed) and the line. Only a
+    /// reset changes a store no route can wake, so a later wake under
+    /// the same line fails with it before reading a row — a scheduler
+    /// over its line costs each request nothing, not a snapshot load.
+    oversize: std::sync::Arc<[std::sync::atomic::AtomicU64; 2]>,
     /// The isolate's cached GitHub App installation token.
     tokens: crate::github_app::TokenCache,
     /// The isolate's billed-but-unsettled row counts — see [`Unsettled`].
@@ -4854,9 +4868,27 @@ impl GraphCell {
             .exceeded_alerted
             .swap(true, std::sync::atomic::Ordering::Relaxed)
     }
+    /// The error a wake under `budget` fails with without reading the
+    /// store: the last failed wake's, while `budget` is no larger than
+    /// the line it failed against.
+    pub(crate) fn oversized(&self, budget: u64) -> Option<QueueError> {
+        let needed = self.oversize[0].load(std::sync::atomic::Ordering::Relaxed);
+        let line = self.oversize[1].load(std::sync::atomic::Ordering::Relaxed);
+        (needed != 0 && budget <= line).then_some(QueueError::GraphExceedsBudget { needed, budget })
+    }
+    /// Remember a wake that found the graph needs `needed` bytes against
+    /// the line `budget`.
+    pub(crate) fn record_oversize(&self, needed: u64, budget: u64) {
+        self.oversize[1].store(budget, std::sync::atomic::Ordering::Relaxed);
+        self.oversize[0].store(needed, std::sync::atomic::Ordering::Relaxed);
+    }
     /// Drop the in-memory graph — the operator reset: the next
     /// request wakes from the (reset) store.
     pub(crate) fn clear(&self) {
+        self.oversize[0].store(0, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(target_arch = "wasm32")]
+        self.exceeded_alerted
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         *self.graph.lock().expect("graph cell poisoned") = Graph::default();
         self.loaded
             .store(false, std::sync::atomic::Ordering::Release);
@@ -6494,6 +6526,80 @@ mod tests {
             before.encode_dispatch_task().expect("encode before"),
             after.encode_dispatch_task().expect("encode after")
         );
+    }
+
+    /// stow#1501: the records published nodes free count as room once
+    /// a compaction would drop them. A merge that fits only that way
+    /// compacts first, and the compacted graph holds exactly the
+    /// figure the room was judged against.
+    #[test]
+    fn the_room_counts_what_a_compaction_would_reclaim() {
+        let mut graph = Graph::default();
+        let mut nodes: Vec<_> = (0..9_000).map(|n| sub(&format!("l{n}"))).collect();
+        for n in 0..1_000u32 {
+            let mut dependent = sub(&format!("d{n}"));
+            dependent.deps = vec![n];
+            nodes.push(dependent);
+        }
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![],
+                    nodes,
+                },
+                0,
+            )
+            .expect("merge");
+        // 600 dependents and their leaves publish: 1,200 freed records
+        // and 600 edges, under the eighth the graph compacts at itself.
+        let rows: Vec<_> = (0..600)
+            .flat_map(|n| [format!("l{n}"), format!("d{n}")])
+            .flat_map(|name| {
+                [
+                    published_row(&name, UnitKind::Linked),
+                    published_row(&name, UnitKind::Unlinked),
+                ]
+            })
+            .collect();
+        let live = graph.slice_generation(TARGET, RUSTC);
+        graph.apply_slice_report(
+            TARGET,
+            RUSTC,
+            live,
+            live.map_or(1, |live| live + 1),
+            &rows,
+            &[],
+        );
+        assert_eq!(graph.counts[Status::Free.index()], 1_200);
+        assert_eq!(graph.free_edges, 600);
+
+        let reusable = Room::of(&graph).reusable_resident();
+        let resident = graph.resident_bytes();
+        assert!(reusable < resident, "{reusable} < {resident}");
+        let growth = occupancy::Growth {
+            nodes: 1,
+            stateful: 1,
+            ..occupancy::Growth::default()
+        };
+        let lines = |line: u64| queue::SchedulerSettings {
+            memory_line_bytes: line,
+            small_memory_line_bytes: line,
+            ..queue::SchedulerSettings::default()
+        };
+        // No room even after a compaction: nothing is planned.
+        let mut room = Room::of(&graph);
+        assert!(room.take(&lines(reusable), growth).is_err());
+        assert!(!room.compact());
+        // Room only after one: the merge fits and plans it.
+        let settings = lines(reusable + 4_096);
+        assert!(!settings.admits(resident, 1), "no room without it");
+        let mut room = Room::of(&graph);
+        assert_eq!(room.take(&settings, growth), Ok(()));
+        assert!(room.compact());
+        graph.compact();
+        assert_eq!(graph.resident_bytes(), reusable);
+        assert_eq!(graph.free_edges, 0);
     }
 
     #[test]
