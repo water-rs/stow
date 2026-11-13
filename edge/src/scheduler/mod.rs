@@ -21,6 +21,8 @@ pub mod feed;
 pub mod graph;
 /// The alert a wake raises when the graph exceeds its memory line.
 pub mod graph_alert;
+/// The operator's memory lines, stored outside the graph (stow#1501).
+pub mod memory_line;
 pub mod meter;
 pub mod queue;
 /// The graph-and-store cores of the routes, shared by the Durable

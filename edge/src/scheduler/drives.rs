@@ -675,7 +675,7 @@ async fn drain_backlog(
     settings: &SchedulerSettings,
     tag: u64,
 ) -> Result<(), String> {
-    routes::admit_backlog(ctx.loaded(), db, settings, now_ms())
+    routes::admit_backlog(ctx.loaded(), db, settings)
         .await
         .map_err(text)?;
     cancel_submitted(ctx, db, vec![source_node_id("costgate-backlog", tag)]).await
@@ -2354,7 +2354,7 @@ pub const DRIVES: &[Drive] = &[
         }),
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
-                let admitted = routes::admit_backlog(ctx.loaded(), db, settings, now_ms())
+                let admitted = routes::admit_backlog(ctx.loaded(), db, settings)
                     .await
                     .map_err(text)?;
                 if admitted == 1 {
@@ -3069,6 +3069,57 @@ pub const DRIVES: &[Drive] = &[
                 routes::snapshot(ctx.loaded(), db, now_ms())
                     .await
                     .map_err(text)
+            })
+        }),
+    },
+    Drive {
+        // The memory lines in force (stow#1501): the `memory_line` row,
+        // read once per isolate, over the bindings. No wake.
+        name: "GET /memory-line",
+        setup: None,
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                routes::memory_lines(db, ctx.loaded().cell(), settings)
+                    .await
+                    .map_err(text)?;
+                Ok(())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // The operator's `set` (stow#1501): one upsert of the
+        // `memory_line` row and no graph read. The seed stores no row,
+        // so the cleanup deletes it and the cell forgets it.
+        name: "POST /memory-line",
+        setup: None,
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                routes::set_memory_lines(
+                    db,
+                    ctx.loaded().cell(),
+                    settings,
+                    stow_types::api::MemoryLineSet {
+                        normal_line_bytes: settings.memory_line_bytes,
+                        small_line_bytes: settings.small_memory_line_bytes,
+                        small_increment_bytes: settings.small_increment_bytes,
+                    },
+                    DRIVE_ACTOR,
+                    "2026-01-01T00:00:00.000Z".to_owned(),
+                )
+                .await
+                .map_err(text)?;
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                db.query("DELETE FROM memory_line")
+                    .execute()
+                    .await
+                    .map_err(text)?;
+                ctx.loaded().cell().set_memory_line(None);
+                Ok(())
             })
         }),
     },

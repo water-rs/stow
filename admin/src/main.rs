@@ -48,8 +48,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use keyring_core::api::CredentialStoreApi;
 use stow_types::api::{
     AdminStatus, ChannelOutcome, DispatchCapSet, DispatchCaps, DispatchFreeze,
-    DispatchFreezeTrigger, FreezeTransitionEvent, ReleasePriority, ReleasePrioritySet,
-    SchedulerSubmitResponse,
+    DispatchFreezeTrigger, FreezeTransitionEvent, MemoryLineSet, MemoryLines, ReleasePriority,
+    ReleasePrioritySet, SchedulerSubmitResponse,
 };
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -132,6 +132,12 @@ enum Command {
     /// Read or adjust the multiplier release-profile nodes rank under
     /// in the scheduler's aging rank (stow#1012).
     ReleasePriority(ReleasePriorityArgs),
+    /// Read or adjust the scheduler graph's memory lines — the bounds
+    /// the deploy bindings `STOW_SCHEDULER_MEMORY_LINE`,
+    /// `STOW_SCHEDULER_SMALL_MEMORY_LINE` and
+    /// `STOW_SCHEDULER_SMALL_INCREMENT_BYTES` set until the first `set`
+    /// (stow#1501).
+    MemoryLine(MemoryLineArgs),
     /// Publish the signed artifact index.
     Index(index_cmd::IndexArgs),
     /// Regenerate the checked-in launch traffic model from production
@@ -239,6 +245,42 @@ struct ReleasePrioritySetArgs {
     /// point's: `25` ranks it at a quarter. No ceiling is checked.
     #[arg(long)]
     percent: u32,
+    /// Apply the change.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+struct MemoryLineArgs {
+    /// `status` prints the lines in force and where they come from;
+    /// `set` replaces the deploy bindings' values until the next set —
+    /// there is no clear.
+    #[command(subcommand)]
+    command: MemoryLineCommand,
+}
+
+#[derive(Subcommand)]
+enum MemoryLineCommand {
+    /// Print the lines in force and whether they come from the deploy
+    /// bindings or the operator setting.
+    Status,
+    /// Set the lines; without `--yes` prints the plan and exits 0.
+    Set(MemoryLineSetArgs),
+}
+
+#[derive(Args)]
+struct MemoryLineSetArgs {
+    /// Resident graph bytes up to which any submission's increment goes
+    /// straight in. No bound is checked.
+    #[arg(long)]
+    normal: u64,
+    /// Resident graph bytes up to which a small increment goes straight
+    /// in, and past which the graph fails to wake. No bound is checked.
+    #[arg(long)]
+    small: u64,
+    /// The largest increment, in resident bytes, that counts as small.
+    #[arg(long)]
+    small_increment: u64,
     /// Apply the change.
     #[arg(long)]
     yes: bool,
@@ -353,6 +395,9 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
         }
         Command::ReleasePriority(args) => {
             release_priority_command(&Edge::connect(&*store)?, args, output).await
+        }
+        Command::MemoryLine(args) => {
+            memory_line_command(&Edge::connect(&*store)?, args, output).await
         }
         Command::Index(args) => index_cmd::run(args, &*store).await,
         Command::LaunchModel(args) => launch_model::run(args, output).await,
@@ -973,6 +1018,68 @@ async fn release_priority_command(
             .await
         }
     }
+}
+
+/// `stow-admin memory-line status|set` — read the scheduler graph's
+/// memory lines in force or write the operator setting that replaces
+/// the deploy bindings' (stow#1501). `set` is a mutation: it prints the
+/// plan and only applies under `--yes`. Both answer while the graph
+/// cannot wake, so a `set` raising the small line is how a graph the
+/// old line refused wakes again.
+async fn memory_line_command(
+    edge: &Edge,
+    args: MemoryLineArgs,
+    output: Output,
+) -> stow_types::error::Result<()> {
+    match args.command {
+        MemoryLineCommand::Status => {
+            let view: MemoryLines = edge.get_json("/api/v1/admin/memory-line").await?;
+            render::emit(output, &view, render_memory_lines)
+        }
+        MemoryLineCommand::Set(args) => {
+            let plan = MemoryLineSet {
+                normal_line_bytes: args.normal,
+                small_line_bytes: args.small,
+                small_increment_bytes: args.small_increment,
+            };
+            render::mutation(
+                output,
+                plan,
+                |envelope: &render::Planned<MemoryLineSet, MemoryLines>| {
+                    let mut out = "set memory lines\n".to_owned();
+                    if let Some(result) = &envelope.result {
+                        let _ = writeln!(out, "{}", render_memory_lines(result));
+                    }
+                    let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
+                    out
+                },
+                args.yes.then_some(async move |plan: &MemoryLineSet| {
+                    edge.post_json("/api/v1/admin/memory-line", plan).await
+                }),
+            )
+            .await
+        }
+    }
+}
+
+/// Human rendering of the memory lines in force and their source.
+fn render_memory_lines(view: &MemoryLines) -> String {
+    let mut out = format!(
+        "normal line {} B\nsmall line {} B\nsmall increment {} B\n({})",
+        view.normal_line_bytes,
+        view.small_line_bytes,
+        view.small_increment_bytes,
+        if view.setting.is_some() {
+            "operator"
+        } else {
+            "deploy bindings"
+        }
+    );
+    if let Some(setting) = &view.setting {
+        let _ = write!(out, "\nset at {}", setting.set_at);
+        let _ = write!(out, "\nset by {}", setting.actor);
+    }
+    out
 }
 
 /// Human rendering of the release multiplier in force and its source.

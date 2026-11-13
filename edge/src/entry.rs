@@ -253,6 +253,9 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 2] {
                 "/release-priority"
                     .at(api::get_release_priority)
                     .post(api::set_release_priority),
+                "/memory-line"
+                    .at(api::get_memory_line)
+                    .post(api::set_memory_line),
                 "/queue".at(api::admin_queue_list),
                 "/queue/retry".post(api::admin_queue_retry),
                 "/queue/cancel".post(api::admin_queue_cancel),

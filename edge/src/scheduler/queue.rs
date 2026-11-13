@@ -207,6 +207,38 @@ impl SchedulerSettings {
             || (increment <= self.small_increment_bytes
                 && resident.saturating_add(increment) <= self.small_memory_line_bytes)
     }
+
+    /// These settings with the operator's memory lines replacing the
+    /// deploy bindings', when a `memory-line set` stored them.
+    #[must_use]
+    pub const fn with_memory_line(
+        self,
+        setting: Option<&stow_types::api::MemoryLineSetting>,
+    ) -> Self {
+        match setting {
+            Some(setting) => Self {
+                memory_line_bytes: setting.lines.normal_line_bytes,
+                small_memory_line_bytes: setting.lines.small_line_bytes,
+                small_increment_bytes: setting.lines.small_increment_bytes,
+                ..self
+            },
+            None => self,
+        }
+    }
+
+    /// The memory lines in force and the setting behind them.
+    #[must_use]
+    pub const fn memory_lines_view(
+        &self,
+        setting: Option<stow_types::api::MemoryLineSetting>,
+    ) -> stow_types::api::MemoryLines {
+        stow_types::api::MemoryLines {
+            setting,
+            normal_line_bytes: self.memory_line_bytes,
+            small_line_bytes: self.small_memory_line_bytes,
+            small_increment_bytes: self.small_increment_bytes,
+        }
+    }
 }
 
 impl Default for SchedulerSettings {

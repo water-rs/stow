@@ -1528,6 +1528,57 @@ pub struct ReleasePrioritySetting {
     pub actor: String,
 }
 
+/// The scheduler graph's memory lines (stow#1501) — wire shape of
+/// `GET`/`POST /api/v1/admin/memory-line` and of the scheduler object's
+/// `/memory-line` routes.
+///
+/// Up to the normal line any submission's increment goes straight into
+/// the graph; up to the small line one within the small increment does;
+/// what fits neither waits in the backlog, and a graph larger than the
+/// small line fails to wake. The deploy bindings
+/// `STOW_SCHEDULER_MEMORY_LINE`, `STOW_SCHEDULER_SMALL_MEMORY_LINE` and
+/// `STOW_SCHEDULER_SMALL_INCREMENT_BYTES` apply until the first `set`;
+/// the setting lives outside the graph, so it reads and sets while the
+/// graph cannot wake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MemoryLines {
+    /// The operator setting in force — absent until the first `set`,
+    /// when the deploy bindings apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setting: Option<MemoryLineSetting>,
+    /// The normal line in force, in resident bytes.
+    pub normal_line_bytes: u64,
+    /// The small-submission line in force, in resident bytes.
+    pub small_line_bytes: u64,
+    /// The largest increment that counts as small, in resident bytes.
+    pub small_increment_bytes: u64,
+}
+
+/// What an operator's `memory-line set` wrote — `POST`'s request body.
+/// No bound is checked: the operator is trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MemoryLineSet {
+    /// The normal line, in resident bytes.
+    pub normal_line_bytes: u64,
+    /// The small-submission line, in resident bytes.
+    pub small_line_bytes: u64,
+    /// The largest increment that counts as small, in resident bytes.
+    pub small_increment_bytes: u64,
+}
+
+/// The operator setting a `set` stored — the scheduler store's
+/// `memory_line` row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MemoryLineSetting {
+    /// The lines the set named.
+    #[serde(flatten)]
+    pub lines: MemoryLineSet,
+    /// ISO 8601 timestamp of the set.
+    pub set_at: String,
+    /// The verified `actor` claim of the operations run that set it.
+    pub actor: String,
+}
+
 /// One component's health as `GET /api/v1/scheduler/health` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]

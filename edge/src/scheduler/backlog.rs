@@ -96,6 +96,14 @@ impl Tally {
             .find(|&lane| self.entries[lane.index()] > 0)
     }
 
+    /// Whether an entry of `lane` or of a lane admitted before it
+    /// waits — the entries a new submission of `lane` must queue
+    /// behind.
+    #[must_use]
+    pub fn waits_at_or_above(&self, lane: Lane) -> bool {
+        self.entries[..=lane.index()].iter().any(|&held| held > 0)
+    }
+
     const fn add(&mut self, lane: Lane, bytes: u64) {
         self.entries[lane.index()] += 1;
         self.bytes += bytes;
@@ -182,7 +190,8 @@ async fn move_counters(
 }
 
 /// Store `tree` whole: one row per `Submit` part, the first carrying
-/// the `actor` of the request. The graph's tally moves with the write.
+/// the `actor` of the request, every one the instant `submitted_ms` it
+/// arrived at. The graph's tally moves with the write.
 ///
 /// # Errors
 /// `QueueError::Sql` on a failed write.
@@ -191,6 +200,7 @@ pub async fn push(
     db: &DurableDb,
     tree: &SubmissionTree,
     actor: Option<&str>,
+    submitted_ms: i64,
 ) -> Result<(), QueueError> {
     let lane = Lane::of(tree.source);
     let mut bytes = 0u64;
@@ -201,19 +211,23 @@ pub async fn push(
         let (part, parts) = (*part, *parts);
         let text = store::encode_event(&event)?;
         bytes += u64::try_from(text.len()).expect("row length fits u64");
-        db.query("INSERT INTO backlog(lane, part, parts, actor, event) VALUES (?, ?, ?, ?, ?)")
-            .bind(i64::from(lane as u8))
-            .bind(i64::from(part))
-            .bind(i64::from(parts))
-            .bind(if part == 0 {
-                actor.map(str::to_owned)
-            } else {
-                None
-            })
-            .bind(text)
-            .execute()
-            .await
-            .map_err(|error| QueueError::Sql(format!("backlog push: {error}")))?;
+        db.query(
+            "INSERT INTO backlog(lane, part, parts, actor, submitted_ms, event) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(i64::from(lane as u8))
+        .bind(i64::from(part))
+        .bind(i64::from(parts))
+        .bind(if part == 0 {
+            actor.map(str::to_owned)
+        } else {
+            None
+        })
+        .bind(submitted_ms)
+        .bind(text)
+        .execute()
+        .await
+        .map_err(|error| QueueError::Sql(format!("backlog push: {error}")))?;
     }
     move_counters(db, lane, bytes, true).await?;
     graph.with(|graph| graph.backlog.add(lane, bytes));
@@ -229,6 +243,9 @@ pub struct Entry {
     bytes: u64,
     /// The verified run behind the request that submitted it.
     pub actor: Option<String>,
+    /// The unix-ms instant it was submitted at, which its merge and its
+    /// log rows carry.
+    pub submitted_ms: i64,
     /// The tree, reassembled from its parts.
     pub tree: SubmissionTree,
 }
@@ -238,6 +255,7 @@ struct PartRow {
     seq: i64,
     parts: i64,
     actor: Option<String>,
+    submitted_ms: i64,
     event: String,
 }
 
@@ -251,7 +269,7 @@ struct PartRow {
 pub async fn head(db: &DurableDb, lane: Lane) -> Result<Option<Entry>, QueueError> {
     let first = db
         .query(
-            "SELECT seq, parts, actor, event FROM backlog WHERE lane = ? \
+            "SELECT seq, parts, actor, submitted_ms, event FROM backlog WHERE lane = ? \
              ORDER BY seq LIMIT 1",
         )
         .bind(i64::from(lane as u8))
@@ -267,7 +285,8 @@ pub async fn head(db: &DurableDb, lane: Lane) -> Result<Option<Entry>, QueueErro
     if parts > 1 {
         rows.extend(
             db.query(
-                "SELECT seq, parts, actor, event FROM backlog WHERE seq > ? ORDER BY seq LIMIT ?",
+                "SELECT seq, parts, actor, submitted_ms, event FROM backlog \
+                 WHERE seq > ? ORDER BY seq LIMIT ?",
             )
             .bind(rows[0].seq)
             .bind(parts - 1)
@@ -297,7 +316,10 @@ pub async fn head(db: &DurableDb, lane: Lane) -> Result<Option<Entry>, QueueErro
         else {
             return Err(corrupt("a row is not a submit part"));
         };
-        if usize::try_from(part).ok() != Some(at) || row.parts != parts {
+        if usize::try_from(part).ok() != Some(at)
+            || row.parts != parts
+            || row.submitted_ms != rows[0].submitted_ms
+        {
             return Err(corrupt("its parts are out of order"));
         }
         if source
@@ -319,6 +341,7 @@ pub async fn head(db: &DurableDb, lane: Lane) -> Result<Option<Entry>, QueueErro
         lane,
         bytes,
         actor: first_row.actor,
+        submitted_ms: first_row.submitted_ms,
         tree: SubmissionTree {
             source: source.expect("an entry has a part"),
             roots,

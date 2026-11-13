@@ -77,7 +77,12 @@ async fn ensure_graph<'a>(
     db: &DurableDb,
     cell: &'a graph::GraphCell,
 ) -> Result<graph::LoadedGraph<'a>> {
-    let settings = binding_settings(env)?;
+    // The wake loads under the small line in force: the operator's
+    // `memory-line set` when one is stored, the binding before it.
+    let setting = super::memory_line::current(db, cell)
+        .await
+        .map_err(to_error)?;
+    let settings = binding_settings(env)?.with_memory_line(setting.as_ref());
     let loaded =
         match routes::wake_graph(db, cell, settings.small_memory_line_bytes, now_ms()).await {
             Ok(loaded) => loaded,
@@ -122,7 +127,7 @@ async fn admit_backlog(
     db: &DurableDb,
     settings: &SchedulerSettings,
 ) {
-    match routes::admit_backlog(graph, db, settings, now_ms()).await {
+    match routes::admit_backlog(graph, db, settings).await {
         Ok(0) => {}
         Ok(admitted) => tracing::info!(admitted, "backlog entries admitted"),
         Err(error) => tracing::error!(%error, "backlog admission failed"),
@@ -148,15 +153,26 @@ async fn graph_exceeds_budget(env: &WasmEnv, cell: &graph::GraphCell, error: Que
 
 /// The settings a request or the alarm runs under: the deploy
 /// bindings, with the operator's stored `dispatch-cap set` replacing
-/// their caps (stow#1039). The one place the stored setting enters the
-/// caps — every claim, free-slot count, reconcile gate and status view
+/// their caps (stow#1039) and the stored `memory-line set` their memory
+/// lines (stow#1501). The one place the stored settings enter — every
+/// claim, free-slot count, reconcile gate, admission and status view
 /// downstream reads only the settings it is handed, so a caller that
 /// passes its own (a budget drive) stays authoritative. Taking the
-/// loaded graph makes the order a type fact: the setting is read after
-/// the wake has replayed it.
+/// loaded graph makes the order a type fact: the dispatch cap is read
+/// after the wake has replayed it, and the memory lines after
+/// `ensure_graph` read their row into the cell.
 fn scheduler_settings(env: &WasmEnv, graph: graph::LoadedGraph<'_>) -> Result<SchedulerSettings> {
     let bindings = binding_settings(env)?;
-    Ok(graph.with(|graph| bindings.with_dispatch_cap(graph.dispatch_cap())))
+    let super::memory_line::Cached::Read(memory_line) = graph.cell().memory_line() else {
+        return Err(to_error(QueueError::Invariant(
+            "settings read before the wake read the memory-line row".to_owned(),
+        )));
+    };
+    Ok(graph.with(|graph| {
+        bindings
+            .with_dispatch_cap(graph.dispatch_cap())
+            .with_memory_line(memory_line.as_ref())
+    }))
 }
 
 /// The deploy bindings alone, with no operator setting applied — for
@@ -363,6 +379,10 @@ impl Scheduler {
                 "/release-priority"
                     .at(read_release_priority)
                     .post(write_release_priority),
+                // The operator's memory lines (stow#1501): reached from
+                // `GET`/`POST /api/v1/admin/memory-line`, and served
+                // without a wake.
+                "/memory-line".at(read_memory_line).post(write_memory_line),
                 // The edge's health probe (stow#860): one read of held
                 // state, reached from `GET /api/v1/scheduler/health`.
                 "/health".at(health),
@@ -1658,6 +1678,51 @@ async fn write_release_priority(
     .map_err(to_error)?;
     tracing::warn!(percent = set.percent, actor = %actor.0, "release priority set by operator");
     Ok(Json(graph.with(|graph| graph.release_priority_view())))
+}
+
+/// `GET /memory-line` — the memory lines in force and the operator
+/// setting behind them (stow#1501). No wake: it answers while the
+/// graph cannot load.
+async fn read_memory_line(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::MemoryLines>> {
+    let view = routes::memory_lines(&db, &graph, &binding_settings(&env)?)
+        .await
+        .map_err(to_error)?;
+    Ok(Json(view))
+}
+
+/// `POST /memory-line` — the operator's `set`: the `memory_line` row
+/// written, in force from the next decision on. No wake and no graph
+/// read, so a set that raises the small line is what lets a graph the
+/// old line refused wake.
+async fn write_memory_line(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+    actor: Actor,
+    Json(set): Json<stow_types::api::MemoryLineSet>,
+) -> Result<Json<stow_types::api::MemoryLines>> {
+    let view = routes::set_memory_lines(
+        &db,
+        &graph,
+        &binding_settings(&env)?,
+        set,
+        &actor.0,
+        iso_now(),
+    )
+    .await
+    .map_err(to_error)?;
+    tracing::warn!(
+        normal = set.normal_line_bytes,
+        small = set.small_line_bytes,
+        small_increment = set.small_increment_bytes,
+        actor = %actor.0,
+        "memory lines set by operator"
+    );
+    Ok(Json(view))
 }
 
 /// `Date#toISOString` — the timestamp format the record and alert

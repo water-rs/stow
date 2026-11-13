@@ -596,6 +596,25 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
+        // stow#1501: the `memory_line` row, read once per isolate (the
+        // cold read priced here), and no wake: measured 1 statement,
+        // 0 rows read (no row before a set), 0 written.
+        name: "GET /memory-line",
+        statements: 2,
+        rows_read: 2,
+        rows_written: 1,
+        wall_ms: 300,
+    },
+    DriveBudget {
+        // stow#1501: one upsert of the `memory_line` row, no graph
+        // read: measured 1 statement, 0 rows read, 1 written.
+        name: "POST /memory-line",
+        statements: 2,
+        rows_read: 2,
+        rows_written: 2,
+        wall_ms: 300,
+    },
+    DriveBudget {
         name: "POST /tasks/complete-run (success)",
         statements: 3,
         rows_read: 5,

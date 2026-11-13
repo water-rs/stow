@@ -4740,6 +4740,10 @@ pub struct GraphCell {
     /// the same line fails with it before reading a row — a scheduler
     /// over its line costs each request nothing, not a snapshot load.
     oversize: std::sync::Arc<[std::sync::atomic::AtomicU64; 2]>,
+    /// The operator's memory lines as the store holds them, once this
+    /// isolate read the `memory_line` row. Kept beside the graph, never
+    /// in it: the wake reads the line it loads under from here.
+    memory_line: std::sync::Arc<std::sync::Mutex<super::memory_line::Cached>>,
     /// The isolate's cached GitHub App installation token.
     tokens: crate::github_app::TokenCache,
     /// The isolate's billed-but-unsettled row counts — see [`Unsettled`].
@@ -4882,10 +4886,24 @@ impl GraphCell {
         self.oversize[1].store(budget, std::sync::atomic::Ordering::Relaxed);
         self.oversize[0].store(needed, std::sync::atomic::Ordering::Relaxed);
     }
+    /// What this isolate knows of the stored memory-line setting.
+    pub(crate) fn memory_line(&self) -> super::memory_line::Cached {
+        self.memory_line
+            .lock()
+            .expect("memory line poisoned")
+            .clone()
+    }
+    /// Keep `setting` as the store's memory-line row.
+    pub(crate) fn set_memory_line(&self, setting: Option<stow_types::api::MemoryLineSetting>) {
+        *self.memory_line.lock().expect("memory line poisoned") =
+            super::memory_line::Cached::Read(setting);
+    }
     /// Drop the in-memory graph — the operator reset: the next
     /// request wakes from the (reset) store.
     pub(crate) fn clear(&self) {
         self.oversize[0].store(0, std::sync::atomic::Ordering::Relaxed);
+        *self.memory_line.lock().expect("memory line poisoned") =
+            super::memory_line::Cached::Unread;
         #[cfg(target_arch = "wasm32")]
         self.exceeded_alerted
             .store(false, std::sync::atomic::Ordering::Relaxed);

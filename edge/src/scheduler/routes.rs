@@ -225,6 +225,12 @@ pub(super) struct Submitted {
 /// published rows of every tree are read in one batch, and the merged
 /// trees append their parts in one turn before the merge.
 ///
+/// Priority holds across arrivals: while an entry of the tree's lane or
+/// of a lane admitted before it waits — in the table or earlier in this
+/// submit — a tree that adds anything queues behind it rather than
+/// take the room that entry waits for. A tree that adds nothing always
+/// merges.
+///
 /// # Errors
 /// As [`commit_trees`], and `QueueError::Sql` on a failed backlog write.
 pub(super) async fn submit_trees(
@@ -240,13 +246,19 @@ pub(super) async fn submit_trees(
     let (fit, backlogged, waiting) = graph.with(|graph| -> Result<_, QueueError> {
         let mut room = Room::of(graph);
         let (mut fit, mut backlogged, mut waiting) = (Vec::new(), Vec::new(), Vec::new());
+        let mut held_back = Vec::new();
         for (at, tree) in validated.iter().enumerate() {
+            let lane = backlog::Lane::of(trees[at].source);
             let mut unpublished = Vec::new();
             let growth = graph.merge_growth(tree, &mut base, &mut unpublished)?;
-            if room.take(settings, growth).is_ok() {
+            let queued_ahead = graph.backlog.waits_at_or_above(lane)
+                || held_back.iter().any(|&ahead| ahead <= lane);
+            let adds_nothing = growth.nodes == 0;
+            if adds_nothing || (!queued_ahead && room.take(settings, growth).is_ok()) {
                 fit.push(at);
             } else {
                 backlogged.push(at);
+                held_back.push(lane);
                 waiting.extend(unpublished);
             }
         }
@@ -258,7 +270,7 @@ pub(super) async fn submit_trees(
     let (inserted, mut unpublished) =
         merge_trees(graph, db, trees, &validated, &fit, &mut base, actor, now).await?;
     for &at in &backlogged {
-        backlog::push(graph, db, &trees[at], actor).await?;
+        backlog::push(graph, db, &trees[at], actor, now).await?;
     }
     unpublished.extend(waiting);
     Ok(Submitted {
@@ -285,6 +297,10 @@ pub(super) async fn submit_trees(
 /// that room exists or a higher lane's entry heads the backlog, so a
 /// blocked backlog costs a completion no read.
 ///
+/// An entry merges, and its parts log, at the instant it was submitted,
+/// so its time in the backlog counts toward its rank (priority × time
+/// waited) and a wake's replay ranks it the same.
+///
 /// Returns the entries admitted. Run by completions, slice reports and
 /// the alarm, when a published node or a compaction may have made room.
 ///
@@ -295,7 +311,6 @@ pub(super) async fn admit_backlog(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
     settings: &SchedulerSettings,
-    now: i64,
 ) -> Result<u32, QueueError> {
     let mut admitted = 0u32;
     let mut moved = 0u64;
@@ -348,7 +363,7 @@ pub(super) async fn admit_backlog(
             &[0],
             &mut base,
             entry.actor.as_deref(),
-            now,
+            entry.submitted_ms,
         )
         .await?;
         backlog::remove(graph, db, &entry).await?;
@@ -356,6 +371,49 @@ pub(super) async fn admit_backlog(
         admitted += 1;
     }
     Ok(admitted)
+}
+
+/// `GET /memory-line`: the memory lines in force over `bindings`, and
+/// the operator setting behind them. It reads no graph, so it answers
+/// while the graph cannot wake; the row is read once per isolate.
+///
+/// # Errors
+/// `QueueError::Sql` on a failed read of the row.
+pub(super) async fn memory_lines(
+    db: &DurableDb,
+    cell: &GraphCell,
+    bindings: &SchedulerSettings,
+) -> Result<stow_types::api::MemoryLines, QueueError> {
+    let setting = super::memory_line::current(db, cell).await?;
+    Ok(bindings
+        .with_memory_line(setting.as_ref())
+        .memory_lines_view(setting))
+}
+
+/// `POST /memory-line`: the operator's `set`, in force from the next
+/// decision on — no graph is read or woken, so it is the way to wake a
+/// graph the old small line refused (a wake under a larger line tries
+/// again). No bound is checked: the operator is trusted.
+///
+/// # Errors
+/// `QueueError::Sql` on a failed write.
+pub(super) async fn set_memory_lines(
+    db: &DurableDb,
+    cell: &GraphCell,
+    bindings: &SchedulerSettings,
+    set: stow_types::api::MemoryLineSet,
+    actor: &str,
+    set_at: String,
+) -> Result<stow_types::api::MemoryLines, QueueError> {
+    let setting = stow_types::api::MemoryLineSetting {
+        lines: set,
+        set_at,
+        actor: actor.to_owned(),
+    };
+    super::memory_line::store(db, cell, setting.clone()).await?;
+    Ok(bindings
+        .with_memory_line(Some(&setting))
+        .memory_lines_view(Some(setting)))
 }
 
 /// The stored text one admission pass moves at most: the request body
@@ -2937,15 +2995,23 @@ mod backlog_tests {
         assert_eq!((tally.entries(), tally.lane_entries(Lane::Preheat)), (1, 1));
         assert!(tally.bytes() > 0);
 
-        let merged = put(
+        // Room now, but its own lane waits: it queues behind its entry,
+        // and admission lands that entry whole.
+        let behind = put(
             cell,
             &db,
             &SchedulerSettings::default(),
             std::slice::from_ref(&tree),
         )
         .await;
-        assert_eq!(merged.backlogged, [] as [usize; 0]);
-        assert_eq!(merged.inserted, 40);
+        assert_eq!(behind.backlogged, [0]);
+        assert_eq!(
+            admit_backlog(cell, &db, &SchedulerSettings::default())
+                .await
+                .expect("admit"),
+            2
+        );
+        assert_eq!(nodes_held(cell), 40);
 
         // The same tree again adds nothing: it merges though no
         // increment fits the lines.
@@ -2997,7 +3063,7 @@ mod backlog_tests {
         }
         assert_eq!(cell.with(|graph| graph.backlog.entries()), 6);
 
-        let admitted = admit_backlog(cell, &db, &SchedulerSettings::default(), HOST_NOW_MS)
+        let admitted = admit_backlog(cell, &db, &SchedulerSettings::default())
             .await
             .expect("admit");
         assert_eq!(admitted, 6);
@@ -3048,16 +3114,11 @@ mod backlog_tests {
             small_memory_line_bytes: 200 * 1024,
             ..SchedulerSettings::default()
         };
-        assert_eq!(
-            admit_backlog(cell, &db, &some, HOST_NOW_MS)
-                .await
-                .expect("admit"),
-            0
-        );
+        assert_eq!(admit_backlog(cell, &db, &some).await.expect("admit"), 0);
         assert_eq!(nodes_held(cell), 0);
         assert_eq!(cell.with(|graph| graph.backlog.entries()), 1);
 
-        let admitted = admit_backlog(cell, &db, &SchedulerSettings::default(), HOST_NOW_MS)
+        let admitted = admit_backlog(cell, &db, &SchedulerSettings::default())
             .await
             .expect("admit");
         assert_eq!(admitted, 1);
@@ -3092,7 +3153,7 @@ mod backlog_tests {
         );
         assert_eq!(nodes_held(cell), 25);
 
-        let admitted = admit_backlog(cell, &db, &SchedulerSettings::default(), HOST_NOW_MS)
+        let admitted = admit_backlog(cell, &db, &SchedulerSettings::default())
             .await
             .expect("admit");
         assert_eq!(admitted, 2);
@@ -3139,6 +3200,149 @@ mod backlog_tests {
         assert_eq!(held.entries(), 1);
     }
 
+    /// Priority holds across arrivals: a tree that adds anything queues
+    /// behind a waiting entry of its own lane or a higher one, while a
+    /// higher lane goes straight past lower waiting entries when it
+    /// fits, and a tree that adds nothing always merges.
+    #[tokio::test]
+    async fn a_new_submission_queues_behind_a_waiting_entry_of_its_lane_or_above() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = live();
+        let cell = owner.loaded().expect("loaded");
+        let roomy = SchedulerSettings::default();
+        let held = chain(SubmissionSource::Preheat, FIRST_ROW, 5);
+        put(cell, &db, &roomy, std::slice::from_ref(&held)).await;
+
+        // A human entry waits; a small preheat tree may not take the
+        // room it needs, though the lines would admit the preheat tree.
+        let human = chain(SubmissionSource::HumanRequest, FIRST_ROW + 100, 5);
+        assert_eq!(put(cell, &db, &full(), &[human]).await.backlogged, [0]);
+        let preheat = chain(SubmissionSource::Preheat, FIRST_ROW + 200, 3);
+        let queued = put(cell, &db, &roomy, std::slice::from_ref(&preheat)).await;
+        assert_eq!(queued.backlogged, [0]);
+        assert_eq!(nodes_held(cell), 5);
+        // Nodes the graph holds add nothing: they merge past the wait.
+        assert_eq!(
+            put(cell, &db, &roomy, std::slice::from_ref(&held))
+                .await
+                .backlogged,
+            [] as [usize; 0]
+        );
+        // Admission lands the human entry first, then the preheat tree.
+        assert_eq!(admit_backlog(cell, &db, &roomy).await.expect("admit"), 2);
+        let order: Vec<_> = log_sources(&db)
+            .await
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect();
+        assert_eq!(
+            order[order.len() - 2..],
+            [SubmissionSource::HumanRequest, SubmissionSource::Preheat]
+        );
+
+        // Only preheat waits: a human tree that fits goes straight in.
+        let waiting = chain(SubmissionSource::Preheat, FIRST_ROW + 300, 3);
+        assert_eq!(put(cell, &db, &full(), &[waiting]).await.backlogged, [0]);
+        let first = chain(SubmissionSource::HumanRequest, FIRST_ROW + 400, 3);
+        let landed = put(cell, &db, &roomy, &[first]).await;
+        assert_eq!(landed.backlogged, [] as [usize; 0]);
+        assert_eq!(landed.inserted, 3);
+    }
+
+    /// An admitted entry merges and logs at its submission instant, so
+    /// its time in the backlog counts toward its rank — as a graph that
+    /// took the tree at once ranks it, and as a wake replays it.
+    #[tokio::test]
+    async fn an_admitted_entry_ranks_from_its_submission_time() {
+        const SUBMITTED: i64 = HOST_NOW_MS - 3_600_000;
+        let db = test_db::memory_db().await.expect("db");
+        let owner = live();
+        let cell = owner.loaded().expect("loaded");
+        let tree = chain(SubmissionSource::CacheMiss, FIRST_ROW, 4);
+        submit_trees(
+            cell,
+            &db,
+            &full(),
+            std::slice::from_ref(&tree),
+            None,
+            SUBMITTED,
+        )
+        .await
+        .expect("submit");
+        assert_eq!(
+            admit_backlog(cell, &db, &SchedulerSettings::default())
+                .await
+                .expect("admit"),
+            1
+        );
+        let requested = |graph: &Graph| {
+            let mut at: Vec<_> = graph
+                .list(&QueueSelector::default(), HOST_NOW_MS)
+                .expect("list")
+                .into_iter()
+                .map(|task| (task.task_id, task.first_requested_at))
+                .collect();
+            at.sort();
+            at
+        };
+        let control_db = test_db::memory_db().await.expect("db");
+        let control_owner = live();
+        let control = control_owner.loaded().expect("loaded");
+        commit_trees(control, &control_db, &[tree], None, SUBMITTED)
+            .await
+            .expect("merge");
+        let admitted = cell.with(|graph| requested(graph));
+        assert_eq!(admitted, control.with(|graph| requested(graph)));
+        let logged: Vec<i64> = store::log_page(&db, 0, 100)
+            .await
+            .expect("log")
+            .into_iter()
+            .map(|(_, logged)| logged.at)
+            .collect();
+        assert_eq!(logged, [SUBMITTED]);
+        let (woken, _) = store::restore(&db, u64::MAX).await.expect("wake");
+        assert_eq!(requested(&woken), admitted);
+    }
+
+    /// The memory lines are an operator setting: the bindings apply
+    /// until a `set`, which the store keeps across a cold isolate, and
+    /// neither read nor set wakes the graph.
+    #[tokio::test]
+    async fn the_memory_lines_are_a_stored_operator_setting() {
+        let db = test_db::memory_db().await.expect("db");
+        let cell = GraphCell::default();
+        let bindings = SchedulerSettings::default();
+        let before = memory_lines(&db, &cell, &bindings).await.expect("read");
+        assert_eq!(before.setting, None);
+        assert_eq!(before.small_line_bytes, bindings.small_memory_line_bytes);
+        let set = stow_types::api::MemoryLineSet {
+            normal_line_bytes: 1,
+            small_line_bytes: 2,
+            small_increment_bytes: 3,
+        };
+        let after = set_memory_lines(&db, &cell, &bindings, set, "ops", "now".to_owned())
+            .await
+            .expect("set");
+        assert_eq!(
+            (
+                after.normal_line_bytes,
+                after.small_line_bytes,
+                after.small_increment_bytes
+            ),
+            (1, 2, 3)
+        );
+        assert!(cell.loaded().is_none(), "no wake");
+        let cold = GraphCell::default();
+        let reread = memory_lines(&db, &cold, &bindings).await.expect("reread");
+        assert_eq!(reread, after);
+        assert_eq!(
+            bindings
+                .with_memory_line(reread.setting.as_ref())
+                .small_memory_line_bytes,
+            2
+        );
+    }
+
     /// A head that does not fit is read once: later passes leave the
     /// table alone until the room it needed exists. The rows are
     /// deleted behind the tally's back, so a read would fail.
@@ -3149,12 +3353,7 @@ mod backlog_tests {
         let cell = owner.loaded().expect("loaded");
         let tree = chain(SubmissionSource::Preheat, FIRST_ROW, 40);
         put(cell, &db, &full(), std::slice::from_ref(&tree)).await;
-        assert_eq!(
-            admit_backlog(cell, &db, &full(), HOST_NOW_MS)
-                .await
-                .expect("pass"),
-            0
-        );
+        assert_eq!(admit_backlog(cell, &db, &full()).await.expect("pass"), 0);
         let blocked = cell
             .with(|graph| graph.backlog_blocked)
             .expect("the head is remembered");
@@ -3165,12 +3364,12 @@ mod backlog_tests {
             .await
             .expect("delete");
         assert_eq!(
-            admit_backlog(cell, &db, &full(), HOST_NOW_MS)
+            admit_backlog(cell, &db, &full())
                 .await
                 .expect("no read while blocked"),
             0
         );
-        let error = admit_backlog(cell, &db, &SchedulerSettings::default(), HOST_NOW_MS)
+        let error = admit_backlog(cell, &db, &SchedulerSettings::default())
             .await
             .expect_err("room exists: the head is read");
         assert!(matches!(error, QueueError::Invariant(_)), "{error}");

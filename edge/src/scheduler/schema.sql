@@ -64,9 +64,25 @@ CREATE TABLE IF NOT EXISTS backlog (
     part INTEGER NOT NULL,
     parts INTEGER NOT NULL,
     actor TEXT,
+    -- The unix-ms instant the entry was submitted: an admitted entry
+    -- merges (and logs) at it, so its time in the backlog counts toward
+    -- its rank.
+    submitted_ms INTEGER NOT NULL,
     event TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS backlog_lane ON backlog(lane, seq);
+-- `memory_line` (stow#1501) holds the operator's `memory-line set`: the
+-- graph's memory lines in resident bytes, which replace the deploy
+-- bindings once a row exists. It lives outside the graph so it reads
+-- and sets while the graph cannot wake.
+CREATE TABLE IF NOT EXISTS memory_line (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    normal_line_bytes INTEGER NOT NULL,
+    small_line_bytes INTEGER NOT NULL,
+    small_increment_bytes INTEGER NOT NULL,
+    set_at TEXT NOT NULL,
+    actor TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS meter (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     day TEXT NOT NULL,
