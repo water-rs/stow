@@ -250,6 +250,11 @@ fn until(what: &str, mut done: impl FnMut() -> bool) {
 /// (Unix replaces the image in place) or the new process the task started
 /// (Windows), and a start of the daemon logged for each image.
 fn assert_replaced_once(daemon: &PrivateDaemon, first: u32) {
+    // Both images' records and the drain, which a daemon writes from a
+    // thread, may trail the replies the caller has seen.
+    daemon.wait_log_lines("stow daemon serving", 2);
+    daemon.wait_log_lines("retiring: draining", 1);
+    daemon.wait_log_lines("stow daemon process started", 2);
     let pids = daemon.serving_pids();
     let log = daemon.log_lines("");
     assert_eq!(
@@ -288,7 +293,7 @@ fn a_replaced_install_serves_the_next_plain_cargo_build() {
     let daemon = PrivateDaemon::in_home(&project.home());
 
     succeeds(project.plain_build(&install, "target-a"), "the first build");
-    let [first] = daemon.serving_pids()[..] else {
+    let [first] = daemon.wait_serving_pids()[..] else {
         panic!("one daemon serves: {:?}", daemon.serving_pids());
     };
 
@@ -300,7 +305,9 @@ fn a_replaced_install_serves_the_next_plain_cargo_build() {
 
     assert_replaced_once(&daemon, first);
     assert_eq!(
-        daemon.log_lines("opened a session for a cargo").len(),
+        daemon
+            .wait_log_lines("opened a session for a cargo", 2)
+            .len(),
         2,
         "each build had its session, the second on the successor"
     );
@@ -317,7 +324,7 @@ fn a_replaced_install_serves_the_next_stow_build() {
     project.stow_setup(&install);
 
     succeeds(project.stow_build(&install, "target-a"), "the first build");
-    let [first] = daemon.serving_pids()[..] else {
+    let [first] = daemon.wait_serving_pids()[..] else {
         panic!("one daemon serves: {:?}", daemon.serving_pids());
     };
 
@@ -348,12 +355,14 @@ fn a_plain_cargo_build_ends_a_daemon_too_old_to_retire() {
 
     let status = reaped.join().expect("the old daemon's reaper");
     assert!(!status.success(), "the old daemon was ended: {status:?}");
-    let [new] = daemon.serving_pids()[..] else {
+    let [new] = daemon.wait_serving_pids()[..] else {
         panic!("one daemon serves: {:?}", daemon.serving_pids());
     };
     assert_ne!(new, old, "the daemon is a new process");
     assert_eq!(
-        daemon.log_lines("opened a session for a cargo").len(),
+        daemon
+            .wait_log_lines("opened a session for a cargo", 1)
+            .len(),
         1,
         "the build's session is the new daemon's"
     );
@@ -470,7 +479,7 @@ fn a_newer_client_gets_the_daemon_replaced_by_its_executable() {
     let daemon = PrivateDaemon::in_home(&project.home());
     let run_dir = project.run_dir();
     daemon_status(&project);
-    let [first] = daemon.serving_pids()[..] else {
+    let [first] = daemon.wait_serving_pids()[..] else {
         panic!("one daemon serves: {:?}", daemon.serving_pids());
     };
 
@@ -495,7 +504,7 @@ fn a_newer_client_gets_the_daemon_replaced_by_its_executable() {
     #[cfg(unix)]
     assert!(
         daemon
-            .log_lines("replacing this daemon's image")
+            .wait_log_lines("replacing this daemon's image", 1)
             .iter()
             .any(|line| line.contains(&install.runtime().display().to_string())),
         "the daemon was replaced by the client's executable:\n{}",
@@ -523,11 +532,13 @@ fn a_build_open_across_a_restart_fails_naming_the_daemon() {
         .spawn()
         .expect("start cargo");
     until("the build script never started", || started.exists());
-    let [first] = daemon.serving_pids()[..] else {
+    let [first] = daemon.wait_serving_pids()[..] else {
         panic!("one daemon serves: {:?}", daemon.serving_pids());
     };
     assert_eq!(
-        daemon.log_lines("opened a session for a cargo").len(),
+        daemon
+            .wait_log_lines("opened a session for a cargo", 1)
+            .len(),
         1,
         "the build holds a session"
     );
