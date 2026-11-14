@@ -1,11 +1,12 @@
 name: Operations
 # The single traced path every operator mutation runs through (stow#955).
-# `stow-admin`'s mutating commands dispatch this workflow on `main` with
-# the operator's `stow-admin login` token and follow the run to its end.
-# The edge's operator routes accept only this workflow's OIDC token at
-# `refs/heads/main` and attribute the mutation to the run's `actor`; the
-# run itself is the record. The job runs in the `operations` environment,
-# whose deployment-branch policy admits only `main`.
+# `stow-admin`'s mutating commands dispatch this workflow on the deployed
+# edge's release tag with the operator's `stow-admin login` token and
+# follow the run to its end. The edge's operator routes accept only this
+# workflow's OIDC token at a `refs/tags/v<semver>` ref and attribute the
+# mutation to the run's `actor`; the run itself is the record. The job
+# runs in the `operations` environment, whose deployment policy admits
+# only release tags.
 #
 # The dispatcher is untrusted: the command line arrives as data and is
 # never evaluated by a shell, only the stow-admin commands below may run,
@@ -56,15 +57,9 @@ jobs:
     environment: operations
     timeout-minutes: 60
     steps:
-      # The same signed binary the watchdog runs: main's head carries the
-      # toolchain, and the action fails if the signature does not verify.
-      - name: Resolve main's head
-        id: main
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" \
-            >> "$GITHUB_OUTPUT"
+      # The same signed binary the watchdog runs: the release tag's
+      # commit carries the toolchain, and the action fails if the
+      # signature does not verify.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: |
@@ -74,7 +69,7 @@ jobs:
       - name: stow-admin from the signed toolchain
         uses: ./.github/actions/stow-toolchain
         with:
-          sha: ${{ steps.main.outputs.sha }}
+          sha: ${{ github.sha }}
           binaries: stow-admin
           github-token: ${{ secrets.GITHUB_TOKEN }}
       # No secret is in scope here: the inputs are validated, the files
@@ -143,7 +138,7 @@ jobs:
       # feed them would refill them only on their next tick, up to a day
       # later. This step runs only after the reset step succeeded (the
       # default `success()` gate), reports every published rustc's slices
-      # and forces a preheat wave, all on `main`; a failed enumeration or
+      # and forces a preheat wave, all on this run's release tag; a failed enumeration or
       # dispatch fails the run like a failed reset. The slices in GHCR
       # are untouched by a reset, so the report is not `full`: a slice in
       # an unreadable format is a format change's own recovery
@@ -161,12 +156,12 @@ jobs:
           rustcs="$(stow-admin index published-rustcs)"
           while IFS= read -r rustc; do
             gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/index-publish.yml/dispatches" \
-              -f ref=main -f 'inputs[report]=true' -f "inputs[rustc_version]=$rustc"
+              -f ref="$GITHUB_REF_NAME" -f 'inputs[report]=true' -f "inputs[rustc_version]=$rustc"
           done <<<"$rustcs"
           # `refresh` bypasses preheat-cron's per-day marker, which would
           # turn a same-day dispatch into a no-op.
           gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/preheat-cron.yml/dispatches" \
-            -f ref=main -f 'inputs[refresh]=true'
+            -f ref="$GITHUB_REF_NAME" -f 'inputs[refresh]=true'
       - name: Run (analytics)
         if: steps.command.outputs.class == 'analytics'
         env:

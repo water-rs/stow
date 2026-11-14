@@ -58,6 +58,8 @@ tokio = { version = "1", features = ["io-std", "macros", "net", "rt-multi-thread
 # Run-record timestamps, serialized as GitHub spells them.
 time = { version = "0.3", default-features = false, features = ["std", "serde-well-known"] }
 async-net = "2"
+# The mock GitHub decodes the base64 file contents of its commit mutation.
+base64 = "0.23"
 # The machine check on every object the plan stage packs — objects and
 # archive members only, never image parsing (`read` covers COFF, ELF,
 # Mach-O, PE, XCOFF and Unix archives; `wasm` would pull wasmparser for a

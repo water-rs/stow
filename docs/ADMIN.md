@@ -12,7 +12,7 @@ Run outside GitHub Actions, the mutating commands — `scheduler reset`,
 `maintenance`, `watchdog`
 (not `--dry-run`), and the `preheat` lanes under `--yes` — do not call
 the edge or Cloudflare themselves: they dispatch
-`.github/workflows/operations.yml` on `main` with the `stow-admin login`
+`.github/workflows/operations.yml` on the edge's release tag with the `stow-admin login`
 token, print the run URL, follow the run and succeed only when it does.
 The run is the record of who changed what; the edge's mutating routes
 accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).

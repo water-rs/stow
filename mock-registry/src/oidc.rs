@@ -47,7 +47,8 @@ pub struct OidcTokenArgs {
     #[arg(long)]
     workflow: String,
     /// The ref the run executes at; its workflow is read at the same ref.
-    #[arg(long = "ref", default_value = "refs/heads/main")]
+    /// Defaults to this build's release tag, the ref the edge admits.
+    #[arg(long = "ref", default_value_t = format!("refs/tags/{}", stow_types::trusted_builder::RELEASE_TAG))]
     git_ref: String,
     /// The login that triggered the run.
     #[arg(long, default_value = "stow-mock-operator")]
@@ -187,7 +188,7 @@ mod tests {
             &key,
             &OidcTokenArgs {
                 workflow: "operations.yml".to_owned(),
-                git_ref: "refs/heads/main".to_owned(),
+                git_ref: "refs/tags/v1.2.3".to_owned(),
                 actor: "octo-dispatcher".to_owned(),
                 lifetime_secs: 600,
             },
@@ -216,10 +217,10 @@ mod tests {
         let claims: serde_json::Value =
             serde_json::from_slice(&decode(signing_input.split('.').nth(1).expect("claims")))
                 .expect("claims json");
-        let workflow = "water-rs/stow/.github/workflows/operations.yml@refs/heads/main";
+        let workflow = "water-rs/stow/.github/workflows/operations.yml@refs/tags/v1.2.3";
         assert_eq!(claims["job_workflow_ref"], workflow);
         assert_eq!(claims["workflow_ref"], workflow);
-        assert_eq!(claims["ref"], "refs/heads/main");
+        assert_eq!(claims["ref"], "refs/tags/v1.2.3");
         assert_eq!(claims["actor"], "octo-dispatcher");
         assert_eq!(claims["aud"], AUDIENCE);
     }

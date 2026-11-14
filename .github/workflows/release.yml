@@ -38,18 +38,19 @@ permissions:
 #
 # If there's a prerelease-style suffix to the version, then the release(s)
 # will be marked as a prerelease.
-# The trigger is restricted to the singular-announcement tag format that
-# release-plz pushes for this workspace (`stow-cli-v<version>`): dist parses
-# the `stow-cli-v` prefix as the package name and announces only that app.
+# The trigger is restricted to the unified tag format that release-plz pushes
+# for the main crate (`v<version>`): dist announces the workspace's dist-able
+# package at that version, `stow-cli` alone. The other crates' tags
+# (`<dir>/v<version>`) never start a run.
 on:
   pull_request:
   push:
     tags:
-      - 'stow-cli-v*'
+      - 'v[0-9]*'
 
 # A branch pushed several times in a row only needs its newest run: the older
-# ones test a tree nobody will merge. Pushes to main and dev keep theirs,
-# because those runs are the record of what the branch did.
+# ones test a tree nobody will merge. Tag runs keep theirs, because those
+# runs are the record of what the release did.
 concurrency:
   group: release-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

@@ -3,25 +3,21 @@ name: Test
 # The checks every merge waits on: nextest on the three platforms, lint and
 # the `CI gate` job the rulesets require. The slow lanes — `Mock end-to-end`
 # and `Traffic cost` — live in
-# release-gate.yml, which runs them on demand, nightly on dev and as the
-# release gate for main. A push to dev runs nothing: the dev merge queue
-# already tested the tree that lands. A nightly run on dev keeps the rust
-# caches fresh — they are saved only from dev's ref, the one every pull
-# request and merge group can restore from.
+# release-gate.yml, which certifies a commit nightly or by name. A push to
+# main runs nothing: the merge queue already tested the tree that lands. The
+# nightly certification dispatches a run on main that keeps the rust caches
+# fresh — they are saved only from main's ref, the one every pull request
+# and merge group can restore from.
 on:
-  push:
-    # deploy-edge.yml waits on this workflow's green run of a main push.
-    branches: [main]
   pull_request:
   merge_group:
-  # The nightly run (03:00 America/New_York, `0 7 * * *`): the edge Cron
-  # Trigger dispatches it on `dev` (`STOW_PERIODIC_WORKFLOWS`, stow#1121)
-  # and it runs every leg regardless of the changed paths.
+  # The nightly run (03:00 America/New_York): release-gate.yml's trampoline
+  # dispatches it on `main`, and it runs every leg regardless of the changed
+  # paths.
   workflow_dispatch:
 
 # A branch pushed several times in a row only needs its newest run: the older
-# ones test a tree nobody will merge. Pushes to main keep theirs, because
-# those runs are the record of what the branch did.
+# ones test a tree nobody will merge.
 concurrency:
   group: test-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -42,7 +38,7 @@ jobs:
   # Documentation cannot change what a compiler or a test observes, so the
   # jobs below skip it. The condition lives on the jobs and never on the
   # workflow's triggers: a workflow skipped by `paths-ignore` leaves its
-  # checks Pending forever, and the dev ruleset requires the gate below,
+  # checks Pending forever, and the main ruleset requires the gate below,
   # while a job skipped by `if:` reports success and the gate passes it.
   #
   # A pull request runs none of them. The merge queue runs this workflow on
@@ -86,7 +82,7 @@ jobs:
         id: bump
         if: github.event_name != 'workflow_dispatch'
         env:
-          BASE: ${{ github.event.merge_group.base_sha || github.event.before }}
+          BASE: ${{ github.event.merge_group.base_sha }}
         run: |
           only=$(python3 -I scripts/version-only.py "$BASE" "$GITHUB_SHA")
           echo "only=$only" >> "$GITHUB_OUTPUT"
@@ -115,10 +111,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: test-${{ matrix.os }}
-          # Pull requests restore the `dev` cache and never save their own:
+          # Pull requests restore the `main` cache and never save their own:
           # a per-PR copy of every job's cache duplicated the whole set
           # under the PR ref and evicted the build-crate caches (#177).
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo nextest run ${{ env.NO_DEBUGINFO }} --workspace --no-fail-fast
       - run: cargo test ${{ env.NO_DEBUGINFO }} --doc --workspace
 
@@ -142,10 +138,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: lint
-          # Pull requests restore the `dev` cache and never save their own:
+          # Pull requests restore the `main` cache and never save their own:
           # a per-PR copy of every job's cache duplicated the whole set
           # under the PR ref and evicted the build-crate caches (#177).
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy ${{ env.NO_DEBUGINFO }} --workspace --all-targets -- -D warnings
       - run: cargo clippy ${{ env.NO_DEBUGINFO }} -p stow-edge --target wasm32-unknown-unknown -- -D warnings

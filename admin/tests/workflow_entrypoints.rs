@@ -28,6 +28,14 @@ use support::{
     scalar, set_path, step_output, substitute,
 };
 
+/// The release tag a dispatched run executes on (`GITHUB_REF_NAME`).
+const RUN_TAG: &str = "v0.20.0";
+
+/// The release tag of the `workflow_run` a follow-up lane reacts to
+/// (`workflow_run.head_branch`), different from [`RUN_TAG`] so a dispatch
+/// that reads the wrong source is caught.
+const TRIGGER_TAG: &str = "v0.19.0";
+
 /// The channel fixture `preheat-cron`/`preheat-missed` resolve —
 /// `edge/tests/fixtures` carries the real manifest shape (decorated
 /// `version = "1.98.1 (hash date)"` reduced to `1.98.1`).
@@ -96,6 +104,8 @@ fn apply_dispatch_defaults(ctx: &mut Val, wf: &serde_yml::Value) {
 fn base_env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     let mut env = BTreeMap::from([
         ("GITHUB_REPOSITORY".to_owned(), "water-rs/stow".to_owned()),
+        // A dispatched run's own ref name: the release tag it runs on.
+        ("GITHUB_REF_NAME".to_owned(), RUN_TAG.to_owned()),
         ("STUB_DATE".to_owned(), CHANNEL_FIXTURE_DAY.to_owned()),
         (
             "STUB_CHANNEL_TOML".to_owned(),
@@ -215,85 +225,48 @@ fn cron_declarations() {
         "preheat-cron cancels in progress — concurrent ticks possible: {cancel:?}"
     );
 
-    // The marker cache is keyed on resolved channel output — version
-    // AND day — over the same file the save step writes.
+    // The once-per-day marker is the runs list of this workflow across
+    // refs, not an `actions/cache` entry: a cache saved on one release
+    // tag is not readable from another tag's runs.
     let steps = job_steps(&wf, "preheat");
+    assert!(
+        steps.iter().all(|s| !s
+            .uses
+            .as_deref()
+            .is_some_and(|u| u.starts_with("actions/cache"))),
+        "preheat-cron keeps a marker in actions/cache"
+    );
     let marker = steps
         .iter()
         .find(|s| s.id.as_deref() == Some("marker"))
         .expect("marker step");
-    assert_eq!(
-        marker.uses.as_deref(),
-        Some("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
-    );
-    assert_eq!(
-        marker.with.get("path").map(String::as_str),
-        Some(".preheat-marker")
-    );
-    let key_template = marker.with.get("key").expect("marker key");
-    assert_eq!(
-        key_template,
-        "preheat-${{ steps.channel.outputs.version }}-${{ steps.channel.outputs.day }}"
-    );
-    let save = steps
-        .iter()
-        .find(|s| {
-            s.uses
-                .as_deref()
-                .is_some_and(|u| u.starts_with("actions/cache/save"))
-        })
-        .expect("save step");
-    assert_eq!(save.with.get("key"), Some(key_template));
-    assert_eq!(save.with.get("path"), marker.with.get("path"));
+    assert!(marker.uses.is_none(), "the marker step runs a command");
 }
 
-#[test]
-fn cron_marker_key_binds_version_and_day() {
-    let template = "preheat-${{ steps.channel.outputs.version }}-${{ steps.channel.outputs.day }}";
-    let resolve = |version: &str, day: &str| {
-        let mut ctx = Val::context();
-        set_path(
-            &mut ctx,
-            "steps.channel.outputs.version",
-            Val::Str(version.to_owned()),
-        );
-        set_path(
-            &mut ctx,
-            "steps.channel.outputs.day",
-            Val::Str(day.to_owned()),
-        );
-        substitute(template, &ctx, Status::Ok)
-    };
-    let a = resolve("1.98.1", "2026-10-08");
-    assert_eq!(a, "preheat-1.98.1-2026-10-08");
-    // A moved stable channel or a new UTC day both produce a cache
-    // miss — each re-dispatches.
-    assert_ne!(a, resolve("1.99.0", "2026-10-08"));
-    assert_ne!(a, resolve("1.98.1", "2026-10-09"));
-}
+/// What `gh api .../preheat-cron.yml/runs` answers: the count of successful
+/// runs created today.
+const NO_RUN_TODAY: &str = r#"{"total_count":0,"workflow_runs":[]}"#;
+const RUN_TODAY: &str = r#"{"total_count":1,"workflow_runs":[{"id":1}]}"#;
 
 #[test]
-fn cron_cache_miss_dispatches_admin_once() {
+fn cron_without_a_run_today_dispatches_admin_once() {
     let wf = preheat_cron();
     let scn = Scenario::new();
-    let mut runner = support::Runner::new(&scn, actions_ctx(), base_env(&[]));
-    // The actions/cache restore step answered "miss" — what the engine
-    // would have set `steps.marker.outputs.cache-hit` to.
-    runner.seed_output("marker", "cache-hit", "false");
+    let mut runner = support::Runner::new(
+        &scn,
+        actions_ctx(),
+        base_env(&[("STUB_GH_RUNS", NO_RUN_TODAY)]),
+    );
     runner.run_job(&wf, "preheat");
 
     assert_eq!(
-        runner.outcome_of("Check whether this version already preheated today"),
-        &Outcome::Declared
+        runner.outcome_of("Check whether a preheat already succeeded today"),
+        &Outcome::Ran(0)
     );
     assert_eq!(runner.outcome_of("Already preheated"), &Outcome::Skipped);
     assert_eq!(
         runner.outcome_of("Dispatch the preheat wave"),
         &Outcome::Ran(0)
-    );
-    assert_eq!(
-        runner.outcome_of("Record the wave marker"),
-        &Outcome::Declared
     );
     assert_eq!(runner.status(), Status::Ok);
 
@@ -321,9 +294,31 @@ fn cron_cache_miss_dispatches_admin_once() {
     // Exactly one dispatch: preheat-admin.yml with the same rustc and
     // the projects lane enabled.
     let gh = scn.calls_of("gh");
-    assert_eq!(gh.len(), 1, "{gh:?}");
-    let dispatch = gh_dispatch(&gh[0]);
+    assert_eq!(gh.len(), 2, "{gh:?}");
+    // The query reads this workflow's successful runs created today,
+    // across refs.
+    let query = &gh[0].argv;
+    assert!(
+        query
+            .iter()
+            .any(|a| a == "repos/water-rs/stow/actions/workflows/preheat-cron.yml/runs"),
+        "{query:?}"
+    );
+    assert!(query.iter().any(|a| a == "status=success"), "{query:?}");
+    assert!(
+        query
+            .iter()
+            .any(|a| a == &format!("created=>={CHANNEL_FIXTURE_DAY}")),
+        "{query:?}"
+    );
+    let (query, dispatch_call) = (&gh[0], &gh[1]);
+    assert_eq!(query.env.get("GH_TOKEN").map(String::as_str), Some("<set>"));
+    let dispatch = gh_dispatch(dispatch_call);
     assert_eq!(dispatch.workflow, "preheat-admin.yml");
+    assert_eq!(
+        dispatch.reference, RUN_TAG,
+        "the wave runs on this release tag"
+    );
     let fields = dispatch.inputs;
     assert_eq!(
         fields,
@@ -336,26 +331,24 @@ fn cron_cache_miss_dispatches_admin_once() {
         ])
     );
     assert_eq!(
-        gh[0].env.get("GH_REPO").map(String::as_str),
+        dispatch_call.env.get("GH_REPO").map(String::as_str),
         Some("water-rs/stow")
     );
-    assert_eq!(gh[0].env.get("GH_TOKEN").map(String::as_str), Some("<set>"));
-
-    // The run step itself wrote the marker the cache save uploads.
-    let marker = scn.workdir().join(".preheat-marker");
-    let body = std::fs::read_to_string(&marker).expect(".preheat-marker written");
     assert_eq!(
-        body.trim(),
-        format!("{CHANNEL_FIXTURE_VERSION} {CHANNEL_FIXTURE_DAY}")
+        dispatch_call.env.get("GH_TOKEN").map(String::as_str),
+        Some("<set>")
     );
 }
 
 #[test]
-fn cron_cache_hit_skips_dispatch_and_save() {
+fn cron_a_run_today_skips_the_dispatch() {
     let wf = preheat_cron();
     let scn = Scenario::new();
-    let mut runner = support::Runner::new(&scn, actions_ctx(), base_env(&[]));
-    runner.seed_output("marker", "cache-hit", "true");
+    let mut runner = support::Runner::new(
+        &scn,
+        actions_ctx(),
+        base_env(&[("STUB_GH_RUNS", RUN_TODAY)]),
+    );
     runner.run_job(&wf, "preheat");
 
     assert_eq!(runner.outcome_of("Already preheated"), &Outcome::Ran(0));
@@ -363,27 +356,21 @@ fn cron_cache_hit_skips_dispatch_and_save() {
         runner.outcome_of("Dispatch the preheat wave"),
         &Outcome::Skipped
     );
-    assert_eq!(
-        runner.outcome_of("Record the wave marker"),
-        &Outcome::Skipped
-    );
     assert_eq!(runner.status(), Status::Ok);
-    assert!(scn.calls_of("gh").is_empty(), "{:?}", scn.calls());
-    assert!(
-        !scn.workdir().join(".preheat-marker").exists(),
-        "a cache hit wrote a marker"
-    );
+    // Only the query: nothing is dispatched.
+    let gh = scn.calls_of("gh");
+    assert_eq!(gh.len(), 1, "{gh:?}");
+    assert!(!is_dispatch(&gh[0]), "{gh:?}");
 }
 
-/// `refresh` (a scheduler reset's refill) dispatches although the day's
-/// marker exists, and saves nothing: the restored entry is the marker.
+/// `refresh` (a scheduler reset's refill) dispatches although a run
+/// already succeeded today.
 #[test]
-fn cron_refresh_dispatches_on_a_cache_hit() {
+fn cron_refresh_dispatches_after_a_run_today() {
     let wf = preheat_cron();
     let scn = Scenario::new();
     let ctx = with_inputs(actions_ctx(), &[("refresh", Val::Bool(true))]);
-    let mut runner = support::Runner::new(&scn, ctx, base_env(&[]));
-    runner.seed_output("marker", "cache-hit", "true");
+    let mut runner = support::Runner::new(&scn, ctx, base_env(&[("STUB_GH_RUNS", RUN_TODAY)]));
     runner.run_job(&wf, "preheat");
 
     assert_eq!(runner.status(), Status::Ok, "{:?}", runner.outcomes);
@@ -392,22 +379,25 @@ fn cron_refresh_dispatches_on_a_cache_hit() {
         runner.outcome_of("Dispatch the preheat wave"),
         &Outcome::Ran(0)
     );
-    assert_eq!(
-        runner.outcome_of("Record the wave marker"),
-        &Outcome::Skipped
-    );
     let gh = scn.calls_of("gh");
-    assert_eq!(gh.len(), 1, "{gh:?}");
-    assert_eq!(gh_dispatch(&gh[0]).workflow, "preheat-admin.yml");
+    assert_eq!(gh.len(), 2, "{gh:?}");
+    assert_eq!(gh_dispatch(&gh[1]).workflow, "preheat-admin.yml");
 }
 
+/// A failed dispatch fails the run, so no successful run exists for the
+/// day's next tick to find.
 #[test]
-fn cron_failed_dispatch_writes_no_marker() {
+fn cron_failed_dispatch_fails_the_run() {
     let wf = preheat_cron();
     let scn = Scenario::new();
-    let mut runner =
-        support::Runner::new(&scn, actions_ctx(), base_env(&[("STUB_TOOL_EXIT", "1")]));
-    runner.seed_output("marker", "cache-hit", "false");
+    let mut runner = support::Runner::new(
+        &scn,
+        actions_ctx(),
+        base_env(&[
+            ("STUB_GH_RUNS", NO_RUN_TODAY),
+            ("STUB_FAIL_RE", "/dispatches"),
+        ]),
+    );
     runner.run_job(&wf, "preheat");
 
     let outcome = runner.outcome_of("Dispatch the preheat wave");
@@ -416,11 +406,7 @@ fn cron_failed_dispatch_writes_no_marker() {
         "{outcome:?}"
     );
     assert_eq!(runner.status(), Status::Failed);
-    assert_eq!(scn.calls_of("gh").len(), 1);
-    assert!(
-        !scn.workdir().join(".preheat-marker").exists(),
-        "a failed dispatch still wrote the success marker"
-    );
+    assert_eq!(scn.calls_of("gh").len(), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -977,6 +963,15 @@ fn index_runner<'a>(
         "github.event.workflow_run.display_title",
         run_title.map_or(Val::Null, |t| Val::Str(t.to_owned())),
     );
+    set_path(
+        &mut ctx,
+        "github.event.workflow_run.head_branch",
+        if event == "workflow_run" {
+            Val::Str(TRIGGER_TAG.to_owned())
+        } else {
+            Val::Null
+        },
+    );
     run_job(scn, &wf, "dispatch", ctx, base_env(&[]))
 }
 
@@ -985,15 +980,15 @@ fn index_publish_completion_forwards_title_rustc() {
     let scn = Scenario::new();
     let runner = index_runner(&scn, "workflow_run", Some("1.98.1-a1b2c3d4e5f6"));
     assert_eq!(
-        runner.outcome_of("Dispatch index-publish on main"),
+        runner.outcome_of("Dispatch index-publish on the release tag"),
         &Outcome::Ran(0)
     );
     let gh = scn.calls_of("gh");
     assert_eq!(gh.len(), 1, "{gh:?}");
     let dispatch = gh_dispatch(&gh[0]);
     assert_eq!(dispatch.workflow, "index-publish.yml");
-    // The signing identity lives on main only.
-    assert_eq!(dispatch.reference, "main");
+    // The signing identity is the release tag of the completed build run.
+    assert_eq!(dispatch.reference, TRIGGER_TAG);
     let fields = dispatch.inputs;
     assert_eq!(
         fields.get("report").map(String::as_str),
@@ -1017,7 +1012,7 @@ fn index_publish_cron_trigger_and_manual_carry_no_rustc() {
     let scn = Scenario::new();
     let runner = index_runner(&scn, event, None);
     assert_eq!(
-        runner.outcome_of("Dispatch index-publish on main"),
+        runner.outcome_of("Dispatch index-publish on the release tag"),
         &Outcome::Ran(0)
     );
     let gh = scn.calls_of("gh");
@@ -1029,7 +1024,8 @@ fn index_publish_cron_trigger_and_manual_carry_no_rustc() {
         "{event} forwarded a rustc: {fields:?}"
     );
     assert_eq!(fields.get("report").map(String::as_str), Some("true"));
-    assert_eq!(dispatch.reference, "main");
+    // A dispatched tick publishes on its own release tag.
+    assert_eq!(dispatch.reference, RUN_TAG);
 }
 
 #[test]
@@ -1040,7 +1036,7 @@ fn index_publish_title_with_extra_dashes_keeps_rustc_prefix() {
     let scn = Scenario::new();
     let runner = index_runner(&scn, "workflow_run", Some("1.99.0-task-9f8e7d-extra"));
     assert_eq!(
-        runner.outcome_of("Dispatch index-publish on main"),
+        runner.outcome_of("Dispatch index-publish on the release tag"),
         &Outcome::Ran(0)
     );
     let gh = scn.calls_of("gh");
@@ -1091,12 +1087,30 @@ fn build_crate_declarations() {
             .as_deref(),
         Some("{}")
     );
-    for input in ["repack_rustc", "repack_concurrency"] {
+    // A call names the rustc of exactly one of the operator runs; a task
+    // call leaves both empty.
+    assert!(at(&wf, "on.workflow_dispatch.inputs.resign_rustc").is_none());
+    assert!(at(&wf, "on.workflow_dispatch.inputs.resign_concurrency").is_none());
+    for input in [
+        "repack_rustc",
+        "repack_concurrency",
+        "resign_rustc",
+        "resign_concurrency",
+    ] {
         assert_eq!(
             at(&wf, &format!("on.workflow_call.inputs.{input}.required"))
                 .map(scalar)
                 .as_deref(),
-            Some("true"),
+            Some("false"),
+            "{input}"
+        );
+    }
+    for input in ["repack_rustc", "resign_rustc"] {
+        assert_eq!(
+            at(&wf, &format!("on.workflow_call.inputs.{input}.default"))
+                .map(scalar)
+                .as_deref(),
+            Some(""),
             "{input}"
         );
     }
@@ -1120,7 +1134,7 @@ fn build_crate_run_name_concurrency_and_jobs() {
     assert_eq!(
         at(&wf, "concurrency.group").map(scalar).as_deref(),
         Some(
-            "${{ inputs.repack_rustc != '' && format('repack-call-{0}', inputs.repack_rustc) || format('build-crate-{0}', fromJSON(inputs.task).task_id) }}"
+            "${{ inputs.repack_rustc != '' && format('repack-call-{0}', inputs.repack_rustc) || inputs.resign_rustc != '' && format('resign-call-{0}', inputs.resign_rustc) || format('build-crate-{0}', fromJSON(inputs.task).task_id) }}"
         )
     );
     assert_eq!(
@@ -1176,7 +1190,9 @@ fn build_crate_run_name_concurrency_and_jobs() {
     );
     assert_eq!(
         at(&wf, "jobs.publish.if").map(scalar).as_deref(),
-        Some("inputs.repack_rustc == '' && needs.build.result == 'success'")
+        Some(
+            "inputs.repack_rustc == '' && inputs.resign_rustc == '' && needs.build.result == 'success'"
+        )
     );
 }
 
@@ -1207,7 +1223,7 @@ fn build_crate_verifies_only_a_candidate_failure() {
     assert_eq!(
         at(&wf, "jobs.verify-failure.if").map(scalar).as_deref(),
         Some(
-            "always() && inputs.repack_rustc == '' && needs.build.result == 'failure' && needs.build.outputs.failure-candidate != ''"
+            "always() && inputs.repack_rustc == '' && inputs.resign_rustc == '' && needs.build.result == 'failure' && needs.build.outputs.failure-candidate != ''"
         )
     );
 }
@@ -1287,6 +1303,62 @@ fn build_crate_repack_job() {
             "repack job permission {permission}"
         );
     }
+}
+
+/// `resign.yml` is the only entry to the re-sign job, as `repack.yml` is to
+/// the repack job: dispatched on a release tag with the rustc, it calls
+/// `build-crate.yml`'s `resign` job, titles itself `<rustc>-resign`, and
+/// serializes per rustc.
+#[test]
+fn resign_workflow_calls_the_trusted_builder() {
+    let wf = load_workflow("resign.yml");
+    assert_eq!(at(&wf, "name").map(scalar).as_deref(), Some("resign"));
+    let triggers: Vec<String> = field(&wf, "on")
+        .and_then(serde_yml::Value::as_mapping)
+        .expect("on mapping")
+        .keys()
+        .map(scalar)
+        .collect();
+    assert_eq!(triggers, ["workflow_dispatch"]);
+    assert_eq!(
+        at(&wf, "run-name").map(scalar).as_deref(),
+        Some("${{ format('{0}-resign', inputs.rustc) }}")
+    );
+    assert_eq!(
+        at(&wf, "concurrency.group").map(scalar).as_deref(),
+        Some("${{ format('resign-{0}', inputs.rustc) }}")
+    );
+    assert_eq!(
+        at(&wf, "jobs.resign.uses").map(scalar).as_deref(),
+        Some("./.github/workflows/build-crate.yml")
+    );
+    assert_eq!(
+        at(&wf, "jobs.resign.if").map(scalar).as_deref(),
+        Some("startsWith(github.ref, 'refs/tags/v')")
+    );
+    let build = load_workflow("build-crate.yml");
+    for permission in ["contents", "packages", "id-token"] {
+        assert_eq!(
+            at(&wf, &format!("jobs.resign.permissions.{permission}")).map(scalar),
+            at(&build, &format!("jobs.resign.permissions.{permission}")).map(scalar),
+            "resign permission {permission}"
+        );
+    }
+    for (input, source) in [
+        ("resign_rustc", "rustc"),
+        ("resign_concurrency", "concurrency"),
+    ] {
+        assert_eq!(
+            at(&wf, &format!("jobs.resign.with.{input}"))
+                .map(scalar)
+                .as_deref(),
+            Some(format!("${{{{ inputs.{source} }}}}").as_str())
+        );
+    }
+    assert_eq!(
+        at(&build, "jobs.resign.if").map(scalar).as_deref(),
+        Some("inputs.resign_rustc != ''")
+    );
 }
 
 /// The five entrypoints' every job runs on a Linux runner — the
@@ -1613,7 +1685,7 @@ fn operations_reset_refills_every_published_rustc_and_forces_a_preheat() {
     let report = |rustc: &str| {
         (
             "index-publish.yml".to_owned(),
-            "main".to_owned(),
+            RUN_TAG.to_owned(),
             BTreeMap::from([
                 ("report".to_owned(), "true".to_owned()),
                 ("rustc_version".to_owned(), rustc.to_owned()),
@@ -1627,7 +1699,7 @@ fn operations_reset_refills_every_published_rustc_and_forces_a_preheat() {
             report("1.99.1"),
             (
                 "preheat-cron.yml".to_owned(),
-                "main".to_owned(),
+                RUN_TAG.to_owned(),
                 BTreeMap::from([("refresh".to_owned(), "true".to_owned())]),
             ),
         ]
@@ -1832,6 +1904,7 @@ fn followup_runner<'a>(
     );
     for (key, value) in [
         ("github.event.workflow_run.display_title", title),
+        ("github.event.workflow_run.head_branch", TRIGGER_TAG),
         ("github.event.workflow_run.conclusion", conclusion),
         ("github.event.workflow_run.id", "4242"),
         // The run object's `name` is the run-name, as in production.
@@ -1944,7 +2017,7 @@ fn followup_declarations() {
         let mint = &steps[0];
         assert_eq!(
             mint.uses.as_deref(),
-            job_steps(&load_workflow("release-plz.yml"), "release-pr")[0]
+            job_steps(&load_workflow("release-gate.yml"), "release-pr")[0]
                 .uses
                 .as_deref()
         );
@@ -1990,7 +2063,7 @@ fn followup_success_publishes_the_index_then_refreshes_the_preheat() {
         [
             (
                 "index-publish.yml".to_owned(),
-                "main".to_owned(),
+                TRIGGER_TAG.to_owned(),
                 BTreeMap::from([
                     ("report".to_owned(), "true".to_owned()),
                     ("rustc_version".to_owned(), "1.99.0".to_owned()),
@@ -1998,7 +2071,7 @@ fn followup_success_publishes_the_index_then_refreshes_the_preheat() {
             ),
             (
                 "preheat-cron.yml".to_owned(),
-                "main".to_owned(),
+                TRIGGER_TAG.to_owned(),
                 BTreeMap::from([("refresh".to_owned(), "true".to_owned())])
             ),
         ]
@@ -2042,6 +2115,7 @@ fn retry_runner<'a>(
         ),
         ("steps.app-token.outputs.token", "test-app-token"),
         ("github.event.workflow_run.conclusion", "success"),
+        ("github.event.workflow_run.head_branch", TRIGGER_TAG),
         ("github.event.workflow_run.created_at", index_created),
     ] {
         set_path(&mut ctx, key, Val::Str(value.to_owned()));
@@ -2067,7 +2141,7 @@ fn retry_dispatches(scn: &Scenario) -> Vec<String> {
     for (workflow, reference, _) in &dispatches {
         assert_eq!(
             (workflow.as_str(), reference.as_str()),
-            ("operations.yml", "main")
+            ("operations.yml", TRIGGER_TAG)
         );
     }
     dispatches
@@ -2166,7 +2240,7 @@ fn followup_timeout_resumes_with_the_variable_concurrency() {
         let dispatches = refill_dispatches(&scn);
         assert_eq!(dispatches.len(), 1, "{conclusion}: {dispatches:?}");
         assert_eq!(dispatches[0].0, "repack.yml");
-        assert_eq!(dispatches[0].1, "main");
+        assert_eq!(dispatches[0].1, TRIGGER_TAG);
         assert_eq!(
             dispatches[0].2,
             BTreeMap::from([
@@ -2267,25 +2341,43 @@ fn followup_ignores_non_repack_titles() {
 }
 
 // ---------------------------------------------------------------------------
-// release-gate.yml: the nightly tick is the App's dispatch (stow#1121)
+// release-gate.yml: the nightly certification (stow#1121)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn release_gate_nightly_is_the_apps_dispatch() {
+fn release_gate_nightly_is_a_trampoline_into_main() {
     let wf = load_workflow("release-gate.yml");
     // The cadence is the edge Cron Trigger's, pinned by
-    // `periodic_schedule.rs`; the workflow carries no `schedule`.
+    // `periodic_schedule.rs`; the workflow carries no `schedule`, and the
+    // merge queue and pull requests no longer run it.
     assert!(at(&wf, "on.schedule").is_none());
+    assert!(at(&wf, "on.pull_request").is_none());
+    assert!(at(&wf, "on.merge_group").is_none());
     assert!(at(&wf, "on.workflow_dispatch").is_some());
-    // The App's dispatch carries no inputs, so the nightly report is told
-    // from an operator's manual dispatch by the dispatching identity.
+    // The edge dispatches it on its release tag with no inputs: that run
+    // only dispatches the certification and the cache refresh on main.
+    assert_eq!(
+        at(&wf, "jobs.trampoline.if").map(scalar).as_deref(),
+        Some("github.ref_type == 'tag'")
+    );
+    let trampoline = job_steps(&wf, "trampoline");
+    let run = trampoline[0].run.as_deref().expect("trampoline run");
+    assert!(
+        run.contains("gh workflow run release-gate.yml --ref main -f nightly=true"),
+        "{run}"
+    );
+    assert!(run.contains("gh workflow run test.yml --ref main"), "{run}");
+    // The report is the certification's `nightly=true` run.
     assert_eq!(
         at(&wf, "jobs.nightly-report.if").map(scalar).as_deref(),
-        Some(
-            "always() && github.event_name == 'workflow_dispatch' && github.triggering_actor == 'stow-ci[bot]'"
-        )
+        Some("always() && inputs.nightly")
     );
-    // Every leg runs on any dispatch, the nightly's included.
+    // Every leg needs `tools`, which skips on the trampoline's tag run and
+    // is otherwise unconditional, the nightly's included.
+    assert_eq!(
+        at(&wf, "jobs.tools.if").map(scalar).as_deref(),
+        Some("github.ref_type != 'tag'")
+    );
     for job in [
         "mock-e2e",
         "traffic-cost",
@@ -2293,10 +2385,11 @@ fn release_gate_nightly_is_the_apps_dispatch() {
         "production-wave",
         "projection",
     ] {
-        let condition = at(&wf, &format!("jobs.{job}.if")).map(scalar).expect(job);
-        assert!(
-            condition.starts_with("github.event_name == 'workflow_dispatch' ||"),
-            "{job}"
-        );
+        assert!(at(&wf, &format!("jobs.{job}.if")).is_none(), "{job}");
     }
+    // A passed gate opens the release PR from the certified commit.
+    assert_eq!(
+        at(&wf, "jobs.release-pr.if").map(scalar).as_deref(),
+        Some("needs.gate.result == 'success'")
+    );
 }

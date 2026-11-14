@@ -1,7 +1,7 @@
 import { env } from "cloudflare:test";
 import { exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
-import { claims, mint, newSigner, publish } from "./oidc-fixture";
+import { RELEASE_REF, claims, mint, newSigner, publish } from "./oidc-fixture";
 
 const CONTROL = "http://127.0.0.1:28124/__control";
 
@@ -27,7 +27,7 @@ async function request(token: string, version = "1.0.228") {
 async function resolveToken(workflow = "resolve-request.yml") {
 	const signer = await newSigner();
 	await publish(signer);
-	const reference = `water-rs/stow/.github/workflows/${workflow}@refs/heads/main`;
+	const reference = `water-rs/stow/.github/workflows/${workflow}@${RELEASE_REF}`;
 	return mint(signer, claims({ workflow_ref: reference, job_workflow_ref: reference }));
 }
 
@@ -51,7 +51,7 @@ async function delivery(requestId: string, action: string, conclusion: string | 
 		repository: { full_name: "water-rs/stow" },
 		workflow_run: {
 			display_title: `resolve-a1-${requestId}`, event: "workflow_dispatch",
-			head_branch: "main", path: ".github/workflows/resolve-request.yml",
+			head_branch: RELEASE_REF.replace("refs/tags/", ""), path: ".github/workflows/resolve-request.yml",
 			conclusion, id: 12345, run_attempt: 1,
 			html_url: "https://github.com/water-rs/stow/actions/runs/12345",
 			head_repository: { full_name: "water-rs/stow" },

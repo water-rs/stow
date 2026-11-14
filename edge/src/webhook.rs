@@ -244,8 +244,10 @@ enum RunSubject<'a> {
 /// The authority boundary a run event must sit inside — a fork or a
 /// feature-branch run's signature still verifies, so the run's own
 /// fields are what make it ours: a trusted workflow's file
-/// (`build-crate.yml` or `resolve-request.yml`), on `main`, dispatched
-/// by `workflow_dispatch`, in the trusted repository (its head repo
+/// (`build-crate.yml` or `resolve-request.yml`), on a release tag (a run
+/// started by the previous release's dispatch still completes after a
+/// deploy, so any release tag counts, not only the edge's own),
+/// dispatched by `workflow_dispatch`, in the trusted repository (its head repo
 /// equal to the event repo, so a fork's delivery cannot pose as
 /// upstream's).
 ///
@@ -257,7 +259,10 @@ fn authorized_run(
     event: &WorkflowRunEvent,
 ) -> Result<Option<(&WorkflowRunFields, RunSubject<'_>)>, GetArtifactError> {
     let run = &event.workflow_run;
-    let pinned = run.head_branch == stow_types::trusted_builder::BRANCH
+    let pinned = run
+        .head_branch
+        .parse::<stow_types::trusted_builder::ReleaseTag>()
+        .is_ok()
         && run.event == "workflow_dispatch"
         && run.head_repository.full_name == event.repository.full_name
         && event.repository.full_name == stow_types::trusted_builder::REPOSITORY;
@@ -772,7 +777,7 @@ mod tests {
             "workflow_run": {
                 "display_title": "1.99.0-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
                 "event": "workflow_dispatch",
-                "head_branch": "main",
+                "head_branch": stow_types::trusted_builder::RELEASE_TAG,
                 "path": ".github/workflows/build-crate.yml",
                 "conclusion": "success",
                 "id": 987_654_321_u64,
@@ -876,6 +881,15 @@ mod tests {
             }),
             completed_event(|event| {
                 event["workflow_run"]["head_branch"] = serde_json::json!("dev");
+            }),
+            completed_event(|event| {
+                event["workflow_run"]["head_branch"] = serde_json::json!("main");
+            }),
+            completed_event(|event| {
+                event["workflow_run"]["head_branch"] = serde_json::json!("stow-cli-v1.2.3");
+            }),
+            completed_event(|event| {
+                event["workflow_run"]["head_branch"] = serde_json::json!("v1.2");
             }),
         ];
         for body in cases {
@@ -1166,6 +1180,9 @@ mod tests {
         let cases = [
             task_completed_event(|event| {
                 event["workflow_run"]["head_branch"] = serde_json::json!("dev");
+            }),
+            task_completed_event(|event| {
+                event["workflow_run"]["head_branch"] = serde_json::json!("main");
             }),
             task_completed_event(|event| {
                 event["workflow_run"]["event"] = serde_json::json!("pull_request");

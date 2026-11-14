@@ -12,13 +12,10 @@ name: Demand feed
 # here and the next tick resumes the cursor exactly — no runner-side
 # state, no background timers in the object.
 #
-# Ordering note: the feed command lands on `main` with this change, so
-# the toolchain this job pulls must come from a merge-queue commit that
-# carries it. Until then the job fails visibly at the `stow-toolchain`
-# pull or at clap — there is no per-hour toolchain build and no
-# silent legacy fallback, by design.
+# The job pulls the toolchain published for its own release tag's
+# commit; there is no per-hour toolchain build and no fallback.
 
-# The edge Cron Trigger dispatches it on `main` at five past every hour
+# The edge Cron Trigger dispatches it on its own release tag at five past every hour
 # (`5 * * * *`, `STOW_PERIODIC_WORKFLOWS`, stow#1121): Analytics Engine
 # closes a hour's writes at the boundary, and the small skew absorbs the
 # delay Cloudflare reports on sampled rows.
@@ -46,27 +43,19 @@ jobs:
       contents: read
       packages: read # pull the pinned stow toolchain from GHCR
       # Mints the run's OIDC token — the edge's demand routes admit only
-      # this workflow's and operations.yml's runs on main, and
+      # this workflow's and operations.yml's runs on a release tag, and
       # stow-admin refreshes it per request.
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Scheduled runs execute on the default branch, but the signed
-      # toolchain artifact exists only for merge-queue commits on
-      # `main` — resolve `main`'s head and pull that commit's verified
-      # toolchain, never a per-job source build.
-      - name: Resolve the signed toolchain commit
-        id: toolchain
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          echo "sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" >> "$GITHUB_OUTPUT"
+      # The signed toolchain artifact exists for release-tag commits;
+      # this run's own commit is one, so pull its verified toolchain,
+      # never a per-job source build.
       - uses: ./.github/actions/stow-toolchain
         with:
-          sha: ${{ steps.toolchain.outputs.sha }}
+          sha: ${{ github.sha }}
           binaries: stow-admin
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Run the hourly demand feed

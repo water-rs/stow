@@ -1637,6 +1637,10 @@ pub struct SchedulerStatus {
     /// a publish" from "waiting on something that will never come".
     #[serde(default)]
     pub blocked: u32,
+    /// The release tag of the deployed edge — the ref `stow-admin`
+    /// dispatches operations on.
+    #[schema(value_type = String)]
+    pub release_tag: crate::trusted_builder::ReleaseTag,
 }
 
 /// Request body for `POST /api/v1/requests`: a human asking for one crate

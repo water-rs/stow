@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
-use sigstore::bundle::verify::policy::Identity;
 use sigstore::cosign::payload::SimpleSigning;
+use stow_oci::verify::ReleaseIdentity;
 use stow_types::error::Context;
+use stow_types::trusted_builder::TrustedWorkflow;
 
 // The signature-verification machinery itself lives in `stow-oci` — the
 // same Fulcio/Rekor + pinned-identity check `stow-admin index export`
@@ -44,9 +45,9 @@ use crate::artifact_cache::CachedArtifactBundle;
 use crate::config::{StowConfig, VerifyMode};
 use crate::fetch::{ArtifactBundle, FetchRequest};
 
-const TRUSTED_CERT_URL: &str = stow_types::trusted_builder::CERTIFICATE_IDENTITY;
 const TRUSTED_CERT_ISSUER: &str = stow_types::trusted_builder::CERTIFICATE_ISSUER;
-const INDEX_CERT_URL: &str = stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY;
+const BUILD_IDENTITY: ReleaseIdentity = ReleaseIdentity::new(TrustedWorkflow::BUILD);
+const INDEX_IDENTITY: ReleaseIdentity = ReleaseIdentity::new(TrustedWorkflow::INDEX);
 
 /// Bumped whenever the meaning of "verified" changes, so verdicts minted
 /// under an older scheme are re-verified instead of trusted. Version 2:
@@ -190,7 +191,7 @@ pub async fn verify_index_signature_with_trust(
             &oci_reference,
             &oci_digest,
             &materials,
-            INDEX_CERT_URL,
+            &INDEX_IDENTITY,
         )
     })
     .await
@@ -219,7 +220,7 @@ fn verify_cached_bundle_signature_blocking(
             oci_digest,
             material,
             &payload_bytes,
-            TRUSTED_CERT_URL,
+            &BUILD_IDENTITY,
         ) {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
@@ -245,7 +246,6 @@ fn verify_bundle_signature_github_ci_blocking(
         ));
     }
 
-    let identity_policy = Identity::new(TRUSTED_CERT_URL, TRUSTED_CERT_ISSUER);
     let mut last_error = None;
     for material in &bundle.manifest.sigstore_signatures {
         let payload_bytes = match verified_payload_bytes(bundle, material) {
@@ -255,7 +255,7 @@ fn verify_bundle_signature_github_ci_blocking(
                 continue;
             }
         };
-        match verify_signature_material(trust, &identity_policy, material, payload_bytes) {
+        match verify_signature_material(trust, &BUILD_IDENTITY, material, payload_bytes) {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
@@ -297,7 +297,12 @@ fn verify_bundle_signature_mock_key_blocking(
 fn expected_trust_marker(config: &StowConfig) -> VerifiedTrustMarker {
     let policy = match &config.verify_mode {
         VerifyMode::GithubCi => {
-            format!("github-ci:{TRUSTED_CERT_URL}:{TRUSTED_CERT_ISSUER}")
+            // The release-tag prefix, not one subject: any release's run
+            // of the build workflow is trusted.
+            format!(
+                "github-ci:{}v*:{TRUSTED_CERT_ISSUER}",
+                TrustedWorkflow::BUILD.san_prefix()
+            )
         }
         #[cfg(feature = "mock-verify")]
         VerifyMode::MockKey {

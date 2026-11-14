@@ -3,9 +3,10 @@ name: Repack follow-up
 # A repack sweep (`repack.yml` dispatched with `repack_rustc`, run
 # title `<rustc>-repack`) is resumable and its `repack` job has a hard
 # 350-minute limit, so a registry larger than one job needs several runs.
-# This lane closes the loop on the default branch (`dev`), dispatching
-# onto `main` (the index signing identity and the `operations` environment
-# live on `main` only) with a GitHub App installation token:
+# This lane closes the loop on the default branch, dispatching onto the
+# release tag of the run it follows (the index signing identity and the
+# `operations` environment admit release tags only) with a GitHub App
+# installation token:
 #
 # - Every dispatch uses that token, never the run's own GITHUB_TOKEN. GitHub
 #   documents that "events triggered by the `GITHUB_TOKEN` will not create
@@ -49,7 +50,7 @@ name: Repack follow-up
 #   and would race the fold. The 2/4/8/16-minute backoff
 #   (`MAX_BUILD_ATTEMPTS`, queue.rs) delays only a build that has failed
 #   again, so it does not cover this race. `index-publish.yml` runs from
-#   `main` and takes no input marking its origin, so the retry reads the
+#   a release tag and takes no input marking its origin, so the retry reads the
 #   run list instead. Serialised by the concurrency group, a publish that
 #   completes while the previous retry runs sees its operations run.
 #
@@ -97,6 +98,8 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           RUN_TITLE: ${{ github.event.workflow_run.display_title }}
+          # A tag-triggered run's `head_branch` is the tag name.
+          RUN_REF: ${{ github.event.workflow_run.head_branch }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           STOW_REPACK_CONCURRENCY: ${{ vars.STOW_REPACK_CONCURRENCY }}
@@ -114,7 +117,7 @@ jobs:
             exit 0
           fi
           rustc="${BASH_REMATCH[1]}"
-          dispatch_args=(--method POST -f ref=main)
+          dispatch_args=(--method POST -f "ref=$RUN_REF")
 
           if [ "$RUN_CONCLUSION" = success ]; then
             gh api "repos/$GITHUB_REPOSITORY/actions/workflows/index-publish.yml/dispatches" "${dispatch_args[@]}" \
@@ -189,6 +192,8 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           INDEX_CREATED: ${{ github.event.workflow_run.created_at }}
+          # A tag-triggered run's `head_branch` is the tag name.
+          RUN_REF: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
           since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
@@ -220,5 +225,5 @@ jobs:
               continue
             fi
             gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/operations.yml/dispatches" \
-              -f ref=main -f "inputs[argv]=$argv"
+              -f "ref=$RUN_REF" -f "inputs[argv]=$argv"
           done <<<"$repacks"

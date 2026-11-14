@@ -50,7 +50,7 @@ impl Extractor for SchedulerCaller {
 }
 
 /// A mutating route's caller (stow#955): only a GitHub Actions OIDC
-/// identity of one of `P`'s workflows, running at `refs/heads/main` — a
+/// identity of one of `P`'s workflows, running at the edge's own release tag — a
 /// user token and every other push credential stay read-only. Carries
 /// the verified `actor` the scheduler log attributes the mutation to.
 #[derive(Debug)]

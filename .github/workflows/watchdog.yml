@@ -63,18 +63,11 @@ jobs:
     steps:
       # A 15-minute cadence cannot afford a Rust build; the binary is
       # the toolchain artifact toolchain-publish.yml builds and
-      # cosign-signs once per platform on main's merge queue (stow#431).
-      # This workflow runs from the default branch, whose own sha has no
-      # toolchain — main's head does, so resolve it and pull that sha's
-      # artifact. The action fails the step if the artifact is absent or
-      # the signature does not verify; there is no compile fallback.
-      - name: Resolve main's head
-        id: main
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" \
-            >> "$GITHUB_OUTPUT"
+      # cosign-signs once per platform on a release tag (stow#431).
+      # This workflow runs on the deployed edge's release tag, whose
+      # commit carries that artifact. The action fails the step if the
+      # artifact is absent or the signature does not verify; there is no
+      # compile fallback.
       # A local action resolves from the workspace, so its directory has
       # to be checked out; nothing else in the tree is needed.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -84,7 +77,7 @@ jobs:
       - name: stow-admin from the signed toolchain
         uses: ./.github/actions/stow-toolchain
         with:
-          sha: ${{ steps.main.outputs.sha }}
+          sha: ${{ github.sha }}
           binaries: stow-admin
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Watchdog

@@ -1,6 +1,6 @@
 //! The traced operator path (stow#955): outside GitHub Actions, every
-//! mutating `stow-admin` command dispatches `operations.yml` on `main`
-//! with the operator's `stow-admin login` token and follows the run to
+//! mutating `stow-admin` command dispatches `operations.yml` on the
+//! deployed edge's release tag with the operator's `stow-admin login` token and follows the run to
 //! its end. The run's OIDC token is the only credential the edge's
 //! operator routes accept, and the run is the record. Inside Actions,
 //! or against the mock stack where the bearer is already a minted JWT,
@@ -12,8 +12,13 @@ use std::time::Duration;
 use keyring_core::api::CredentialStoreApi;
 use stow_types::stow_error;
 use stow_types::transient::Backoff;
+use stow_types::trusted_builder::ReleaseTag;
 
 use crate::github;
+
+/// The scheduler status route; its `release_tag` is the ref the deployed
+/// edge admits operations runs at.
+const SCHEDULER_STATUS_PATH: &str = "/api/v1/scheduler/status";
 
 /// The workflow file that performs every operator mutation.
 pub const WORKFLOW: &str = "operations.yml";
@@ -39,11 +44,11 @@ pub struct Dispatch {
 }
 
 impl Dispatch {
-    /// The `dispatches` request body: `main`, the inputs `operations.yml`
-    /// declares, and `return_run_details` so GitHub answers with the
-    /// run it created.
+    /// The `dispatches` request body: the deployed edge's release tag, the
+    /// inputs `operations.yml` declares, and `return_run_details` so GitHub
+    /// answers with the run it created.
     #[must_use]
-    pub fn body(&self) -> serde_json::Value {
+    pub fn body(&self, release_tag: &ReleaseTag) -> serde_json::Value {
         let mut inputs = serde_json::json!({
             "argv": serde_json::to_string(&self.argv).expect("argv serializes"),
         });
@@ -52,7 +57,7 @@ impl Dispatch {
                 serde_json::Value::from(serde_json::to_string(&self.files).expect("files"));
         }
         serde_json::json!({
-            "ref": "main",
+            "ref": release_tag.as_str(),
             "inputs": inputs,
             "return_run_details": true,
         })
@@ -246,7 +251,8 @@ struct WorkflowRun {
     conclusion: Option<String>,
 }
 
-/// Dispatch `dispatch` to `operations.yml` on `main` and follow the run
+/// Dispatch `dispatch` to `operations.yml` on the deployed edge's release
+/// tag (its scheduler status names it) and follow the run
 /// to its conclusion. Prints the run URL as soon as GitHub creates the
 /// run; the command succeeds only when the run does.
 ///
@@ -260,10 +266,14 @@ pub async fn dispatch_and_follow(
 ) -> stow_types::error::Result<()> {
     refuse_loopback_edge(std::env::var(crate::STOW_EDGE_URL_ENV).ok().as_deref())?;
     let token = crate::operator_token(store)?;
+    let release_tag = crate::Edge::connect(store)?
+        .get_json_retried::<stow_types::api::SchedulerStatus>(SCHEDULER_STATUS_PATH, Backoff::new())
+        .await?
+        .release_tag;
     let run: DispatchedRun = github::post(
         &token,
         &format!("actions/workflows/{WORKFLOW}/dispatches"),
-        &dispatch.body(),
+        &dispatch.body(&release_tag),
     )
     .await
     .map_err(|error| stow_error!("dispatch {WORKFLOW}: {error}"))?;
@@ -298,24 +308,24 @@ pub async fn dispatch_and_follow(
 
 #[cfg(test)]
 mod tests {
-    use super::{Dispatch, FILES_DIR, refuse_loopback_edge};
+    use super::{Dispatch, FILES_DIR, ReleaseTag, refuse_loopback_edge};
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_owned()).collect()
     }
 
-    /// The dispatch names `main`, asks for the run's id, and carries the
-    /// argv as a JSON array — the shape `operations.yml` parses without
-    /// a shell, so an argument with spaces or shell syntax stays one
-    /// literal argument.
+    /// The dispatch names the edge's release tag, asks for the run's id,
+    /// and carries the argv as a JSON array — the shape `operations.yml`
+    /// parses without a shell, so an argument with spaces or shell syntax
+    /// stays one literal argument.
     #[test]
-    fn the_body_carries_main_and_a_literal_argv() {
+    fn the_body_carries_the_release_tag_and_a_literal_argv() {
         let dispatch = Dispatch {
             argv: argv(&["queue", "retry", "--crate", "a b; $(x)", "--yes"]),
             files: std::collections::BTreeMap::new(),
         };
-        let body = dispatch.body();
-        assert_eq!(body["ref"], "main");
+        let body = dispatch.body(&"v1.2.3".parse().expect("release tag"));
+        assert_eq!(body["ref"], "v1.2.3");
         assert_eq!(body["return_run_details"], true);
         let replayed: Vec<String> =
             serde_json::from_str(body["inputs"]["argv"].as_str().expect("argv is a string"))
@@ -362,7 +372,7 @@ mod tests {
             ]
         );
         let files: std::collections::BTreeMap<String, String> = serde_json::from_str(
-            dispatch.body()["inputs"]["files"]
+            dispatch.body(&ReleaseTag::current())["inputs"]["files"]
                 .as_str()
                 .expect("files is a string"),
         )

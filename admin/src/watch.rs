@@ -922,6 +922,7 @@ mod tests {
             running: 4,
             completed: 100,
             failed: 5,
+            release_tag: stow_types::trusted_builder::ReleaseTag::current(),
         }
     }
 
@@ -1237,7 +1238,7 @@ mod tests {
     }
 
     /// The queue status the scheduler endpoint answers.
-    const STATUS_JSON: &str = "{\"pending\":10,\"human_pending\":3,\"blocked\":2,\"dispatched\":1,\"running\":4,\"completed\":9,\"failed\":0}";
+    const STATUS_JSON: &str = "{\"pending\":10,\"human_pending\":3,\"blocked\":2,\"dispatched\":1,\"running\":4,\"completed\":9,\"failed\":0,\"release_tag\":\"v1.2.3\"}";
 
     /// A 200 step carrying an `ETag`.
     fn ok_etag(etag: &str, body: &'static str) -> Step {

@@ -1052,11 +1052,11 @@ mod tests {
         let base64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let claims = base64::Engine::encode(
             &base64,
-            br#"{"sub":"repo:water-rs/stow:ref:refs/heads/main","aud":"sigstore"}"#,
+            br#"{"sub":"repo:water-rs/stow:ref:refs/tags/v1.2.3","aud":"sigstore"}"#,
         );
         assert_eq!(
             token_subject(&format!("e30.{claims}.c2ln")).expect("subject"),
-            "repo:water-rs/stow:ref:refs/heads/main"
+            "repo:water-rs/stow:ref:refs/tags/v1.2.3"
         );
         assert!(token_subject("opaque").is_err());
         let no_sub = base64::Engine::encode(&base64, br#"{"aud":"sigstore"}"#);

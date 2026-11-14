@@ -13,16 +13,15 @@ on:
 permissions: {}
 
 # The source check is all this workflow does. The checks a release must
-# pass are required by the `main` ruleset itself (`CI gate`, `Release
-# gate`, `installable release`, `toolchain gate`), so no job holds a
-# runner polling the others.
+# pass are required by the `main` ruleset itself (`CI gate`, `installable
+# release`), so no job holds a runner polling the others.
 jobs:
   verify-source:
     name: PR source gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: main only accepts merges from dev
+      - name: main only accepts merges from dev and release PRs
         if: github.event_name == 'pull_request'
         env:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
@@ -33,8 +32,10 @@ jobs:
             echo "::error::Pull requests into 'main' must come from this repository, not a fork."
             exit 1
           fi
-          if [ "${HEAD_REF}" != "dev" ]; then
-            echo "::error::Pull requests into 'main' are only allowed from 'dev'. Retarget this pull request at 'dev' instead."
+          # release-plz opens the release PR on `release-plz-*` branches from
+          # the certified commit; this admits them until `dev` is retired.
+          if [ "${HEAD_REF}" != "dev" ] && [[ "${HEAD_REF}" != release-plz-* ]]; then
+            echo "::error::Pull requests into 'main' are only allowed from 'dev' or a release PR branch. Retarget this pull request at 'dev' instead."
             exit 1
           fi
           echo "'${HEAD_REF}' -> 'main': source branch allowed."

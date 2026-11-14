@@ -1,9 +1,9 @@
 name: deploy-edge
 
-# The edge deploys a tested commit only: the trigger is a green `Test` run of
-# a push to main (a main → dev backmerge PR's `pull_request` run also reports
-# head branch `main`, and must not deploy the same commit twice), and a manual
-# dispatch must name a commit that has one. The deploy is
+# The edge deploys a release only: toolchain-publish.yml dispatches this
+# workflow on the release tag once every platform's toolchain is published,
+# and `prepare` refuses any other ref. The run's commit is the release PR's
+# head commit — the certified commit plus its version bump. The deploy is
 # four jobs — no runner is ever held waiting:
 #
 #   prepare          upload the new version (`wrangler versions upload` via
@@ -47,16 +47,8 @@ name: deploy-edge
 # version upload that changes no DO lifecycle is legal and a rollback never
 # crosses a migration boundary.
 on:
-  workflow_run:
-    workflows: [Test]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
     inputs:
-      sha:
-        description: Commit to deploy; must have a completed green `Test` run.
-        required: true
-        type: string
       canary_share:
         description: Percentage of traffic the canary version serves (1-99).
         required: false
@@ -65,8 +57,6 @@ on:
 
 permissions:
   contents: read
-  # `gh run list` reads the Test run's conclusion for a dispatched sha.
-  actions: read
   # Trusted `stow-admin` calls mint an Actions OIDC JWT per request.
   id-token: write
   # Pull the commit's signed stow toolchain from GHCR.
@@ -75,7 +65,7 @@ permissions:
 concurrency: deploy-edge
 
 env:
-  DEPLOY_SHA: ${{ inputs.sha || github.event.workflow_run.head_sha }}
+  DEPLOY_SHA: ${{ github.sha }}
   CANARY_SHARE: ${{ inputs.canary_share || '5' }}
   # zen-rs/skyzen commit that provides `deploy --upload-only` — the
   # squash-merged commit of zen-rs/skyzen#98 on skyzen's dev.
@@ -104,9 +94,6 @@ env:
 jobs:
   prepare:
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success')
     outputs:
       baseline_version: ${{ steps.versions.outputs.baseline_version }}
       candidate_version: ${{ steps.versions.outputs.candidate_version }}
@@ -116,28 +103,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.sha || github.event.workflow_run.head_sha }}
           persist-credentials: false
 
-      # A dispatch is only as tested as the commit it names — the deploy's
-      # justification is a green Test run, so verify one exists for the SHA.
-      - name: Resolve the green Test run for $DEPLOY_SHA
-        env:
-          GH_TOKEN: ${{ github.token }}
+      # The edge reports `v<workspace version>` as the tag it dispatches
+      # production workflows on, so a deploy is valid only on exactly that
+      # tag: any other ref, and a tag that is not the version of the
+      # commit it points at, is refused.
+      - name: Require the release tag of this commit's version
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = workflow_run ]; then
-            run_id="${{ github.event.workflow_run.id }}"
-          else
-            run_id=$(gh run list --commit "$DEPLOY_SHA" --workflow Test --limit 50 \
-              --json databaseId,conclusion \
-              | jq -r '[.[] | select(.conclusion == "success")][0].databaseId // empty')
-          fi
-          if [ -z "$run_id" ]; then
-            echo "::error::no green Test run for $DEPLOY_SHA — refusing to deploy an untested commit" >&2
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p;}' Cargo.toml)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::workspace version '$version' is not MAJOR.MINOR.PATCH" >&2
             exit 1
           fi
-          echo "Test run $run_id gates this deploy"
+          if [ "$GITHUB_REF" != "refs/tags/v$version" ]; then
+            echo "::error::deploy-edge runs only on refs/tags/v$version (this commit's version); got $GITHUB_REF" >&2
+            exit 1
+          fi
 
       - name: Validate the canary input
         run: |

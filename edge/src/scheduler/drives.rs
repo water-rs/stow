@@ -2283,12 +2283,9 @@ pub const DRIVES: &[Drive] = &[
                         &ctx.graph,
                         env,
                         db,
-                        &stow_types::periodic::PeriodicWorkflow {
-                            workflow: "watchdog.yml"
-                                .parse()
-                                .map_err(|error| format!("periodic dispatch workflow: {error}"))?,
-                            dispatch_ref: stow_types::periodic::DispatchRef::Main,
-                        },
+                        &"watchdog.yml"
+                            .parse::<stow_types::periodic::WorkflowFile>()
+                            .map_err(|error| format!("periodic dispatch workflow: {error}"))?,
                     )
                     .await
                     .map_err(text)

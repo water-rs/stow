@@ -5,7 +5,7 @@ members = ["cargo:."]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.30.2"
-# release.yml is hand-edited to trigger only on `stow-cli-v*` tags, so
+# release.yml is hand-edited to trigger only on `v[0-9]*` tags, so
 # dist must not flag it as out of date.
 allow-dirty = ["ci"]
 # CI backends to support

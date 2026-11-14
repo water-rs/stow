@@ -424,7 +424,6 @@ impl<T: CiTransport> CiInterface<T> {
         let request = self.plain_dispatch_request(
             crate::trusted_builder::PREHEAT_WORKFLOW_FILE,
             "preheat",
-            crate::trusted_builder::BRANCH,
             &inputs,
         )?;
         self.send_checked(request).await.map(|_| ()).inspect(|()| {
@@ -433,7 +432,7 @@ impl<T: CiTransport> CiInterface<T> {
     }
 
     /// `workflow_dispatch` of a periodic workflow (stow#1100) on the
-    /// branch its schedule entry names, with no inputs — the edge's
+    /// release tag, with no inputs — the edge's
     /// Cron Trigger fires the periodic workflows this way, since
     /// GitHub's own `schedule` skips ticks. The dispatch
     /// needs only its HTTP status.
@@ -445,20 +444,15 @@ impl<T: CiTransport> CiInterface<T> {
     /// have landed.
     pub async fn submit_periodic(
         &self,
-        periodic: &crate::periodic::PeriodicWorkflow,
+        workflow: &crate::periodic::WorkflowFile,
     ) -> Result<(), DispatchError> {
         let request = self.plain_dispatch_request(
-            periodic.workflow.as_str(),
-            periodic.workflow.stem(),
-            periodic.dispatch_ref.as_str(),
+            workflow.as_str(),
+            workflow.stem(),
             &serde_json::json!({}),
         )?;
         self.send_checked(request).await.map(|_| ()).inspect(|()| {
-            tracing::info!(
-                workflow = periodic.workflow.as_str(),
-                dispatch_ref = periodic.dispatch_ref.as_str(),
-                "submitted periodic run"
-            );
+            tracing::info!(workflow = workflow.as_str(), "submitted periodic run");
         })
     }
 
@@ -578,12 +572,11 @@ impl<T: CiTransport> CiInterface<T> {
         &self,
         workflow_file: &str,
         event_type: &str,
-        dispatch_ref: &str,
         inputs: &serde_json::Value,
     ) -> Result<CiRequest, DispatchError> {
         match &self.endpoint {
             CiEndpoint::GitHub { repo, .. } => {
-                let mut payload = serde_json::json!({ "ref": dispatch_ref });
+                let mut payload = serde_json::json!({ "ref": crate::trusted_builder::RELEASE_TAG });
                 if inputs.as_object().is_some_and(|inputs| !inputs.is_empty()) {
                     payload["inputs"] = inputs.clone();
                 }
@@ -625,7 +618,7 @@ impl<T: CiTransport> CiInterface<T> {
                 let input_json = serde_json::to_string(input)
                     .map_err(|error| DispatchError::Network(error.to_string()))?;
                 let mut payload = serde_json::json!({
-                    "ref": crate::trusted_builder::BRANCH,
+                    "ref": crate::trusted_builder::RELEASE_TAG,
                     "inputs": { input_name: input_json },
                 });
                 if return_run_details {
@@ -1132,10 +1125,10 @@ mod tests {
         );
     }
 
-    /// A periodic dispatch is the workflow file on `main` with no
-    /// inputs on GitHub, and the file's stem as the local event.
+    /// A periodic dispatch is the workflow file on the release tag with
+    /// no inputs on GitHub, and the file's stem as the local event.
     #[test]
-    fn a_periodic_dispatch_names_the_workflow_and_the_default_branch() {
+    fn a_periodic_dispatch_names_the_workflow_and_the_release_tag() {
         let workflow: crate::periodic::WorkflowFile = "watchdog.yml".parse().expect("workflow");
         let stub = || Stub {
             requests: Mutex::new(Vec::new()),
@@ -1143,12 +1136,7 @@ mod tests {
         };
         let github = CiInterface::github("water-rs/stow", "token", stub());
         let request = github
-            .plain_dispatch_request(
-                workflow.as_str(),
-                workflow.stem(),
-                crate::trusted_builder::BRANCH,
-                &serde_json::json!({}),
-            )
+            .plain_dispatch_request(workflow.as_str(), workflow.stem(), &serde_json::json!({}))
             .expect("request");
         assert_eq!(
             request.url,
@@ -1158,28 +1146,12 @@ mod tests {
             serde_json::from_slice(&request.body.expect("body")).expect("json");
         assert_eq!(
             body,
-            serde_json::json!({ "ref": crate::trusted_builder::BRANCH })
+            serde_json::json!({ "ref": crate::trusted_builder::RELEASE_TAG })
         );
-        let request = github
-            .plain_dispatch_request(
-                "test.yml",
-                "test",
-                crate::periodic::DispatchRef::Dev.as_str(),
-                &serde_json::json!({}),
-            )
-            .expect("request");
-        let body: serde_json::Value =
-            serde_json::from_slice(&request.body.expect("body")).expect("json");
-        assert_eq!(body, serde_json::json!({ "ref": "dev" }));
 
         let local = CiInterface::local_ci("http://127.0.0.1:28124/", stub());
         let request = local
-            .plain_dispatch_request(
-                workflow.as_str(),
-                workflow.stem(),
-                crate::trusted_builder::BRANCH,
-                &serde_json::json!({}),
-            )
+            .plain_dispatch_request(workflow.as_str(), workflow.stem(), &serde_json::json!({}))
             .expect("request");
         assert_eq!(request.url, "http://127.0.0.1:28124/dispatch");
         let body: serde_json::Value =

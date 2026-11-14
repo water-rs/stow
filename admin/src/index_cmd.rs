@@ -40,6 +40,7 @@ use stow_types::public_cache::UnitShape;
 use stow_types::records::{parse_records_tag, record_to_index_row};
 use stow_types::registry::{CacheRepository, cache_repository, sha256_digest};
 use stow_types::stow_error;
+use stow_types::trusted_builder::TrustedWorkflow;
 
 use crate::Edge;
 use crate::cloudflare;
@@ -59,12 +60,10 @@ const PREV_PULL_CONCURRENCY: usize = 8;
 /// the bound only limits how many edge requests the pass holds open.
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
 const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
-/// Records artifacts are signed by `build-crate.yml` — the export pins
-/// that identity the same way the CLI pins it for bundles.
-const RECORDS_CERT_URL: &str = stow_types::trusted_builder::CERTIFICATE_IDENTITY;
-/// The `index.*`/`folded.*` pair is signed by the index workflow — the
-/// export verifies previous slices against it before folding on top.
-pub const INDEX_CERT_URL: &str = stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY;
+// Records artifacts are signed by `build-crate.yml` and the `index.*` /
+// `folded.*` pair by the index workflow, each at a release tag: the export
+// pins those identities the same way the CLI pins them for bundles, and
+// verifies previous slices against the index one before folding on top.
 
 #[derive(Args)]
 pub struct IndexArgs {
@@ -112,6 +111,11 @@ pub enum IndexCommand {
     /// list `index-publish.yml` iterates, read from the binary so the
     /// workflow never carries its own copy.
     Targets,
+    /// The one-time re-sign of a rustc's published `index`/`folded`
+    /// slices from the branch identity to this run's release-tag
+    /// identity; `index-publish.yml` runs it with `resign: true`. A rerun
+    /// writes nothing.
+    Resign(crate::index_resign::IndexResignArgs),
     /// Resolve the public hit leaderboard's bundle digests to crate
     /// identities through the signed index slices (stow#889) — the
     /// edge keeps no identity store, so the offline join lives here.
@@ -263,6 +267,7 @@ pub async fn run(
             render::emit_line(&CI_TARGET_TRIPLES.join("\n"));
             Ok(())
         }
+        IndexCommand::Resign(args) => crate::index_resign::run(args).await,
         IndexCommand::Join(args) => index_join(args).await,
     }
 }
@@ -283,7 +288,7 @@ pub async fn verify_artifact(
     reference: &oci_client::Reference,
     identity_reference: &str,
     manifest_digest: &str,
-    cert_url: &str,
+    workflow: TrustedWorkflow,
 ) -> stow_types::error::Result<()> {
     stow_oci::verify_artifact_signature(
         session,
@@ -291,7 +296,7 @@ pub async fn verify_artifact(
         reference,
         identity_reference,
         manifest_digest,
-        cert_url,
+        &stow_oci::verify::ReleaseIdentity::new(workflow),
     )
     .await
 }
@@ -342,7 +347,7 @@ impl PullContext {
                 &self.session.reference(folded)?,
                 &self.repository.reference(folded),
                 &pulled_folded.manifest_digest,
-                INDEX_CERT_URL,
+                TrustedWorkflow::INDEX,
             )
             .await?;
         }
@@ -382,7 +387,7 @@ impl PullContext {
             &index_reference,
             &self.repository.reference(&itag),
             &pulled_index.manifest_digest,
-            INDEX_CERT_URL,
+            TrustedWorkflow::INDEX,
         )
         .await?;
         let index = decode_published_slice(&index_reference, rustc_version, &pulled_index.bytes)?;
@@ -408,7 +413,7 @@ impl PullContext {
             &reference,
             &self.repository.reference(tag),
             &pulled.manifest_digest,
-            RECORDS_CERT_URL,
+            TrustedWorkflow::BUILD,
         )
         .await?;
         Ok(pulled.records)
@@ -1023,7 +1028,7 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
             // The keyless signer checks every signature it makes against
             // the trust readers verify with.
             let trust = stow_oci::verify::records_trust().await?;
-            let publisher = stow_oci::Publisher::from_env(http, &trust, INDEX_CERT_URL)?;
+            let publisher = stow_oci::Publisher::from_env(http, &trust, TrustedWorkflow::INDEX)?;
             let outcome = stow_oci::publish_index(
                 &publisher,
                 &bytes,

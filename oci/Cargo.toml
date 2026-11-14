@@ -55,6 +55,8 @@ x509-cert = "0.2.5"
 const-oid = { version = "0.10", features = ["db"] }
 webpki = { package = "rustls-webpki", version = "0.103.8" }
 async-fs = "2"
+# The bundle tar the re-sign reads its signature material from.
+tar.workspace = true
 # The sigstore trust cache's default root — the platform cache
 # directory, not `$HOME` (a Windows Actions runner has none, stow#1026).
 dirs = "7"

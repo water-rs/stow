@@ -2,8 +2,8 @@
 
 /// The scheduler's deliveries-stopped bound (stow#860) is the longest
 /// dependency path of `build-crate.yml` jobs a task run executes; a timeout
-/// change must move it. The operator's repack job never runs in a task
-/// run, so its bound is not part of the scheduler's.
+/// change must move it. The operator's repack and re-sign jobs never run
+/// in a task run, so their bounds are not part of the scheduler's.
 #[test]
 fn build_crate_run_timeout_matches_the_jobs() {
     fn path_minutes(
@@ -52,10 +52,12 @@ fn build_crate_run_timeout_matches_the_jobs() {
                 (timeout, needs),
             );
         } else {
-            assert_eq!(
-                condition,
-                "inputs.repack_rustc != ''",
-                "job {} runs in neither a task run nor a repack run",
+            assert!(
+                matches!(
+                    condition,
+                    "inputs.repack_rustc != ''" | "inputs.resign_rustc != ''"
+                ),
+                "job {} runs in neither a task run, a repack run nor a re-sign run",
                 name.as_str().expect("job name").to_owned()
             );
         }

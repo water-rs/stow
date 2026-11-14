@@ -303,7 +303,7 @@ pub async fn pull_signature_materials(
     .await
 }
 
-/// Verify that a signature under `certificate_identity` binds
+/// Verify that a signature whose certificate satisfies `policy` binds
 /// `identity_reference` at `manifest_digest`, reading the signature
 /// image next to `reference`.
 ///
@@ -322,7 +322,7 @@ pub async fn verify_artifact_signature(
     reference: &Reference,
     identity_reference: &str,
     manifest_digest: &str,
-    certificate_identity: &str,
+    policy: &(impl sigstore::bundle::verify::policy::VerificationPolicy + Sync),
 ) -> stow_types::error::Result<()> {
     let materials = pull_signature_materials(session, reference, manifest_digest).await?;
     crate::verify::verify_materials(
@@ -330,7 +330,7 @@ pub async fn verify_artifact_signature(
         identity_reference,
         manifest_digest,
         &materials,
-        certificate_identity,
+        policy,
     )
 }
 

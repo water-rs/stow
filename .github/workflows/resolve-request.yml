@@ -7,7 +7,7 @@ name: Resolve a crate request
 # attempt's name.
 run-name: ${{ fromJSON(inputs.request).run_title }}
 
-# The scheduler dispatches this workflow on `main` through the GitHub App
+# The scheduler dispatches this workflow on the edge's release tag through the GitHub App
 # with the whole admission as one JSON input (`RequestDispatch`), exactly
 # the arm `build-crate.yml` already rides. The job resolves the request
 # with `stow-resolver` across `stow_types::CI_TARGET_TRIPLES` and reports
@@ -47,7 +47,7 @@ jobs:
       contents: read
       packages: read # pull the pinned stow toolchain from GHCR
       # Mints the run's OIDC token — the edge's outcome route admits
-      # only this workflow's runs on main, and stow-admin refreshes it
+      # only this workflow's runs on a release tag, and stow-admin refreshes it
       # per request.
       id-token: write
     steps:
@@ -61,8 +61,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ fromJSON(inputs.request).rustc_version }}
-      # stow-admin comes from the signed toolchain artifact the merge
-      # queue publishes per commit, never compiled in this job — the
+      # stow-admin comes from the signed toolchain artifact published
+      # per release tag, never compiled in this job — the
       # cold start is a verified pull, not a `cargo build`.
       - uses: ./.github/actions/stow-toolchain
         with:

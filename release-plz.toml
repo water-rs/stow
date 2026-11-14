@@ -4,15 +4,31 @@ changelog_update = true
 # crate versions and stow-cli's GitHub release is owned by cargo-dist.
 git_release_enable = false
 
-# release-plz still pushes the `stow-cli-v*` tag (git_tag_enable defaults
-# to true), which triggers the cargo-dist release workflow; dist then
-# creates the GitHub Release itself and attaches the prebuilt binaries
-# (https://axodotdev.github.io/cargo-dist/book/ — the "host" step runs
-# `gh release create`, which would fail if release-plz had already made
-# the release).
+# release-plz still pushes each released crate's tag (git_tag_enable
+# defaults to true). The main crate's tag is `v<version>`; it triggers the
+# cargo-dist release workflow, toolchain-publish.yml and the edge deploy,
+# and it is the release tag the production workflows and signing identities
+# are scoped to. dist creates the GitHub Release itself and attaches the
+# prebuilt binaries (https://axodotdev.github.io/cargo-dist/book/ — the
+# "host" step runs `gh release create`, which would fail if release-plz had
+# already made the release). Every other crate's tag is
+# `<directory>/v<version>`, which no workflow triggers on.
 [[package]]
 name = "stow-cli"
 git_release_enable = false
+git_tag_name = "v{{ version }}"
+
+[[package]]
+name = "stow-oci"
+git_tag_name = "oci/v{{ version }}"
+
+[[package]]
+name = "stow-shim"
+git_tag_name = "shim/v{{ version }}"
+
+[[package]]
+name = "stow-types"
+git_tag_name = "types/v{{ version }}"
 
 # Internal tooling: never released or published.
 [[package]]

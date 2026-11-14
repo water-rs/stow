@@ -12,6 +12,7 @@ mod publisher;
 mod records;
 mod registry;
 mod repack;
+pub mod resign;
 pub mod retry;
 mod sign;
 mod throttle;

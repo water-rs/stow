@@ -19,6 +19,7 @@ mod deploy;
 mod dump;
 mod github;
 mod index_cmd;
+mod index_resign;
 mod launch_model;
 mod login;
 mod maintenance;

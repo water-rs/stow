@@ -400,12 +400,12 @@ accelerated:
 
 | Input | Default | Purpose |
 |---|---|---|
-| `version` | `latest` | `stow-cli` release to install — `latest` (the newest stable release that already carries its archives), a bare version (`1.2.3`), or the full `stow-cli-v1.2.3` tag. |
+| `version` | `latest` | `stow-cli` release to install — `latest` (the newest stable release that already carries its archives), a bare version (`1.2.3`), or the full `v1.2.3` tag. |
 | `edge-url` | `https://stow.waterui.dev` | Edge worker URL, exported as `STOW_EDGE_URL`. |
 | `verify-mode` | `github-ci` | Signature verification mode, exported as `STOW_VERIFY_MODE`. `mock-key` additionally needs `STOW_MOCK_PUBLIC_KEY_PATH` in the job environment. |
 
 The action downloads `stow-cli-<target>.tar.xz` (`.zip` on Windows) and
-its `.sha256` from the `stow-cli-v<version>` GitHub Release, verifies
+its `.sha256` from the `v<version>` GitHub Release, verifies
 the checksum — a failed download or checksum fails the job — unpacks
 `stow`, `stow-cli`, and `cargo-stow` onto `PATH`, and writes
 `RUSTC_WRAPPER`, `CC_<runner triple>`, `CXX_<runner triple>`,
