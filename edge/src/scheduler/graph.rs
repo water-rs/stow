@@ -3422,6 +3422,7 @@ impl Graph {
             completed: count(Status::Completed),
             failed: count(Status::Failed),
             blocked: self.pending_blocked,
+            release_tag: stow_types::trusted_builder::ReleaseTag::current(),
         }
     }
 

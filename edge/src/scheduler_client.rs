@@ -371,11 +371,11 @@ pub async fn send_preheat_release(
 
 /// `POST /periodic/dispatch` — one periodic workflow the Worker's
 /// Cron Trigger found due (stow#1100). The object dispatches it on
-/// the branch the entry names through the CI interface; a dispatch failure is the
+/// the edge's release tag through the CI interface; a dispatch failure is the
 /// caller's error.
 pub async fn send_periodic_dispatch(
     namespace: &CfDurableNamespace,
-    request: &stow_types::periodic::PeriodicWorkflow,
+    request: &stow_types::periodic::WorkflowFile,
 ) -> Result<(), SchedulerClientError> {
     send_json(namespace, SCHEDULER_PERIODIC_DISPATCH_URL, request).await
 }

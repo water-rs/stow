@@ -145,9 +145,9 @@ runs:
       shell: bash
       run: ci/glibc-sysroot/wrappers.sh "$HOME/stow-glibc-2.28" "$HOME/stow-system-libs"
     # toolchain-publish.yml publishes stow-build and stow-cli (and on
-    # Linux stow-admin) once per main commit per host platform from the merge queue; this
+    # Linux stow-admin) once per release-tag commit per host platform; this
     # job pulls that artifact — digest-pinned, cosign-verified against the
-    # merge-queue identity and this commit — instead of compiling
+    # release-tag identity and this commit — instead of compiling
     # (stow#431). An absent artifact fails the step; there is no
     # source-build fallback.
     - uses: ./.github/actions/stow-toolchain

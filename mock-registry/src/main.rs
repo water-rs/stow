@@ -3322,6 +3322,12 @@ mod tests {
         base.push_session(&test_cache_repository(), &credentials, http, writes)
     }
 
+    /// The identity the records readers pin. The mock key verifies without
+    /// consulting it; the policy only has to exist.
+    fn build_identity() -> stow_oci::verify::ReleaseIdentity {
+        stow_oci::verify::ReleaseIdentity::new(stow_types::trusted_builder::TrustedWorkflow::BUILD)
+    }
+
     /// The budget of the tests that do not exercise it: far above
     /// anything they write.
     fn ample_writes() -> stow_oci::WriteBudget {
@@ -3824,7 +3830,7 @@ mod tests {
                 &format!("{REFERENCE_BASE}:{tag}"),
                 digest,
                 &materials,
-                "",
+                &build_identity(),
             )
             .unwrap_or_else(|error| panic!("{tag} must verify: {error}"));
         }
@@ -3984,7 +3990,7 @@ mod tests {
         .remove(0);
 
         assert_eq!(
-            stow_oci::repack_record(&session, &trust, "", &packed, &sign)
+            stow_oci::repack_record(&session, &trust, &build_identity(), &packed, &sign)
                 .await
                 .expect("a packed node is accepted"),
             None,
@@ -4000,10 +4006,11 @@ mod tests {
         )
         .await;
         assert_ne!(retired.oci_digest, packed.oci_digest);
-        let repacked = stow_oci::repack_record(&session, &trust, "", &retired, &sign)
-            .await
-            .expect("the retired layout repacks")
-            .expect("and is rewritten");
+        let repacked =
+            stow_oci::repack_record(&session, &trust, &build_identity(), &retired, &sign)
+                .await
+                .expect("the retired layout repacks")
+                .expect("and is rewritten");
         assert_eq!(
             ArtifactRecord {
                 bundle_digest: packed.bundle_digest.clone(),
@@ -4020,13 +4027,13 @@ mod tests {
             &reference,
             &repacked.oci_reference,
             &repacked.oci_digest,
-            "",
+            &build_identity(),
         )
         .await
         .expect("repacked signature verifies");
 
         assert_eq!(
-            stow_oci::repack_record(&session, &trust, "", &repacked, &sign)
+            stow_oci::repack_record(&session, &trust, &build_identity(), &repacked, &sign)
                 .await
                 .expect("the repacked node is accepted"),
             None,
@@ -4072,7 +4079,7 @@ mod tests {
                 .count()
         };
         let puts_before = manifest_puts();
-        let error = stow_oci::repack_record(&session, &trust, "", &tampered, &sign)
+        let error = stow_oci::repack_record(&session, &trust, &build_identity(), &tampered, &sign)
             .await
             .expect_err("a file the config does not record is refused");
         assert!(
@@ -4088,7 +4095,7 @@ mod tests {
             &mock_sign(root.path()),
         )
         .await;
-        let error = stow_oci::repack_record(&session, &trust, "", &untrusted, &sign)
+        let error = stow_oci::repack_record(&session, &trust, &build_identity(), &untrusted, &sign)
             .await
             .expect_err("a signature of another key is refused");
         assert!(

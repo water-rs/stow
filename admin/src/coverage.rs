@@ -13,7 +13,7 @@ use stow_types::identity::{CrateName, CrateVersion, TargetTriple, WireRustcVersi
 use stow_types::registry::cache_repository;
 use stow_types::stow_error;
 
-use crate::index_cmd::{INDEX_CERT_URL, decode_published_slice, registry_base, verify_artifact};
+use crate::index_cmd::{decode_published_slice, registry_base, verify_artifact};
 use crate::render::{self, Output, Table};
 
 /// The concurrent slice-pull bound — one pull per CI target at most.
@@ -97,7 +97,7 @@ impl IndexSource {
             &reference,
             &self.repository.reference(&itag),
             &pulled.manifest_digest,
-            INDEX_CERT_URL,
+            stow_types::trusted_builder::TrustedWorkflow::INDEX,
         )
         .await?;
         decode_published_slice(&reference, &self.rustc_version, &pulled.bytes).map(Some)

@@ -8,7 +8,7 @@ name: build-crate
 run-name: ${{ format('{0}-{1}', fromJSON(inputs.task).rustc_version, fromJSON(inputs.task).task_id) }}
 
 # The scheduler (or `stow-admin preheat manual`) dispatches this workflow on
-# `main` with the whole task as one JSON input. Isolated jobs, two trust levels,
+# the deployed edge's release tag with the whole task as one JSON input. Isolated jobs, two trust levels,
 # and no Cloudflare dependency at all (stow#455):
 #
 #   build   — compiles third-party code. Read-only token, no secrets,
@@ -35,7 +35,7 @@ run-name: ${{ format('{0}-{1}', fromJSON(inputs.task).rustc_version, fromJSON(in
 #             stored one layer per file into the single-pack layout, and
 #             publishes them and their records under this workflow's
 #             identity (`stow-build repack`). The identity clients trust
-#             is a property of this file on main, so the re-signature has
+#             is a property of this file on a release tag, so the re-signature has
 #             to come from here and from no other workflow. It does, as
 #             a reusable workflow: Fulcio's SAN is built from the
 #             token's `job_workflow_ref`, which names the called file
@@ -43,13 +43,17 @@ run-name: ${{ format('{0}-{1}', fromJSON(inputs.task).rustc_version, fromJSON(in
 #             and `stow-build repack` refuses to sign under any other
 #             identity (`KeylessSigner`, checked before a signature is
 #             pushed).
+#   resign  — called by `resign.yml`, the one-time re-sign of a rustc's
+#             repository from the branch identity to this workflow's
+#             release-tag identity (`stow-build resign`, stow#1515). It
+#             compiles nothing and runs here for the reason `repack` does.
 #
 # Completion reaches the scheduler through GitHub itself: `run-name`
 # above stamps `<rustc>-<task_id>`, so the `workflow_run` `completed`
 # webhook the edge receives carries both in `display_title` — no
 # completion POST from a runner, no failure-report job.
 #
-# The certificate identity clients trust is this file on refs/heads/main
+# The certificate identity clients trust is this file on `refs/tags/v<semver>`
 # (stow_types::trusted_builder): Fulcio's SAN for a reusable workflow is
 # (stow_types::trusted_builder); dispatching any other ref produces artifacts
 # no client accepts.
@@ -72,12 +76,24 @@ on:
         default: '{}'
       repack_rustc:
         description: Rustc whose published nodes are repacked into the single-pack layout
-        required: true
+        required: false
         type: string
+        default: ''
       repack_concurrency:
         description: Tasks a repack run repacks at once
-        required: true
+        required: false
         type: string
+        default: '4'
+      resign_rustc:
+        description: Rustc whose repository is re-signed under the release-tag identity
+        required: false
+        type: string
+        default: ''
+      resign_concurrency:
+        description: Tasks a re-sign run re-signs at once
+        required: false
+        type: string
+        default: '4'
 
 permissions: {}
 
@@ -86,7 +102,7 @@ permissions: {}
 # of one rustc behind the one in flight: the same group on both levels
 # would block the call on its caller.
 concurrency:
-  group: ${{ inputs.repack_rustc != '' && format('repack-call-{0}', inputs.repack_rustc) || format('build-crate-{0}', fromJSON(inputs.task).task_id) }}
+  group: ${{ inputs.repack_rustc != '' && format('repack-call-{0}', inputs.repack_rustc) || inputs.resign_rustc != '' && format('resign-call-{0}', inputs.resign_rustc) || format('build-crate-{0}', fromJSON(inputs.task).task_id) }}
   cancel-in-progress: false
 
 env:
@@ -100,7 +116,7 @@ env:
 # `env`, so the map is inline in both jobs.
 jobs:
   build:
-    if: inputs.repack_rustc == ''
+    if: inputs.repack_rustc == '' && inputs.resign_rustc == ''
     name: build ${{ fromJSON(inputs.task).crate_name }} ${{ fromJSON(inputs.task).version }} (${{ fromJSON(inputs.task).target }})
     outputs:
       records-exist: ${{ steps.records-exist.outputs.found }}
@@ -199,7 +215,7 @@ jobs:
     needs: build
     # A build that failed for any other reason has nothing to replay, and a
     # job that could only fail would hold a runner and keep the run open.
-    if: always() && inputs.repack_rustc == '' && needs.build.result == 'failure' && needs.build.outputs.failure-candidate != ''
+    if: always() && inputs.repack_rustc == '' && inputs.resign_rustc == '' && needs.build.result == 'failure' && needs.build.outputs.failure-candidate != ''
     runs-on: ${{ fromJSON('{"aarch64-apple-darwin":"macos-26","aarch64-apple-ios":"macos-26","aarch64-apple-ios-sim":"macos-26","aarch64-linux-android":"ubuntu-26.04","x86_64-unknown-linux-gnu":"ubuntu-26.04","aarch64-unknown-linux-gnu":"ubuntu-26.04","x86_64-pc-windows-msvc":"windows-latest","aarch64-pc-windows-msvc":"windows-latest","wasm32-unknown-unknown":"ubuntu-26.04"}')[fromJSON(inputs.task).target] }}
     permissions:
       contents: read
@@ -236,7 +252,7 @@ jobs:
   publish:
     name: publish
     needs: build
-    if: inputs.repack_rustc == '' && needs.build.result == 'success'
+    if: inputs.repack_rustc == '' && inputs.resign_rustc == '' && needs.build.result == 'success'
     runs-on: ${{ fromJSON('{"aarch64-apple-darwin":"macos-26","aarch64-apple-ios":"macos-26","aarch64-apple-ios-sim":"macos-26","aarch64-linux-android":"ubuntu-26.04","x86_64-unknown-linux-gnu":"ubuntu-26.04","aarch64-unknown-linux-gnu":"ubuntu-26.04","x86_64-pc-windows-msvc":"windows-latest","aarch64-pc-windows-msvc":"windows-latest","wasm32-unknown-unknown":"ubuntu-26.04"}')[fromJSON(inputs.task).target] }}
     permissions:
       contents: read
@@ -249,7 +265,7 @@ jobs:
           persist-credentials: false
       # This job executes only a binary trusted CI built from this commit:
       # the action pulls the toolchain artifact by manifest digest and
-      # cosign-verifies it against toolchain-publish.yml's merge-queue
+      # cosign-verifies it against toolchain-publish.yml's release-tag
       # identity bound to `github.sha` — cryptographic provenance the
       # compile-in-job path it replaces never had (stow#431).
       - uses: ./.github/actions/stow-toolchain
@@ -299,3 +315,35 @@ jobs:
           REPACK_RUSTC: ${{ inputs.repack_rustc }}
           REPACK_CONCURRENCY: ${{ inputs.repack_concurrency }}
         run: stow-build repack --rustc-version "$REPACK_RUSTC" --concurrency "$REPACK_CONCURRENCY"
+
+  # The one-time re-sign of a rustc's repository under the release-tag
+  # identity, called by `resign.yml` (stow#1515). It runs here for the same
+  # reason `repack` does: the identity clients trust is this file at a
+  # release tag. The tool is removed once the operator's run has finished.
+  resign:
+    name: resign ${{ inputs.resign_rustc }}
+    if: inputs.resign_rustc != ''
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    # A run is idempotent and resumes where the last stopped, so the
+    # job's bound is GitHub's own job limit rather than an estimate of
+    # the registry's size.
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/stow-toolchain
+        with:
+          binaries: stow-build
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Re-sign the published records and nodes
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESIGN_RUSTC: ${{ inputs.resign_rustc }}
+          RESIGN_CONCURRENCY: ${{ inputs.resign_concurrency }}
+        run: stow-build resign --rustc-version "$RESIGN_RUSTC" --concurrency "$RESIGN_CONCURRENCY"

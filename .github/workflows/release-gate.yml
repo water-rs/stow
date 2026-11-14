@@ -3,23 +3,34 @@ name: Release gate
 # The checks a release must pass but a routine merge must not wait on: the
 # mock end-to-end, the traffic-cost and preheat-cost tests, the production
 # wave count, and the monthly projection over what those three measured.
-# They run three ways —
-# `workflow_dispatch` on any ref, nightly on dev's head (03:00 ET, which
-# the edge Cron Trigger dispatches through the App: `STOW_PERIODIC_WORKFLOWS`,
-# stow#1121), and in main's merge group, where the `main` ruleset requires
-# this workflow's `Release gate` check. The App's dispatch carries no
-# inputs, so the nightly is told from a manual dispatch by the dispatching
-# identity, `stow-ci[bot]`.
+# Passing them certifies a commit, and a certified commit gets its release
+# PR: release-plz's version bump and changelog on top of exactly that
+# commit. A run certifies `inputs.sha`, or the head of the ref it was
+# dispatched on, in one of two ways —
+# nightly (03:00 ET): the edge Cron Trigger dispatches this workflow on its
+# own release tag (`STOW_PERIODIC_WORKFLOWS`, stow#1121); that run only
+# runs `trampoline`, which dispatches the certification on `main` with
+# `nightly=true`, and `test.yml` on `main` so the caches saved from
+# `main`'s ref stay fresh;
+# by name: an operator dispatches it on `main` with `sha` set to the commit
+# to release, or without it for `main`'s head, for a release during the day.
+# A failed nightly files or updates the `nightly` issue and opens nothing.
 #
-# A pull request into main and a dev merge group run only the gate job: the
-# required check still reports, and the legs run once, in main's merge
-# group, which tests the tree that lands. The `merge_group` trigger carries
-# no branch filter because dev's queue fires it as well as main's, so every
-# leg checks the group's base ref (`github.event.merge_group.base_ref` is
-# the group's target branch).
+# `release-plz.yml` releases a release PR's head commit only when its
+# parent carries the `Certified` commit status this workflow sets.
 on:
   workflow_dispatch:
     inputs:
+      sha:
+        description: "Commit to certify; empty certifies the head of the dispatched ref"
+        required: false
+        default: ""
+        type: string
+      nightly:
+        description: "Report the result on the `nightly` issue (set by the nightly trampoline)"
+        required: false
+        default: false
+        type: boolean
       capacity_jobs:
         description: "Mock scheduler total job capacity; empty keeps the test defaults"
         required: false
@@ -35,16 +46,12 @@ on:
         required: false
         default: ""
         type: string
-  pull_request:
-    branches: [main]
-  merge_group:
 
-# Same contract as test.yml: a pull request pushed several times in a row
-# only needs its newest run; nightly and merge-group runs are records and
-# never cancel one another.
+# One certification per commit; runs are records and never cancel one
+# another.
 concurrency:
-  group: release-gate-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: release-gate-${{ inputs.sha || github.sha }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -57,8 +64,31 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
+  # The run on the edge's release tag is the nightly tick: it certifies
+  # nothing itself and only dispatches the real runs on `main`.
+  trampoline:
+    if: github.ref_type == 'tag'
+    name: Nightly trampoline
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write # dispatch release-gate.yml and test.yml on main
+    steps:
+      - name: Dispatch the certification and the cache refresh on main
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run release-gate.yml --ref main -f nightly=true
+          gh workflow run test.yml --ref main
+
+  # Every other job needs `tools`, so a skipped `tools` (the trampoline run)
+  # skips the legs; on any other run they run unconditionally: a
+  # certification has no "changed paths" to scope to, and the nightly exists
+  # to catch a drift no change drove.
   tools:
-    if: github.event_name == 'workflow_dispatch' || github.event.merge_group.base_ref == 'refs/heads/main'
+    if: github.ref_type != 'tag'
     name: Gate tools (${{ matrix.variant }})
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -68,13 +98,15 @@ jobs:
         variant: [production, preheat, mock]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: mock-e2e
-          save-if: ${{ github.ref == 'refs/heads/dev' && matrix.variant == 'production' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.variant == 'production' }}
           cache-on-failure: true
       - uses: ./.github/actions/link-with-mold
       - name: Build the tools once for this workflow
@@ -95,12 +127,7 @@ jobs:
           path: ${{ runner.temp }}/gate-tools.tar.gz
           if-no-files-found: error
 
-  # Every leg skips itself on a pull request and in a dev merge group — see
-  # the header. Otherwise it runs unconditionally: a release gate or a
-  # nightly tick has no "changed paths" to scope to, and the nightly exists
-  # to catch a drift no change drove.
   mock-e2e:
-    if: github.event_name == 'workflow_dispatch' || github.event.merge_group.base_ref == 'refs/heads/main'
     needs: tools
     name: Mock end-to-end
     runs-on: ubuntu-26.04
@@ -112,6 +139,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
@@ -164,7 +193,6 @@ jobs:
   # signal or 5xx under the drive. Its reports are what the `Monthly
   # projection` job prices the month from.
   traffic-cost:
-    if: github.event_name == 'workflow_dispatch' || github.event.merge_group.base_ref == 'refs/heads/main'
     needs: tools
     name: Traffic cost
     runs-on: ubuntu-26.04
@@ -176,6 +204,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
@@ -224,7 +254,6 @@ jobs:
   # production lanes outran this job's timeout beside the wave's builds,
   # so the `Production wave` job counts it.
   preheat-cost:
-    if: github.event_name == 'workflow_dispatch' || github.event.merge_group.base_ref == 'refs/heads/main'
     needs: tools
     name: Preheat cost
     runs-on: ubuntu-26.04
@@ -238,6 +267,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
@@ -285,7 +316,6 @@ jobs:
   # minutes for the projects lane, which is why it has a job of its own
   # and a timeout of its own. It fails when a lane fails or plans nothing.
   production-wave:
-    if: github.event_name == 'workflow_dispatch' || github.event.merge_group.base_ref == 'refs/heads/main'
     needs: tools
     name: Production wave
     runs-on: ubuntu-26.04
@@ -293,6 +323,8 @@ jobs:
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha || github.sha }}
       - uses: ./.github/actions/gate-tools
         with:
           variant: production
@@ -327,6 +359,41 @@ jobs:
             ${{ runner.temp }}/stow-production-wave/lanes/*/exit
           if-no-files-found: ignore
 
+  # The release flow (stow#1514): a certified commit gets its release PR,
+  # the PR's merge releases the PR's head commit and not the merge commit,
+  # and a release PR with an extra commit releases nothing. The two release
+  # scripts and release-plz run unchanged against the mock GitHub
+  # (`stow-build serve`, docs/MOCK.md) over a throwaway crate, so a change
+  # to release-plz, to a script or to the mock that breaks the flow fails
+  # the certification rather than the release it would have gated.
+  release-flow:
+    needs: tools
+    name: Release flow
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - uses: ./.github/actions/gate-tools
+        with:
+          variant: production
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: release-plz@0.3.169
+      - run: scripts/release-flow-e2e.sh
+        env:
+          STOW_RELEASE_FLOW_WORK_DIR: ${{ runner.temp }}/stow-release-flow
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: release-flow-logs
+          path: ${{ runner.temp }}/stow-release-flow/logs
+          if-no-files-found: ignore
+
   # The monthly projection (stow#452, stow#775): what a month costs each
   # Cloudflare product against its allowance: 90% for DO requests, 80%
   # for every other dimension. It needs the three
@@ -339,7 +406,6 @@ jobs:
   # project` prints the traffic, preheat and total beside the bound for
   # each product and fails when any total is over it.
   projection:
-    if: github.event_name == 'workflow_dispatch' || github.event.merge_group.base_ref == 'refs/heads/main'
     needs:
       - tools
       - traffic-cost
@@ -350,6 +416,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha || github.sha }}
       - uses: ./.github/actions/gate-tools
         with:
           variant: production
@@ -374,20 +442,20 @@ jobs:
             --production "$RUNNER_TEMP/production-wave/production-wave.json" \
             --model launch-model.toml
 
-  # One check to require — the `main` ruleset names `Release gate` — built
-  # like test.yml's `CI gate`: it needs every leg, `if: always()` runs it
-  # past a failed or cancelled need, and the verdict reads
-  # `needs.*.result` so such a leg turns the gate red. `skipped` passes,
-  # which is what every leg reports in a dev merge group.
+  # One verdict for the certification, built like test.yml's `CI gate`: it
+  # needs every leg, `if: always()` runs it past a failed or cancelled need,
+  # and the verdict reads `needs.*.result` so such a leg turns the gate red.
+  # `release-pr` and the nightly report read it.
   gate:
     needs:
       - tools
       - mock-e2e
+      - release-flow
       - traffic-cost
       - preheat-cost
       - production-wave
       - projection
-    if: always()
+    if: always() && github.ref_type != 'tag'
     name: Release gate
     runs-on: ubuntu-26.04
     steps:
@@ -395,14 +463,14 @@ jobs:
         with:
           persist-credentials: false
       # The gate covers every job only because it needs every job; a new
-      # job that forgets to join `needs:` would ship ungated. Read the
-      # workflow itself and fail if any job other than this one and the
-      # nightly-only reporter — which needs the gate, so the gate cannot
-      # need it — is absent from the list.
+      # job that forgets to join `needs:` would certify ungated. Read the
+      # workflow itself and fail if any job other than this one, the
+      # trampoline and the jobs that need the gate — so the gate cannot
+      # need them — is absent from the list.
       - name: Needs covers every job
         run: |
           needed=$(yq '.jobs.gate.needs.[]' .github/workflows/release-gate.yml | sort)
-          declared=$(yq '.jobs | keys.[]' .github/workflows/release-gate.yml | sort | grep -vx -e gate -e nightly-report)
+          declared=$(yq '.jobs | keys.[]' .github/workflows/release-gate.yml | sort | grep -vx -e gate -e trampoline -e release-pr -e nightly-report)
           if [ "$needed" != "$declared" ]; then
             diff <(echo "$declared") <(echo "$needed") || true
             echo "Release gate needs: must name every other job in release-gate.yml" >&2
@@ -415,21 +483,61 @@ jobs:
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
           echo "$NEEDS" | jq -e '[.[].result] | all(. == "success" or . == "skipped")' > /dev/null
 
-  # The nightly tick alone (a dispatch by the App, `stow-ci[bot]`; an
-  # operator's manual dispatch is not one), after the gate: a failure comments on the open
-  # `nightly` issue — filing one when none is open — and a pass closes
-  # every open one. It needs the legs and the gate so `needs` carries
-  # their results; `if: always()` because a failed leg must not silence
-  # it. The gate's needs-cover check exempts this job.
+  # A passed gate certifies the commit: release-plz opens the release PR from
+  # it and the `Certified` status is set on it. The release PR's head is the
+  # certified commit plus the version bump, and `release-plz.yml` releases
+  # that head only. The release PR App's token opens the PR so its own
+  # checks run; the status is written with the run's GITHUB_TOKEN, the one
+  # identity the release job accepts it from.
+  release-pr:
+    needs: gate
+    if: needs.gate.result == 'success'
+    name: Release PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      statuses: write # the Certified status
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ vars.STOW_APP_ID }}
+          private-key: ${{ secrets.STOW_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: release-plz@0.3.169
+      - name: Open the release PR from the certified commit
+        env:
+          CERTIFIED_SHA: ${{ inputs.sha || github.sha }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          STATUS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: scripts/release-pr.sh "$CERTIFIED_SHA"
+
+  # The nightly run alone (`nightly=true`, set by the trampoline), after the
+  # gate: a failure comments on the open `nightly` issue — filing one when
+  # none is open — and a pass closes every open one. It needs the legs and
+  # the gate so `needs` carries their results; `if: always()` because a
+  # failed leg must not silence it. The gate's needs-cover check exempts
+  # this job.
   nightly-report:
     needs:
       - mock-e2e
+      - release-flow
       - traffic-cost
       - preheat-cost
       - production-wave
       - projection
       - gate
-    if: always() && github.event_name == 'workflow_dispatch' && github.triggering_actor == 'stow-ci[bot]'
+    if: always() && inputs.nightly
     name: Nightly report
     runs-on: ubuntu-26.04
     permissions:
@@ -440,20 +548,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           NEEDS: ${{ toJSON(needs) }}
+          CERTIFIED_SHA: ${{ inputs.sha || github.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           failed=$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key] | join(", ")')
           open_issues=$(gh issue list --label nightly --state open --json number --jq '.[].number')
           if [ -n "$failed" ]; then
-            body=$(printf 'Nightly release gate failed on commit %s.\n\nFailed jobs: %s\nRun: %s\n' "$GITHUB_SHA" "$failed" "$RUN_URL")
+            body=$(printf 'Nightly release gate failed on commit %s.\n\nFailed jobs: %s\nRun: %s\n' "$CERTIFIED_SHA" "$failed" "$RUN_URL")
             if [ -n "$open_issues" ]; then
               gh issue comment "$(echo "$open_issues" | head -n 1)" --body "$body"
             else
               gh issue create --title "Nightly release gate failed" --label nightly --body "$body"
             fi
           elif [ -n "$open_issues" ]; then
-            body=$(printf 'Nightly release gate passed on commit %s.\n\nRun: %s\n' "$GITHUB_SHA" "$RUN_URL")
+            body=$(printf 'Nightly release gate passed on commit %s.\n\nRun: %s\n' "$CERTIFIED_SHA" "$RUN_URL")
             while read -r issue; do
               gh issue comment "$issue" --body "$body"
               gh issue close "$issue"

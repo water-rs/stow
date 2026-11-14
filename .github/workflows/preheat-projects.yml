@@ -8,16 +8,16 @@ name: Regenerate the projects list
 # live: preheat-admin.yml reads the merged file.
 #
 # The pull request is created through GitHub's API rather than `git
-# commit` + `gh pr`, because `dev`'s ruleset requires signed commits and
+# commit` + `gh pr`, because `main`'s ruleset requires signed commits and
 # a `github-actions[bot]` commit is unsigned: peter-evans/create-pull-request
 # writes the commit through the GraphQL `createCommitOnBranch` mutation
 # (`sign-commits: true`), which GitHub signs itself. It also refreshes a
 # still-open regeneration PR in place and no-ops on an empty diff, which
 # replaces the hand-written branch/force-push/`gh pr` shell entirely.
 #
-# The edge Cron Trigger dispatches it on `dev` (`30 5 * * 1`,
-# `STOW_PERIODIC_WORKFLOWS`, stow#1121): the pull request opens against
-# the branch the run checked out.
+# The edge Cron Trigger dispatches it on its own release tag (`30 5 * * 1`,
+# `STOW_PERIODIC_WORKFLOWS`, stow#1121): the run checks out `main` and the
+# pull request opens against it.
 on:
   workflow_dispatch:
 
@@ -36,6 +36,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
@@ -72,4 +74,5 @@ jobs:
           title: "preheat: regenerate the projects list"
           body-path: /tmp/pr-body.md
           branch: preheat/projects-list
+          base: main
           sign-commits: true

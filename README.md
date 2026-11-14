@@ -127,8 +127,10 @@ so the rest of the graph still resolves.
 
 ## Why you can trust it
 
-- Artifacts are built only by `build-crate.yml` on the `main` branch of
-  this repository, on GitHub-hosted runners, in public. Third-party build
+- Artifacts are built only by `build-crate.yml` at a release tag of this
+  repository (a `v<MAJOR.MINOR.PATCH>` tag that only the release workflow
+  can create, on a commit that passed the release gate), on GitHub-hosted
+  runners, in public. Third-party build
   scripts run in a sandboxed job that holds no credentials; a separate job
   re-checks the output and signs it.
 - Every artifact and every index slice carries a keyless Sigstore

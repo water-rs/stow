@@ -124,7 +124,12 @@ the run, so publish never calls the edge); `stow-build serve --listen
 <host:port>` is the dev-only local dispatch endpoint. Both stages read the
 task from the dispatch event file `GITHUB_EVENT_PATH` names
 (`.inputs.task`, a JSON `BuildTaskPayload`) — the dispatched
-`build-crate.yml` run's `workflow_dispatch`.
+`build-crate.yml` run's `workflow_dispatch`. `stow-build resign
+--rustc-version <rustc> --concurrency <n>` is the one-time sweep that
+re-signs a rustc's repository under the release tag it runs at
+(`resign.yml`, `docs/DEPLOYMENT.md`); it takes the registry and signing
+variables of `publish` below and prints its counts as JSON. It is removed
+by stow#1517.
 
 | Variable | Stage | Purpose |
 |---|---|---|
@@ -139,11 +144,11 @@ task from the dispatch event file `GITHUB_EVENT_PATH` names
 | `STOW_GLIBC_SYSROOT` | build (set by the Linux build of `build-crate.yml`) | Root of the glibc-2.28 sysroot the Linux build job installs under `$HOME/stow-glibc-2.28` — the heel sandbox grants the whole tree to the untrusted crate build so its compiles and links read the sysroot's headers and libraries. The job's PATH shim dir (`<root>/bin`, canonical driver names carrying `-B`/`--sysroot`) is reached through the `PATH` passthrough; `STOW_GLIBC_SYSROOT` itself rides the toolchain passthrough like every other `CC_*`/`CARGO_TARGET_*` variable. |
 | `STOW_SYSTEM_LIBS` | build (set by the Linux build of `build-crate.yml`) | Root of the system-library tree `ci/system-libs/install.sh` extracts from the sha256-locked debs under `$HOME/stow-system-libs` (stow#850) — amd64 and arm64 headers, `.pc` files and libraries the pkg-config, shim, bindgen and CMake lookups are pointed at. The heel sandbox grants read+exec on the whole tree through the toolchain passthrough, like `STOW_GLIBC_SYSROOT`. |
 | The toolchain passthrough: `CC` / `CXX` / `AR` / `RANLIB`, `CFLAGS` / `CXXFLAGS` / `CPPFLAGS` / `LDFLAGS`, `SDKROOT` / `DEVELOPER_DIR`, the MSVC developer environment (`LIB`, `INCLUDE`, `VCINSTALLDIR`, `VCToolsInstallDir`, `WindowsSdkDir`, `WindowsSdkBinPath`, `WindowsSdkVerBinPath`, `WindowsSDKVersion`, `WindowsSDKLibVersion`, `UniversalCRTSdkDir`, `UCRTVersion`), `CMAKE_PREFIX_PATH`, and every name beginning `CARGO_TARGET_` (except `CARGO_TARGET_DIR`), `CC_`, `CXX_`, `AR_`, `RANLIB_`, `CFLAGS_`, `CXXFLAGS_`, `CPPFLAGS_`, `LDFLAGS_`, `PKG_CONFIG_` or `BINDGEN_EXTRA_CLANG_ARGS` | build (set by the job) | Handed unchanged into the sandboxed crate build; the Android SDK/NDK roots (`ANDROID_HOME`, `ANDROID_SDK_ROOT`, `ANDROID_NDK`, `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, `ANDROID_NDK_LATEST_HOME`) pass only to an Android task. The aarch64 Linux build sets `PKG_CONFIG_aarch64_unknown_linux_gnu=aarch64-linux-gnu-pkg-config`, per target so a build script compiling for the host keeps the native one; the name resolves to the sysroot-written wrapper whose `PKG_CONFIG_LIBDIR` is the arm64 half of `STOW_SYSTEM_LIBS` plus the image's `/usr/share/pkgconfig`. `env.sh` also exports, per architecture half the root carries, `PKG_CONFIG_PATH_x86_64_unknown_linux_gnu` and `BINDGEN_EXTRA_CLANG_ARGS_<target>` (the root's `-isystem` include dirs), plus `CMAKE_PREFIX_PATH=<root>/usr`. |
-| `GHCR_USERNAME` / `GHCR_TOKEN` | publish, repack, records-exist | Registry credential the bundles, records artifacts and their signature images are pushed with (and the records-exist check reads with). Required. |
-| `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | publish, repack | Endpoint + bearer Actions injects into a job granted `id-token: write`. The keyless signer mints the job's `sigstore`-audience OIDC token from them for each Fulcio certificate — one per validity window, reused by every signature the process makes while more than four minutes of it remain. Required; their absence fails the stage before anything is pushed. |
-| `STOW_GHCR_WRITES_PER_MINUTE` | publish, repack, records-exist | Operator setting: registry writes (`POST`/`PUT`/`PATCH`) per minute the process sends to GHCR, held by one token bucket every push session in the process shares (refilled at this rate, holding one second of it; a retried write takes a token too). Default `1500`: three quarters of GHCR's 2000-a-minute namespace write cap, leaving 500 a minute to the build and index publishes writing into the same namespace while a repack sweep runs. Any positive whole number; no ceiling. `0` or a non-number fails the run. |
-| `GITHUB_RUN_ID` / `GITHUB_RUN_ATTEMPT` | publish | Actions run identity the records artifact's per-build tag carries — `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`. Both must be numeric; the Actions runner injects them into every job's environment. Required. |
-| `STOW_CACHE_DIR` | publish, repack, records-exist | Fulcio/Rekor trust material cache the records-marker signature verification and the keyless signer's check of its own signatures write through to. Default is `stow` under the platform cache directory (`~/Library/Caches/stow` on macOS, `$XDG_CACHE_HOME/stow` or `~/.cache/stow` on Linux, `%LOCALAPPDATA%\stow` on Windows) — `HOME` is never read, which a Windows runner has none of; the variable overrides it. |
+| `GHCR_USERNAME` / `GHCR_TOKEN` | publish, repack, resign, records-exist | Registry credential the bundles, records artifacts and their signature images are pushed with (and the records-exist check reads with). Required. |
+| `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | publish, repack, resign | Endpoint + bearer Actions injects into a job granted `id-token: write`. The keyless signer mints the job's `sigstore`-audience OIDC token from them for each Fulcio certificate — one per validity window, reused by every signature the process makes while more than four minutes of it remain. Required; their absence fails the stage before anything is pushed. |
+| `STOW_GHCR_WRITES_PER_MINUTE` | publish, repack, resign, records-exist | Operator setting: registry writes (`POST`/`PUT`/`PATCH`) per minute the process sends to GHCR, held by one token bucket every push session in the process shares (refilled at this rate, holding one second of it; a retried write takes a token too). Default `1500`: three quarters of GHCR's 2000-a-minute namespace write cap, leaving 500 a minute to the build and index publishes writing into the same namespace while a repack sweep runs. Any positive whole number; no ceiling. `0` or a non-number fails the run. |
+| `GITHUB_RUN_ID` / `GITHUB_RUN_ATTEMPT` | publish, resign | Actions run identity the records artifact's per-build tag carries — `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`. Both must be numeric; the Actions runner injects them into every job's environment. Required. |
+| `STOW_CACHE_DIR` | publish, repack, resign, records-exist | Fulcio/Rekor trust material cache the records-marker signature verification and the keyless signer's check of its own signatures write through to. Default is `stow` under the platform cache directory (`~/Library/Caches/stow` on macOS, `$XDG_CACHE_HOME/stow` or `~/.cache/stow` on Linux, `%LOCALAPPDATA%\stow` on Windows) — `HOME` is never read, which a Windows runner has none of; the variable overrides it. |
 | `STOW_MOCK_PUBLIC_KEY_PATH` | records-exist | Mock cosign key the records-marker verification trusts under a mock registry — honoured only by a `stow-build` built with the `mock-verify` feature; a build without it errors when the variable is set. `publish` and `repack` refuse it: their keyless signer checks its signatures against the Fulcio/Rekor trust root, which the mock key is not. |
 | `STOW_EDGE_URL` | serve | Edge base URL the local server's `workflow_run` webhook POSTs to. Required. |
 | `STOW_GITHUB_WEBHOOK_SECRET` | serve | HMAC key the webhook signature is computed with — the same value the edge verifies `X-Hub-Signature-256` against. Required. |
@@ -151,6 +156,7 @@ task from the dispatch event file `GITHUB_EVENT_PATH` names
 | `STOW_NEWRELEASES_WEBHOOK_SECRET` | serve | Signing secret of the newreleases.io webhook on `rust-lang/rust` releases (stow#880) — the value the subscription's *Key* shows, which the edge verifies `X-Newreleases-Signature` (hex HMAC-SHA256 of `<X-Newreleases-Timestamp>.<body>`, timestamp inside ±300 s) against on `POST /api/v1/newreleases/release`. Required. |
 | `STOW_OIDC_AUDIENCE` | publish (Actions) | `aud` for the edge OIDC token minted when a publish step calls a trusted edge route (the publish's `index report`/`index reconcile`); unused when the run only pushes GHCR artifacts. |
 | `STOW_MOCK_PRIVATE_KEY_PATH` / `STOW_MOCK_REGISTRY_ROOT` | serve | Mock cosign signing key and mock registry root the local dispatcher populates. Required. |
+| `STOW_MOCK_GIT_ROOT` | serve | Optional. A directory of bare `<owner>/<repo>.git` repositories; when set, the server also answers the mock GitHub REST (`/api/v3/…`) and GraphQL (`/api/graphql`) endpoints `scripts/release-flow-e2e.sh` runs release-plz and the release scripts against (`docs/MOCK.md`). Unset, those routes are refused. |
 | `STOW_LOCAL_CI_STUB` | serve | **Mock/test-only.** When set (any value), the local CI server short-circuits each task's build and publish work — the dispatch POST the budget probe and the launch-load run measure stays real, while a stubbed run still pushes the task's (empty) records artifact and completes through the same signed `workflow_run` webhook. |
 | `RUST_LOG` | unset (defaults to `info,stow_oci::client=debug`) | Standard tracing-env-filter directive. The default keeps `stow_oci`'s per-attempt registry retry lines — `debug` for end users (stow#633), visible in CI logs here. |
 
@@ -211,6 +217,26 @@ credential is involved (`docs/MOCK.md`).
 | `STOW_PRODUCTION_WAVE_DEADLINE` | `3300` | Seconds each lane may run before it is killed; the count then refuses the lane. |
 | `STOW_RESOLVE_CARGO_HOME` | `$WORK_DIR/resolve-cargo` | The shared resolve root the script exports to each lane as `<root>/<NN>-<lane>` — separate per lane because the lanes run concurrently and a worker's resolve holds cargo's exclusive package-cache lock. Point it at a directory kept between runs so a later run skips the cold index/`.crate` fetch. |
 | `STOW_E2E_TOOLCHAIN` | `stable` | The rustup toolchain whose version the lanes resolve for (`RUSTUP_TOOLCHAIN`). |
+
+## scripts/release-flow-e2e.sh
+
+The release gate's `release-flow` leg (`docs/MOCK.md`): the release PR,
+the release of its head commit and a refused release PR with an extra
+commit, on a mock GitHub. It needs `release-plz`, `git` 2.38 or newer,
+`curl` and `jq` on `PATH` and no credential.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STOW_RELEASE_FLOW_WORK_DIR` | fresh `mktemp -d` under `TMPDIR`, removed on success | Work dir: the bare repositories, the clones and `logs/`. Must be empty when given, and is kept. |
+| `STOW_GATE_BIN_DIR` | unset | Directory holding a built `stow-build`. When unset the script builds the production gate tools. |
+| `STOW_E2E_FORGE_PORT` | `28125` | Port `stow-build serve` binds the mock GitHub on. |
+
+The two release scripts it runs read `GITHUB_REPOSITORY`, `GITHUB_API_URL`
+(the REST API root, which Actions sets), `GITHUB_TOKEN`, `STATUS_TOKEN` and
+`RUN_URL` (`scripts/release-pr.sh`), `GH_TOKEN`, `RELEASE_PR_AUTHOR` and
+`GITHUB_OUTPUT` (`scripts/release-resolve.sh`), and `RELEASE_PLZ_ARGS`
+(extra release-plz arguments, split on whitespace, which the script passes
+to name the mock forge); the workflows set them.
 
 ## scripts/mock-e2e.sh
 
@@ -330,7 +356,7 @@ oidc-token`.
 | `STOW_COST_BUDGET_MULTIPLIER` | `1.0` | Scales the scheduler DO's daily SQL budget — it self-meters `rowsRead`/`rowsWritten` off every statement's cursor and freezes dispatch the moment the day passes (80% of the monthly Workers Paid allowance / 30 — the stow#883 line's daily share) × this value; `0.5` trips at 40% of the allowance. `edge/Skyzen.mock.toml` inflates it (`10000`) so the budget probe's destructive fixture seeds — millions of billed writes — never trip the freeze; the production value lives in `edge/Skyzen.toml`. |
 | `STOW_ALERT_FROM` | `alerts@stow.waterui.dev` | Sender address of the freeze/clear alert emails; must live on a domain onboarded and Enabled under Compute → Email Service → Email Sending (`E_SENDER_NOT_VERIFIED` otherwise). |
 | `STOW_ALERT_TO` | `me@lexo.cool` | Recipient of the freeze/clear transition alert emails — should match the binding's `allowed_destination_addresses`. |
-| `STOW_PERIODIC_WORKFLOWS` | _set in `Skyzen.toml`; required by the scheduled handler_ | JSON object mapping each cron expression of `[cloudflare.triggers] crons` to the workflows the Cron Trigger dispatches when that cron fires. An entry is a workflow file name (`*.yml`), dispatched on `main`, or `{"workflow": "test.yml", "ref": "dev"}` to dispatch on `dev` (`main` and `dev` are the only refs), e.g. `{"*/15 * * * *": ["watchdog.yml"], "0 7 * * *": [{"workflow": "test.yml", "ref": "dev"}]}`. A tick whose cron is not a key fails and is mailed. Keep its keys equal to `crons` (a test pins it). `edge/Skyzen.mock.toml` carries the same map. |
+| `STOW_PERIODIC_WORKFLOWS` | _set in `Skyzen.toml`; required by the scheduled handler_ | JSON object mapping each cron expression of `[cloudflare.triggers] crons` to the workflows the Cron Trigger dispatches when that cron fires. An entry is a workflow file name (`*.yml`), dispatched on the edge's own release tag (`v<version>`); an entry names no ref, e.g. `{"*/15 * * * *": ["watchdog.yml"], "0 7 * * *": ["release-gate.yml"]}`. A tick whose cron is not a key fails and is mailed. Keep its keys equal to `crons` (a test pins it). `edge/Skyzen.mock.toml` carries the same map. |
 | `STOW_ALERT_EMAIL` | _declared in `Skyzen.toml` only_ (`send_email` binding, `remote = true`) | Email Service send binding the alert emails go through — `send({to, from, subject, text, html})`. The mock/local manifests deliberately omit it, so their alert path resolves to `Disabled` and can never reach Cloudflare's sending API. |
 | `TURNSTILE_SITE_KEY` | `0x4AAAAAAE8LjhnMsqdVhiSp` | Public site key of the invisible Turnstile widget the request page renders; paired with `TURNSTILE_SECRET_KEY`. Mock fixtures use Cloudflare's always-pass test key `1x00000000000000000000AA`. |
 | `TURNSTILE_HOSTNAME` | `stow.waterui.dev` | Hostname the Turnstile widget is registered for; a `POST /api/v1/requests` token whose siteverify report names another host is rejected `hostname-mismatch`. Mock fixtures use `example.com`, the hostname Cloudflare's test keys always report. |
@@ -372,6 +398,6 @@ ledger. Semantics the operator knobs expose:
   second job finding the hour frozen delivers rather than
   re-materializing.
 - Ordering: the workflow pulls the signed `stow-admin` binary of the
-  merge-queue head of `main`; the command ships with this change so
+  release's commit; the command ships with this change so
   ticks fail visibly until a released toolchain carries it — no
   per-hour toolchain build, no new alert cron.

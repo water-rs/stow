@@ -3,8 +3,11 @@
 import { expect } from "vitest";
 
 const ISSUER = "https://token.actions.githubusercontent.com";
-const WORKFLOW =
-	"water-rs/stow/.github/workflows/preheat-admin.yml@refs/heads/main";
+// Injected by vitest.config.ts: `v` and the workspace version.
+declare const RELEASE_TAG: string;
+/** The ref the edge under test admits and dispatches on. */
+export const RELEASE_REF = `refs/tags/${RELEASE_TAG}`;
+const WORKFLOW = `water-rs/stow/.github/workflows/preheat-admin.yml@${RELEASE_REF}`;
 const CONTROL = "http://127.0.0.1:28123/__control/jwks";
 const RS256 = { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" } as const;
 
@@ -61,7 +64,7 @@ export function claims(overrides: Record<string, unknown> = {}) {
 		workflow_ref: WORKFLOW,
 		run_id: "12345",
 		run_attempt: "1",
-		ref: "refs/heads/main",
+		ref: RELEASE_REF,
 		actor: "octo-dispatcher",
 		...overrides,
 	};

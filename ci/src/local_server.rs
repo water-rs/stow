@@ -125,6 +125,9 @@ pub struct LocalServerState {
     /// The bound listen address, filled by `serve` — the `html_url` a
     /// mock run reports.
     pub listen: SocketAddr,
+    /// The release flow's mock GitHub (stow#1514), served under
+    /// `/api/v3` and `/api/graphql` when a repository root is given.
+    pub release: Option<Arc<crate::local_release::ReleaseForge>>,
 }
 
 impl std::fmt::Debug for LocalServerState {
@@ -164,7 +167,16 @@ impl LocalServerState {
             next_id: Arc::new(AtomicU64::new(1)),
             runners,
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            release: None,
         }
+    }
+
+    /// Serves the release flow's mock GitHub over the bare repositories
+    /// under `root`.
+    #[must_use]
+    pub fn with_release_forge(mut self, root: PathBuf) -> Self {
+        self.release = Some(Arc::new(crate::local_release::ReleaseForge::new(root)));
+        self
     }
 
     /// The `triggering_actor.login` a run dispatched through this
@@ -784,6 +796,10 @@ fn build_router(state: LocalServerState) -> Router {
         "/repos/{owner}/{repo}/actions/runs/{id}".at(get_run),
         "/repos/{owner}/{repo}/actions/runs/{id}/attempts/{attempt}/jobs".at(get_attempt_jobs),
         "/repos/{owner}/{repo}/actions/runs/{id}/cancel".post(cancel_run),
+        // The release flow's GitHub (stow#1514): release-plz addresses a
+        // non-github.com host under `/api/v3` and `/api/graphql`.
+        "/api/v3".route(crate::local_release::routes()),
+        "/api/graphql".post(crate::local_release::graphql),
     ))
     .with(State(state))
     .build()
@@ -872,7 +888,7 @@ fn run_response(state: &LocalServerState, run_id: u64) -> Response {
             "html_url": run.html_url,
             "path": run.path,
             "event": "workflow_dispatch",
-            "head_branch": stow_types::trusted_builder::BRANCH,
+            "head_branch": stow_types::trusted_builder::RELEASE_TAG,
             "triggering_actor": {"login": run.triggering_actor_login},
         }),
         StatusCode::OK,
@@ -943,7 +959,7 @@ async fn list_workflow_runs(
                 "html_url": run.html_url,
                 "path": run.path,
                 "event": "workflow_dispatch",
-                "head_branch": stow_types::trusted_builder::BRANCH,
+                "head_branch": stow_types::trusted_builder::RELEASE_TAG,
                 "triggering_actor": {"login": run.triggering_actor_login},
             })
         })
@@ -1514,7 +1530,7 @@ fn dispatch_response(run: &WorkflowRunReport) -> DispatchResponse {
     }
 }
 
-fn json_response(payload: &impl serde::Serialize, status: StatusCode) -> Response {
+pub fn json_response(payload: &impl serde::Serialize, status: StatusCode) -> Response {
     let body = serde_json::to_vec(payload).expect("response always serializes");
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
@@ -2142,7 +2158,7 @@ async fn post_workflow_run(
             "path": format!(".github/workflows/{}", run.workflow_file),
             "event": "workflow_dispatch",
             "display_title": run.display_title,
-            "head_branch": stow_types::trusted_builder::BRANCH,
+            "head_branch": stow_types::trusted_builder::RELEASE_TAG,
             "conclusion": run.conclusion,
             "html_url": run.html_url,
             "head_repository": {"full_name": stow_types::trusted_builder::REPOSITORY},

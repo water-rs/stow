@@ -15,12 +15,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use futures_util::StreamExt as _;
+use stow_oci::verify::ReleaseIdentity;
 use stow_oci::{Publisher, RegistryHttp, RegistrySession};
 use stow_types::api::ArtifactRecord;
 use stow_types::identity::WireRustcVersion;
 use stow_types::records::{BuildRun, parse_records_tag};
 use stow_types::registry::cache_repository;
-use stow_types::trusted_builder::CERTIFICATE_IDENTITY;
+use stow_types::trusted_builder::TrustedWorkflow;
 
 /// What one sweep did.
 #[derive(Debug, Default, serde::Serialize)]
@@ -64,7 +65,7 @@ pub async fn run(
 ) -> stow_types::error::Result<Sweep> {
     let http = RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
     let trust = stow_oci::verify::records_trust().await?;
-    let publisher = Publisher::from_env(http, &trust, CERTIFICATE_IDENTITY)?;
+    let publisher = Publisher::from_env(http, &trust, TrustedWorkflow::BUILD)?;
     let session = publisher.session(&cache_repository(rustc_version))?;
     let tags = stow_oci::list_records_tags(&session)
         .await
@@ -111,7 +112,7 @@ pub async fn run(
 /// The `records-*` tags of `rustc_version` grouped by task, each group
 /// newest build first — the reverse of the order the index fold applies
 /// them in.
-fn tasks_newest_first<'a>(
+pub fn tasks_newest_first<'a>(
     tags: &'a [String],
     rustc_version: &WireRustcVersion,
 ) -> Vec<Vec<&'a str>> {
@@ -150,7 +151,7 @@ impl Sweeper<'_> {
                 &reference,
                 &cache_repository(self.rustc_version).reference(tag),
                 &records.manifest_digest,
-                CERTIFICATE_IDENTITY,
+                &ReleaseIdentity::new(TrustedWorkflow::BUILD),
             )
             .await?;
             pulled.push(records);
@@ -179,7 +180,7 @@ impl Sweeper<'_> {
             let row = stow_oci::repack_record(
                 self.session,
                 self.trust,
-                CERTIFICATE_IDENTITY,
+                &ReleaseIdentity::new(TrustedWorkflow::BUILD),
                 record,
                 &sign,
             )

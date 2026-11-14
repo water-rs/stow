@@ -6,8 +6,7 @@ inputs:
   version:
     description: >-
       stow-cli release to install: `latest` or a version matching the
-      `stow-cli-v<version>` release tag (a bare `v<version>` or the full tag
-      name also work).
+      `v<version>` release tag (a bare `<version>` also works).
     required: false
     default: latest
   edge-url:
@@ -45,17 +44,16 @@ runs:
           # cargo-dist has attached the archives, so a release without assets
           # is still in flight and is skipped.
           tag="$(gh api 'repos/water-rs/stow/releases?per_page=100' \
-            --jq '[.[] | select(.draft == false and .prerelease == false) | select(any(.assets[]; .name | startswith("stow-cli-"))) | .tag_name | select(startswith("stow-cli-v"))][0] // empty')"
+            --jq '[.[] | select(.draft == false and .prerelease == false) | select(any(.assets[]; .name | startswith("stow-cli-"))) | .tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0] // empty')"
           if [ -z "$tag" ]; then
-            echo "::error::no installable stow-cli-v* release found on water-rs/stow" >&2
+            echo "::error::no installable v<version> release found on water-rs/stow" >&2
             exit 1
           fi
         else
-          version="${version#stow-cli-v}"
           version="${version#v}"
-          tag="stow-cli-v${version}"
+          tag="v${version}"
         fi
-        version="${tag#stow-cli-v}"
+        version="${tag#v}"
 
         case "${{ runner.os }}-${{ runner.arch }}" in
           Linux-X64) target=x86_64-unknown-linux-gnu ;;
@@ -113,13 +111,13 @@ runs:
         if ($version -eq 'latest') {
           # The newest installable release; see the bash step.
           $tag = gh api 'repos/water-rs/stow/releases?per_page=100' `
-            --jq '[.[] | select(.draft == false and .prerelease == false) | select(any(.assets[]; .name | startswith("stow-cli-"))) | .tag_name | select(startswith("stow-cli-v"))][0] // empty'
+            --jq '[.[] | select(.draft == false and .prerelease == false) | select(any(.assets[]; .name | startswith("stow-cli-"))) | .tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0] // empty'
           if ($LASTEXITCODE -ne 0) { throw 'gh api failed while listing releases' }
-          if (-not $tag) { throw 'no installable stow-cli-v* release found on water-rs/stow' }
+          if (-not $tag) { throw 'no installable v<version> release found on water-rs/stow' }
         } else {
-          $tag = 'stow-cli-v' + ($version -replace '^stow-cli-v', '' -replace '^v', '')
+          $tag = 'v' + ($version -replace '^v', '')
         }
-        $version = $tag -replace '^stow-cli-v', ''
+        $version = $tag -replace '^v', ''
 
         $target = switch ("${{ runner.os }}-${{ runner.arch }}") {
           'Windows-X64' { 'x86_64-pc-windows-msvc' }

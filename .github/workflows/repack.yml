@@ -2,7 +2,7 @@ name: repack
 
 # A repack sweep: `build-crate.yml`'s `repack` job, called as a reusable
 # workflow. The job has to run from `build-crate.yml` because the
-# certificate identity clients trust is that file on main, which a called
+# certificate identity clients trust is that file on a release tag, which a called
 # workflow's `job_workflow_ref` (Fulcio's SAN) still names. The call lives
 # in its own workflow so that `repack-followup.yml` can trigger on this one
 # alone: a `workflow_run` trigger filters by workflow name, never by run

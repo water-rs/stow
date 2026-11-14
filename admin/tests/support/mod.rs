@@ -861,16 +861,6 @@ impl<'a> Runner<'a> {
         }
     }
 
-    /// Seed a step's outputs the way the Actions engine would have
-    /// produced them (`steps.<id>.outputs.<name>`).
-    pub fn seed_output(&mut self, step: &str, name: &str, value: &str) {
-        set_path(
-            &mut self.ctx,
-            &format!("steps.{step}.outputs.{name}"),
-            Val::Str(value.to_owned()),
-        );
-    }
-
     /// The job's failure status after the steps run so far.
     #[must_use]
     pub const fn status(&self) -> Status {

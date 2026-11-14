@@ -1335,7 +1335,7 @@ impl Watcher<'_> {
                 &reference,
                 &repository.reference(&tag),
                 &pulled.manifest_digest,
-                crate::index_cmd::INDEX_CERT_URL,
+                stow_types::trusted_builder::TrustedWorkflow::INDEX,
             )
             .await?;
             let index = crate::index_cmd::decode_published_slice(

@@ -8,7 +8,7 @@ name: Preheat missed crates
 # preheat-admin.yml does, and reads Analytics Engine with a dedicated
 # account-scoped API token (`CF_ACCOUNT_ID` variable + `CF_ANALYTICS_TOKEN`
 # secret — see DEPLOYMENT.md). The edge Cron Trigger dispatches it on
-# `main` weekly (`0 6 * * 1`, `STOW_PERIODIC_WORKFLOWS`, stow#1121),
+# its own release tag weekly (`0 6 * * 1`, `STOW_PERIODIC_WORKFLOWS`, stow#1121),
 # ahead of the Monday-morning build wave.
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ on:
 permissions:
   contents: read
   # Mints the run's OIDC token — the edge's submit route admits this
-  # workflow's runs on main.
+  # workflow's runs on a release tag.
   id-token: write
 
 concurrency:
@@ -67,7 +67,7 @@ jobs:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
           # stow-admin mints a fresh Actions OIDC JWT for every edge
           # request under this audience; the submit route admits this
-          # workflow on main.
+          # workflow on a release tag.
           STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
           CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
           CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}

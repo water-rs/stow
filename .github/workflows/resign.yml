@@ -1,0 +1,53 @@
+name: resign
+
+# The one-time re-sign of a rustc's repository under the release-tag
+# identity (stow#1515): `build-crate.yml`'s `resign` job, called as a
+# reusable workflow, for the reason `repack.yml` calls its repack job: the
+# certificate identity clients trust is `build-crate.yml` on a release tag,
+# which a called workflow's `job_workflow_ref` (Fulcio's SAN) still names.
+#
+# An operator dispatches it on the release tag, once per rustc whose
+# repository holds records signed before the switch:
+#
+#   gh workflow run resign.yml --ref v<release> -f rustc=<version>
+#
+# and re-signs the rustc's index slices with `index-publish.yml`'s
+# `resign` input. Both runs are rerun-safe. The workflow is deleted
+# with the tool (stow#1517).
+
+run-name: ${{ format('{0}-resign', inputs.rustc) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      rustc:
+        description: Rustc whose repository is re-signed under the release-tag identity
+        required: true
+        type: string
+      concurrency:
+        description: Tasks the run re-signs at once
+        required: false
+        type: string
+        default: '4'
+
+permissions: {}
+
+# A run serializes per rustc: a second dispatch for the same rustc queues
+# behind the one in flight instead of racing it.
+concurrency:
+  group: ${{ format('resign-{0}', inputs.rustc) }}
+  cancel-in-progress: false
+
+jobs:
+  resign:
+    # Signing under any other ref would mint certificates no reader accepts.
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/build-crate.yml
+    # The called job's own permissions; a caller must grant at least them.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      resign_rustc: ${{ inputs.rustc }}
+      resign_concurrency: ${{ inputs.concurrency }}

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { externalBindings, outboundModules } from "./external-data.mjs";
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
@@ -28,7 +29,15 @@ import { defineConfig } from "vitest/config";
 // records check requires. No cosign material is involved on this read
 // path — the check is manifest shape, not signature verification.
 
+// The release tag the edge under test dispatches on and admits: `v` and the
+// workspace version, as `stow_types::trusted_builder::RELEASE_TAG` composes it.
+const workspaceVersion = /^version = "([^"]+)"/m.exec(
+	readFileSync(path.resolve(import.meta.dirname, "../../../Cargo.toml"), "utf8"),
+)?.[1];
+if (!workspaceVersion) throw new Error("workspace version not found in Cargo.toml");
+
 export default defineConfig(async () => ({
+	define: { RELEASE_TAG: JSON.stringify(`v${workspaceVersion}`) },
 	plugins: [
 		cloudflareTest({
 			wrangler: {

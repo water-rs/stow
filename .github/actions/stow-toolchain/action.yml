@@ -1,14 +1,14 @@
 name: stow-toolchain
 description: >-
   Download the stow toolchain artifact for a commit from GHCR, verify its
-  cosign signature against the merge-queue signing identity, and put the
+  cosign signature against the release-tag signing identity, and put the
   requested binaries on PATH.
 # toolchain-publish.yml builds stow-build and stow-cli (and on Linux
-# stow-admin) once per platform on the merge queue and pushes them to
-# ghcr.io/water-rs/stow-toolchain as `<sha>-<os>-<arch>` — the merge group head sha is exactly what main is
-# fast-forwarded to (stow#431). The pull resolves the tag to its manifest
+# stow-admin) once per platform on a release tag and pushes them to
+# ghcr.io/water-rs/stow-toolchain as `<sha>-<os>-<arch>`, where sha is the
+# release tag's commit (stow#431). The pull resolves the tag to its manifest
 # digest, cosign proves the signer was toolchain-publish.yml on a
-# gh-readonly-queue ref — only GitHub's merge queue can create those — and
+# `v<semver>` tag — only the release workflow can create those — and
 # --certificate-github-workflow-sha binds the signature to the requested
 # commit. An absent artifact or a failed verify fails the step; there is no
 # source-build fallback.
@@ -68,7 +68,7 @@ runs:
           --username "$GITHUB_ACTOR" --password-stdin
         digest="$(oras manifest fetch --descriptor "$ref" | jq -r .digest)"
         cosign verify "${repo}@${digest}" \
-          --certificate-identity-regexp '^https://github\.com/water-rs/stow/\.github/workflows/toolchain-publish\.yml@refs/heads/gh-readonly-queue/main/.+$' \
+          --certificate-identity-regexp '^https://github\.com/water-rs/stow/\.github/workflows/toolchain-publish\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
           --certificate-github-workflow-sha "$TOOLCHAIN_SHA" \
           --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
         oras pull "${repo}@${digest}" --output "$RUNNER_TEMP/stow-toolchain"
