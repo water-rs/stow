@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.1](https://github.com/water-rs/stow/compare/types/v0.21.0...types/v0.21.1) - 2026-11-14
+
+### Fixed
+
+- *(edge)* answer the status route's release tag from the edge, not the scheduler object ([#1528](https://github.com/water-rs/stow/pull/1528))
+
+### Other
+
+- Merge pull request #1534 from water-rs/dev
+
 ## [0.21.0](https://github.com/water-rs/stow/compare/types/v0.20.0...types/v0.21.0) - 2026-11-14
 
 ### Added
