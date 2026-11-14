@@ -1075,8 +1075,9 @@ async fn list_tasks(
 /// The selector resolves to ids against the graph, the resolved ids
 /// are the logged event, and the apply is the same event replay runs.
 /// Retried and promoted rows can dispatch immediately, and a
-/// cancellation frees a slot, so every non-purge verb runs a dispatch
-/// pass.
+/// cancellation frees a slot, so every non-purge verb arms the alarm
+/// at `now`; its pass sends the runs, so the request's cost does not
+/// scale with the free slots.
 async fn apply_queue_mutation(
     graph: &graph::GraphCell,
     env: WasmEnv,
@@ -1091,12 +1092,6 @@ async fn apply_queue_mutation(
         .await
         .map_err(route_error)?;
     if affected > 0 && op != stow_types::api::MutationKind::Purge {
-        dispatch_pending(&env, &db, graph.cell())
-            .await
-            .map_err(|error| {
-                tracing::error!(%error, "scheduler mutation dispatch_pending failed");
-                error
-            })?;
         schedule_alarm(&env, &db, &alarm, graph.cell())
             .await
             .map_err(|error| {
@@ -1361,8 +1356,8 @@ async fn apply_request_outcome(
 
 /// The outcome's work, shared with the budget probe's
 /// `outcome (dispatching)` drive: the report lands, then the inline
-/// pass claims every free slot — the resolve job released a layer,
-/// which is when slots sit idle (stow#940). Returns the record's
+/// pass claims one concurrent round — the resolve job released a layer,
+/// which is when slots sit idle (stow#940); the rest is the alarm's. Returns the record's
 /// status and the claimed task ids.
 pub(super) async fn request_outcome_pass(
     graph: &graph::GraphCell,
@@ -1389,7 +1384,7 @@ pub(super) async fn request_outcome_pass(
     // The enqueue's human-lane rows are eligible at once, so this
     // request fans them out itself; the pass ends before the response
     // (stow#444).
-    let claimed = dispatch_pending(env, db, graph.cell())
+    let claimed = dispatch_pending(env, db, graph.cell(), COMPLETION_CLAIM_BOUND)
         .await
         .map_err(|error| {
             tracing::error!(%error, "scheduler request-outcome dispatch_pending failed");
@@ -1541,13 +1536,9 @@ async fn write_dispatch_freeze(
             tracing::warn!(?record.notify, "dispatch freeze engaged manually");
         }
         freeze::FreezeTransition::Cleared(_) => {
-            // Misses that queued during the freeze dispatch first now.
-            dispatch_pending(&env, &db, graph.cell())
-                .await
-                .map_err(|error| {
-                    tracing::error!(%error, "scheduler unfreeze dispatch_pending failed");
-                    error
-                })?;
+            // Misses that queued during the freeze dispatch first now:
+            // the plan arms the alarm at `now` and its pass sends the
+            // runs, so the request's cost does not scale with the cap.
             schedule_alarm(&env, &db, &alarm, graph.cell())
                 .await
                 .map_err(|error| {
@@ -1589,9 +1580,10 @@ async fn write_dispatch_cap(
 }
 
 /// The `set`'s work: one `DispatchCap` event appended — in force until
-/// the next `set`, there is no clear — then a dispatch pass, because a
-/// raised cap frees slots the queue may already wait on, like every
-/// slot-freeing mutation.
+/// the next `set`, there is no clear — then the wake re-plan: a raised
+/// cap frees slots the queue may already wait on, so the plan arms the
+/// alarm at `now` and its pass sends the runs; the request's cost does
+/// not scale with the cap.
 pub(super) async fn dispatch_cap_pass(
     graph: &graph::GraphCell,
     env: &WasmEnv,
@@ -1618,12 +1610,6 @@ pub(super) async fn dispatch_cap_pass(
     )
     .await
     .map_err(to_error)?;
-    dispatch_pending(env, db, graph.cell())
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "scheduler dispatch-cap dispatch_pending failed");
-            error
-        })?;
     schedule_alarm(env, db, alarm, graph.cell()).await?;
     tracing::warn!(
         jobs = set.max_concurrent_jobs,
@@ -1959,9 +1945,9 @@ async fn record_published_index(
 
 /// The slice report's work, shared with the budget probe's
 /// `index/published (dispatching)` drive: the report's append, then
-/// the inline pass claiming every free slot — a publish releases a
-/// dependency layer, which is when slots sit idle (stow#940). Returns
-/// the claimed task ids.
+/// the inline pass claiming one concurrent round — a publish releases a
+/// dependency layer, which is when slots sit idle (stow#940); the rest
+/// is the alarm's. Returns the claimed task ids.
 pub(super) async fn published_index_pass(
     graph: &graph::GraphCell,
     env: &WasmEnv,
@@ -1978,7 +1964,7 @@ pub(super) async fn published_index_pass(
     routes::slice_reports(graph, db, slices, Some(actor), now_ms())
         .await
         .map_err(route_error)?;
-    let claimed = dispatch_pending(env, db, graph.cell())
+    let claimed = dispatch_pending(env, db, graph.cell(), COMPLETION_CLAIM_BOUND)
         .await
         .map_err(|error| {
             tracing::error!(%error, "scheduler published-index dispatch_pending failed");
@@ -2016,7 +2002,7 @@ async fn run_alarm(
         meter
     };
     let result = async {
-        dispatch_pending(&env, &metered, &graph)
+        dispatch_pending(&env, &metered, &graph, u32::MAX)
             .await
             .map_err(|error| {
                 tracing::error!(%error, "scheduler alarm dispatch_pending failed");
@@ -2070,10 +2056,15 @@ pub fn loopback_url(binding: &str, url: &str) -> Result<String> {
     }
 }
 
+/// One dispatch pass claiming at most `bound` tasks: the alarm claims
+/// every free slot (`u32::MAX`); request code claims at most one
+/// concurrent POST round and leaves the rest to the alarm its plan arms
+/// at `now`.
 async fn dispatch_pending(
     env: &WasmEnv,
     db: &DurableDb,
     graph: &graph::GraphCell,
+    bound: u32,
 ) -> Result<Vec<String>> {
     let graph = ensure_graph(env, db, graph).await?;
     let settings = scheduler_settings(env, graph)?;
@@ -2088,15 +2079,7 @@ async fn dispatch_pending(
         tracing::info!("dispatch frozen — skipping dispatch pass");
         return Ok(Vec::new());
     }
-    dispatch_pass(
-        graph.cell(),
-        env,
-        db,
-        &settings,
-        u32::MAX,
-        PassReconcile::Due,
-    )
-    .await
+    dispatch_pass(graph.cell(), env, db, &settings, bound, PassReconcile::Due).await
 }
 
 /// The CI interface one pass resolves — same credential arm as

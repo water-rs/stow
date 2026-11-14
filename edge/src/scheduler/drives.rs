@@ -2934,17 +2934,18 @@ pub const DRIVES: &[Drive] = &[
     },
     Drive {
         // The operator's `set` (stow#1039): one `DispatchCap` append,
-        // then the route's own tail — the dispatch pass a raised cap's
-        // freed slots run and the wake re-plan, both under the settings
-        // the object builds after the append (the stored setting
-        // replacing the bindings' caps). The setting is sized two slots
-        // above the fixture's in-flight count so the pass claims like
-        // production's raise does. The seed stores no setting and a
-        // `set` has no clear, so the cleanup restores that state
-        // exactly: the claimed tasks return, the in-memory setting is
-        // dropped, and a snapshot makes that the store's state — the
-        // log row it covered goes with the prefix, so no later wake
-        // replays it.
+        // then the route's own tail — the wake re-plan under the
+        // settings the object builds after the append (the stored
+        // setting replacing the bindings' caps). The route runs no
+        // dispatch pass: the plan arms the alarm at `now` and the
+        // alarm's pass sends the freed slots' runs, so the drive's
+        // cost is independent of the cap. The setting is sized two
+        // slots above the fixture's in-flight count so the plan finds
+        // claimable work like production's raise does. The seed stores
+        // no setting and a `set` has no clear, so the cleanup restores
+        // that state exactly: the in-memory setting is dropped, and a
+        // snapshot makes that the store's state — the log row it
+        // covered goes with the prefix, so no later wake replays it.
         name: "POST /dispatch-cap",
         setup: Some(|_db, _shape, _settings, ctx| {
             Box::pin(async move {
@@ -2976,24 +2977,17 @@ pub const DRIVES: &[Drive] = &[
                 let raised = ctx
                     .loaded()
                     .with(|graph| settings.with_dispatch_cap(graph.dispatch_cap()));
-                let claimed = pass(db, &raised, ctx).await?;
-                let _plan = routes::wake_plan(ctx.loaded(), &raised, now_ms());
-                ctx.set_bound(BoundRun {
-                    task: claimed.join(","),
-                    run: 0,
-                });
+                let plan = routes::wake_plan(ctx.loaded(), &raised, now_ms());
+                if !matches!(plan, super::queue::AlarmPlan::At(_)) {
+                    return Err(format!(
+                        "POST /dispatch-cap drive expects a wake plan, got {plan:?}"
+                    ));
+                }
                 Ok(())
             })
         },
         cleanup: Some(|db, _shape, _settings, ctx| {
             Box::pin(async move {
-                let claimed = ctx.bound_run()?.task;
-                let ids = claimed
-                    .split(',')
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned)
-                    .collect();
-                restore_claimed(ctx, db, ids).await?;
                 ctx.loaded()
                     .with(super::graph::Graph::restore_unset_dispatch_cap);
                 routes::snapshot(ctx.loaded(), db, now_ms())
@@ -3347,7 +3341,7 @@ pub const DRIVES: &[Drive] = &[
     },
     Drive {
         // `index/published` with claimable work behind it: the report's
-        // append plus the inline pass over every free slot — on wasm
+        // append plus the inline pass over one outbound round — on wasm
         // the real `published_index_pass`, on host the same store half
         // with synthetic bindings.
         name: "POST /index/published (dispatching)",
@@ -3399,9 +3393,16 @@ pub const DRIVES: &[Drive] = &[
                     )
                     .await
                     .map_err(text)?;
-                    let claims = routes::claim_pass(ctx.loaded(), db, settings, now, u32::MAX)
-                        .await
-                        .map_err(text)?;
+                    let claims = routes::claim_pass(
+                        ctx.loaded(),
+                        db,
+                        settings,
+                        now,
+                        u32::try_from(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+                            .expect("the outbound bound fits u32"),
+                    )
+                    .await
+                    .map_err(text)?;
                     let bindings: Vec<DispatchBinding> = claims
                         .iter()
                         .zip(HOST_RUN_BASE..)
@@ -3458,7 +3459,7 @@ pub const DRIVES: &[Drive] = &[
     },
     Drive {
         // `requests outcome` on a live record: the report's merge plus
-        // the inline pass over every free slot — on wasm the real
+        // the inline pass over one outbound round — on wasm the real
         // `request_outcome_pass`, on host the same store half with
         // synthetic bindings.
         name: "POST /requests/{id}/outcome (dispatching)",
@@ -3546,9 +3547,16 @@ pub const DRIVES: &[Drive] = &[
                     )
                     .await
                     .map_err(text)?;
-                    let claims = routes::claim_pass(ctx.loaded(), db, settings, now, u32::MAX)
-                        .await
-                        .map_err(text)?;
+                    let claims = routes::claim_pass(
+                        ctx.loaded(),
+                        db,
+                        settings,
+                        now,
+                        u32::try_from(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+                            .expect("the outbound bound fits u32"),
+                    )
+                    .await
+                    .map_err(text)?;
                     let bindings: Vec<DispatchBinding> = claims
                         .iter()
                         .zip(HOST_RUN_BASE..)
