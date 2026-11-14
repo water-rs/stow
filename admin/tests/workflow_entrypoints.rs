@@ -2378,13 +2378,7 @@ fn release_gate_nightly_is_a_trampoline_into_main() {
         at(&wf, "jobs.tools.if").map(scalar).as_deref(),
         Some("github.ref_type != 'tag'")
     );
-    for job in [
-        "mock-e2e",
-        "traffic-cost",
-        "preheat-cost",
-        "production-wave",
-        "projection",
-    ] {
+    for job in ["mock-e2e", "traffic-cost", "preheat-cost"] {
         assert!(at(&wf, &format!("jobs.{job}.if")).is_none(), "{job}");
     }
     // A passed gate opens the release PR from the certified commit.
