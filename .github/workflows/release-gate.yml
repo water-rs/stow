@@ -317,6 +317,12 @@ jobs:
   # and a timeout of its own. It fails when a lane fails or plans nothing.
   production-wave:
     needs: tools
+    # Off for the switching release only: the production index is signed
+    # under the identity this release replaces until the re-sign (#1515)
+    # runs on its tag, so the wave cannot read it before that release
+    # exists. Restored once the re-sign has run; the projection skips
+    # with it.
+    if: false
     name: Production wave
     runs-on: ubuntu-26.04
     # Measured 37 minutes (the projects lane dominates), plus half.
