@@ -922,7 +922,6 @@ mod tests {
             running: 4,
             completed: 100,
             failed: 5,
-            release_tag: stow_types::trusted_builder::ReleaseTag::current(),
         }
     }
 

@@ -269,7 +269,17 @@ fn clients_connecting_as_the_drain_ends_are_answered() {
             });
         assert!(answered > 0, "a client was never answered");
     }
-    assert!(!alive(first), "the retired daemon exited");
+    wait_exited(first);
+}
+
+/// Waits for the retired daemon `pid` to exit. It closes its pipe before its
+/// process ends, so a client that finds the pipe gone can still see it alive.
+fn wait_exited(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(START_SECS);
+    while alive(pid) {
+        assert!(Instant::now() < deadline, "the retired daemon never exited");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Whether the process `pid` is running.
@@ -316,11 +326,7 @@ fn a_retired_daemon_is_succeeded_through_the_task() {
 
     // The old daemon leaves, and the connection stays open across the
     // hand-over.
-    let deadline = Instant::now() + Duration::from_secs(START_SECS);
-    while alive(first) {
-        assert!(Instant::now() < deadline, "the retired daemon never exited");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_exited(first);
 
     assert_answered(client(&run_dir), Instant::now());
     drop(connection);
