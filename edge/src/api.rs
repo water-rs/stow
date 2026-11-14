@@ -812,7 +812,10 @@ pub async fn submit_task_ids(
 pub async fn scheduler_status(
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Response, GetArtifactError> {
-    let status = scheduler_client::get_status(&scheduler).await?;
+    let status = stow_types::api::EdgeSchedulerStatus {
+        release_tag: stow_types::trusted_builder::ReleaseTag::current(),
+        scheduler: scheduler_client::get_status(&scheduler).await?,
+    };
     cacheable_json(&status, POINT_IN_TIME_NO_STORE)
 }
 

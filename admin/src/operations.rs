@@ -267,7 +267,10 @@ pub async fn dispatch_and_follow(
     refuse_loopback_edge(std::env::var(crate::STOW_EDGE_URL_ENV).ok().as_deref())?;
     let token = crate::operator_token(store)?;
     let release_tag = crate::Edge::connect(store)?
-        .get_json_retried::<stow_types::api::SchedulerStatus>(SCHEDULER_STATUS_PATH, Backoff::new())
+        .get_json_retried::<stow_types::api::EdgeSchedulerStatus>(
+            SCHEDULER_STATUS_PATH,
+            Backoff::new(),
+        )
         .await?
         .release_tag;
     let run: DispatchedRun = github::post(
