@@ -289,6 +289,13 @@ echo "[release-flow] $TAG at $HEAD, one commit on certified $CERTIFIED"
 # --- 4. an extra commit on the release branch releases nothing -------------
 
 CERTIFIED_2="$(origin_head)"
+# release-plz names a release branch by the UTC second it opens it in, and
+# the first release PR's branch stays on the remote as GitHub keeps merged
+# head branches here; two certifications never share a second, so the
+# second one waits for the clock to leave the first branch's second.
+while [ "release-plz-$(date -u +%Y-%m-%dT%H-%M-%SZ)" = "$PR_BRANCH" ]; do
+    sleep 0.2
+done
 release_pr "$CERTIFIED_2" "$WORK_DIR/pr-clone-2" >"$LOG_DIR/release-pr-2.log" 2>&1 \
     || die "the second release-pr.sh failed"
 PRS_2="$(api "$MAINTAINER_TOKEN" GET "pulls?state=open")"
