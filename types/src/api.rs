@@ -1637,10 +1637,22 @@ pub struct SchedulerStatus {
     /// a publish" from "waiting on something that will never come".
     #[serde(default)]
     pub blocked: u32,
-    /// The release tag of the deployed edge — the ref `stow-admin`
-    /// dispatches operations on.
+}
+
+/// `GET /api/v1/scheduler/status`: queue status and the answering edge's tag.
+///
+/// The tag is the ref that edge admits operations runs at, so the one
+/// `stow-admin` dispatches them on. The edge adds its own tag rather than
+/// asking the scheduler object, which runs the previous release's code
+/// while a new one is in canary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct EdgeSchedulerStatus {
+    /// The answering edge's release tag.
     #[schema(value_type = String)]
     pub release_tag: crate::trusted_builder::ReleaseTag,
+    /// The scheduler's queue status.
+    #[serde(flatten)]
+    pub scheduler: SchedulerStatus,
 }
 
 /// Request body for `POST /api/v1/requests`: a human asking for one crate
