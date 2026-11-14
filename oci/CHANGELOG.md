@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0](https://github.com/water-rs/stow/compare/oci/v0.20.0...oci/v0.21.0) - 2026-11-14
+
+### Added
+
+- [**breaking**] release from a certified commit and scope production identity to release tags ([#1518](https://github.com/water-rs/stow/pull/1518))
+
 ## [0.17.0](https://github.com/water-rs/stow/compare/stow-oci-v0.16.0...stow-oci-v0.17.0) - 2026-11-12
 
 ### Fixed
