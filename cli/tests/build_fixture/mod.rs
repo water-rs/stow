@@ -226,6 +226,9 @@ pub fn stow_build_command(
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_TARGET_DIR", target_dir)
+        // Setup placed the build directory under stow's cache; a build
+        // that wants fresh intermediates names its own (stow#1538).
+        .env("CARGO_BUILD_BUILD_DIR", target_dir)
         // The default filter, whatever the developer's shell exports: the
         // daemon routes a session's events to the driver, so the warnings
         // it logs are on this stderr, where a test can assert on them

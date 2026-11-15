@@ -68,6 +68,10 @@ pub struct SandboxRequest<'a> {
     /// The build's target directory: written and executed, since the
     /// build scripts cargo compiles run out of it.
     pub target_dir: &'a Path,
+    /// The directory `build.build-dir` places intermediates in when it is
+    /// away from the target directory: it holds the build scripts and
+    /// proc macros cargo compiles, so it is written and executed too.
+    pub build_dir: Option<&'a Path>,
     /// The daemon's runtime directory, resolved. The sandbox can neither
     /// connect to the daemon's socket nor read or write the directory at
     /// any level: a sandboxed wrapper reaches the daemon only through the
@@ -434,12 +438,7 @@ async fn confined_builder<N: NetworkPolicy>(
             // Every grant must canonicalize, and cargo has not run to create
             // the target directory — a fresh checkout, or right after
             // `cargo clean` (stow#823).
-            std::fs::create_dir_all(request.target_dir).map_err(|error| {
-                stow_types::stow_error!(
-                    "create the target directory {}: {error}",
-                    request.target_dir.display()
-                )
-            })?;
+            create_output_dirs(request)?;
             let mut grants = protect_grants(request);
             grants.extend(
                 toolchain_grants(
@@ -525,18 +524,12 @@ fn read_denylist(request: &SandboxRequest<'_>) -> ReadDenylist {
 /// written and executed, and the shim and stow binary paths may sit under
 /// a temporary directory heel does not let a process execute from.
 fn protect_grants(request: &SandboxRequest<'_>) -> Vec<(PathBuf, Access, &'static str)> {
-    let mut grants = vec![
-        (
-            request.target_dir.to_path_buf(),
-            Access::WRITE | Access::EXEC,
-            "the target directory — build scripts and proc macros are compiled here and must execute",
-        ),
-        (
-            request.runtime_executable.to_path_buf(),
-            Access::READ | Access::EXEC,
-            "the stow binary the wrapper shims resolve to",
-        ),
-    ];
+    let mut grants = output_grants(request);
+    grants.extend([(
+        request.runtime_executable.to_path_buf(),
+        Access::READ | Access::EXEC,
+        "the stow binary the wrapper shims resolve to",
+    )]);
     if let Some(dir) = request.shims_dir {
         grants.push((
             dir.to_path_buf(),
@@ -545,6 +538,38 @@ fn protect_grants(request: &SandboxRequest<'_>) -> Vec<(PathBuf, Access, &'stati
         ));
     }
     grants
+}
+
+/// The directories a build writes and executes: the target directory and,
+/// when cargo is configured to keep intermediates elsewhere, the build
+/// directory — build scripts and proc macros are compiled in them and must
+/// execute.
+fn output_grants(request: &SandboxRequest<'_>) -> Vec<(PathBuf, Access, &'static str)> {
+    let mut grants = vec![(
+        request.target_dir.to_path_buf(),
+        Access::WRITE | Access::EXEC,
+        "the target directory — build scripts and proc macros are compiled here and must execute",
+    )];
+    grants.extend(request.build_dir.map(|dir| {
+        (
+            dir.to_path_buf(),
+            Access::WRITE | Access::EXEC,
+            "the build directory — build scripts and proc macros are compiled here and must execute",
+        )
+    }));
+    grants
+}
+
+/// Create the output directories a build's grants name: every grant must
+/// canonicalize, but cargo has not run to create them — a fresh checkout,
+/// or right after `cargo clean` (stow#823).
+fn create_output_dirs(request: &SandboxRequest<'_>) -> stow_types::error::Result<()> {
+    for dir in std::iter::once(request.target_dir).chain(request.build_dir) {
+        std::fs::create_dir_all(dir).map_err(|error| {
+            stow_types::stow_error!("create the output directory {}: {error}", dir.display())
+        })?;
+    }
+    Ok(())
 }
 
 async fn run<N: heel::NetworkPolicy>(
@@ -645,12 +670,7 @@ async fn sandbox_grants(
     // The target dir is granted below and every grant must
     // canonicalize, but cargo has not run to create it — a fresh
     // checkout, or right after `cargo clean` (stow#823).
-    std::fs::create_dir_all(request.target_dir).map_err(|error| {
-        stow_types::stow_error!(
-            "create the target directory {}: {error}",
-            request.target_dir.display()
-        )
-    })?;
+    create_output_dirs(request)?;
 
     let mut grants: Vec<(PathBuf, Access, &'static str)> = request
         .source_roots
@@ -663,11 +683,7 @@ async fn sandbox_grants(
             )
         })
         .collect();
-    grants.push((
-        request.target_dir.to_path_buf(),
-        Access::WRITE | Access::EXEC,
-        "the target directory — build scripts and proc macros are compiled here and must execute",
-    ));
+    grants.extend(output_grants(request));
     grants.push((
         request.runtime_executable.to_path_buf(),
         Access::READ | Access::EXEC,
@@ -1703,6 +1719,7 @@ mod tests {
             lockfile_root: Path::new("/tmp"),
             source_roots: &[],
             target_dir: Path::new("/tmp"),
+            build_dir: None,
             run_dir: &run_dir,
             shims_dir: None,
             runtime_executable: &dummy,
@@ -1747,6 +1764,7 @@ mod tests {
             lockfile_root: Path::new("/tmp"),
             source_roots: &[],
             target_dir: Path::new("/tmp/host-target"),
+            build_dir: None,
             run_dir: &run_dir,
             shims_dir: None,
             runtime_executable: &dummy,
@@ -1762,6 +1780,7 @@ mod tests {
             lockfile_root: Path::new("/tmp"),
             source_roots: &[],
             target_dir: Path::new("/tmp/cross-target"),
+            build_dir: None,
             run_dir: &run_dir,
             shims_dir: None,
             runtime_executable: &dummy,

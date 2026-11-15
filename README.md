@@ -24,7 +24,9 @@ irm https://stow.waterui.dev/install.ps1 | iex           # Windows
 The installer puts `stow` on your `PATH` and runs `stow setup`, which wires
 `$CARGO_HOME/config.toml` so every `cargo` invocation on the machine goes
 through stow's rustc and C/C++ wrappers. On Linux it also installs mold
-and selects it as the linker. Nothing per project.
+and selects it as the linker. Nothing per project. Build intermediates live
+under stow's cache directory, one folder per workspace; final artifacts stay in
+the project's `target`. A build directory you configured yourself is kept.
 
 Then build as usual:
 

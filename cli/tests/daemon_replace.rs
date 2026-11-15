@@ -174,6 +174,7 @@ impl Project {
             .current_dir(self.dir.path())
             .env("CARGO_HOME", self.cargo_home.path())
             .env("CARGO_TARGET_DIR", self.dir.path().join(target))
+            .env("CARGO_BUILD_BUILD_DIR", self.dir.path().join(target))
             .env("CARGO_INCREMENTAL", "0")
             .env("RUSTC_WRAPPER", install.wrapper())
             .env("STOW_DAEMON_DRAIN_SECS", DRAIN_SECS);
@@ -198,6 +199,7 @@ impl Project {
         command
             .env("CARGO_INCREMENTAL", "0")
             .env("CARGO_TARGET_DIR", self.dir.path().join(target))
+            .env("CARGO_BUILD_BUILD_DIR", self.dir.path().join(target))
             .env("STOW_DAEMON_DRAIN_SECS", DRAIN_SECS)
             .env_remove("RUST_LOG");
         install.register_task(&self.run_dir());

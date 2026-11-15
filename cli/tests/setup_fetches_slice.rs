@@ -345,6 +345,7 @@ fn plain_build(
         .env("CARGO_HOME", cargo_home)
         .env("RUSTC_WRAPPER", shim)
         .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_BUILD_BUILD_DIR", target_dir)
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_INCREMENTAL", "0")
         .env("NO_COLOR", "1")
