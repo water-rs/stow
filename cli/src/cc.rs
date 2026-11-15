@@ -1187,6 +1187,20 @@ mod tests {
             .expect("publish the compiled object");
     }
 
+    /// Store a freshly compiled object and then clean the build output it
+    /// was cloned from, so on a copy-on-write volume the cached object
+    /// shares nothing and frees its full size (stow#1539).
+    #[cfg(unix)]
+    async fn store_then_clean(
+        config: &StowConfig,
+        cache_path: &std::path::Path,
+        output: &std::path::Path,
+    ) {
+        std::fs::write(output, b"object bytes").expect("write output object");
+        store(config, cache_path, output).await;
+        std::fs::remove_file(output).expect("clean the build output");
+    }
+
     #[cfg(unix)]
     fn test_config(cache_dir: PathBuf) -> StowConfig {
         StowConfig {
@@ -1787,7 +1801,7 @@ mod tests {
             .len();
 
         for key in ["key-a", "key-b", "key-c"] {
-            store(&config, &cc_dir.join(format!("{key}.o")), &output).await;
+            store_then_clean(&config, &cc_dir.join(format!("{key}.o")), &output).await;
         }
 
         let pool = crate::state_db::connect(&config.cache_dir)
@@ -1826,8 +1840,8 @@ mod tests {
 
         let first = cc_dir.join("first.o");
         let second = cc_dir.join("second.o");
-        store(&config, &first, &output).await;
-        store(&config, &second, &output).await;
+        store_then_clean(&config, &first, &output).await;
+        store_then_clean(&config, &second, &output).await;
 
         let pool = crate::state_db::connect(&config.cache_dir)
             .await
@@ -1847,7 +1861,7 @@ mod tests {
             .await
             .expect("hit on first object");
 
-        store(&config, &cc_dir.join("third.o"), &output).await;
+        store_then_clean(&config, &cc_dir.join("third.o"), &output).await;
 
         let entries = list_cc_cache_keys(&pool).await;
         assert!(

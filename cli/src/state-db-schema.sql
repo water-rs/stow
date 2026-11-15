@@ -40,11 +40,30 @@ CREATE TABLE artifact_cache_entries (
     -- stage also restricts its candidates to `Public` rows, which are
     -- exactly the standard-codegen crates.io entries.
     reach INTEGER NOT NULL,
+    -- stow#1539: the bytes of the entry's files a clone elsewhere — a
+    -- build directory's copy — still shares, as last measured at
+    -- `shared_measured_ms`; deleting the entry frees `size_bytes` minus
+    -- these. A new row is unmeasured and counts as unshared, so the cap
+    -- over-counts it until an over-cap pass measures it.
+    shared_bytes INTEGER NOT NULL DEFAULT 0,
+    shared_measured_ms INTEGER NOT NULL DEFAULT 0,
+    -- The eviction order's keys: shared entries go last, and among
+    -- equals a remote entry, which can be downloaded again, goes before
+    -- a local one, which only a compile rebuilds.
+    shared INTEGER GENERATED ALWAYS AS (shared_bytes > 0) VIRTUAL,
+    local_only INTEGER GENERATED ALWAYS AS (provenance = 'local') VIRTUAL,
     PRIMARY KEY (rustc_version, cache_key)
 );
 
-CREATE INDEX idx_artifact_cache_entries_lru
-ON artifact_cache_entries (rustc_version, last_accessed_ms, cache_key);
+CREATE INDEX idx_artifact_cache_entries_eviction
+ON artifact_cache_entries (rustc_version, shared, local_only, last_accessed_ms, cache_key);
+
+-- The shared entries an over-cap store re-measures, oldest measurement
+-- first: a deleted clone changes no row, so a recorded share is only
+-- trusted for `SHARE_REFRESH_INTERVAL_MS`.
+CREATE INDEX idx_artifact_cache_entries_shared_age
+ON artifact_cache_entries (rustc_version, shared_measured_ms)
+WHERE shared_bytes > 0;
 
 -- The closure walk of an eviction pass finds the providers of a compile
 -- key through this index (stow#1053).
@@ -111,23 +130,27 @@ END;
 -- and a store under the cap reads one row instead of the table.
 CREATE TABLE artifact_cache_totals (
     rustc_version TEXT PRIMARY KEY,
-    total_bytes INTEGER NOT NULL
+    total_bytes INTEGER NOT NULL,
+    -- stow#1539: the sum of the rows' `shared_bytes`.
+    shared_bytes INTEGER NOT NULL
 );
 
 CREATE TRIGGER artifact_cache_entries_total_insert
 AFTER INSERT ON artifact_cache_entries
 BEGIN
-    INSERT INTO artifact_cache_totals (rustc_version, total_bytes)
-    VALUES (NEW.rustc_version, NEW.size_bytes)
+    INSERT INTO artifact_cache_totals (rustc_version, total_bytes, shared_bytes)
+    VALUES (NEW.rustc_version, NEW.size_bytes, NEW.shared_bytes)
     ON CONFLICT (rustc_version)
-    DO UPDATE SET total_bytes = total_bytes + NEW.size_bytes;
+    DO UPDATE SET total_bytes = total_bytes + NEW.size_bytes,
+                  shared_bytes = shared_bytes + NEW.shared_bytes;
 END;
 
 CREATE TRIGGER artifact_cache_entries_total_resize
-AFTER UPDATE OF size_bytes ON artifact_cache_entries
+AFTER UPDATE OF size_bytes, shared_bytes ON artifact_cache_entries
 BEGIN
     UPDATE artifact_cache_totals
-    SET total_bytes = total_bytes + NEW.size_bytes - OLD.size_bytes
+    SET total_bytes = total_bytes + NEW.size_bytes - OLD.size_bytes,
+        shared_bytes = shared_bytes + NEW.shared_bytes - OLD.shared_bytes
     WHERE rustc_version = NEW.rustc_version;
 END;
 
@@ -135,7 +158,8 @@ CREATE TRIGGER artifact_cache_entries_total_delete
 AFTER DELETE ON artifact_cache_entries
 BEGIN
     UPDATE artifact_cache_totals
-    SET total_bytes = total_bytes - OLD.size_bytes
+    SET total_bytes = total_bytes - OLD.size_bytes,
+        shared_bytes = shared_bytes - OLD.shared_bytes
     WHERE rustc_version = OLD.rustc_version;
 END;
 
@@ -160,38 +184,53 @@ CREATE TABLE artifact_cache_sigstore_signatures (
 CREATE TABLE cc_cache_entries (
     cache_key TEXT PRIMARY KEY,
     size_bytes INTEGER NOT NULL,
-    last_accessed_ms INTEGER NOT NULL
+    last_accessed_ms INTEGER NOT NULL,
+    -- stow#1539: as on `artifact_cache_entries`. An object is always a
+    -- local compile, so its order key is the shared flag alone.
+    shared_bytes INTEGER NOT NULL DEFAULT 0,
+    shared_measured_ms INTEGER NOT NULL DEFAULT 0,
+    shared INTEGER GENERATED ALWAYS AS (shared_bytes > 0) VIRTUAL
 );
 
-CREATE INDEX idx_cc_cache_entries_lru
-ON cc_cache_entries (last_accessed_ms, cache_key);
+CREATE INDEX idx_cc_cache_entries_eviction
+ON cc_cache_entries (shared, last_accessed_ms, cache_key);
+
+CREATE INDEX idx_cc_cache_entries_shared_age
+ON cc_cache_entries (shared_measured_ms)
+WHERE shared_bytes > 0;
 
 -- stow#1053: the resident bytes of every C/C++ object, kept by triggers
 -- like `artifact_cache_totals`.
 CREATE TABLE cc_cache_totals (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    total_bytes INTEGER NOT NULL
+    total_bytes INTEGER NOT NULL,
+    shared_bytes INTEGER NOT NULL
 );
 
-INSERT INTO cc_cache_totals (singleton, total_bytes) VALUES (1, 0);
+INSERT INTO cc_cache_totals (singleton, total_bytes, shared_bytes) VALUES (1, 0, 0);
 
 CREATE TRIGGER cc_cache_entries_total_insert
 AFTER INSERT ON cc_cache_entries
 BEGIN
-    UPDATE cc_cache_totals SET total_bytes = total_bytes + NEW.size_bytes;
+    UPDATE cc_cache_totals
+    SET total_bytes = total_bytes + NEW.size_bytes,
+        shared_bytes = shared_bytes + NEW.shared_bytes;
 END;
 
 CREATE TRIGGER cc_cache_entries_total_resize
-AFTER UPDATE OF size_bytes ON cc_cache_entries
+AFTER UPDATE OF size_bytes, shared_bytes ON cc_cache_entries
 BEGIN
     UPDATE cc_cache_totals
-    SET total_bytes = total_bytes + NEW.size_bytes - OLD.size_bytes;
+    SET total_bytes = total_bytes + NEW.size_bytes - OLD.size_bytes,
+        shared_bytes = shared_bytes + NEW.shared_bytes - OLD.shared_bytes;
 END;
 
 CREATE TRIGGER cc_cache_entries_total_delete
 AFTER DELETE ON cc_cache_entries
 BEGIN
-    UPDATE cc_cache_totals SET total_bytes = total_bytes - OLD.size_bytes;
+    UPDATE cc_cache_totals
+    SET total_bytes = total_bytes - OLD.size_bytes,
+        shared_bytes = shared_bytes - OLD.shared_bytes;
 END;
 
 CREATE TABLE metadata_values (

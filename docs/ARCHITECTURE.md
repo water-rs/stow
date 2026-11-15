@@ -824,12 +824,19 @@ nothing on this path needs the script's `OUT_DIR` products.
 
 ### Eviction
 
-Local entries join the remote LRU: post-insert `evict_entries` runs against
-`artifact_cache_max_bytes`, `last_accessed_ms` bumps on every hit, and
-`size_bytes` charges the staged entry's bytes. Eviction is
-provenance-agnostic. C/C++ objects under `cache_dir/cc/` share the same
-budget and ordering through their `cc_cache_entries` rows — a store or a
-hit on either side of the cache moves the whole LRU.
+Local entries join the remote budget: post-insert `evict_entries` runs
+against `artifact_cache_max_bytes`, `last_accessed_ms` bumps on every hit,
+and `size_bytes` charges the staged entry's bytes. The cap counts what
+deleting an entry frees: `size_bytes` minus `shared_bytes`, the bytes a
+clone in a build directory still shares, read from the filesystem (APFS
+private size, btrfs and XFS `FIEMAP_EXTENT_SHARED` extents; nothing is
+shared elsewhere). Shares are measured lazily: a logical total within the
+cap reads only the maintained totals; over it, a store re-measures up to
+64 shares per table recorded more than a minute ago, and the pass measures
+each candidate before evicting it. Entries a clone shares go last, a remote
+entry goes before a local one, and `last_accessed_ms` breaks ties. C/C++
+objects under `cache_dir/cc/` share the same budget and ordering through
+their `cc_cache_entries` rows, as local entries.
 
 ### Trust
 
