@@ -526,36 +526,90 @@ struct ExportPass {
 type PullFut<'a, T> =
     std::pin::Pin<Box<dyn Future<Output = stow_types::error::Result<T>> + Send + 'a>>;
 
-/// Index rows keyed by the `(c_metadata, profile, unit_shape, dependency_identity)`
-/// node a unit was published for. The `(c_metadata, unit_shape)` pair is
-/// what a consumer's key space identifies, but it is not the row key:
+/// An index row's key: the `(c_metadata, profile, unit_shape,
+/// dependency_identity)` node a unit was published for.
+type RowKey = (
+    String,
+    stow_types::node_profile::NodeProfile,
+    UnitShape,
+    DependencyIdentity,
+);
+
+/// A bundle tag as one node publishes it. Within a `(target, rustc)`
+/// slice the tag is `<crate>.<version>-<target>-<rustc>-<feature hash>-
+/// <c_metadata><kind suffix>`, and `c_metadata` already hashes the
+/// crate, version and features, so `(c_metadata, artifact_kind)` names
+/// the tag. The side, profile and dependency identity complete the
+/// node's task id.
+type NodeBundle = (
+    String,
+    stow_types::artifact::ArtifactKind,
+    stow_types::public_cache::UnitSide,
+    stow_types::node_profile::NodeProfile,
+    DependencyIdentity,
+);
+
+/// Index rows keyed by [`RowKey`]. The `(c_metadata, unit_shape)` pair
+/// is what a consumer's key space identifies, but it is not the row key:
 /// two nodes that differ only in dependency context can compile to the
 /// same unit, and each keeps a row so the slice answers for both
 /// (stow#657).
-type RowsByIdentity = BTreeMap<
-    (
-        String,
-        stow_types::node_profile::NodeProfile,
-        UnitShape,
-        DependencyIdentity,
-    ),
-    ArtifactIndexRow,
->;
+///
+/// A bundle tag does not name the unit shape, so a later build of a node
+/// that publishes its unit at another shape moves the tag the earlier
+/// row's digest was published under. `by_bundle` holds the one row each
+/// node keeps per tag — the one folded last — so the row the move
+/// superseded leaves the slice.
+#[derive(Default)]
+struct RowsByIdentity {
+    rows: BTreeMap<RowKey, ArtifactIndexRow>,
+    by_bundle: BTreeMap<NodeBundle, RowKey>,
+}
 
-/// Fold `row` into `rows` under its
-/// `(c_metadata, profile, unit_shape, dependency_identity)` key — a rebuilt unit
-/// replaces its node's row, a second node publishing the same unit adds
-/// a row beside it.
+impl RowsByIdentity {
+    fn values(&self) -> impl Iterator<Item = &ArtifactIndexRow> {
+        self.rows.values()
+    }
+
+    fn into_values(self) -> impl Iterator<Item = ArtifactIndexRow> {
+        self.rows.into_values()
+    }
+}
+
+/// The bundle tag `row` was published under, as its node published it.
+fn node_bundle(row: &ArtifactIndexRow) -> stow_types::error::Result<NodeBundle> {
+    Ok((
+        row.c_metadata.as_str().to_owned(),
+        row.artifact_kind.clone(),
+        row.unit_shape.side,
+        row.node_profile,
+        row.dependency_identity()?,
+    ))
+}
+
+/// Fold `row` into `rows` under its [`RowKey`] — a rebuilt unit replaces
+/// its node's row, a second node publishing the same unit adds a row
+/// beside it — and evict the row its node published earlier under the
+/// same bundle tag at another key.
 fn fold_row(rows: &mut RowsByIdentity, row: ArtifactIndexRow) -> stow_types::error::Result<()> {
-    rows.insert(
-        (
-            row.c_metadata.as_str().to_owned(),
-            row.node_profile,
-            row.unit_shape,
-            row.dependency_identity()?,
-        ),
-        row,
+    let bundle = node_bundle(&row)?;
+    let key = (
+        row.c_metadata.as_str().to_owned(),
+        row.node_profile,
+        row.unit_shape,
+        bundle.4.clone(),
     );
+    if let Some(superseded) = rows.by_bundle.insert(bundle.clone(), key.clone())
+        && superseded != key
+    {
+        rows.rows.remove(&superseded);
+    }
+    if let Some(replaced) = rows.rows.insert(key.clone(), row) {
+        let replaced_bundle = node_bundle(&replaced)?;
+        if replaced_bundle != bundle && rows.by_bundle.get(&replaced_bundle) == Some(&key) {
+            rows.by_bundle.remove(&replaced_bundle);
+        }
+    }
     Ok(())
 }
 
@@ -693,7 +747,8 @@ where
 /// Fold the new records into the previous slices: previous rows first,
 /// then each new row through [`fold_row`] — a rebuilt unit replaces its
 /// node's row, a second node publishing the same unit adds a row beside
-/// it — and the folded set growing by every tag a record named.
+/// it, a node's newer row on a bundle tag evicts its older one — and the
+/// folded set growing by every tag a record named.
 /// `generated_at` is stamped once so every slice of the pass matches.
 fn merge_exports(
     mut prev: BTreeMap<(TargetTriple, WireRustcVersion), PrevSlice>,
@@ -708,7 +763,7 @@ fn merge_exports(
     let published: BTreeSet<(TargetTriple, WireRustcVersion)> = prev.keys().cloned().collect();
     let mut push_slice = |key: &(TargetTriple, WireRustcVersion)| {
         let prev_slice = prev.remove(key);
-        let mut merged = RowsByIdentity::new();
+        let mut merged = RowsByIdentity::default();
         if let Some(slice) = prev_slice.as_ref() {
             for row in slice.index.rows.iter().chain(&slice.index.build_scripts) {
                 fold_row(&mut merged, row.clone())?;
@@ -716,7 +771,8 @@ fn merge_exports(
         }
         // New rows fold on top of the slice's own: a re-run task
         // rebuilding the same unit under the same node replaces its
-        // row, and the sibling rule holds across the pass boundary.
+        // row — at another unit shape too, since the bundle tag moved —
+        // and the sibling rule holds across the pass boundary.
         if let Some(rows) = new_rows.get(key) {
             for row in rows.values() {
                 fold_row(&mut merged, row.clone())?;
@@ -2429,13 +2485,142 @@ mod tests {
         let dev = record_to_index_row(&shared_unit_record(&["dep-left"]));
         let mut release = dev.clone();
         release.node_profile = NodeProfile::Release;
-        let mut rows = RowsByIdentity::new();
+        let mut rows = RowsByIdentity::default();
         for row in [dev.clone(), release.clone(), dev.clone()] {
             fold_row(&mut rows, row).expect("fold row");
         }
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.values().count(), 2);
         assert!(rows.values().any(|row| row == &dev));
         assert!(rows.values().any(|row| row == &release));
+    }
+
+    /// One node's record of `aaaa1111` at `invocation`, whose bundle
+    /// carries `digest`. The bundle tag names no unit shape, so every
+    /// such record lands on one tag.
+    fn shaped_record(
+        invocation: stow_types::public_cache::UnitInvocation,
+        digest: &str,
+    ) -> ArtifactRecord {
+        let mut record = record("aaaa1111");
+        record.unit_shape.invocation = invocation;
+        record.bundle_digest = format!("sha256:{digest:0>64}");
+        record
+    }
+
+    /// A rebuild of one node that publishes its unit at another shape
+    /// moves the bundle tag: within one pass, the newer build's row is
+    /// the only one the slice keeps, whichever shape sorts first.
+    #[test]
+    fn a_newer_build_on_the_same_tag_evicts_the_older_shape_within_a_pass() {
+        use stow_types::public_cache::UnitInvocation::{Native, Target};
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        for (older, newer) in [(Target, Native), (Native, Target)] {
+            let older = shaped_record(older, "01d");
+            let newer = shaped_record(newer, "e3");
+            let tags = vec![
+                records_tag(RUSTC, "bbbb2222", build(9)),
+                records_tag(RUSTC, "bbbb2222", build(10)),
+            ];
+            let by_tag = BTreeMap::from([
+                (tags[0].clone(), vec![older]),
+                (tags[1].clone(), vec![newer.clone()]),
+            ]);
+            let pass = block_on(export_pass(
+                &tags,
+                pull_no_prev(),
+                pull_records_by_tag(by_tag),
+                false,
+                &rustc,
+            ))
+            .expect("export pass");
+            assert_eq!(
+                target_slice(&pass).index.rows,
+                [record_to_index_row(&newer)]
+            );
+        }
+    }
+
+    /// The same eviction across the pass boundary, on the build-script
+    /// list: the published slice's row on the tag leaves once a newer
+    /// build of its node publishes the unit at another shape.
+    #[test]
+    fn a_newer_build_on_the_same_tag_evicts_the_published_shape() {
+        use stow_types::public_cache::UnitInvocation::{Native, Target};
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let script = |invocation, digest| {
+            let mut script = shaped_record(invocation, digest);
+            script.artifact_kind = ArtifactKind::BuildScript;
+            script.crate_types = vec![RustCrateType::Bin];
+            script
+        };
+        let mut published = prev_index(Vec::new(), 4);
+        published.build_scripts = vec![record_to_index_row(&script(Target, "01d"))];
+        let newer = script(Native, "e3");
+        let tags = vec![
+            folded_tag(TARGET, RUSTC),
+            records_tag(RUSTC, "bbbb2222", build(10)),
+        ];
+        let by_tag = BTreeMap::from([(tags[1].clone(), vec![newer.clone()])]);
+        let pass = block_on(export_pass(
+            &tags,
+            pull_only_prev(published, [records_tag(RUSTC, "bbbb2222", build(9))].into()),
+            pull_records_by_tag(by_tag),
+            false,
+            &rustc,
+        ))
+        .expect("export pass");
+        let slice = target_slice(&pass);
+        assert_eq!(slice.index.rows, []);
+        assert_eq!(slice.index.build_scripts, [record_to_index_row(&newer)]);
+    }
+
+    /// A `--full` pass re-pulls every build of the rustc in build order,
+    /// so a superseded shape on a moved tag never survives it.
+    #[test]
+    fn a_full_pass_keeps_only_the_newest_row_on_a_tag() {
+        use stow_types::public_cache::UnitInvocation::{Native, Target};
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let older = shaped_record(Target, "01d");
+        let newer = shaped_record(Native, "e3");
+        let tags = vec![
+            folded_tag(TARGET, RUSTC),
+            records_tag(RUSTC, "bbbb2222", build(10)),
+            records_tag(RUSTC, "bbbb2222", build(9)),
+        ];
+        let by_tag = BTreeMap::from([
+            (tags[1].clone(), vec![newer.clone()]),
+            (tags[2].clone(), vec![older]),
+        ]);
+        let pass = block_on(export_pass(
+            &tags,
+            pull_no_prev(),
+            pull_records_by_tag(by_tag),
+            true,
+            &rustc,
+        ))
+        .expect("export pass");
+        assert_eq!(
+            target_slice(&pass).index.rows,
+            [record_to_index_row(&newer)]
+        );
+    }
+
+    /// Eviction follows the tag: one node's units at two shapes under
+    /// distinct bundle tags both stay.
+    #[test]
+    fn rows_on_distinct_tags_stay_side_by_side() {
+        use stow_types::public_cache::UnitInvocation::{Native, Target};
+        let first = record_to_index_row(&shaped_record(Target, "01d"));
+        // The kind suffix makes it another tag: `…-aaaa1111-dy`.
+        let mut second = record_to_index_row(&shaped_record(Native, "e3"));
+        second.artifact_kind = ArtifactKind::Dylib;
+        let mut rows = RowsByIdentity::default();
+        for row in [first.clone(), second.clone()] {
+            fold_row(&mut rows, row).expect("fold row");
+        }
+        assert_eq!(rows.values().count(), 2);
+        assert!(rows.values().any(|row| row == &first));
+        assert!(rows.values().any(|row| row == &second));
     }
 
     #[test]
