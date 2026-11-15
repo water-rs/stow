@@ -3,7 +3,7 @@ use oci_client::manifest::{OciDescriptor, OciImageManifest};
 use stow_types::error::Context;
 use stow_types::registry::{GHCR_REGISTRY_URL, verify_oci_digest};
 
-use crate::client::RegistrySession;
+use crate::client::{Presence, RegistrySession};
 
 const GHCR_USERNAME_ENV: &str = "GHCR_USERNAME";
 const GHCR_TOKEN_ENV: &str = "GHCR_TOKEN";
@@ -128,8 +128,17 @@ pub async fn pull_tagged_manifest(
     session: &RegistrySession,
     reference: &Reference,
 ) -> stow_types::error::Result<(String, OciImageManifest)> {
+    pull_tagged_manifest_as(session, reference, Presence::Unknown).await
+}
+
+/// [`pull_tagged_manifest`] under `presence`.
+pub async fn pull_tagged_manifest_as(
+    session: &RegistrySession,
+    reference: &Reference,
+    presence: Presence,
+) -> stow_types::error::Result<(String, OciImageManifest)> {
     let (bytes, digest) = session
-        .pull_manifest(reference)
+        .pull_manifest_as(reference, presence)
         .await
         .map_err(|error| stow_types::stow_error!("pull manifest {reference}: {error}"))?;
     let manifest: OciImageManifest = serde_json::from_slice(&bytes)

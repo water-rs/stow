@@ -434,6 +434,16 @@ impl RegistryHttp {
     }
 }
 
+/// Whether the caller knows the manifest it pulls exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presence {
+    /// Nothing says it exists: a `404` is the answer.
+    Unknown,
+    /// A tag listing or a pull of its artifact vouched for it: a `404` is
+    /// a stale read and is retried.
+    Listed,
+}
+
 /// One HTTP session over a `RegistryBase` — holds the process's client
 /// handle, and owns the single minted bearer and the one retry loop.
 ///
@@ -878,8 +888,55 @@ impl RegistrySession {
         &self,
         reference: &Reference,
     ) -> Result<(Vec<u8>, String), RegistryError> {
+        self.pull_manifest_as(reference, Presence::Unknown).await
+    }
+
+    /// [`pull_manifest`] for a manifest the caller already knows exists — a
+    /// tag taken from [`list_tags`], or the signature manifest of an
+    /// artifact it just pulled. The registry's read replicas lag a write
+    /// by moments, so such a manifest can answer `404` once and `200` on
+    /// the next try: a `404` is retried on the client's own backoff, up to
+    /// [`MAX_ATTEMPTS`] dispatches, before it is returned as the refusal it
+    /// then is.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`pull_manifest`].
+    pub async fn pull_listed_manifest(
+        &self,
+        reference: &Reference,
+    ) -> Result<(Vec<u8>, String), RegistryError> {
+        self.pull_manifest_as(reference, Presence::Listed).await
+    }
+
+    /// [`pull_manifest`] under `presence`.
+    pub async fn pull_manifest_as(
+        &self,
+        reference: &Reference,
+        presence: Presence,
+    ) -> Result<(Vec<u8>, String), RegistryError> {
         let selector = self.selector(reference)?;
-        self.pull_manifest_selector(&selector).await
+        let mut attempt = 1u32;
+        loop {
+            match self.pull_manifest_selector(&selector).await {
+                Err(error)
+                    if presence == Presence::Listed
+                        && error.is_not_found()
+                        && attempt < MAX_ATTEMPTS =>
+                {
+                    let delay = retry_delay(attempt, None);
+                    tracing::debug!(
+                        %reference,
+                        attempt,
+                        delay_ms = delay.as_millis(),
+                        "registry answered 404 for a manifest known to exist; retrying"
+                    );
+                    smol::Timer::after(delay).await;
+                    attempt += 1;
+                }
+                answer => return answer,
+            }
+        }
     }
 
     /// [`pull_manifest`] on a bare `tag`/`sha256:…` selector — the path a
@@ -1507,6 +1564,47 @@ mod tests {
         })
         .await
         .expect("both requests must start before either response");
+    }
+
+    const MANIFEST_UNKNOWN: &str =
+        r#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown"}]}"#;
+
+    /// A manifest the caller listed answers `404` once, then `200`: the
+    /// pull retries and returns the manifest.
+    #[tokio::test]
+    async fn listed_manifest_retries_a_404_then_succeeds() {
+        let (url, task) =
+            scripted_registry(|url| script(url, false, vec![(404, MANIFEST_UNKNOWN), (200, "{}")]))
+                .await;
+        let (session, _http) = session_on(&url).await;
+        let reference = session.reference("records-listed").expect("reference");
+        let (bytes, _digest) = session
+            .pull_listed_manifest(&reference)
+            .await
+            .expect("the retry finds the manifest");
+        assert_eq!(bytes, b"{}");
+        let lines = task.await.expect("server");
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[2].contains("/manifests/records-listed "), "{lines:?}");
+        assert!(lines[3].contains("/manifests/records-listed "), "{lines:?}");
+    }
+
+    /// A manifest nothing vouches for answers `404` once and the pull
+    /// fails at once: the script holds no second manifest answer, so a
+    /// retry would hang the server task.
+    #[tokio::test]
+    async fn unlisted_manifest_404_fails_at_once() {
+        let (url, task) =
+            scripted_registry(|url| script(url, false, vec![(404, MANIFEST_UNKNOWN)])).await;
+        let (session, _http) = session_on(&url).await;
+        let reference = session.reference("records-unlisted").expect("reference");
+        let error = session
+            .pull_manifest(&reference)
+            .await
+            .expect_err("a 404 is the answer");
+        assert!(error.is_not_found(), "{error}");
+        let lines = task.await.expect("server");
+        assert_eq!(lines.len(), 3, "{lines:?}");
     }
 
     /// `has_tags` asks for one tag, and answers from it.
