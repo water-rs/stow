@@ -12,6 +12,11 @@ use support::{PrivateDaemon, denied_registry, hermetic_stow_env};
 
 struct Machine {
     project: support::TempDir,
+    /// The cargo home lives beside the project, never inside it, as it does
+    /// for a user (and in the other sandbox tests): the sandbox grants the
+    /// project's sources read-only, and the wrapper shims under the cargo
+    /// home must stay executable.
+    _cargo_home_dir: support::TempDir,
     cargo_home: PathBuf,
     home: PathBuf,
     cache: PathBuf,
@@ -22,7 +27,8 @@ impl Machine {
         let project = support::tempdir().expect("project dir");
         let home = project.path().join("stow-home");
         let cache = home.join("stow-cache");
-        let cargo_home = project.path().join("cargo-home");
+        let cargo_home_dir = support::tempdir().expect("cargo home dir");
+        let cargo_home = cargo_home_dir.path().join("cargo-home");
         std::fs::create_dir_all(project.path().join("src")).expect("src dir");
         std::fs::write(
             project.path().join("Cargo.toml"),
@@ -39,6 +45,7 @@ impl Machine {
         support::write_global_config(&[&home], "[cache]\nremote = false\n");
         Self {
             project,
+            _cargo_home_dir: cargo_home_dir,
             cargo_home,
             home,
             cache,
