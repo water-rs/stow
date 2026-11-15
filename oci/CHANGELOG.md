@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.3](https://github.com/water-rs/stow/compare/oci/v0.21.2...oci/v0.21.3) - 2026-11-15
+
+### Fixed
+
+- *(admin)* retry a listed manifest the registry briefly answers 404 for ([#1554](https://github.com/water-rs/stow/pull/1554))
+
+### Other
+
+- Merge pull request #1559 from water-rs/dev
+
 ## [0.21.0](https://github.com/water-rs/stow/compare/oci/v0.20.0...oci/v0.21.0) - 2026-11-14
 
 ### Added
