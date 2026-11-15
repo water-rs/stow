@@ -2455,6 +2455,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
+name = "fiemap"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5df22ec34db45457baae5bc0f70f622adbf7aa2408e102fc94409ac47586e7bd"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8220,6 +8229,7 @@ dependencies = [
  "clap",
  "const-oid 0.10.2",
  "dirs 7.0.0",
+ "fiemap",
  "find-msvc-tools",
  "flate2",
  "futures-lite",

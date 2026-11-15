@@ -43,7 +43,9 @@ verify_mode = "github-ci"
 # cache_dir = "/var/cache/stow"
 
 # Soft cap on the on-disk artifact cache size in bytes. Default 20 GiB.
-# When exceeded, stow LRU-prunes old bundles in the background.
+# Bytes a build directory's clone still shares are not counted. When
+# exceeded, stow evicts unshared, re-downloadable, least recently used
+# entries first.
 # artifact_cache_max_bytes = 21474836480
 
 # Per-request HTTP timeout (seconds) for the edge worker. Default 300.

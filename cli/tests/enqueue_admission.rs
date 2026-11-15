@@ -267,6 +267,7 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         // The drain log and journals the test reads live in the target
         // dir it names here, never one cargo or the environment picks.
         .env("CARGO_TARGET_DIR", &target_dir)
+        .env("CARGO_BUILD_BUILD_DIR", &target_dir)
         .output()
         .expect("run stow-cli build");
 
@@ -371,6 +372,7 @@ fn a_failed_admission_is_named_in_the_drain_log_and_the_journal_stays() {
         // The drain log and journals the test reads live in the target
         // dir it names here, never one cargo or the environment picks.
         .env("CARGO_TARGET_DIR", &target_dir)
+        .env("CARGO_BUILD_BUILD_DIR", &target_dir)
         .output()
         .expect("run stow-cli build");
     assert!(
@@ -537,6 +539,7 @@ fn a_plain_cargo_builds_misses_are_drained_when_its_session_ends() {
             // The journal and drain log the test reads live in the
             // target dir it names here.
             .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env("CARGO_BUILD_BUILD_DIR", dir.join("target"))
             .output()
             .expect("run cargo build");
         assert!(

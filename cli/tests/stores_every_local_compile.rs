@@ -174,6 +174,7 @@ fn a_plain_builds_wrappers_exit_with_their_compilers() {
         .current_dir(dir.path())
         .env("CARGO_HOME", cargo_home.path())
         .env("CARGO_TARGET_DIR", target.path())
+        .env("CARGO_BUILD_BUILD_DIR", target.path())
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_NET_OFFLINE", "true")
         .env("RUSTC", &rustc)

@@ -155,7 +155,7 @@ BEFORE="$(counts)"
 echo "before: $BEFORE"
 [ "$(stub_ids | wc -l | tr -d ' ')" -eq 0 ] || die "the stub holds runs before the pass"
 
-# Clearing the freeze runs the dispatch pass inline in this request.
+# Clearing the freeze arms the alarm at now; its dispatch pass runs after the request.
 (api POST /api/v1/admin/dispatch-freeze '{"enabled":false}' >"$WORK/logs/unfreeze.out" 2>&1 || true) &
 UNFREEZE=$!
 PIDS+=("$UNFREEZE")

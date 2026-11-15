@@ -49,8 +49,11 @@ use zenwave::ResponseExt as _;
 
 /// Records artifacts pulled in flight per export — the shared
 /// anonymous session already honors the registry's rate limit, so this
-/// bounds in-flight work, not throughput.
-const RECORDS_PULL_CONCURRENCY: usize = 16;
+/// bounds in-flight work, not throughput. A pull is one registry round
+/// trip, so the export's length is the new records over this bound: 16
+/// in flight could not fold a full re-sign's 62,103 new records inside
+/// the job's 30 minutes, and 64 does with room to spare.
+const RECORDS_PULL_CONCURRENCY: usize = 64;
 /// Published slices or previous `index`/`folded` pairs pulled in flight.
 const PREV_PULL_CONCURRENCY: usize = 8;
 /// Artifact records per sync request — each request lands as one

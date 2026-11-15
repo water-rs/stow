@@ -2531,13 +2531,93 @@ impl EvictionLocation {
     }
 }
 
-/// One entry in the shared `artifact_cache_max_bytes` LRU — a rustc
+/// One entry under the shared `artifact_cache_max_bytes` budget — a rustc
 /// bundle entry under `version_dir` or a C/C++ object under `cc_dir`
-/// (stow#980), ordered by `last_accessed_ms`.
+/// (stow#980) — at its place in the eviction order (stow#1539): entries
+/// a clone shares last, then remote before local, then `last_accessed_ms`.
 struct EvictionCandidate {
     cache_key: String,
+    /// The row's recorded share: some of its bytes were shared when last
+    /// measured.
+    shared: bool,
+    /// A local compile: only compiling again rebuilds it.
+    local_only: bool,
     last_accessed_ms: u64,
     location: EvictionLocation,
+    /// The entry dir or object file whose bytes the candidate holds.
+    path: PathBuf,
+}
+
+impl EvictionCandidate {
+    /// Re-measure the candidate's shared bytes and record them on its row.
+    /// Returns whether any byte is shared now.
+    async fn measure(
+        &self,
+        connection: &sqlx::SqlitePool,
+        rustc_version: &str,
+    ) -> stow_types::error::Result<bool> {
+        let path = self.path.clone();
+        let shared_bytes = tokio::task::spawn_blocking(move || {
+            crate::reclaimable::shared_bytes(&path)
+                .wrap_err_with(|| format!("measure shared bytes of {}", path.display()))
+        })
+        .await
+        .wrap_err("join eviction candidate measure task")??;
+        let mut transaction = connection.begin().await?;
+        record_shared_bytes(
+            &mut transaction,
+            rustc_version,
+            &self.cache_key,
+            self.location,
+            shared_bytes,
+            now_millis(),
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(shared_bytes > 0)
+    }
+}
+
+/// Write a measurement onto an entry's row; the totals' triggers carry
+/// the change into `shared_bytes` of the budget. A row another process
+/// removed meanwhile matches nothing.
+async fn record_shared_bytes(
+    connection: &mut sqlx::SqliteConnection,
+    rustc_version: &str,
+    cache_key: &str,
+    location: EvictionLocation,
+    shared_bytes: u64,
+    measured_ms: u64,
+) -> stow_types::error::Result<()> {
+    let shared_bytes = db_int::<_, i64>(shared_bytes, "cache entry shared_bytes")?;
+    let measured_ms = db_int::<_, i64>(measured_ms, "cache entry shared_measured_ms")?;
+    match location {
+        EvictionLocation::Rustc => {
+            sqlx::query(
+                "UPDATE artifact_cache_entries \
+                 SET shared_bytes = ?, shared_measured_ms = ? \
+                 WHERE rustc_version = ? AND cache_key = ?",
+            )
+            .bind(shared_bytes)
+            .bind(measured_ms)
+            .bind(rustc_version)
+            .bind(cache_key)
+            .execute(&mut *connection)
+            .await?;
+        }
+        EvictionLocation::Cc => {
+            sqlx::query(
+                "UPDATE cc_cache_entries SET shared_bytes = ?, shared_measured_ms = ? \
+                 WHERE cache_key = ?",
+            )
+            .bind(shared_bytes)
+            .bind(measured_ms)
+            .bind(cache_key)
+            .execute(&mut *connection)
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Post-store eviction for a C/C++ object store: the object joined the
@@ -2777,46 +2857,160 @@ impl<'a> ClosureGraph<'a> {
     }
 }
 
-/// Candidates fetched from the LRU indexes per round trip.
+/// Candidates fetched from the eviction-order indexes per round trip, and
+/// recorded shares re-measured per table by an over-cap store.
 const EVICTION_BATCH: i64 = 64;
 
-/// The resident bytes of the shared budget: the active version's rustc
-/// entries plus every C/C++ object, read from the totals the state
-/// database's triggers keep in the transaction of every row change —
-/// two primary-key lookups, whatever the entry count.
+/// How long a recorded share is trusted. Deleting a build directory's
+/// clone changes no row, so an over-cap store re-measures the shared
+/// entries measured longer ago than this, `EVICTION_BATCH` per table, and
+/// an entry whose clone went away counts its full size again within a
+/// minute of over-cap stores. One minute is the LRU stamp's own
+/// granularity (`LRU_STAMP_INTERVAL_MS`): the order is never staler in
+/// its share than in its access time.
+const SHARE_REFRESH_INTERVAL_MS: u64 = LRU_STAMP_INTERVAL_MS;
+
+/// The shared budget's totals: the active version's rustc entries plus
+/// every C/C++ object, read from the totals the state database's triggers
+/// keep in the transaction of every row change — two primary-key
+/// lookups, whatever the entry count.
+#[derive(Clone, Copy)]
+struct ResidentBytes {
+    /// The entries' file sizes.
+    logical: u64,
+    /// Of those, the bytes a clone shared when last measured.
+    shared: u64,
+}
+
+impl ResidentBytes {
+    /// What deleting every entry would free, by the recorded shares.
+    const fn reclaimable(self) -> u64 {
+        self.logical.saturating_sub(self.shared)
+    }
+}
+
 async fn resident_bytes(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
-) -> stow_types::error::Result<u64> {
-    let total: i64 = sqlx::query_scalar(
-        "SELECT COALESCE((SELECT total_bytes FROM artifact_cache_totals \
-                          WHERE rustc_version = ?), 0) \
-                + (SELECT total_bytes FROM cc_cache_totals)",
+) -> stow_types::error::Result<ResidentBytes> {
+    let (logical, shared): (i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(rustc.total_bytes, 0) + cc.total_bytes, \
+                COALESCE(rustc.shared_bytes, 0) + cc.shared_bytes \
+         FROM cc_cache_totals AS cc \
+         LEFT JOIN artifact_cache_totals AS rustc ON rustc.rustc_version = ?",
     )
     .bind(rustc_version)
     .fetch_one(connection)
     .await?;
-    db_int(total, "artifact cache resident bytes")
+    Ok(ResidentBytes {
+        logical: db_int(logical, "artifact cache resident bytes")?,
+        shared: db_int(shared, "artifact cache shared bytes")?,
+    })
 }
 
-/// A position in the shared LRU order: `last_accessed_ms`, then cache
-/// key, then location rank.
-struct LruPosition {
+/// Re-measure the shared entries whose share was recorded longer than
+/// `SHARE_REFRESH_INTERVAL_MS` ago, oldest first, at most
+/// `EVICTION_BATCH` per table, and record what the filesystem reports
+/// now. Only a recorded share can be stale in the direction that hides
+/// bytes from the cap: an entry recorded unshared already counts its
+/// full size, and the pass measures it before evicting it.
+async fn refresh_stale_shares(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+    version_dir: &Path,
+    cc_dir: &Path,
+) -> stow_types::error::Result<()> {
+    let now = now_millis();
+    let stale_before = db_int::<_, i64>(
+        now.saturating_sub(SHARE_REFRESH_INTERVAL_MS),
+        "share refresh cutoff",
+    )?;
+    let rustc_rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT cache_key, relative_dir FROM artifact_cache_entries \
+         WHERE rustc_version = ? AND shared_bytes > 0 AND shared_measured_ms < ? \
+         ORDER BY shared_measured_ms LIMIT ?",
+    )
+    .bind(rustc_version)
+    .bind(stale_before)
+    .bind(EVICTION_BATCH)
+    .fetch_all(connection)
+    .await?;
+    let cc_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT cache_key FROM cc_cache_entries \
+         WHERE shared_bytes > 0 AND shared_measured_ms < ? \
+         ORDER BY shared_measured_ms LIMIT ?",
+    )
+    .bind(stale_before)
+    .bind(EVICTION_BATCH)
+    .fetch_all(connection)
+    .await?;
+    if rustc_rows.is_empty() && cc_rows.is_empty() {
+        return Ok(());
+    }
+    let stale: Vec<(String, EvictionLocation, PathBuf)> = rustc_rows
+        .into_iter()
+        .map(|(cache_key, relative_dir)| {
+            let path = version_dir.join(relative_dir);
+            (cache_key, EvictionLocation::Rustc, path)
+        })
+        .chain(cc_rows.into_iter().map(|cache_key| {
+            let path = crate::cc::cc_object_path(cc_dir, &cache_key);
+            (cache_key, EvictionLocation::Cc, path)
+        }))
+        .collect();
+    let measured = tokio::task::spawn_blocking(move || {
+        stale
+            .into_iter()
+            .map(|(cache_key, location, path)| {
+                let shared_bytes = crate::reclaimable::shared_bytes(&path)
+                    .wrap_err_with(|| format!("measure shared bytes of {}", path.display()))?;
+                Ok((cache_key, location, shared_bytes))
+            })
+            .collect::<stow_types::error::Result<Vec<_>>>()
+    })
+    .await
+    .wrap_err("join share refresh task")??;
+    let mut transaction = connection.begin().await?;
+    for (cache_key, location, shared_bytes) in measured {
+        record_shared_bytes(
+            &mut transaction,
+            rustc_version,
+            &cache_key,
+            location,
+            shared_bytes,
+            now,
+        )
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// A position in the shared eviction order: the shared flag, the
+/// local-only flag, `last_accessed_ms`, then cache key, then location
+/// rank.
+struct EvictionPosition {
+    shared: i64,
+    local_only: i64,
     last_accessed_ms: i64,
     cache_key: String,
     location: EvictionLocation,
 }
 
-impl LruPosition {
-    /// Before every row: stamps are never negative.
+impl EvictionPosition {
+    /// Before every row: both flags are 0 or 1.
     const START: Self = Self {
-        last_accessed_ms: -1,
+        shared: -1,
+        local_only: 0,
+        last_accessed_ms: 0,
         cache_key: String::new(),
         location: EvictionLocation::Cc,
     };
 
     fn of(candidate: &EvictionCandidate) -> stow_types::error::Result<Self> {
         Ok(Self {
+            shared: i64::from(candidate.shared),
+            local_only: i64::from(candidate.local_only),
             last_accessed_ms: db_int(
                 candidate.last_accessed_ms,
                 "eviction cursor last_accessed_ms",
@@ -2827,57 +3021,84 @@ impl LruPosition {
     }
 }
 
-/// The next `EVICTION_BATCH` candidates in LRU order strictly after
-/// `after`, merged from the two LRU indexes.
+/// The next `EVICTION_BATCH` candidates in eviction order strictly after
+/// `after`, merged from the two eviction-order indexes.
 async fn next_eviction_candidates(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
-    after: &LruPosition,
+    version_dir: &Path,
+    cc_dir: &Path,
+    after: &EvictionPosition,
 ) -> stow_types::error::Result<Vec<EvictionCandidate>> {
-    let stamp = after.last_accessed_ms;
-    // A cc row ties with the cursor on stamp and key only behind a rustc
-    // cursor (rank 0 before rank 1); a rustc row never ties after one.
-    let cc_comparison = match after.location {
-        EvictionLocation::Rustc => ">=",
-        EvictionLocation::Cc => ">",
-    };
-    let rustc_rows = sqlx::query_as::<_, (String, i64)>(
-        "SELECT cache_key, last_accessed_ms FROM artifact_cache_entries \
-         WHERE rustc_version = ? AND (last_accessed_ms, cache_key) > (?, ?) \
-         ORDER BY last_accessed_ms, cache_key LIMIT ?",
+    let rustc_rows = sqlx::query_as::<_, (String, String, bool, bool, i64)>(
+        "SELECT cache_key, relative_dir, shared, local_only, last_accessed_ms \
+         FROM artifact_cache_entries \
+         WHERE rustc_version = ? \
+           AND (shared, local_only, last_accessed_ms, cache_key) > (?, ?, ?, ?) \
+         ORDER BY shared, local_only, last_accessed_ms, cache_key LIMIT ?",
     )
     .bind(rustc_version)
-    .bind(stamp)
+    .bind(after.shared)
+    .bind(after.local_only)
+    .bind(after.last_accessed_ms)
     .bind(&after.cache_key)
     .bind(EVICTION_BATCH)
     .fetch_all(connection)
     .await?;
-    let cc_rows = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(format!(
-        "SELECT cache_key, last_accessed_ms FROM cc_cache_entries \
-         WHERE (last_accessed_ms, cache_key) {cc_comparison} (?, ?) \
-         ORDER BY last_accessed_ms, cache_key LIMIT ?"
-    )))
-    .bind(stamp)
-    .bind(&after.cache_key)
-    .bind(EVICTION_BATCH)
-    .fetch_all(connection)
-    .await?;
+    // Every object is local-only. Behind a remote cursor every object of
+    // the cursor's share class or a later one follows; behind a local
+    // one the order is the share flag, stamp and key, where an object
+    // tied with a rustc cursor follows it (rank 0 before rank 1) and a
+    // rustc row never ties after an object cursor.
+    let cc_query = if after.local_only == 0 {
+        sqlx::query_as::<_, (String, bool, i64)>(
+            "SELECT cache_key, shared, last_accessed_ms FROM cc_cache_entries \
+             WHERE shared >= ? \
+             ORDER BY shared, last_accessed_ms, cache_key LIMIT ?",
+        )
+        .bind(after.shared)
+        .bind(EVICTION_BATCH)
+    } else {
+        let comparison = match after.location {
+            EvictionLocation::Rustc => ">=",
+            EvictionLocation::Cc => ">",
+        };
+        sqlx::query_as::<_, (String, bool, i64)>(sqlx::AssertSqlSafe(format!(
+            "SELECT cache_key, shared, last_accessed_ms FROM cc_cache_entries \
+             WHERE (shared, last_accessed_ms, cache_key) {comparison} (?, ?, ?) \
+             ORDER BY shared, last_accessed_ms, cache_key LIMIT ?"
+        )))
+        .bind(after.shared)
+        .bind(after.last_accessed_ms)
+        .bind(&after.cache_key)
+        .bind(EVICTION_BATCH)
+    };
+    let cc_rows = cc_query.fetch_all(connection).await?;
     let mut candidates = Vec::with_capacity(rustc_rows.len() + cc_rows.len());
-    for (rows, location) in [
-        (rustc_rows, EvictionLocation::Rustc),
-        (cc_rows, EvictionLocation::Cc),
-    ] {
-        for (cache_key, last_accessed_ms) in rows {
-            candidates.push(EvictionCandidate {
-                cache_key,
-                last_accessed_ms: db_int(last_accessed_ms, "eviction candidate last_accessed_ms")?,
-                location,
-            });
-        }
+    for (cache_key, relative_dir, shared, local_only, last_accessed_ms) in rustc_rows {
+        candidates.push(EvictionCandidate {
+            cache_key,
+            shared,
+            local_only,
+            last_accessed_ms: db_int(last_accessed_ms, "eviction candidate last_accessed_ms")?,
+            location: EvictionLocation::Rustc,
+            path: version_dir.join(relative_dir),
+        });
+    }
+    for (cache_key, shared, last_accessed_ms) in cc_rows {
+        let path = crate::cc::cc_object_path(cc_dir, &cache_key);
+        candidates.push(EvictionCandidate {
+            cache_key,
+            shared,
+            local_only: true,
+            last_accessed_ms: db_int(last_accessed_ms, "eviction candidate last_accessed_ms")?,
+            location: EvictionLocation::Cc,
+            path,
+        });
     }
     candidates.sort_by(|left, right| {
-        left.last_accessed_ms
-            .cmp(&right.last_accessed_ms)
+        (left.shared, left.local_only, left.last_accessed_ms)
+            .cmp(&(right.shared, right.local_only, right.last_accessed_ms))
             .then_with(|| left.cache_key.cmp(&right.cache_key))
             .then_with(|| left.location.rank().cmp(&right.location.rank()))
     });
@@ -2889,41 +3110,47 @@ async fn next_eviction_candidates(
 async fn protected_candidate(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
+    version_dir: &Path,
+    cc_dir: &Path,
     protected: &ProtectedEntry<'_>,
 ) -> stow_types::error::Result<Option<EvictionCandidate>> {
-    let (row, location) = match protected {
-        ProtectedEntry::Rustc(cache_key) => (
-            sqlx::query_as::<_, (i64,)>(
-                "SELECT last_accessed_ms FROM artifact_cache_entries \
-                 WHERE rustc_version = ? AND cache_key = ?",
-            )
-            .bind(rustc_version)
-            .bind(*cache_key)
-            .fetch_optional(connection)
-            .await?,
-            EvictionLocation::Rustc,
-        ),
-        ProtectedEntry::Cc(cache_key) => (
-            sqlx::query_as::<_, (i64,)>(
-                "SELECT last_accessed_ms FROM cc_cache_entries WHERE cache_key = ?",
-            )
-            .bind(*cache_key)
-            .fetch_optional(connection)
-            .await?,
-            EvictionLocation::Cc,
-        ),
+    let candidate = match protected {
+        ProtectedEntry::Rustc(cache_key) => sqlx::query_as::<_, (String, bool, bool, i64)>(
+            "SELECT relative_dir, shared, local_only, last_accessed_ms \
+             FROM artifact_cache_entries WHERE rustc_version = ? AND cache_key = ?",
+        )
+        .bind(rustc_version)
+        .bind(*cache_key)
+        .fetch_optional(connection)
+        .await?
+        .map(|(relative_dir, shared, local_only, last_accessed_ms)| {
+            Ok::<_, stow_types::error::Error>(EvictionCandidate {
+                cache_key: (*cache_key).to_owned(),
+                shared,
+                local_only,
+                last_accessed_ms: db_int(last_accessed_ms, "protected entry last_accessed_ms")?,
+                location: EvictionLocation::Rustc,
+                path: version_dir.join(relative_dir),
+            })
+        }),
+        ProtectedEntry::Cc(cache_key) => sqlx::query_as::<_, (bool, i64)>(
+            "SELECT shared, last_accessed_ms FROM cc_cache_entries WHERE cache_key = ?",
+        )
+        .bind(*cache_key)
+        .fetch_optional(connection)
+        .await?
+        .map(|(shared, last_accessed_ms)| {
+            Ok(EvictionCandidate {
+                cache_key: (*cache_key).to_owned(),
+                shared,
+                local_only: true,
+                last_accessed_ms: db_int(last_accessed_ms, "protected entry last_accessed_ms")?,
+                location: EvictionLocation::Cc,
+                path: crate::cc::cc_object_path(cc_dir, cache_key),
+            })
+        }),
     };
-    let cache_key = match protected {
-        ProtectedEntry::Rustc(key) | ProtectedEntry::Cc(key) => (*key).to_owned(),
-    };
-    row.map(|(last_accessed_ms,)| {
-        Ok(EvictionCandidate {
-            cache_key,
-            last_accessed_ms: db_int(last_accessed_ms, "protected entry last_accessed_ms")?,
-            location,
-        })
-    })
-    .transpose()
+    candidate.transpose()
 }
 
 async fn evict_entries(
@@ -2935,16 +3162,33 @@ async fn evict_entries(
     protected: &ProtectedEntry<'_>,
 ) -> stow_types::error::Result<()> {
     // stow#1053: under the cap a store reads the maintained totals and
-    // nothing else; over it, candidates stream in LRU order, a batch at
-    // a time, and the total is re-read after each removal.
-    if resident_bytes(connection, rustc_version).await? <= max_bytes {
+    // nothing else. stow#1539: the cap counts reclaimable bytes — what
+    // deleting an entry frees — which never exceed the logical size, so
+    // a logical total within the cap needs no measurement at all.
+    if resident_bytes(connection, rustc_version).await?.logical <= max_bytes {
+        return Ok(());
+    }
+    // Over the logical cap, shares recorded long enough ago to be stale
+    // are re-measured, a bounded batch per store, and the recorded
+    // reclaimable total decides.
+    refresh_stale_shares(connection, rustc_version, version_dir, cc_dir).await?;
+    if resident_bytes(connection, rustc_version)
+        .await?
+        .reclaimable()
+        <= max_bytes
+    {
         return Ok(());
     }
 
+    // Over it, candidates stream in eviction order, a batch at a time;
+    // each is measured before it goes, and the total is re-read after
+    // each measurement or removal.
+    //
     // stow#1005: eviction is closure-aware — a victim carries out every
     // entry that depends on it, transitively, in the same pass, and
     // nothing in the protected entry's own dependency closure is ever a
-    // victim. Victim order stays `last_accessed_ms`.
+    // victim. The order picks victims; the closure rule decides what
+    // goes with them.
     let mut pass = EvictionPass {
         connection,
         rustc_version,
@@ -2956,18 +3200,34 @@ async fn evict_entries(
         ProtectedEntry::Rustc(cache_key) => pass.graph.untouchable_closure(cache_key).await?,
         ProtectedEntry::Cc(_) => BTreeSet::new(),
     };
-    let mut cursor = LruPosition::START;
+    let mut cursor = EvictionPosition::START;
     loop {
-        let batch = next_eviction_candidates(connection, rustc_version, &cursor).await?;
+        let batch =
+            next_eviction_candidates(connection, rustc_version, version_dir, cc_dir, &cursor)
+                .await?;
         let Some(last) = batch.last() else {
             break;
         };
-        cursor = LruPosition::of(last)?;
+        cursor = EvictionPosition::of(last)?;
         for candidate in &batch {
             if protected.matches(candidate)
                 || untouchable.contains(&candidate.cache_key)
                 || pass.evicted.contains(&candidate.cache_key)
             {
+                continue;
+            }
+            let shared = candidate.measure(connection, rustc_version).await?;
+            if shared && !candidate.shared {
+                // A clone appeared since the row was recorded: the entry
+                // moved to the shared tail of the order, where the cursor
+                // meets it again, and its share may already settle the cap.
+                if resident_bytes(connection, rustc_version)
+                    .await?
+                    .reclaimable()
+                    <= max_bytes
+                {
+                    return Ok(());
+                }
                 continue;
             }
             match &candidate.location {
@@ -2983,13 +3243,19 @@ async fn evict_entries(
                     evict_cc_object(connection, cc_dir, &candidate.cache_key).await?;
                 }
             }
-            if resident_bytes(connection, rustc_version).await? <= max_bytes {
+            if resident_bytes(connection, rustc_version)
+                .await?
+                .reclaimable()
+                <= max_bytes
+            {
                 return Ok(());
             }
         }
     }
 
-    if let Some(candidate) = protected_candidate(connection, rustc_version, protected).await? {
+    if let Some(candidate) =
+        protected_candidate(connection, rustc_version, version_dir, cc_dir, protected).await?
+    {
         pass.evict_protected_entry(cc_dir, &candidate).await?;
         return Err(stow_types::stow_error!(
             "artifact cache entry {} exceeds max local cache size {} bytes",
@@ -6390,11 +6656,8 @@ pub mod tests {
 
         let local_meta = "10ca1e7710ca1e77";
         let local_parsed = local_build_parsed("demo", "cargo-meta-ev1", out_dir, &["link"]);
-        std::fs::write(
-            local_parsed.output_rlib_path().expect("rlib output path"),
-            b"evict-me",
-        )
-        .expect("write rlib");
+        let local_rlib = local_parsed.output_rlib_path().expect("rlib output path");
+        std::fs::write(&local_rlib, b"evict-me").expect("write rlib");
         let local_build = local_build_artifact(&local_parsed, local_meta);
         let local_key = super::artifact_cache_key("aarch64-apple-darwin", local_meta);
         let remote_request = fetch_request("bbbb");
@@ -6420,19 +6683,17 @@ pub mod tests {
                 .await
                 .expect("store local build")
             );
+            // The build output the entry was cloned from is gone, so the
+            // entry frees its full size on a copy-on-write volume too.
+            std::fs::remove_file(&local_rlib).expect("clean the build output");
             super::store_downloaded_bundle(&config, &remote_request, &remote_bundle)
                 .await
                 .expect("store remote bundle");
 
             let pool = connect(&config.cache_dir).await.expect("connect state db");
-            let resident: u64 = list_artifact_cache_entries(&pool, "1.91.1")
-                .await
-                .expect("list entries")
-                .values()
-                .fold(0u64, |sum, entry| sum.saturating_add(entry.size_bytes));
-            // One byte short of fitting all three: the next store must evict
-            // the least recently touched entry — the local one.
-            config.artifact_cache_max_bytes = resident + third_size - 1;
+            // Only the third entry fits: the remote entry goes first
+            // (stow#1539), and the local one must go too.
+            config.artifact_cache_max_bytes = third_size;
             touch_artifact_cache_entry(&pool, "1.91.1", &local_key, 1)
                 .await
                 .expect("stale local lru timestamp");
@@ -6453,7 +6714,7 @@ pub mod tests {
                 !index.contains_key(&local_key),
                 "local entry must be evicted by the shared budget like a remote one"
             );
-            assert!(index.contains_key(&cache_key(&remote_request)));
+            assert!(!index.contains_key(&cache_key(&remote_request)));
             assert!(index.contains_key(&cache_key(&third_request)));
             assert!(!local_dir.exists());
         });
@@ -6536,6 +6797,272 @@ pub mod tests {
         });
     }
 
+    /// stow#1539: among unshared entries, one that can be downloaded
+    /// again goes before one only a compile rebuilds, even when the local
+    /// entry was touched longer ago.
+    #[test]
+    fn remote_entry_evicts_before_an_older_local_entry() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tempdir.path());
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+
+        let local_meta = "10ca1e7710ca1e79";
+        let local_parsed = local_build_parsed("demo", "cargo-meta-ev3", out_dir, &["link"]);
+        let local_rlib = local_parsed.output_rlib_path().expect("rlib output path");
+        std::fs::write(&local_rlib, b"older-local").expect("write rlib");
+        let local_build = local_build_artifact(&local_parsed, local_meta);
+        let local_key = super::artifact_cache_key("aarch64-apple-darwin", local_meta);
+        let remote_request = fetch_request("ffff");
+        let remote_bundle = sample_bundle("ffff", "libdemo-ffff.rmeta");
+        let third_request = fetch_request("abab");
+        let third_bundle = sample_bundle("abab", "libdemo-abab.rmeta");
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(
+                super::store_local_build_outputs(
+                    &config,
+                    &local_parsed,
+                    &local_build,
+                    "aarch64-apple-darwin",
+                    &super::LocalEntryKey::plain(local_build.identity.c_metadata.as_str())
+                )
+                .await
+                .expect("store local build")
+            );
+            // The build directory's output is gone, so on a copy-on-write
+            // volume the local entry shares nothing either.
+            std::fs::remove_file(&local_rlib).expect("clean the build output");
+            super::store_downloaded_bundle(&config, &remote_request, &remote_bundle)
+                .await
+                .expect("store remote bundle");
+            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            touch_artifact_cache_entry(&pool, "1.91.1", &local_key, 1)
+                .await
+                .expect("older local lru timestamp");
+            touch_artifact_cache_entry(&pool, "1.91.1", &cache_key(&remote_request), 2)
+                .await
+                .expect("newer remote lru timestamp");
+            let third_size = write_downloaded_bundle_to_entry(
+                &tempdir.path().join("scratch-third"),
+                &third_bundle,
+            )
+            .expect("measure third bundle size");
+            let resident = resident_logical(&pool).await;
+            config.artifact_cache_max_bytes = resident + third_size - 1;
+
+            super::store_downloaded_bundle(&config, &third_request, &third_bundle)
+                .await
+                .expect("store third bundle");
+
+            let index = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries after eviction");
+            assert!(
+                !index.contains_key(&cache_key(&remote_request)),
+                "the remote entry goes first: it can be downloaded again"
+            );
+            assert!(
+                index.contains_key(&local_key),
+                "the older local entry stays: only a compile rebuilds it"
+            );
+            assert!(index.contains_key(&cache_key(&third_request)));
+        });
+    }
+
+    async fn resident_logical(pool: &sqlx::SqlitePool) -> u64 {
+        list_artifact_cache_entries(pool, "1.91.1")
+            .await
+            .expect("list entries")
+            .values()
+            .fold(0u64, |sum, entry| sum.saturating_add(entry.size_bytes))
+    }
+
+    /// Clone every file of a cache entry into `build_dir`, as a serve
+    /// materializes the entry into a build directory.
+    #[cfg(target_os = "macos")]
+    fn clone_entry_into(entry_dir: &Path, build_dir: &Path) -> Vec<PathBuf> {
+        std::fs::create_dir_all(build_dir).expect("create build dir");
+        let mut clones = Vec::new();
+        for (index, file) in walkdir::WalkDir::new(entry_dir).into_iter().enumerate() {
+            let file = file.expect("walk entry");
+            if !file.file_type().is_file() {
+                continue;
+            }
+            let clone = build_dir.join(format!("{index}-{}", file.file_name().to_string_lossy()));
+            reflink_copy::reflink(file.path(), &clone).expect("clone on the APFS temp volume");
+            clones.push(clone);
+        }
+        clones
+    }
+
+    /// stow#1539 on a copy-on-write volume: an entry a build directory
+    /// still clones frees close to nothing, so it outlasts an unshared
+    /// entry touched after it, and its bytes do not count against the
+    /// cap. Once the clone is deleted the entry frees its full size again,
+    /// and the next over-cap store, re-measuring the stale share, evicts
+    /// it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_cloned_entry_outlasts_unshared_ones_until_its_clone_is_deleted() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tempdir.path());
+        let entries_dir = config
+            .artifact_cache_version_dir("1.91.1")
+            .join("bundles/v3/aarch64-apple-darwin");
+        let build_dir = tempdir.path().join("project/target/debug/deps");
+        let bundles: Vec<(FetchRequest<'_>, ArtifactBundle, u64)> =
+            ["a1a1", "b2b2", "c3c3", "d4d4"]
+                .into_iter()
+                .map(|meta| {
+                    let bundle = sample_bundle(meta, &format!("libdemo-{meta}.rmeta"));
+                    let size = write_downloaded_bundle_to_entry(
+                        &tempdir.path().join(format!("scratch-{meta}")),
+                        &bundle,
+                    )
+                    .expect("measure bundle size");
+                    (fetch_request(meta), bundle, size)
+                })
+                .collect();
+        let [
+            (cloned_request, cloned_bundle, cloned_size),
+            (plain_request, plain_bundle, _),
+            (third_request, third_bundle, third_size),
+            (fourth_request, fourth_bundle, fourth_size),
+        ] = <[_; 4]>::try_from(bundles).unwrap_or_else(|_| unreachable!("four bundles"));
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            super::store_downloaded_bundle(&config, &cloned_request, &cloned_bundle)
+                .await
+                .expect("store the entry a build directory clones");
+            super::store_downloaded_bundle(&config, &plain_request, &plain_bundle)
+                .await
+                .expect("store the unshared entry");
+            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            touch_artifact_cache_entry(&pool, "1.91.1", &cache_key(&cloned_request), 1)
+                .await
+                .expect("oldest stamp on the cloned entry");
+            touch_artifact_cache_entry(&pool, "1.91.1", &cache_key(&plain_request), 2)
+                .await
+                .expect("newer stamp on the unshared entry");
+            let clones = clone_entry_into(&entries_dir.join("a1a1"), &build_dir);
+            assert_ne!(clones, [] as [std::path::PathBuf; 0]);
+
+            // Counting logical bytes, evicting the oldest entry would do;
+            // counting what deleting frees, the clone holds the oldest
+            // entry's bytes and the unshared one must go.
+            let plain_size = resident_logical(&pool).await - cloned_size;
+            config.artifact_cache_max_bytes = plain_size + third_size - 1;
+            super::store_downloaded_bundle(&config, &third_request, &third_bundle)
+                .await
+                .expect("store third bundle");
+            let index = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries after the first pass");
+            assert!(
+                index.contains_key(&cache_key(&cloned_request)),
+                "the cloned entry frees nothing and is kept"
+            );
+            assert!(
+                !index.contains_key(&cache_key(&plain_request)),
+                "the unshared entry is evicted first although touched later"
+            );
+            assert!(index.contains_key(&cache_key(&third_request)));
+            let resident = super::resident_bytes(&pool, "1.91.1")
+                .await
+                .expect("resident after the first pass");
+            assert_eq!(
+                resident.shared, cloned_size,
+                "the pass recorded the clone's share of the whole entry"
+            );
+
+            // The project is cleaned. The recorded share is now stale; once
+            // it is older than the refresh interval, the next over-cap
+            // store re-measures it and the entry counts in full.
+            for clone in clones {
+                std::fs::remove_file(clone).expect("delete the build directory's clone");
+            }
+            sqlx::query(
+                "UPDATE artifact_cache_entries SET shared_measured_ms = 1 \
+                 WHERE rustc_version = '1.91.1' AND cache_key = ?",
+            )
+            .bind(cache_key(&cloned_request))
+            .execute(&pool)
+            .await
+            .expect("age the recorded share");
+            // By the stale record everything fits; by the disk it does not.
+            config.artifact_cache_max_bytes = third_size + fourth_size;
+            super::store_downloaded_bundle(&config, &fourth_request, &fourth_bundle)
+                .await
+                .expect("store fourth bundle");
+            let index = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries after the second pass");
+            assert!(
+                !index.contains_key(&cache_key(&cloned_request)),
+                "with its clone gone the entry frees its full size and goes"
+            );
+            assert!(index.contains_key(&cache_key(&third_request)));
+            assert!(index.contains_key(&cache_key(&fourth_request)));
+            assert_eq!(
+                super::resident_bytes(&pool, "1.91.1")
+                    .await
+                    .expect("resident after the second pass")
+                    .shared,
+                0
+            );
+        });
+    }
+
+    /// stow#1539 on a volume, or a placement, without clones: an entry
+    /// written as plain bytes and never cloned frees its whole size, so
+    /// the pass evicts by logical bytes and last access alone.
+    #[test]
+    fn unshared_entries_free_their_full_size() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tempdir.path());
+        let first_request = fetch_request("e5e5");
+        let first_bundle = sample_bundle("e5e5", "libdemo-e5e5.rmeta");
+        let second_request = fetch_request("f6f6");
+        let second_bundle = sample_bundle("f6f6", "libdemo-f6f6.rmeta");
+        let second_size =
+            write_downloaded_bundle_to_entry(&tempdir.path().join("scratch"), &second_bundle)
+                .expect("measure second bundle size");
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            super::store_downloaded_bundle(&config, &first_request, &first_bundle)
+                .await
+                .expect("store first bundle");
+            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            config.artifact_cache_max_bytes = second_size;
+            super::store_downloaded_bundle(&config, &second_request, &second_bundle)
+                .await
+                .expect("store second bundle");
+            let index = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries after eviction");
+            assert!(!index.contains_key(&cache_key(&first_request)));
+            assert!(index.contains_key(&cache_key(&second_request)));
+            let resident = super::resident_bytes(&pool, "1.91.1")
+                .await
+                .expect("resident after eviction");
+            assert_eq!(
+                resident.shared, 0,
+                "nothing written as plain bytes is shared"
+            );
+            assert_eq!(resident.reclaimable(), second_size);
+        });
+    }
+
     /// A `derive_demo` proc-macro unit in `out_dir`, compiled against the
     /// `serde_core` rmeta at `dep_rmeta`, with its dylib written — the
     /// host-side dependent shape stow#1005 names.
@@ -6560,6 +7087,15 @@ pub mod tests {
         )
         .expect("write proc-macro dylib");
         parsed
+    }
+
+    /// Delete projects' build directories under `root`, as `cargo clean`
+    /// does: the local entries stored as clones of their outputs share
+    /// nothing any more and free their full size (stow#1539).
+    fn clean_build_dirs(root: &Path, projects: &[&str]) {
+        for project in projects {
+            std::fs::remove_dir_all(root.join(project)).expect("clean build dir");
+        }
     }
 
     /// The invariant a closure-aware pass leaves (stow#1005): every
@@ -6638,6 +7174,7 @@ pub mod tests {
             touch_artifact_cache_entry(&pool, "1.91.1", &dep_key, 1)
                 .await
                 .expect("stale dep lru timestamp");
+            clean_build_dirs(tempdir.path(), &["dep", "derive"]);
 
             assert!(
                 store_dependency(&config, &leaf, &leaf_build).await,
@@ -6726,6 +7263,7 @@ pub mod tests {
             touch_artifact_cache_entry(&pool, "1.91.1", &dep_key, 1)
                 .await
                 .expect("stale dep lru timestamp");
+            clean_build_dirs(tempdir.path(), &["dep", "leaf"]);
 
             super::store_downloaded_bundle(&config, &fetch_request(remote_meta), &remote)
                 .await
@@ -6820,6 +7358,7 @@ pub mod tests {
             touch_artifact_cache_entry(&pool, "1.91.1", &leaf_key, 3)
                 .await
                 .expect("stale leaf lru timestamp");
+            clean_build_dirs(tempdir.path(), &["dep", "dependent", "leaf"]);
 
             // Another process holds the dependent's lease.
             let _dependent_lease = super::acquire_entry_shared_lock(
@@ -6918,6 +7457,7 @@ pub mod tests {
             touch_artifact_cache_entry(&pool, "1.91.1", &dep_key, 1)
                 .await
                 .expect("stale dep lru timestamp");
+            clean_build_dirs(tempdir.path(), &["dep", "toml", "top"]);
 
             assert!(
                 store_dependency(&config, &leaf, &leaf_build).await,
@@ -7088,10 +7628,66 @@ pub mod tests {
             assert_eq!(
                 super::resident_bytes(&pool, "1.91.1")
                     .await
-                    .expect("resident"),
+                    .expect("resident")
+                    .logical,
                 u64::try_from(counted_total(&pool).await.0 + 50).expect("non-negative"),
             );
+
+            // stow#1539: a recorded share moves the shared totals with it,
+            // and a deleted row takes its share out.
+            let mut transaction = pool.begin().await.expect("begin");
+            for (key, location, shared) in [
+                ("key-1", super::EvictionLocation::Rustc, 3),
+                ("key-4", super::EvictionLocation::Rustc, 1),
+                ("a", super::EvictionLocation::Cc, 20),
+            ] {
+                super::record_shared_bytes(&mut transaction, "1.91.1", key, location, shared, 9)
+                    .await
+                    .expect("record share");
+            }
+            transaction.commit().await.expect("commit shares");
+            assert_eq!(shared_totals(&pool).await, summed_shares(&pool).await);
+            assert_eq!(shared_totals(&pool).await, (4, 20));
+            super::delete_artifact_cache_entry(&pool, "1.91.1", "key-4")
+                .await
+                .expect("delete shared entry");
+            assert_eq!(shared_totals(&pool).await, summed_shares(&pool).await);
+            let resident = super::resident_bytes(&pool, "1.91.1")
+                .await
+                .expect("resident after shares");
+            assert_eq!(resident.shared, 3 + 20);
+            assert_eq!(resident.reclaimable(), resident.logical - 23);
         });
+    }
+
+    async fn shared_totals(pool: &sqlx::SqlitePool) -> (i64, i64) {
+        let rustc: i64 = sqlx::query_scalar(
+            "SELECT shared_bytes FROM artifact_cache_totals WHERE rustc_version = '1.91.1'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("rustc shared total");
+        let cc: i64 = sqlx::query_scalar("SELECT shared_bytes FROM cc_cache_totals")
+            .fetch_one(pool)
+            .await
+            .expect("cc shared total");
+        (rustc, cc)
+    }
+
+    async fn summed_shares(pool: &sqlx::SqlitePool) -> (i64, i64) {
+        let rustc: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(shared_bytes), 0) FROM artifact_cache_entries \
+             WHERE rustc_version = '1.91.1'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("rustc shared sum");
+        let cc: i64 =
+            sqlx::query_scalar("SELECT COALESCE(SUM(shared_bytes), 0) FROM cc_cache_entries")
+                .fetch_one(pool)
+                .await
+                .expect("cc shared sum");
+        (rustc, cc)
     }
 
     /// stow#1053: the dependency edges follow the entry row — inserted

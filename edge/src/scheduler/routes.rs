@@ -1816,11 +1816,12 @@ mod eviction_tests {
 }
 
 /// The stow#940 inline-dispatch contract: the request that frees a
-/// slot or releases work runs the pass itself — a completion claims at
-/// most one `MAX_OUTBOUND_INFLIGHT` round, `index/published` and the
-/// request outcome claim every free slot — and the `RunFinished` row
-/// folds into the `Claims` append. Anything claimable past the
-/// completion's bound arms the alarm at `now`.
+/// slot or releases work runs the pass itself — a completion,
+/// `index/published` and the request outcome claim at most one
+/// `MAX_OUTBOUND_INFLIGHT` round — and the `RunFinished` row folds into
+/// the `Claims` append. Anything claimable past the bound arms the
+/// alarm at `now`; the dispatch-cap set, the freeze clear and the queue
+/// mutations run no pass and leave every claim to the alarm.
 #[cfg(test)]
 mod inline_dispatch_tests {
     use super::*;

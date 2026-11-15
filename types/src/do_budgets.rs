@@ -567,18 +567,16 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 300,
     },
     DriveBudget {
-        // stow#1039 provisional: the `DispatchCap` append plus the
-        // freed slots' `Claims` and `Bindings` — the same shape as
-        // `POST /tasks/complete-run (dispatching)`; the workerd
-        // absolute awaits a probe run.
-        // stow#1378: its `Claims` mint their ids from digest rows, at
-        // most the dispatch cap (45) in one statement, two rows read
-        // per digest read: 5 + 1 statements, 7 + 2×45 reads.
+        // stow#1039 provisional: the `DispatchCap` append and the wake
+        // re-plan; the route runs no dispatch pass — the alarm armed at
+        // `now` sends the freed slots' runs — so the cost is
+        // independent of the dispatch cap: measured 1 append, no
+        // claim reads.
         name: "POST /dispatch-cap",
-        statements: 6,
-        rows_read: 97,
-        rows_written: 7,
-        wall_ms: 500,
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 300,
     },
     DriveBudget {
         name: "GET /release-priority",
