@@ -51,6 +51,7 @@ mod network_gate;
 mod prefetch;
 mod profile_guard;
 mod provenance;
+mod reclaimable;
 mod report;
 mod resolve;
 mod retry;

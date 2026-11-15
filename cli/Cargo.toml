@@ -94,6 +94,11 @@ time = { version = "0.3.55", default-features = false, features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `FS_IOC_FIEMAP` extents with their `SHARED` flag: the bytes of a cache
+# entry a btrfs or XFS reflink still holds (stow#1539).
+fiemap = { version = "0.2.1", default-features = false }
+
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 # The launch agent plist (`cli/templates/launch_agent.xml`) and the
 # Windows scheduled task (`cli/templates/scheduled_task.xml`): XML-escaped
