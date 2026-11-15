@@ -57,7 +57,7 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
     // Where a workspace's intermediates go: under stow's cache root, so a
     // store or a serve is a same-volume clone — unless the user already
     // placed the build directory (stow#1538).
-    let build_dir = match user_build_dir(&current_dir, &env)? {
+    let build_dir = match user_build_dir(&cargo_home, &env)? {
         Some(user) => BuildDirPlacement::User(user),
         None => BuildDirPlacement::Stow(stow_build_dir_template(&config::cache_dir(&env)?)?),
     };
@@ -1219,23 +1219,35 @@ impl BuildDirPlacement {
     }
 }
 
-/// The `build.build-dir` the user configured for `current_dir` — cargo's
-/// own resolution over its config files and `CARGO_BUILD_BUILD_DIR` — or
-/// `None` when there is none or it is one stow placed.
+/// The `build.build-dir` the user configured machine-wide — the
+/// `CARGO_BUILD_BUILD_DIR` variable, which cargo ranks first, else a value
+/// in `$CARGO_HOME/config.toml` — or `None` when there is none or it is one
+/// stow placed. Project configs are not consulted: cargo ranks them above
+/// the global file, so a project's own build directory wins for that
+/// project without stopping setup from placing the global one.
 fn user_build_dir(
-    current_dir: &Path,
+    cargo_home: &Path,
     env: &SessionEnv,
 ) -> stow_types::error::Result<Option<String>> {
-    let options = cargo_config2::ResolveOptions::default()
-        .cargo_home(env.cargo_home().map(Path::to_path_buf))
-        .env(env.environ().iter().cloned());
-    let config = cargo_config2::Config::load_with_options(current_dir, options)
-        .wrap_err("load the cargo config")?;
-    Ok(config
-        .build
-        .build_dir
-        .map(|dir| dir.to_string_lossy().into_owned())
-        .filter(|dir| !is_stow_build_dir(dir)))
+    if let Some(value) = env.var_os("CARGO_BUILD_BUILD_DIR") {
+        return Ok(Some(value.to_string_lossy().into_owned()));
+    }
+    let path = cargo_home.join("config.toml");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).wrap_err_with(|| format!("read {}", path.display())),
+    };
+    let document = contents
+        .parse::<DocumentMut>()
+        .wrap_err_with(|| format!("parse {}", path.display()))?;
+    Ok(document
+        .get("build")
+        .and_then(Item::as_table_like)
+        .and_then(|build| build.get("build-dir"))
+        .and_then(Item::as_str)
+        .filter(|dir| !is_stow_build_dir(dir))
+        .map(str::to_owned))
 }
 
 /// Whether `document` holds any value stow's wiring owns — a

@@ -3776,6 +3776,7 @@ async fn run_cargo_passthrough_sandboxed(
         ));
     }
     let target_dir = resolved_target_dir(&project.facts, &project.env, cargo_args, current_dir);
+    let build_dir = resolved_build_dir(&project.facts, &project.env, cargo_args, current_dir)?;
     let runtime = std::env::current_exe().wrap_err("resolve current executable")?;
     // The workspace root plus the manifest directory `current_dir`
     // walks up to: a member's cargo reads its workspace root manifest,
@@ -3793,6 +3794,7 @@ async fn run_cargo_passthrough_sandboxed(
         lockfile_root: &project.facts.workspace_root,
         source_roots: &source_roots,
         target_dir: &target_dir,
+        build_dir: build_dir.as_deref(),
         run_dir: &run_dir,
         shims_dir: None,
         runtime_executable: &runtime,
@@ -4242,6 +4244,12 @@ async fn sandboxed_cargo_run(
         plan.cargo_args,
         plan.current_dir,
     );
+    let build_dir = resolved_build_dir(
+        &plan.project.facts,
+        &plan.project.env,
+        plan.cargo_args,
+        plan.current_dir,
+    )?;
     let shims_dir = Path::new(&wrappers.rustc).parent().ok_or_else(|| {
         stow_types::stow_error!("rustc wrapper shim {} has no parent", wrappers.rustc)
     })?;
@@ -4262,6 +4270,7 @@ async fn sandboxed_cargo_run(
         lockfile_root: plan.source_root,
         source_roots: &source_roots,
         target_dir: &target_dir,
+        build_dir: build_dir.as_deref(),
         run_dir: &run_dir,
         shims_dir: Some(shims_dir),
         runtime_executable: &wrappers.runtime_executable,

@@ -178,7 +178,7 @@ fn setup_run_again_keeps_one_stow_build_dir_entry() {
 }
 
 #[test]
-fn a_build_directory_in_a_config_file_is_kept_and_reported() {
+fn a_project_build_directory_wins_for_that_project_and_not_for_setup() {
     let machine = Machine::new();
     let mine = machine.dir().join("my-build-dir");
     std::fs::create_dir_all(machine.dir().join(".cargo")).expect("project .cargo");
@@ -193,21 +193,105 @@ fn a_build_directory_in_a_config_file_is_kept_and_reported() {
 
     let output = machine.setup(|_| {});
 
-    assert_eq!(build_dir_of(&machine.global_config()), None);
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    // A project's config ranks above the global one, so setup still
+    // places the global key for every other project.
+    let config = machine.global_config();
     assert!(
-        stdout.contains("already configured, left alone") && stdout.contains("my-build-dir"),
-        "setup did not report the user's build directory:\n{stdout}"
+        build_dir_of(&config).is_some_and(|dir| dir.ends_with("{workspace-path-hash}")),
+        "setup skipped the global key: {config:?}"
     );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("left alone"));
 
     machine.cargo_build();
     assert!(
         !files_under(&mine).is_empty(),
-        "the user's build directory was not used"
+        "the project's build directory was not used"
     );
     assert!(
         files_under(&machine.cache.join("build-dir")).is_empty(),
-        "stow placed a build directory beside the user's"
+        "stow's build directory was used despite the project's"
+    );
+}
+
+#[test]
+fn a_build_directory_in_the_global_config_is_kept_and_reported() {
+    let machine = Machine::new();
+    let mine = machine.dir().join("my-global-build-dir");
+    std::fs::create_dir_all(&machine.cargo_home).expect("cargo home");
+    std::fs::write(
+        machine.cargo_home.join("config.toml"),
+        format!(
+            "[build]\nbuild-dir = {}\n",
+            toml::Value::String(mine.to_str().expect("utf-8 path").to_owned())
+        ),
+    )
+    .expect("global config");
+
+    let output = machine.setup(|_| {});
+
+    assert_eq!(
+        build_dir_of(&machine.global_config()),
+        mine.to_str(),
+        "setup replaced the user's build directory"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("already configured, left alone") && stdout.contains("my-global-build-dir"),
+        "setup did not report the user's build directory:\n{stdout}"
+    );
+
+    machine.cargo_build();
+    assert_ne!(files_under(&mine), [] as [std::path::PathBuf; 0]);
+    assert_eq!(
+        files_under(&machine.cache.join("build-dir")),
+        [] as [std::path::PathBuf; 0]
+    );
+}
+
+/// `stow build` at the default isolation level grants the placed build
+/// directory: a build script writes its `OUT_DIR` there and the crate
+/// builds.
+#[test]
+fn a_sandboxed_stow_build_with_a_build_script_uses_the_placed_build_directory() {
+    let machine = Machine::new();
+    std::fs::write(
+        machine.dir().join("build.rs"),
+        "fn main() {\n\
+         let out = std::env::var(\"OUT_DIR\").expect(\"OUT_DIR\");\n\
+         std::fs::write(std::path::Path::new(&out).join(\"gen.rs\"), \"pub fn two() -> u8 { 2 }\\n\").expect(\"write gen.rs\");\n\
+         }\n",
+    )
+    .expect("build script");
+    std::fs::write(
+        machine.dir().join("src").join("lib.rs"),
+        "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n",
+    )
+    .expect("lib");
+    machine.setup(|_| {});
+
+    let mut build = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    build.arg("build");
+    machine.hermetic(&mut build);
+    let output = build.output().expect("run stow-cli build");
+    assert!(
+        output.status.success(),
+        "stow build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        files_under(&machine.cache.join("build-dir"))
+            .into_iter()
+            .any(|path| path.file_name().is_some_and(|name| name == "gen.rs")),
+        "the build script's OUT_DIR is not under the placed build directory"
+    );
+    assert!(
+        machine
+            .dir()
+            .join("target")
+            .join("debug")
+            .join("libplaced.rlib")
+            .is_file()
     );
 }
 
