@@ -910,6 +910,13 @@ impl RegistrySession {
     }
 
     /// [`pull_manifest`] under `presence`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when `reference` names another repository
+    /// than the session serves, on a transport failure, a refusal, or a
+    /// digest mismatch. A `404` for a [`Presence::Listed`] manifest is
+    /// returned only after its `MAX_ATTEMPTS` dispatches all answer `404`.
     pub async fn pull_manifest_as(
         &self,
         reference: &Reference,

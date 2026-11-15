@@ -21,7 +21,7 @@ use stow_types::registry::{cache_repository, sha256_digest};
 
 use crate::client::{Presence, RegistrySession, canonical_manifest_bytes};
 use crate::publisher::Publisher;
-use crate::registry::{pull_blob_verified, pull_tagged_manifest, pull_tagged_manifest_as};
+use crate::registry::{pull_blob_verified, pull_tagged_manifest_as};
 use crate::sign;
 
 /// What [`push_records`] did: the tag and manifest digest the records
