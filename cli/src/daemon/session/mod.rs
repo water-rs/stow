@@ -19,7 +19,7 @@ pub mod invocation;
 pub mod os_bytes;
 mod resources;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use stow_types::error::{Context, Result};
@@ -35,6 +35,7 @@ use crate::config::StowConfig;
 use crate::daemon::owner::CargoOwner;
 use crate::daemon::wrapper::InvocationEnv;
 use crate::session_env::SessionEnv;
+use crate::state_db::now_millis;
 use crate::toolchain::BuildToolchain;
 use crate::{
     AnalysisFacts, BuildContext, Outcome, PostCompile, ResolutionDone, UnitOutcome,
@@ -44,7 +45,7 @@ use crate::{
     resolve_native_target_cpu, rustc_args,
 };
 use handler::{CONNECTION_DRAIN_BUDGET, Decision, Handler, InFlightUnits, Reports};
-use invocation::{Refusal, VerifiedInvocation};
+use invocation::{OutputRoots, Refusal, VerifiedInvocation};
 
 /// What a session reports when its build ends.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -69,6 +70,13 @@ pub trait Origin: Send + Sync + 'static {
         None
     }
 
+    /// The manifests of the workspace members the build is known to
+    /// compile so far: what a build directory stow placed is attributed
+    /// to (stow#1540).
+    fn manifests(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
     /// Called with the environment of each plan request before it is
     /// decided. The default observes nothing.
     fn planned(&self, _env: &InvocationEnv) {}
@@ -88,6 +96,10 @@ pub trait Origin: Send + Sync + 'static {
 impl Origin for DriverFacts {
     fn driver(&self) -> Option<&DriverFacts> {
         Some(self)
+    }
+
+    fn manifests(&self) -> Vec<PathBuf> {
+        vec![self.project.workspace_root.join("Cargo.toml")]
     }
 
     fn journal(
@@ -212,7 +224,10 @@ impl Session<Cargo> {
         handles: &CacheDirHandles,
         sessions: &Path,
     ) -> Result<Arc<Self>> {
-        let session = Self::assemble(id, build, Cargo::default(), handles, sessions).await?;
+        let cargo_home = SessionEnv::new(build.environ.clone(), build.cwd.clone())
+            .cargo_home()
+            .map(Path::to_path_buf);
+        let session = Self::assemble(id, build, Cargo::new(cargo_home), handles, sessions).await?;
         session.dir.record_owner(owner)?;
         Ok(session)
     }
@@ -315,6 +330,7 @@ impl<O: Origin> Session<O> {
             in_flight,
             registry_sources: build.registry_sources.clone(),
         };
+        spawn_build_dir_bookkeeping(&span, config.as_ref(), &build.roots, origin.manifests());
         let env_cache = WrapperEnvCache::for_session(config.clone(), toolchain);
         let enrichment = if seed.deferred
             && let Some(config) = config
@@ -421,6 +437,7 @@ impl<O: Origin> Session<O> {
         self.stop_enrichment().await;
         self.reports.drain(CONNECTION_DRAIN_BUDGET).await;
         let journal_written = self.write_journal();
+        self.record_manifests().await;
         let refusals = self
             .refusals
             .lock()
@@ -433,6 +450,30 @@ impl<O: Origin> Session<O> {
             refusals,
             journal_written,
         })
+    }
+
+    /// Attribute the build directory to the workspace members the build
+    /// compiled, which only a finished build knows (stow#1540). One
+    /// database transaction per session.
+    async fn record_manifests(&self) {
+        let manifests = self.origin.manifests();
+        let Some(config) = self.env_cache.config() else {
+            return;
+        };
+        let Some(build_dir) = stow_build_dir(config, &self.build.roots) else {
+            return;
+        };
+        if manifests.is_empty() {
+            return;
+        }
+        let recorded = async {
+            let pool = config.state_db.pool(&config.cache_dir).await?;
+            crate::build_dirs::record(&pool, &build_dir, &manifests, now_millis()).await
+        }
+        .await;
+        if let Err(error) = recorded {
+            tracing::warn!(error = %error, "could not record the build directory's workspace");
+        }
     }
 
     async fn remove_dir(&self) -> Result<()> {
@@ -794,6 +835,65 @@ fn session_config(
     Some(config)
 }
 
+/// The build directory of a build, when stow placed it: the root under
+/// `<cache>/build-dir/`. A build directory elsewhere is not stow's to
+/// collect and is not recorded.
+fn stow_build_dir(config: &StowConfig, roots: &OutputRoots) -> Option<PathBuf> {
+    let parent = config.cache_dir.join(crate::build_dirs::BUILD_DIR_PARENT);
+    roots
+        .dirs()
+        .iter()
+        .find(|root| root.starts_with(&parent))
+        .cloned()
+}
+
+/// Record the build directory of this build with the member manifests
+/// known at the session's open, and sweep the build directories when a
+/// sweep is due (stow#1540). One transaction and one conditional write
+/// per session, never per compile; the sweep itself is paced inside
+/// [`crate::build_dirs::collect_if_due`]. The session's end records the
+/// manifests the build went on to compile ([`Session::record_manifests`]).
+fn spawn_build_dir_bookkeeping(
+    span: &tracing::Span,
+    config: Option<&StowConfig>,
+    roots: &OutputRoots,
+    manifests: Vec<PathBuf>,
+) {
+    let Some(config) = config else {
+        return;
+    };
+    let cache_dir = config.cache_dir.clone();
+    let idle = config.build_dir_idle;
+    let state_db = config.state_db.clone();
+    let build_dir = stow_build_dir(config, roots);
+    tokio::spawn(
+        async move {
+            let swept = async {
+                let pool = state_db.pool(&cache_dir).await?;
+                if let Some(build_dir) = build_dir {
+                    crate::build_dirs::record(&pool, &build_dir, &manifests, now_millis()).await?;
+                }
+                crate::build_dirs::collect_if_due(&pool, &cache_dir, idle).await
+            }
+            .await;
+            match swept {
+                Ok(Some(collected)) if !collected.removed.is_empty() => {
+                    tracing::info!(
+                        removed = collected.removed.len(),
+                        locked = collected.locked.len(),
+                        "collected build directories"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "build directory bookkeeping failed");
+                }
+            }
+        }
+        .instrument(span.clone()),
+    );
+}
+
 /// The policy gate's readiness latch for this build: pending only while a
 /// deferred build's enrichment still owes the allow set its coarse commit
 /// — released by the commit or by the guard dropping with the task; every
@@ -874,6 +974,7 @@ mod tests {
             circuit_trip_threshold: 1,
             artifact_cache_max_bytes: u64::MAX,
             index_refresh_interval: Duration::ZERO,
+            build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
             verify_mode: crate::config::VerifyMode::GithubCi,
             switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),

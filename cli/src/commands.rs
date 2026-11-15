@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use stow_types::error::Context;
 use toml_edit::{DocumentMut, Item, Table, Value};
 
+use crate::build_dirs::BUILD_DIR_PARENT;
 use crate::cli_args::{
     CheckArtifactArgs, FetchArtifactArgs, IndexRefreshArgs, PurgeCacheDirArgs, SetupArgs, StatsArgs,
 };
@@ -1150,10 +1151,6 @@ fn document_selects_mold(document: &DocumentMut) -> bool {
         })
 }
 
-/// The directory under stow's cache root holding one build directory per
-/// workspace.
-const BUILD_DIR_PARENT: &str = "build-dir";
-
 /// Cargo's template for a per-workspace directory: a hash of the
 /// workspace's path, so two workspaces never share a build directory
 /// (cargo locks one whole).
@@ -1447,6 +1444,7 @@ mod tests {
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: 1024,
             index_refresh_interval: Duration::from_mins(5),
+            build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
             verify_mode,
             switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),

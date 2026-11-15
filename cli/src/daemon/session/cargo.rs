@@ -89,17 +89,60 @@ pub struct Cargo {
     /// from the first unit that says so: what the drain re-derives the
     /// build's dependency graph from.
     consumer_manifest_dir: OnceLock<PathBuf>,
+    /// The cargo home of the build: what its registry and git checkouts
+    /// live under, whose packages are not the workspace's.
+    home: Option<PathBuf>,
+    /// The manifest directories of the local packages the build's units
+    /// belong to — the workspace members and path dependencies — which
+    /// attribute the build directory to its workspace (stow#1540). One
+    /// entry per package, however many units it has.
+    local_manifest_dirs: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
+}
+
+impl Cargo {
+    /// The origin of a cargo whose home is `cargo_home`.
+    #[must_use]
+    pub fn new(cargo_home: Option<PathBuf>) -> Self {
+        Self {
+            home: cargo_home,
+            ..Self::default()
+        }
+    }
+
+    /// Whether a package at `manifest_dir` is local: not a checkout of a
+    /// registry or git source under the cargo home.
+    fn is_local(&self, manifest_dir: &Path) -> bool {
+        self.home.as_ref().is_none_or(|home| {
+            !manifest_dir.starts_with(home.join("registry"))
+                && !manifest_dir.starts_with(home.join("git"))
+        })
+    }
 }
 
 impl Origin for Cargo {
     fn planned(&self, env: &InvocationEnv) {
-        if !env.primary_package {
+        let Ok(Some(manifest_dir)) = env.manifest_dir() else {
             return;
-        }
-        if let Ok(Some(manifest_dir)) = env.manifest_dir() {
+        };
+        if env.primary_package {
             // The first unit that names it wins; later ones name the same.
-            let _ = self.consumer_manifest_dir.set(manifest_dir);
+            let _ = self.consumer_manifest_dir.set(manifest_dir.clone());
         }
+        if env.primary_package || self.is_local(&manifest_dir) {
+            self.local_manifest_dirs
+                .lock()
+                .expect("local manifest dirs mutex")
+                .insert(manifest_dir);
+        }
+    }
+
+    fn manifests(&self) -> Vec<PathBuf> {
+        self.local_manifest_dirs
+            .lock()
+            .expect("local manifest dirs mutex")
+            .iter()
+            .map(|dir| dir.join("Cargo.toml"))
+            .collect()
     }
 
     fn journal(

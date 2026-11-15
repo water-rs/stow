@@ -373,6 +373,7 @@ mod tests {
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: 1024,
             index_refresh_interval: Duration::from_mins(5),
+            build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
             verify_mode: crate::config::VerifyMode::GithubCi,
             switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
