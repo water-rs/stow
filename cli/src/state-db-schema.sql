@@ -238,6 +238,17 @@ CREATE TABLE metadata_values (
     value TEXT NOT NULL
 );
 
+-- stow#1540: the build directories stow placed under `<cache>/build-dir/`,
+-- each attributed to the member manifests of the workspace builds of it
+-- compiled (a JSON array of paths, empty when none was seen) and the
+-- last time a build opened a session in it. A directory with no row is
+-- collected by its modification times alone.
+CREATE TABLE build_directories (
+    build_dir TEXT PRIMARY KEY,
+    manifests_json TEXT NOT NULL,
+    last_built_ms INTEGER NOT NULL
+);
+
 CREATE TABLE circuit_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     consecutive_failures INTEGER NOT NULL,

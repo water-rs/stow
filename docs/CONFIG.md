@@ -48,6 +48,15 @@ verify_mode = "github-ci"
 # entries first.
 # artifact_cache_max_bytes = 21474836480
 
+# Seconds a build directory stow placed under `<cache_dir>/build-dir/` may
+# go unbuilt before the daemon removes it, returning the cache bytes its
+# clones held to reclaimable space. A directory whose workspace manifest no
+# longer exists is removed regardless of age; one a running build holds
+# (cargo's `.cargo-build-lock`) is never touched. A directory stow has no
+# record of is judged by its files' modification times. Default 2592000
+# (30 days).
+# build_dir_idle_secs = 2592000
+
 # Per-request HTTP timeout (seconds) for the edge worker. Default 300.
 # request_timeout_secs = 300
 

@@ -37,6 +37,11 @@ pub const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 /// read re-checks the tag — `STOW_INDEX_REFRESH_SECS`, config
 /// `index_refresh_secs`, default ten minutes.
 const DEFAULT_INDEX_REFRESH_SECS: u64 = 600;
+/// How long a build directory stow placed may go unbuilt before the
+/// daemon collects it — config `build_dir_idle_secs`, default 30 days
+/// (stow#1540). A workspace left alone for a month is rebuilt from the
+/// cache in one serve.
+pub const DEFAULT_BUILD_DIR_IDLE: Duration = Duration::from_hours(24 * 30);
 /// The consumer's registry connect bound: an unreachable registry
 /// answers in seconds, and its connect/DNS failure never joins the
 /// retry sweep — the build's circuit carries the outage instead of
@@ -172,6 +177,9 @@ pub struct StowConfig {
     /// manifest request re-validates the digest and re-downloads only on
     /// change. `STOW_INDEX_REFRESH_SECS` or `index_refresh_secs`.
     pub index_refresh_interval: Duration,
+    /// Age past which a build directory under `<cache_dir>/build-dir/`
+    /// that has not been built is collected. `build_dir_idle_secs`.
+    pub build_dir_idle: Duration,
     pub verify_mode: VerifyMode,
     /// The process's handle on the state database, shared by every config
     /// the process loads: the command entry point creates it, hands it to
@@ -395,6 +403,10 @@ impl StowConfig {
                 .unwrap_or(DEFAULT_CIRCUIT_TRIP_THRESHOLD),
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(env, file_config.as_ref())?,
             index_refresh_interval: load_index_refresh_interval(env, file_config.as_ref())?,
+            build_dir_idle: file_config
+                .as_ref()
+                .and_then(|config| config.build_dir_idle_secs)
+                .map_or(DEFAULT_BUILD_DIR_IDLE, Duration::from_secs),
             verify_mode,
             state_db,
             trust_material: Arc::default(),
@@ -668,6 +680,7 @@ struct StowUserConfig {
     circuit_trip_threshold: Option<u32>,
     artifact_cache_max_bytes: Option<u64>,
     index_refresh_secs: Option<u64>,
+    build_dir_idle_secs: Option<u64>,
     verify_mode: Option<String>,
     isolation: Option<crate::isolation::IsolationConfig>,
     #[cfg(feature = "mock-verify")]
