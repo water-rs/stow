@@ -268,6 +268,7 @@ fn stow_build(
     command
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_BUILD_BUILD_DIR", target_dir)
         .env_remove("RUST_LOG");
     command
 }
@@ -572,6 +573,7 @@ fn cargo_build_in(
     command
         .env("RUSTC_WRAPPER", wrapper)
         .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_BUILD_BUILD_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
         .env_remove("RUST_LOG")
         .envs(extra_envs.iter().copied());
@@ -1217,6 +1219,7 @@ fn cargo_baseline(dir: &Path, cargo_home: &Path, target_dir: &Path) -> Command {
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home)
         .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_BUILD_BUILD_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
         // An empty RUSTC_WRAPPER is no wrapper to cargo, and it
         // overrides the `build.rustc-wrapper` stow setup wrote into
@@ -1263,6 +1266,7 @@ fn stow_candidate(
     command
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_BUILD_BUILD_DIR", target_dir)
         .env_remove("RUST_LOG");
     command
 }
@@ -1299,6 +1303,7 @@ fn plain_candidate(
         .env("RUSTC_WRAPPER", wrapper)
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_BUILD_BUILD_DIR", target_dir)
         .env_remove("RUST_LOG");
     command
 }

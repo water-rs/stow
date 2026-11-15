@@ -54,6 +54,13 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
     let mold_bin_dir = mold::prepare_global().await?;
     let wrappers = detect_wrapper_commands()?;
     let cleaned = clean_stale_project_configs(&current_dir, &cargo_home.join("config.toml"))?;
+    // Where a workspace's intermediates go: under stow's cache root, so a
+    // store or a serve is a same-volume clone — unless the user already
+    // placed the build directory (stow#1538).
+    let build_dir = match user_build_dir(&current_dir, &env)? {
+        Some(user) => BuildDirPlacement::User(user),
+        None => BuildDirPlacement::Stow(stow_build_dir_template(&config::cache_dir(&env)?)?),
+    };
     let (config_path, selects_mold) = write_cargo_config(
         &cargo_home,
         &wrappers,
@@ -61,6 +68,7 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
         configured_c_compiler(&host_target).as_deref(),
         configured_cxx_compiler(&host_target).as_deref(),
         mold_bin_dir.as_deref(),
+        build_dir.stow_template(),
     )
     .await?;
     // The config the link-cache record below and the index-slice fetch
@@ -125,13 +133,14 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
         _ => String::new(),
     };
     write_stdout(&format!(
-        "configured {}\nrustc-wrapper: {}\ncc: {}\ncxx: {}\ncc-launcher: {}{}\n",
+        "configured {}\nrustc-wrapper: {}\ncc: {}\ncxx: {}\ncc-launcher: {}{}\n{}\n",
         config_path.display(),
         wrappers.rustc,
         wrappers.cc_compiler,
         wrappers.cxx_compiler,
         wrappers.cc_launcher,
         linker_line,
+        build_dir.report(),
     ))?;
     for path in cleaned {
         write_stdout(&format!(
@@ -214,6 +223,7 @@ async fn write_cargo_config(
     real_cc: Option<&str>,
     real_cxx: Option<&str>,
     mold_bin_dir: Option<&Path>,
+    build_dir: Option<&str>,
 ) -> stow_types::error::Result<(PathBuf, bool)> {
     let config_path = cargo_dir.join("config.toml");
     async_fs::create_dir_all(cargo_dir)
@@ -259,6 +269,7 @@ async fn write_cargo_config(
             real_cxx.as_deref(),
         ),
         mold_bin_dir,
+        build_dir,
     )?;
     let selects_mold = document_selects_mold(&document);
 
@@ -283,9 +294,13 @@ fn configure_document(
     wrappers: &WrapperCommands,
     env_entries: Vec<(String, String)>,
     mold_bin_dir: Option<&Path>,
+    build_dir: Option<&str>,
 ) -> stow_types::error::Result<()> {
     clean_stow_owned_entries(document, LinkerSelection::Keep);
     set_build_wrapper(document, &wrappers.rustc);
+    if let Some(build_dir) = build_dir {
+        ensure_table(document, "build")["build-dir"] = Item::Value(Value::from(build_dir));
+    }
     // The selection writes `env.COMPILER_PATH`, so it goes ahead of the
     // rewritten env keys: remove-then-write appends after the entries a
     // pass keeps, and keeping the selection identical across a run that
@@ -1058,7 +1073,7 @@ fn stale_project_configs(dir: &Path, exclude: &Path) -> Vec<PathBuf> {
         let Ok(document) = contents.parse::<DocumentMut>() else {
             continue;
         };
-        if document_is_stow_wired(&document) {
+        if document_is_stow_wired(&document) || document_build_dir_is_stow(&document) {
             stale.push(path);
         }
     }
@@ -1135,6 +1150,94 @@ fn document_selects_mold(document: &DocumentMut) -> bool {
         })
 }
 
+/// The directory under stow's cache root holding one build directory per
+/// workspace.
+const BUILD_DIR_PARENT: &str = "build-dir";
+
+/// Cargo's template for a per-workspace directory: a hash of the
+/// workspace's path, so two workspaces never share a build directory
+/// (cargo locks one whole).
+const WORKSPACE_PATH_HASH: &str = "{workspace-path-hash}";
+
+/// The `build.build-dir` value `stow setup` writes for `cache_dir`:
+/// `<cache_dir>/build-dir/{workspace-path-hash}`, absolute, so the config
+/// means the same thing from every directory.
+fn stow_build_dir_template(cache_dir: &Path) -> stow_types::error::Result<String> {
+    let root = std::path::absolute(cache_dir)
+        .wrap_err_with(|| format!("resolve cache directory {}", cache_dir.display()))?;
+    let template = root.join(BUILD_DIR_PARENT).join(WORKSPACE_PATH_HASH);
+    template
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| stow_types::stow_error!("{} is not UTF-8", template.display()))
+}
+
+/// Whether `value` is a build directory stow placed: a per-workspace
+/// directory under a `build-dir` directory, whichever cache root it names.
+fn is_stow_build_dir(value: &str) -> bool {
+    let mut components = Path::new(value.trim()).components().rev();
+    components
+        .next()
+        .is_some_and(|leaf| leaf.as_os_str() == WORKSPACE_PATH_HASH)
+        && components
+            .next()
+            .is_some_and(|parent| parent.as_os_str() == BUILD_DIR_PARENT)
+}
+
+fn document_build_dir_is_stow(document: &DocumentMut) -> bool {
+    document
+        .get("build")
+        .and_then(Item::as_table_like)
+        .and_then(|build| build.get("build-dir"))
+        .and_then(Item::as_str)
+        .is_some_and(is_stow_build_dir)
+}
+
+/// Where setup left this machine's build directory.
+enum BuildDirPlacement {
+    /// Stow's own template, written by this setup.
+    Stow(String),
+    /// A build directory the user configured — a cargo config file in
+    /// scope of the current directory or `CARGO_BUILD_BUILD_DIR` — which
+    /// setup leaves alone.
+    User(String),
+}
+
+impl BuildDirPlacement {
+    fn stow_template(&self) -> Option<&str> {
+        match self {
+            Self::Stow(template) => Some(template),
+            Self::User(_) => None,
+        }
+    }
+
+    fn report(&self) -> String {
+        match self {
+            Self::Stow(template) => format!("build-dir: {template}"),
+            Self::User(user) => format!("build-dir: {user} (already configured, left alone)"),
+        }
+    }
+}
+
+/// The `build.build-dir` the user configured for `current_dir` — cargo's
+/// own resolution over its config files and `CARGO_BUILD_BUILD_DIR` — or
+/// `None` when there is none or it is one stow placed.
+fn user_build_dir(
+    current_dir: &Path,
+    env: &SessionEnv,
+) -> stow_types::error::Result<Option<String>> {
+    let options = cargo_config2::ResolveOptions::default()
+        .cargo_home(env.cargo_home().map(Path::to_path_buf))
+        .env(env.environ().iter().cloned());
+    let config = cargo_config2::Config::load_with_options(current_dir, options)
+        .wrap_err("load the cargo config")?;
+    Ok(config
+        .build
+        .build_dir
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .filter(|dir| !is_stow_build_dir(dir)))
+}
+
 /// Whether `document` holds any value stow's wiring owns — a
 /// `rustc-wrapper` or an `[env]` entry pointing at a stow shim or the
 /// tools dir.
@@ -1179,6 +1282,13 @@ enum LinkerSelection {
 fn clean_stow_owned_entries(document: &mut DocumentMut, linker_selection: LinkerSelection) -> bool {
     let mut changed = false;
     let wired = document_is_stow_wired(document);
+
+    if document_build_dir_is_stow(document)
+        && let Some(build) = document.get_mut("build").and_then(Item::as_table_mut)
+    {
+        build.remove("build-dir");
+        changed = true;
+    }
 
     if wired
         && let Some(build) = document.get_mut("build").and_then(Item::as_table_mut)
@@ -1338,6 +1448,44 @@ mod tests {
     /// not the platform spelling.
     const TEST_TOOLS_DIR: &str = "/home/user/.local/share/stow/tools";
 
+    /// stow#1538 — the build directory setup writes is recognized as
+    /// stow's whichever cache root it names, and removed with the rest of
+    /// stow's wiring; a user's own is neither.
+    #[test]
+    fn the_build_dir_setup_writes_is_stows_to_write_and_to_remove() {
+        let template =
+            super::stow_build_dir_template(std::path::Path::new("/cache/stow")).expect("template");
+        assert!(super::is_stow_build_dir(&template));
+        assert!(super::is_stow_build_dir(
+            "/elsewhere/build-dir/{workspace-path-hash}"
+        ));
+        assert!(!super::is_stow_build_dir("/home/user/mine"));
+        assert!(!super::is_stow_build_dir(
+            "/home/user/{workspace-path-hash}"
+        ));
+
+        let wrappers = test_wrappers();
+        let mut document = toml_edit::DocumentMut::new();
+        super::configure_document(&mut document, &wrappers, Vec::new(), None, Some(&template))
+            .expect("configure");
+        assert!(super::document_build_dir_is_stow(&document));
+        // Re-running replaces the key in place.
+        super::configure_document(&mut document, &wrappers, Vec::new(), None, Some(&template))
+            .expect("configure again");
+        assert_eq!(document.to_string().matches("build-dir =").count(), 1);
+
+        super::clean_stow_owned_entries(&mut document, super::LinkerSelection::Strip);
+        assert!(!document.to_string().contains("build-dir ="), "{document}");
+
+        let mut user: toml_edit::DocumentMut = "[build]\nbuild-dir = \"/home/user/mine\"\n"
+            .parse()
+            .expect("parse");
+        super::configure_document(&mut user, &wrappers, Vec::new(), None, None)
+            .expect("configure user");
+        super::clean_stow_owned_entries(&mut user, super::LinkerSelection::Strip);
+        assert!(user.to_string().contains("/home/user/mine"));
+    }
+
     fn test_wrappers() -> WrapperCommands {
         WrapperCommands {
             rustc: format!("{TEST_TOOLS_DIR}/stow-rustc-wrapper"),
@@ -1443,6 +1591,7 @@ mod tests {
             Some("clang"),
             Some("clang++"),
             None,
+            None,
         )
         .await
         .expect("first setup");
@@ -1454,6 +1603,7 @@ mod tests {
             "x86_64-unknown-linux-gnu",
             Some("clang"),
             Some("clang++"),
+            None,
             None,
         )
         .await
@@ -1590,11 +1740,11 @@ mod tests {
         let bin_dir = std::path::Path::new("/home/user/.local/share/stow/tools/mold/bin");
 
         let mut document = toml_edit::DocumentMut::new();
-        super::configure_document(&mut document, &wrappers, env_entries(), Some(bin_dir))
+        super::configure_document(&mut document, &wrappers, env_entries(), Some(bin_dir), None)
             .expect("first configure");
         let written = document.to_string();
 
-        super::configure_document(&mut document, &wrappers, env_entries(), None)
+        super::configure_document(&mut document, &wrappers, env_entries(), None, None)
             .expect("already-configured configure");
         assert_eq!(
             document.to_string(),
@@ -1602,7 +1752,7 @@ mod tests {
             "the already-reachable answer dropped the selection"
         );
 
-        super::configure_document(&mut document, &wrappers, env_entries(), Some(bin_dir))
+        super::configure_document(&mut document, &wrappers, env_entries(), Some(bin_dir), None)
             .expect("provisioned configure");
         assert_eq!(document.to_string(), written, "rewriting drifted");
     }
@@ -1626,6 +1776,7 @@ mod tests {
             &mut document,
             &wrappers,
             super::compiler_env_entries(&wrappers, "x86_64-unknown-linux-gnu", None, None),
+            None,
             None,
         )
         .expect("configure");
