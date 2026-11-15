@@ -19,9 +19,9 @@ use stow_types::records::{
 };
 use stow_types::registry::{cache_repository, sha256_digest};
 
-use crate::client::{RegistrySession, canonical_manifest_bytes};
+use crate::client::{Presence, RegistrySession, canonical_manifest_bytes};
 use crate::publisher::Publisher;
-use crate::registry::{pull_blob_verified, pull_tagged_manifest};
+use crate::registry::{pull_blob_verified, pull_tagged_manifest_as};
 use crate::sign;
 
 /// What [`push_records`] did: the tag and manifest digest the records
@@ -197,8 +197,32 @@ pub async fn pull_records_by_tag(
     session: &RegistrySession,
     tag: &str,
 ) -> stow_types::error::Result<PulledRecords> {
+    pull_records_by_tag_as(session, tag, Presence::Unknown).await
+}
+
+/// [`pull_records_by_tag`] for a tag taken from the registry's tag listing.
+///
+/// The tag is known to exist, so a `404` on its manifest is a stale read and
+/// is retried (see [`RegistrySession::pull_listed_manifest`]).
+///
+/// # Errors
+///
+/// Same as [`pull_records`].
+pub async fn pull_listed_records_by_tag(
+    session: &RegistrySession,
+    tag: &str,
+) -> stow_types::error::Result<PulledRecords> {
+    pull_records_by_tag_as(session, tag, Presence::Listed).await
+}
+
+async fn pull_records_by_tag_as(
+    session: &RegistrySession,
+    tag: &str,
+    presence: Presence,
+) -> stow_types::error::Result<PulledRecords> {
     let reference = session.reference(tag)?;
-    let (manifest_digest, manifest) = pull_tagged_manifest(session, &reference).await?;
+    let (manifest_digest, manifest) =
+        pull_tagged_manifest_as(session, &reference, presence).await?;
     if manifest.artifact_type.as_deref() != Some(RECORDS_ARTIFACT_TYPE) {
         return Err(stow_types::stow_error!(
             "{reference} is not a records artifact (artifactType {:?})",

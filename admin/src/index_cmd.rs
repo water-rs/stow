@@ -304,6 +304,28 @@ pub async fn verify_artifact(
     .await
 }
 
+/// [`verify_artifact`] for an artifact the export took from the tag
+/// listing: its signature manifest is known to exist, so a `404` on it is
+/// retried as a stale read.
+async fn verify_listed_artifact(
+    session: &stow_oci::RegistrySession,
+    trust: &stow_oci::verify::Trust,
+    reference: &oci_client::Reference,
+    identity_reference: &str,
+    manifest_digest: &str,
+    workflow: TrustedWorkflow,
+) -> stow_types::error::Result<()> {
+    stow_oci::verify_listed_artifact_signature(
+        session,
+        trust,
+        reference,
+        identity_reference,
+        manifest_digest,
+        &stow_oci::verify::ReleaseIdentity::new(workflow),
+    )
+    .await
+}
+
 /// The state a slice was published with on the last pass: the index as
 /// pulled and verified — its rows the merge extends, its header's
 /// generation the stamp increments, its body the `.prev` sidecar — and
@@ -342,9 +364,10 @@ impl PullContext {
             .map_err(|error| stow_error!("folded rustc_version: {error}"))?;
 
         let pulled_folded =
-            stow_oci::pull_folded(&self.session, target.as_str(), rustc_version.as_str()).await?;
+            stow_oci::pull_listed_folded(&self.session, target.as_str(), rustc_version.as_str())
+                .await?;
         if let Some(pulled_folded) = &pulled_folded {
-            verify_artifact(
+            verify_listed_artifact(
                 &self.session,
                 &self.trust,
                 &self.session.reference(folded)?,
@@ -355,12 +378,34 @@ impl PullContext {
             .await?;
         }
 
-        let Some(index) = self.live_index(&target, &rustc_version).await? else {
+        // The folded tag was listed, so its sibling slice is published: its
+        // absence is a stale read to retry, not an answer.
+        let Some(pulled_index) =
+            stow_oci::pull_listed_index(&self.session, target.as_str(), rustc_version.as_str())
+                .await?
+        else {
             return Err(stow_error!(
                 "folded {folded} exists but index.{target}.{rustc_version} is missing — \
                  re-export with --full"
             ));
         };
+        let itag = index_tag(target.as_str(), rustc_version.as_str());
+        let index_reference = self.session.reference(&itag)?;
+        verify_listed_artifact(
+            &self.session,
+            &self.trust,
+            &index_reference,
+            &self.repository.reference(&itag),
+            &pulled_index.manifest_digest,
+            TrustedWorkflow::INDEX,
+        )
+        .await?;
+        let index = decode_slice_of(
+            &index_reference,
+            &target,
+            &rustc_version,
+            &pulled_index.bytes,
+        )?;
         Ok(Some((
             (target, rustc_version),
             PrevSlice {
@@ -393,24 +438,16 @@ impl PullContext {
             TrustedWorkflow::INDEX,
         )
         .await?;
-        let index = decode_published_slice(&index_reference, rustc_version, &pulled_index.bytes)?;
-        if index.header.target != *target || index.header.rustc_version != *rustc_version {
-            return Err(stow_error!(
-                "index.{target}.{rustc_version} carries header {}/{} — re-export with --full",
-                index.header.target,
-                index.header.rustc_version,
-            ));
-        }
-        Ok(Some(index))
+        decode_slice_of(&index_reference, target, rustc_version, &pulled_index.bytes).map(Some)
     }
 
     /// Pull and verify one records artifact — a signature that fails the
     /// pinned identity is fatal: the alternative, silently dropping it,
     /// would export a slice that quietly misses crates.
     async fn records(&self, tag: &str) -> stow_types::error::Result<BuildRecords> {
-        let pulled = stow_oci::pull_records_by_tag(&self.session, tag).await?;
+        let pulled = stow_oci::pull_listed_records_by_tag(&self.session, tag).await?;
         let reference = self.session.reference(tag)?;
-        verify_artifact(
+        verify_listed_artifact(
             &self.session,
             &self.trust,
             &reference,
@@ -421,6 +458,25 @@ impl PullContext {
         .await?;
         Ok(pulled.records)
     }
+}
+
+/// Decode the verified bytes of `index.<target>.<rustc>` and require its
+/// header to name that same target and rustc.
+fn decode_slice_of(
+    reference: &oci_client::Reference,
+    target: &TargetTriple,
+    rustc_version: &WireRustcVersion,
+    bytes: &[u8],
+) -> stow_types::error::Result<ArtifactIndex> {
+    let index = decode_published_slice(reference, rustc_version, bytes)?;
+    if index.header.target != *target || index.header.rustc_version != *rustc_version {
+        return Err(stow_error!(
+            "index.{target}.{rustc_version} carries header {}/{} — re-export with --full",
+            index.header.target,
+            index.header.rustc_version,
+        ));
+    }
+    Ok(index)
 }
 
 /// `decode` a pulled published slice. The decoder stays strict — but a

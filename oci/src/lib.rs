@@ -20,20 +20,21 @@ pub mod verify;
 
 pub use artifacts::{
     UploadOutcome, publish_packed, pull_signature_materials, push_artifacts, push_artifacts_with,
-    verify_artifact_signature,
+    verify_artifact_signature, verify_listed_artifact_signature,
 };
 pub use client::{
     OPERATOR_LOG_FILTER, RegistryError, RegistryHttp, RegistrySession, TransportPolicy,
 };
 pub use index::{
     IndexPublishOutcome, PulledFolded, PulledIndex, publish_folded, publish_index,
-    published_index_content_sha256, pull_folded, pull_index, pull_published_index,
+    published_index_content_sha256, pull_folded, pull_index, pull_listed_folded, pull_listed_index,
+    pull_published_index,
 };
 pub use oci_client::Reference;
 pub use publisher::Publisher;
 pub use records::{
-    PulledRecords, RecordsPublishOutcome, list_records_tags, pull_records, pull_records_by_tag,
-    push_records, push_records_with,
+    PulledRecords, RecordsPublishOutcome, list_records_tags, pull_listed_records_by_tag,
+    pull_records, pull_records_by_tag, push_records, push_records_with,
 };
 pub use registry::{RegistryBase, RegistryCredentials, pull_blob_verified, pull_tagged_manifest};
 pub use repack::repack_record;

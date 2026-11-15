@@ -39,7 +39,7 @@ use stow_types::registry::verify_oci_digest;
 
 use crate::artifacts::{publish_packed, pull_signature_materials};
 use crate::client::RegistrySession;
-use crate::records::{RecordsPublishOutcome, pull_records_by_tag, push_records_with};
+use crate::records::{RecordsPublishOutcome, pull_listed_records_by_tag, push_records_with};
 use crate::registry::pull_blob_verified;
 use crate::verify::{Trust, verify_materials};
 
@@ -450,7 +450,7 @@ where
     };
     let mut pulled = Vec::with_capacity(tags.len());
     for tag in tags {
-        let records = pull_records_by_tag(session, tag).await?;
+        let records = pull_listed_records_by_tag(session, tag).await?;
         let reference = session.reference(tag)?;
         let resigned = resign_manifest(
             session,
