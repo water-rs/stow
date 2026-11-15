@@ -23,6 +23,7 @@ mod budget;
 /// and artifact injection — one implementation for the user CLI and the
 /// trusted builder alike.
 pub mod build_consume;
+mod build_dirs;
 mod cache_policy;
 mod cargo_cmd;
 mod cc;
@@ -6221,6 +6222,7 @@ mod tests {
             circuit_trip_threshold: 1,
             artifact_cache_max_bytes: 1,
             index_refresh_interval: std::time::Duration::from_mins(10),
+            build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
             verify_mode: crate::config::VerifyMode::GithubCi,
             switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
@@ -6846,6 +6848,7 @@ mod tests {
             circuit_trip_threshold: 1,
             artifact_cache_max_bytes: 0,
             index_refresh_interval: std::time::Duration::ZERO,
+            build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
             verify_mode: crate::config::VerifyMode::GithubCi,
             switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
@@ -7022,6 +7025,7 @@ mod tests {
                 circuit_trip_threshold: 1,
                 artifact_cache_max_bytes: u64::MAX,
                 index_refresh_interval: Duration::ZERO,
+                build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
                 verify_mode: crate::config::VerifyMode::GithubCi,
                 switches: crate::config::Switches::default(),
                 state_db: crate::state_db::StateDb::default(),

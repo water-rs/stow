@@ -56,6 +56,7 @@ fn config(cache_dir: &Path, cache: CacheLayers, tripwire: &Tripwire) -> StowConf
         circuit_trip_threshold: 5,
         artifact_cache_max_bytes: 1024,
         index_refresh_interval: std::time::Duration::from_mins(10),
+        build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
         verify_mode: VerifyMode::GithubCi,
         switches: crate::config::Switches::default(),
         state_db: crate::state_db::StateDb::default(),

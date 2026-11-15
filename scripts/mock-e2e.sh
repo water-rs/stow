@@ -1784,8 +1784,11 @@ fg stow_cli index refresh >"$LOG_DIR/index-refresh-inexact.log" 2>&1 \
 
 # Rebuild the consumer cold: the analysis must now serve the exact
 # ["alloc","race"] artifact — one more hit, no misses, no local builds,
-# and no second inexact report (the exact set is published).
-rm -rf "$SUPERSET_CONSUMER/target"
+# and no second inexact report (the exact set is published). `cargo
+# clean` empties the build directory `stow setup` placed outside the
+# target directory as well, so nothing compiled survives.
+fg in_dir "$SUPERSET_CONSUMER" isolated_env cargo clean >"$LOG_DIR/superset-clean.log" 2>&1 \
+    || die "cargo clean (superset consumer) failed — see $LOG_DIR/superset-clean.log"
 enqueues_before_exact="$(grep -c 'POST /api/v1/enqueue' "$LOG_DIR/edge.log")"
 fg in_dir "$SUPERSET_CONSUMER" stow_cli check >"$LOG_DIR/stow-check-exact.log" 2>&1 \
     || die "stow check (exact) failed — see $LOG_DIR/stow-check-exact.log"

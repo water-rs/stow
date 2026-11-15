@@ -8230,6 +8230,7 @@ dependencies = [
  "const-oid 0.10.2",
  "dirs 7.0.0",
  "fiemap",
+ "filetime",
  "find-msvc-tools",
  "flate2",
  "futures-lite",
