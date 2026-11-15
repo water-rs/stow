@@ -326,7 +326,10 @@ fn newest_modification_ms(dir: &Path) -> Result<u64> {
             }
             Err(error) => return Err(error).wrap_err_with(|| format!("walk {}", dir.display())),
         };
-        let modified = match entry.metadata().map_err(std::io::Error::from) {
+        // Read through the path, not the walk's entry: on Windows the
+        // entry carries the timestamps the directory listing cached, which
+        // lag a directory a build just added files to.
+        let modified = match std::fs::symlink_metadata(entry.path()) {
             Ok(metadata) => metadata.modified().wrap_err_with(|| {
                 format!("read the modification time of {}", entry.path().display())
             })?,
