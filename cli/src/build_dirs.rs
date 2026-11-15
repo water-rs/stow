@@ -484,13 +484,12 @@ mod tests {
 
     /// Age every file and directory of `dir` down to the activity depth.
     fn age(dir: &Path, days: u64) {
-        let old = SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
+        let old = filetime::FileTime::from_system_time(
+            SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60),
+        );
         for entry in walkdir::WalkDir::new(dir).max_depth(super::ACTIVITY_DEPTH) {
             let entry = entry.expect("walk");
-            File::open(entry.path())
-                .expect("open")
-                .set_modified(old)
-                .expect("age");
+            filetime::set_file_mtime(entry.path(), old).expect("age");
         }
     }
 
