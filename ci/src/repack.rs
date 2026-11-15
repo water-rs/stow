@@ -143,9 +143,9 @@ impl Sweeper<'_> {
     async fn task(&self, tags: &[&str]) -> stow_types::error::Result<usize> {
         let mut pulled = Vec::with_capacity(tags.len());
         for tag in tags {
-            let records = stow_oci::pull_records_by_tag(self.session, tag).await?;
+            let records = stow_oci::pull_listed_records_by_tag(self.session, tag).await?;
             let reference = self.session.reference(tag)?;
-            stow_oci::verify_artifact_signature(
+            stow_oci::verify_listed_artifact_signature(
                 self.session,
                 self.trust,
                 &reference,

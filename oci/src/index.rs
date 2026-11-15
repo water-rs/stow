@@ -11,7 +11,7 @@ use stow_types::index::{
 };
 use stow_types::registry::{cache_repository, sha256_digest};
 
-use crate::client::{RegistrySession, canonical_manifest_bytes};
+use crate::client::{Presence, RegistrySession, canonical_manifest_bytes};
 use crate::publisher::Publisher;
 use crate::registry::pull_blob_verified;
 use crate::sign;
@@ -294,9 +294,33 @@ pub async fn pull_index(
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<Option<PulledIndex>> {
+    pull_index_as(session, target, rustc_version, Presence::Unknown).await
+}
+
+/// [`pull_index`] for a slice a published `folded` sibling vouches for: a
+/// `404` on the tag is a stale read and is retried (see
+/// [`RegistrySession::pull_listed_manifest`]) before it answers `None`.
+///
+/// # Errors
+///
+/// Same as [`pull_index`].
+pub async fn pull_listed_index(
+    session: &RegistrySession,
+    target: &str,
+    rustc_version: &str,
+) -> stow_types::error::Result<Option<PulledIndex>> {
+    pull_index_as(session, target, rustc_version, Presence::Listed).await
+}
+
+async fn pull_index_as(
+    session: &RegistrySession,
+    target: &str,
+    rustc_version: &str,
+    presence: Presence,
+) -> stow_types::error::Result<Option<PulledIndex>> {
     let tag = index_tag(target, rustc_version);
     let reference = session.reference(&tag)?;
-    let (bytes, manifest_digest) = match session.pull_manifest(&reference).await {
+    let (bytes, manifest_digest) = match session.pull_manifest_as(&reference, presence).await {
         Ok(pulled) => pulled,
         Err(error) if error.is_not_found() => return Ok(None),
         Err(error) => {
@@ -346,9 +370,33 @@ pub async fn pull_folded(
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<Option<PulledFolded>> {
+    pull_folded_as(session, target, rustc_version, Presence::Unknown).await
+}
+
+/// [`pull_folded`] for a tag taken from the registry's tag listing: a
+/// `404` is a stale read and is retried (see
+/// [`RegistrySession::pull_listed_manifest`]) before it answers `None`.
+///
+/// # Errors
+///
+/// Same as [`pull_folded`].
+pub async fn pull_listed_folded(
+    session: &RegistrySession,
+    target: &str,
+    rustc_version: &str,
+) -> stow_types::error::Result<Option<PulledFolded>> {
+    pull_folded_as(session, target, rustc_version, Presence::Listed).await
+}
+
+async fn pull_folded_as(
+    session: &RegistrySession,
+    target: &str,
+    rustc_version: &str,
+    presence: Presence,
+) -> stow_types::error::Result<Option<PulledFolded>> {
     let tag = folded_tag(target, rustc_version);
     let reference = session.reference(&tag)?;
-    let (bytes, manifest_digest) = match session.pull_manifest(&reference).await {
+    let (bytes, manifest_digest) = match session.pull_manifest_as(&reference, presence).await {
         Ok(pulled) => pulled,
         Err(error) if error.is_not_found() => return Ok(None),
         Err(error) => {

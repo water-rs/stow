@@ -17,7 +17,7 @@ use stow_types::identity::WireRustcVersion;
 use stow_types::registry::{bundle_oci_reference, cache_repository, sha256_digest};
 use stow_types::upload_plan::{PlannedArtifact, PublishedArtifact};
 
-use crate::client::{RegistrySession, canonical_manifest_bytes};
+use crate::client::{Presence, RegistrySession, canonical_manifest_bytes};
 use crate::publisher::Publisher;
 use crate::sign;
 
@@ -285,14 +285,22 @@ pub async fn pull_signature_materials(
     reference: &Reference,
     oci_digest: &str,
 ) -> stow_types::error::Result<Vec<BundleSignatureMaterial>> {
+    pull_signature_materials_as(session, reference, oci_digest, Presence::Unknown).await
+}
+
+async fn pull_signature_materials_as(
+    session: &RegistrySession,
+    reference: &Reference,
+    oci_digest: &str,
+    presence: Presence,
+) -> stow_types::error::Result<Vec<BundleSignatureMaterial>> {
     let signature_reference = signature_reference(reference, oci_digest)?;
-    let (manifest_bytes, _) =
-        session
-            .pull_manifest(&signature_reference)
-            .await
-            .map_err(|error| {
-                stow_types::stow_error!("pull signature manifest {signature_reference}: {error}")
-            })?;
+    let (manifest_bytes, _) = session
+        .pull_manifest_as(&signature_reference, presence)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("pull signature manifest {signature_reference}: {error}")
+        })?;
     // `Box::pin` keeps the shared tail's future out of the callers' — the
     // CLI's `run_cli` tree measures these reads inside one large future.
     Box::pin(signature_materials(
@@ -324,7 +332,57 @@ pub async fn verify_artifact_signature(
     manifest_digest: &str,
     policy: &(impl sigstore::bundle::verify::policy::VerificationPolicy + Sync),
 ) -> stow_types::error::Result<()> {
-    let materials = pull_signature_materials(session, reference, manifest_digest).await?;
+    verify_artifact_signature_as(
+        session,
+        trust,
+        reference,
+        identity_reference,
+        manifest_digest,
+        policy,
+        Presence::Unknown,
+    )
+    .await
+}
+
+/// [`verify_artifact_signature`] for an artifact the caller listed and pulled.
+///
+/// Its signature manifest is known to exist, so a `404` on it is a stale
+/// read and is retried (see [`RegistrySession::pull_listed_manifest`]).
+///
+/// # Errors
+///
+/// Same as [`verify_artifact_signature`].
+pub async fn verify_listed_artifact_signature(
+    session: &RegistrySession,
+    trust: &crate::verify::Trust,
+    reference: &Reference,
+    identity_reference: &str,
+    manifest_digest: &str,
+    policy: &(impl sigstore::bundle::verify::policy::VerificationPolicy + Sync),
+) -> stow_types::error::Result<()> {
+    verify_artifact_signature_as(
+        session,
+        trust,
+        reference,
+        identity_reference,
+        manifest_digest,
+        policy,
+        Presence::Listed,
+    )
+    .await
+}
+
+async fn verify_artifact_signature_as(
+    session: &RegistrySession,
+    trust: &crate::verify::Trust,
+    reference: &Reference,
+    identity_reference: &str,
+    manifest_digest: &str,
+    policy: &(impl sigstore::bundle::verify::policy::VerificationPolicy + Sync),
+    presence: Presence,
+) -> stow_types::error::Result<()> {
+    let materials =
+        pull_signature_materials_as(session, reference, manifest_digest, presence).await?;
     crate::verify::verify_materials(
         trust,
         identity_reference,
