@@ -2514,7 +2514,7 @@ mod tests {
         ))
         .expect("export pass");
         let slice = target_slice(&pass);
-        assert!(slice.index.rows.is_empty());
+        assert_eq!(slice.index.rows, []);
         assert_eq!(slice.index.build_scripts, [record_to_index_row(&newer)]);
     }
 
