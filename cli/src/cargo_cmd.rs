@@ -3776,7 +3776,7 @@ async fn run_cargo_passthrough_sandboxed(
         ));
     }
     let target_dir = resolved_target_dir(&project.facts, &project.env, cargo_args, current_dir);
-    let build_dir = resolved_build_dir(&project.facts, &project.env, cargo_args, current_dir)?;
+    let build_dir = cargo_build_dir(&project.facts, &project.env, cargo_args, current_dir).await?;
     let runtime = std::env::current_exe().wrap_err("resolve current executable")?;
     // The workspace root plus the manifest directory `current_dir`
     // walks up to: a member's cargo reads its workspace root manifest,
@@ -3928,6 +3928,7 @@ fn session_facts(
     plan: &CargoRunPlan<'_>,
     toolchain: &crate::toolchain::BuildToolchain,
     registry_sources: crate::RegistrySources,
+    build_dir: Option<PathBuf>,
 ) -> stow_types::error::Result<crate::daemon::session::SessionFacts> {
     let project = plan.project;
     Ok(crate::daemon::session::SessionFacts {
@@ -3943,7 +3944,8 @@ fn session_facts(
                 &project.env,
                 plan.cargo_args,
                 plan.current_dir,
-            )?,
+                build_dir,
+            ),
             refusal_policy: crate::daemon::session::invocation::RefusalPolicy::of_this_build(),
             registry_sources,
             rustc_extra_args: rustc_wrapper_extra_args(plan.source_root)?,
@@ -3987,7 +3989,16 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     // provisioning and the analysis, so this await is almost always an
     // immediate take (stow#608).
     let toolchain = join_toolchain(&project.toolchain).await?;
-    let facts = session_facts(plan, &toolchain, registry_sources)?;
+    // Cargo's own answer, asked once: the daemon's output roots and the
+    // sandbox's grant are the same directory.
+    let build_dir = cargo_build_dir(
+        &project.facts,
+        &project.env,
+        plan.cargo_args,
+        plan.current_dir,
+    )
+    .await?;
+    let facts = session_facts(plan, &toolchain, registry_sources, build_dir.clone())?;
     let exe = std::env::current_exe().wrap_err("resolve the current executable")?;
     let settings = crate::daemon::Settings::from_env()?;
     let session = crate::daemon::client::DaemonSession::open(exe.clone(), facts, settings).await?;
@@ -3995,7 +4006,16 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     // holds the package-cache lock only shared, a drain's cargo can no
     // longer make this build wait (stow#667).
     let release_hold = spawn_hold_release(session.resolution_done(), project.foreground.clone());
-    let mut cargo_run = spawn_cargo_run(plan, &session, exe, settings, &wrappers, launch).await?;
+    let mut cargo_run = spawn_cargo_run(
+        plan,
+        &session,
+        exe,
+        settings,
+        &wrappers,
+        launch,
+        build_dir.as_deref(),
+    )
+    .await?;
 
     let before = coverage_snapshot(config).await;
 
@@ -4171,6 +4191,7 @@ async fn spawn_cargo_run(
     settings: crate::daemon::Settings,
     wrappers: &crate::commands::WrapperCommands,
     mut launch: CargoLaunch,
+    build_dir: Option<&Path>,
 ) -> stow_types::error::Result<CargoRun> {
     match plan.isolation.level.confinement() {
         None => {
@@ -4201,6 +4222,7 @@ async fn spawn_cargo_run(
                 (session.id(), exe, settings),
                 wrappers,
                 launch,
+                build_dir,
             )
             .await
         }
@@ -4225,6 +4247,7 @@ async fn sandboxed_cargo_run(
     ),
     wrappers: &crate::commands::WrapperCommands,
     mut launch: CargoLaunch,
+    build_dir: Option<&Path>,
 ) -> stow_types::error::Result<CargoRun> {
     if confinement.is_allowlist() {
         crate::sandbox::fetch_dependencies(plan.current_dir, plan.cargo_args).await?;
@@ -4244,12 +4267,6 @@ async fn sandboxed_cargo_run(
         plan.cargo_args,
         plan.current_dir,
     );
-    let build_dir = resolved_build_dir(
-        &plan.project.facts,
-        &plan.project.env,
-        plan.cargo_args,
-        plan.current_dir,
-    )?;
     let shims_dir = Path::new(&wrappers.rustc).parent().ok_or_else(|| {
         stow_types::stow_error!("rustc wrapper shim {} has no parent", wrappers.rustc)
     })?;
@@ -4270,7 +4287,7 @@ async fn sandboxed_cargo_run(
         lockfile_root: plan.source_root,
         source_roots: &source_roots,
         target_dir: &target_dir,
-        build_dir: build_dir.as_deref(),
+        build_dir,
         run_dir: &run_dir,
         shims_dir: Some(shims_dir),
         runtime_executable: &wrappers.runtime_executable,
@@ -4807,11 +4824,12 @@ fn resolved_output_roots(
     env: &SessionEnv,
     cargo_args: &[OsString],
     current_dir: &Path,
-) -> stow_types::error::Result<crate::daemon::session::invocation::OutputRoots> {
-    Ok(crate::daemon::session::invocation::OutputRoots::new(
+    build_dir: Option<PathBuf>,
+) -> crate::daemon::session::invocation::OutputRoots {
+    crate::daemon::session::invocation::OutputRoots::new(
         resolved_target_dir(project, env, cargo_args, current_dir),
-        resolved_build_dir(project, env, cargo_args, current_dir)?,
-    ))
+        build_dir,
+    )
 }
 
 /// The directory cargo keeps a build's intermediate outputs in when
@@ -4819,65 +4837,57 @@ fn resolved_output_roots(
 /// spelled `--config`, `CARGO_BUILD_BUILD_DIR`, or a config file, in
 /// cargo's precedence — else `None`: they are in the target directory.
 ///
-/// A template resolves the way cargo does for `{workspace-root}` and
-/// `{cargo-cache-home}`; one whose value cargo derives (`{workspace-path-hash}`)
-/// stands for the directory that precedes it, under which cargo creates it.
-fn resolved_build_dir(
+/// Cargo expands every template (`{workspace-root}`, `{cargo-cache-home}`,
+/// `{workspace-path-hash}`), so its own `cargo metadata` answer is the
+/// directory — exactly this workspace's, never the directory above it.
+/// `--config` arguments are forwarded, since they set `build.build-dir`
+/// too.
+async fn cargo_build_dir(
     project: &ProjectFacts,
     env: &SessionEnv,
     cargo_args: &[OsString],
     current_dir: &Path,
 ) -> stow_types::error::Result<Option<PathBuf>> {
-    let spelled = crate::mold::config_arg_documents(current_dir, cargo_args)
-        .into_iter()
-        .rev()
-        .find_map(|(_, document)| {
-            document
-                .get("build")?
-                .get("build-dir")?
-                .as_str()
-                .map(str::to_owned)
-        });
-    let raw = if let Some(raw) = spelled {
-        raw
-    } else {
-        let options = cargo_config2::ResolveOptions::default()
-            .cargo_home(env.cargo_home().map(Path::to_path_buf))
-            .env(env.environ().iter().cloned());
-        let config = cargo_config2::Config::load_with_options(current_dir, options)
-            .wrap_err("load the cargo config")?;
-        let Some(dir) = config.build.build_dir else {
-            return Ok(None);
-        };
-        dir.to_string_lossy().into_owned()
-    };
-    let mut expanded = raw.replace(
-        "{workspace-root}",
-        &project.workspace_root.to_string_lossy(),
-    );
-    if expanded.contains("{cargo-cache-home}") {
-        let home = env.cargo_home().ok_or_else(|| {
-            stow_types::stow_error!(
-                "build.build-dir names {{cargo-cache-home}}, but no cargo home is set"
-            )
-        })?;
-        expanded = expanded.replace("{cargo-cache-home}", &home.to_string_lossy());
-    }
-    if let Some(template) = expanded.find('{') {
-        // The directory that holds what cargo derives: keep whole
-        // components only.
-        expanded.truncate(template);
-        let keep = expanded
-            .rfind(['/', std::path::MAIN_SEPARATOR])
-            .map_or(0, |separator| separator + 1);
-        expanded.truncate(keep);
-        if expanded.is_empty() {
-            return Err(stow_types::stow_error!(
-                "build.build-dir `{raw}` has no fixed directory to check outputs against"
-            ));
+    let mut metadata = env.command("cargo")?;
+    metadata
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .arg("--manifest-path")
+        .arg(&project.manifest_path)
+        .current_dir(current_dir)
+        .kill_on_drop(true);
+    let mut args = cargo_args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--config" {
+            metadata.arg(arg).args(args.next());
+        } else if arg.to_str().is_some_and(|arg| arg.starts_with("--config=")) {
+            metadata.arg(arg);
         }
     }
-    Ok(Some(resolve_user_path(current_dir, &expanded)))
+    let output = metadata.output().await.wrap_err("spawn cargo metadata")?;
+    if !output.status.success() {
+        return Err(stow_types::stow_error!(
+            "cargo metadata failed ({}):\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    placed_build_dir(&output.stdout)
+}
+
+/// The `build_directory` of `cargo metadata`'s answer when it is not the
+/// target directory — the intermediates are in the target directory
+/// otherwise, and `None` says so.
+fn placed_build_dir(metadata: &[u8]) -> stow_types::error::Result<Option<PathBuf>> {
+    #[derive(serde::Deserialize)]
+    struct Metadata {
+        target_directory: PathBuf,
+        build_directory: PathBuf,
+    }
+    let Metadata {
+        target_directory,
+        build_directory,
+    } = serde_json::from_slice(metadata).wrap_err("parse cargo metadata")?;
+    Ok((build_directory != target_directory).then_some(build_directory))
 }
 
 fn cargo_target_dir(workspace_root: &Path, cargo_args: &[OsString], current_dir: &Path) -> PathBuf {
@@ -6142,8 +6152,11 @@ mod tests {
                 manifest_path: project.path().join("Cargo.toml"),
                 ..project_facts()
             };
-            let roots = super::resolved_output_roots(&facts, &session, &[], project.path())
+            let build_dir = super::cargo_build_dir(&facts, &session, &[], project.path())
+                .await
                 .unwrap_or_else(|error| panic!("{label}: {error}"));
+            let roots =
+                super::resolved_output_roots(&facts, &session, &[], project.path(), build_dir);
 
             let records = project.build(&vars);
             assert!(!records.is_empty(), "{label}: cargo ran no rustc");
@@ -6168,36 +6181,39 @@ mod tests {
     }
 
     #[test]
-    fn a_templated_build_directory_stands_for_the_directory_before_the_template() {
-        let session = SessionEnv::new(
-            vec![
-                (
-                    OsString::from("CARGO_HOME"),
-                    OsString::from("/home/dev/.cargo"),
-                ),
-                (
-                    OsString::from("CARGO_BUILD_BUILD_DIR"),
-                    OsString::from("{cargo-cache-home}/build/{workspace-path-hash}"),
-                ),
-            ],
-            PathBuf::from("/workspace"),
-        );
-        let build_dir =
-            super::resolved_build_dir(&project_facts(), &session, &[], Path::new("/workspace"))
-                .expect("resolve the build directory");
-        assert_eq!(build_dir, Some(PathBuf::from("/home/dev/.cargo/build/")));
-        let none = SessionEnv::new(Vec::new(), PathBuf::from("/nonexistent-workspace"));
+    fn a_build_directory_is_placed_only_when_it_differs_from_the_target_directory() {
+        let placed =
+            br#"{"target_directory":"/p/target","build_directory":"/c/build-dir/e5/31c0"}"#;
         assert_eq!(
-            super::resolved_build_dir(
-                &project_facts(),
-                &none,
-                &[OsString::from(
-                    "--config=build.build-dir='{workspace-root}/bd'"
-                )],
-                Path::new("/workspace"),
-            )
-            .expect("a spelled --config"),
-            Some(PathBuf::from("/workspace/bd"))
+            super::placed_build_dir(placed).expect("parse"),
+            Some(PathBuf::from("/c/build-dir/e5/31c0"))
         );
+        let default = br#"{"target_directory":"/p/target","build_directory":"/p/target"}"#;
+        assert_eq!(super::placed_build_dir(default).expect("parse"), None);
+    }
+
+    /// Cargo expands the template: the directory is this workspace's own,
+    /// below the templated one, with no template left in it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_templated_build_directory_is_the_one_cargo_expands() {
+        let project = WrappedProject::new();
+        let root = tempfile::tempdir().expect("build dir root");
+        let templated = root.path().join("{workspace-path-hash}");
+        let vars = project.vars(&[("CARGO_BUILD_BUILD_DIR", templated.as_path())]);
+        let session = SessionEnv::new(vars, project.path().to_path_buf());
+        let facts = ProjectFacts {
+            workspace_root: project.path().to_path_buf(),
+            current_dir: project.path().to_path_buf(),
+            manifest_path: project.path().join("Cargo.toml"),
+            ..project_facts()
+        };
+        let build_dir = super::cargo_build_dir(&facts, &session, &[], project.path())
+            .await
+            .expect("ask cargo")
+            .expect("a placed build directory");
+        let below = build_dir.strip_prefix(root.path()).expect("under the root");
+        assert!(below.components().count() >= 1, "{}", build_dir.display());
+        assert!(!build_dir.to_string_lossy().contains('{'));
     }
 }

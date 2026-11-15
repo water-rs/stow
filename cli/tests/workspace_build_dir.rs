@@ -89,6 +89,30 @@ impl Machine {
         );
     }
 
+    /// The build directory cargo reports for the workspace in `dir`, its
+    /// template expanded.
+    fn reported_build_dir(&self, dir: &Path) -> PathBuf {
+        let mut metadata = support::cargo_command(&self.home);
+        metadata.args(["metadata", "--format-version", "1", "--no-deps"]);
+        self.hermetic(&mut metadata);
+        let output = metadata
+            .current_dir(dir)
+            .output()
+            .expect("run cargo metadata");
+        assert!(
+            output.status.success(),
+            "cargo metadata failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("parse cargo metadata");
+        PathBuf::from(
+            metadata["build_directory"]
+                .as_str()
+                .expect("cargo reports build_directory"),
+        )
+    }
+
     fn global_config(&self) -> toml::Value {
         let text = std::fs::read_to_string(self.cargo_home.join("config.toml"))
             .expect("read the written cargo config");
@@ -253,13 +277,56 @@ fn a_build_directory_in_the_global_config_is_kept_and_reported() {
 /// builds.
 #[test]
 fn a_sandboxed_stow_build_with_a_build_script_uses_the_placed_build_directory() {
+    sandboxed_build_script_build(None);
+}
+
+/// Under `strict` the grant is exactly this workspace's build directory:
+/// a build script cannot write another workspace's.
+#[test]
+fn a_strict_build_script_cannot_write_another_workspaces_build_directory() {
+    let outcome = sandboxed_build_script_build(Some("strict"));
+    assert_eq!(
+        outcome, "denied",
+        "the first workspace's build script could write the second's build directory"
+    );
+}
+
+/// Set up a machine, build a crate with a build script through `stow
+/// build` (at `isolation` when given), and return what the script's attempt
+/// to write a second workspace's build directory came to — which a build
+/// whose sandbox leaves the machine open does not restrict.
+fn sandboxed_build_script_build(isolation: Option<&str>) -> String {
     let machine = Machine::new();
+    machine.setup(|_| {});
+
+    // A second workspace, whose build directory the first one's build
+    // script must not be able to write: the grant is this workspace's own
+    // directory, not the directory that holds every workspace's.
+    let other = support::tempdir().expect("second workspace");
+    std::fs::create_dir_all(other.path().join("src")).expect("src dir");
+    std::fs::write(
+        other.path().join("Cargo.toml"),
+        "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(other.path().join("src").join("lib.rs"), "").expect("lib");
+    let other_build_dir = machine.reported_build_dir(other.path());
+    let first_build_dir = machine.reported_build_dir(machine.dir());
+    assert_ne!(other_build_dir, first_build_dir);
+    std::fs::create_dir_all(&other_build_dir).expect("create the second build dir");
+
     std::fs::write(
         machine.dir().join("build.rs"),
-        "fn main() {\n\
-         let out = std::env::var(\"OUT_DIR\").expect(\"OUT_DIR\");\n\
-         std::fs::write(std::path::Path::new(&out).join(\"gen.rs\"), \"pub fn two() -> u8 { 2 }\\n\").expect(\"write gen.rs\");\n\
-         }\n",
+        format!(
+            "fn main() {{\n\
+             let out = std::env::var(\"OUT_DIR\").expect(\"OUT_DIR\");\n\
+             std::fs::write(std::path::Path::new(&out).join(\"gen.rs\"), \"pub fn two() -> u8 {{ 2 }}\\n\").expect(\"write gen.rs\");\n\
+             let intruder = std::path::Path::new({other:?}).join(\"intruder\");\n\
+             let outcome = if std::fs::write(&intruder, \"x\").is_ok() {{ \"written\" }} else {{ \"denied\" }};\n\
+             std::fs::write(std::path::Path::new(&out).join(\"intruder-outcome\"), outcome).expect(\"write the outcome\");\n\
+             }}\n",
+            other = other_build_dir.to_str().expect("utf-8 path"),
+        ),
     )
     .expect("build script");
     std::fs::write(
@@ -267,10 +334,12 @@ fn a_sandboxed_stow_build_with_a_build_script_uses_the_placed_build_directory() 
         "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n",
     )
     .expect("lib");
-    machine.setup(|_| {});
 
     let mut build = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     build.arg("build");
+    if let Some(isolation) = isolation {
+        build.args(["--isolation", isolation]);
+    }
     machine.hermetic(&mut build);
     let output = build.output().expect("run stow-cli build");
     assert!(
@@ -293,6 +362,20 @@ fn a_sandboxed_stow_build_with_a_build_script_uses_the_placed_build_directory() 
             .join("libplaced.rlib")
             .is_file()
     );
+
+    let outcome = files_under(&first_build_dir)
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "intruder-outcome")
+        })
+        .expect("the build script recorded its outcome in its own build directory");
+    let outcome = std::fs::read_to_string(outcome).expect("read the outcome");
+    assert_eq!(
+        other_build_dir.join("intruder").exists(),
+        outcome == "written"
+    );
+    outcome
 }
 
 #[test]
