@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.2](https://github.com/water-rs/stow/compare/types/v0.21.1...types/v0.21.2) - 2026-11-15
+
+### Fixed
+
+- *(edge)* leave the freeze-clear, cap-set and queue-mutation dispatch to the alarm ([#1536](https://github.com/water-rs/stow/pull/1536))
+
+### Other
+
+- Merge pull request #1547 from water-rs/dev
+
 ## [0.21.1](https://github.com/water-rs/stow/compare/types/v0.21.0...types/v0.21.1) - 2026-11-14
 
 ### Fixed
