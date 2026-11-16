@@ -8351,6 +8351,7 @@ dependencies = [
  "stow-oci",
  "stow-shim",
  "stow-types",
+ "tar",
  "tempfile",
  "time",
  "tokio",

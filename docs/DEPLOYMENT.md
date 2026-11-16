@@ -684,7 +684,7 @@ lists live in `edge/src/api.rs` (the
 
 | Routes | Workflows |
 |---|---|
-| `POST /api/v1/admin/dispatch-freeze`, `POST /api/v1/admin/dispatch-cap`, `POST /api/v1/admin/queue/{retry,cancel,promote,purge}`, `POST /api/v1/admin/scheduler/reset`, the mock-only `POST /api/v1/admin/scheduler/budget[/seed,/rearm]` | `operations.yml` |
+| `POST /api/v1/admin/dispatch-freeze`, `POST /api/v1/admin/dispatch-cap`, `POST /api/v1/admin/dispatch-rate`, `POST /api/v1/admin/queue/{retry,cancel,promote,purge}`, `POST /api/v1/admin/scheduler/reset`, the mock-only `POST /api/v1/admin/scheduler/budget[/seed,/rearm]` | `operations.yml` |
 | `POST /api/v1/scheduler/tasks/submit` | `operations.yml`, `preheat-admin.yml`, `preheat-missed.yml` |
 | `POST /api/v1/scheduler/tasks/submit-ids` | `operations.yml`, `preheat-admin.yml` |
 | `POST /api/v1/admin/scheduler/demand`, `POST /api/v1/admin/scheduler/demand-feed/{query,begin,page,complete,cleanup,deliver}` | `operations.yml`, `demand-feed.yml` |
@@ -728,7 +728,7 @@ rest get the edge URL and audience alone.
 `stow-admin` dispatches the workflow for these mutating commands, each
 under `--yes` where the command takes it: `scheduler reset`,
 `scheduler demand-feed`, `queue retry|cancel|promote|purge`,
-`dispatch-freeze engage|clear`, `dispatch-cap set`, `submit`,
+`dispatch-freeze engage|clear`, `dispatch-cap set`, `dispatch-rate set`, `submit`,
 `maintenance ensure|on|off|status`,
 `watchdog` (not `--dry-run`), `preheat binary|top-binaries|missed|manual`
 and `preheat projects submit`. It sends the argument list as a JSON array

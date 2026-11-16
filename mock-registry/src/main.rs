@@ -136,10 +136,9 @@ async fn populate_registry(request: PopulateArgs) -> stow_types::error::Result<(
 }
 
 /// Write one signed index artifact into the on-disk registry — the mock
-/// counterpart of `stow_oci::publish_index`. The layout is byte-for-byte
-/// what `populate` produces for artifact manifests: the index blob, a
-/// `{}` config blob, the manifest under both tag and digest, and the
-/// cosign-shaped signature image under `sigstore_signature_tag`.
+/// counterpart of `stow_oci::publish_index`: the index blob, a `{}` config
+/// blob, the manifest under both tag and digest, and the cosign-shaped
+/// signature image under `sigstore_signature_tag`.
 ///
 /// When the published tag already carries the file's `content_sha256`
 /// annotation nothing is rewritten — the same skip the production
@@ -931,7 +930,6 @@ async fn write_mock_registry_entry(
     };
     let config_bytes = serde_json::to_vec(&config)?;
     let config_digest = sha256_digest(&config_bytes);
-    write_blob(registry_root, &config_digest, &config_bytes).await?;
 
     // Same order as CI packs: outputs, then the native archive.
     let mut named = Vec::with_capacity(plan.outputs.len() + 1);
@@ -951,7 +949,6 @@ async fn write_mock_registry_entry(
     })
     .await?;
     let pack_digest = sha256_digest(&pack);
-    write_blob(registry_root, &pack_digest, &pack).await?;
     let layers = [serde_json::json!({
         "mediaType": STOW_PACK_MEDIA_TYPE,
         "digest": pack_digest,
@@ -969,16 +966,14 @@ async fn write_mock_registry_entry(
         "layers": layers,
     }))?;
     let manifest_digest = sha256_digest(&manifest_bytes);
-    let (repo, tag) = split_reference(&plan.oci_reference)?;
-    write_manifest(registry_root, &repo, &manifest_digest, &manifest_bytes).await?;
+    let (repo, _) = split_reference(&plan.oci_reference)?;
 
     let (signature_b64, payload_bytes) =
-        write_mock_signature(registry_root, signer, &plan.oci_reference, &manifest_digest).await?;
-    // Tagged only once signed, as `stow_oci::put_signed_manifest` pushes.
-    write_manifest(registry_root, &repo, &tag, &manifest_bytes).await?;
+        mock_signature(signer, &plan.oci_reference, &manifest_digest)?;
 
     // The same bundle tar the trusted publish stage pushes as
-    // `<tag>.bundle`: the edge streams this blob by digest.
+    // `<tag>.bundle` — the only place a node is published: the edge
+    // streams this blob by digest.
     let signature_material = BundleSignatureMaterial {
         payload_path: sigstore_payload_path(0),
         payload_bytes,
@@ -1127,14 +1122,10 @@ async fn append_mock_signature(
     .await
 }
 
-/// The signature pair the push path reads back through
-/// `pull_signature_materials`: the simple-signing payload as a blob and
-/// the `sha256-<digest>.sig` manifest whose layers carry each tag's
-/// signature and certificate annotations — appended, so a digest shared
-/// by several tags accumulates them all. Returns the base64 signature
-/// and the payload bytes — the bundle embeds both.
-async fn write_mock_signature(
-    registry_root: &Path,
+/// A mock signature of `manifest_digest` under `oci_reference`, published
+/// nowhere: the base64 signature and the simple-signing payload bytes — what
+/// a node's bundle embeds.
+fn mock_signature(
     signer: &SigStoreSigner,
     oci_reference: &str,
     manifest_digest: &str,
@@ -1144,7 +1135,25 @@ async fn write_mock_signature(
     let signature = signer.sign(&payload_bytes).map_err(|error| {
         stow_types::stow_error!("sign mock payload for {oci_reference}: {error}")
     })?;
-    let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
+    Ok((
+        base64::engine::general_purpose::STANDARD.encode(signature),
+        payload_bytes,
+    ))
+}
+
+/// The signature pair the records and index readers read back through
+/// `pull_signature_materials`: the simple-signing payload as a blob and
+/// the `sha256-<digest>.sig` manifest whose layers carry each tag's
+/// signature and certificate annotations — appended, so a digest shared
+/// by several tags accumulates them all. Returns the base64 signature
+/// and the payload bytes.
+async fn write_mock_signature(
+    registry_root: &Path,
+    signer: &SigStoreSigner,
+    oci_reference: &str,
+    manifest_digest: &str,
+) -> stow_types::error::Result<(String, Vec<u8>)> {
+    let (signature_b64, payload_bytes) = mock_signature(signer, oci_reference, manifest_digest)?;
     let (repo, _) = split_reference(oci_reference)?;
     append_mock_signature(
         registry_root,
@@ -2593,8 +2602,10 @@ mod tests {
     use stow_types::api::ArtifactRecord;
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::bundle::{
-        ArtifactBundleFile, OCI_IMAGE_MANIFEST_MEDIA_TYPE, STOW_ARTIFACT_CONFIG_MEDIA_TYPE,
-        STOW_BUNDLE_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, sigstore_signature_tag,
+        ArtifactBundleFile, ArtifactBundleManifest, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+        STOW_ARTIFACT_CONFIG_MEDIA_TYPE, STOW_BUNDLE_MANIFEST_PATH, STOW_BUNDLE_MEDIA_TYPE,
+        STOW_OCI_CONFIG_PATH, STOW_OCI_MANIFEST_PATH, STOW_RLIB_MEDIA_TYPE, SigstoreSignature,
+        sigstore_signature_tag,
     };
     use stow_types::identity::{
         CMetadata, CrateName, DependencyCMetadataJson, FeaturesJson, WireRustcVersion,
@@ -2625,9 +2636,10 @@ mod tests {
 
     use super::{
         Arc, Body, MockRegistryState, Mutex, Path, RegistryProbe, SigStoreKeyPair, SigningScheme,
-        TokenState, analytics_engine_sql, analytics_engine_sql_answer, create_dir_all,
-        demand_query_hour, log_demand_query, manifest_file_name, registry_app_with_probe,
-        split_reference, write, write_blob, write_manifest, write_mock_signature,
+        TokenState, analytics_engine_sql, analytics_engine_sql_answer, bundle_oci_reference,
+        create_dir_all, demand_query_hour, log_demand_query, manifest_file_name, mock_signature,
+        registry_app_with_probe, split_reference, write, write_blob, write_manifest,
+        write_mock_signature,
     };
 
     const MANIFEST_URI: &str = "/v2/water-rs/stow-cache-v2-1.98.0/manifests/latest";
@@ -3346,10 +3358,9 @@ mod tests {
         }
     }
 
-    /// Write the mock signature and return the same material to the publisher.
-    fn mock_sign(
-        root: &std::path::Path,
-    ) -> impl Fn(
+    /// Sign under a fresh mock key and return the material to the publisher,
+    /// writing nothing: a node's signature lives only in its bundle.
+    fn mock_sign() -> impl Fn(
         String,
         String,
     ) -> std::pin::Pin<
@@ -3359,15 +3370,12 @@ mod tests {
                 > + Send,
         >,
     > {
-        let root = root.to_path_buf();
         move |oci_reference: String, manifest_digest: String| {
-            let root = root.clone();
             Box::pin(async move {
                 let signer = SigningScheme::ECDSA_P256_SHA256_ASN1
                     .create_signer()
                     .map_err(|error| stow_types::stow_error!("create mock signer: {error}"))?;
-                write_mock_signature(&root, &signer, &oci_reference, &manifest_digest)
-                    .await
+                mock_signature(&signer, &oci_reference, &manifest_digest)
                     .map(mock_signature_material)
             })
         }
@@ -3389,7 +3397,7 @@ mod tests {
             .await
             .expect("registry http");
         let session = push_session(&listen, &http, &ample_writes());
-        stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
+        stow_oci::push_artifacts_with(&session, &[plan], mock_sign())
             .await
             .expect("push succeeds");
 
@@ -3413,12 +3421,12 @@ mod tests {
         );
         assert_eq!(
             count(Method::HEAD, "/blobs/"),
-            4,
-            "a HEAD per blob: artifact layer + config, bundle layer + config"
+            2,
+            "a HEAD per blob: the bundle layer and its config"
         );
         assert_eq!(
             count(Method::POST, "/blobs/uploads"),
-            4,
+            2,
             "one monolithic POST per missing blob: {log:?}"
         );
         let manifest_puts: Vec<&str> = log
@@ -3428,14 +3436,12 @@ mod tests {
             .collect();
         assert_eq!(
             manifest_puts.len(),
-            2,
-            "the signed artifact tag, then the bundle: {manifest_puts:?}"
+            1,
+            "the bundle tag alone: {manifest_puts:?}"
         );
         assert!(
-            manifest_puts
-                .iter()
-                .all(|path| !path.contains("/manifests/sha256:")),
-            "no redundant digest upload: {manifest_puts:?}"
+            manifest_puts[0].ends_with(".bundle"),
+            "the one manifest is the bundle: {manifest_puts:?}"
         );
         assert_eq!(
             count(Method::GET, "/manifests/"),
@@ -3451,45 +3457,57 @@ mod tests {
             !log.iter().any(|record| record.method == Method::PATCH),
             "no chunked upload session"
         );
-        assert_eq!(log.len(), 12, "the full push in twelve requests");
+        assert_eq!(log.len(), 7, "the full push in seven requests");
     }
 
-    /// The signer runs before either the digest or tag exists. Publishing
-    /// the tag once signing succeeds also makes the digest readable.
+    /// The signer runs before anything of the node is written, and the
+    /// node is published only as its bundle: neither the artifact tag nor
+    /// its manifest digest ever exists in the registry.
     #[tokio::test]
-    async fn push_signs_before_it_tags() {
+    async fn push_signs_before_it_tags_and_publishes_only_the_bundle() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let root = tempfile::tempdir().expect("registry root");
         let plan = test_plan(root.path());
-        let (listen, _probe) = serve_probe_registry(root.path()).await;
+        let (listen, probe) = serve_probe_registry(root.path()).await;
         let manifests = root.path().join("manifests");
-        let sign = mock_sign(root.path());
+        let sign = mock_sign();
 
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
             .await
             .expect("registry http");
         let session = push_session(&listen, &http, &ample_writes());
-        stow_oci::push_artifacts_with(
+        let signed_writes = std::sync::atomic::AtomicUsize::new(usize::MAX);
+        let outcome = stow_oci::push_artifacts_with(
             &session,
-            &[plan],
+            std::slice::from_ref(&plan),
             |oci_reference: String, manifest_digest: String| {
-                let (repo, tag) = split_reference(&oci_reference).expect("tagged reference");
-                assert!(
-                    !manifests.join(&repo).join(&tag).exists(),
-                    "{tag} was tagged before it was signed"
-                );
-                assert!(
-                    !manifests
-                        .join(&repo)
-                        .join(manifest_file_name(&manifest_digest))
-                        .exists(),
-                    "{manifest_digest} was uploaded before signing"
+                signed_writes.store(
+                    probe.write_arrivals().len(),
+                    std::sync::atomic::Ordering::SeqCst,
                 );
                 sign(oci_reference, manifest_digest)
             },
         )
         .await
         .expect("push succeeds");
+        assert_eq!(
+            signed_writes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing was written before the node was signed"
+        );
+
+        let published = &outcome.published_by_reference[&plan.oci_reference];
+        let (repo, tag) = split_reference(&plan.oci_reference).expect("tagged reference");
+        for absent in [tag.clone(), manifest_file_name(&published.oci_digest)] {
+            assert!(
+                !manifests.join(&repo).join(&absent).exists(),
+                "{absent} must never be published"
+            );
+        }
+        assert!(
+            manifests.join(&repo).join(format!("{tag}.bundle")).exists(),
+            "the bundle is tagged"
+        );
     }
 
     /// A task's artifacts publish together: each signature completes only
@@ -3504,7 +3522,7 @@ mod tests {
         second.oci_reference = second.oci_reference.replace("serde.1.0.0", "serde.1.0.1");
         assert_ne!(first.oci_reference, second.oci_reference);
         let (listen, _probe) = serve_probe_registry(root.path()).await;
-        let sign = mock_sign(root.path());
+        let sign = mock_sign();
         let both_signing = tokio::sync::Barrier::new(2);
 
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
@@ -3540,7 +3558,7 @@ mod tests {
         );
     }
 
-    /// Either blob's refusal prevents signing and publishing the manifest.
+    /// Either bundle blob's refusal prevents tagging the bundle.
     #[tokio::test]
     async fn failed_blob_upload_never_publishes_a_manifest() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -3558,64 +3576,81 @@ mod tests {
             .await
             .expect("registry http");
         let session = push_session(&listen, &http, &ample_writes());
-        let error = stow_oci::push_artifacts_with(&session, &[plan], |_, _| async {
-            panic!("failed blob must not reach signing");
-        })
-        .await
-        .expect_err("refused blob");
+        let error = stow_oci::push_artifacts_with(&session, &[plan], mock_sign())
+            .await
+            .expect_err("refused blob");
         assert!(error.to_string().contains("400"), "{error}");
         assert!(probe.request_log().iter().all(|request| {
             request.method != Method::PUT || !request.path.contains("/manifests/")
         }));
     }
 
-    /// Failed signing never writes a manifest, whether the destination
-    /// tag is new or already serves a signed artifact.
+    /// Failed signing writes nothing, whether the node's bundle tag is new
+    /// or already serves a signed bundle; nor does a signed manifest whose
+    /// signature fails.
     #[tokio::test]
     async fn failed_signing_preserves_existing_and_absent_tags() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let root = tempfile::tempdir().expect("registry root");
         let plan = test_plan(root.path());
-        let reference = plan.oci_reference.parse().expect("reference");
+        let mut unpublished = test_plan(root.path());
+        unpublished.oci_reference = unpublished
+            .oci_reference
+            .replace("serde.1.0.0", "serde.1.0.1");
+        let bundle_tag = |plan: &PlannedArtifact| {
+            split_reference(&bundle_oci_reference(&plan.oci_reference).expect("bundle reference"))
+                .expect("tagged reference")
+                .1
+        };
         let (listen, probe) = serve_probe_registry(root.path()).await;
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
             .await
             .expect("registry http");
         let session = push_session(&listen, &http, &ample_writes());
-        stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
+        stow_oci::push_artifacts_with(&session, std::slice::from_ref(&plan), mock_sign())
             .await
-            .expect("initial signed artifact");
-        let (manifest, digest) = session.pull_manifest(&reference).await.expect("manifest");
-        let absent = session.reference("unpublished").expect("new reference");
-        let writes = || {
-            probe
-                .request_log()
-                .iter()
-                .filter(|request| request.method == Method::PUT)
-                .count()
-        };
+            .expect("initial signed bundle");
+        let existing = session
+            .reference(&bundle_tag(&plan))
+            .expect("bundle reference");
+        let absent = session
+            .reference(&bundle_tag(&unpublished))
+            .expect("new reference");
+        let (manifest, digest) = session.pull_manifest(&existing).await.expect("manifest");
+        let writes = || probe.write_arrivals().len();
         let before = writes();
-        for destination in [&reference, &absent] {
+        for plan in [&plan, &unpublished] {
             let error =
-                stow_oci::put_signed_manifest(&session, destination, &manifest, |_| async {
-                    Err::<(), _>(stow_types::stow_error!("signing refused"))
+                stow_oci::push_artifacts_with(&session, std::slice::from_ref(plan), |_, _| async {
+                    Err::<stow_types::bundle::BundleSignatureMaterial, _>(stow_types::stow_error!(
+                        "signing refused"
+                    ))
                 })
                 .await
                 .expect_err("failed signature");
             assert!(error.to_string().contains("signing refused"), "{error}");
         }
-        assert_eq!(writes(), before, "failed signing uploads no manifest");
+        let records = session.reference("records-unpublished").expect("reference");
+        let error = stow_oci::put_signed_manifest(&session, &records, &manifest, |_| async {
+            Err::<(), _>(stow_types::stow_error!("signing refused"))
+        })
+        .await
+        .expect_err("failed signature");
+        assert!(error.to_string().contains("signing refused"), "{error}");
+        assert_eq!(writes(), before, "failed signing writes nothing");
         assert_eq!(
-            session.pull_manifest(&reference).await.expect("old tag"),
+            session.pull_manifest(&existing).await.expect("old tag"),
             (manifest, digest)
         );
-        assert!(
-            session
-                .pull_manifest(&absent)
-                .await
-                .expect_err("absent tag")
-                .is_not_found()
-        );
+        for tag in [&absent, &records] {
+            assert!(
+                session
+                    .pull_manifest(tag)
+                    .await
+                    .expect_err("absent tag")
+                    .is_not_found()
+            );
+        }
     }
 
     /// GHCR's cap shape — `429 TOOMANYREQUESTS` carrying
@@ -3634,7 +3669,7 @@ mod tests {
             .await
             .expect("registry http");
         let session = push_session(&listen, &http, &ample_writes());
-        stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
+        stow_oci::push_artifacts_with(&session, &[plan], mock_sign())
             .await
             .expect("push succeeds after retries");
 
@@ -3645,7 +3680,7 @@ mod tests {
                 record.method == Method::POST && record.path.contains("/blobs/uploads")
             })
             .count();
-        assert_eq!(uploads, 7, "three refused uploads retried, four accepted");
+        assert_eq!(uploads, 5, "three refused uploads retried, two accepted");
     }
 
     /// A registry that answers `202` + a session `Location` — the
@@ -3663,7 +3698,7 @@ mod tests {
             .await
             .expect("registry http");
         let session = push_session(&listen, &http, &ample_writes());
-        stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
+        stow_oci::push_artifacts_with(&session, &[plan], mock_sign())
             .await
             .expect("push succeeds through commit PUTs");
 
@@ -3676,24 +3711,24 @@ mod tests {
         };
         assert_eq!(
             count(Method::POST, "/blobs/uploads"),
-            4,
+            2,
             "each missing blob opened an upload session"
         );
         assert_eq!(
             count(Method::PUT, "/blobs/uploads/"),
-            4,
+            2,
             "each session committed with one PUT"
         );
         assert_eq!(
             count(Method::PUT, "/manifests/"),
-            2,
-            "manifest puts are unchanged by the upload fallback: the signed artifact tag and the bundle"
+            1,
+            "manifest puts are unchanged by the upload fallback: the bundle alone"
         );
     }
 
     /// A `PUT` answer without `Docker-Content-Digest` makes the client
     /// read the manifest back under the pushed bytes' own digest and
-    /// require the same bytes — both manifests get the round trip.
+    /// require the same bytes.
     #[tokio::test]
     async fn push_verifies_manifest_bytes_without_digest_header() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -3706,7 +3741,7 @@ mod tests {
             .await
             .expect("registry http");
         let session = push_session(&listen, &http, &ample_writes());
-        stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
+        stow_oci::push_artifacts_with(&session, &[plan], mock_sign())
             .await
             .expect("push verifies manifests by read-back");
 
@@ -3718,8 +3753,8 @@ mod tests {
             })
             .count();
         assert_eq!(
-            read_backs, 2,
-            "every manifest PUT verified by digest: the signed artifact tag and the bundle"
+            read_backs, 1,
+            "the bundle's manifest PUT verified by digest"
         );
     }
 
@@ -3866,15 +3901,12 @@ mod tests {
         write_public_key(&public_key_path, &key_pair)
             .await
             .expect("public key");
-        let root = root.to_path_buf();
         let sign = move |oci_reference: String, manifest_digest: String| {
-            let root = root.clone();
             let signer = key_pair
                 .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
                 .expect("mock signer");
             Box::pin(async move {
-                write_mock_signature(&root, &signer, &oci_reference, &manifest_digest)
-                    .await
+                mock_signature(&signer, &oci_reference, &manifest_digest)
                     .map(mock_signature_material)
             })
                 as std::pin::Pin<
@@ -3890,9 +3922,10 @@ mod tests {
         (sign, stow_oci::verify::Trust::MockKey(public_key_path))
     }
 
-    /// Re-publish `record`'s tag as the retired layout — one zstd layer
-    /// per file, `layer_bytes` standing in for the files' contents —
-    /// signed by `sign`. Returns the record naming the retired manifest.
+    /// Publish `packed`'s node again in the retired layout — one zstd layer
+    /// per file, `layer_bytes` standing in for the files' contents — signed
+    /// by `sign`, as the bundle the retired assembler wrote: each layer at
+    /// `files/<file name>`. Returns the record naming that bundle.
     async fn publish_retired_layout<S, Fut>(
         session: &stow_oci::RegistrySession,
         plan: &PlannedArtifact,
@@ -3906,59 +3939,76 @@ mod tests {
                 Output = stow_types::error::Result<stow_types::bundle::BundleSignatureMaterial>,
             >,
     {
-        let (packed_manifest, _) = session
-            .pull_manifest(
-                &session
-                    .digest_reference(&packed.oci_digest)
-                    .expect("reference"),
-            )
+        let node = stow_oci::pull_bundle(session, packed)
             .await
-            .expect("packed manifest");
-        let packed_manifest: serde_json::Value =
-            serde_json::from_slice(&packed_manifest).expect("manifest json");
-        let config_digest = packed_manifest["config"]["digest"]
-            .as_str()
-            .expect("config digest");
-        let config_size = packed_manifest["config"]["size"].clone();
-
+            .expect("packed bundle");
         let stored = stow_shim::compress(layer_bytes).expect("compress layer");
-        let layer_digest = sha256_digest(&stored);
-        session
-            .push_blob(&layer_digest, &stored)
-            .await
-            .expect("push retired layer");
+        let file = &plan.outputs[0].bundle_file;
         let manifest = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 2,
             "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
             "config": {
                 "mediaType": STOW_ARTIFACT_CONFIG_MEDIA_TYPE,
-                "digest": config_digest,
-                "size": config_size,
+                "digest": sha256_digest(&node.config_bytes),
+                "size": node.config_bytes.len(),
             },
             "layers": [{
-                "mediaType": format!("{}+zstd", plan.outputs[0].bundle_file.media_type),
-                "digest": layer_digest,
+                "mediaType": format!("{}+zstd", file.media_type),
+                "digest": sha256_digest(&stored),
                 "size": stored.len(),
             }],
         }))
         .expect("manifest bytes");
-        let reference = session
-            .reference(
-                packed
-                    .oci_reference
-                    .rsplit_once(':')
-                    .expect("tagged reference")
-                    .1,
-            )
-            .expect("reference");
-        let oci_digest = stow_oci::put_signed_manifest(session, &reference, &manifest, |digest| {
-            sign(packed.oci_reference.clone(), digest)
+        let oci_digest = sha256_digest(&manifest);
+        let signature = sign(packed.oci_reference.clone(), oci_digest.clone())
+            .await
+            .expect("sign the retired manifest");
+        let bundle_manifest = serde_json::to_vec(&ArtifactBundleManifest {
+            oci_reference: packed.oci_reference.clone(),
+            oci_digest: oci_digest.clone(),
+            config: node.config.clone(),
+            sigstore_signatures: vec![SigstoreSignature {
+                payload_path: signature.payload_path.clone(),
+                signature: signature.signature.clone(),
+                certificate_pem: signature.certificate_pem.clone(),
+                rekor_bundle_json: signature.rekor_bundle_json.clone(),
+            }],
         })
-        .await
-        .expect("publish retired layout")
-        .digest;
+        .expect("bundle manifest");
+        let mut tar = tar::Builder::new(Vec::new());
+        for (path, bytes) in [
+            (
+                STOW_BUNDLE_MANIFEST_PATH.to_owned(),
+                bundle_manifest.as_slice(),
+            ),
+            (STOW_OCI_MANIFEST_PATH.to_owned(), manifest.as_slice()),
+            (
+                STOW_OCI_CONFIG_PATH.to_owned(),
+                node.config_bytes.as_slice(),
+            ),
+            (
+                signature.payload_path.clone(),
+                signature.payload_bytes.as_slice(),
+            ),
+            (format!("files/{}", file.file_name), stored.as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(u64::try_from(bytes.len()).expect("entry size"));
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, path, bytes)
+                .expect("append bundle entry");
+        }
+        let bundle = tar.into_inner().expect("retired bundle");
+        let bundle_digest = sha256_digest(&bundle);
+        session
+            .push_blob(&bundle_digest, &bundle)
+            .await
+            .expect("push retired bundle");
         ArtifactRecord {
             oci_digest,
+            bundle_digest,
+            bundle_size: u64::try_from(bundle.len()).expect("bundle size"),
             ..packed.clone()
         }
     }
@@ -4020,17 +4070,11 @@ mod tests {
             packed,
             "repack preserves the node; a fresh signature may change bundle bytes"
         );
-        let reference = repacked.oci_reference.parse().expect("reference");
-        stow_oci::verify_artifact_signature(
-            &session,
-            &trust,
-            &reference,
-            &repacked.oci_reference,
-            &repacked.oci_digest,
-            &build_identity(),
-        )
-        .await
-        .expect("repacked signature verifies");
+        stow_oci::pull_bundle(&session, &repacked)
+            .await
+            .expect("the repacked bundle reads")
+            .verify(&trust, &build_identity())
+            .expect("repacked signature verifies");
 
         assert_eq!(
             stow_oci::repack_record(&session, &trust, &build_identity(), &repacked, &sign)
@@ -4092,7 +4136,7 @@ mod tests {
             &plan,
             &packed,
             b"the rlib the mock uploads",
-            &mock_sign(root.path()),
+            &mock_sign(),
         )
         .await;
         let error = stow_oci::repack_record(&session, &trust, &build_identity(), &untrusted, &sign)
@@ -4104,8 +4148,8 @@ mod tests {
         );
         assert_eq!(
             manifest_puts(),
-            puts_before + 1,
-            "a refused node pushes nothing; only the untrusted node's own manifest went up"
+            puts_before,
+            "a refused node pushes nothing"
         );
     }
 
@@ -4135,7 +4179,7 @@ mod tests {
             .await
             .expect("registry http");
         let session = push_session(&listen, &http, &ample_writes());
-        let outcome = stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
+        let outcome = stow_oci::push_artifacts_with(&session, &[plan], mock_sign())
             .await
             .expect("publish without signature read-back");
         let artifact = outcome

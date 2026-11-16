@@ -23,14 +23,16 @@ use rcgen::{
 use sha2::Digest as _;
 use sigstore::cosign::bundle::Payload as RekorPayload;
 use sigstore::crypto::{CosignVerificationKey, Signature, SigningScheme};
-use stow_oci::resign::Identities;
+use stow_oci::resign::{Identities, Signers};
 use stow_oci::verify::ReleaseIdentity;
+use stow_types::api::ArtifactRecord;
 use stow_types::bundle::{
     SIGSTORE_BUNDLE_ANNOTATION, SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE,
     SIGSTORE_SIGNATURE_ANNOTATION, sigstore_signature_tag,
 };
 use stow_types::identity::WireRustcVersion;
 use stow_types::records::{BuildRecords, BuildRun};
+use stow_types::registry::BUNDLE_TAG_SUFFIX;
 use stow_types::trusted_builder::{CERTIFICATE_ISSUER, TrustedWorkflow};
 use stow_types::upload_plan::PlannedArtifact;
 
@@ -445,48 +447,37 @@ impl Stack {
     }
 
     /// Publish `plans` at once through `session`, signing with `signer`;
-    /// the digest each plan's manifest landed under.
+    /// the row each plan's bundle landed under.
     async fn publish(
         session: &stow_oci::RegistrySession,
         signer: &stow_oci::KeylessSigner,
         plans: &[PlannedArtifact],
-    ) -> stow_types::error::Result<Vec<String>> {
+    ) -> stow_types::error::Result<Vec<ArtifactRecord>> {
         let sign = |reference: String, digest: String| async move {
-            signer.sign(session, &reference, &digest).await
+            signer.sign_detached(&reference, &digest).await
         };
         let outcomes =
             futures_util::future::try_join_all(plans.iter().map(|plan| {
                 stow_oci::push_artifacts_with(session, std::slice::from_ref(plan), &sign)
             }))
             .await?;
-        Ok(plans
-            .iter()
-            .zip(outcomes)
-            .map(|(plan, outcome)| {
-                outcome.published_by_reference[&plan.oci_reference]
-                    .oci_digest
-                    .clone()
-            })
-            .collect())
+        let mut rows = Vec::with_capacity(plans.len());
+        for (plan, outcome) in plans.iter().zip(outcomes) {
+            rows.extend(row_of(plan, &outcome)?);
+        }
+        Ok(rows)
     }
 
-    /// Verify `plan`'s signature as a reader does.
+    /// Verify the node `row` names from its bundle, as a reader does.
     async fn verify(
         &self,
         session: &stow_oci::RegistrySession,
-        plan: &PlannedArtifact,
-        digest: &str,
+        row: &ArtifactRecord,
     ) -> stow_types::error::Result<()> {
-        let reference: stow_oci::Reference = plan.oci_reference.parse().expect("reference");
-        stow_oci::verify_artifact_signature(
-            session,
+        stow_oci::pull_bundle(session, row).await?.verify(
             &stow_oci::verify::Trust::GithubCi(self.sigstore.trust()),
-            &reference,
-            &plan.oci_reference,
-            digest,
             &reader_identity(),
         )
-        .await
     }
 
     /// The writes the registry saw.
@@ -507,44 +498,80 @@ impl Stack {
     }
 }
 
-/// A keyless signature lands in cosign's legacy layout and verifies with
-/// the reader's verifier; signing costs three writes — the payload, the
-/// config and the `.sig` manifest.
+/// The row `plan` published as, from its push outcome.
+fn row_of(
+    plan: &PlannedArtifact,
+    outcome: &stow_oci::UploadOutcome,
+) -> stow_types::error::Result<Vec<ArtifactRecord>> {
+    stow_types::upload_plan::build_artifact_records(
+        std::slice::from_ref(plan),
+        &outcome.published_by_reference,
+        &BTreeMap::from([(plan.oci_reference.clone(), None)]),
+    )
+}
+
+/// A node's keyless signature travels in its bundle alone and verifies
+/// with the reader's verifier; the publish costs three writes — the
+/// bundle's layer, config and manifest — and pushes no `.sig` image.
 #[tokio::test]
 async fn a_keyless_signature_verifies_with_the_readers_verifier() {
     let stack = Stack::new().await;
     let session = stack.session(&unbounded());
     let plans = [plan(&stack.root, 0)];
-    let digests = Stack::publish(&session, &stack.signer(), &plans)
+    let rows = Stack::publish(&session, &stack.signer(), &plans)
         .await
         .expect("publish");
     stack
-        .verify(&session, &plans[0], &digests[0])
+        .verify(&session, &rows[0])
         .await
         .expect("the signature verifies");
 
     assert_eq!(stack.sigstore.certificates(), 1);
     assert_eq!(stack.sigstore.entries(), 1);
-    // Layer and config; the signature's payload, config and manifest;
-    // the signed tag; the bundle's layer, config and manifest.
     assert_eq!(
         stack.writes(),
-        9,
+        3,
         "requests: {:?}",
         stack.probe.request_log()
     );
-    let log = stack.probe.request_log();
+    assert!(
+        stack.signature_manifest(&rows[0].oci_digest).is_none(),
+        "a node's signature has no .sig image"
+    );
+}
+
+/// A signature of a manifest published under its own tag lands in cosign's
+/// legacy layout and verifies with the reader's verifier; signing costs
+/// three writes — the payload, the config and the `.sig` manifest.
+#[tokio::test]
+async fn a_signature_image_is_cosigns_legacy_layout() {
+    let stack = Stack::new().await;
+    let session = stack.session(&unbounded());
+    let reference = session.reference("records-layout").expect("reference");
+    let digest = stow_types::registry::sha256_digest(b"manifest");
+    stack
+        .signer()
+        .sign(&session, &reference.to_string(), &digest)
+        .await
+        .expect("sign");
+    stow_oci::verify_artifact_signature(
+        &session,
+        &stow_oci::verify::Trust::GithubCi(stack.sigstore.trust()),
+        &reference,
+        &reference.to_string(),
+        &digest,
+        &reader_identity(),
+    )
+    .await
+    .expect("the signature verifies");
     assert_eq!(
-        log.iter()
-            .filter(|record| record.method == Method::PUT && record.path.ends_with(".sig"))
-            .count(),
-        1,
-        "one .sig manifest push"
+        stack.writes(),
+        3,
+        "requests: {:?}",
+        stack.probe.request_log()
     );
 
-    let manifest = stack
-        .signature_manifest(&digests[0])
-        .expect("signature image");
+    let manifest = stack.signature_manifest(&digest).expect("signature image");
     assert_eq!(
         manifest["config"]["mediaType"],
         "application/vnd.oci.image.config.v1+json"
@@ -656,8 +683,12 @@ async fn publication_write_cost(session_put: bool, artifact_count: usize) {
             let (signer, session) = (&signer, &session);
             async move { signer.sign(session, &reference, &digest).await }
         };
+        let sign_node = |reference: String, digest: String| {
+            let signer = &signer;
+            async move { signer.sign_detached(&reference, &digest).await }
+        };
         let before = stack.writes();
-        let outcome = stow_oci::push_artifacts_with(&session, &plans, sign)
+        let outcome = stow_oci::push_artifacts_with(&session, &plans, sign_node)
             .await
             .expect("artifacts");
         let artifacts = stow_types::upload_plan::build_artifact_records(
@@ -686,8 +717,11 @@ async fn publication_write_cost(session_put: bool, artifact_count: usize) {
         )
         .await
         .expect("signed records");
+        // Each node is its bundle alone: the layer, the config and the
+        // manifest, a blob two writes when the registry answers its `POST`
+        // with an upload session. The records costs are unchanged.
         let (per_artifact, cold_records, warm_records) =
-            if session_put { (15, 11, 9) } else { (9, 7, 6) };
+            if session_put { (5, 11, 9) } else { (3, 7, 6) };
         assert_eq!(
             stack.writes() - before,
             per_artifact * artifact_count
@@ -718,7 +752,7 @@ async fn the_certificate_is_reused_while_valid_and_renewed_inside_the_margin() {
     let plans = (0..3)
         .map(|index| plan(&stack.root, index))
         .collect::<Vec<_>>();
-    let digests = Stack::publish(&session, &signer, &plans)
+    let rows = Stack::publish(&session, &signer, &plans)
         .await
         .expect("publish");
     assert_eq!(
@@ -727,11 +761,8 @@ async fn the_certificate_is_reused_while_valid_and_renewed_inside_the_margin() {
         "one certificate for three signatures"
     );
     assert_eq!(stack.sigstore.entries(), 3, "one Rekor entry per signature");
-    for (plan, digest) in plans.iter().zip(&digests) {
-        stack
-            .verify(&session, plan, digest)
-            .await
-            .expect("verifies");
+    for row in &rows {
+        stack.verify(&session, row).await.expect("verifies");
     }
 
     // Two minutes left is inside the four-minute margin.
@@ -743,13 +774,10 @@ async fn the_certificate_is_reused_while_valid_and_renewed_inside_the_margin() {
         .map(|index| plan(&stack.root, index))
         .collect::<Vec<_>>();
     for plan in &plans {
-        let digests = Stack::publish(&session, &renewing, std::slice::from_ref(plan))
+        let rows = Stack::publish(&session, &renewing, std::slice::from_ref(plan))
             .await
             .expect("publish");
-        stack
-            .verify(&session, plan, &digests[0])
-            .await
-            .expect("verifies");
+        stack.verify(&session, &rows[0]).await.expect("verifies");
     }
     assert_eq!(
         stack.sigstore.certificates(),
@@ -784,10 +812,13 @@ async fn a_sweep_stays_under_the_write_budget() {
     stack.probe.cap_writes(110, Duration::from_secs(1));
     let budget = stow_oci::WriteBudget::per_minute(NonZeroU32::new(3000).expect("rate"));
     let session = stack.session(&budget);
-    let plans = (0..24)
+    // 72 nodes at three writes each: 216 writes, past the budget's
+    // 100-write first second.
+    let nodes = 72;
+    let plans = (0..nodes)
         .map(|index| plan(&stack.root, index))
         .collect::<Vec<_>>();
-    let digests = Stack::publish(&session, &stack.signer(), &plans)
+    let rows = Stack::publish(&session, &stack.signer(), &plans)
         .await
         .expect("the sweep completes");
 
@@ -795,27 +826,16 @@ async fn a_sweep_stays_under_the_write_budget() {
     let arrivals = stack.probe.write_arrivals();
     assert_eq!(
         arrivals.len(),
-        24 * 9,
+        nodes * 3,
         "requests: {:?}",
         stack.probe.request_log()
     );
     let peak = peak(&arrivals, Duration::from_secs(1));
     assert!(peak <= 101, "{peak} writes in one second, over the budget");
     assert_eq!(stack.sigstore.certificates(), 1);
-    assert_eq!(stack.sigstore.entries(), 24);
-    for (plan, digest) in plans.iter().zip(&digests) {
-        stack
-            .verify(&session, plan, digest)
-            .await
-            .expect("verifies");
-        assert_eq!(
-            stack.signature_manifest(digest).expect("signature")["layers"]
-                .as_array()
-                .expect("layers")
-                .len(),
-            1,
-            "one signature layer"
-        );
+    assert_eq!(stack.sigstore.entries(), nodes);
+    for row in &rows {
+        stack.verify(&session, row).await.expect("verifies");
     }
 }
 
@@ -831,17 +851,14 @@ async fn a_refused_write_backs_off_in_place_without_re_signing() {
     let plans = (0..12)
         .map(|index| plan(&stack.root, index))
         .collect::<Vec<_>>();
-    let digests = Stack::publish(&session, &stack.signer(), &plans)
+    let rows = Stack::publish(&session, &stack.signer(), &plans)
         .await
         .expect("the sweep completes");
     assert!(stack.probe.throttled_writes() > 0, "the cap refused writes");
     assert_eq!(stack.sigstore.certificates(), 1);
     assert_eq!(stack.sigstore.entries(), 12, "no signature was made twice");
-    for (plan, digest) in plans.iter().zip(&digests) {
-        stack
-            .verify(&session, plan, digest)
-            .await
-            .expect("verifies");
+    for row in &rows {
+        stack.verify(&session, row).await.expect("verifies");
     }
 }
 
@@ -853,13 +870,17 @@ async fn independent_publishers_recover_without_re_signing() {
     let plans = (0..500)
         .map(|index| plan(&stack.root, index))
         .collect::<Vec<_>>();
-    for plan in &plans {
+    let bundle_manifest_path = |plan: &PlannedArtifact| {
         let reference: stow_oci::Reference = plan.oci_reference.parse().expect("reference");
-        stack.probe.rate_limit(
-            Method::PUT,
-            &format!("/manifests/{}", reference.tag().expect("artifact tag")),
-            1,
-        );
+        format!(
+            "/manifests/{}{BUNDLE_TAG_SUFFIX}",
+            reference.tag().expect("artifact tag")
+        )
+    };
+    for plan in &plans {
+        stack
+            .probe
+            .rate_limit(Method::PUT, &bundle_manifest_path(plan), 1);
     }
     // All 500 jobs are polled concurrently, each with an independent
     // 1500-write/minute budget, matching the production default.
@@ -879,15 +900,16 @@ async fn independent_publishers_recover_without_re_signing() {
                 let (session, signer) = (&session, &signer);
                 async move { signer.sign(session, &reference, &digest).await }
             };
+            let sign_node = |reference: String, digest: String| {
+                let signer = &signer;
+                async move { signer.sign_detached(&reference, &digest).await }
+            };
             let outcome =
-                stow_oci::push_artifacts_with(&session, std::slice::from_ref(plan), sign).await?;
-            let artifacts = stow_types::upload_plan::build_artifact_records(
-                std::slice::from_ref(plan),
-                &outcome.published_by_reference,
-                &[(plan.oci_reference.clone(), None)].into_iter().collect(),
-            )?;
+                stow_oci::push_artifacts_with(&session, std::slice::from_ref(plan), sign_node)
+                    .await?;
+            let artifacts = row_of(plan, &outcome)?;
             let records = stow_types::records::BuildRecords {
-                artifacts,
+                artifacts: artifacts.clone(),
                 local_programs: Vec::new(),
             };
             let published_records = stow_oci::push_records_with(
@@ -912,8 +934,7 @@ async fn independent_publishers_recover_without_re_signing() {
                 &reader_identity(),
             )
             .await?;
-            let digest = &outcome.published_by_reference[&plan.oci_reference].oci_digest;
-            stack.verify(&session, plan, digest).await?;
+            stack.verify(&session, &artifacts[0]).await?;
             Ok::<_, stow_types::error::Error>(())
         }
     }))
@@ -923,15 +944,14 @@ async fn independent_publishers_recover_without_re_signing() {
     assert_eq!(stack.sigstore.entries(), plans.len() * 2);
     let requests = stack.probe.request_log();
     for plan in &plans {
-        let reference: stow_oci::Reference = plan.oci_reference.parse().expect("reference");
-        let path = format!("/manifests/{}", reference.tag().expect("artifact tag"));
+        let path = bundle_manifest_path(plan);
         assert_eq!(
             requests
                 .iter()
                 .filter(|request| request.method == Method::PUT && request.path.ends_with(&path))
                 .count(),
             2,
-            "one refusal and one successful artifact manifest write"
+            "one refusal and one successful bundle manifest write"
         );
     }
 }
@@ -944,15 +964,12 @@ async fn a_lost_rekor_answer_reads_the_logged_entry_back() {
     stack.sigstore.with(|state| state.lose_answers = 1);
     let session = stack.session(&unbounded());
     let plans = [plan(&stack.root, 0)];
-    let digests = Stack::publish(&session, &stack.signer(), &plans)
+    let rows = Stack::publish(&session, &stack.signer(), &plans)
         .await
         .expect("publish");
     assert_eq!(stack.sigstore.entries(), 1);
     assert_eq!(stack.sigstore.reads(), 1);
-    stack
-        .verify(&session, &plans[0], &digests[0])
-        .await
-        .expect("verifies");
+    stack.verify(&session, &rows[0]).await.expect("verifies");
 }
 
 /// Rekor's real shape after a lost answer: the retry meets `409`, and the
@@ -968,20 +985,17 @@ async fn a_logged_entry_not_yet_readable_is_read_back_once_it_is() {
     });
     let session = stack.session(&unbounded());
     let plans = [plan(&stack.root, 0)];
-    let digests = Stack::publish(&session, &stack.signer(), &plans)
+    let rows = Stack::publish(&session, &stack.signer(), &plans)
         .await
         .expect("publish");
     assert_eq!(stack.sigstore.entries(), 1, "no signature was logged twice");
     assert_eq!(stack.sigstore.reads(), 3, "two 404s, then the entry");
-    stack
-        .verify(&session, &plans[0], &digests[0])
-        .await
-        .expect("verifies");
+    stack.verify(&session, &rows[0]).await.expect("verifies");
 }
 
 /// A refused certificate request fails the signature with Fulcio's own
-/// answer, and nothing of the signature is written: the tag never moves to
-/// the unsigned manifest.
+/// answer, and nothing of the node is written: it is signed before its
+/// bundle is pushed.
 #[tokio::test]
 async fn a_refused_certificate_fails_fast_and_writes_no_signature() {
     let stack = Stack::new().await;
@@ -997,8 +1011,7 @@ async fn a_refused_certificate_fails_fast_and_writes_no_signature() {
     assert!(message.contains("Fulcio refused"), "{message}");
     assert!(message.contains("401"), "{message}");
     assert!(message.contains("token audience rejected"), "{message}");
-    // The layer and config — no signature or manifest.
-    assert_eq!(stack.writes(), 2);
+    assert_eq!(stack.writes(), 0, "nothing of the node is written");
     assert_eq!(stack.sigstore.entries(), 0);
 }
 
@@ -1019,7 +1032,7 @@ async fn a_signature_the_trust_root_rejects_is_never_pushed() {
         message.contains("does not verify against the Sigstore trust root"),
         "{message}"
     );
-    assert_eq!(stack.writes(), 2, "no signature or manifest write");
+    assert_eq!(stack.writes(), 0, "nothing of the node is written");
 }
 
 // ---- the one-time re-sign from the branch identity to a release tag ----
@@ -1039,8 +1052,7 @@ fn old_identity() -> stow_oci::resign::ExactIdentity {
 struct OldTask {
     tag: String,
     manifest_digest: String,
-    rows: Vec<stow_types::api::ArtifactRecord>,
-    plans: Vec<PlannedArtifact>,
+    rows: Vec<ArtifactRecord>,
 }
 
 impl Stack {
@@ -1050,8 +1062,12 @@ impl Stack {
             let (signer, session) = (&old_signer, session);
             async move { signer.sign(session, &reference, &digest).await }
         };
+        let sign_node = |reference: String, digest: String| {
+            let signer = &old_signer;
+            async move { signer.sign_detached(&reference, &digest).await }
+        };
         let plans = vec![plan(&self.root, 0), plan(&self.root, 1)];
-        let outcome = stow_oci::push_artifacts_with(session, &plans, &sign)
+        let outcome = stow_oci::push_artifacts_with(session, &plans, &sign_node)
             .await
             .expect("a build publishes");
         let rows = stow_types::upload_plan::build_artifact_records(
@@ -1084,7 +1100,6 @@ impl Stack {
             tag: pushed.tag,
             manifest_digest: pushed.manifest_digest,
             rows,
-            plans,
         }
     }
 
@@ -1161,6 +1176,14 @@ async fn a_task_signed_under_the_old_identity_resigns_under_the_new_one() {
         let (signer, session) = (&new_signer, &session);
         async move { signer.sign(session, &reference, &digest).await }
     };
+    let sign_node = |reference: String, digest: String| {
+        let signer = &new_signer;
+        async move { signer.sign_detached(&reference, &digest).await }
+    };
+    let signers = || Signers {
+        records: &sign,
+        node: &sign_node,
+    };
     let resigned = stow_oci::resign::resign_task(
         &session,
         &trust,
@@ -1174,7 +1197,7 @@ async fn a_task_signed_under_the_old_identity_resigns_under_the_new_one() {
             run_id: 2,
             run_attempt: 1,
         },
-        &sign,
+        signers(),
     )
     .await
     .expect("the task re-signs");
@@ -1222,13 +1245,8 @@ async fn a_task_signed_under_the_old_identity_resigns_under_the_new_one() {
             "the node is the same"
         );
         assert_ne!(new_row.bundle_digest, old_row.bundle_digest);
-        let node = task
-            .plans
-            .iter()
-            .find(|plan| plan.oci_reference == new_row.oci_reference)
-            .expect("plan");
         stack
-            .verify(&session, node, &new_row.oci_digest)
+            .verify(&session, new_row)
             .await
             .expect("the node verifies under the new identity");
         let verifies = |row, new_identity| bundle_verifies(&session, &trust, row, new_identity);
@@ -1254,7 +1272,7 @@ async fn a_task_signed_under_the_old_identity_resigns_under_the_new_one() {
             run_id: 3,
             run_attempt: 1,
         },
-        &sign,
+        signers(),
     )
     .await
     .expect("the rerun");

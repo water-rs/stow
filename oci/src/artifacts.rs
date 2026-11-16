@@ -19,7 +19,6 @@ use stow_types::upload_plan::{PlannedArtifact, PublishedArtifact};
 
 use crate::client::{Presence, RegistrySession, canonical_manifest_bytes};
 use crate::publisher::Publisher;
-use crate::sign;
 
 /// How many plans [`push_artifacts_with`] publishes at once: the packs (and
 /// the bundle assembled from each) held in memory at the same time.
@@ -34,8 +33,8 @@ pub struct UploadOutcome {
     pub newly_pushed: u32,
 }
 
-/// Publish every plan: push the artifact, sign it, assemble the bundle
-/// tar, and push that as the `<tag>.bundle` artifact.
+/// Publish every plan: sign its artifact, assemble the bundle tar, and
+/// push that as the `<tag>.bundle` artifact.
 ///
 /// One session mints one bearer for the whole batch. Plans publish
 /// concurrently, at most [`PUBLISH_CONCURRENCY`] at a time, which bounds the
@@ -51,9 +50,8 @@ pub async fn push_artifacts(
     publisher: &Publisher,
 ) -> stow_types::error::Result<UploadOutcome> {
     let session = publisher.session(&cache_repository(rustc_version))?;
-    let session = &session;
-    push_artifacts_with(session, plans, |reference, digest| async move {
-        publisher.signer().sign(session, &reference, &digest).await
+    push_artifacts_with(&session, plans, |reference, digest| async move {
+        publisher.signer().sign_detached(&reference, &digest).await
     })
     .await
 }
@@ -61,7 +59,9 @@ pub async fn push_artifacts(
 /// [`push_artifacts`] with the session and signer supplied — the mock
 /// registry tests push through this with the mock key's signer.
 ///
-/// `sign` is invoked once per plan with `(oci_reference, manifest_digest)`.
+/// `sign` is invoked once per plan with `(oci_reference, manifest_digest)`
+/// and returns the signature the bundle carries; it publishes nothing
+/// itself ([`crate::KeylessSigner::sign_detached`]).
 ///
 /// # Errors
 ///
@@ -120,18 +120,23 @@ where
     .await
 }
 
-/// Push a signed artifact whose one layer is `pack`, and the bundle
-/// artifact assembled from it.
+/// Sign the artifact whose one layer is `pack` and push the bundle
+/// assembled from it — the only place the node is published.
 ///
-/// The artifact build and the repack of an already-published node both end
-/// here: the same layer, manifest, signature and bundle, whichever bytes
-/// the files came from. `config_bytes` are the config blob exactly as
-/// they are (to be) stored — a repack passes the published bytes so the
-/// config digest, and with it the node's identity, does not move.
+/// The signature binds `oci_reference` at the digest of the artifact's
+/// manifest, which the bundle carries byte for byte beside the config and
+/// the pack; the manifest itself, its blobs and its signature are never
+/// pushed on their own, since every reader reads the bundle.
+///
+/// The artifact build and the repack or re-sign of an already-published
+/// node all end here: the same manifest, signature and bundle, whichever
+/// bytes the files came from. `config_bytes` are the config blob exactly
+/// as signed — a repack passes the published bytes so the config digest,
+/// and with it the node's identity, does not move.
 ///
 /// # Errors
 ///
-/// Returns an error when a push or the signature fails.
+/// Returns an error when the signature or the bundle push fails.
 pub async fn publish_packed<S, Fut>(
     session: &RegistrySession,
     oci_reference: &str,
@@ -144,22 +149,7 @@ where
     S: Fn(String, String) -> Fut + Send + Sync,
     Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
 {
-    let reference: Reference = oci_reference
-        .parse()
-        .map_err(|error| stow_types::stow_error!("parse OCI reference {oci_reference}: {error}"))?;
     let layer = ImageLayer::new(pack.to_vec(), STOW_PACK_MEDIA_TYPE.to_owned(), None);
-
-    // The layer and config are independent; both must exist before
-    // publishing the manifest. A blob already stored under its
-    // digest is skipped by `push_blob`'s HEAD — content addressing means it
-    // can only be the same bytes.
-    session
-        .push_blob_pair(
-            (&layer.sha256_digest(), &layer.data),
-            (&sha256_digest(config_bytes), config_bytes),
-        )
-        .await
-        .map_err(|error| stow_types::stow_error!("push OCI artifact {oci_reference}: {error}"))?;
     let manifest = OciImageManifest::build(
         std::slice::from_ref(&layer),
         &Config::new(
@@ -170,19 +160,17 @@ where
         None,
     );
     let manifest_bytes = canonical_manifest_bytes(&manifest)?;
-    let signed = sign::put_signed_manifest(session, &reference, &manifest_bytes, |digest| {
-        sign(oci_reference.to_owned(), digest)
-    })
-    .await
-    .map_err(|error| stow_types::stow_error!("push OCI artifact {oci_reference}: {error}"))?;
-    let oci_digest = signed.digest;
+    let oci_digest = sha256_digest(&manifest_bytes);
+    let signature = sign(oci_reference.to_owned(), oci_digest.clone())
+        .await
+        .map_err(|error| stow_types::stow_error!("sign OCI artifact {oci_reference}: {error}"))?;
     tracing::info!(
         oci_reference = %oci_reference,
         digest = %oci_digest,
-        "pushed and signed OCI artifact on GHCR"
+        "signed OCI artifact"
     );
 
-    let signatures = [signed.signing];
+    let signatures = [signature];
 
     let (bundle_digest, bundle_size) = push_bundle(
         session,
@@ -271,7 +259,9 @@ async fn push_bundle(
 /// One material per simple-signing layer: payload path and bytes,
 /// signature, certificate, and the Rekor bundle when the signer logged
 /// one.
-/// Shared by the bundle republish path and the CLI's index verification.
+/// Shared by the records, marker and index readers, the CLI's index
+/// verification among them; a node's signature lives in its bundle
+/// ([`crate::pull_bundle`]).
 ///
 /// This is the read for a signature published earlier or by someone else:
 /// a `404` is the answer — the signature does not exist.

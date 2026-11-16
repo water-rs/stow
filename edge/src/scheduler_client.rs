@@ -16,6 +16,7 @@ const SCHEDULER_HEALTH_URL: &str = "https://scheduler.internal/health";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
 const SCHEDULER_FREEZE_URL: &str = "https://scheduler.internal/dispatch-freeze";
 const SCHEDULER_DISPATCH_CAP_URL: &str = "https://scheduler.internal/dispatch-cap";
+const SCHEDULER_DISPATCH_RATE_URL: &str = "https://scheduler.internal/dispatch-rate";
 const SCHEDULER_RELEASE_PRIORITY_URL: &str = "https://scheduler.internal/release-priority";
 const SCHEDULER_MEMORY_LINE_URL: &str = "https://scheduler.internal/memory-line";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
@@ -252,6 +253,24 @@ pub async fn set_dispatch_caps(
     actor: &str,
 ) -> Result<stow_types::api::DispatchCaps, SchedulerClientError> {
     post_json_as(namespace, SCHEDULER_DISPATCH_CAP_URL, set, actor).await
+}
+
+/// The dispatch rate bound in force and the runs started in the last
+/// minute (stow#1568).
+pub async fn get_dispatch_rate(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::DispatchRate, SchedulerClientError> {
+    get_json(namespace, SCHEDULER_DISPATCH_RATE_URL).await
+}
+
+/// The operator's `dispatch-rate set` — in force until the next `set`;
+/// the object answers the bound it now enforces.
+pub async fn set_dispatch_rate(
+    namespace: &CfDurableNamespace,
+    set: &stow_types::api::DispatchRateSet,
+    actor: &str,
+) -> Result<stow_types::api::DispatchRate, SchedulerClientError> {
+    post_json_as(namespace, SCHEDULER_DISPATCH_RATE_URL, set, actor).await
 }
 
 /// The release multiplier in force — the operator setting behind it

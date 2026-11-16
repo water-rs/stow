@@ -293,6 +293,16 @@ struct SnapshotHead {
     /// The operator's dispatch-cap setting (stow#1039) — `None` until
     /// the first `set`, when the deploy bindings apply.
     dispatch_cap: Option<stow_types::api::DispatchCapSetting>,
+    /// The operator's dispatch-rate setting (stow#1568) — `None` until
+    /// the first `set`, when the rate is unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dispatch_rate: Option<stow_types::api::DispatchRateSetting>,
+    /// The claim instants of the rate bound's window (epoch ms,
+    /// ascending). The `Claims` rows after the snapshot replay into the
+    /// window, but the ones the snapshot's prefix covers do not, so the
+    /// window rides the head: a restart never opens a fresh minute.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    recent_claims: Vec<i64>,
     /// The operator's release-priority setting (stow#1012) — `None`
     /// until the first `set`, when the default applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -894,6 +904,8 @@ impl Graph {
             ci_not_before: self.ci_not_before,
             freeze: self.freeze.clone(),
             dispatch_cap: self.dispatch_cap.clone(),
+            dispatch_rate: self.dispatch_rate.clone(),
+            recent_claims: self.recent_claims.iter().copied().collect(),
             release_priority: self.release_priority.clone(),
             external_runs: self.external_runs.iter().map(|(&k, &v)| (k, v)).collect(),
             slice_generations: self
@@ -1199,6 +1211,8 @@ impl SnapshotLoader {
         graph.freeze = head.freeze;
         graph.ci_not_before = head.ci_not_before;
         graph.dispatch_cap = head.dispatch_cap;
+        graph.dispatch_rate = head.dispatch_rate;
+        graph.recent_claims = head.recent_claims.into();
         graph.release_priority = head.release_priority;
         graph.external_runs = head.external_runs.into_iter().collect();
         graph.slice_generations = head.slice_generations.into_iter().collect();
