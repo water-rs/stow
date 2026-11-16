@@ -295,11 +295,13 @@ struct SnapshotHead {
     dispatch_cap: Option<stow_types::api::DispatchCapSetting>,
     /// The operator's dispatch-rate setting (stow#1568) — `None` until
     /// the first `set`, when the rate is unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     dispatch_rate: Option<stow_types::api::DispatchRateSetting>,
     /// The claim instants of the rate bound's window (epoch ms,
     /// ascending). The `Claims` rows after the snapshot replay into the
     /// window, but the ones the snapshot's prefix covers do not, so the
     /// window rides the head: a restart never opens a fresh minute.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     recent_claims: Vec<i64>,
     /// The operator's release-priority setting (stow#1012) — `None`
     /// until the first `set`, when the default applies.

@@ -3563,7 +3563,7 @@ impl Graph {
 
     /// The claim instants inside the rate window at `now`, oldest
     /// first — [`Self::expire_claim_window`] without the mutation.
-    fn live_claims(&self, now: i64) -> impl Iterator<Item = i64> + ExactSizeIterator {
+    fn live_claims(&self, now: i64) -> impl ExactSizeIterator<Item = i64> {
         let live_from = self
             .recent_claims
             .partition_point(|&at| at <= now - DISPATCH_RATE_WINDOW_MS);
@@ -3586,11 +3586,9 @@ impl Graph {
     fn rate_release(&self, now: i64) -> Option<i64> {
         let limit = self.rate_limit().filter(|&limit| limit > 0)?;
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-        let live = self.live_claims(now);
+        let mut live = self.live_claims(now);
         let over = live.len().checked_sub(limit)?;
-        live.skip(over)
-            .next()
-            .map(|at| at + DISPATCH_RATE_WINDOW_MS)
+        live.nth(over).map(|at| at + DISPATCH_RATE_WINDOW_MS)
     }
 
     /// Dispatch slots free under `settings`: the cap minus in-flight and

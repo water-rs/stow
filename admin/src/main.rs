@@ -1166,10 +1166,10 @@ fn render_memory_lines(view: &MemoryLines) -> String {
 /// Human rendering of the dispatch rate bound in force and the runs
 /// started in the last minute.
 fn render_dispatch_rate(view: &DispatchRate) -> String {
-    let mut out = match view.max_runs_per_minute {
-        Some(max) => format!("dispatch rate {max} runs per minute (operator)"),
-        None => "dispatch rate unbounded".to_owned(),
-    };
+    let mut out = view.max_runs_per_minute.map_or_else(
+        || "dispatch rate unbounded".to_owned(),
+        |max| format!("dispatch rate {max} runs per minute (operator)"),
+    );
     let _ = write!(
         out,
         "\nstarted in the last minute {}",
@@ -1506,10 +1506,10 @@ mod tests {
     use clap::Parser as _;
 
     fn dispatch_rate_set(args: &[&str]) -> Result<super::DispatchRateSetArgs, clap::Error> {
-        let argv = ["stow-admin", "dispatch-rate", "set"]
+        let tokens = ["stow-admin", "dispatch-rate", "set"]
             .into_iter()
             .chain(args.iter().copied());
-        match super::Cli::try_parse_from(argv)?.command {
+        match super::Cli::try_parse_from(tokens)?.command {
             super::Command::DispatchRate(super::DispatchRateArgs {
                 command: super::DispatchRateCommand::Set(set),
             }) => Ok(set),
