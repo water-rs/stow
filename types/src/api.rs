@@ -3434,6 +3434,11 @@ pub struct AdminIndexSlice {
     pub rustc_version: WireRustcVersion,
     /// The index generation the scheduler last applied for the slice.
     pub generation: i64,
+    /// The generation of the multi-part full report the scheduler holds
+    /// staged for the slice, waiting on its remaining parts — `None` when
+    /// nothing is staged. While one is staged the scheduler refuses every
+    /// delta on the slice, so only a full report lands.
+    pub staged_generation: Option<i64>,
 }
 
 /// Response of `POST /api/v1/scheduler/tasks/submit` — what a request batch

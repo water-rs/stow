@@ -127,8 +127,9 @@ jobs:
           stow-admin index resign --rustc-version "$RUSTC_VERSION"
       # A published generation the scheduler never received — the report
       # of an earlier run failed, or that run died between a slice's
-      # index and folded tags — is reported in full before this run's
-      # delta, which builds on what the scheduler holds. Without it a
+      # index and folded tags — is replayed, one delta per generation the
+      # scheduler lacks, before this run's delta, which builds on what
+      # the scheduler holds. Without it a
       # slice no later export re-emits would stay unreported.
       #
       # The reconcile decodes every published slice of the rustc, so a
@@ -194,8 +195,7 @@ jobs:
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # When the export ran `--full` the report does too: its slices
-          # carry no `.prev` base, and the explicit full shape is also
-          # the resync a stale-base 409 asks for.
+          # carry no `.prev` base.
           INPUT_FULL: ${{ inputs.full }}
         # A slice whose publish fails must not cost every later slice its
         # update: slices are independent, and a stale slice is what every

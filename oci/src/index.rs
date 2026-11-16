@@ -7,7 +7,8 @@ use stow_types::bundle::sigstore_signature_tag;
 use stow_types::identity::WireRustcVersion;
 use stow_types::index::{
     STOW_FOLDED_CONFIG_MEDIA_TYPE, STOW_FOLDED_MEDIA_TYPE, STOW_INDEX_CONFIG_MEDIA_TYPE,
-    STOW_INDEX_MEDIA_TYPE, folded_tag, index_tag,
+    STOW_INDEX_CONTENT_SHA256_ANNOTATION, STOW_INDEX_MEDIA_TYPE, STOW_INDEX_PREVIOUS_ANNOTATION,
+    folded_tag, index_tag,
 };
 use stow_types::registry::{cache_repository, sha256_digest};
 
@@ -15,13 +16,6 @@ use crate::client::{Presence, RegistrySession, canonical_manifest_bytes};
 use crate::publisher::Publisher;
 use crate::registry::pull_blob_verified;
 use crate::sign;
-
-/// Manifest annotation carrying the index's content digest — the
-/// `content_sha256` of everything except the wall-clock `generated_at`.
-/// Publishing compares it to decide whether the slice changed; the blob
-/// digest can never signal that because `generated_at` makes every
-/// export's bytes unique.
-const INDEX_CONTENT_SHA256_ANNOTATION: &str = "dev.stow.index.content-sha256";
 
 /// What `publish_index` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,18 +86,27 @@ async fn signature_present(
     }))
 }
 
-/// The `content-sha256` annotation of the manifest the tag currently
-/// carries, and that manifest's digest — `None` when the tag does not
-/// exist yet or carries no annotation.
+/// The manifest a slice's tag currently resolves to, as a publish reads
+/// it: its digest — the `previous` link the replacing push records — and
+/// its `content-sha256` annotation, the change check.
+struct PublishedIndexManifest {
+    digest: String,
+    content_sha256: String,
+}
+
+/// The manifest the tag currently carries — `None` when the tag does
+/// not exist yet.
 ///
 /// # Errors
 ///
 /// Returns an error when the reference does not parse, the pull fails,
-/// or the tag resolves to an image index instead of an image manifest.
-pub async fn published_index_content_sha256(
+/// the tag resolves to an image index instead of an image manifest, or
+/// the manifest carries no `content-sha256` annotation (every index
+/// manifest is pushed with one).
+async fn published_index_manifest(
     session: &RegistrySession,
     reference: &str,
-) -> stow_types::error::Result<Option<(String, String)>> {
+) -> stow_types::error::Result<Option<PublishedIndexManifest>> {
     let reference: Reference = reference
         .parse()
         .map_err(|error| stow_types::stow_error!("parse index reference {reference}: {error}"))?;
@@ -116,20 +119,27 @@ pub async fn published_index_content_sha256(
             ));
         }
     };
-    match serde_json::from_slice(&bytes)
-        .map_err(|error| stow_types::stow_error!("parse index manifest {reference}: {error}"))?
-    {
-        OciManifest::Image(manifest) => {
-            let content_sha256 = manifest
-                .annotations
-                .as_ref()
-                .and_then(|annotations| annotations.get(INDEX_CONTENT_SHA256_ANNOTATION).cloned());
-            Ok(content_sha256.map(|sha256| (sha256, digest)))
-        }
-        OciManifest::ImageIndex(_) => Err(stow_types::stow_error!(
-            "index reference {reference} resolves to an image index, not an image manifest"
-        )),
-    }
+    let manifest: OciImageManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| stow_types::stow_error!("parse index manifest {reference}: {error}"))?;
+    let content_sha256 = manifest_annotation(&manifest, STOW_INDEX_CONTENT_SHA256_ANNOTATION)
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "index manifest {reference} carries no {STOW_INDEX_CONTENT_SHA256_ANNOTATION} \
+                 annotation"
+            )
+        })?;
+    Ok(Some(PublishedIndexManifest {
+        digest,
+        content_sha256,
+    }))
+}
+
+/// One annotation of an index manifest.
+fn manifest_annotation(manifest: &OciImageManifest, key: &str) -> Option<String> {
+    manifest
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(key).cloned())
 }
 
 /// Pull the index blob the slice's tag currently resolves to.
@@ -185,7 +195,8 @@ pub async fn pull_published_index(
 ///
 /// The manifest carries `dev.stow.index.content-sha256` so a later publish
 /// of byte-identical content — a re-export of unchanged rows — skips the
-/// push. The signature is skipped only when its `.sig` tag is actually
+/// push, and `dev.stow.index.previous` naming the manifest it replaces
+/// on the tag, when the tag existed. The signature is skipped only when its `.sig` tag is actually
 /// there: a slice whose signature never landed (or landed in a layout the
 /// CLI does not read) is signed again in place.
 ///
@@ -207,10 +218,11 @@ pub async fn publish_index(
         .parse()
         .map_err(|error| stow_types::stow_error!("parse index reference {reference}: {error}"))?;
 
-    if let Some((published_sha256, manifest_digest)) =
-        published_index_content_sha256(&session, &reference).await?
-        && published_sha256 == content_sha256
+    let on_tag = published_index_manifest(&session, &reference).await?;
+    if let Some(on_tag) = &on_tag
+        && on_tag.content_sha256 == content_sha256
     {
+        let manifest_digest = on_tag.digest.clone();
         if signature_present(&session, &parsed_reference, &manifest_digest, &reference).await? {
             tracing::info!(
                 %reference,
@@ -237,14 +249,17 @@ pub async fn publish_index(
         STOW_INDEX_CONFIG_MEDIA_TYPE.to_owned(),
         None,
     );
-    let manifest = OciImageManifest::build(
-        std::slice::from_ref(&layer),
-        &config,
-        Some(BTreeMap::from([(
-            INDEX_CONTENT_SHA256_ANNOTATION.to_owned(),
-            content_sha256.to_owned(),
-        )])),
-    );
+    let mut annotations = BTreeMap::from([(
+        STOW_INDEX_CONTENT_SHA256_ANNOTATION.to_owned(),
+        content_sha256.to_owned(),
+    )]);
+    // The link back to the manifest this push replaces on the tag — the
+    // slice's history a lost report is replayed along.
+    if let Some(on_tag) = on_tag {
+        annotations.insert(STOW_INDEX_PREVIOUS_ANNOTATION.to_owned(), on_tag.digest);
+    }
+    let manifest =
+        OciImageManifest::build(std::slice::from_ref(&layer), &config, Some(annotations));
     session
         .push_blob_pair(
             (&layer.sha256_digest(), &layer.data),
@@ -280,6 +295,9 @@ pub struct PulledIndex {
     /// Digest of the manifest the tag resolved to — the input to
     /// `pull_signature_materials`.
     pub manifest_digest: String,
+    /// The manifest this one replaced on the slice's tag — its
+    /// `dev.stow.index.previous` link; `None` on a slice's first push.
+    pub previous: Option<String>,
 }
 
 /// Pull the published `index.<target>.<rustc>` slice: `None` when the tag
@@ -320,7 +338,38 @@ async fn pull_index_as(
 ) -> stow_types::error::Result<Option<PulledIndex>> {
     let tag = index_tag(target, rustc_version);
     let reference = session.reference(&tag)?;
-    let (bytes, manifest_digest) = match session.pull_manifest_as(&reference, presence).await {
+    pull_index_reference(session, &reference, presence).await
+}
+
+/// Pull the index manifest a later one links by digest.
+///
+/// The link is a `dev.stow.index.previous` annotation. The registry
+/// keeps every manifest a republish untags, so the digest answers; the
+/// pull checks the body against it.
+///
+/// # Errors
+///
+/// Returns an error when the manifest is absent, the pull fails, the
+/// manifest is malformed for an index artifact, or the layer fails its
+/// digest check.
+pub async fn pull_index_by_digest(
+    session: &RegistrySession,
+    manifest_digest: &str,
+) -> stow_types::error::Result<PulledIndex> {
+    let reference = session.digest_reference(manifest_digest)?;
+    pull_index_reference(session, &reference, Presence::Listed)
+        .await?
+        .ok_or_else(|| {
+            stow_types::stow_error!("index manifest {reference} a later manifest links is missing")
+        })
+}
+
+async fn pull_index_reference(
+    session: &RegistrySession,
+    reference: &Reference,
+    presence: Presence,
+) -> stow_types::error::Result<Option<PulledIndex>> {
+    let (bytes, manifest_digest) = match session.pull_manifest_as(reference, presence).await {
         Ok(pulled) => pulled,
         Err(error) if error.is_not_found() => return Ok(None),
         Err(error) => {
@@ -341,10 +390,12 @@ async fn pull_index_as(
             descriptor.media_type
         ));
     }
+    let previous = manifest_annotation(&manifest, STOW_INDEX_PREVIOUS_ANNOTATION);
     let bytes = pull_blob_verified(session, descriptor).await?;
     Ok(Some(PulledIndex {
         bytes,
         manifest_digest,
+        previous,
     }))
 }
 
