@@ -2,9 +2,9 @@
 //!
 //! Runs in `build-crate.yml` under the same identity builds sign with, in
 //! a job that compiles nothing: every node it touches is read back from
-//! GHCR, verified (the records artifact and the node's own signature under
-//! the pinned builder identity, then every file's SHA-256), packed, and
-//! published through the build's publish path. Each task whose rows
+//! its bundle in GHCR, verified (the records artifact and the signature
+//! the bundle carries under the pinned builder identity, then every file's
+//! SHA-256), packed, and published through the build's publish path. Each task whose rows
 //! changed gets a new signed records artifact under this run's tag, which
 //! the next index export folds over the old rows.
 //!
@@ -174,6 +174,12 @@ impl Sweeper<'_> {
                 .sign(self.session, &reference, &digest)
                 .await
         };
+        let sign_node = |reference: String, digest: String| async move {
+            self.publisher
+                .signer()
+                .sign_detached(&reference, &digest)
+                .await
+        };
         let mut rows: Vec<ArtifactRecord> = Vec::with_capacity(live.len());
         let mut repacked = 0;
         for record in live {
@@ -182,7 +188,7 @@ impl Sweeper<'_> {
                 self.trust,
                 &ReleaseIdentity::new(TrustedWorkflow::BUILD),
                 record,
-                &sign,
+                &sign_node,
             )
             .await?;
             if row.is_some() {

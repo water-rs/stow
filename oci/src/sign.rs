@@ -19,6 +19,9 @@
 //! payload binding the tagged reference, a layer per signature carrying
 //! the signature, certificate, chain and Rekor bundle annotations, and the
 //! config go-containerregistry derives from the layers.
+//!
+//! A node's signature has no image: [`KeylessSigner::sign_detached`]
+//! returns it for the node's bundle, the only place it is published.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -274,12 +277,13 @@ impl KeylessSigner {
 
     /// Sign the manifest `digest` under `reference` — the tagged reference
     /// readers bind — and append the signature to its `.sig` image through
-    /// `session`.
+    /// `session`: the signature of a manifest published under its own tag
+    /// (a records artifact, an index slice, its folded set).
     ///
     /// The signature is logged in Rekor and checked against the trust
     /// root before anything is pushed: a signature no reader would accept
     /// is an error here, never a published layer. Returns that verified
-    /// material for bundle assembly without a registry read-back.
+    /// material without a registry read-back.
     ///
     /// # Errors
     ///
@@ -291,6 +295,38 @@ impl KeylessSigner {
         reference: &str,
         digest: &str,
     ) -> stow_types::error::Result<BundleSignatureMaterial> {
+        let layer = self.signed_layer(reference, digest).await?;
+        push_signature_layer(session, digest, &layer).await?;
+        Ok(layer.into_material())
+    }
+
+    /// Sign the manifest `digest` under `reference` without publishing the
+    /// signature anywhere: the material is the caller's to carry — a
+    /// node's bundle embeds it, and nothing else holds the node's
+    /// signature.
+    ///
+    /// The checks are [`Self::sign`]'s: logged in Rekor and verified
+    /// against the trust root before it is returned.
+    ///
+    /// # Errors
+    ///
+    /// The OIDC token, Fulcio or Rekor request fails, or the signature does
+    /// not verify against the trust root.
+    pub async fn sign_detached(
+        &self,
+        reference: &str,
+        digest: &str,
+    ) -> stow_types::error::Result<BundleSignatureMaterial> {
+        Ok(self.signed_layer(reference, digest).await?.into_material())
+    }
+
+    /// A signature of `digest` under `reference`, logged in Rekor and
+    /// checked as a reader will check it.
+    async fn signed_layer(
+        &self,
+        reference: &str,
+        digest: &str,
+    ) -> stow_types::error::Result<SignatureLayer> {
         let payload = simple_signing_payload(reference, digest)?;
         let identity = self.identity().await?;
         let signature = identity
@@ -306,20 +342,13 @@ impl KeylessSigner {
             bundle_json: serde_json::to_string(&bundle).wrap_err("encode the Rekor bundle")?,
         };
         self.check(&layer, reference, digest)?;
-        push_signature_layer(session, digest, &layer).await?;
         tracing::info!(
             %reference,
             %digest,
             log_index = bundle.payload.log_index,
             "signed OCI artifact"
         );
-        Ok(BundleSignatureMaterial {
-            payload_path: sigstore_payload_path(0),
-            payload_bytes: layer.payload,
-            signature: layer.signature,
-            certificate_pem: layer.certificate_pem,
-            rekor_bundle_json: Some(layer.bundle_json),
-        })
+        Ok(layer)
     }
 
     /// The signature as a reader will check it: the payload binds
@@ -765,13 +794,29 @@ fn simple_signing_payload(reference: &str, digest: &str) -> stow_types::error::R
     })?)
 }
 
-/// One signature, ready to append to the `.sig` image.
+/// One signature, ready to append to the `.sig` image or embed in a
+/// bundle.
 struct SignatureLayer {
     payload: Vec<u8>,
     signature: String,
     certificate_pem: String,
     chain_pem: String,
     bundle_json: String,
+}
+
+impl SignatureLayer {
+    /// The material a bundle embeds and a reader verifies. The chain
+    /// annotation is cosign's `.sig` layout alone; readers verify the
+    /// certificate against the trust root.
+    fn into_material(self) -> BundleSignatureMaterial {
+        BundleSignatureMaterial {
+            payload_path: sigstore_payload_path(0),
+            payload_bytes: self.payload,
+            signature: self.signature,
+            certificate_pem: self.certificate_pem,
+            rekor_bundle_json: Some(self.bundle_json),
+        }
+    }
 }
 
 /// A signature image manifest, in the field order go-containerregistry

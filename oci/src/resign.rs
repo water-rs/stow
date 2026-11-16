@@ -11,36 +11,30 @@
 //!   slice, its folded set): [`resign_manifest`] adds a signature layer
 //!   under the new identity to the manifest's `.sig` image, after checking
 //!   the old one;
-//! * a node, whose bundle tar carries the signature material the CLI
-//!   verifies: [`resign_node`] republishes the node's pack under the new
+//! * a node, whose bundle tar carries its only signature: [`resign_node`]
+//!   reads the node from its bundle, republishes its pack under the new
 //!   identity and returns the row naming the new bundle;
 //! * the tag space of a rustc's repository, every tag of which belongs to
 //!   one of those kinds or is refused ([`classify_tag`]).
 
 use std::collections::BTreeSet;
-use std::io::Read as _;
 
 use oci_client::Reference;
-use oci_client::manifest::OciImageManifest;
 /// The policy accepting one exact certificate subject from one issuer —
 /// what a caller verifies the old identity's signatures with.
 pub use sigstore::bundle::verify::policy::Identity as ExactIdentity;
 /// The trait a caller's policies implement.
 pub use sigstore::bundle::verify::policy::VerificationPolicy;
 use stow_types::api::{ArtifactRecord, CI_TARGET_TRIPLES};
-use stow_types::bundle::{
-    ArtifactBlobConfig, ArtifactBundleManifest, BundleSignatureMaterial, STOW_BUNDLE_MANIFEST_PATH,
-    STOW_PACK_MEDIA_TYPE, STOW_SIGSTORE_PAYLOAD_DIR,
-};
+use stow_types::bundle::{BundleSignatureMaterial, STOW_BUNDLE_PACK_PATH, STOW_PACK_MEDIA_TYPE};
 use stow_types::error::Context as _;
 use stow_types::identity::WireRustcVersion;
 use stow_types::records::{BuildRecords, BuildRun, is_records_tag, parse_records_tag};
-use stow_types::registry::verify_oci_digest;
 
 use crate::artifacts::{publish_packed, pull_signature_materials};
+use crate::bundle::pull_bundle;
 use crate::client::RegistrySession;
 use crate::records::{RecordsPublishOutcome, pull_listed_records_by_tag, push_records_with};
-use crate::registry::pull_blob_verified;
 use crate::verify::{Trust, verify_materials};
 
 /// What a tag of a rustc's repository is.
@@ -239,19 +233,20 @@ pub enum NodeResigned {
 
 /// Republish the node `record` names under the new identity.
 ///
-/// The node is trusted only after: the manifest hashes to the record's
-/// `oci_digest`, its signature verifies under the old identity (or already
-/// under the new one) for the record's `oci_reference`, the config blob and
-/// the pack hash to their descriptors, and every file of the pack hashes to
-/// the SHA-256 the signed config records. The same config and pack then
-/// publish through a build's own path: the manifest is byte-identical, so
-/// its digest does not move; the signature image gains a layer under the new
-/// identity; and the bundle, which carries that layer alone, is new — so
-/// the row's `bundle_digest` and `bundle_size` are.
+/// The node is read from its bundle and trusted only after: the bundle
+/// hashes to the record's `bundle_digest`, the manifest it carries to the
+/// record's `oci_digest`, a signature it carries verifies under the old
+/// identity for the record's `oci_reference`, the config and the pack hash
+/// to their descriptors, and every file of the pack hashes to the SHA-256
+/// the signed config records. The same config and pack then publish
+/// through a build's own path: the manifest is byte-identical, so its
+/// digest does not move, and the bundle, which carries the new identity's
+/// signature alone, is new — so the row's `bundle_digest` and
+/// `bundle_size` are.
 ///
-/// A node whose bundle already verifies under the new identity is left
-/// alone, and a signature layer a crashed earlier attempt already made is
-/// reused instead of signed again.
+/// `sign` signs the manifest digest under the new identity and publishes
+/// nothing itself: the bundle carries the signature. A node whose bundle
+/// already verifies under the new identity is left alone.
 ///
 /// # Errors
 ///
@@ -272,20 +267,14 @@ where
 {
     let Identities { old, new } = identities;
     let oci_reference = record.oci_reference.as_str();
-    let by_digest = session.digest_reference(&record.oci_digest)?;
-    let (manifest_bytes, manifest_digest) = session
-        .pull_manifest(&by_digest)
-        .await
-        .map_err(|error| stow_types::stow_error!("pull manifest of {oci_reference}: {error}"))?;
-    if manifest_digest != record.oci_digest {
-        return Err(stow_types::stow_error!(
-            "the manifest of {oci_reference} hashes to {manifest_digest}, the record names {}",
-            record.oci_digest
-        ));
+    let bundle = pull_bundle(session, record).await?;
+    if bundle.verify(trust, new).is_ok() {
+        return Ok(NodeResigned::Already);
     }
-    let manifest: OciImageManifest = serde_json::from_slice(&manifest_bytes)
-        .wrap_err_with(|| format!("parse manifest of {oci_reference}"))?;
-    let [layer] = manifest.layers.as_slice() else {
+    bundle
+        .verify(trust, old)
+        .wrap_err_with(|| format!("verify {oci_reference} under the old identity"))?;
+    let [layer] = bundle.manifest.layers.as_slice() else {
         return Err(stow_types::stow_error!(
             "{oci_reference} is not in the single-pack layout; repack it before re-signing"
         ));
@@ -296,30 +285,8 @@ where
         ));
     }
 
-    let materials = pull_signature_materials(session, &by_digest, &manifest_digest).await?;
-    let existing = materials.iter().find(|material| {
-        verify_materials(
-            trust,
-            oci_reference,
-            &manifest_digest,
-            std::slice::from_ref(*material),
-            new,
-        )
-        .is_ok()
-    });
-    if existing.is_some() && bundle_verifies(session, trust, record, new).await? {
-        return Ok(NodeResigned::Already);
-    }
-    if existing.is_none() {
-        verify_materials(trust, oci_reference, &manifest_digest, &materials, old)
-            .wrap_err_with(|| format!("verify {oci_reference} under the old identity"))?;
-    }
-
-    let config_bytes = pull_blob_verified(session, &manifest.config).await?;
-    let config: ArtifactBlobConfig = serde_json::from_slice(&config_bytes)
-        .wrap_err_with(|| format!("parse config of {oci_reference}"))?;
-    let pack = pull_blob_verified(session, layer).await?;
-    let files = config.packed_files().cloned().collect::<Vec<_>>();
+    let pack = bundle.layer(STOW_BUNDLE_PACK_PATH, layer)?.to_vec();
+    let files = bundle.config.packed_files().cloned().collect::<Vec<_>>();
     let pack = smol::unblock(move || {
         let expected = files.iter().collect::<Vec<_>>();
         stow_shim::unpack(&pack, &expected).map(|_| pack)
@@ -327,23 +294,13 @@ where
     .await
     .wrap_err_with(|| format!("check the pack of {oci_reference}"))?;
 
-    let reuse = existing.cloned();
-    let sign_or_reuse = |reference: String, digest: String| {
-        let reuse = reuse.clone();
-        async move {
-            match reuse {
-                Some(material) => Ok(material),
-                None => sign(reference, digest).await,
-            }
-        }
-    };
     let published = publish_packed(
         session,
         oci_reference,
-        &config,
-        &config_bytes,
+        &bundle.config,
+        &bundle.config_bytes,
         &pack,
-        &sign_or_reuse,
+        sign,
     )
     .await?;
     if published.oci_digest != record.oci_digest {
@@ -365,34 +322,28 @@ where
 ///
 /// # Errors
 ///
-/// The bundle cannot be pulled, does not hash to its digest, or is not a
-/// bundle tar.
+/// The bundle cannot be pulled or fails a check of
+/// [`crate::PulledBundle`].
 pub async fn bundle_verifies(
     session: &RegistrySession,
     trust: &Trust,
     record: &ArtifactRecord,
     policy: &(impl VerificationPolicy + Sync),
 ) -> stow_types::error::Result<bool> {
-    let bytes = session
-        .pull_blob(&record.bundle_digest)
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("pull bundle {}: {error}", record.bundle_digest)
-        })?;
-    verify_oci_digest(&bytes, &record.bundle_digest).map_err(|error| {
-        stow_types::stow_error!("verify bundle {}: {error}", record.bundle_digest)
-    })?;
-    let materials = smol::unblock(move || bundle_signatures(&bytes))
-        .await
-        .wrap_err_with(|| format!("read bundle {}", record.bundle_digest))?;
-    Ok(verify_materials(
-        trust,
-        &record.oci_reference,
-        &record.oci_digest,
-        &materials,
-        policy,
-    )
-    .is_ok())
+    Ok(pull_bundle(session, record)
+        .await?
+        .verify(trust, policy)
+        .is_ok())
+}
+
+/// The two signatures a re-sign makes, each under the new identity.
+#[derive(Debug)]
+pub struct Signers<'a, S, D> {
+    /// Signs a records manifest and appends the signature to its `.sig`
+    /// image.
+    pub records: &'a S,
+    /// Signs a node's manifest for its bundle and publishes nothing itself.
+    pub node: &'a D,
 }
 
 /// What [`resign_task`] did.
@@ -426,21 +377,27 @@ pub struct TaskResigned {
 ///
 /// A records artifact cannot be read or fails its checks, or any
 /// [`resign_manifest`] or [`resign_node`] error.
-pub async fn resign_task<O, N, S, Fut>(
+pub async fn resign_task<O, N, S, Fut, D, DFut>(
     session: &RegistrySession,
     trust: &Trust,
     rustc_version: &WireRustcVersion,
     tags: &[&str],
     identities: Identities<'_, O, N>,
     build: BuildRun,
-    sign: &S,
+    signers: Signers<'_, S, D>,
 ) -> stow_types::error::Result<TaskResigned>
 where
     O: VerificationPolicy + Sync,
     N: VerificationPolicy + Sync,
     S: Fn(String, String) -> Fut + Send + Sync,
     Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
+    D: Fn(String, String) -> DFut + Send + Sync,
+    DFut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
 {
+    let Signers {
+        records: sign,
+        node: sign_node,
+    } = signers;
     let mut outcome = TaskResigned {
         records_signed: 0,
         records_already: 0,
@@ -479,7 +436,7 @@ where
         .collect::<Vec<_>>();
     let mut rows = Vec::with_capacity(live.len());
     for record in live {
-        match resign_node(session, trust, identities, record, sign).await? {
+        match resign_node(session, trust, identities, record, sign_node).await? {
             NodeResigned::Already => {
                 outcome.nodes_already += 1;
                 rows.push(record.clone());
@@ -509,57 +466,6 @@ where
         .await?,
     );
     Ok(outcome)
-}
-
-/// The signature materials a bundle tar carries: its manifest's signatures,
-/// each with its payload entry.
-fn bundle_signatures(bytes: &[u8]) -> stow_types::error::Result<Vec<BundleSignatureMaterial>> {
-    let mut archive = tar::Archive::new(bytes);
-    let mut manifest = None;
-    let mut payloads = std::collections::BTreeMap::new();
-    for entry in archive.entries().wrap_err("read the bundle entries")? {
-        let mut entry = entry.wrap_err("read a bundle entry")?;
-        let path = entry
-            .path()
-            .wrap_err("read a bundle entry path")?
-            .to_string_lossy()
-            .into_owned();
-        let signature_payload = path
-            .strip_prefix(STOW_SIGSTORE_PAYLOAD_DIR)
-            .is_some_and(|rest| rest.starts_with('/'));
-        if path != STOW_BUNDLE_MANIFEST_PATH && !signature_payload {
-            continue;
-        }
-        let mut contents = Vec::new();
-        entry
-            .read_to_end(&mut contents)
-            .wrap_err_with(|| format!("read bundle entry {path}"))?;
-        if path == STOW_BUNDLE_MANIFEST_PATH {
-            manifest = Some(
-                serde_json::from_slice::<ArtifactBundleManifest>(&contents)
-                    .wrap_err("parse the bundle manifest")?,
-            );
-        } else {
-            payloads.insert(path, contents);
-        }
-    }
-    let manifest = manifest.ok_or_else(|| stow_types::stow_error!("the bundle has no manifest"))?;
-    manifest
-        .sigstore_signatures
-        .into_iter()
-        .map(|signature| {
-            let payload_bytes = payloads.remove(&signature.payload_path).ok_or_else(|| {
-                stow_types::stow_error!("the bundle lacks {}", signature.payload_path)
-            })?;
-            Ok(BundleSignatureMaterial {
-                payload_path: signature.payload_path,
-                payload_bytes,
-                signature: signature.signature,
-                certificate_pem: signature.certificate_pem,
-                rekor_bundle_json: signature.rekor_bundle_json,
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]
