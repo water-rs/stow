@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.4](https://github.com/water-rs/stow/compare/oci/v0.21.3...oci/v0.21.4) - 2026-11-16
+
+### Other
+
+- Merge pull request #1572 from water-rs/dev
+- *(oci)* publish each node only as its bundle ([#1570](https://github.com/water-rs/stow/pull/1570))
+
 ## [0.21.3](https://github.com/water-rs/stow/compare/oci/v0.21.2...oci/v0.21.3) - 2026-11-15
 
 ### Fixed
