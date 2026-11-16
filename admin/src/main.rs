@@ -49,8 +49,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use keyring_core::api::CredentialStoreApi;
 use stow_types::api::{
     AdminStatus, ChannelOutcome, DispatchCapSet, DispatchCaps, DispatchFreeze,
-    DispatchFreezeTrigger, FreezeTransitionEvent, MemoryLineSet, MemoryLines, ReleasePriority,
-    ReleasePrioritySet, SchedulerSubmitResponse,
+    DispatchFreezeTrigger, DispatchRate, DispatchRateSet, FreezeTransitionEvent, MemoryLineSet,
+    MemoryLines, ReleasePriority, ReleasePrioritySet, SchedulerSubmitResponse,
 };
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -130,6 +130,10 @@ enum Command {
     /// bounds the deploy bindings `STOW_MAX_CONCURRENT_JOBS` /
     /// `STOW_MAX_CONCURRENT_MACOS_JOBS` set until the first `set`.
     DispatchCap(DispatchCapArgs),
+    /// Read or adjust the most runs the scheduler starts per rolling
+    /// minute, fleet wide (stow#1568) — unbounded until the first
+    /// `set`.
+    DispatchRate(DispatchRateArgs),
     /// Read or adjust the multiplier release-profile nodes rank under
     /// in the scheduler's aging rank (stow#1012).
     ReleasePriority(ReleasePriorityArgs),
@@ -218,6 +222,41 @@ struct DispatchCapSetArgs {
     /// cap keeps reading its deploy binding.
     #[arg(long)]
     macos: Option<u32>,
+    /// Apply the change.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+struct DispatchRateArgs {
+    /// `status` prints the bound in force and the runs started in the
+    /// last minute; `set` replaces the bound until the next set.
+    #[command(subcommand)]
+    command: DispatchRateCommand,
+}
+
+#[derive(Subcommand)]
+enum DispatchRateCommand {
+    /// Print the bound in force and the runs started in the last
+    /// minute.
+    Status,
+    /// Set the bound; without `--yes` prints the plan and exits 0.
+    Set(DispatchRateSetArgs),
+}
+
+#[derive(Args)]
+struct DispatchRateSetArgs {
+    /// The most runs started per rolling minute — 0 starts none. No
+    /// ceiling is checked.
+    #[arg(
+        long,
+        conflicts_with = "unbounded",
+        required_unless_present = "unbounded"
+    )]
+    per_minute: Option<u32>,
+    /// Lift the bound.
+    #[arg(long)]
+    unbounded: bool,
     /// Apply the change.
     #[arg(long)]
     yes: bool,
@@ -393,6 +432,9 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
         }
         Command::DispatchCap(args) => {
             dispatch_cap_command(&Edge::connect(&*store)?, args, output).await
+        }
+        Command::DispatchRate(args) => {
+            dispatch_rate_command(&Edge::connect(&*store)?, args, output).await
         }
         Command::ReleasePriority(args) => {
             release_priority_command(&Edge::connect(&*store)?, args, output).await
@@ -983,6 +1025,44 @@ async fn dispatch_cap_command(
     }
 }
 
+/// `stow-admin dispatch-rate status|set` — read the bound on the runs
+/// the claim pass starts per rolling minute or write the operator
+/// setting that replaces it (stow#1568). `set` is a mutation: it prints
+/// the plan and only applies under `--yes`.
+async fn dispatch_rate_command(
+    edge: &Edge,
+    args: DispatchRateArgs,
+    output: Output,
+) -> stow_types::error::Result<()> {
+    match args.command {
+        DispatchRateCommand::Status => {
+            let view: DispatchRate = edge.get_json("/api/v1/admin/dispatch-rate").await?;
+            render::emit(output, &view, render_dispatch_rate)
+        }
+        DispatchRateCommand::Set(args) => {
+            let plan = DispatchRateSet {
+                max_runs_per_minute: args.per_minute,
+            };
+            render::mutation(
+                output,
+                plan,
+                |envelope: &render::Planned<DispatchRateSet, DispatchRate>| {
+                    let mut out = "set dispatch rate\n".to_owned();
+                    if let Some(result) = &envelope.result {
+                        let _ = writeln!(out, "{}", render_dispatch_rate(result));
+                    }
+                    let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
+                    out
+                },
+                args.yes.then_some(async move |plan: &DispatchRateSet| {
+                    edge.post_json("/api/v1/admin/dispatch-rate", plan).await
+                }),
+            )
+            .await
+        }
+    }
+}
+
 /// `stow-admin release-priority status|set` — read the multiplier
 /// release-profile nodes rank under or write the operator setting that
 /// replaces its default (stow#1012). `set` is a mutation: it prints the
@@ -1075,6 +1155,25 @@ fn render_memory_lines(view: &MemoryLines) -> String {
         } else {
             "deploy bindings"
         }
+    );
+    if let Some(setting) = &view.setting {
+        let _ = write!(out, "\nset at {}", setting.set_at);
+        let _ = write!(out, "\nset by {}", setting.actor);
+    }
+    out
+}
+
+/// Human rendering of the dispatch rate bound in force and the runs
+/// started in the last minute.
+fn render_dispatch_rate(view: &DispatchRate) -> String {
+    let mut out = match view.max_runs_per_minute {
+        Some(max) => format!("dispatch rate {max} runs per minute (operator)"),
+        None => "dispatch rate unbounded".to_owned(),
+    };
+    let _ = write!(
+        out,
+        "\nstarted in the last minute {}",
+        view.started_last_minute
     );
     if let Some(setting) = &view.setting {
         let _ = write!(out, "\nset at {}", setting.set_at);
@@ -1404,6 +1503,38 @@ fn install_tracing() {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser as _;
+
+    fn dispatch_rate_set(args: &[&str]) -> Result<super::DispatchRateSetArgs, clap::Error> {
+        let argv = ["stow-admin", "dispatch-rate", "set"]
+            .into_iter()
+            .chain(args.iter().copied());
+        match super::Cli::try_parse_from(argv)?.command {
+            super::Command::DispatchRate(super::DispatchRateArgs {
+                command: super::DispatchRateCommand::Set(set),
+            }) => Ok(set),
+            _ => unreachable!("the argv names `dispatch-rate set`"),
+        }
+    }
+
+    /// stow#1568: `dispatch-rate set` names a bound or lifts it — one
+    /// of the two, never both and never neither.
+    #[test]
+    fn dispatch_rate_set_takes_a_bound_or_lifts_it() {
+        let bound = dispatch_rate_set(&["--per-minute", "1200", "--yes"]).expect("bound");
+        assert_eq!(
+            (bound.per_minute, bound.unbounded, bound.yes),
+            (Some(1200), false, true)
+        );
+        let lifted = dispatch_rate_set(&["--unbounded"]).expect("lifted");
+        assert_eq!(
+            (lifted.per_minute, lifted.unbounded, lifted.yes),
+            (None, true, false)
+        );
+        assert!(dispatch_rate_set(&[]).is_err());
+        assert!(dispatch_rate_set(&["--per-minute", "5", "--unbounded"]).is_err());
+    }
+
     /// #510 made `run` the one executor entry; #530 was the watchdog
     /// panicking "there is no reactor running" the moment a dispatched
     /// future touched Tokio machinery (`tokio::fs`, `tokio::spawn` —

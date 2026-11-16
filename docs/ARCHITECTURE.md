@@ -261,7 +261,16 @@ setting to the scheduler's log that replaces the binding values at
 claim time until the next `set` (stow#1039): there is no clear, a
 `--macos`-less `set` leaves that cap on its binding, no ceiling is
 checked, and a lowered cap cancels nothing in flight — new claims
-pause until the in-flight count drops below it.
+pause until the in-flight count drops below it. Concurrency alone makes
+the start rate depend on build durations, so a second operator setting
+bounds it: `stow-admin dispatch-rate set --per-minute N` caps the runs
+the claim pass starts in any rolling minute (stow#1568), unbounded until
+the first `set` and lifted by `set --unbounded`. The graph holds the
+claim instants of the last minute — at most the setting, and it rides
+the snapshot — and when that window is what stops a pass with ready
+work left, the wake plan is the instant the oldest counted claim leaves
+it, so the queue never stalls; a claim proven to have created no run
+gives its place back.
 
 The handler resolves the requested version (newest non-prerelease,
 non-yanked release when the body omits it) and the current stable rustc,
@@ -980,6 +989,8 @@ unauthorized POSTs short-circuit before deserialization.
 | POST `/api/v1/admin/dispatch-freeze` | Bearer: `operations.yml` OIDC on the edge's release tag | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|engage\|clear`) |
 | GET `/api/v1/admin/dispatch-cap` | Bearer: repo-workflow OIDC or push user | — | `DispatchCaps` | The dispatch caps in force plus the operator setting behind them (stow#1039) |
 | POST `/api/v1/admin/dispatch-cap` | Bearer: `operations.yml` OIDC on the edge's release tag | `DispatchCapSet` | `DispatchCaps` | The operator's `set` — replaces the cap bindings at claim time until the next `set` (`stow-admin dispatch-cap status\|set`) |
+| GET `/api/v1/admin/dispatch-rate` | Bearer: repo-workflow OIDC or push user | — | `DispatchRate` | The runs-per-minute bound in force plus the runs started in the last minute (stow#1568) |
+| POST `/api/v1/admin/dispatch-rate` | Bearer: `operations.yml` OIDC on the edge's release tag | `DispatchRateSet` | `DispatchRate` | The operator's `set` — bounds the runs the claim pass starts per rolling minute until the next `set`; one append and a wake re-plan, no dispatch pass (`stow-admin dispatch-rate status\|set`) |
 | GET `/api/v1/admin/memory-line` | Bearer: repo-workflow OIDC or push user | — | `MemoryLines` | The scheduler graph's memory lines in force plus the operator setting behind them; answers without waking the graph (stow#1501) |
 | POST `/api/v1/admin/memory-line` | Bearer: `operations.yml` OIDC on the edge's release tag | `MemoryLineSet` | `MemoryLines` | The operator's `set` — replaces the memory-line bindings until the next `set` (`stow-admin memory-line status\|set`) |
 | GET `/api/v1/admin/release-priority` | Bearer: repo-workflow OIDC or push user | — | `ReleasePriority` | The multiplier release-profile nodes rank under plus the operator setting behind it (stow#1012) |

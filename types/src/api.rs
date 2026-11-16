@@ -1488,6 +1488,53 @@ pub struct DispatchCapSetting {
     pub actor: String,
 }
 
+/// The fleet's dispatch rate bound — wire shape of `GET`/`POST
+/// /api/v1/admin/dispatch-rate` and of the scheduler object's
+/// `/dispatch-rate` routes (stow#1568).
+///
+/// The most runs the claim pass starts in any rolling minute, fleet
+/// wide, applied beside the concurrency caps. Concurrency alone makes
+/// the start rate depend on how long builds take; this bounds what the
+/// fleet's publishes write to the registry together whatever the build
+/// durations. Until the first `set` there is no bound; a `set` replaces
+/// the previous one and may lift the bound again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchRate {
+    /// The operator setting in force — absent until the first `set`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setting: Option<DispatchRateSetting>,
+    /// The bound in force, runs per rolling minute — absent when the
+    /// rate is unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_runs_per_minute: Option<u32>,
+    /// The runs the claim pass started in the minute before the read.
+    pub started_last_minute: u32,
+}
+
+/// What an operator's `dispatch-rate set` wrote — `POST`'s request
+/// body. No ceiling is checked: the operator is trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchRateSet {
+    /// The most runs started per rolling minute — `0` starts none —
+    /// or absent to lift the bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_runs_per_minute: Option<u32>,
+}
+
+/// The operator setting a `set` appended to the scheduler's log — the
+/// `SchedulerEvent::DispatchRate` payload, the graph's in-memory copy
+/// and the snapshot's field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchRateSetting {
+    /// The bound the set named; absent when it lifted the bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_runs_per_minute: Option<u32>,
+    /// ISO 8601 timestamp of the set.
+    pub set_at: String,
+    /// The verified `actor` claim of the operations run that set it.
+    pub actor: String,
+}
+
 /// The release multiplier the scheduler ranks release-profile nodes
 /// under — wire shape of `GET`/`POST /api/v1/admin/release-priority`
 /// and of the scheduler object's `/release-priority` routes
@@ -6933,6 +6980,14 @@ pub enum SchedulerEvent {
     DispatchCap {
         /// The setting the log row recorded.
         setting: Box<DispatchCapSetting>,
+    },
+    /// An operator's dispatch-rate setting (stow#1568): the most runs
+    /// the claim pass starts per rolling minute, in force until the
+    /// next `set`. The event always carries a full setting; a setting
+    /// naming no bound lifts it.
+    DispatchRate {
+        /// The setting the log row recorded.
+        setting: Box<DispatchRateSetting>,
     },
     /// An operator's release-priority setting (stow#1012): the
     /// multiplier release-profile nodes rank under, in force until the

@@ -2997,6 +2997,80 @@ pub const DRIVES: &[Drive] = &[
         }),
     },
     Drive {
+        // The operator's rate bound read (stow#1568): one read of
+        // state the graph holds — the bound and the window's count —
+        // the same shape as `GET /dispatch-cap`.
+        name: "GET /dispatch-rate",
+        setup: None,
+        run: |_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                ctx.loaded()
+                    .with(|graph| graph.dispatch_rate_view(now_ms()));
+                Ok(())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // The operator's `set` (stow#1568): one `DispatchRate` append,
+        // then the route's own tail — the wake re-plan, which arms the
+        // alarm for the claims a raised or lifted bound frees. The
+        // route runs no dispatch pass, and the plan reads the window
+        // (at most the bound's claims, one deque) beside the ready
+        // queue it already reads, so the cost is independent of the
+        // rate. The seed stores no setting and a `set` can only
+        // replace one, so the cleanup restores the unset state exactly:
+        // the in-memory setting is dropped and a snapshot makes that
+        // the store's state, the log row it covered going with the
+        // prefix.
+        name: "POST /dispatch-rate",
+        setup: Some(|_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                if ctx.loaded().with(|graph| graph.dispatch_rate().is_some()) {
+                    return Err(
+                        "POST /dispatch-rate drive expects the seed's unset rate".to_owned()
+                    );
+                }
+                Ok(())
+            })
+        }),
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                routes::commit_as(
+                    ctx.loaded(),
+                    db,
+                    Some(DRIVE_ACTOR),
+                    &[SchedulerEvent::DispatchRate {
+                        setting: Box::new(stow_types::api::DispatchRateSetting {
+                            max_runs_per_minute: Some(1_000),
+                            set_at: "2026-01-01T00:00:00.000Z".to_owned(),
+                            actor: DRIVE_ACTOR.to_owned(),
+                        }),
+                    }],
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?;
+                let plan = routes::wake_plan(ctx.loaded(), settings, now_ms());
+                if !matches!(plan, super::queue::AlarmPlan::At(_)) {
+                    return Err(format!(
+                        "POST /dispatch-rate drive expects a wake plan, got {plan:?}"
+                    ));
+                }
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                ctx.loaded()
+                    .with(super::graph::Graph::restore_unset_dispatch_rate);
+                routes::snapshot(ctx.loaded(), db, now_ms())
+                    .await
+                    .map_err(text)
+            })
+        }),
+    },
+    Drive {
         // The operator's multiplier read (stow#1012): one read of
         // state the graph holds.
         name: "GET /release-priority",

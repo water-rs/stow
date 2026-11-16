@@ -7,7 +7,8 @@ table). Commands that take `--yes` require it before applying their plan;
 
 Run outside GitHub Actions, the mutating commands — `scheduler reset`,
 `scheduler demand-feed`, `queue retry|cancel|promote|purge`,
-`dispatch-freeze engage|clear`, `dispatch-cap set`, `release-priority set`,
+`dispatch-freeze engage|clear`, `dispatch-cap set`, `dispatch-rate set`,
+`release-priority set`,
 `memory-line set`, `submit`,
 `maintenance`, `watchdog`
 (not `--dry-run`), and the `preheat` lanes under `--yes` — do not call
@@ -54,6 +55,17 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   pauses dispatch, and no ceiling is checked. A lowered cap cancels
   nothing in flight: new claims pause until the in-flight count drops
   below it.
+- `stow-admin dispatch-rate status` — the most runs the claim pass
+  starts per rolling minute, fleet wide, and the runs started in the
+  last minute; unbounded until the first `set`.
+  `stow-admin dispatch-rate set --per-minute N` bounds it and
+  `stow-admin dispatch-rate set --unbounded` lifts the bound, each
+  until the next `set` (no expiry; `--per-minute 0` starts nothing, no
+  ceiling is checked). The bound applies beside the concurrency caps:
+  it holds the fleet's publish rate under the registry's write cap
+  whatever the build durations, and the claim pass resumes the moment
+  the oldest counted start leaves the minute. Nothing in flight is
+  cancelled.
 - `stow-admin release-priority status` — the multiplier release-profile
   library builds rank under (percent of the entry point's priority) and
   whether it is the default (`10`) or the operator setting.

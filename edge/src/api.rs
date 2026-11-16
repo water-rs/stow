@@ -374,6 +374,31 @@ pub async fn set_dispatch_cap(
     Ok(Json(stored))
 }
 
+/// GET /api/v1/admin/dispatch-rate
+///
+/// The fleet's dispatch rate bound in force and the runs started in
+/// the last minute (stow#1568).
+pub async fn get_dispatch_rate(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::DispatchRate>, GetArtifactError> {
+    Ok(Json(scheduler_client::get_dispatch_rate(&scheduler).await?))
+}
+
+/// POST /api/v1/admin/dispatch-rate
+///
+/// The operator's `set` — bounds the runs the claim pass starts per
+/// rolling minute until the next `set`; a set naming no bound lifts it.
+pub async fn set_dispatch_rate(
+    Mutator { caller, actor, .. }: Mutator<OperatorRoute>,
+    Json(set): Json<stow_types::api::DispatchRateSet>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::DispatchRate>, GetArtifactError> {
+    let stored = scheduler_client::set_dispatch_rate(&scheduler, &set, &actor).await?;
+    tracing::warn!(max = ?stored.max_runs_per_minute, %caller, "dispatch rate set via admin endpoint");
+    Ok(Json(stored))
+}
+
 /// GET /api/v1/admin/release-priority
 ///
 /// The multiplier release-profile nodes rank under — the operator

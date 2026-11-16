@@ -436,6 +436,10 @@ pub struct RequestRecord {
     pub error: Option<String>,
 }
 
+/// The rolling window of the dispatch-rate bound (stow#1568): the rate
+/// is runs per minute.
+const DISPATCH_RATE_WINDOW_MS: i64 = 60_000;
+
 /// The whole in-memory graph. Nothing here serializes whole: the
 /// snapshot (`snapshot.rs`) walks it one byte-bounded chunk at a time,
 /// and a wake decodes it one chunk at a time — neither side ever holds
@@ -548,6 +552,17 @@ pub struct Graph {
     /// `STOW_MAX_CONCURRENT_MACOS_JOBS` at claim time until the next
     /// `set`. `None` until the first one.
     dispatch_cap: Option<stow_types::api::DispatchCapSetting>,
+    /// The operator's dispatch-rate setting (stow#1568): the most runs
+    /// the claim pass starts per rolling minute. `None` until the
+    /// first `set`; a setting naming no bound lifts it.
+    dispatch_rate: Option<stow_types::api::DispatchRateSetting>,
+    /// The instants (epoch ms, ascending) of the claims the last
+    /// [`DISPATCH_RATE_WINDOW_MS`] holds — the rate bound's window.
+    /// Every claim records its instant, replay included, and each
+    /// record drops the ones that left the window, so the deque is
+    /// O(claims in a minute) — at most the setting while one binds —
+    /// and never scales with stored data.
+    recent_claims: std::collections::VecDeque<i64>,
     /// The operator's release-priority setting (stow#1012): the
     /// multiplier release-profile nodes rank under. `None` until the
     /// first `set`, when [`queue::DEFAULT_RELEASE_PRIORITY_PERCENT`]
@@ -2543,6 +2558,10 @@ impl Graph {
         let (total_free, macos_free) = self.free_slots(settings);
         let total_free = total_free.min(bound);
         let macos_free = macos_free.min(bound);
+        // The rate bound (stow#1568) counts the runs started, so it
+        // limits the pass's claims, not its closure refusals.
+        self.expire_claim_window(now);
+        let rate_free = self.rate_free(now);
         // The rank is `operand × time waited` (stow#879): within one
         // operand class the oldest entry ranks highest, so the best
         // node of each class is its oldest eligible one and the claim
@@ -2557,7 +2576,9 @@ impl Graph {
         let mut cursors: BTreeMap<(bool, ReadyClass), Option<(i64, u32)>> = BTreeMap::new();
         let mut pass = ClaimPass::default();
         let mut macos_taken = 0u32;
-        while pass.claims.len() + pass.refusals.len() < total_free as usize {
+        while pass.claims.len() + pass.refusals.len() < total_free as usize
+            && pass.claims.len() < rate_free as usize
+        {
             let mut best: Option<(Candidate, bool)> = None;
             for (macos, ready) in [(false, &self.ready), (true, &self.ready_macos)] {
                 if macos && macos_taken >= macos_free {
@@ -2633,6 +2654,8 @@ impl Graph {
     /// `generation`, unbound, with its dispatch attempt counted.
     fn mark_claimed(&mut self, ix: u32, generation: u64, now: i64) {
         self.next_generation = self.next_generation.max(generation);
+        self.expire_claim_window(now);
+        self.recent_claims.push_back(now);
         self.set_status(ix, Status::Dispatched);
         self.state_mut(ix).touch(now);
         self.edit_extra(ix, |extra| {
@@ -2683,6 +2706,12 @@ impl Graph {
             return;
         }
         self.settling.remove(&claim.generation);
+        // A claim that created no run wrote nothing to the registry:
+        // it gives its place in the rate window back.
+        let claimed_at = self.claimed_at_of(ix);
+        if let Some(at) = self.recent_claims.iter().rposition(|&at| at == claimed_at) {
+            self.recent_claims.remove(at);
+        }
         self.set_status(ix, Status::Pending);
         self.state_mut(ix).touch(now);
         // The claim's fields go; the attempt counters stay, the
@@ -3490,6 +3519,80 @@ impl Graph {
         }
     }
 
+    /// The operator's stored `dispatch-rate set` (stow#1568), `None`
+    /// until the first one.
+    pub const fn dispatch_rate(&self) -> Option<&stow_types::api::DispatchRateSetting> {
+        self.dispatch_rate.as_ref()
+    }
+
+    /// Drop the stored dispatch-rate setting — the budget drives'
+    /// restore of the unset state the fixture seed wrote, made the
+    /// store's state by the snapshot the caller writes next. No route
+    /// reaches it: a `set` lifts the bound by naming none.
+    pub fn restore_unset_dispatch_rate(&mut self) {
+        self.dispatch_rate = None;
+    }
+
+    /// `GET /dispatch-rate`'s body at `now`.
+    pub fn dispatch_rate_view(&self, now: i64) -> stow_types::api::DispatchRate {
+        stow_types::api::DispatchRate {
+            setting: self.dispatch_rate.clone(),
+            max_runs_per_minute: self.rate_limit(),
+            started_last_minute: u32::try_from(self.live_claims(now).len()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// The rate bound in force: runs per rolling minute, `None` when
+    /// unbounded.
+    fn rate_limit(&self) -> Option<u32> {
+        self.dispatch_rate
+            .as_ref()
+            .and_then(|set| set.max_runs_per_minute)
+    }
+
+    /// Drop the claims that left the rate window at `now`.
+    fn expire_claim_window(&mut self, now: i64) {
+        while self
+            .recent_claims
+            .front()
+            .is_some_and(|&at| at <= now - DISPATCH_RATE_WINDOW_MS)
+        {
+            self.recent_claims.pop_front();
+        }
+    }
+
+    /// The claim instants inside the rate window at `now`, oldest
+    /// first — [`Self::expire_claim_window`] without the mutation.
+    fn live_claims(&self, now: i64) -> impl Iterator<Item = i64> + ExactSizeIterator {
+        let live_from = self
+            .recent_claims
+            .partition_point(|&at| at <= now - DISPATCH_RATE_WINDOW_MS);
+        self.recent_claims.iter().skip(live_from).copied()
+    }
+
+    /// The claims the rate bound still allows at `now`; unbounded is
+    /// `u32::MAX`.
+    fn rate_free(&self, now: i64) -> u32 {
+        self.rate_limit().map_or(u32::MAX, |limit| {
+            limit.saturating_sub(u32::try_from(self.live_claims(now).len()).unwrap_or(u32::MAX))
+        })
+    }
+
+    /// The instant the rate bound next allows a claim, when it stops
+    /// one at `now` and a window expiry will free one: the instant the
+    /// claim that leaves the window to open a place does. `None` when
+    /// the bound allows a claim now, or is `0` — nothing expires into
+    /// a place.
+    fn rate_release(&self, now: i64) -> Option<i64> {
+        let limit = self.rate_limit().filter(|&limit| limit > 0)?;
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let live = self.live_claims(now);
+        let over = live.len().checked_sub(limit)?;
+        live.skip(over)
+            .next()
+            .map(|at| at + DISPATCH_RATE_WINDOW_MS)
+    }
+
     /// Dispatch slots free under `settings`: the cap minus in-flight and
     /// external occupancy, in total and for the macOS family. A cap
     /// below the in-flight count saturates at zero — nothing in flight
@@ -3556,8 +3659,14 @@ impl Graph {
         let min_age = i64::from(settings.dispatch_min_age_minutes) * 60_000;
         let stale = i64::from(settings.stale_dispatch_minutes) * 60_000;
         let (free, macos_free) = self.free_slots(settings);
+        // The rate bound (stow#1568) is no slot: while its window is
+        // full, ready work waits for the instant the window frees a
+        // place — a wake planned there, or the queue stalls with no
+        // claim to arm one (stow#1564).
+        let rate_free = self.rate_free(now);
+        let rate_wake = self.rate_release(now);
         let mut wake: Option<i64> = None;
-        if free > 0 {
+        if free > 0 && (rate_free > 0 || rate_wake.is_some()) {
             let macos_queue = (macos_free > 0).then_some(&self.ready_macos);
             for &(_, ix) in self
                 .ready
@@ -3571,8 +3680,9 @@ impl Graph {
                 } else {
                     min_age
                 };
-                let eligible_at =
-                    (self.state(ix).first_requested + age_gate).max(self.not_before_of(ix));
+                let eligible_at = (self.state(ix).first_requested + age_gate)
+                    .max(self.not_before_of(ix))
+                    .max(rate_wake.unwrap_or(i64::MIN));
                 if eligible_at <= now {
                     return queue::AlarmPlan::At(now);
                 }
@@ -3924,6 +4034,9 @@ impl Graph {
             }
             SchedulerEvent::DispatchCap { setting } => {
                 self.dispatch_cap = Some((**setting).clone());
+            }
+            SchedulerEvent::DispatchRate { setting } => {
+                self.dispatch_rate = Some((**setting).clone());
             }
             SchedulerEvent::ReleasePriority { setting } => {
                 self.release_priority = Some((**setting).clone());
@@ -7030,6 +7143,181 @@ mod tests {
         assert_eq!(view.max_concurrent_jobs, 0);
         assert_eq!(view.max_concurrent_macos_jobs, macos);
         assert_eq!(view.setting.map(|set| set.max_concurrent_jobs), Some(0));
+    }
+
+    /// A graph of `count` ready miss-lane nodes, and the settings and
+    /// instant a pass over them runs at — far past the age gate.
+    fn rate_fixture(count: usize) -> (Graph, queue::SchedulerSettings, i64) {
+        let mut graph = Graph::default();
+        let nodes = (0..count).map(|n| sub(&format!("r{n}"))).collect();
+        graph
+            .merge(&forest(SubmissionSource::CacheMiss, nodes), 0)
+            .expect("merge");
+        // The run-listing reconcile is timer work of its own
+        // ([`Graph::reconcile_due`]); the rate wake is what these
+        // tests read, so the reconcile has just run.
+        graph.reconcile_attempted_at = i64::MAX / 2;
+        (graph, claim_settings(45, 16), 3_600_000)
+    }
+
+    fn rate_event(max: Option<u32>) -> SchedulerEvent {
+        SchedulerEvent::DispatchRate {
+            setting: Box::new(stow_types::api::DispatchRateSetting {
+                max_runs_per_minute: max,
+                set_at: "2026-01-01T00:00:00Z".to_owned(),
+                actor: "ops".to_owned(),
+            }),
+        }
+    }
+
+    /// stow#1568: a pass never starts more runs in a rolling minute
+    /// than the setting allows, whatever the concurrency caps leave
+    /// free; the next claim comes once the oldest one leaves the
+    /// window; and the wake plan names that instant, so the queue never
+    /// stalls on a bound that frees with the clock alone.
+    #[test]
+    fn the_rate_bound_caps_claims_per_rolling_minute() {
+        let (mut graph, settings, t0) = rate_fixture(10);
+        let claim = |graph: &mut Graph, now: i64| {
+            graph
+                .claim_nodes(&settings, now, u32::MAX)
+                .expect("claim")
+                .claims
+                .len()
+        };
+        // Unset: only the concurrency cap (45) bounds the pass.
+        assert_eq!(graph.wake_plan(t0, &settings), queue::AlarmPlan::At(t0));
+        graph.apply(&rate_event(Some(3)), t0);
+        assert_eq!(graph.dispatch_rate_view(t0).max_runs_per_minute, Some(3));
+
+        // The first pass stops at the bound with ready work left.
+        assert_eq!(claim(&mut graph, t0), 3);
+        assert_eq!(graph.dispatch_rate_view(t0).started_last_minute, 3);
+        assert_eq!(claim(&mut graph, t0), 0);
+        // The bound, not a slot, holds the work: the wake is the
+        // instant the oldest counted claim leaves the window.
+        let freed = t0 + DISPATCH_RATE_WINDOW_MS;
+        assert_eq!(
+            graph.wake_plan(t0 + 1, &settings),
+            queue::AlarmPlan::At(freed)
+        );
+        // One millisecond short of it nothing is claimable.
+        assert_eq!(claim(&mut graph, freed - 1), 0);
+        // At it the window frees all three places and the pass fills
+        // them again, no more.
+        assert_eq!(claim(&mut graph, freed), 3);
+        assert_eq!(
+            graph.wake_plan(freed, &settings),
+            queue::AlarmPlan::At(freed + DISPATCH_RATE_WINDOW_MS)
+        );
+    }
+
+    /// stow#1568: claims staggered across the window free their places
+    /// one at a time, a lowered bound waits out the excess, and a set
+    /// lifting the bound claims at once.
+    #[test]
+    fn the_rate_window_frees_places_as_claims_age_out() {
+        let (mut graph, settings, t0) = rate_fixture(10);
+        graph.apply(&rate_event(Some(2)), t0);
+        let at = |graph: &mut Graph, now: i64| {
+            graph
+                .claim_nodes(&settings, now, 1)
+                .expect("claim")
+                .claims
+                .len()
+        };
+        assert_eq!(at(&mut graph, t0), 1);
+        assert_eq!(at(&mut graph, t0 + 20_000), 1);
+        assert_eq!(at(&mut graph, t0 + 30_000), 0);
+        assert_eq!(
+            graph.wake_plan(t0 + 30_000, &settings),
+            queue::AlarmPlan::At(t0 + DISPATCH_RATE_WINDOW_MS)
+        );
+        // The first claim leaves; one place opens, not two.
+        assert_eq!(at(&mut graph, t0 + DISPATCH_RATE_WINDOW_MS), 1);
+        assert_eq!(at(&mut graph, t0 + DISPATCH_RATE_WINDOW_MS), 0);
+        assert_eq!(
+            graph.wake_plan(t0 + DISPATCH_RATE_WINDOW_MS, &settings),
+            queue::AlarmPlan::At(t0 + 20_000 + DISPATCH_RATE_WINDOW_MS)
+        );
+
+        // Lowered below what the window holds: places open only once
+        // enough claims leave to bring the count under the bound.
+        let now = t0 + DISPATCH_RATE_WINDOW_MS;
+        graph.apply(&rate_event(Some(1)), now);
+        assert_eq!(
+            graph.wake_plan(now, &settings),
+            queue::AlarmPlan::At(now + DISPATCH_RATE_WINDOW_MS)
+        );
+        // Lifted, the window no longer binds.
+        graph.apply(&rate_event(None), now);
+        assert_eq!(graph.wake_plan(now, &settings), queue::AlarmPlan::At(now));
+        assert_eq!(
+            graph
+                .claim_nodes(&settings, now, u32::MAX)
+                .expect("claim")
+                .claims
+                .len(),
+            7
+        );
+    }
+
+    /// stow#1568: a bound of zero starts nothing and plans no wake for
+    /// the ready work it holds — no claim expiry will ever open a place.
+    #[test]
+    fn a_zero_rate_starts_nothing_and_plans_no_wake() {
+        let (mut graph, settings, t0) = rate_fixture(2);
+        graph.apply(&rate_event(Some(0)), t0);
+        let pass = graph.claim_nodes(&settings, t0, u32::MAX).expect("claim");
+        assert!(pass.claims.is_empty());
+        assert_eq!(graph.wake_plan(t0, &settings), queue::AlarmPlan::Delete);
+    }
+
+    /// stow#1568: a claim proven to have created no run gives its place
+    /// back, and a snapshot round trip carries the setting and the
+    /// window, so a restart never opens a fresh minute.
+    #[test]
+    fn a_refused_claim_frees_its_place_and_the_window_survives_a_snapshot() {
+        let (mut graph, settings, t0) = rate_fixture(4);
+        graph.apply(&rate_event(Some(2)), t0);
+        let claimed = graph.claim(&settings, t0, u32::MAX).expect("claim");
+        assert_eq!(claimed.len(), 2);
+
+        let restored = round_trip(&graph);
+        assert_eq!(
+            restored.dispatch_rate_view(t0 + 1),
+            graph.dispatch_rate_view(t0 + 1)
+        );
+        assert_eq!(restored.dispatch_rate_view(t0 + 1).started_last_minute, 2);
+        let mut restored = restored;
+        assert!(
+            restored
+                .claim_nodes(&settings, t0 + 1, u32::MAX)
+                .expect("claim")
+                .claims
+                .is_empty()
+        );
+
+        let first = &claimed[0];
+        graph.apply(
+            &SchedulerEvent::ClaimsRefused {
+                claims: vec![stow_types::api::DispatchClaim {
+                    task_id: first.task_id.clone(),
+                    generation: first.generation,
+                    attempt: first.attempt,
+                }],
+            },
+            t0 + 1,
+        );
+        assert_eq!(graph.dispatch_rate_view(t0 + 1).started_last_minute, 1);
+        assert_eq!(
+            graph
+                .claim_nodes(&settings, t0 + 1, u32::MAX)
+                .expect("claim")
+                .claims
+                .len(),
+            1
+        );
     }
 
     /// stow#940: a `running` state the reconcile restored stamps its
