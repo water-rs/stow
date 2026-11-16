@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.4](https://github.com/water-rs/stow/compare/types/v0.21.3...types/v0.21.4) - 2026-11-16
+
+### Added
+
+- *(scheduler)* bound the fleet's dispatch rate with an operator setting ([#1571](https://github.com/water-rs/stow/pull/1571))
+
+### Other
+
+- Merge pull request #1572 from water-rs/dev
+
 ## [0.21.2](https://github.com/water-rs/stow/compare/types/v0.21.1...types/v0.21.2) - 2026-11-15
 
 ### Fixed
