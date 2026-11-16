@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.5](https://github.com/water-rs/stow/compare/types/v0.21.4...types/v0.21.5) - 2026-11-16
+
+### Fixed
+
+- *(ci)* measure the promoted candidate only once the Scheduler runs its code ([#1575](https://github.com/water-rs/stow/pull/1575)) ([#1576](https://github.com/water-rs/stow/pull/1576))
+
+### Other
+
+- Merge pull request #1577 from water-rs/dev
+
 ## [0.21.4](https://github.com/water-rs/stow/compare/types/v0.21.3...types/v0.21.4) - 2026-11-16
 
 ### Added
