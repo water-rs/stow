@@ -13,8 +13,8 @@
 //! * each of its records tags is re-signed in place — the manifest is
 //!   unchanged and its `.sig` image gains a layer;
 //! * each live row's node (the newest row per node, as the index fold
-//!   resolves them) is republished under the new identity: the CLI verifies
-//!   a node from the signature material in its bundle tar, so the bundle,
+//!   resolves them) is read from its bundle and republished under the new
+//!   identity: the bundle carries a node's only signature, so the bundle,
 //!   and with it the row's `bundle_digest`, is new;
 //! * when any row changed, one new records artifact under this run's tag
 //!   carries the task's rows, which the next index export folds over the
@@ -26,7 +26,7 @@
 
 use futures_util::StreamExt as _;
 use stow_oci::resign::{
-    ExactIdentity, Identities, TagClass, TaskResigned, classify_tag, resign_task,
+    ExactIdentity, Identities, Signers, TagClass, TaskResigned, classify_tag, resign_task,
 };
 use stow_oci::verify::ReleaseIdentity;
 use stow_oci::{Publisher, RegistryHttp, RegistrySession};
@@ -211,6 +211,12 @@ impl Resigner<'_> {
                 .sign(self.session, &reference, &digest)
                 .await
         };
+        let sign_node = |reference: String, digest: String| async move {
+            self.publisher
+                .signer()
+                .sign_detached(&reference, &digest)
+                .await
+        };
         let outcome = resign_task(
             self.session,
             self.trust,
@@ -221,7 +227,10 @@ impl Resigner<'_> {
                 new: &self.new,
             },
             self.build,
-            &sign,
+            Signers {
+                records: &sign,
+                node: &sign_node,
+            },
         )
         .await?;
         if let Some(published) = &outcome.published {

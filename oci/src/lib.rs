@@ -6,6 +6,7 @@
 //! exactly the same way, so neither carries its own copy.
 
 mod artifacts;
+mod bundle;
 mod client;
 mod index;
 mod publisher;
@@ -22,6 +23,7 @@ pub use artifacts::{
     UploadOutcome, publish_packed, pull_signature_materials, push_artifacts, push_artifacts_with,
     verify_artifact_signature, verify_listed_artifact_signature,
 };
+pub use bundle::{PulledBundle, pull_bundle};
 pub use client::{
     OPERATOR_LOG_FILTER, RegistryError, RegistryHttp, RegistrySession, TransportPolicy,
 };

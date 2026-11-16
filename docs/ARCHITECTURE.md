@@ -409,9 +409,12 @@ reader treats that answer as the empty index, the same result a missing
 tag gives, so a fresh rustc's first builds can start it and a deleted
 package reads as reset (stow#844).
 
-Each artifact is two OCI images on that package. The signed image is the
-tag above: its config is the `ArtifactBlobConfig` and it carries one layer,
-the pack: a deterministic tar (fixed order, mtime 0, owner 0:0, mode 0644)
+Each artifact is one OCI image on that package, `<tag>.bundle`, where
+`<tag>` is the reference above. The reference names the signed artifact:
+an OCI image manifest whose config is the `ArtifactBlobConfig` and whose
+one layer is the pack. That manifest is never pushed under its own tag; the
+publish stage signs its digest keyless under the reference, and the bundle
+carries the manifest, config, signature and pack. The pack is a deterministic tar (fixed order, mtime 0, owner 0:0, mode 0644)
 of every output file plus, when the build script produced one, the native
 `OUT_DIR` archive, compressed as a single zstd stream at level 19 with
 long-distance matching and a 2^27 window (`stow_shim::pack`), split into
@@ -421,13 +424,13 @@ rlib embeds the metadata its rmeta carries. The config records each file's
 SHA-256; the CLI unpacks the pack with the 2^27 window bound and verifies
 every file against it. Decompression speed does not depend on the level,
 so the cost is paid once, at publish. Index slices are compressed at the
-same level, multithreaded; the publish stage signs this image keyless.
-Next to it the
-trusted publish stage pushes `<tag>.bundle`, a single-layer image whose
+same level, multithreaded.
+The trusted publish stage pushes `<tag>.bundle`, a single-layer image whose
 layer is the bundle tar a CLI consumes (`stow_types::bundle::assemble_bundle`).
 The bundle needs no signature of its own: it embeds the signed manifest and
-config, the signature materials, and the pack byte-for-byte, and the CLI
-verifies that material after download. The build's records artifact
+config, the signature materials, and the pack byte-for-byte; the CLI and
+the repack and re-sign tools verify that material from the bundle, and
+nothing else holds a node's signature. The build's records artifact
 carries the bundle layer's digest and size (`bundle_digest`,
 `bundle_size`), republished verbatim into the index row; the CLI asks the
 edge for `GET /api/v1/bundles/{rustc_version}/{bundle_digest}`, which
@@ -442,10 +445,10 @@ ever assembles, buffers or inspects it. The publish stage validated the tar
 | Path | Content |
 |---|---|
 | `manifest.json` | `ArtifactBundleManifest` (oci_reference, oci_digest, embedded `ArtifactBlobConfig`, sigstore signatures) |
-| `oci/manifest.json` | OCI image manifest of the signed image (registry bytes verbatim) |
-| `oci/config.json` | OCI image config of the signed image (registry bytes verbatim) |
-| `sigstore/payload-<n>.json` | Cosign simple-signing payloads, one per signature layer |
-| `files/pack.tar.zst` | The signed image's one layer, the pack, verbatim; it holds `lib<crate>-<extra>.rlib`, `.rmeta`, `.so`/`.dylib`/`.dll` and the native archive in `ArtifactBlobConfig` order |
+| `oci/manifest.json` | OCI image manifest of the signed artifact (the signed bytes verbatim) |
+| `oci/config.json` | OCI image config of the signed artifact (the signed bytes verbatim) |
+| `sigstore/payload-<n>.json` | Cosign simple-signing payloads, one per signature |
+| `files/pack.tar.zst` | The signed artifact's one layer, the pack, verbatim; it holds `lib<crate>-<extra>.rlib`, `.rmeta`, `.so`/`.dylib`/`.dll` and the native archive in `ArtifactBlobConfig` order |
 
 A record always carries its pushed bundle's digest — the publish
 writes it — so every record maps to one index row.
@@ -453,7 +456,8 @@ writes it — so every record maps to one index row.
 Constants (media types, paths) are defined in `types/src/bundle.rs`.
 
 The CLI reads only this layout. A node published before it stored one zstd
-layer per file; `build-crate.yml` repacks those without rebuilding. A
+layer per file, carried in its bundle at `files/<file name>`;
+`build-crate.yml` repacks those without rebuilding. A
 `repack.yml` dispatch with `repack_rustc` (and `repack_concurrency`, tasks
 in flight, default 4) calls `build-crate.yml`'s `repack` job as a reusable
 workflow, whose certificate identity is the called file's, the same signing
@@ -462,7 +466,7 @@ certificate for any other identity before a signature is pushed.
 `stow-build repack` lists the rustc's `records-*` artifacts,
 verifies each task's records and each node still in the old layout under
 the pinned builder identity, checks every file's SHA-256 against the signed
-config, publishes the single-layer artifact and bundle through the build's
+config, publishes the single-pack bundle through the build's
 publish path, and pushes a new signed records artifact per task changed.
 The config blob is carried over byte for byte, so a node's identity does
 not change. The next index export folds the new records over the old rows.
