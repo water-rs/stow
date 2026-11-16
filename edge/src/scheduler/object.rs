@@ -1043,7 +1043,10 @@ async fn status(
     db: DurableDb,
 ) -> Result<Json<stow_types::api::SchedulerStatus>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
-    Ok(Json(graph.with(|graph| graph.status())))
+    Ok(Json(stow_types::api::SchedulerStatus {
+        scheduler_release_tag: Some(stow_types::trusted_builder::ReleaseTag::current()),
+        ..graph.with(|graph| graph.status())
+    }))
 }
 
 /// `GET /admin/status` — the operator view behind `stow-admin status`.

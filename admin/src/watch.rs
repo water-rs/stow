@@ -922,6 +922,7 @@ mod tests {
             running: 4,
             completed: 100,
             failed: 5,
+            scheduler_release_tag: None,
         }
     }
 

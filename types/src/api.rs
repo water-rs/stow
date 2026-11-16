@@ -1684,6 +1684,13 @@ pub struct SchedulerStatus {
     /// a publish" from "waiting on something that will never come".
     #[serde(default)]
     pub blocked: u32,
+    /// The release tag of the code the scheduler object runs. A deploy
+    /// runs the object on the previous release's code for a while after
+    /// the edge moves, so the object's tag is its own; a previous
+    /// release's object, in that window, sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub scheduler_release_tag: Option<crate::trusted_builder::ReleaseTag>,
 }
 
 /// `GET /api/v1/scheduler/status`: queue status and the answering edge's tag.
