@@ -3581,9 +3581,12 @@ impl Graph {
                 }
             }
         }
+        // A lease that already expired — a freeze outlived it, and the
+        // freeze armed nothing — wakes now: only a claim pass reclaims
+        // it, and a cap full of expired claims plans no other wake.
         for &ix in &self.inflight {
-            let expiry = self.lease_since_of(ix) + stale;
-            if expiry > now && wake.is_none_or(|w| expiry < w) {
+            let expiry = (self.lease_since_of(ix) + stale).max(now);
+            if wake.is_none_or(|w| expiry < w) {
                 wake = Some(expiry);
             }
         }
@@ -6898,6 +6901,52 @@ mod tests {
             graph.wake_plan(now, &settings),
             queue::AlarmPlan::At(renewed + stale)
         );
+    }
+
+    /// A freeze that outlives a claim's lease arms nothing; once it
+    /// clears with the cap full of that expired claim, the plan wakes
+    /// now so the claim pass reclaims it.
+    #[test]
+    fn a_lease_expired_under_a_freeze_wakes_once_it_clears() {
+        use stow_types::api::{ChannelOutcome, DispatchFreezeRecord, DispatchFreezeTrigger};
+        let settings = claim_settings(1, 1);
+        let stale = i64::from(settings.stale_dispatch_minutes) * 60_000;
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        assert_eq!(graph.claim(&settings, 0, u32::MAX).expect("claim").len(), 1);
+        let trigger = DispatchFreezeTrigger::Manual {
+            actor: "test".to_owned(),
+        };
+        graph.apply(
+            &SchedulerEvent::Freeze {
+                at: "2026-11-15T03:00:00Z".to_owned(),
+                trigger: trigger.clone(),
+                record: Some(Box::new(DispatchFreezeRecord {
+                    frozen_at: "2026-11-15T03:00:00Z".to_owned(),
+                    trigger: trigger.clone(),
+                    notify: ChannelOutcome::Disabled {
+                        reason: "test".to_owned(),
+                    },
+                })),
+            },
+            0,
+        );
+        let now = stale + 30 * 60_000;
+        assert_eq!(graph.wake_plan(now, &settings), queue::AlarmPlan::Delete);
+        graph.apply(
+            &SchedulerEvent::Freeze {
+                at: "2026-11-15T04:30:00Z".to_owned(),
+                trigger,
+                record: None,
+            },
+            now,
+        );
+        graph.reconcile_failed(now);
+        assert!(!graph.reconcile_due(now, &settings));
+        assert_eq!(graph.wake_plan(now, &settings), queue::AlarmPlan::At(now));
+        let reclaimed = graph.claim(&settings, now, u32::MAX).expect("reclaim");
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].task_id, id("solo"));
     }
 
     /// stow#940: a failed listing counts as an attempt — the plan goes
