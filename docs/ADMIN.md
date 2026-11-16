@@ -176,10 +176,16 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   delegate to `stow-mock-registry publish-index`), and report each
   slice's membership to the scheduler. `index-publish.yml`
   runs this loop after every `build-crate` run, preceded by `index
-  reconcile`, which reports in full every published slice whose
-  generation the scheduler does not hold (a full membership over one
-  request body posts in parts; a delta too large for one part is
-  reported as the slice's full membership). Under `full` the reconcile runs after the
+  reconcile`, which replays every published slice whose generation
+  the scheduler does not hold from the generation it does hold, one
+  delta per missing generation along the `dev.stow.index.previous`
+  links each pushed index manifest carries; only a slice the scheduler
+  holds nothing or a staged full report of, or a first or `full`
+  publish in that history, goes out in full (a full membership over
+  one request body posts in parts; a delta too large for one part is
+  reported as the slice's full membership). A history that does not
+  reach the held generation fails the reconcile naming the slice; an
+  `index-publish.yml` run with `full` republishes it. Under `full` the reconcile runs after the
   publish step instead, once every slice it reads is regenerated. `index targets` prints
   every `CI_TARGET_TRIPLES` entry.
   `index published-rustcs` prints every stable rustc release

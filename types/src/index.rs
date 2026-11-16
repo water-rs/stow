@@ -36,6 +36,22 @@ pub const STOW_INDEX_MEDIA_TYPE: &str = "application/vnd.stow.index.v1+zstd";
 /// Media type of the OCI config the index artifact carries.
 pub const STOW_INDEX_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.index.config.v1+json";
 
+/// Manifest annotation carrying the index's [`content_sha256`].
+///
+/// The digest covers everything except the wall-clock `generated_at`.
+/// Publishing compares it to decide whether the slice changed; the blob
+/// digest can never signal that because `generated_at` makes every
+/// export's bytes unique.
+pub const STOW_INDEX_CONTENT_SHA256_ANNOTATION: &str = "dev.stow.index.content-sha256";
+
+/// Manifest annotation linking the index manifest this one replaced.
+///
+/// It names the digest the slice's tag resolved to before the push, and
+/// is absent on a slice's first push. The links walk a slice's published
+/// history back from its live manifest, so a report the scheduler never
+/// received is replayed against the generation it holds.
+pub const STOW_INDEX_PREVIOUS_ANNOTATION: &str = "dev.stow.index.previous";
+
 /// Media type of the folded set's single OCI layer — the JSON array of
 /// records tags already folded into the sibling `index` slice.
 pub const STOW_FOLDED_MEDIA_TYPE: &str = "application/vnd.stow.folded.v1+json";

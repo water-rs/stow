@@ -169,6 +169,18 @@ impl<'a> SliceReportPart<'a> {
     }
 }
 
+/// A reported slice as [`Graph::slice_generations`] lists it.
+pub struct HeldSlice {
+    /// The slice's target, by name.
+    pub target: String,
+    /// The slice's rustc, by name.
+    pub rustc_version: String,
+    /// The generation the slice last applied.
+    pub generation: i64,
+    /// The generation of the full report staged for the slice, if any.
+    pub staged_generation: Option<i64>,
+}
+
 /// The parts received so far of one slice's multi-part full report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StagedSlice {
@@ -1985,16 +1997,19 @@ impl Graph {
         self.slice_generations.get(&slice).copied()
     }
 
-    /// The generation each reported slice last applied, by name.
-    pub fn slice_generations(&self) -> Vec<(String, String, i64)> {
+    /// The generation each reported slice last applied, by name, and the
+    /// generation of the full report staged for it, if any.
+    pub fn slice_generations(&self) -> Vec<HeldSlice> {
         self.slice_generations
             .iter()
-            .map(|(&(target, rustc), &generation)| {
-                (
-                    self.targets[usize::from(target)].name.to_string(),
-                    self.rustcs[usize::from(rustc)].to_string(),
-                    generation,
-                )
+            .map(|(&slice, &generation)| HeldSlice {
+                target: self.targets[usize::from(slice.0)].name.to_string(),
+                rustc_version: self.rustcs[usize::from(slice.1)].to_string(),
+                generation,
+                staged_generation: self
+                    .staged_slices
+                    .get(&slice)
+                    .map(|staged| staged.generation),
             })
             .collect()
     }
@@ -4750,13 +4765,14 @@ impl Graph {
             index_slices: self
                 .slice_generations()
                 .into_iter()
-                .map(|(target, rustc_version, generation)| {
+                .map(|held| {
                     Ok(stow_types::api::AdminIndexSlice {
-                        target: stow_types::identity::TargetTriple::parse(&target)?,
+                        target: stow_types::identity::TargetTriple::parse(&held.target)?,
                         rustc_version: stow_types::identity::WireRustcVersion::parse(
-                            &rustc_version,
+                            &held.rustc_version,
                         )?,
-                        generation,
+                        generation: held.generation,
+                        staged_generation: held.staged_generation,
                     })
                 })
                 .collect::<Result<Vec<_>, QueueError>>()?,
@@ -6152,6 +6168,14 @@ mod tests {
         part_report(&mut graph, 5, 1, 3, &["b"]).expect("part 1");
         assert_eq!(graph.staged_part_count(), 2);
         assert_eq!(graph.slice_generation(TARGET, RUSTC), Some(1));
+        let held = graph.slice_generations();
+        assert_eq!(
+            held.iter()
+                .map(|slice| (slice.generation, slice.staged_generation))
+                .collect::<Vec<_>>(),
+            [(1, Some(5))],
+            "the status names the staged report a replay must supersede"
+        );
         assert!(graph.is_published(&id("x")), "the live set stands");
         assert!(!graph.is_published(&id("c")) && !graph.is_published(&id("b")));
         assert!(!is_ready(&graph, "b"), "nothing acts on a staged report");
