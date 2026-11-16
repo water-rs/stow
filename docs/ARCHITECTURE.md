@@ -524,15 +524,20 @@ reports a `content_sha256` over everything but the timestamp, the
 manifest carries it as the `dev.stow.index.content-sha256` annotation,
 and an equal annotation skips the push (and the signature, when its
 `.sig` tag is present; a missing one is signed in place) — an unchanged slice
-never churns the tag. Pushed indexes are signed keyless under
+never churns the tag, and the export keeps such a slice's published
+header, so a pass that only adds folded marks reports no generation its
+tag does not carry. Each pushed manifest also carries
+`dev.stow.index.previous`, the digest of the manifest it replaced on the
+tag, which links a slice's published history. Pushed indexes are signed keyless under
 `index-publish.yml@refs/tags/v<MAJOR.MINOR.PATCH>`
 (`stow_types::trusted_builder::TrustedWorkflow::INDEX`), the same
 Fulcio chain the CLI verifies for artifact bundles.
 
 The scheduler holds each reported slice's generation. A delta report
 applies only on top of exactly that generation and publishes the next
-one, else the route answers 409 and `index report` resends the slice in
-full; a full report replaces the slice's set and restarts the sequence.
+one, else the route answers 409 and `index report` replays the slice
+from the generation the scheduler holds; a full report replaces the
+slice's set and restarts the sequence.
 A full report larger than the edge's 2 MiB request body (a store-reset
 reconcile, a first publish) is sent in parts: each part names its slice,
 generation, index and part count and carries a share of the membership
@@ -546,8 +551,19 @@ report, a delta is refused with a 409 while one is staged, and a part
 that does not continue its staged report (or contradicts its part count)
 is refused. `stow-admin` refuses any JSON body over the request limit
 before sending it. A run whose report failed fails, and the next run's `index reconcile`
-(which reads the generations from `GET /api/v1/admin/status`) reports
+(which reads the generations from `GET /api/v1/admin/status`) replays
 every published slice the scheduler does not hold before its own delta.
+A replay walks the `previous` links back from the live manifest to the
+one at the held generation, verifying each manifest's signature, and
+reports each later generation as the delta from its predecessor — the
+reports the scheduler missed, so recovery costs the rows that moved
+since the held generation, not the slice. A full report goes out only
+where no base exists: the scheduler holds nothing of the slice (a reset
+or a slice never reported), it holds a full report staged (status names
+its `staged_generation`), or the walk reaches a generation-1 first or
+`full` publish first, whose own report was full. A history that does
+not reach the held generation is an error naming the slice, and an
+`index-publish.yml` run with `full` republishes it.
 
 Every publish leaves superseded manifests in the package — an index
 republish untags the previous manifest, a rebuilt task's older

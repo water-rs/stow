@@ -37,7 +37,8 @@ use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
     STOW_FOLDED_CONFIG_MEDIA_TYPE, STOW_FOLDED_MEDIA_TYPE, STOW_INDEX_CONFIG_MEDIA_TYPE,
-    STOW_INDEX_MEDIA_TYPE, content_sha256, folded_tag, index_tag,
+    STOW_INDEX_CONTENT_SHA256_ANNOTATION, STOW_INDEX_MEDIA_TYPE, STOW_INDEX_PREVIOUS_ANNOTATION,
+    content_sha256, folded_tag, index_tag,
 };
 use stow_types::records::{
     BuildRun, RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_TASK_ID_ANNOTATION,
@@ -51,9 +52,6 @@ use tracing_subscriber::EnvFilter;
 mod oidc;
 
 const OCI_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
-/// Manifest annotation the index publisher compares for change detection —
-/// the same one `stow_oci::publish_index` writes on GHCR.
-const INDEX_CONTENT_SHA256_ANNOTATION: &str = "dev.stow.index.content-sha256";
 /// The certificate slot of a mock signature: `stow-cli` built with
 /// `mock-verify` verifies against the mock public key and ignores it.
 const MOCK_CERTIFICATE: &str = "mock-local";
@@ -414,6 +412,9 @@ async fn write_signed_index(
         .join("manifests")
         .join(repository.as_str())
         .join(&tag);
+    // The manifest this push replaces on the tag — the `previous` link
+    // `stow_oci::publish_index` records the same way.
+    let mut previous = None;
     if let Ok(existing) = read(&manifest_path).await {
         let published: serde_json::Value = serde_json::from_slice(&existing).map_err(|error| {
             stow_types::stow_error!(
@@ -421,15 +422,26 @@ async fn write_signed_index(
                 manifest_path.display()
             )
         })?;
+        let published_digest = published_manifest_digest(&existing)?;
         if published
-            .pointer("/annotations/dev.stow.index.content-sha256")
+            .get("annotations")
+            .and_then(|annotations| annotations.get(STOW_INDEX_CONTENT_SHA256_ANNOTATION))
             .and_then(serde_json::Value::as_str)
             == Some(content_sha256.as_str())
         {
             tracing::info!(%reference, %content_sha256, "index unchanged — skipping publish");
-            report_index_publish("unchanged", &published_manifest_digest(&existing)?);
+            report_index_publish("unchanged", &published_digest);
             return Ok(());
         }
+        previous = Some(published_digest);
+    }
+    let mut annotations = serde_json::Map::new();
+    annotations.insert(
+        STOW_INDEX_CONTENT_SHA256_ANNOTATION.to_owned(),
+        content_sha256.into(),
+    );
+    if let Some(previous) = previous {
+        annotations.insert(STOW_INDEX_PREVIOUS_ANNOTATION.to_owned(), previous.into());
     }
 
     let key_pair = load_key_pair(private_key_path).await?;
@@ -455,9 +467,7 @@ async fn write_signed_index(
             "digest": layer_digest,
             "size": index_bytes.len(),
         }],
-        "annotations": {
-            INDEX_CONTENT_SHA256_ANNOTATION: content_sha256,
-        },
+        "annotations": annotations,
     }))?;
     let manifest_digest = sha256_digest(&manifest_bytes);
     write_manifest(
@@ -3087,7 +3097,92 @@ mod tests {
         write_blob(root, &bundle_digest, bundle)
             .await
             .expect("bundle blob");
-        let index = ArtifactIndex {
+        let index = slice_pinning(bundle);
+        let index_bytes = stow_shim::encode_index(&index).expect("encode index");
+        let layer_digest = sha256_digest(&index_bytes);
+        write_blob(root, &layer_digest, &index_bytes)
+            .await
+            .expect("index blob");
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "layers": [{ "mediaType": STOW_INDEX_MEDIA_TYPE, "digest": layer_digest, "size": index_bytes.len() }],
+        }))
+        .expect("manifest json");
+        write_manifest(root, REPOSITORY, &index_tag(TARGET, RUSTC), &manifest)
+            .await
+            .expect("index manifest");
+    }
+
+    /// stow#1581: each index push links the manifest it replaces on the
+    /// tag, the replaced manifest stays pullable by that digest, and an
+    /// unchanged slice pushes nothing.
+    #[tokio::test]
+    async fn an_index_push_links_the_manifest_it_replaces() {
+        let root = tempfile::tempdir().expect("registry root");
+        let key_pair = SigStoreKeyPair::ECDSA(
+            sigstore::crypto::signing_key::ecdsa::ECDSAKeys::new(
+                sigstore::crypto::signing_key::ecdsa::EllipticCurve::P256,
+            )
+            .expect("ecdsa key pair"),
+        );
+        let private_key_path = root.path().join("private.pem");
+        write(
+            &private_key_path,
+            key_pair
+                .private_key_to_pem()
+                .expect("encode private key")
+                .as_bytes(),
+        )
+        .await
+        .expect("write private key");
+        let first = slice_pinning(b"a bundle");
+        let mut second = first.clone();
+        second.rows.clear();
+        second.header.generation = 2;
+        second.header.row_count = 0;
+        for index in [&first, &second, &second] {
+            super::write_signed_index(
+                root.path(),
+                &private_key_path,
+                index,
+                &stow_shim::encode_index(index).expect("encode index"),
+            )
+            .await
+            .expect("publish the slice");
+        }
+
+        let (listen, _probe) = serve_probe_registry(root.path()).await;
+        let session = stow_oci::RegistryBase::parse(&format!("http://{listen}"))
+            .expect("registry base")
+            .session(
+                &test_cache_repository(),
+                &stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+                    .await
+                    .expect("registry http"),
+            );
+        let live = stow_oci::pull_index(&session, TARGET, RUSTC)
+            .await
+            .expect("pull the live slice")
+            .expect("the slice is published");
+        assert_eq!(
+            ArtifactIndex::decode(&live.bytes).expect("decode").header,
+            second.header
+        );
+        let previous = live.previous.expect("the second push links the first");
+        let linked = stow_oci::pull_index_by_digest(&session, &previous)
+            .await
+            .expect("the replaced manifest stays pullable");
+        assert_eq!(
+            ArtifactIndex::decode(&linked.bytes).expect("decode").header,
+            first.header
+        );
+        assert_eq!(linked.previous, None, "the first push links nothing");
+    }
+
+    /// One index slice pinning `bundle` at generation 1.
+    fn slice_pinning(bundle: &[u8]) -> ArtifactIndex {
+        let bundle_digest = sha256_digest(bundle);
+        ArtifactIndex {
             header: ArtifactIndexHeader {
                 format_version: ARTIFACT_INDEX_FORMAT_VERSION,
                 target: TARGET.parse().expect("target"),
@@ -3127,20 +3222,7 @@ mod tests {
             }],
             build_scripts: Vec::new(),
             local_programs: Vec::new(),
-        };
-        let index_bytes = stow_shim::encode_index(&index).expect("encode index");
-        let layer_digest = sha256_digest(&index_bytes);
-        write_blob(root, &layer_digest, &index_bytes)
-            .await
-            .expect("index blob");
-        let manifest = serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 2,
-            "layers": [{ "mediaType": STOW_INDEX_MEDIA_TYPE, "digest": layer_digest, "size": index_bytes.len() }],
-        }))
-        .expect("manifest json");
-        write_manifest(root, REPOSITORY, &index_tag(TARGET, RUSTC), &manifest)
-            .await
-            .expect("index manifest");
+        }
     }
 
     /// The edge byte-path stand-in serves blobs by digest under the

@@ -28,9 +28,8 @@ pub use client::{
     OPERATOR_LOG_FILTER, RegistryError, RegistryHttp, RegistrySession, TransportPolicy,
 };
 pub use index::{
-    IndexPublishOutcome, PulledFolded, PulledIndex, publish_folded, publish_index,
-    published_index_content_sha256, pull_folded, pull_index, pull_listed_folded, pull_listed_index,
-    pull_published_index,
+    IndexPublishOutcome, PulledFolded, PulledIndex, publish_folded, publish_index, pull_folded,
+    pull_index, pull_index_by_digest, pull_listed_folded, pull_listed_index, pull_published_index,
 };
 pub use oci_client::Reference;
 pub use publisher::Publisher;

@@ -96,11 +96,13 @@ pub enum IndexCommand {
     /// publish; running it again against the same file is idempotent.
     Report(IndexReportArgs),
     /// Report every published slice of the rustc whose generation the
-    /// scheduler does not hold, each as a full report. A publish run
-    /// whose report failed, or that died between a slice's two tags,
-    /// leaves a live generation the scheduler never received and no
-    /// later export re-emits; `index-publish.yml` runs this before each
-    /// export so the next run converges on the published state.
+    /// scheduler does not hold, replayed from the generation it holds
+    /// along the slice's published history: one delta per generation it
+    /// lacks. A publish run whose report failed, or that died between a
+    /// slice's two tags, leaves a live generation the scheduler never
+    /// received and no later export re-emits; `index-publish.yml` runs
+    /// this before each export so the next run converges on the
+    /// published state.
     Reconcile(IndexReconcileArgs),
     /// Print every stable rustc with a published
     /// `ghcr.io/water-rs/stow-cache-v2-<rustc>` package, one per line: the
@@ -212,10 +214,12 @@ struct IndexPublishSummary {
 /// report sends `base_generation` plus only the rows that moved. `--full`
 /// sends the explicit full report the scheduler diffs itself; so does a
 /// first publish (`generation == 1`), the only slice with no `.prev`.
-/// A delta the edge refuses with 409 — its live generation moved past
-/// `base_generation`, or the slice was never reported — is resent once
-/// as the full report for the same file, which is the resync the
-/// conflict asks for.
+/// A file whose `.prev` is the same generation (the export found no new
+/// content) is not reported. A delta the edge refuses with 409 — the
+/// scheduler does not hold `base_generation` — is replayed once from the
+/// generation it does hold along the slice's published history, the
+/// recovery `index reconcile` runs; a full report goes out only where
+/// that history has no base for it.
 #[derive(Args)]
 pub struct IndexReportArgs {
     /// The encoded index files (`index export --out-dir` wrote them) —
@@ -224,8 +228,8 @@ pub struct IndexReportArgs {
     #[arg(long, required = true)]
     file: Vec<std::path::PathBuf>,
     /// Send the explicit full report (`base_generation` unset) — the
-    /// resync path for a slice whose optimistic-lock check failed, and
-    /// the automatic shape of a first publish.
+    /// report of a `full` export, and the automatic shape of a first
+    /// publish.
     #[arg(long)]
     full: bool,
 }
@@ -249,9 +253,8 @@ struct IndexReportSummary {
     added: usize,
     /// Rows the report retired — `0` on a full report.
     retired: usize,
-    /// `true` when the report took the explicit full path (`--full`,
-    /// first publishes with no `.prev` sidecar, or the resync a 409'd
-    /// delta triggers).
+    /// `true` when every report sent took the explicit full path
+    /// (`--full`, or first publishes with no `.prev` sidecar).
     full: bool,
 }
 
@@ -263,7 +266,13 @@ pub async fn run(
     match args.command {
         IndexCommand::Export(args) => index_export(args).await,
         IndexCommand::Publish(args) => index_publish(args).await,
-        IndexCommand::Report(args) => index_report(&Edge::connect(store)?, args).await,
+        IndexCommand::Report(args) => {
+            let connect = |rustc_version: WireRustcVersion| {
+                Box::pin(async move { PullContext::connect(&rustc_version).await })
+                    as PullFut<'static, PullContext>
+            };
+            index_report(&Edge::connect(store)?, args, &connect).await
+        }
         IndexCommand::Reconcile(args) => index_reconcile(&Edge::connect(store)?, args).await,
         IndexCommand::PublishedRustcs => published_rustcs().await,
         IndexCommand::Targets => {
@@ -415,32 +424,135 @@ impl PullContext {
         )))
     }
 
-    /// Pull and verify the published `index.<target>.<rustc>` slice;
-    /// `None` when the tag does not exist.
-    async fn live_index(
+    /// The anonymous registry session, repository and trust the reads
+    /// of `rustc_version`'s cache package share.
+    async fn connect(rustc_version: &WireRustcVersion) -> stow_types::error::Result<Self> {
+        let base = registry_base()?;
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
+        let repository = cache_repository(rustc_version);
+        let session = base.session(&repository, &http);
+        let trust = stow_oci::verify::records_trust().await?;
+        Ok(Self {
+            session,
+            repository,
+            trust,
+        })
+    }
+
+    /// Verify a pulled index manifest under the index workflow and decode
+    /// it as `index.<target>.<rustc>`.
+    async fn verified_manifest(
         &self,
         target: &TargetTriple,
         rustc_version: &WireRustcVersion,
-    ) -> stow_types::error::Result<Option<ArtifactIndex>> {
-        let Some(pulled_index) =
+        pulled: stow_oci::PulledIndex,
+        presence: Presence,
+    ) -> stow_types::error::Result<SliceManifest> {
+        let itag = index_tag(target.as_str(), rustc_version.as_str());
+        let index_reference = self.session.reference(&itag)?;
+        let identity_reference = self.repository.reference(&itag);
+        match presence {
+            Presence::Unknown => {
+                verify_artifact(
+                    &self.session,
+                    &self.trust,
+                    &index_reference,
+                    &identity_reference,
+                    &pulled.manifest_digest,
+                    TrustedWorkflow::INDEX,
+                )
+                .await?;
+            }
+            Presence::Listed => {
+                verify_listed_artifact(
+                    &self.session,
+                    &self.trust,
+                    &index_reference,
+                    &identity_reference,
+                    &pulled.manifest_digest,
+                    TrustedWorkflow::INDEX,
+                )
+                .await?;
+            }
+        }
+        Ok(SliceManifest {
+            index: decode_slice_of(&index_reference, target, rustc_version, &pulled.bytes)?,
+            previous: pulled.previous,
+        })
+    }
+}
+
+/// How a read knows its manifest exists: [`Presence::Listed`] when a
+/// signed manifest names it, so a `404` on its signature is a stale read
+/// retried before it answers.
+#[derive(Clone, Copy)]
+enum Presence {
+    Unknown,
+    Listed,
+}
+
+/// One published manifest of a slice: its verified index, and the
+/// manifest it replaced on the slice's tag (`None` on a first push).
+struct SliceManifest {
+    index: ArtifactIndex,
+    previous: Option<String>,
+}
+
+/// A slice's published history: its live manifest, and each earlier
+/// manifest by the digest a later one links. Every manifest it answers
+/// is signature-verified under the index workflow and decoded as the
+/// slice it was asked for.
+trait SliceHistory: Send + Sync {
+    /// The manifest `index.<target>.<rustc>` resolves to; `None` when
+    /// the tag does not exist.
+    fn live(
+        &self,
+        target: &TargetTriple,
+        rustc_version: &WireRustcVersion,
+    ) -> impl Future<Output = stow_types::error::Result<Option<SliceManifest>>> + Send;
+
+    /// The manifest of the slice a later one links as its `previous`.
+    fn linked(
+        &self,
+        target: &TargetTriple,
+        rustc_version: &WireRustcVersion,
+        manifest_digest: &str,
+    ) -> impl Future<Output = stow_types::error::Result<SliceManifest>> + Send;
+}
+
+/// Opens the [`SliceHistory`] of one rustc's cache package — a refused
+/// delta's replay connects to the registry only when it runs.
+type ConnectHistory<'a, H> = &'a (dyn Fn(WireRustcVersion) -> PullFut<'static, H> + Sync);
+
+impl SliceHistory for PullContext {
+    async fn live(
+        &self,
+        target: &TargetTriple,
+        rustc_version: &WireRustcVersion,
+    ) -> stow_types::error::Result<Option<SliceManifest>> {
+        let Some(pulled) =
             stow_oci::pull_index(&self.session, target.as_str(), rustc_version.as_str()).await?
         else {
             return Ok(None);
         };
-        let itag = index_tag(target.as_str(), rustc_version.as_str());
-        let index_reference = self.session.reference(&itag)?;
-        verify_artifact(
-            &self.session,
-            &self.trust,
-            &index_reference,
-            &self.repository.reference(&itag),
-            &pulled_index.manifest_digest,
-            TrustedWorkflow::INDEX,
-        )
-        .await?;
-        decode_slice_of(&index_reference, target, rustc_version, &pulled_index.bytes).map(Some)
+        self.verified_manifest(target, rustc_version, pulled, Presence::Unknown)
+            .await
+            .map(Some)
     }
 
+    async fn linked(
+        &self,
+        target: &TargetTriple,
+        rustc_version: &WireRustcVersion,
+        manifest_digest: &str,
+    ) -> stow_types::error::Result<SliceManifest> {
+        let pulled = stow_oci::pull_index_by_digest(&self.session, manifest_digest).await?;
+        self.verified_manifest(target, rustc_version, pulled, Presence::Listed)
+            .await
+    }
+}
+
+impl PullContext {
     /// Pull and verify one records artifact — a signature that fails the
     /// pinned identity is fatal: the alternative, silently dropping it,
     /// would export a slice that quietly misses crates.
@@ -853,21 +965,31 @@ fn merge_exports(
                 .as_ref()
                 .map_or(1, |slice| slice.index.header.generation + 1);
             let row_count = u64::try_from(rows.len())
-                .map_err(|_| stow_error!("row count {} exceeds u64", rows.len()));
-            row_count.map(|row_count| SliceExport {
-                index: ArtifactIndex {
-                    header: ArtifactIndexHeader {
-                        format_version: ARTIFACT_INDEX_FORMAT_VERSION,
-                        target: target.clone(),
-                        rustc_version: rustc_version.clone(),
-                        generated_at: now.clone(),
-                        generation,
-                        row_count,
-                    },
-                    rows,
-                    build_scripts,
-                    local_programs: programs,
+                .map_err(|_| stow_error!("row count {} exceeds u64", rows.len()))?;
+            let mut index = ArtifactIndex {
+                header: ArtifactIndexHeader {
+                    format_version: ARTIFACT_INDEX_FORMAT_VERSION,
+                    target: target.clone(),
+                    rustc_version: rustc_version.clone(),
+                    generated_at: now.clone(),
+                    generation,
+                    row_count,
                 },
+                rows,
+                build_scripts,
+                local_programs: programs,
+            };
+            // A slice whose new records added only folded marks keeps the
+            // published content, which the publish leaves on the tag: it
+            // keeps the published header too, so no generation is reported
+            // that no manifest carries.
+            if let Some(slice) = &prev_slice
+                && content_sha256(&index)? == content_sha256(&slice.index)?
+            {
+                index.header = slice.index.header.clone();
+            }
+            Ok(SliceExport {
+                index,
                 folded,
                 prev: prev_slice.map(|slice| slice.index),
                 target,
@@ -1257,16 +1379,27 @@ async fn post_report(
 /// measured glibc floor exceeds the builder baseline publishes in the
 /// index but a baseline host cannot load it, so it releases no
 /// dependent — the same rule the catalog's coverage oracle applies.
-async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::Result<()> {
+async fn index_report<H: SliceHistory>(
+    edge: &Edge,
+    args: IndexReportArgs,
+    connect: ConnectHistory<'_, H>,
+) -> stow_types::error::Result<()> {
     let mut slices = Vec::with_capacity(args.file.len());
     for file in &args.file {
-        slices.push(slice_report_for(file, args.full).await?);
+        slices.extend(slice_report_for(file, args.full).await?);
     }
-    match post_report_unchecked(edge, &slices).await? {
+    let outcome = if slices.is_empty() {
+        Ok(())
+    } else {
+        post_report_unchecked(edge, &slices).await?
+    };
+    match outcome {
         Ok(()) => {}
-        // A refused delta resyncs once with every slice sent as the
-        // explicit full shape - the resync a per-slice 409 asked for;
-        // a refused full report is an error.
+        // A refused delta means the scheduler does not hold the
+        // generation the run's export extended: each slice is replayed
+        // from the generation it does hold along the slice's published
+        // history, as `index reconcile` replays it. A refused full
+        // report is an error.
         Err(zenwave::Error::Http {
             status, message, ..
         }) if status == zenwave::StatusCode::CONFLICT
@@ -1274,15 +1407,14 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
         {
             tracing::warn!(
                 answer = %message,
-                "slice report refused - resyncing with a full report"
+                "slice report refused - replaying each slice from the generation the scheduler holds"
             );
-            slices.clear();
-            for file in &args.file {
-                slices.push(slice_report_for(file, true).await?);
+            slices = recover_reported(edge, &slices, connect).await?;
+            if !slices.is_empty() {
+                post_report(edge, &slices)
+                    .await
+                    .map_err(|error| error.wrap_err("replayed slice report"))?;
             }
-            post_report(edge, &slices)
-                .await
-                .map_err(|error| error.wrap_err("full slice report"))?;
         }
         Err(error) => {
             return Err(stow_error!("POST {}{REPORT_PATH}: {error}", edge.base()));
@@ -1292,7 +1424,7 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
         slices: slices.len(),
         added: slices.iter().map(|slice| slice.added.len()).sum(),
         retired: slices.iter().map(|slice| slice.retired.len()).sum(),
-        full: slices.iter().all(|slice| slice.base_generation.is_none()),
+        full: !slices.is_empty() && slices.iter().all(|slice| slice.base_generation.is_none()),
     };
     tracing::info!(
         slices = summary.slices,
@@ -1310,27 +1442,52 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
 /// One file's [`stow_types::api::PublishedSlice`]: the header's
 /// `(target, rustc_version)` pair and, per `full`, the whole servable
 /// membership or the delta against the `.prev` sidecar `index export`
-/// captured while the tag still named the previous index.
+/// captured while the tag still named the previous index. `None` when
+/// the file is its `.prev` at the same generation — an export whose
+/// slice gained only folded marks keeps the published content and
+/// generation, so the publish leaves the tag in place and the scheduler
+/// already holds it.
 async fn slice_report_for(
     file: &std::path::Path,
     full: bool,
-) -> stow_types::error::Result<stow_types::api::PublishedSlice> {
+) -> stow_types::error::Result<Option<stow_types::api::PublishedSlice>> {
     let bytes = tokio::fs::read(file)
         .await
         .map_err(|error| stow_error!("read index file {}: {error}", file.display()))?;
     let index = ArtifactIndex::decode(&bytes)
         .map_err(|error| stow_error!("decode index file {}: {error}", file.display()))?;
-    let rows = semantic_rows(&index)?;
     if full {
-        return Ok(full_slice(index, rows));
+        return full_slice(&index).map(Some);
     }
 
     // The delta base is the `.prev` sidecar — resolved exactly, never
     // silently: a first publish takes the explicit full path.
     let Some(prev) = read_prev_sidecar(file, index.header.generation).await? else {
-        return Ok(full_slice(index, rows));
+        return full_slice(&index).map(Some);
     };
-    let prev_rows = semantic_rows(&prev)?;
+    if prev.header.generation == index.header.generation {
+        let (content, base) = (content_sha256(&index)?, content_sha256(&prev)?);
+        if content != base {
+            return Err(stow_error!(
+                "index file {} and its previous-index sidecar share generation {} but not \
+                 their content",
+                file.display(),
+                index.header.generation
+            ));
+        }
+        return Ok(None);
+    }
+    delta_slice(&prev, &index).map(Some)
+}
+
+/// The report that carries a slice from `prev` to `index`, the next
+/// generation published on its tag: the rows that moved between them.
+fn delta_slice(
+    prev: &ArtifactIndex,
+    index: &ArtifactIndex,
+) -> stow_types::error::Result<stow_types::api::PublishedSlice> {
+    let rows = semantic_rows(index)?;
+    let prev_rows = semantic_rows(prev)?;
     let current: std::collections::BTreeSet<_> = rows.iter().map(row_key).collect();
     let previous: std::collections::BTreeSet<_> = prev_rows.iter().map(row_key).collect();
     let added: Vec<PublishedSliceRow> = rows
@@ -1356,20 +1513,25 @@ async fn slice_report_for(
     // outgrows a part (a long gap between publishes) is reported as the
     // slice's full membership, which does.
     if stow_types::api::json_len(&delta)? > stow_types::api::SLICE_REPORT_PART_BYTES {
-        return Ok(full_slice(index, rows));
+        return Ok(full_slice_of(index, rows));
     }
     Ok(delta)
 }
 
 /// The explicit full report of a slice: its whole servable membership,
 /// which the scheduler takes as the slice's set.
-fn full_slice(
-    index: ArtifactIndex,
+fn full_slice(index: &ArtifactIndex) -> stow_types::error::Result<stow_types::api::PublishedSlice> {
+    Ok(full_slice_of(index, semantic_rows(index)?))
+}
+
+/// [`full_slice`] over `index`'s already computed servable rows.
+fn full_slice_of(
+    index: &ArtifactIndex,
     rows: Vec<PublishedSliceRow>,
 ) -> stow_types::api::PublishedSlice {
     stow_types::api::PublishedSlice {
-        target: index.header.target,
-        rustc_version: index.header.rustc_version,
+        target: index.header.target.clone(),
+        rustc_version: index.header.rustc_version.clone(),
         base_generation: None,
         generation: index.header.generation,
         part: 0,
@@ -1379,14 +1541,170 @@ fn full_slice(
     }
 }
 
+/// What the scheduler holds of one slice, from `GET /api/v1/admin/status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeldSlice {
+    /// The generation it last applied.
+    generation: i64,
+    /// The generation of a multi-part full report it holds staged.
+    staged: Option<i64>,
+}
+
+/// The scheduler's held state of every slice it was reported.
+async fn held_slices(
+    edge: &Edge,
+) -> stow_types::error::Result<BTreeMap<(TargetTriple, WireRustcVersion), HeldSlice>> {
+    let status: stow_types::api::AdminStatus = edge.get_json("/api/v1/admin/status").await?;
+    Ok(status
+        .index_slices
+        .into_iter()
+        .map(|slice| {
+            (
+                (slice.target, slice.rustc_version),
+                HeldSlice {
+                    generation: slice.generation,
+                    staged: slice.staged_generation,
+                },
+            )
+        })
+        .collect())
+}
+
+/// The reports that carry the scheduler from what it holds of a slice to
+/// `live`, the slice's published state, oldest first.
+///
+/// The scheduler applies a delta only on exactly the generation it
+/// holds, so a report it never received is replayed: the walk follows
+/// `live`'s `previous` links back to the manifest at the held
+/// generation, and each later manifest is reported as the delta from
+/// its predecessor — the report its own publish run sent or lost. The
+/// cost is the rows that moved since the held generation, never the
+/// slice's size. A full report is sent only where no base exists: the
+/// scheduler holds nothing of the slice (a reset, or a slice it was
+/// never reported), it holds a full report staged (which refuses every
+/// delta until a full one lands), or the walk reaches a generation-1
+/// manifest — a first or `full` publish, whose own report was full —
+/// before the held generation, and the replay starts from its full
+/// report.
+///
+/// # Errors
+/// When a manifest above the held generation links no predecessor, or
+/// a link's generation is not the one below it: the history does not
+/// hold the scheduler's base, and the slice is republished by an
+/// `index-publish.yml` run with `full`.
+async fn recovery_reports(
+    history: &impl SliceHistory,
+    live: SliceManifest,
+    held: Option<HeldSlice>,
+) -> stow_types::error::Result<Vec<stow_types::api::PublishedSlice>> {
+    let live_generation = live.index.header.generation;
+    let held = match held {
+        Some(held) if held.staged.is_none() && held.generation == live_generation => {
+            return Ok(Vec::new());
+        }
+        Some(held) if held.staged.is_none() => held.generation,
+        _ => return full_slice(&live.index).map(|full| vec![full]),
+    };
+    let target = live.index.header.target.clone();
+    let rustc_version = live.index.header.rustc_version.clone();
+    // Newest first: `live`, then each manifest it links, down to the base.
+    let mut walked = vec![live];
+    let base = loop {
+        let oldest = walked.last().expect("the walk starts at the live manifest");
+        let generation = oldest.index.header.generation;
+        if generation == held {
+            break walked.pop().map(|base| base.index);
+        }
+        if generation == 1 {
+            break None;
+        }
+        let Some(previous) = oldest.previous.clone() else {
+            return Err(stow_error!(
+                "{target}/{rustc_version}: the scheduler holds generation {held}, and the \
+                 published history from the live generation {live_generation} ends at \
+                 generation {generation}, which links no earlier manifest — republish the \
+                 slice with an index-publish.yml run with `full`"
+            ));
+        };
+        let linked = history.linked(&target, &rustc_version, &previous).await?;
+        if linked.index.header.generation != generation - 1 {
+            return Err(stow_error!(
+                "{target}/{rustc_version}: generation {generation} links {previous} at \
+                 generation {}, not {}",
+                linked.index.header.generation,
+                generation - 1
+            ));
+        }
+        walked.push(linked);
+    };
+    let mut steps = walked.into_iter().rev().map(|manifest| manifest.index);
+    let mut reports = Vec::new();
+    let mut prev = if let Some(base) = base {
+        base
+    } else {
+        let first = steps.next().expect("the walk holds the live manifest");
+        reports.push(full_slice(&first)?);
+        first
+    };
+    for index in steps {
+        reports.push(delta_slice(&prev, &index)?);
+        prev = index;
+    }
+    Ok(reports)
+}
+
+/// After a refused delta: every reported slice replayed from the
+/// generation the scheduler holds to its live manifest, which must be
+/// the generation the run reported — the run published it.
+async fn recover_reported<H: SliceHistory>(
+    edge: &Edge,
+    slices: &[stow_types::api::PublishedSlice],
+    connect: ConnectHistory<'_, H>,
+) -> stow_types::error::Result<Vec<stow_types::api::PublishedSlice>> {
+    let held = held_slices(edge).await?;
+    let mut histories: BTreeMap<WireRustcVersion, H> = BTreeMap::new();
+    let mut reports = Vec::new();
+    for slice in slices {
+        if !histories.contains_key(&slice.rustc_version) {
+            histories.insert(
+                slice.rustc_version.clone(),
+                connect(slice.rustc_version.clone()).await?,
+            );
+        }
+        let history = &histories[&slice.rustc_version];
+        let live = history
+            .live(&slice.target, &slice.rustc_version)
+            .await?
+            .ok_or_else(|| {
+                stow_error!(
+                    "{}/{}: the reported slice has no published index",
+                    slice.target,
+                    slice.rustc_version
+                )
+            })?;
+        if live.index.header.generation != slice.generation {
+            return Err(stow_error!(
+                "{}/{}: the live index is generation {}, not the reported {}",
+                slice.target,
+                slice.rustc_version,
+                live.index.header.generation,
+                slice.generation
+            ));
+        }
+        let key = (slice.target.clone(), slice.rustc_version.clone());
+        reports.extend(recovery_reports(history, live, held.get(&key).copied()).await?);
+    }
+    Ok(reports)
+}
+
 /// The verified `index.<target>.<rustc>` slices that exist for `rustc_version`,
 /// in `CI_TARGET_TRIPLES` order. The slice tags follow from the supported
 /// targets and the rustc, so no tag listing is needed; a target whose slice
 /// was never published is skipped.
 async fn published_slices(
-    ctx: &PullContext,
+    history: &impl SliceHistory,
     rustc_version: &WireRustcVersion,
-) -> stow_types::error::Result<Vec<ArtifactIndex>> {
+) -> stow_types::error::Result<Vec<SliceManifest>> {
     let targets = CI_TARGET_TRIPLES
         .iter()
         .map(|target| {
@@ -1397,7 +1715,7 @@ async fn published_slices(
     let live = futures_util::stream::iter(
         targets
             .iter()
-            .map(|target| ctx.live_index(target, rustc_version)),
+            .map(|target| history.live(target, rustc_version)),
     )
     .buffered(PREV_PULL_CONCURRENCY)
     .try_collect::<Vec<_>>()
@@ -1406,45 +1724,63 @@ async fn published_slices(
 }
 
 /// `stow-admin index reconcile`: the published slices of one rustc the
-/// scheduler does not hold at their live generation, reported in full.
-/// Every slice read is signature-verified against the index workflow's
-/// identity, exactly as the export reads them.
+/// scheduler does not hold at their live generation, each replayed from
+/// the generation it holds ([`recovery_reports`]). Every manifest read
+/// is signature-verified against the index workflow's identity, exactly
+/// as the export reads them.
 async fn index_reconcile(edge: &Edge, args: IndexReconcileArgs) -> stow_types::error::Result<()> {
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("--rustc-version: {error}"))?;
-    let base = registry_base()?;
-    let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
-    let repository = cache_repository(&rustc_version);
-    let session = base.session(&repository, &http);
-    let trust = stow_oci::verify::records_trust().await?;
-    let ctx = PullContext {
-        session,
-        repository,
-        trust,
+    let history = PullContext::connect(&rustc_version).await?;
+    let held = held_slices(edge).await?;
+    let published = published_slices(&history, &rustc_version).await?;
+    let summary = reconcile(edge, &history, published, &held).await?;
+    let line = serde_json::to_string(&summary)
+        .map_err(|error| stow_error!("serialize index reconcile summary: {error}"))?;
+    render::emit_line(&line);
+    Ok(())
+}
+
+/// Replay every `live` slice the scheduler does not hold as published
+/// and post the reports, in order.
+async fn reconcile(
+    edge: &Edge,
+    history: &impl SliceHistory,
+    live: Vec<SliceManifest>,
+    held: &BTreeMap<(TargetTriple, WireRustcVersion), HeldSlice>,
+) -> stow_types::error::Result<IndexReconcileSummary> {
+    let replays = futures_util::stream::iter(live.into_iter().map(|manifest| {
+        let key = (
+            manifest.index.header.target.clone(),
+            manifest.index.header.rustc_version.clone(),
+        );
+        recovery_reports(history, manifest, held.get(&key).copied())
+    }))
+    .buffered(PREV_PULL_CONCURRENCY)
+    .try_collect::<Vec<_>>()
+    .await?;
+    let summary = IndexReconcileSummary {
+        reported: replays.iter().filter(|reports| !reports.is_empty()).count(),
+        reports: replays.iter().map(Vec::len).sum(),
+        full: replays
+            .iter()
+            .flatten()
+            .filter(|report| report.base_generation.is_none())
+            .count(),
     };
-    let status: stow_types::api::AdminStatus = edge.get_json("/api/v1/admin/status").await?;
-    let reported: BTreeMap<(TargetTriple, WireRustcVersion), i64> = status
-        .index_slices
-        .into_iter()
-        .map(|slice| ((slice.target, slice.rustc_version), slice.generation))
-        .collect();
-    let indexes = published_slices(&ctx, &rustc_version).await?;
-    let report = unreported_slices(indexes, &reported)?;
+    let reports: Vec<_> = replays.into_iter().flatten().collect();
     tracing::info!(
-        slices = report.slices.len(),
-        "published slices the scheduler does not hold at their live generation"
+        slices = summary.reported,
+        reports = summary.reports,
+        full = summary.full,
+        "replayed the published slices the scheduler does not hold at their live generation"
     );
-    if !report.slices.is_empty() {
-        post_report(edge, &report.slices)
+    if !reports.is_empty() {
+        post_report(edge, &reports)
             .await
             .map_err(|error| error.wrap_err("reconcile slice report"))?;
     }
-    let line = serde_json::to_string(&IndexReconcileSummary {
-        reported: report.slices.len(),
-    })
-    .map_err(|error| stow_error!("serialize index reconcile summary: {error}"))?;
-    render::emit_line(&line);
-    Ok(())
+    Ok(summary)
 }
 
 /// Cache packages probed in flight — anonymous tag listings against the
@@ -1498,31 +1834,18 @@ async fn probe_published(
     Ok(published)
 }
 
-/// The full report of every published slice the scheduler does not hold
-/// at the slice's live generation.
-fn unreported_slices(
-    indexes: Vec<ArtifactIndex>,
-    reported: &BTreeMap<(TargetTriple, WireRustcVersion), i64>,
-) -> stow_types::error::Result<stow_types::api::PublishedRunReport> {
-    let mut slices = Vec::new();
-    for index in indexes {
-        let key = (
-            index.header.target.clone(),
-            index.header.rustc_version.clone(),
-        );
-        if reported.get(&key) != Some(&index.header.generation) {
-            let rows = semantic_rows(&index)?;
-            slices.push(full_slice(index, rows));
-        }
-    }
-    Ok(stow_types::api::PublishedRunReport { slices })
-}
-
 /// The JSON line `index reconcile` prints on stdout.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 struct IndexReconcileSummary {
-    /// Slices the reconcile report carried.
+    /// Slices the reconcile replayed.
     reported: usize,
+    /// Reports the replay posted — one per generation the scheduler
+    /// lacked, from the first with no base.
+    reports: usize,
+    /// Of those, the full reports: a slice the scheduler holds nothing
+    /// or a staged full report of, or a first or `full` publish the
+    /// replay passed.
+    full: usize,
 }
 
 /// The registry base the anonymous bundle pulls go through —
@@ -1718,7 +2041,12 @@ async fn index_join(args: IndexJoinArgs) -> stow_types::error::Result<()> {
             repository,
             trust: trust.clone(),
         };
-        slices.extend(published_slices(&ctx, &rustc_version).await?);
+        slices.extend(
+            published_slices(&ctx, &rustc_version)
+                .await?
+                .into_iter()
+                .map(|manifest| manifest.index),
+        );
     }
 
     for entry in join_leaderboard(digests, &slices) {
@@ -2735,7 +3063,10 @@ mod tests {
                 stow_shim::encode_index(&prev_index(vec![dev.clone()], 2)).expect("encode prev"),
             )
             .expect("write previous index");
-            let report = slice_report_for(&file, false).await.expect("delta report");
+            let report = slice_report_for(&file, false)
+                .await
+                .expect("delta report")
+                .expect("the slice moved");
             assert_eq!(report.base_generation, Some(2));
             assert_eq!(report.added.len(), 1);
             assert_eq!(report.added[0].node_profile, NodeProfile::Release);
@@ -2876,18 +3207,117 @@ mod tests {
         slices[0].clone()
     }
 
-    /// stow#780: a delta report refused with the scheduler's 409 —
-    /// the edge's live generation moved past `base_generation` —
-    /// resyncs once as the full report for the same file: no
-    /// `base_generation`, the slice's whole membership, and no
-    /// `retired`.
+    /// A slice's published history held in memory: each manifest under
+    /// a digest naming its generation, linked to the one below it.
+    struct FakeHistory {
+        live: Option<String>,
+        manifests: BTreeMap<String, (ArtifactIndex, Option<String>)>,
+    }
+
+    impl FakeHistory {
+        /// `indexes`, oldest first, each linked to the one before it;
+        /// the last is live.
+        fn chain(indexes: Vec<ArtifactIndex>) -> Self {
+            let mut manifests = BTreeMap::new();
+            let mut previous: Option<String> = None;
+            for index in indexes {
+                let digest = format!("sha256:{:064}", manifests.len());
+                manifests.insert(digest.clone(), (index, previous.replace(digest)));
+            }
+            Self {
+                live: previous,
+                manifests,
+            }
+        }
+
+        fn manifest(&self, digest: &str) -> SliceManifest {
+            let (index, previous) = self.manifests[digest].clone();
+            SliceManifest { index, previous }
+        }
+
+        fn live_manifest(&self) -> SliceManifest {
+            self.manifest(self.live.as_deref().expect("a live manifest"))
+        }
+    }
+
+    impl SliceHistory for FakeHistory {
+        fn live(
+            &self,
+            _target: &TargetTriple,
+            _rustc_version: &WireRustcVersion,
+        ) -> impl Future<Output = stow_types::error::Result<Option<SliceManifest>>> + Send {
+            std::future::ready(Ok(self.live.as_deref().map(|digest| self.manifest(digest))))
+        }
+
+        fn linked(
+            &self,
+            _target: &TargetTriple,
+            _rustc_version: &WireRustcVersion,
+            manifest_digest: &str,
+        ) -> impl Future<Output = stow_types::error::Result<SliceManifest>> + Send {
+            std::future::ready(Ok(self.manifest(manifest_digest)))
+        }
+    }
+
+    /// The registry connection a report that never needs a replay is
+    /// handed: reaching it fails the test.
+    fn no_history(_rustc: WireRustcVersion) -> PullFut<'static, FakeHistory> {
+        panic!("the report needed no replay")
+    }
+
+    /// The registry connection a replaying report is handed: the
+    /// fixture slice's history from generation 1 to the file's 3.
+    fn history_to_generation_3(_rustc: WireRustcVersion) -> PullFut<'static, FakeHistory> {
+        Box::pin(async {
+            Ok(FakeHistory::chain(vec![
+                prev_index(Vec::new(), 1),
+                prev_index(vec![row("dep-left")], 2),
+                prev_index(vec![row("dep-left"), row("dep-right")], 3),
+            ]))
+        })
+    }
+
+    fn row(dep: &str) -> ArtifactIndexRow {
+        record_to_index_row(&shared_unit_record(&[dep]))
+    }
+
+    const fn held(generation: i64) -> HeldSlice {
+        HeldSlice {
+            generation,
+            staged: None,
+        }
+    }
+
+    /// `GET /api/v1/admin/status` holding the fixture slice at
+    /// generation 1.
+    const STATUS_AT_GENERATION_1: &str = r#"{"pending_miss":0,"pending_human":0,"ready":0,
+        "in_flight":[],"targets":[],"dispatch_frozen":false,
+        "index_slices":[{"target":"x86_64-unknown-linux-gnu","rustc_version":"1.88.0",
+            "generation":1,"staged_generation":null}],
+        "memory":{"resident_bytes":0,"normal_line_bytes":0,"small_line_bytes":0,
+            "wasm_linear_bytes":null,"backlog_entries":0,"backlog_bytes":0}}"#;
+
+    /// stow#1581: a delta report refused with the scheduler's 409 — it
+    /// holds generation 1, not the base 2 the export extended — replays
+    /// the slice from generation 1 along its published history: one
+    /// delta per generation it lacks, never the slice's full membership.
     #[tokio::test]
-    async fn a_conflicted_delta_resyncs_with_the_full_report() {
+    async fn a_conflicted_delta_replays_from_the_held_generation() {
         let server = crate::test_server::Loopback::start(vec![
             crate::test_server::Step::Respond {
                 status: 409,
                 retry_after: None,
                 body: r#"{"error":"slice report base generation 2 conflicts with the live generation 1"}"#,
+            },
+            crate::test_server::Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: STATUS_AT_GENERATION_1,
+            },
+            crate::test_server::Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: r#"{"ok":true}"#,
             },
             crate::test_server::Step::Respond {
                 status: 200,
@@ -2903,26 +3333,19 @@ mod tests {
                 file: vec![file],
                 full: false,
             },
+            &history_to_generation_3,
         )
         .await
-        .expect("the resynced report succeeds");
+        .expect("the replayed report succeeds");
         let requests = server.join().await;
-        assert_eq!(requests.len(), 2, "the delta, then exactly one full report");
-        let delta = posted_report(&requests[0]);
-        assert_eq!(delta["base_generation"], 2);
-        assert_eq!(
-            delta["added"].as_array().expect("added rows").len(),
-            1,
-            "the delta carries only the moved row"
-        );
-        let full = posted_report(&requests[1]);
-        assert!(full.get("base_generation").is_none());
-        assert_eq!(full["generation"], 3);
-        assert_eq!(full["added"].as_array().expect("added rows").len(), 2);
-        assert!(
-            full.get("retired").is_none(),
-            "a full report carries no retired rows"
-        );
+        assert_eq!(requests.len(), 4, "the delta, the status, then two replays");
+        assert_eq!(requests[1].head.uri.path(), "/api/v1/admin/status");
+        for (request, base) in requests[2..].iter().zip([1, 2]) {
+            let replay = posted_report(request);
+            assert_eq!(replay["base_generation"], base);
+            assert_eq!(replay["generation"], base + 1);
+            assert_eq!(replay["added"].as_array().expect("added rows").len(), 1);
+        }
     }
 
     /// A full report over the edge's request limit posts as consecutive
@@ -2947,6 +3370,7 @@ mod tests {
                 file: vec![file],
                 full: true,
             },
+            &no_history,
         )
         .await
         .expect("the parts post");
@@ -2990,15 +3414,20 @@ mod tests {
         assert!(server.join().await.is_empty(), "nothing was sent");
     }
 
-    /// A full report refused the same way stays an error — the resync
-    /// itself failed, and no third request goes out.
+    /// A replay refused the same way stays an error — the recovery
+    /// itself failed, and no further request goes out.
     #[tokio::test]
-    async fn a_conflicted_full_report_is_an_error() {
+    async fn a_conflicted_replay_is_an_error() {
         let server = crate::test_server::Loopback::start(vec![
             crate::test_server::Step::Respond {
                 status: 409,
                 retry_after: None,
                 body: r#"{"error":"slice report base generation 2 conflicts with the live generation 1"}"#,
+            },
+            crate::test_server::Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: STATUS_AT_GENERATION_1,
             },
             crate::test_server::Step::Respond {
                 status: 409,
@@ -3014,11 +3443,43 @@ mod tests {
                 file: vec![file],
                 full: false,
             },
+            &history_to_generation_3,
         )
         .await
-        .expect_err("a refused resync is an error");
+        .expect_err("a refused replay is an error");
         let requests = server.join().await;
-        assert_eq!(requests.len(), 2, "the delta plus exactly one resync");
+        assert_eq!(requests.len(), 3, "the delta, the status, one replay");
+    }
+
+    /// An export whose slice gained only folded marks keeps the
+    /// published header, and its report sends nothing for the slice:
+    /// the publish leaves the tag in place, and the scheduler holds it.
+    #[tokio::test]
+    async fn an_unchanged_slice_reports_nothing() {
+        let dir = tempfile::tempdir().expect("report dir");
+        let file = dir.path().join(index_tag(TARGET, RUSTC));
+        let index =
+            stow_shim::encode_index(&prev_index(vec![row("dep-left")], 2)).expect("encode index");
+        std::fs::write(&file, &index).expect("write index file");
+        std::fs::write(prev_path(&file), &index).expect("write prev sidecar");
+        assert!(
+            slice_report_for(&file, false)
+                .await
+                .expect("the report reads")
+                .is_none()
+        );
+        let server = crate::test_server::Loopback::start(Vec::new()).await;
+        index_report(
+            &Edge::for_test(server.url.clone()),
+            IndexReportArgs {
+                file: vec![file],
+                full: false,
+            },
+            &no_history,
+        )
+        .await
+        .expect("nothing to report");
+        assert!(server.join().await.is_empty(), "nothing was posted");
     }
 
     /// A delta refused with anything but the generation conflict —
@@ -3038,6 +3499,7 @@ mod tests {
                 file: vec![file],
                 full: false,
             },
+            &no_history,
         )
         .await
         .expect_err("a non-conflict refusal is an error");
@@ -3079,39 +3541,153 @@ mod tests {
         assert_eq!(slice.folded.len(), 2, "the next publish writes the pair");
     }
 
-    /// stow#1049: a report that failed after its slices went live is
-    /// retried by the next run — every published slice the scheduler
-    /// does not hold at its live generation is reported in full, and a
-    /// slice it holds is left alone.
+    /// A pass that folds only records the slice already serves adds
+    /// folded marks and no content: the slice keeps its published
+    /// header, so the generation it reports is the one its tag carries.
     #[test]
-    fn the_reconcile_reports_only_what_the_scheduler_lacks() {
-        let index = prev_index(vec![record_to_index_row(&record("aaaa1111"))], 3);
-        let key = (
-            index.header.target.clone(),
-            index.header.rustc_version.clone(),
-        );
-        let none = BTreeMap::new();
-        let report = unreported_slices(vec![index.clone()], &none).expect("a never-reported slice");
-        assert_eq!(report.slices.len(), 1);
-        let slice = &report.slices[0];
-        assert_eq!((slice.base_generation, slice.generation), (None, 3));
-        assert_eq!(slice.added.len(), 1);
-        let stale = BTreeMap::from([(key.clone(), 2)]);
+    fn a_pass_that_adds_no_content_keeps_the_published_generation() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let published = record("aaaa1111");
+        let prev = prev_index(vec![record_to_index_row(&published)], 4);
+        let tags = vec![
+            index_tag(TARGET, RUSTC),
+            records_tag(RUSTC, "aaaa1111", BUILD),
+        ];
+        let by_tag = BTreeMap::from([(tags[1].clone(), vec![published])]);
+        let pass = block_on(export_pass(
+            &tags,
+            pull_only_prev(prev.clone(), BTreeSet::new()),
+            pull_records_by_tag(by_tag),
+            false,
+            &rustc,
+        ))
+        .expect("the pass");
+        let slice = target_slice(&pass);
+        assert_eq!(slice.index.header, prev.header);
+        assert_eq!(slice.folded.len(), 1, "the mark is still published");
+    }
+
+    /// stow#1049: a report that failed after its slices went live is
+    /// retried by the next run, and stow#1581: what the scheduler lacks
+    /// is replayed from the generation it holds, one delta per
+    /// generation, never as the slice's full membership; a slice it
+    /// holds is left alone.
+    #[test]
+    fn the_reconcile_replays_only_what_the_scheduler_lacks() {
+        let history = FakeHistory::chain(vec![
+            prev_index(vec![row("a")], 1),
+            prev_index(vec![row("a"), row("b")], 2),
+            prev_index(vec![row("b"), row("c")], 3),
+            prev_index(vec![row("b"), row("c"), row("d")], 4),
+        ]);
+        let replay = |held| {
+            block_on(recovery_reports(&history, history.live_manifest(), held))
+                .expect("the history holds the base")
+        };
+        // The lost report of generation 4, and of 3 and 4.
+        let lost = replay(Some(held(3)));
+        assert_eq!(lost.len(), 1);
+        assert_eq!((lost[0].base_generation, lost[0].generation), (Some(3), 4));
+        assert_eq!((lost[0].added.len(), lost[0].retired.len()), (1, 0));
+        let two = replay(Some(held(2)));
         assert_eq!(
-            unreported_slices(vec![index.clone()], &stale)
-                .expect("a stale slice")
-                .slices
-                .len(),
-            1
+            two.iter()
+                .map(|report| (report.base_generation, report.generation))
+                .collect::<Vec<_>>(),
+            [(Some(2), 3), (Some(3), 4)]
         );
-        let current = BTreeMap::from([(key, 3)]);
+        assert_eq!((two[0].added.len(), two[0].retired.len()), (1, 1));
+        // Held at the live generation: nothing to send.
         assert_eq!(
-            unreported_slices(vec![index], &current)
-                .expect("a current slice")
-                .slices
-                .len(),
-            0
+            replay(Some(held(4))),
+            [] as [stow_types::api::PublishedSlice; 0]
         );
+        // No base: a scheduler holding nothing, or a staged full report
+        // that refuses every delta, takes the live slice in full.
+        for no_base in [
+            None,
+            Some(HeldSlice {
+                generation: 3,
+                staged: Some(4),
+            }),
+        ] {
+            let full = replay(no_base);
+            assert_eq!(full.len(), 1);
+            assert_eq!((full[0].base_generation, full[0].generation), (None, 4));
+            assert_eq!(full[0].added.len(), 3);
+        }
+    }
+
+    /// A `full` publish restamps generation 1 and links the manifest it
+    /// replaced: a scheduler holding a generation from before it replays
+    /// from that publish's own full report, then the deltas above it.
+    #[test]
+    fn the_replay_starts_at_a_full_publish_after_the_held_generation() {
+        let history = FakeHistory::chain(vec![
+            prev_index(vec![row("a")], 4),
+            prev_index(vec![row("a"), row("b")], 5),
+            prev_index(vec![row("b")], 1),
+            prev_index(vec![row("b"), row("c")], 2),
+        ]);
+        let replay = block_on(recovery_reports(
+            &history,
+            history.live_manifest(),
+            Some(held(5)),
+        ))
+        .expect("the replay");
+        assert_eq!(
+            replay
+                .iter()
+                .map(|report| (report.base_generation, report.generation))
+                .collect::<Vec<_>>(),
+            [(None, 1), (Some(1), 2)]
+        );
+    }
+
+    /// A history that does not reach the held generation — a manifest
+    /// above it links no predecessor, or a link skips a generation — is
+    /// an error naming the slice, never a silent full report.
+    #[test]
+    fn a_history_without_the_held_base_is_an_error() {
+        let mut history = FakeHistory::chain(vec![
+            prev_index(vec![row("a")], 2),
+            prev_index(vec![row("a"), row("b")], 3),
+        ]);
+        let unlinked = FakeHistory {
+            live: history.live.clone(),
+            manifests: history
+                .manifests
+                .iter()
+                .map(|(digest, (index, _))| (digest.clone(), (index.clone(), None)))
+                .collect(),
+        };
+        let error = block_on(recovery_reports(
+            &unlinked,
+            unlinked.live_manifest(),
+            Some(held(2)),
+        ))
+        .expect_err("no link down to generation 2");
+        let message = error.to_string();
+        assert!(
+            message.contains(TARGET) && message.contains("`full`"),
+            "{message}"
+        );
+        // Generation 3 linking generation 1 skips the held generation 2.
+        let oldest = history.manifests.keys().next().expect("a manifest").clone();
+        history
+            .manifests
+            .get_mut(&oldest)
+            .expect("oldest")
+            .0
+            .header
+            .generation = 1;
+        let error = block_on(recovery_reports(
+            &history,
+            history.live_manifest(),
+            Some(held(2)),
+        ))
+        .expect_err("a skipped generation");
+        assert!(error.to_string().contains("not 2"), "{error}");
     }
 
     /// The join resolves a leaderboard digest to its crate identity
@@ -3305,7 +3881,7 @@ mod tests {
                 .map(|request| request.head.uri.path().to_owned())
                 .collect::<Vec<_>>();
             let slices = slices.unwrap_or_else(|error| panic!("{error}: {paths:?}"));
-            assert_eq!(slices, Vec::<ArtifactIndex>::new());
+            assert!(slices.is_empty(), "no target has a published slice");
             let (challenge, manifests) = paths.split_first().expect("the challenge");
             assert_eq!(challenge, "/v2/");
             // The pulls run concurrently, so their arrival order is not
