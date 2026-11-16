@@ -170,6 +170,10 @@ pub fn traced(
             crate::DispatchCapCommand::Set(a) if a.yes => &[],
             _ => return None,
         },
+        crate::Command::DispatchRate(a) => match &a.command {
+            crate::DispatchRateCommand::Set(a) if a.yes => &[],
+            _ => return None,
+        },
         crate::Command::ReleasePriority(a) => match &a.command {
             crate::ReleasePriorityCommand::Set(a) if a.yes => &[],
             _ => return None,

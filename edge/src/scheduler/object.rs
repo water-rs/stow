@@ -374,6 +374,11 @@ impl Scheduler {
                 "/dispatch-cap"
                     .at(read_dispatch_cap)
                     .post(write_dispatch_cap),
+                // The operator's dispatch rate bound (stow#1568):
+                // reached from `GET`/`POST /api/v1/admin/dispatch-rate`.
+                "/dispatch-rate"
+                    .at(read_dispatch_rate)
+                    .post(write_dispatch_rate),
                 // The operator's release multiplier (stow#1012):
                 // reached from `GET`/`POST /api/v1/admin/release-priority`.
                 "/release-priority"
@@ -1621,6 +1626,56 @@ pub(super) async fn dispatch_cap_pass(
     // setting puts in force.
     let settings = scheduler_settings(env, graph)?;
     Ok(graph.with(|graph| graph.dispatch_cap_view(&settings)))
+}
+
+/// `GET /dispatch-rate` — the rate bound in force and the runs started
+/// in the last minute (stow#1568).
+async fn read_dispatch_rate(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::DispatchRate>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    Ok(Json(graph.with(|graph| graph.dispatch_rate_view(now_ms()))))
+}
+
+/// `POST /dispatch-rate` — the operator's `set`: one `DispatchRate`
+/// event appended, in force until the next `set`, then the wake
+/// re-plan: a raised or lifted bound frees claims the queue may already
+/// wait on, so the plan arms the alarm and its pass sends the runs; the
+/// request's cost does not scale with the rate.
+async fn write_dispatch_rate(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    actor: Actor,
+    Json(set): Json<stow_types::api::DispatchRateSet>,
+) -> Result<Json<stow_types::api::DispatchRate>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let now = now_ms();
+    routes::commit_as(
+        graph,
+        &db,
+        Some(&actor.0),
+        &[SchedulerEvent::DispatchRate {
+            setting: Box::new(stow_types::api::DispatchRateSetting {
+                max_runs_per_minute: set.max_runs_per_minute,
+                set_at: iso_now(),
+                actor: actor.0.clone(),
+            }),
+        }],
+        now,
+    )
+    .await
+    .map_err(to_error)?;
+    schedule_alarm(&env, &db, &alarm, graph.cell()).await?;
+    tracing::warn!(
+        max = ?set.max_runs_per_minute,
+        actor = %actor.0,
+        "dispatch rate set by operator"
+    );
+    Ok(Json(graph.with(|graph| graph.dispatch_rate_view(now))))
 }
 
 /// `GET /release-priority` — the multiplier in force and the operator

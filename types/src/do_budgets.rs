@@ -579,6 +579,26 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 300,
     },
     DriveBudget {
+        name: "GET /dispatch-rate",
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
+        wall_ms: 300,
+    },
+    DriveBudget {
+        // stow#1568 provisional: the `DispatchRate` append and the wake
+        // re-plan; the route runs no dispatch pass — the alarm armed at
+        // `now` sends the freed claims' runs — so the cost is
+        // independent of the rate: 1 append, no claim reads. Priced as
+        // `POST /dispatch-cap`, which has the same shape; the workerd
+        // absolute awaits a probe run.
+        name: "POST /dispatch-rate",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 300,
+    },
+    DriveBudget {
         name: "GET /release-priority",
         statements: 2,
         rows_read: 4,
