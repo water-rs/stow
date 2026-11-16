@@ -47,12 +47,48 @@
 //! and the fixture's node count, so it meets the same cache behaviour;
 //! and serializing, parsing and hashing request-sized JSON. A runner
 //! that runs that work slower runs the lanes slower too, and the
-//! quotient cancels it. The reference is unusable — and the pass fails
-//! rather than gate on it — when it returns anything but its checksum,
-//! when a round collects too few samples to resolve, or when the
-//! reference before the lanes and after them disagree by more than
-//! [`REFERENCE_DRIFT_LIMIT`]: the runner's speed moved during the pass,
-//! so no single reference describes every lane.
+//! quotient cancels it.
+//!
+//! The quotient only cancels the runner when both sides of it ran the
+//! same compiled code, and the reference reaches its final code late.
+//! Its work is a few long loops inside one call, so V8 first tiers it
+//! up by on-stack replacement: each invocation enters in the
+//! interpreter and jumps into code optimized for one loop, which bails
+//! out where the loop leaves into code it has no feedback for. Only
+//! after several invocations does V8 compile the whole function and
+//! enter it in that code from the call, and the first such compile can
+//! still deoptimize and restart the climb; the local workerd settled on
+//! its eleventh invocation. That climb ran the reference 1.26–1.42×
+//! slower than the settled function in release gate runs, so a
+//! single warm-up call left the reference before the lanes in the climb
+//! and the one after them settled. So the pass settles the reference
+//! before each side measures it: it profiles invocations one at a time
+//! until [`SETTLED_INVOCATIONS`] in a row ran in the reference's own
+//! code, at most [`REFERENCE_SETTLE_LIMIT`] of them.
+//!
+//! The profile tells the two states apart. When a profile starts, V8
+//! names the code that already exists after the functions it is
+//! attached to (`ExistingCodeLogger::LogCompiledFunctions` in V8's
+//! `src/logging/log.cc`); on-stack-replacement code lives in the
+//! function's feedback vector, attached to no function, so samples in
+//! such code compiled before the profile resolve to the frame below it
+//! — the inspector's calling wrapper. A settled invocation keeps nearly
+//! all its JavaScript samples in the reference's own frames; one still
+//! climbing charges most of them to the wrapper. Code compiled during
+//! the profile is named correctly wherever it runs, so one clean
+//! invocation can be the one that compiled the climb's code; the next
+//! runs that code and is charged to the wrapper, which is why settling
+//! takes [`SETTLED_INVOCATIONS`] in a row.
+//!
+//! The reference is unusable — and the pass fails rather than gate on
+//! it — when it returns anything but its checksum, when it does not
+//! settle, when a measured invocation charges more than
+//! [`REFERENCE_CALLER_SHARE_LIMIT`] of its JavaScript samples outside
+//! the reference's own frames (it left the settled code, or other work
+//! ran in the round), when a round collects too few samples to resolve,
+//! or when the reference before the lanes and after them disagree by
+//! more than [`REFERENCE_DRIFT_LIMIT`]: the runner's speed moved during
+//! the pass, so no single reference describes every lane.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -198,7 +234,8 @@ pub(super) async fn capture_segment<R>(
             let rounds_before = measure_reference(reference, &mut artifacts).await?;
             let measured = profiled(&inspector, &mut artifacts, label, work).await;
             artifacts.save_raw(out).await?;
-            let (result, cpu_ms) = measured?;
+            let (result, profile) = measured?;
+            let cpu_ms = profile_cpu_ms(&profile);
             let rounds_after = measure_reference(reference, &mut artifacts).await;
             artifacts.save_raw(out).await?;
             let rounds_after = rounds_after?;
@@ -246,6 +283,23 @@ const MIN_REFERENCE_CPU_MS: f64 = 10.0;
 /// How far apart the reference before the lanes and the reference after
 /// them may lie, as the larger over the smaller.
 const REFERENCE_DRIFT_LIMIT: f64 = 1.25;
+
+/// Profiled invocations in a row that must run in the reference's own
+/// code before it counts as settled: the second shows the first
+/// compiled none of the code it ran.
+const SETTLED_INVOCATIONS: u32 = 2;
+
+/// The most profiled invocations settling may take. The local workerd
+/// settled the reference on its eleventh invocation, after one
+/// deoptimization restarted the climb; this allows several more
+/// restarts, about a second of a release gate runner's CPU.
+const REFERENCE_SETTLE_LIMIT: u32 = 64;
+
+/// The share of an invocation's JavaScript samples that may land
+/// outside the reference's own frames. Settled invocations charged at
+/// most 9% to the inspector's calling wrapper, locally and in release
+/// gate runs; invocations still climbing charged at least 39%.
+const REFERENCE_CALLER_SHARE_LIMIT: f64 = 0.25;
 
 /// A resolved reference round; CPU is summed across these invocations.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -658,11 +712,17 @@ impl Inspector {
             .as_str()
             .filter(|_| evaluated["result"]["type"] == "function")
             .ok_or_else(|| stow_error!("reference did not evaluate to a function: {evaluated}"))?;
-        let reference = Reference {
-            inspector: self,
-            object_id,
+        let result = match self.function_location(object_id).await {
+            Ok(location) => {
+                work(&Reference {
+                    inspector: self,
+                    object_id,
+                    location,
+                })
+                .await
+            }
+            Err(error) => Err(error),
         };
-        let result = work(&reference).await;
         let released = self
             .call(
                 "Runtime.releaseObject",
@@ -673,15 +733,146 @@ impl Inspector {
         released?;
         Ok(value)
     }
+
+    /// Where the function `object_id` names starts — the call frame its
+    /// profile nodes carry.
+    async fn function_location(
+        &self,
+        object_id: &str,
+    ) -> stow_types::error::Result<FunctionLocation> {
+        let properties = self
+            .call(
+                "Runtime.getProperties",
+                serde_json::json!({ "objectId": object_id, "ownProperties": true }),
+            )
+            .await?;
+        let location = properties["internalProperties"]
+            .as_array()
+            .and_then(|internal| {
+                internal
+                    .iter()
+                    .find(|property| property["name"] == "[[FunctionLocation]]")
+            })
+            .ok_or_else(|| {
+                stow_error!("Runtime.getProperties reported no [[FunctionLocation]]: {properties}")
+            })?;
+        FunctionLocation::deserialize(&location["value"]["value"])
+            .map_err(|error| stow_error!("decode the reference's location {location}: {error}"))
+    }
 }
 
-/// A warmed function retained by the inspector for one sampling scope.
+/// A function's start, as `[[FunctionLocation]]` and a profile's call
+/// frames report it.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FunctionLocation {
+    script_id: String,
+    line_number: i64,
+    column_number: i64,
+}
+
+impl FunctionLocation {
+    fn starts(&self, frame: &CallFrame) -> bool {
+        frame.script_id == self.script_id
+            && frame.line_number == self.line_number
+            && frame.column_number == self.column_number
+    }
+}
+
+/// A function retained by the inspector for one sampling scope.
 struct Reference<'a> {
     inspector: &'a Inspector,
     object_id: &'a str,
+    location: FunctionLocation,
+}
+
+/// One profiled invocation of the reference.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ReferenceInvocation {
+    cpu_ms: f64,
+    /// The share of the invocation's JavaScript samples outside the
+    /// reference's own frames.
+    caller_share: f64,
+}
+
+impl ReferenceInvocation {
+    /// The invocation `profile` holds; samples are JavaScript unless
+    /// they are the profiler's own `(idle)`, `(program)` or `(garbage
+    /// collector)` entries.
+    fn of(profile: &CpuProfile, location: &FunctionLocation) -> Self {
+        let nodes: std::collections::BTreeMap<u64, &ProfileNode> =
+            profile.nodes.iter().map(|node| (node.id, node)).collect();
+        let mut pending: Vec<u64> = profile
+            .nodes
+            .iter()
+            .filter(|node| location.starts(&node.call_frame))
+            .map(|node| node.id)
+            .collect();
+        let mut inside = std::collections::BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if inside.insert(id)
+                && let Some(node) = nodes.get(&id)
+            {
+                pending.extend(&node.children);
+            }
+        }
+        let (mut in_reference, mut outside) = (0_u32, 0_u32);
+        for sample in &profile.samples {
+            if inside.contains(sample) {
+                in_reference += 1;
+            } else if nodes.get(sample).is_some_and(|node| {
+                !matches!(
+                    node.call_frame.function_name.as_str(),
+                    "(idle)" | "(program)" | "(garbage collector)" | "(root)"
+                )
+            }) {
+                outside += 1;
+            }
+        }
+        let javascript = in_reference + outside;
+        Self {
+            cpu_ms: profile_cpu_ms(profile),
+            caller_share: if javascript == 0 {
+                1.0
+            } else {
+                f64::from(outside) / f64::from(javascript)
+            },
+        }
+    }
+
+    /// Whether the invocation ran in the reference's own code.
+    fn settled(&self) -> bool {
+        self.caller_share <= REFERENCE_CALLER_SHARE_LIMIT
+    }
+
+    /// The CPU of a measured invocation, which must have run in the
+    /// settled code.
+    fn measured_cpu_ms(&self) -> stow_types::error::Result<f64> {
+        if self.settled() {
+            return Ok(self.cpu_ms);
+        }
+        Err(stow_error!(
+            "a measured reference invocation charged {:.0}% of its JavaScript samples outside \
+             the reference's own frames (limit {:.0}%) — it left the settled code, or other work \
+             ran in the round, so the round does not measure the settled reference",
+            self.caller_share * 100.0,
+            REFERENCE_CALLER_SHARE_LIMIT * 100.0
+        ))
+    }
 }
 
 impl Reference<'_> {
+    /// Invoke the reference once under its own profile.
+    async fn profiled_run(
+        &self,
+        artifacts: &mut ProfileArtifacts,
+        label: &str,
+    ) -> stow_types::error::Result<ReferenceInvocation> {
+        let ((), profile) =
+            profiled(self.inspector, artifacts, label, async || self.run().await).await?;
+        Ok(ReferenceInvocation::of(&profile, &self.location))
+    }
+
     /// Invoke the retained workload and check its checksum.
     async fn run(&self) -> stow_types::error::Result<()> {
         let evaluated = self
@@ -783,6 +974,9 @@ struct ProfileNode {
     id: u64,
     #[serde(rename = "callFrame")]
     call_frame: CallFrame,
+    /// The protocol leaves `children` out of a node that has none.
+    #[serde(default)]
+    children: Vec<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -816,13 +1010,13 @@ fn profile_cpu_ms(profile: &CpuProfile) -> f64 {
     busy as f64 * SAMPLING_INTERVAL_US as f64 / 1000.0
 }
 
-/// Profile whatever `work` drives and return the profile's CPU ms.
+/// Profile whatever `work` drives and return the decoded profile.
 async fn profiled<R>(
     inspector: &Inspector,
     artifacts: &mut ProfileArtifacts,
     label: &str,
     work: impl AsyncFnOnce() -> stow_types::error::Result<R>,
-) -> stow_types::error::Result<(R, f64)> {
+) -> stow_types::error::Result<(R, CpuProfile)> {
     inspector
         .call("Profiler.start", serde_json::Value::Null)
         .await?;
@@ -870,7 +1064,7 @@ async fn profiled<R>(
         "Worker CPU profile hotspots (function, samples)"
     );
     artifacts.capture(label, raw, &profile);
-    Ok((worked?, profile_cpu_ms(&profile)))
+    Ok((worked?, profile))
 }
 
 /// Fire `count` events of `lane` back to back; any response outside the
@@ -950,11 +1144,11 @@ async fn measure_lane(
     let mut rounds_cpu_ms = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
         ready(lane, edge, args.events_per_round).await?;
-        let ((), cpu_ms) = profiled(inspector, artifacts, lane.name, async || {
+        let ((), profile) = profiled(inspector, artifacts, lane.name, async || {
             fire_events(lane, edge, &mut client, &mut counter, args.events_per_round).await
         })
         .await?;
-        rounds_cpu_ms.push(cpu_ms / f64::from(args.events_per_round));
+        rounds_cpu_ms.push(profile_cpu_ms(&profile) / f64::from(args.events_per_round));
     }
     Ok(LaneCpu {
         budget,
@@ -963,28 +1157,53 @@ async fn measure_lane(
     })
 }
 
-/// Warm the retained function, then resolve each round to at least 100 samples.
-/// Repeating the same reference preserves the budget's per-invocation unit.
+/// Settle the retained function, then resolve each round to at least 100
+/// samples, every invocation in the settled code. Repeating the same
+/// reference preserves the budget's per-invocation unit.
 async fn measure_reference(
     reference: &Reference<'_>,
     artifacts: &mut ProfileArtifacts,
 ) -> stow_types::error::Result<Vec<ReferenceRound>> {
-    reference.run().await?;
+    let invocations =
+        settle_reference(async || reference.profiled_run(artifacts, "reference-settle").await)
+            .await?;
+    tracing::info!(invocations, "the reference settled");
     let mut rounds = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
         rounds.push(
             resolve_reference_round(async || {
-                let ((), cpu_ms) =
-                    profiled(reference.inspector, artifacts, "reference", async || {
-                        reference.run().await
-                    })
-                    .await?;
-                Ok(cpu_ms)
+                reference
+                    .profiled_run(artifacts, "reference")
+                    .await?
+                    .measured_cpu_ms()
             })
             .await?,
         );
     }
     Ok(rounds)
+}
+
+/// Invoke the reference until [`SETTLED_INVOCATIONS`] in a row ran in
+/// its own code, and return how many invocations that took.
+async fn settle_reference(
+    mut invoke: impl AsyncFnMut() -> stow_types::error::Result<ReferenceInvocation>,
+) -> stow_types::error::Result<u32> {
+    let mut in_a_row = 0;
+    let mut shares = Vec::new();
+    for invocation in 1..=REFERENCE_SETTLE_LIMIT {
+        let run = invoke().await?;
+        shares.push(format!("{:.0}%", run.caller_share * 100.0));
+        in_a_row = if run.settled() { in_a_row + 1 } else { 0 };
+        if in_a_row == SETTLED_INVOCATIONS {
+            return Ok(invocation);
+        }
+    }
+    Err(stow_error!(
+        "the reference did not run {SETTLED_INVOCATIONS} invocations in a row in its own code \
+         within {REFERENCE_SETTLE_LIMIT} — V8 never settled it, so no round would measure the \
+         settled reference (share of each invocation's samples outside it: {})",
+        shares.join(" ")
+    ))
 }
 
 async fn resolve_reference_round(
@@ -1039,11 +1258,12 @@ async fn prepare_sampler(
         .await?;
 
     let mut artifacts = ProfileArtifacts::default();
-    let ((), idle_cpu_ms) = profiled(&inspector, &mut artifacts, "idle", async || {
+    let ((), idle) = profiled(&inspector, &mut artifacts, "idle", async || {
         tokio::time::sleep(IDLE_WINDOW).await;
         Ok(())
     })
     .await?;
+    let idle_cpu_ms = profile_cpu_ms(&idle);
     let idle_window_ms = IDLE_WINDOW.as_millis() as f64;
     if idle_cpu_ms > idle_window_ms * IDLE_CPU_FRACTION {
         return Err(stow_error!(
@@ -1186,6 +1406,16 @@ mod tests {
         track_context,
     };
 
+    /// A `Runtime.getProperties` result naming a function's start.
+    fn function_location(script_id: &str, line: i64, column: i64) -> serde_json::Value {
+        serde_json::json!({"result": [], "internalProperties": [
+            {"name": "[[Scopes]]", "value": {"type": "object"}},
+            {"name": "[[FunctionLocation]]", "value": {"type": "object",
+                "subtype": "internal#location",
+                "value": {"scriptId": script_id, "lineNumber": line, "columnNumber": column}}},
+        ]})
+    }
+
     async fn incomplete_source_inspector(listener: tokio::net::TcpListener) {
         use futures_util::StreamExt as _;
         let (stream, _) = listener.accept().await.expect("accept");
@@ -1214,6 +1444,7 @@ mod tests {
                     "type":"function", "objectId":"reference"}}),
                 "Runtime.callFunctionOn" => serde_json::json!({"result":{
                     "value":super::REFERENCE_CHECKSUM}}),
+                "Runtime.getProperties" => function_location("3", 0, 0),
                 "Profiler.stop" => {
                     stops += 1;
                     if stops == 1 {
@@ -1614,6 +1845,117 @@ mod tests {
         assert!(reference_cpu(vec![40.0; 3], vec![40.0 * REFERENCE_DRIFT_LIMIT; 3]).is_ok());
     }
 
+    /// A reference profile as release gate run 43924187385 recorded one:
+    /// the inspector's wrapper (`31:0:9`) calls the reference (`29:7:1`),
+    /// which calls `nested`; each entry is a node's self samples.
+    fn reference_profile(wrapper: usize, reference: usize, nested: usize) -> CpuProfile {
+        let frame = |script: &str, name: &str, line: i64, column: i64| {
+            serde_json::json!({"scriptId": script, "functionName": name, "url": "",
+                "lineNumber": line, "columnNumber": column})
+        };
+        let mut samples = vec![2; 1];
+        samples.extend(std::iter::repeat_n(4, wrapper));
+        samples.extend(std::iter::repeat_n(5, reference));
+        samples.extend(std::iter::repeat_n(7, nested));
+        samples.extend([6, 6, 6, 3, 3]);
+        serde_json::from_value(serde_json::json!({
+            "nodes": [
+                {"id": 1, "callFrame": frame("0", "(root)", -1, -1), "children": [2, 3, 4, 6]},
+                {"id": 2, "callFrame": frame("0", "(idle)", -1, -1)},
+                {"id": 3, "callFrame": frame("0", "(program)", -1, -1)},
+                {"id": 4, "callFrame": frame("31", "", 0, 9), "children": [5]},
+                {"id": 5, "callFrame": frame("29", "", 7, 1), "children": [7]},
+                {"id": 6, "callFrame": frame("0", "(garbage collector)", -1, -1)},
+                {"id": 7, "callFrame": frame("29", "nested", 20, 4)},
+            ],
+            "samples": samples,
+        }))
+        .expect("profile")
+    }
+
+    const REFERENCE_LOCATION: super::FunctionLocation = super::FunctionLocation {
+        script_id: String::new(),
+        line_number: 7,
+        column_number: 1,
+    };
+
+    fn located() -> super::FunctionLocation {
+        super::FunctionLocation {
+            script_id: "29".to_owned(),
+            ..REFERENCE_LOCATION
+        }
+    }
+
+    /// Samples under the reference's node, its callees included, are
+    /// its own; the wrapper's self samples are not, and the profiler's
+    /// own entries count on neither side.
+    #[test]
+    fn a_reference_invocation_is_charged_by_the_frames_its_samples_resolve_to() {
+        // Before the lanes: 110 on the wrapper, 38 on the reference.
+        let climbing = super::ReferenceInvocation::of(&reference_profile(110, 30, 8), &located());
+        assert!(close(climbing.caller_share, 110.0 / 148.0));
+        assert!(!climbing.settled());
+        assert!(climbing.measured_cpu_ms().is_err());
+        // After them: 4 on the wrapper, 137 on the reference.
+        let settled = super::ReferenceInvocation::of(&reference_profile(4, 130, 7), &located());
+        assert!(close(settled.caller_share, 4.0 / 141.0));
+        assert!(close(settled.cpu_ms, 14.6));
+        assert!(close(settled.measured_cpu_ms().expect("settled"), 14.6));
+        // A profile whose samples never resolve to the reference is
+        // charged entirely to its caller.
+        let unresolved = super::ReferenceInvocation::of(&reference_profile(0, 0, 0), &located());
+        assert!(close(unresolved.caller_share, 1.0));
+        let elsewhere =
+            super::ReferenceInvocation::of(&reference_profile(20, 100, 0), &REFERENCE_LOCATION);
+        assert!(close(elsewhere.caller_share, 1.0));
+    }
+
+    fn invocation(caller_share: f64) -> super::ReferenceInvocation {
+        super::ReferenceInvocation {
+            cpu_ms: 15.0,
+            caller_share,
+        }
+    }
+
+    /// Settling takes two clean invocations in a row: the local
+    /// workerd's first invocation compiles its loops' code inside its
+    /// own profile and so looks clean, and the next is charged to the
+    /// wrapper.
+    #[tokio::test]
+    async fn the_reference_settles_on_consecutive_invocations_in_its_own_code() {
+        let series = [
+            0.22, 0.97, 0.92, 0.93, 0.93, 0.39, 0.58, 0.88, 0.94, 0.86, 0.09, 0.01, 0.02,
+        ];
+        let mut calls = 0;
+        let settled = super::settle_reference(async || {
+            calls += 1;
+            Ok(invocation(series[calls - 1]))
+        })
+        .await
+        .expect("settled");
+        assert_eq!((settled, calls), (12, 12));
+
+        let mut calls = 0;
+        let error = super::settle_reference(async || {
+            calls += 1;
+            Ok(invocation(if calls % 2 == 0 { 0.9 } else { 0.0 }))
+        })
+        .await
+        .expect_err("never two in a row")
+        .to_string();
+        assert_eq!(calls, super::REFERENCE_SETTLE_LIMIT as usize);
+        assert!(
+            error.contains("did not run 2 invocations in a row"),
+            "{error}"
+        );
+
+        assert!(
+            super::settle_reference(async || Err(stow_types::stow_error!("checksum")))
+                .await
+                .is_err()
+        );
+    }
+
     /// Idle samples are not CPU; every other sample is one interval.
     #[test]
     fn idle_samples_do_not_count() {
@@ -1632,80 +1974,100 @@ mod tests {
         assert!((profile_cpu_ms(&profile) - 0.4).abs() < 1e-9);
     }
 
+    /// An inspector serving one retained reference, located when
+    /// `locate`; it checks every call goes to that one function and that
+    /// the function is released.
+    async fn retaining_inspector(listener: tokio::net::TcpListener, locate: bool) {
+        use futures_util::StreamExt as _;
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = async_tungstenite::tokio::accept_async(stream)
+            .await
+            .expect("handshake");
+        let mut evaluations = 0;
+        let mut calls = 0;
+        loop {
+            let frame = socket.next().await.expect("request").expect("frame");
+            let request: serde_json::Value =
+                serde_json::from_str(frame.to_text().expect("text")).expect("command");
+            let method = request["method"].as_str().expect("method");
+            if method == "Runtime.enable" {
+                socket
+                    .send(async_tungstenite::tungstenite::Message::Text(
+                        serde_json::json!({"method":"Runtime.executionContextCreated",
+                            "params":{"context":{"id":7,"name":"Worker"}}})
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .expect("context");
+            }
+            let result = match method {
+                "Runtime.disable" | "Runtime.enable" => serde_json::json!({}),
+                "Runtime.evaluate" => {
+                    evaluations += 1;
+                    assert_eq!(evaluations, 1);
+                    assert_eq!(request["params"]["contextId"], 7);
+                    assert_eq!(request["params"]["expression"], super::REFERENCE_WORKLOAD);
+                    assert_eq!(request["params"]["returnByValue"], false);
+                    serde_json::json!({"result":{"type":"function","objectId":"warmed"}})
+                }
+                "Runtime.getProperties" => {
+                    assert_eq!(request["params"]["objectId"], "warmed");
+                    if locate {
+                        function_location("29", 7, 1)
+                    } else {
+                        serde_json::json!({"result": [], "internalProperties": []})
+                    }
+                }
+                "Runtime.callFunctionOn" => {
+                    calls += 1;
+                    assert_eq!(request["params"]["objectId"], "warmed");
+                    assert_eq!(request["params"]["returnByValue"], true);
+                    serde_json::json!({"result":{"value":super::REFERENCE_CHECKSUM}})
+                }
+                "Runtime.releaseObject" => {
+                    assert_eq!(request["params"]["objectId"], "warmed");
+                    assert_eq!((evaluations, calls), (1, if locate { 2 } else { 0 }));
+                    serde_json::json!({})
+                }
+                other => panic!("unexpected command {other}"),
+            };
+            socket
+                .send(async_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"id":request["id"],"result":result})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("reply");
+            if method == "Runtime.releaseObject" {
+                break;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn reference_calls_share_one_function_and_release_it_after_success_or_failure() {
-        use futures_util::StreamExt as _;
-
-        for fail_work in [false, true] {
+        for (fail_work, locate) in [(false, true), (true, true), (false, false)] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("listen");
             let address = listener.local_addr().expect("address");
-            let server = async {
-                let (stream, _) = listener.accept().await.expect("accept");
-                let mut socket = async_tungstenite::tokio::accept_async(stream)
-                    .await
-                    .expect("handshake");
-                let mut evaluations = 0;
-                let mut calls = 0;
-                loop {
-                    let frame = socket.next().await.expect("request").expect("frame");
-                    let request: serde_json::Value =
-                        serde_json::from_str(frame.to_text().expect("text")).expect("command");
-                    let method = request["method"].as_str().expect("method");
-                    if method == "Runtime.enable" {
-                        socket
-                            .send(async_tungstenite::tungstenite::Message::Text(
-                                serde_json::json!({"method":"Runtime.executionContextCreated",
-                            "params":{"context":{"id":7,"name":"Worker"}}})
-                                .to_string()
-                                .into(),
-                            ))
-                            .await
-                            .expect("context");
-                    }
-                    let result = match method {
-                        "Runtime.disable" | "Runtime.enable" => serde_json::json!({}),
-                        "Runtime.evaluate" => {
-                            evaluations += 1;
-                            assert_eq!(evaluations, 1);
-                            assert_eq!(request["params"]["contextId"], 7);
-                            assert_eq!(request["params"]["expression"], super::REFERENCE_WORKLOAD);
-                            assert_eq!(request["params"]["returnByValue"], false);
-                            serde_json::json!({"result":{"type":"function","objectId":"warmed"}})
-                        }
-                        "Runtime.callFunctionOn" => {
-                            calls += 1;
-                            assert_eq!(request["params"]["objectId"], "warmed");
-                            assert_eq!(request["params"]["returnByValue"], true);
-                            serde_json::json!({"result":{"value":super::REFERENCE_CHECKSUM}})
-                        }
-                        "Runtime.releaseObject" => {
-                            assert_eq!(request["params"]["objectId"], "warmed");
-                            assert_eq!((evaluations, calls), (1, 2));
-                            serde_json::json!({})
-                        }
-                        other => panic!("unexpected command {other}"),
-                    };
-                    socket
-                        .send(async_tungstenite::tungstenite::Message::Text(
-                            serde_json::json!({"id":request["id"],"result":result})
-                                .to_string()
-                                .into(),
-                        ))
-                        .await
-                        .expect("reply");
-                    if method == "Runtime.releaseObject" {
-                        break;
-                    }
-                }
-            };
+            let server = retaining_inspector(listener, locate);
             let client = async {
                 let inspector = super::Inspector::connect(&format!("ws://{address}"))
                     .await
                     .expect("inspector");
                 let result = inspector
                     .with_reference(async |reference| {
+                        assert_eq!(reference.location.script_id, "29");
+                        assert_eq!(
+                            (
+                                reference.location.line_number,
+                                reference.location.column_number
+                            ),
+                            (7, 1)
+                        );
                         reference.run().await?;
                         reference.run().await?;
                         if fail_work {
@@ -1715,7 +2077,14 @@ mod tests {
                         }
                     })
                     .await;
-                if fail_work {
+                if !locate {
+                    assert!(
+                        result
+                            .expect_err("no location")
+                            .to_string()
+                            .contains("[[FunctionLocation]]")
+                    );
+                } else if fail_work {
                     assert!(
                         result
                             .expect_err("failed capture")
