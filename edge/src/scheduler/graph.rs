@@ -3451,6 +3451,9 @@ impl Graph {
             completed: count(Status::Completed),
             failed: count(Status::Failed),
             blocked: self.pending_blocked,
+            // The object stamps its own tag (`object.rs`'s `status`);
+            // the graph holds no build identity.
+            scheduler_release_tag: None,
         }
     }
 

@@ -89,6 +89,11 @@ env:
   # organic requests decide (stow#1022).
   STOW_DO_WORKLOAD_RPS: "2"
   STOW_DO_WORKLOAD_MINUTES: "3"
+  # How long the Scheduler object may keep switching between the two
+  # releases' code after promotion before the candidate window fails
+  # closed. On 2026-11-16 the object ran the outgoing code for most of
+  # the first 4 minutes after a promotion (stow#1574).
+  STOW_DO_WORKLOAD_SETTLE_MINUTES: "15"
   MIN_DO_SAMPLE_REQUESTS: "280"
 
 jobs:
@@ -442,6 +447,9 @@ jobs:
         id: do_workload
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          # `prepare` admits only refs/tags/v<version>, so the ref name is
+          # the tag the candidate's Scheduler object reports.
+          STOW_DO_WORKLOAD_EXPECT_TAG: ${{ github.ref_name }}
         run: scripts/deploy-do-workload.sh candidate
 
       - name: Roll back to the baseline
