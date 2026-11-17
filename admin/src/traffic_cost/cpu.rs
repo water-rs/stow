@@ -383,7 +383,10 @@ pub struct CapturedProfile {
 pub struct ScriptSource {
     script_id: String,
     url: String,
-    source: String,
+    /// `None` for a runtime-internal script the debugger never reported,
+    /// which has no source to fetch; its frames and samples stay in the
+    /// profile.
+    source: Option<String>,
 }
 
 #[derive(Default, Serialize)]
@@ -420,6 +423,19 @@ impl ProfileArtifacts {
         // One owner reads this protocol socket; its request/reply exchanges
         // serialize under a concurrency bound of one.
         for (script_id, url) in &self.scripts {
+            if !inspector.reported(script_id) {
+                tracing::info!(
+                    script_id,
+                    url,
+                    "the debugger never reported this profiled script; recording it without source"
+                );
+                sources.push(ScriptSource {
+                    script_id: script_id.clone(),
+                    url: url.clone(),
+                    source: None,
+                });
+                continue;
+            }
             let result = inspector
                 .call(
                     "Debugger.getScriptSource",
@@ -437,7 +453,7 @@ impl ProfileArtifacts {
             sources.push(ScriptSource {
                 script_id: script_id.clone(),
                 url: url.clone(),
-                source: source.to_owned(),
+                source: Some(source.to_owned()),
             });
         }
         inspector
@@ -549,6 +565,13 @@ fn reference_cpu(
 struct Session {
     socket: WebSocket,
     next_id: AtomicU64,
+    /// Every script `Debugger.scriptParsed` reported. The profiler also
+    /// names code from runtime-internal scripts the debugger never
+    /// reports — workerd's `wasm-instantiate-shim.js` — whose source
+    /// `Debugger.getScriptSource` cannot return. Each access locks and
+    /// releases within one statement; the session's futures must be
+    /// `Send`, which rules out a `RefCell`.
+    reported_scripts: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl Session {
@@ -571,7 +594,16 @@ impl Session {
         Ok(Self {
             socket,
             next_id: AtomicU64::new(1),
+            reported_scripts: std::sync::Mutex::default(),
         })
+    }
+
+    /// Whether the debugger reported `script_id`.
+    fn reported(&self, script_id: &str) -> bool {
+        self.reported_scripts
+            .lock()
+            .expect("the reported-script set is never poisoned")
+            .contains(script_id)
     }
 
     /// Send one command and return its `result`, skipping the protocol
@@ -635,6 +667,14 @@ impl Session {
                             "inspector lifecycle"
                         );
                     }
+                    if event == "Debugger.scriptParsed"
+                        && let Some(script_id) = reply["params"]["scriptId"].as_str()
+                    {
+                        self.reported_scripts
+                            .lock()
+                            .expect("the reported-script set is never poisoned")
+                            .insert(script_id.to_owned());
+                    }
                     observe(&reply)?;
                 }
                 continue;
@@ -692,6 +732,11 @@ impl Inspector {
         params: serde_json::Value,
     ) -> stow_types::error::Result<serde_json::Value> {
         self.session.call(method, params).await
+    }
+
+    /// Whether the debugger reported `script_id`.
+    fn reported(&self, script_id: &str) -> bool {
+        self.session.reported(script_id)
     }
 
     /// Retain the same function through warm-up and sampling. The remote
@@ -1428,6 +1473,17 @@ mod tests {
                     .await
                     .expect("context");
             }
+            if method == "Debugger.enable" {
+                socket
+                    .send(async_tungstenite::tungstenite::Message::Text(
+                        serde_json::json!({"method":"Debugger.scriptParsed",
+                        "params":{"scriptId":"3","url":"worker.js","executionContextId":1}})
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .expect("script");
+            }
             let result = match method {
                 "Runtime.evaluate" => serde_json::json!({"result":{
                     "type":"function", "objectId":"reference"}}),
@@ -1656,16 +1712,25 @@ mod tests {
                 let request: serde_json::Value =
                     serde_json::from_str(request.to_text().expect("text")).expect("command");
                 assert_eq!(request["method"], method);
-                if method == "Runtime.enable" {
-                    let event = serde_json::json!({"method": "Runtime.executionContextCreated", "params": {"context": {
-                        "id": 1, "name": "Worker", "origin": "", "uniqueId": "test-context"
-                    }}});
+                let event = match method {
+                    "Runtime.enable" => Some(
+                        serde_json::json!({"method": "Runtime.executionContextCreated", "params": {"context": {
+                            "id": 1, "name": "Worker", "origin": "", "uniqueId": "test-context"
+                        }}}),
+                    ),
+                    "Debugger.enable" => {
+                        Some(serde_json::json!({"method": "Debugger.scriptParsed",
+                        "params": {"scriptId": "3", "url": "worker-module", "executionContextId": 1}}))
+                    }
+                    _ => None,
+                };
+                if let Some(event) = event {
                     socket
                         .send(async_tungstenite::tungstenite::Message::Text(
                             event.to_string().into(),
                         ))
                         .await
-                        .expect("context event");
+                        .expect("event");
                 }
                 let result = match method {
                     "Profiler.stop" => {
@@ -1695,12 +1760,22 @@ mod tests {
             artifacts
                 .scripts
                 .insert("3".to_owned(), "worker-module".to_owned());
+            // Release gate run 43983673114 sampled workerd's shim, which
+            // the debugger never reports; it is recorded without source
+            // and never asked for.
+            artifacts
+                .scripts
+                .insert("2".to_owned(), "wasm-instantiate-shim.js".to_owned());
             let sources = artifacts
                 .sources(&inspector)
                 .await
                 .expect("retained source");
-            assert_eq!(sources.len(), 1);
-            assert_eq!(sources[0].source, "retained source");
+            assert_eq!(sources.len(), 2);
+            assert_eq!(
+                (sources[0].url.as_str(), sources[0].source.as_deref()),
+                ("wasm-instantiate-shim.js", None)
+            );
+            assert_eq!(sources[1].source.as_deref(), Some("retained source"));
         };
         Box::pin(tokio::time::timeout(
             std::time::Duration::from_secs(10),
