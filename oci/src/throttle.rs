@@ -81,9 +81,12 @@ impl WriteBudget {
         self.per_minute
     }
 
-    /// Wait for one write's token.
+    /// Wait for one write's token. The grant is the instant the write is
+    /// issued, so it is traced for a test to observe
+    /// what the budget bounds.
     pub(crate) async fn acquire(&self) {
         self.limiter.until_ready().await;
+        tracing::trace!(target: "stow_oci::write_budget", "write granted");
     }
 }
 

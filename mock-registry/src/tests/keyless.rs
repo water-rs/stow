@@ -800,6 +800,47 @@ fn peak(arrivals: &[Instant], window: Duration) -> usize {
     best
 }
 
+/// The instants the write budget granted its tokens, read off the
+/// `stow_oci::write_budget` events the budget logs as it grants one, for
+/// as long as the guard lives on this thread.
+struct GrantLog {
+    grants: std::sync::Arc<std::sync::Mutex<Vec<Instant>>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+struct GrantLayer(std::sync::Arc<std::sync::Mutex<Vec<Instant>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for GrantLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() == "stow_oci::write_budget" {
+            self.0.lock().expect("grants poisoned").push(Instant::now());
+        }
+    }
+}
+
+impl GrantLog {
+    /// Record grants made on this thread: the test's current-thread
+    /// runtime runs the whole publish here.
+    fn install() -> Self {
+        use tracing_subscriber::layer::SubscriberExt;
+        let grants = std::sync::Arc::default();
+        let subscriber =
+            tracing_subscriber::registry().with(GrantLayer(std::sync::Arc::clone(&grants)));
+        Self {
+            grants,
+            _guard: tracing::subscriber::set_default(subscriber),
+        }
+    }
+
+    fn instants(&self) -> Vec<Instant> {
+        self.grants.lock().expect("grants poisoned").clone()
+    }
+}
+
 /// A sweep publishing many nodes at once against a registry that caps
 /// writes stays under the write budget — no write is ever refused — and
 /// completes with one certificate and exactly one Rekor entry per
@@ -811,6 +852,7 @@ async fn a_sweep_stays_under_the_write_budget() {
     // writes in any second, under the registry's 110.
     stack.probe.cap_writes(110, Duration::from_secs(1));
     let budget = stow_oci::WriteBudget::per_minute(NonZeroU32::new(3000).expect("rate"));
+    let grants = GrantLog::install();
     let session = stack.session(&budget);
     // 72 nodes at three writes each: 216 writes, past the budget's
     // 100-write first second.
@@ -824,13 +866,17 @@ async fn a_sweep_stays_under_the_write_budget() {
 
     assert_eq!(stack.probe.throttled_writes(), 0, "no write was refused");
     let arrivals = stack.probe.write_arrivals();
+    let grants = grants.instants();
     assert_eq!(
         arrivals.len(),
         nodes * 3,
         "requests: {:?}",
         stack.probe.request_log()
     );
-    let peak = peak(&arrivals, Duration::from_secs(1));
+    // The budget bounds when writes are issued, not when they arrive: a
+    // loaded runner can bunch arrivals the publisher spaced out.
+    assert_eq!(grants.len(), arrivals.len(), "every write took a grant");
+    let peak = peak(&grants, Duration::from_secs(1));
     assert!(peak <= 101, "{peak} writes in one second, over the budget");
     assert_eq!(stack.sigstore.certificates(), 1);
     assert_eq!(stack.sigstore.entries(), nodes);
