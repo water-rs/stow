@@ -6945,13 +6945,14 @@ pub struct DispatchClaim {
 }
 
 /// One pending task a dispatch pass refused because its dependency
-/// closure disagrees (stow#1481).
+/// closure disagrees (stow#1481) or holds a target-side node keyed at
+/// another triple (stow#1593).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClosureRefusal {
     /// The refused task.
     pub task_id: String,
     /// The failure the task settles with, naming the package its
-    /// closure holds twice.
+    /// closure holds twice or at another triple.
     pub error: String,
 }
 
@@ -7126,7 +7127,8 @@ pub enum SchedulerEvent {
     },
     /// One dispatch pass's refusals of pending tasks whose dependency
     /// closure holds two feature sets of one `(crate, version, target,
-    /// side)` (stow#1481), appended with the pass's `Claims`: each task
+    /// side)` (stow#1481) or a target-side node keyed at another triple
+    /// (stow#1593), appended with the pass's `Claims`: each task
     /// fails without a run, naming the package, and its dependents
     /// block as a failed build's do.
     ClosuresRefused {

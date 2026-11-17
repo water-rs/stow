@@ -695,8 +695,9 @@ pub struct ClaimedNode {
 }
 
 /// What one claim pass took, before any task id is minted: the nodes it
-/// claimed and the ones it refused for a disagreeing closure
-/// (stow#1481), which settled `failed` in the pass and never reach CI.
+/// claimed and the ones it refused for a closure their run could only
+/// fail on (stow#1481, stow#1593), which settled `failed` in the pass
+/// and never reach CI.
 #[derive(Debug, Default)]
 pub struct ClaimPass {
     claims: Vec<ClaimedNode>,
@@ -729,21 +730,23 @@ pub(super) struct ValidatedSubmission<'a> {
 }
 
 impl<'a> ValidatedSubmission<'a> {
-    /// A tree arriving at a submit route: its shape and identity, and a
-    /// closure that agrees (stow#1470) — a disagreeing one could only
-    /// fail on a runner.
+    /// A tree arriving at a submit route: its shape and identity, a
+    /// closure that agrees (stow#1470), and no target-side node keyed at
+    /// a triple other than its owner's (stow#1593) — a tree breaking
+    /// either could only fail on a runner.
     pub(super) fn new(tree: &'a SubmissionTree) -> Result<Self, QueueError> {
         // The shape check first: the agreement walk needs deps in range.
         let validated = Self::logged(tree)?;
         tree.ensure_closure_agreement()
+            .and_then(|()| tree.ensure_target_side_keys())
             .map_err(|error| QueueError::Invariant(error.to_string()))?;
         Ok(validated)
     }
 
     /// A tree the log already accepted: its shape and identity only. A
-    /// `Submit` row older than the closure-agreement check may hold a
-    /// disagreeing closure; it replays as accepted, and the claim pass
-    /// refuses the task it carries (stow#1481).
+    /// `Submit` row older than the closure checks may break one; it
+    /// replays as accepted, and the claim pass refuses the task it
+    /// carries (stow#1481, stow#1593).
     pub(super) fn logged(tree: &'a SubmissionTree) -> Result<Self, QueueError> {
         Ok(Self {
             tree,
@@ -2354,7 +2357,9 @@ impl Graph {
     /// A picked node whose dependency closure holds two feature sets of
     /// one `(crate, version, target, side)` is refused instead
     /// (stow#1481): the build's wrapper manifest declares a package
-    /// version once per side, so its run could only fail. It settles
+    /// version once per side, so its run could only fail. So is one
+    /// whose closure holds a target-side node keyed at another triple
+    /// (stow#1593), whose payload re-derives another task id. It settles
     /// `failed` here and takes the slot it would have claimed for this
     /// pass, so a pass examines and mints no more nodes than its free
     /// slots; the pass logs the refusals beside its claims.
@@ -2491,6 +2496,43 @@ impl Graph {
         Some(format!(
             "dependency closure holds {}",
             stow_types::feature_sets::disagreement_text(self.intern.at(crate_name), conflict)
+        ))
+    }
+
+    /// Why `ix`'s dispatch payload could only fail, as its refusal names
+    /// it: a disagreeing closure ([`Self::closure_disagreement`]) or a
+    /// target-side node keyed at another triple (stow#1593), whose
+    /// subgraph re-derives another task id on the runner.
+    fn closure_refusal(&self, ix: u32) -> Option<String> {
+        self.closure_disagreement(ix)
+            .or_else(|| self.foreign_target_side(ix))
+    }
+
+    /// The target-side node in `ix`'s closure keyed at a triple other
+    /// than `ix`'s own, as the refusal names it (stow#1593). One walk of
+    /// the closure the dispatch payload carries. Superset serving
+    /// produced such subtrees before it kept the rule; the submit path
+    /// now refuses them, and this settles the ones already merged.
+    fn foreign_target_side(&self, ix: u32) -> Option<String> {
+        let foreign = stow_types::task_graph::foreign_target_side_below(
+            ix as usize,
+            |at| self.nodes[at].target,
+            |at| self.nodes[at].flags.host(),
+            |at, stack| {
+                let at = u32::try_from(at).expect("arena indexes fit u32");
+                stack.extend(self.deps_of(at).map(|dep| dep as usize));
+            },
+        )?;
+        let node = &self.nodes[foreign];
+        let target_name = |target: u8| &self.targets[usize::from(target)].name;
+        Some(format!(
+            "dependency closure holds {}",
+            stow_types::task_graph::foreign_target_side_text(
+                self.intern.at(node.crate_name),
+                self.intern.at(node.version),
+                target_name(node.target),
+                target_name(self.node(ix).target),
+            )
         ))
     }
 
@@ -2647,7 +2689,7 @@ impl Graph {
             if family_is_macos {
                 macos_taken += 1;
             }
-            if let Some(error) = self.closure_disagreement(ix) {
+            if let Some(error) = self.closure_refusal(ix) {
                 self.refuse_closure(ix, error, now);
                 pass.refusals.push(ix);
                 continue;
@@ -5962,6 +6004,145 @@ mod tests {
         );
         let gcm = graph.node_ix(&id("aes-gcm")).expect("dependent");
         assert!(graph.node(gcm).flags.blocked(), "the dependent blocks");
+        assert!(graph.attempt_outcomes.is_empty(), "no run, no outcome");
+    }
+
+    /// The wasm target the stow#1593 tests key their consumer at.
+    const WASM: &str = "wasm32-unknown-unknown";
+
+    /// The stow#1593 pieces: `unicode-segmentation` on the target side
+    /// at the native triple, and a native consumer's host-side
+    /// `derive_more-impl` carrying its dedup-shadow edge onto it.
+    fn native_shadow_pair() -> (SubmissionNode, SubmissionNode) {
+        let segmentation = sub("unicode-segmentation");
+        let mut derive_impl = sub("derive_more-impl");
+        derive_impl.host_side = true;
+        derive_impl.task_id = minted_id(&derive_impl);
+        (segmentation, derive_impl)
+    }
+
+    /// `name` keyed at the wasm target, depending on `deps`.
+    fn wasm_sub(name: &str, deps: Vec<u32>) -> SubmissionNode {
+        let mut node = sub(name);
+        node.target = TargetTriple::parse(WASM).expect("target");
+        node.deps = deps;
+        node.task_id = minted_id(&node);
+        node
+    }
+
+    /// stow#1593: a wasm tree whose host-side node carries a native
+    /// consumer's shadow edge onto a target-side node at the native
+    /// triple is refused at the route — its payload would re-derive
+    /// another task id on the runner.
+    #[test]
+    fn a_target_side_node_at_another_triple_is_refused_at_submit() {
+        let (segmentation, mut derive_impl) = native_shadow_pair();
+        derive_impl.deps = vec![0];
+        let tree = SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![2],
+            nodes: vec![segmentation, derive_impl, wasm_sub("derive_more", vec![1])],
+        };
+        let error = Graph::default().merge(&tree, 0).expect_err("refused");
+        assert!(
+            error.to_string().contains(&format!(
+                "unicode-segmentation 1.0.0 on the target side for {TARGET}, which a node for {WASM} cannot carry"
+            )),
+            "{error}"
+        );
+    }
+
+    /// stow#1593: two trees that each keep the rule — a native one that
+    /// commits `derive_more-impl`'s shadow edge, and a wasm one naming
+    /// the published `derive_more-impl` bare — leave the wasm
+    /// `derive_more` with a native target-side node in its graph
+    /// closure. The claim refuses it without a run, naming that node,
+    /// while the native consumer dispatches.
+    #[test]
+    fn a_target_side_node_at_another_triple_in_the_graph_is_refused_at_claim() {
+        let (segmentation, mut derive_impl) = native_shadow_pair();
+        let rows = |node: &SubmissionNode, shapes: [(UnitSide, UnitInvocation, UnitKind); 2]| {
+            shapes.map(|(side, invocation, kind)| PublishedSliceRow {
+                crate_name: node.crate_name.clone(),
+                version: node.version.clone(),
+                features_json: node.features_json.clone(),
+                unit_shape: UnitShape {
+                    side,
+                    invocation,
+                    kind,
+                },
+                dependency_identity: node.dependency_identity.clone(),
+                node_profile: node.profile,
+            })
+        };
+        // A target-side node publishes its invocation's check and build
+        // shapes; a host-side one its linked shape on both invocations.
+        let published: Vec<_> = rows(
+            &segmentation,
+            [UnitKind::Unlinked, UnitKind::Linked]
+                .map(|kind| (UnitSide::Target, UnitInvocation::Native, kind)),
+        )
+        .into_iter()
+        .chain(rows(
+            &derive_impl,
+            [UnitInvocation::Native, UnitInvocation::Target]
+                .map(|invocation| (UnitSide::Host, invocation, UnitKind::Linked)),
+        ))
+        .collect();
+        let mut graph = Graph::default();
+        graph.apply_slice_report(TARGET, RUSTC, None, 1, &published, &[]);
+        derive_impl.deps = vec![0];
+        let mut native = sub("derive_more");
+        native.deps = vec![1];
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![2],
+                    nodes: vec![segmentation, derive_impl.clone(), native],
+                },
+                0,
+            )
+            .expect("the native tree keeps the rule");
+        derive_impl.deps.clear();
+        let wasm = wasm_sub("derive_more", vec![0]);
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![1],
+                    nodes: vec![derive_impl, wasm.clone()],
+                },
+                0,
+            )
+            .expect("the wasm tree keeps the rule on its own edges");
+        let pass = graph
+            .claim_nodes(&claim_settings(45, 16), 10_000, u32::MAX)
+            .expect("claim");
+        let minted = graph
+            .claimed(&pass, &mut graph.test_digest_source())
+            .expect("mint");
+        assert_eq!(
+            minted
+                .claims
+                .iter()
+                .map(|claim| claim.task_id.as_str())
+                .collect::<Vec<_>>(),
+            [id("derive_more")],
+            "the native consumer dispatches"
+        );
+        let [refusal] = minted.refusals.as_slice() else {
+            panic!("one refusal: {:?}", minted.refusals);
+        };
+        assert_eq!(refusal.task_id, wasm.task_id);
+        assert_eq!(
+            refusal.error,
+            format!(
+                "dependency closure holds unicode-segmentation 1.0.0 on the target side for {TARGET}, which a node for {WASM} cannot carry"
+            )
+        );
+        let ix = graph.node_ix(&wasm.task_id).expect("wasm derive_more");
+        assert_eq!(graph.node(ix).status, Status::Failed);
         assert!(graph.attempt_outcomes.is_empty(), "no run, no outcome");
     }
 

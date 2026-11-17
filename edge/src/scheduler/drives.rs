@@ -512,15 +512,27 @@ struct SubmitBatch {
     task_ids: Vec<String>,
 }
 
+/// The fixture row whose target the drives' own nodes take.
+const DRIVE_TARGET_ROW: u32 = 101;
+
+/// `CI_TARGET_TRIPLES`' index of the drives' target, which their
+/// published deps share: a closure keeps one target (stow#1593).
+fn drive_target_index() -> u32 {
+    DRIVE_TARGET_ROW % u32::try_from(CI_TARGET_TRIPLES.len()).expect("target count fits u32")
+}
+
 fn submit_batch(shape: FixtureShape, tag: u64) -> SubmitBatch {
-    let target = stow_types::fixture::target_of(101);
+    let target = stow_types::fixture::target_of(DRIVE_TARGET_ROW);
     let seed = DRIVE_SEED + tag * 1_000;
     let mut nodes = Vec::new();
     // Published deps enter as bare copies: an existing id merges as
     // itself, and the edge answers against the published masks.
     let resync_deps: Vec<u32> = (0..30)
         .map(|k| {
-            nodes.push(fixture::fixture_node(shape.dep_row(k), Vec::new()));
+            nodes.push(fixture::fixture_node(
+                shape.dep_row(drive_target_index(), k),
+                Vec::new(),
+            ));
             u32::try_from(nodes.len() - 1).expect("tree fits u32")
         })
         .collect();
@@ -531,7 +543,10 @@ fn submit_batch(shape: FixtureShape, tag: u64) -> SubmitBatch {
         resync_deps,
     ));
     let resync = u32::try_from(nodes.len() - 1).expect("tree fits u32");
-    nodes.push(fixture::fixture_node(shape.dep_row(31), Vec::new()));
+    nodes.push(fixture::fixture_node(
+        shape.dep_row(drive_target_index(), 31),
+        Vec::new(),
+    ));
     let fresh_dep = u32::try_from(nodes.len() - 1).expect("tree fits u32");
     nodes.push(fixture::named_node(
         "costgate-fresh",
@@ -733,7 +748,7 @@ fn request_report(shape: FixtureShape) -> stow_types::api::RequestOutcomeReport 
     let target = CI_TARGET_TRIPLES[0];
     let seed = DRIVE_SEED + TAG_UNTRUSTED * 1_000 + 500;
     let nodes = vec![
-        fixture::fixture_node(shape.dep_row(2), Vec::new()),
+        fixture::fixture_node(shape.dep_row(0, 2), Vec::new()),
         fixture::named_node("costgate-request-root", seed, target, vec![0]),
     ];
     stow_types::api::RequestOutcomeReport {
@@ -4149,9 +4164,8 @@ fn snapshot_node_id(k: u32) -> String {
 /// size that dirties a constant number of spans.
 fn snapshot_merge_tree(shape: FixtureShape) -> SubmissionTree {
     let target = stow_types::fixture::target_of(101);
-    let pool = shape.pending_end() + 3;
     let mut nodes: Vec<_> = (0..64)
-        .map(|leaf| fixture::fixture_node(pool + leaf, Vec::new()))
+        .map(|leaf| fixture::fixture_node(shape.pool_row(drive_target_index(), leaf), Vec::new()))
         .collect();
     nodes.extend((0..SNAPSHOT_MERGE_NODES).map(|k| {
         fixture::named_node(
@@ -4217,9 +4231,8 @@ async fn snapshot_slice_report(
 /// published masks as it merges.
 fn merge_tree(shape: FixtureShape) -> SubmissionTree {
     let target = stow_types::fixture::target_of(101);
-    let pool = shape.pending_end() + 3;
     let mut nodes: Vec<_> = (0..64)
-        .map(|leaf| fixture::fixture_node(pool + leaf, Vec::new()))
+        .map(|leaf| fixture::fixture_node(shape.pool_row(drive_target_index(), leaf), Vec::new()))
         .collect();
     nodes.extend((0..MERGE_NODES).map(|k| {
         fixture::named_node(

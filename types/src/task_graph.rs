@@ -647,6 +647,32 @@ pub fn foreign_target_side<T: PartialEq>(
     None
 }
 
+/// The first target-side node in `start`'s closure keyed at another triple.
+///
+/// It is [`foreign_target_side`]'s rule checked for one root, the closure
+/// its dispatch payload carries. One walk, each node visited once.
+pub fn foreign_target_side_below<T: PartialEq>(
+    start: usize,
+    target: impl Fn(usize) -> T,
+    host_side: impl Fn(usize) -> bool,
+    deps: impl Fn(usize, &mut Vec<usize>),
+) -> Option<usize> {
+    let own = target(start);
+    let mut seen = std::collections::HashSet::from([start]);
+    let mut stack = Vec::new();
+    deps(start, &mut stack);
+    while let Some(at) = stack.pop() {
+        if !seen.insert(at) {
+            continue;
+        }
+        if !host_side(at) && target(at) != own {
+            return Some(at);
+        }
+        deps(at, &mut stack);
+    }
+    None
+}
+
 /// What a closure breaking [`foreign_target_side`]'s rule holds, in the
 /// words every refusal of one uses: `<crate> <version> on the target
 /// side for <foreign>, which a node for <own> cannot carry`.
