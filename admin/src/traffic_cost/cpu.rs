@@ -78,15 +78,19 @@
 //! the profile is named correctly wherever it runs, so one clean
 //! invocation can be the one that compiled the climb's code; the next
 //! runs that code and is charged to the wrapper, which is why settling
-//! takes [`SETTLED_INVOCATIONS`] in a row.
+//! takes [`SETTLED_INVOCATIONS`] in a row. Even that can end early: in a
+//! release gate run the lanes knocked the reference back, two climbing
+//! invocations each compiled what they ran and looked clean, and the
+//! next ran that code and was charged entirely to the wrapper. A
+//! measured invocation charging more than
+//! [`REFERENCE_CALLER_SHARE_LIMIT`] outside the reference's own frames
+//! therefore discards the rounds measured so far and settles again, so
+//! every round follows the last invocation outside the settled code.
 //!
 //! The reference is unusable — and the pass fails rather than gate on
 //! it — when it returns anything but its checksum, when it does not
-//! settle, when a measured invocation charges more than
-//! [`REFERENCE_CALLER_SHARE_LIMIT`] of its JavaScript samples outside
-//! the reference's own frames (it left the settled code, or other work
-//! ran in the round), when a round collects too few samples to resolve,
-//! or when the reference before the lanes and after them disagree by
+//! stay settled through its rounds within [`REFERENCE_SETTLE_LIMIT`]
+//! invocations, or when the reference before the lanes and after them disagree by
 //! more than [`REFERENCE_DRIFT_LIMIT`]: the runner's speed moved during
 //! the pass, so no single reference describes every lane.
 
@@ -289,9 +293,10 @@ const REFERENCE_DRIFT_LIMIT: f64 = 1.25;
 /// compiled none of the code it ran.
 const SETTLED_INVOCATIONS: u32 = 2;
 
-/// The most profiled invocations settling may take. The local workerd
-/// settled the reference on its eleventh invocation, after one
-/// deoptimization restarted the climb; this allows several more
+/// The most profiled invocations settling and measuring may take
+/// together. The local workerd settled the reference on its eleventh
+/// invocation, after one deoptimization restarted the climb, and a
+/// measurement takes about [`ROUNDS`] more; this allows several more
 /// restarts, about a second of a release gate runner's CPU.
 const REFERENCE_SETTLE_LIMIT: u32 = 64;
 
@@ -844,21 +849,6 @@ impl ReferenceInvocation {
     fn settled(&self) -> bool {
         self.caller_share <= REFERENCE_CALLER_SHARE_LIMIT
     }
-
-    /// The CPU of a measured invocation, which must have run in the
-    /// settled code.
-    fn measured_cpu_ms(&self) -> stow_types::error::Result<f64> {
-        if self.settled() {
-            return Ok(self.cpu_ms);
-        }
-        Err(stow_error!(
-            "a measured reference invocation charged {:.0}% of its JavaScript samples outside \
-             the reference's own frames (limit {:.0}%) — it left the settled code, or other work \
-             ran in the round, so the round does not measure the settled reference",
-            self.caller_share * 100.0,
-            REFERENCE_CALLER_SHARE_LIMIT * 100.0
-        ))
-    }
 }
 
 impl Reference<'_> {
@@ -1157,80 +1147,79 @@ async fn measure_lane(
     })
 }
 
-/// Settle the retained function, then resolve each round to at least 100
-/// samples, every invocation in the settled code. Repeating the same
+/// Measure the retained function in its settled code. Repeating the same
 /// reference preserves the budget's per-invocation unit.
 async fn measure_reference(
     reference: &Reference<'_>,
     artifacts: &mut ProfileArtifacts,
 ) -> stow_types::error::Result<Vec<ReferenceRound>> {
-    let invocations =
-        settle_reference(async || reference.profiled_run(artifacts, "reference-settle").await)
-            .await?;
-    tracing::info!(invocations, "the reference settled");
-    let mut rounds = Vec::with_capacity(ROUNDS);
-    for _ in 0..ROUNDS {
-        rounds.push(
-            resolve_reference_round(async || {
-                reference
-                    .profiled_run(artifacts, "reference")
-                    .await?
-                    .measured_cpu_ms()
-            })
-            .await?,
-        );
-    }
-    Ok(rounds)
+    measure_settled(async |label| reference.profiled_run(artifacts, label).await).await
 }
 
 /// Invoke the reference until [`SETTLED_INVOCATIONS`] in a row ran in
-/// its own code, and return how many invocations that took.
-async fn settle_reference(
-    mut invoke: impl AsyncFnMut() -> stow_types::error::Result<ReferenceInvocation>,
-) -> stow_types::error::Result<u32> {
+/// its own code, then resolve [`ROUNDS`] rounds of at least
+/// [`MIN_REFERENCE_CPU_MS`] each. A measured invocation outside the
+/// settled code shows settling ended while V8 was still climbing, so it
+/// discards the rounds measured so far and settles again; every
+/// invocation, settling or measured, counts toward
+/// [`REFERENCE_SETTLE_LIMIT`].
+async fn measure_settled(
+    mut invoke: impl AsyncFnMut(&'static str) -> stow_types::error::Result<ReferenceInvocation>,
+) -> stow_types::error::Result<Vec<ReferenceRound>> {
     let mut in_a_row = 0;
     let mut shares = Vec::new();
-    for invocation in 1..=REFERENCE_SETTLE_LIMIT {
-        let run = invoke().await?;
+    let mut rounds = Vec::with_capacity(ROUNDS);
+    let (mut round_invocations, mut round_cpu_ms) = (0_u32, 0.0);
+    for _ in 0..REFERENCE_SETTLE_LIMIT {
+        let settling = in_a_row < SETTLED_INVOCATIONS;
+        let run = invoke(if settling {
+            "reference-settle"
+        } else {
+            "reference"
+        })
+        .await?;
         shares.push(format!("{:.0}%", run.caller_share * 100.0));
-        in_a_row = if run.settled() { in_a_row + 1 } else { 0 };
-        if in_a_row == SETTLED_INVOCATIONS {
-            return Ok(invocation);
+        if !run.settled() {
+            if !settling {
+                tracing::warn!(
+                    caller_share = run.caller_share,
+                    discarded_rounds = rounds.len(),
+                    "a measured reference invocation left the settled code; settling again"
+                );
+                rounds.clear();
+                (round_invocations, round_cpu_ms) = (0, 0.0);
+            }
+            in_a_row = 0;
+            continue;
+        }
+        if settling {
+            in_a_row += 1;
+            if in_a_row == SETTLED_INVOCATIONS {
+                tracing::info!(invocations = shares.len(), "the reference settled");
+            }
+            continue;
+        }
+        round_invocations += 1;
+        round_cpu_ms += run.cpu_ms;
+        if round_cpu_ms >= MIN_REFERENCE_CPU_MS {
+            rounds.push(ReferenceRound {
+                invocations: std::num::NonZeroU32::new(round_invocations)
+                    .expect("a resolved round invoked the reference"),
+                sampled_cpu_ms: round_cpu_ms,
+            });
+            (round_invocations, round_cpu_ms) = (0, 0.0);
+            if rounds.len() == ROUNDS {
+                return Ok(rounds);
+            }
         }
     }
     Err(stow_error!(
-        "the reference did not run {SETTLED_INVOCATIONS} invocations in a row in its own code \
-         within {REFERENCE_SETTLE_LIMIT} — V8 never settled it, so no round would measure the \
-         settled reference (share of each invocation's samples outside it: {})",
+        "the reference did not stay in its own code through {SETTLED_INVOCATIONS} settling \
+         invocations and {ROUNDS} measured rounds within {REFERENCE_SETTLE_LIMIT} invocations — \
+         V8 never settled it, so no round would measure the settled reference (share of each \
+         invocation's samples outside it: {})",
         shares.join(" ")
     ))
-}
-
-async fn resolve_reference_round(
-    mut sample: impl AsyncFnMut() -> stow_types::error::Result<f64>,
-) -> stow_types::error::Result<ReferenceRound> {
-    let mut invocations = 0_u32;
-    let mut sampled_cpu_ms = 0.0;
-    loop {
-        let cpu_ms = sample().await?;
-        if cpu_ms <= 0.0 {
-            return Err(stow_error!(
-                "a complete reference invocation collected no CPU samples"
-            ));
-        }
-        invocations = invocations
-            .checked_add(1)
-            .ok_or_else(|| stow_error!("reference invocation count overflow"))?;
-        sampled_cpu_ms += cpu_ms;
-        if sampled_cpu_ms >= MIN_REFERENCE_CPU_MS {
-            break;
-        }
-    }
-    Ok(ReferenceRound {
-        invocations: std::num::NonZeroU32::new(invocations)
-            .expect("a resolved round invoked the reference"),
-        sampled_cpu_ms,
-    })
 }
 
 /// Connect and verify that idle isolate time is not counted as CPU.
@@ -1767,25 +1756,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fast_reference_accumulates_complete_invocations_and_zero_samples_fail() {
-        let mut calls = 0;
-        let round = super::resolve_reference_round(async || {
-            calls += 1;
-            Ok(8.5)
+    async fn a_fast_reference_accumulates_complete_invocations() {
+        let mut labels = Vec::new();
+        let rounds = super::measure_settled(async |label| {
+            labels.push(label);
+            Ok(super::ReferenceInvocation {
+                cpu_ms: 8.5,
+                caller_share: 0.0,
+            })
         })
         .await
-        .expect("resolved round");
-        assert_eq!(calls, 2);
-        assert_eq!(round.invocations.get(), 2);
-        assert!(close(round.sampled_cpu_ms, 17.0));
-        assert!(close(round.per_invocation_ms(), 8.5));
-        assert!(
-            super::resolve_reference_round(async || Ok(0.0))
-                .await
-                .is_err()
+        .expect("resolved rounds");
+        assert_eq!(
+            labels,
+            [
+                "reference-settle",
+                "reference-settle",
+                "reference",
+                "reference",
+                "reference",
+                "reference",
+                "reference",
+                "reference",
+            ]
         );
+        assert_eq!(rounds.len(), super::ROUNDS);
+        for round in &rounds {
+            assert_eq!(round.invocations.get(), 2);
+            assert!(close(round.sampled_cpu_ms, 17.0));
+            assert!(close(round.per_invocation_ms(), 8.5));
+        }
         assert!(
-            super::resolve_reference_round(async || Err(stow_types::stow_error!("capture failed")))
+            super::measure_settled(async |_| Err(stow_types::stow_error!("capture failed")))
                 .await
                 .is_err()
         );
@@ -1895,12 +1897,11 @@ mod tests {
         let climbing = super::ReferenceInvocation::of(&reference_profile(110, 30, 8), &located());
         assert!(close(climbing.caller_share, 110.0 / 148.0));
         assert!(!climbing.settled());
-        assert!(climbing.measured_cpu_ms().is_err());
         // After them: 4 on the wrapper, 137 on the reference.
         let settled = super::ReferenceInvocation::of(&reference_profile(4, 130, 7), &located());
         assert!(close(settled.caller_share, 4.0 / 141.0));
         assert!(close(settled.cpu_ms, 14.6));
-        assert!(close(settled.measured_cpu_ms().expect("settled"), 14.6));
+        assert!(settled.settled());
         // A profile whose samples never resolve to the reference is
         // charged entirely to its caller.
         let unresolved = super::ReferenceInvocation::of(&reference_profile(0, 0, 0), &located());
@@ -1924,19 +1925,20 @@ mod tests {
     #[tokio::test]
     async fn the_reference_settles_on_consecutive_invocations_in_its_own_code() {
         let series = [
-            0.22, 0.97, 0.92, 0.93, 0.93, 0.39, 0.58, 0.88, 0.94, 0.86, 0.09, 0.01, 0.02,
+            0.22, 0.97, 0.92, 0.93, 0.93, 0.39, 0.58, 0.88, 0.94, 0.86, 0.09, 0.01, 0.02, 0.03,
+            0.04, 0.05,
         ];
         let mut calls = 0;
-        let settled = super::settle_reference(async || {
+        let rounds = super::measure_settled(async |_| {
             calls += 1;
             Ok(invocation(series[calls - 1]))
         })
         .await
         .expect("settled");
-        assert_eq!((settled, calls), (12, 12));
+        assert_eq!((rounds.len(), calls), (super::ROUNDS, 15));
 
         let mut calls = 0;
-        let error = super::settle_reference(async || {
+        let error = super::measure_settled(async |_| {
             calls += 1;
             Ok(invocation(if calls % 2 == 0 { 0.9 } else { 0.0 }))
         })
@@ -1944,16 +1946,60 @@ mod tests {
         .expect_err("never two in a row")
         .to_string();
         assert_eq!(calls, super::REFERENCE_SETTLE_LIMIT as usize);
-        assert!(
-            error.contains("did not run 2 invocations in a row"),
-            "{error}"
-        );
+        assert!(error.contains("did not stay in its own code"), "{error}");
 
         assert!(
-            super::settle_reference(async || Err(stow_types::stow_error!("checksum")))
+            super::measure_settled(async |_| Err(stow_types::stow_error!("checksum")))
                 .await
                 .is_err()
         );
+    }
+
+    /// Release gate run 43983673114: two climbing invocations looked
+    /// clean and the next measured one was charged entirely to the
+    /// wrapper. The pass settles again and measures every round after
+    /// it.
+    #[tokio::test]
+    async fn a_measured_invocation_outside_the_settled_code_settles_again() {
+        let series = [0.08, 0.05, 0.03, 1.0, 0.02, 0.02, 0.02, 0.02, 0.02];
+        let mut labels = Vec::new();
+        let rounds = super::measure_settled(async |label| {
+            labels.push(label);
+            let share = series[labels.len() - 1];
+            Ok(super::ReferenceInvocation {
+                cpu_ms: if labels.len() == 3 { 99.0 } else { 15.0 },
+                caller_share: share,
+            })
+        })
+        .await
+        .expect("settled again");
+        assert_eq!(
+            labels,
+            [
+                "reference-settle",
+                "reference-settle",
+                "reference",
+                "reference",
+                "reference-settle",
+                "reference-settle",
+                "reference",
+                "reference",
+                "reference",
+            ]
+        );
+        // The round measured before the unsettled invocation is discarded.
+        assert!(rounds.iter().all(|round| close(round.sampled_cpu_ms, 15.0)));
+
+        let mut calls = 0;
+        let error = super::measure_settled(async |_| {
+            calls += 1;
+            Ok(invocation(if calls % 3 == 0 { 1.0 } else { 0.0 }))
+        })
+        .await
+        .expect_err("never stays settled")
+        .to_string();
+        assert_eq!(calls, super::REFERENCE_SETTLE_LIMIT as usize);
+        assert!(error.contains("did not stay in its own code"), "{error}");
     }
 
     /// Idle samples are not CPU; every other sample is one interval.
