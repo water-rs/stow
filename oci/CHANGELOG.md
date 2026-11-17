@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.6](https://github.com/water-rs/stow/compare/oci/v0.21.5...oci/v0.21.6) - 2026-11-17
+
+### Fixed
+
+- *(index)* replay a lost slice report from the generation the scheduler holds ([#1582](https://github.com/water-rs/stow/pull/1582))
+
+### Other
+
+- Merge pull request #1590 from water-rs/dev
+- measure the write-budget sweep on the publisher's grant times ([#1589](https://github.com/water-rs/stow/pull/1589))
+
 ## [0.21.4](https://github.com/water-rs/stow/compare/oci/v0.21.3...oci/v0.21.4) - 2026-11-16
 
 ### Other
