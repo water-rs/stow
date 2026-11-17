@@ -4382,6 +4382,70 @@ mod tests {
         }
     }
 
+    /// stow#1593 on the published side: the host slice serves `imp`'s
+    /// containing set from a native consumer's row whose
+    /// `dependency_task_ids` name the target-side `seg` at the host
+    /// triple — its dedup-shadow pin. Under the wasm root that move
+    /// would mint an id no dispatch payload re-derives, so `imp` keeps
+    /// its own set and the tree carries no target-side node at the host
+    /// triple.
+    #[test]
+    fn substitution_keeps_a_published_native_subtree_out_of_a_wasm_closure() {
+        use crate::identity::DependencyIdentity;
+        use crate::task_graph::TaskNodeIdentity;
+
+        const TARGET: &str = "wasm32-unknown-unknown";
+        const HOST: &str = "x86_64-unknown-linux-gnu";
+        let seg_task_id = TaskNodeIdentity {
+            crate_name: "seg".parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::default(),
+            target: HOST.parse().expect("host"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            host_side: false,
+            profile: crate::node_profile::NodeProfile::Dev,
+        }
+        .task_id(&DependencyIdentity::leaf().expect("leaf digest"));
+        let published = vec![crate::api::PublishedIndexSlice {
+            local_programs: Vec::new(),
+            target: HOST.parse().expect("host"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            rows: vec![
+                published_row("seg", &[], &[], Vec::new(), "11", false),
+                published_row(
+                    "imp",
+                    &["a", "b"],
+                    &[("seg", "11")],
+                    vec![seg_task_id],
+                    "22",
+                    true,
+                ),
+            ],
+        }];
+        let mut submitted = tree(vec![
+            submission_node("app", &[], &[1], "app-sub"),
+            submission_node("imp", &["a"], &[], "imp-a-sub"),
+        ]);
+        submitted.nodes[0].target = TARGET.parse().expect("target");
+        submitted.nodes[1].target = HOST.parse().expect("host");
+        submitted.nodes[1].host_side = true;
+        let mut trees = vec![submitted];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        let tree = &trees[0];
+        assert_eq!(
+            sets_of(tree, "imp", true),
+            BTreeSet::from([vec!["a".to_owned()]])
+        );
+        assert!(
+            tree.nodes
+                .iter()
+                .all(|node| node.crate_name.as_str() != "seg"),
+            "no target-side node at the host triple joins the wasm closure"
+        );
+        tree.ensure_target_side_keys().expect("the rule holds");
+    }
+
     /// A hand-built node of a real package at a real version.
     fn versioned_node(
         crate_name: &str,
@@ -5607,6 +5671,48 @@ impl SubmissionTree {
         Ok(())
     }
 
+    /// Reject a tree in which a node's dependency closure holds a
+    /// target-side node at a triple other than the node's own
+    /// (stow#1593, [`crate::task_graph::foreign_target_side`]): that
+    /// node's dispatch payload re-derives another task id, so it can
+    /// never build. A resolve keeps the rule; superset serving checks it
+    /// holds on what it is handed.
+    ///
+    /// # Errors
+    /// `Error` naming the owning task and the target-side node it holds
+    /// at another triple. Dep indexes must be in range.
+    pub fn ensure_target_side_keys(&self) -> crate::error::Result<()> {
+        crate::task_graph::foreign_target_side(
+            self.nodes.len(),
+            |index| &self.nodes[index].target,
+            |index| self.nodes[index].host_side,
+            |index, stack| stack.extend(self.nodes[index].deps.iter().map(|&dep| dep as usize)),
+        )
+        .map_or(Ok(()), |foreign| {
+            Err(self.foreign_target_side_error(foreign))
+        })
+    }
+
+    /// The refusal of a tree whose node `foreign.owner` holds the
+    /// target-side node `foreign.foreign` at another triple.
+    fn foreign_target_side_error(
+        &self,
+        foreign: crate::task_graph::ForeignTargetSide,
+    ) -> crate::error::Error {
+        let owner = &self.nodes[foreign.owner];
+        let node = &self.nodes[foreign.foreign];
+        stow_error!(
+            "the closure of task {} holds {}",
+            owner.task_id,
+            crate::task_graph::foreign_target_side_text(
+                &node.crate_name,
+                &node.version,
+                &node.target,
+                &owner.target,
+            )
+        )
+    }
+
     /// The member `group` holds in node `start`'s closure, walked over
     /// this tree's own edges without descending below a node `stop`
     /// accepts. `stop` sees every node the walk visits.
@@ -5691,9 +5797,16 @@ impl SubmissionTree {
     /// union — and the pass reruns until no closure disagrees, so what
     /// moves is a function of the batch alone.
     ///
+    /// The same block keeps a serving set's subtree out of a closure it
+    /// would hand a target-side node at a foreign triple (stow#1593):
+    /// a native consumer's host node pins its host dependencies'
+    /// target-side twins at the host triple, and spliced under a root of
+    /// another target it mints an id no dispatch payload re-derives.
+    ///
     /// # Errors
     /// Fails as [`ResolvedTaskGraph::resolve`] does, when a tree's own
-    /// closure holds two sets of one package, and fails fast when
+    /// closure holds two sets of one package or a target-side node at a
+    /// foreign triple, and fails fast when
     /// a reconstructed published subtree resolves to an id other than
     /// the row's published one.
     ///
@@ -5709,6 +5822,7 @@ impl SubmissionTree {
         // resolve's output; moves can only agree with closures that do.
         for tree in trees.iter() {
             tree.ensure_closure_agreement()?;
+            tree.ensure_target_side_keys()?;
         }
         // Each group's distinct feature sets over the batch ∪ the
         // published slices, and the serving map over them: a set
@@ -6353,11 +6467,15 @@ impl Substitution<'_> {
     /// blocked node's twin (same package and set on the other side,
     /// stow#723) is blocked with it, so the pair stays together.
     ///
+    /// The moves that splice a target-side node at a foreign triple
+    /// into a closure are blocked too (stow#1593, see
+    /// [`Self::target_side_moves_to_block`]).
+    ///
     /// # Errors
     /// Fails naming the package when a closure disagrees and no move
     /// accounts for it.
     fn moves_to_block(&self) -> crate::error::Result<BTreeSet<(usize, usize)>> {
-        let mut fresh = BTreeSet::new();
+        let mut fresh = self.target_side_moves_to_block()?;
         for (tree_index, tree) in self.trees.iter().enumerate() {
             for &root in &tree.roots {
                 let image = self.memo[&(tree_index, root as usize)];
@@ -6417,6 +6535,129 @@ impl Substitution<'_> {
             }
         }
         Ok(fresh)
+    }
+
+    /// The moves to block so that no closure a root reaches holds a
+    /// target-side node at a triple other than its owner's (stow#1593,
+    /// [`crate::task_graph::foreign_target_side`]).
+    ///
+    /// A serving set's node carries the dependency context of the tree it
+    /// was resolved in: a native consumer's host node pins the
+    /// target-side twins of its host dependencies at the host triple
+    /// (stow#506, stow#723), and a published row records the same edges.
+    /// Spliced under a root of another target, that subtree mints an id
+    /// whose dispatch payload re-derives another one, and no build of
+    /// the root's target compiles it. Such a move keeps its own chain
+    /// and exact set, as a disagreeing one does (stow#1470).
+    ///
+    /// Each round reads the arena once: per node the triples of the
+    /// target-side nodes its closure holds and whether the closure keeps
+    /// the rule inside, then walks every tree from its roots over the
+    /// occurrences that kept their own chain.
+    ///
+    /// # Errors
+    /// Fails naming the node when a closure breaks the rule and no move
+    /// accounts for it.
+    fn target_side_moves_to_block(&self) -> crate::error::Result<BTreeSet<(usize, usize)>> {
+        // Every arena node is pushed after its dependencies, so one
+        // forward pass sees each node's children first.
+        let mut held = Vec::<Vec<&TargetTriple>>::with_capacity(self.arena.len());
+        let mut keeps = Vec::<bool>::with_capacity(self.arena.len());
+        for node in &self.arena {
+            let own = &node.identity.target;
+            let mut targets = Vec::new();
+            if !node.identity.host_side {
+                targets.push(own);
+            }
+            let mut inside = true;
+            for &dep in &node.dependencies {
+                inside &= keeps[dep] && held[dep].iter().all(|target| *target == own);
+                targets.extend(held[dep].iter().copied());
+            }
+            targets.sort_unstable();
+            targets.dedup();
+            held.push(targets);
+            keeps.push(inside);
+        }
+        let foreign = |image: usize, own: &TargetTriple| held[image].iter().any(|t| *t != own);
+
+        let mut fresh = BTreeSet::new();
+        for (tree_index, tree) in self.trees.iter().enumerate() {
+            let occurrence = |node_index: usize| (tree_index, node_index);
+            let mut seen = BTreeSet::new();
+            let mut stack: Vec<usize> = tree.roots.iter().map(|&root| root as usize).collect();
+            while let Some(node_index) = stack.pop() {
+                if !seen.insert(node_index) || self.moved.contains(&occurrence(node_index)) {
+                    continue;
+                }
+                let own = &tree.nodes[node_index].target;
+                for &dep in &tree.nodes[node_index].deps {
+                    let dep = dep as usize;
+                    let image = self.memo[&occurrence(dep)];
+                    if self.moved.contains(&occurrence(dep)) {
+                        if !keeps[image] || foreign(image, own) {
+                            fresh.insert(occurrence(dep));
+                        }
+                    } else if foreign(image, own) {
+                        self.block_foreign_below(
+                            (tree_index, node_index),
+                            dep,
+                            &foreign,
+                            &mut fresh,
+                        )?;
+                    }
+                    stack.push(dep);
+                }
+            }
+        }
+        Ok(fresh)
+    }
+
+    /// Block the moves at or under `node_index`, a dependency of the kept
+    /// occurrence `owner`, that bring a target-side node at a triple
+    /// other than the owner's into its closure. A kept target-side node
+    /// at another triple is the submitted tree's own, which no move
+    /// accounts for.
+    fn block_foreign_below(
+        &self,
+        (tree_index, owner): (usize, usize),
+        node_index: usize,
+        foreign: &impl Fn(usize, &TargetTriple) -> bool,
+        fresh: &mut BTreeSet<(usize, usize)>,
+    ) -> crate::error::Result<()> {
+        let tree = &self.trees[tree_index];
+        let want = &tree.nodes[owner].target;
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![node_index];
+        while let Some(at) = stack.pop() {
+            if !seen.insert(at) {
+                continue;
+            }
+            if self.moved.contains(&(tree_index, at)) {
+                fresh.insert((tree_index, at));
+                continue;
+            }
+            let node = &tree.nodes[at];
+            if !node.host_side && node.target != *want {
+                return Err(stow_error!(
+                    "the closure of task {} holds {}",
+                    tree.nodes[owner].task_id,
+                    crate::task_graph::foreign_target_side_text(
+                        &node.crate_name,
+                        &node.version,
+                        &node.target,
+                        want,
+                    )
+                ));
+            }
+            stack.extend(
+                node.deps
+                    .iter()
+                    .map(|&dep| dep as usize)
+                    .filter(|&dep| foreign(self.memo[&(tree_index, dep)], want)),
+            );
+        }
+        Ok(())
     }
 
     /// The first group holding two members in arena node `image`'s
