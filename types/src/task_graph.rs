@@ -562,6 +562,106 @@ fn declare_union_deps(
     }
 }
 
+/// A target-side node keyed at a triple other than that of a node whose
+/// dependency closure holds it (stow#1593): `owner` and `foreign` index
+/// the caller's node list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForeignTargetSide {
+    /// The node whose closure holds `foreign`.
+    pub owner: usize,
+    /// The target-side node at another triple.
+    pub foreign: usize,
+}
+
+/// The first node whose dependency closure, below the node itself, holds
+/// a target-side node at a triple other than the node's own — `None`
+/// when every node keeps the rule.
+///
+/// The rule is what a dispatch payload can carry: its wire subgraph
+/// ([`crate::api::TaskSubgraph`]) keys every target-side node at the
+/// task's own target and every host-side node at the runner family's
+/// host triple, so a node breaking it dispatches a subgraph that
+/// re-derives another task id, and no build of the task's target could
+/// compile a target-side unit for another triple anyway. A native
+/// consumer's host node legitimately depends on target-side nodes at the
+/// host triple — dedup-shadow and self-twin edges (stow#506, stow#723);
+/// the same node inside a closure rooted at another target does not.
+///
+/// One post-order pass, each node and edge visited once: every node
+/// records one target-side node its closure holds (itself when it is
+/// target-side), and because a node is checked only after its
+/// dependencies keep the rule, every target-side node in one closure
+/// shares that one's target. `deps` pushes a node's direct
+/// dependencies; a cycle is not this check's to report, so an edge
+/// back into the walk's own path is skipped.
+pub fn foreign_target_side<T: PartialEq>(
+    len: usize,
+    target: impl Fn(usize) -> T,
+    host_side: impl Fn(usize) -> bool,
+    deps: impl Fn(usize, &mut Vec<usize>),
+) -> Option<ForeignTargetSide> {
+    // `Some(held)` once a node is done: the target-side node its closure
+    // holds, if any.
+    let mut done = vec![None::<Option<usize>>; len];
+    let mut on_path = vec![false; len];
+    let mut children = Vec::new();
+    for start in 0..len {
+        if done[start].is_some() {
+            continue;
+        }
+        let mut stack = vec![(start, false)];
+        while let Some((at, expanded)) = stack.pop() {
+            if done[at].is_some() {
+                continue;
+            }
+            children.clear();
+            deps(at, &mut children);
+            if !expanded {
+                if on_path[at] {
+                    continue;
+                }
+                on_path[at] = true;
+                stack.push((at, true));
+                stack.extend(
+                    children
+                        .iter()
+                        .filter(|&&child| done[child].is_none() && !on_path[child])
+                        .map(|&child| (child, false)),
+                );
+                continue;
+            }
+            on_path[at] = false;
+            let mut held = (!host_side(at)).then_some(at);
+            for &child in &children {
+                let Some(Some(foreign)) = done[child] else {
+                    continue;
+                };
+                if target(foreign) != target(at) {
+                    return Some(ForeignTargetSide { owner: at, foreign });
+                }
+                held.get_or_insert(foreign);
+            }
+            done[at] = Some(held);
+        }
+    }
+    None
+}
+
+/// What a closure breaking [`foreign_target_side`]'s rule holds, in the
+/// words every refusal of one uses: `<crate> <version> on the target
+/// side for <foreign>, which a node for <own> cannot carry`.
+#[must_use]
+pub fn foreign_target_side_text(
+    crate_name: impl std::fmt::Display,
+    version: impl std::fmt::Display,
+    foreign_target: impl std::fmt::Display,
+    own_target: impl std::fmt::Display,
+) -> String {
+    format!(
+        "{crate_name} {version} on the target side for {foreign_target}, which a node for {own_target} cannot carry"
+    )
+}
+
 // The wire shape is the input nodes alone: computed digests and task
 // ids are re-derived by `resolve` on read, so a serialized graph can
 // never carry a forged identity.
