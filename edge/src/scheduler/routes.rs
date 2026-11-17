@@ -1618,12 +1618,14 @@ mod eviction_tests {
         commit(live, &db, &events, HOST_NOW_MS)
             .await
             .expect("report");
+        // The owner sits on its dependency's target, outside the report.
+        let targets = u32::try_from(stow_types::api::CI_TARGET_TRIPLES.len()).expect("fits u32");
         let tree = SubmissionTree {
             source: stow_types::api::SubmissionSource::CacheMiss,
             roots: Vec::new(),
             nodes: vec![
                 fixture::fixture_node(published + 5, Vec::new()),
-                fixture::fixture_node(SHAPE.queue_rows + 4000, vec![0]),
+                fixture::fixture_node(published + 5 + 100 * targets, vec![0]),
             ],
         };
         commit_trees(live, &db, &[tree], None, HOST_NOW_MS)
@@ -2844,15 +2846,20 @@ mod backlog_tests {
     /// Fixture rows far outside the seeded range, so every node is new.
     const FIRST_ROW: u32 = 7_000_000;
 
-    /// `nodes` nodes from row `first`, each depending on the one before.
+    /// `nodes` nodes from position `first`, each depending on the one
+    /// before. Position `p` is fixture row `p * targets`, so every node
+    /// sits on one target — a closure holds one (stow#1593), and the
+    /// fixture spreads rows over the targets by `n % targets` — while
+    /// chains at overlapping positions share their nodes.
     fn chain(source: SubmissionSource, first: u32, nodes: u32) -> SubmissionTree {
+        let targets = u32::try_from(stow_types::api::CI_TARGET_TRIPLES.len()).expect("fits u32");
         SubmissionTree {
             source,
             roots: vec![0],
             nodes: (0..nodes)
                 .map(|k| {
                     let deps = if k == 0 { Vec::new() } else { vec![k - 1] };
-                    fixture::fixture_node(first + k, deps)
+                    fixture::fixture_node((first + k) * targets, deps)
                 })
                 .collect(),
         }

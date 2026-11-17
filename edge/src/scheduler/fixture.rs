@@ -276,26 +276,45 @@ fn dispatch_window(settings: &super::queue::SchedulerSettings) -> u32 {
 /// The dependency ids of pending node `n`, every one a node already in
 /// the graph by the time `n`'s tree merges (rows above `pending_end`
 /// are built first, and pending deps point at lower `n`).
+///
+/// Every dep sits on `n`'s own target ([`target_of`] spreads rows by
+/// `n % targets`): a closure holding a target-side node at another
+/// triple is refused at submit and at claim (stow#1593), as no real
+/// resolve produces one.
 fn pending_deps(shape: FixtureShape, eligible_rows: u32, n: u32) -> Vec<u32> {
     let rows = shape.queue_rows;
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
     let eligible_end = human_end + eligible_rows;
-    // The pool starts at `completed_row(2)`, clear of the purge
-    // drive's `completed_row(0)`/`completed_row(1)`; the `n % 64` pool
-    // spreads the window's edges over 64 published leaves so no leaf
-    // accrues fan-in that grows with the window.
-    let pool = shape.pending_end() + 3 + n % 64;
+    let targets = u32::try_from(CI_TARGET_TRIPLES.len()).expect("target count fits u32");
+    // The first row at or above `pick` on `n`'s target.
+    let up = |pick: u32| pick + (n % targets + targets - pick % targets) % targets;
+    // The first failed row on `n`'s target: a met-never edge.
+    let failed = up(shape.failed_row(0));
+    // The last row at or below `pick` on `n`'s target, or the failed
+    // row when none is left above row 0.
+    let down =
+        |pick: u32| match pick.checked_sub((pick % targets + targets - n % targets) % targets) {
+            Some(row) if row > 0 => row,
+            _ => failed,
+        };
+    let pool = shape.pool_row(n % targets, n % 64);
     // A pending dep always points below `n`, so it merged earlier.
     let lower = |pick: u32| -> u32 {
         if pick <= shape.pending_end() && pick >= n {
             if n > 1 {
-                pick % (n - 1) + 1
+                down(pick % (n - 1) + 1)
             } else {
-                shape.failed_row(0)
+                failed
             }
+        } else if pick <= shape.pending_end() {
+            down(pick)
         } else {
-            pick
+            // Above the pending group: stay above it and within the
+            // queue, which ends on failed rows.
+            Some(down(pick))
+                .filter(|&row| row > shape.pending_end())
+                .unwrap_or_else(|| up(pick))
         }
     };
     if n > human_pin && n <= human_end {
@@ -308,17 +327,17 @@ fn pending_deps(shape: FixtureShape, eligible_rows: u32, n: u32) -> Vec<u32> {
         // unmet one — the production state a parked row holds.
         let mut deps = vec![pool];
         if n % 20 == 1 {
-            deps.push(spread(n, 7919, n - 1) + 1);
+            deps.push(down(spread(n, 7919, n - 1) + 1));
         }
         return deps;
     }
     // Bulk: the first edge is an unmet lower pending node (or a failed
-    // one for the first row), so no bulk row is claimable; every third
-    // row adds a spread edge onto the whole queue.
+    // one when none is left below), so no bulk row is claimable; every
+    // third row adds a spread edge onto the whole queue.
     let first = if n > 1 {
-        spread(n, 7919, n - 1) + 1
+        down(spread(n, 7919, n - 1) + 1)
     } else {
-        shape.failed_row(0)
+        failed
     };
     let mut deps = vec![first];
     if n.is_multiple_of(3) {
