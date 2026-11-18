@@ -27,6 +27,7 @@ const STOW_MAX_CONCURRENT_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_JOBS";
 const STOW_MAX_CONCURRENT_MACOS_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_MACOS_JOBS";
 const STOW_STALE_DISPATCH_MINUTES_BINDING: &str = "STOW_STALE_DISPATCH_MINUTES";
 const STOW_MAX_QUEUE_PENDING_BINDING: &str = "STOW_MAX_QUEUE_PENDING";
+const STOW_MIN_CLI_VERSION_BINDING: &str = "STOW_MIN_CLI_VERSION";
 const STOW_HUMAN_DAILY_TASK_BUDGET_BINDING: &str = "STOW_HUMAN_DAILY_TASK_BUDGET";
 const STOW_MIN_DISPATCH_VALUE_BINDING: &str = "STOW_MIN_DISPATCH_VALUE";
 const STOW_SCHEDULER_MEMORY_LINE_BINDING: &str = "STOW_SCHEDULER_MEMORY_LINE";
@@ -743,7 +744,8 @@ async fn submit_tasks(
     // so it is refused before its tree reaches the graph — on the
     // graph the submit loads anyway.
     let loaded = ensure_graph(&env, &db, &graph).await?;
-    let minimum = loaded.with(|graph| graph.min_cli_version());
+    let deployed = deployed_min_cli_version(&env)?;
+    let minimum = loaded.with(|graph| graph.min_cli_version(&deployed));
     if let Err(refusal) = producer::check(user_agent.0.as_deref(), &minimum) {
         tracing::info!(%refusal, "refused a submission from an outdated or unidentified producer");
         return Err(Error::msg(refusal.to_string()).set_status(StatusCode::UPGRADE_REQUIRED));
@@ -1748,7 +1750,26 @@ async fn read_min_cli_version(
     db: DurableDb,
 ) -> Result<Json<stow_types::api::MinCliVersion>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
-    Ok(Json(graph.with(|graph| graph.min_cli_version_view())))
+    let deployed = deployed_min_cli_version(&env)?;
+    Ok(Json(
+        graph.with(|graph| graph.min_cli_version_view(&deployed)),
+    ))
+}
+
+/// The minimum CLI version the deploy names — `STOW_MIN_CLI_VERSION`,
+/// else [`queue::DEFAULT_MIN_CLI_VERSION`] — in force until the
+/// operator's `min-cli-version set`.
+fn deployed_min_cli_version(env: &WasmEnv) -> Result<semver::Version> {
+    read_optional_string_binding(env, STOW_MIN_CLI_VERSION_BINDING).map_or_else(
+        || Ok(queue::DEFAULT_MIN_CLI_VERSION),
+        |raw| {
+            semver::Version::parse(&raw).map_err(|error| {
+                Error::msg(format!(
+                    "parse binding '{STOW_MIN_CLI_VERSION_BINDING}' as a version: {error}"
+                ))
+            })
+        },
+    )
 }
 
 /// `POST /min-cli-version` — the operator's `set`: one `MinCliVersion`
@@ -1778,7 +1799,10 @@ async fn write_min_cli_version(
     .await
     .map_err(to_error)?;
     tracing::warn!(version = %set.version, actor = %actor.0, "minimum CLI version set by operator");
-    Ok(Json(graph.with(|graph| graph.min_cli_version_view())))
+    let deployed = deployed_min_cli_version(&env)?;
+    Ok(Json(
+        graph.with(|graph| graph.min_cli_version_view(&deployed)),
+    ))
 }
 
 /// `GET /memory-line` — the memory lines in force and the operator

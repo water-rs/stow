@@ -74,8 +74,9 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   and the new value re-ranks queued release nodes at the next claim.
 - `stow-admin min-cli-version status` — the oldest CLI whose miss and
   inexact-hit reports the scheduler queues, and whether it is the
-  default (`0.21.7`, the first CLI that stops minting registry nodes
-  over path and git packages) or the operator setting. A report from an
+  deploy default (`STOW_MIN_CLI_VERSION`, `0.21.7` when unset: the
+  first CLI that stops minting registry nodes over path and git
+  packages) or the operator setting. A report from an
   older CLI, or from a caller whose `User-Agent` names no
   `stow-cli/<version>`, is refused with `426` and a message telling the
   user to update stow; the user's local build is unaffected.

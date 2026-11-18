@@ -3159,7 +3159,9 @@ pub const DRIVES: &[Drive] = &[
         setup: None,
         run: |_db, _shape, _settings, ctx| {
             Box::pin(async move {
-                ctx.loaded().with(|graph| graph.min_cli_version_view());
+                ctx.loaded().with(|graph| {
+                    graph.min_cli_version_view(&super::queue::DEFAULT_MIN_CLI_VERSION)
+                });
                 Ok(())
             })
         },
@@ -3201,7 +3203,9 @@ pub const DRIVES: &[Drive] = &[
                 )
                 .await
                 .map_err(text)?;
-                ctx.loaded().with(|graph| graph.min_cli_version_view());
+                ctx.loaded().with(|graph| {
+                    graph.min_cli_version_view(&super::queue::DEFAULT_MIN_CLI_VERSION)
+                });
                 Ok(())
             })
         },

@@ -3600,11 +3600,12 @@ impl Graph {
     }
 
     /// The oldest CLI version whose reports are queued: the operator's
-    /// stored `min-cli-version set` or the default.
-    pub fn min_cli_version(&self) -> semver::Version {
+    /// stored `min-cli-version set`, else the deploy's `deployed`
+    /// default.
+    pub fn min_cli_version(&self, deployed: &semver::Version) -> semver::Version {
         self.min_cli_version
             .as_ref()
-            .map_or(queue::DEFAULT_MIN_CLI_VERSION, |set| set.version.clone())
+            .map_or_else(|| deployed.clone(), |set| set.version.clone())
     }
 
     /// The operator's stored `min-cli-version set` (stow#1605), `None`
@@ -3614,10 +3615,13 @@ impl Graph {
     }
 
     /// `GET /min-cli-version`'s body.
-    pub fn min_cli_version_view(&self) -> stow_types::api::MinCliVersion {
+    pub fn min_cli_version_view(
+        &self,
+        deployed: &semver::Version,
+    ) -> stow_types::api::MinCliVersion {
         stow_types::api::MinCliVersion {
             setting: self.min_cli_version.clone(),
-            version: self.min_cli_version(),
+            version: self.min_cli_version(deployed),
         }
     }
 
@@ -8212,9 +8216,13 @@ mod tests {
         use crate::scheduler::producer;
         let mut graph = Graph::default();
         let agent = Some("stow-cli/0.21.7 (linux)");
-        assert_eq!(graph.min_cli_version(), queue::DEFAULT_MIN_CLI_VERSION);
+        let deployed = queue::DEFAULT_MIN_CLI_VERSION;
+        assert_eq!(graph.min_cli_version(&deployed), deployed);
         assert!(graph.min_cli_version_setting().is_none());
-        assert_eq!(producer::check(agent, &graph.min_cli_version()), Ok(()));
+        assert_eq!(
+            producer::check(agent, &graph.min_cli_version(&deployed)),
+            Ok(())
+        );
         graph.apply(
             &SchedulerEvent::MinCliVersion {
                 setting: Box::new(stow_types::api::MinCliVersionSetting {
@@ -8225,10 +8233,10 @@ mod tests {
             },
             0,
         );
-        let view = graph.min_cli_version_view();
+        let view = graph.min_cli_version_view(&deployed);
         assert_eq!(view.version, semver::Version::new(0, 22, 0));
         assert_eq!(view.setting.expect("setting").actor, "ops");
-        assert!(producer::check(agent, &graph.min_cli_version()).is_err());
+        assert!(producer::check(agent, &graph.min_cli_version(&deployed)).is_err());
         graph.apply(
             &SchedulerEvent::MinCliVersion {
                 setting: Box::new(stow_types::api::MinCliVersionSetting {
@@ -8239,7 +8247,33 @@ mod tests {
             },
             0,
         );
-        assert_eq!(producer::check(agent, &graph.min_cli_version()), Ok(()));
+        assert_eq!(
+            producer::check(agent, &graph.min_cli_version(&deployed)),
+            Ok(())
+        );
+    }
+
+    /// stow#1605: a deploy's default stands until the operator's `set`
+    /// replaces it.
+    #[test]
+    fn the_deployed_minimum_is_the_default_until_an_operator_set() {
+        let mut graph = Graph::default();
+        let deployed = semver::Version::new(0, 0, 0);
+        assert_eq!(graph.min_cli_version(&deployed), deployed);
+        graph.apply(
+            &SchedulerEvent::MinCliVersion {
+                setting: Box::new(stow_types::api::MinCliVersionSetting {
+                    version: semver::Version::new(1, 2, 3),
+                    set_at: "2026-01-01T00:00:00Z".to_owned(),
+                    actor: "ops".to_owned(),
+                }),
+            },
+            0,
+        );
+        assert_eq!(
+            graph.min_cli_version(&deployed),
+            semver::Version::new(1, 2, 3)
+        );
     }
 
     /// stow#1012: the admission floor compares the weighted value. At
