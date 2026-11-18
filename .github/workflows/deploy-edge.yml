@@ -317,7 +317,7 @@ jobs:
               "/api/v1/scheduler/status"; do
               for override in "$cand" "$base"; do
                 probe=$((probe + 1))
-                code=$(curl -sS -o /dev/null -w '%{http_code}' --retry 2 \
+                code=$(curl -sS -o /dev/null -w '%{http_code}' --retry 2 --retry-all-errors \
                   -H "Cloudflare-Workers-Version-Overrides: $override" \
                   "$STOW_EDGE_URL$url?deploy-suite=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$probe")
                 case "$code" in
