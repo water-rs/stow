@@ -889,25 +889,33 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // statements, 3 reads, 271 written (36 / 3 / 38 before).
         //
         // stow#1379: the published masks are no longer snapshot rows, so
-        // the batch's slice report dirties no published bucket: 12
-        // spans and 118 upserted rows on workerd at 1M queue rows, under
-        // a bound of 16 spans x 13 rows = 208. The turn writes the
-        // overlay's changes to the `published` table instead, through
-        // `json_each` at 4,096 to a statement (one upsert, one delete
-        // for retired keys); the report's 45 changed masks bill 45 rows
-        // read and 45 written. workerd bills an upserted snapshot row
-        // as a row read as well. Statements: ceil(208 / 16) = 13
-        // upserts + 16 stale-range deletes + 1 covered-seq read + 1
-        // watermark + 1 log drop + 1 checkpoint + 2 published = 35.
-        // Rows written: 208 + 16 covered-log rows + 1 watermark + 1
-        // checkpoint + 45 published = 271. Rows read: 208 upserts + 16
-        // range deletes + 16 covered-log rows + 1 covered-seq + 2
-        // checkpoint + 1 watermark + 45 published = 289. Measured on
-        // workerd: 25 statements, 187 read, 172 written.
+        // the batch's slice report dirties no published bucket. The turn
+        // writes the overlay's changes to the `published` table instead,
+        // through `json_each` at 4,096 to a statement (one upsert, one
+        // delete for retired keys); the report's 45 changed masks bill
+        // 45 rows read and 45 written. workerd bills an upserted
+        // snapshot row as a row read as well.
+        //
+        // The spans follow from the batch: 6 fixed ones the merge,
+        // claims and completion dirty (meta, intern, outcomes, two node
+        // ranges and one edge range at 1M queue rows) plus 2 per pending
+        // dependent the report's retire refreshes (its node range and
+        // its edge range). The fixture plants `fixture::DELTA_DEPENDENTS` = 6
+        // such dependents at every size — the fixture's mean fan-in of
+        // 0.2 a completed row over the 30 retired members — so the
+        // bound is 6 + 2 x 6 = 18 spans x 13 rows = 234 upserted rows.
+        // Statements: ceil(234 / 16) = 15 upserts + 18 stale-range
+        // deletes + 1 covered-seq read + 1 watermark + 1 log drop + 1
+        // checkpoint + 2 published = 39. Rows written: 234 + 16
+        // covered-log rows + 1 watermark + 1 checkpoint + 45 published =
+        // 297. Rows read: 234 upserts + 18 range deletes + 16 covered-log
+        // rows + 1 covered-seq + 2 checkpoint + 1 watermark + 45
+        // published = 317. Measured on the host at 1M queue rows: 36
+        // statements, 262 written (18 spans, 208 upserted rows).
         name: "snapshot write",
-        statements: 35,
-        rows_read: 289,
-        rows_written: 271,
+        statements: 39,
+        rows_read: 317,
+        rows_written: 297,
         wall_ms: 5000,
     },
 ];
