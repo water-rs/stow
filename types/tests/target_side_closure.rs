@@ -33,13 +33,30 @@ fn native_root(payload: &BuildTaskPayload) -> TaskNodeIdentity {
     }
 }
 
-/// The native consumer's resolved graph: the dispatched subgraph under a
-/// native root, so every target-side node keys at the host triple.
-fn native_graph(payload: &BuildTaskPayload) -> ResolvedTaskGraph {
+/// The dispatched subgraph under a native root, so every target-side
+/// node keys at the host triple.
+fn dispatched_graph(payload: &BuildTaskPayload) -> ResolvedTaskGraph {
     payload
         .dependency_subgraph
         .resolve(&native_root(payload), payload.explicit_spelling)
         .unwrap()
+}
+
+/// The native consumer's resolved graph: the dispatched subgraph plus
+/// the dedup-shadow edge the native root carries to the target-side
+/// `unicode-segmentation`, the twin of the host-side one it reaches
+/// through `derive_more-impl` (stow#506) — the edge the wasm root, whose
+/// subgraph this was, never had.
+fn native_graph(payload: &BuildTaskPayload) -> ResolvedTaskGraph {
+    let mut nodes = dispatched_graph(payload).nodes().to_vec();
+    let twin = nodes
+        .iter()
+        .position(|node| {
+            node.identity.crate_name.as_str() == "unicode-segmentation" && !node.identity.host_side
+        })
+        .unwrap();
+    nodes[0].dependencies.push(twin);
+    ResolvedTaskGraph::resolve(nodes).unwrap()
 }
 
 /// A one-root submission tree holding every node of `graph`.
@@ -78,7 +95,7 @@ fn tree_of(graph: &ResolvedTaskGraph) -> SubmissionTree {
 /// `graph` with its root replaced by the payload's own wasm root — the
 /// tree superset serving spliced.
 fn spliced_graph(payload: &BuildTaskPayload) -> ResolvedTaskGraph {
-    let mut nodes = native_graph(payload).nodes().to_vec();
+    let mut nodes = dispatched_graph(payload).nodes().to_vec();
     nodes[0].identity = payload.task_node_identity();
     ResolvedTaskGraph::resolve(nodes).unwrap()
 }

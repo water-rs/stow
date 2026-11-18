@@ -3227,3 +3227,102 @@ fn explicit_spelling_marks_proc_macro_closures() {
         .collect();
     assert_eq!(dep_flags, vec![("mid".to_owned(), apart)]);
 }
+
+/// stow#1566: a registry crate built against a `[patch.crates-io]` path
+/// package mints no node, in the shape run 44199081474 dispatched: a
+/// consumer patches `postgres-types`, and `rust_decimal`'s task passed
+/// through the patched package to its registry deps, so the builder —
+/// which pins the subgraph from crates.io alone — compiled the registry
+/// `postgres-types` and refused the context. The registry crates on
+/// both sides of the patch still mint.
+#[test]
+fn a_registry_crate_over_a_patched_package_mints_no_node() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    let no_features: &[&str] = &[];
+    for (name, version, deps) in [
+        ("base64", "0.23.1", vec![]),
+        ("arrayvec", "0.7.8", vec![]),
+        (
+            "postgres-types",
+            "0.2.14",
+            vec![("base64", "0.23", no_features)],
+        ),
+        (
+            "rust_decimal",
+            "1.43.0",
+            vec![
+                ("arrayvec", "0.7", no_features),
+                ("postgres-types", "0.2", no_features),
+            ],
+        ),
+    ] {
+        publish(
+            &reg,
+            &Fixture {
+                name,
+                version,
+                deps,
+                target_deps: vec![],
+                features: &[],
+                yanked: false,
+                proc_macro: false,
+            },
+        );
+    }
+    let root = work.path().join("root");
+    let patched = root.join("postgres-types");
+    std::fs::create_dir_all(patched.join("src")).unwrap();
+    std::fs::write(patched.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        patched.join("Cargo.toml"),
+        toml_document(&json!({
+            "package": { "name": "postgres-types", "version": "0.2.14", "edition": "2021" },
+            "dependencies": { "base64": "0.23" },
+        })),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "").unwrap();
+    let manifest = root.join("Cargo.toml");
+    std::fs::write(
+        &manifest,
+        toml_document(&json!({
+            "package": { "name": "root", "version": "0.0.0", "edition": "2021" },
+            "dependencies": { "rust_decimal": "1.43" },
+            "patch": { "crates-io": { "postgres-types": { "path": "postgres-types" } } },
+        })),
+    )
+    .unwrap();
+    let (_home, resolver) = resolver_at(&reg);
+    let out = resolver
+        .resolve(
+            &manifest,
+            &ResolveOptions::default(),
+            &["wasm32-unknown-unknown".to_owned()],
+        )
+        .unwrap();
+    let units: Vec<StowUnit> = out
+        .iter()
+        .flat_map(|(_target, out)| out.units.iter().cloned())
+        .collect();
+    let (requests, _nodes) = stow_resolver::enqueue_requests_from_output(
+        &units,
+        pinned_rustc_version(),
+        stow_types::api::EnqueueSource::CrateUpdate,
+        0,
+        DEV,
+    )
+    .unwrap();
+    let mut minted: Vec<&str> = requests
+        .iter()
+        .map(|request| request.crate_name.as_str())
+        .collect();
+    minted.sort_unstable();
+    assert_eq!(
+        minted,
+        ["arrayvec", "base64"],
+        "rust_decimal links the patched postgres-types, so only the crates around it mint"
+    );
+}

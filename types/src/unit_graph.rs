@@ -145,30 +145,51 @@ pub fn serialize_feature_set(features: &BTreeSet<String>) -> Result<String> {
 /// # Errors
 /// A unit whose feature set cannot serialize, or a dep ref that names
 /// no unit in this resolve.
-pub fn task_graph<'u>(units: &'u [TaskUnit]) -> Result<TaskGraph> {
-    let index = UnitIndex::new(units);
-    let raw_deps = |unit: &'u TaskUnit| index.raw_deps(unit);
+pub fn task_graph(units: &[TaskUnit]) -> Result<TaskGraph> {
+    let index = UnitIndex::new(units)?;
     let mut nodes = BTreeSet::new();
     let mut edges = BTreeMap::<TaskNode, BTreeSet<TaskNode>>::new();
     for unit in units {
-        if unit.key.kind != TaskUnitKind::Lib || !unit.is_crates_io {
+        if !index.mints(unit) {
             continue;
         }
         let node = task_node(unit)?;
         nodes.insert(node.clone());
-        let deps = direct_dep_nodes(unit, &node, &raw_deps)?;
+        let deps = direct_dep_nodes(unit, &index)?;
         edges.entry(node).or_default().extend(deps);
     }
-    for (node, shadows) in dedup_shadow_edges(units, raw_deps, |key| index.lib(key))? {
+    for (node, shadows) in dedup_shadow_edges(units, &index)? {
         edges.entry(node).or_default().extend(shadows);
     }
-    for (host, target) in self_twin_edges(units)? {
+    for (host, target) in twins_kept_apart(units, &index)? {
+        if !index.mints(host) || !index.mints(target) {
+            continue;
+        }
         edges
             .entry(task_node(host)?)
             .or_default()
             .insert(task_node(target)?);
     }
     Ok((nodes, edges))
+}
+
+/// Every lib unit of `units` that mints a task node (stow#1566).
+///
+/// A crates.io lib mints only when every lib it links — its own lib
+/// deps and its build script's — mints too. A crates.io package built
+/// against a path or git package (a `[patch]` or a direct non-registry
+/// dependency of a registry crate), or against a lib compiled under a
+/// profile no node carries, compiles a context no build can reproduce
+/// from crates.io: the builder pins the task's subgraph from crates.io
+/// alone. Such a lib is a way into the graph, like a project member,
+/// and the consumer compiles it locally.
+///
+/// # Errors
+/// A lib dep ref that names no unit in this resolve, or a lib
+/// dependency cycle — both unit-source inconsistencies.
+pub fn minting_libs(units: &[TaskUnit]) -> Result<BTreeSet<TaskUnitKey>> {
+    let index = UnitIndex::new(units)?;
+    Ok(index.mints.into_iter().cloned().collect())
 }
 
 /// The lib units and build-script compile units of one resolve, indexed
@@ -180,10 +201,12 @@ struct UnitIndex<'u> {
     /// shares it across sides at equal features, so a twin pair's
     /// `raw_deps` carry the same compile unit's deps.
     scripts: BTreeMap<(&'u str, &'u [String]), &'u TaskUnit>,
+    /// The lib units that mint a task node ([`minting_libs`]).
+    mints: BTreeSet<&'u TaskUnitKey>,
 }
 
 impl<'u> UnitIndex<'u> {
-    fn new(units: &'u [TaskUnit]) -> Self {
+    fn new(units: &'u [TaskUnit]) -> Result<Self> {
         let mut libs = BTreeMap::new();
         let mut scripts = BTreeMap::new();
         for unit in units {
@@ -199,11 +222,65 @@ impl<'u> UnitIndex<'u> {
                 TaskUnitKind::RunBuildScript => {}
             }
         }
-        Self { libs, scripts }
+        let mut index = Self {
+            libs,
+            scripts,
+            mints: BTreeSet::new(),
+        };
+        index.mints = index.minting()?;
+        Ok(index)
     }
 
     fn lib(&self, key: &TaskUnitKey) -> Option<&'u TaskUnit> {
         self.libs.get(key).copied()
+    }
+
+    /// Whether `unit` is a lib unit that mints a task node.
+    fn mints(&self, unit: &TaskUnit) -> bool {
+        self.mints.contains(&unit.key)
+    }
+
+    /// The minting lib units, bottom-up over the lib-dep DAG: an
+    /// iterative post-order whose `visiting` set doubles as the cycle
+    /// check.
+    fn minting(&self) -> Result<BTreeSet<&'u TaskUnitKey>> {
+        let mut verdicts = BTreeMap::<&'u TaskUnitKey, bool>::new();
+        let mut visiting = BTreeSet::<&'u TaskUnitKey>::new();
+        for &lib in self.libs.values() {
+            let mut stack = vec![(lib, false)];
+            while let Some((current, children_done)) = stack.pop() {
+                if verdicts.contains_key(&current.key) {
+                    continue;
+                }
+                let deps = self.raw_deps(current)?;
+                if children_done {
+                    visiting.remove(&current.key);
+                    let mints = current.is_crates_io
+                        && deps.iter().all(|dep| verdicts.get(&dep.key) == Some(&true));
+                    verdicts.insert(&current.key, mints);
+                    continue;
+                }
+                if !visiting.insert(&current.key) {
+                    return Err(stow_error!(
+                        "{} {} ({}, {:?}) sits on a lib dependency cycle",
+                        current.name,
+                        current.version,
+                        current.key.platform,
+                        current.key.side,
+                    ));
+                }
+                stack.push((current, true));
+                stack.extend(
+                    deps.into_iter()
+                        .filter(|dep| !verdicts.contains_key(&dep.key))
+                        .map(|dep| (dep, false)),
+                );
+            }
+        }
+        Ok(verdicts
+            .into_iter()
+            .filter_map(|(key, mints)| mints.then_some(key))
+            .collect())
     }
 
     /// One unit's direct lib deps: its normal-dep libs plus the
@@ -281,7 +358,14 @@ impl<'u> UnitIndex<'u> {
 /// A lib dep ref that names no unit in this resolve — a unit-source
 /// inconsistency, never a dropped edge.
 pub fn self_twin_edges(units: &[TaskUnit]) -> Result<Vec<(&TaskUnit, &TaskUnit)>> {
-    let index = UnitIndex::new(units);
+    twins_kept_apart(units, &UnitIndex::new(units)?)
+}
+
+/// [`self_twin_edges`] over an index the caller already built.
+fn twins_kept_apart<'u>(
+    units: &'u [TaskUnit],
+    index: &UnitIndex<'u>,
+) -> Result<Vec<(&'u TaskUnit, &'u TaskUnit)>> {
     let mut memo = BTreeMap::new();
     let mut twins = Vec::new();
     for unit in units {
@@ -301,7 +385,7 @@ pub fn self_twin_edges(units: &[TaskUnit]) -> Result<Vec<(&TaskUnit, &TaskUnit)>
         if !same_features(unit, target) || !unit.profile.host_can_share_target(target.profile) {
             continue;
         }
-        if !twins_shareable(&index, unit, target, &mut memo)? {
+        if !twins_shareable(index, unit, target, &mut memo)? {
             twins.push((unit, target));
         }
     }
@@ -384,44 +468,14 @@ fn deps_pair<'u>(
     twins_shareable(index, host_dep, target_dep, memo)
 }
 
-/// One node's task-dep edge set: every crates.io lib reached through
-/// `unit`'s direct lib deps. Non-crates.io units (project members, path
-/// deps, git packages) carry the resolve's edges but mint no task — a
-/// project's own crates are the way into the crates.io graph — so the
-/// walk passes through them to the crates.io libs on the far side.
+/// One node's task-dep edge set: its direct lib deps. A minting node's
+/// lib deps all mint ([`minting_libs`]), so every one is a node, and the
+/// minting pass already refused a self-edge as the cycle it is.
 ///
 /// # Errors
-/// A `raw_deps` failure, or a real self-edge — a lib that resolves to
-/// its own dependency is a unit-source inconsistency: cargo's unit graph
-/// is acyclic.
-fn direct_dep_nodes<'u>(
-    unit: &'u TaskUnit,
-    node: &TaskNode,
-    raw_deps: &impl Fn(&'u TaskUnit) -> Result<Vec<&'u TaskUnit>>,
-) -> Result<BTreeSet<TaskNode>> {
-    let mut deps = BTreeSet::new();
-    let mut seen = BTreeSet::new();
-    let mut stack = raw_deps(unit)?;
-    while let Some(dep_unit) = stack.pop() {
-        if !seen.insert(&dep_unit.key) {
-            continue;
-        }
-        if dep_unit.is_crates_io {
-            deps.insert(task_node(dep_unit)?);
-        } else {
-            stack.extend(raw_deps(dep_unit)?);
-        }
-    }
-    if deps.contains(node) {
-        return Err(stow_error!(
-            "task node {} {} ({}, {:?}) depends on itself",
-            node.crate_name,
-            node.version,
-            node.target,
-            unit.key.side,
-        ));
-    }
-    Ok(deps)
+/// A `raw_deps` failure or a dep the typed identity cannot carry.
+fn direct_dep_nodes<'u>(unit: &'u TaskUnit, index: &UnitIndex<'u>) -> Result<BTreeSet<TaskNode>> {
+    index.raw_deps(unit)?.into_iter().map(task_node).collect()
 }
 
 /// Every lib unit's explicit-spelling flag (stow#736).
@@ -543,6 +597,10 @@ pub fn resolved_task_graph(
         if unit.key.kind != TaskUnitKind::Lib || !unit.is_crates_io {
             continue;
         }
+        let node = task_node(unit)?;
+        if !nodes.contains(&node) {
+            continue;
+        }
         let flag = spellings.get(&unit.key).copied().ok_or_else(|| {
             stow_error!(
                 "lib unit {} {} ({}, {:?}) minted no explicit-spelling flag",
@@ -552,7 +610,7 @@ pub fn resolved_task_graph(
                 unit.key.side,
             )
         })?;
-        spelling_by_node.insert(task_node(unit)?, flag);
+        spelling_by_node.insert(node, flag);
     }
     let ordered: Vec<&TaskNode> = nodes.iter().collect();
     let index_of: BTreeMap<&TaskNode, usize> = ordered
@@ -613,20 +671,24 @@ pub fn resolved_task_graph(
 /// never shares and resolves as its own identity, so pinning it
 /// reproduces nothing a consumer computes and makes the task compile
 /// units no node publishes (stow#722).
+///
+/// Only minting units take part ([`minting_libs`]): a minting node's
+/// host-reachable libs all mint, and a target twin that mints no node is
+/// no edge.
 fn dedup_shadow_edges<'u>(
     units: &'u [TaskUnit],
-    raw_deps: impl Fn(&'u TaskUnit) -> Result<Vec<&'u TaskUnit>>,
-    by_key: impl Fn(&TaskUnitKey) -> Option<&'u TaskUnit>,
+    index: &UnitIndex<'u>,
 ) -> Result<BTreeMap<TaskNode, BTreeSet<TaskNode>>> {
     let mut extra_edges = BTreeMap::<TaskNode, BTreeSet<TaskNode>>::new();
     for unit in units {
-        if unit.key.kind != TaskUnitKind::Lib || !unit.is_crates_io {
+        if !index.mints(unit) {
             continue;
         }
         let node = task_node(unit)?;
         let mut seen = BTreeSet::new();
         seen.insert(&unit.key);
-        let mut stack: Vec<&TaskUnit> = raw_deps(unit)?
+        let mut stack: Vec<&TaskUnit> = index
+            .raw_deps(unit)?
             .into_iter()
             .filter(|dep| dep.key.side == TaskUnitSide::Host)
             .collect();
@@ -641,17 +703,16 @@ fn dedup_shadow_edges<'u>(
                 side: TaskUnitSide::Target,
                 ..dep_unit.key.clone()
             };
-            if dep_unit.is_crates_io
-                && let Some(target) = by_key(&target_key)
-                && target.is_crates_io
+            if let Some(target) = index.lib(&target_key)
+                && index.mints(target)
                 && dep_unit.profile.host_can_share_target(target.profile)
-                && target.features.iter().collect::<BTreeSet<_>>()
-                    == dep_unit.features.iter().collect::<BTreeSet<_>>()
+                && same_features(target, dep_unit)
             {
                 shadows.insert(task_node(target)?);
             }
             stack.extend(
-                raw_deps(dep_unit)?
+                index
+                    .raw_deps(dep_unit)?
                     .into_iter()
                     .filter(|dep| dep.key.side == TaskUnitSide::Host),
             );
