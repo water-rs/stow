@@ -56,7 +56,7 @@
 use askama::Template;
 use stow_types::api::{
     ChannelOutcome, DispatchFreezeCost, DispatchFreezeRecord, DispatchFreezeTarget,
-    DispatchFreezeTrigger, DispatchFreezeTrip,
+    DispatchFreezeTrigger, DispatchFreezeTrip, DispatchFreezeWorkflow,
 };
 use stow_types::identity::TargetTriple;
 
@@ -307,6 +307,10 @@ pub fn freeze_subject(trigger: &DispatchFreezeTrigger) -> String {
             "[stow] dispatch frozen — {} over daily budget",
             metric_label(cost.metric)
         ),
+        DispatchFreezeTrigger::WorkflowDisabled(workflow) => format!(
+            "[stow] dispatch frozen — {} is {}",
+            workflow.workflow, workflow.state
+        ),
     }
 }
 
@@ -435,6 +439,10 @@ pub fn summarize_trigger(trigger: &DispatchFreezeTrigger) -> String {
             human_count(cost.used),
             human_count(cost.budget),
         ),
+        DispatchFreezeTrigger::WorkflowDisabled(workflow) => format!(
+            "dispatch refused: {} is {}",
+            workflow.workflow, workflow.state
+        ),
     }
 }
 
@@ -497,6 +505,7 @@ struct FreezeAlertTemplate<'a> {
     manual: bool,
     trip: Option<TripContext<'a>>,
     cost: Option<CostContext<'a>>,
+    workflow: Option<&'a DispatchFreezeWorkflow>,
     clear_command: &'a str,
     status_command: &'a str,
 }
@@ -510,6 +519,7 @@ struct FreezeAlertHtmlTemplate<'a> {
     manual: bool,
     trip: Option<TripContext<'a>>,
     cost: Option<CostContext<'a>>,
+    workflow: Option<&'a DispatchFreezeWorkflow>,
     clear_command: &'a str,
     status_command: &'a str,
 }
@@ -559,39 +569,45 @@ pub fn render_freeze_alert(
     frozen_at: &str,
     trigger: &DispatchFreezeTrigger,
 ) -> Result<AlertDraft, askama::Error> {
-    let render_bodies =
-        |trigger: &DispatchFreezeTrigger| -> Result<(String, String), askama::Error> {
-            let (manual, trip, cost) = match trigger {
-                DispatchFreezeTrigger::Manual { .. } => (true, None, None),
-                DispatchFreezeTrigger::Tripped(trip) => (false, Some(trip_context(trip)), None),
-                DispatchFreezeTrigger::Cost(cost) => (false, None, Some(cost_context(cost))),
-            };
-            let body = FreezeAlertTemplate {
-                frozen_at,
-                manual,
-                trip,
-                cost,
-                clear_command: CLEAR_COMMAND,
-                status_command: STATUS_COMMAND,
+    /// What each trigger kind fills in: manual flag, trip, cost, workflow.
+    type Context<'a> = (
+        bool,
+        Option<TripContext<'a>>,
+        Option<CostContext<'a>>,
+        Option<&'a DispatchFreezeWorkflow>,
+    );
+    fn context(trigger: &DispatchFreezeTrigger) -> Context<'_> {
+        match trigger {
+            DispatchFreezeTrigger::Manual { .. } => (true, None, None, None),
+            DispatchFreezeTrigger::Tripped(trip) => (false, Some(trip_context(trip)), None, None),
+            DispatchFreezeTrigger::Cost(cost) => (false, None, Some(cost_context(cost)), None),
+            DispatchFreezeTrigger::WorkflowDisabled(workflow) => {
+                (false, None, None, Some(workflow))
             }
-            .render()?;
-            let (manual, trip, cost) = match trigger {
-                DispatchFreezeTrigger::Manual { .. } => (true, None, None),
-                DispatchFreezeTrigger::Tripped(trip) => (false, Some(trip_context(trip)), None),
-                DispatchFreezeTrigger::Cost(cost) => (false, None, Some(cost_context(cost))),
-            };
-            let html = FreezeAlertHtmlTemplate {
-                frozen_at,
-                manual,
-                trip,
-                cost,
-                clear_command: CLEAR_COMMAND,
-                status_command: STATUS_COMMAND,
-            }
-            .render()?;
-            Ok((body, html))
-        };
-    let (body, html) = render_bodies(trigger)?;
+        }
+    }
+    let (manual, trip, cost, workflow) = context(trigger);
+    let body = FreezeAlertTemplate {
+        frozen_at,
+        manual,
+        trip,
+        cost,
+        workflow,
+        clear_command: CLEAR_COMMAND,
+        status_command: STATUS_COMMAND,
+    }
+    .render()?;
+    let (manual, trip, cost, workflow) = context(trigger);
+    let html = FreezeAlertHtmlTemplate {
+        frozen_at,
+        manual,
+        trip,
+        cost,
+        workflow,
+        clear_command: CLEAR_COMMAND,
+        status_command: STATUS_COMMAND,
+    }
+    .render()?;
     Ok(AlertDraft {
         key: FREEZE_INCIDENT_KEY,
         subject: freeze_subject(trigger),

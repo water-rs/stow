@@ -2287,7 +2287,8 @@ pub(super) async fn dispatch_pass(
     if claims.is_empty() {
         return Ok(Vec::new());
     }
-    dispatch::dispatch_claims(graph, db, &interface, claims, now_ms)
+    let sink = EdgeAlerter::new(env.as_js());
+    dispatch::dispatch_claims(graph, db, &interface, &sink, claims, now_ms, iso_now)
         .await
         .map_err(route_error)?;
     Ok(task_ids)
