@@ -695,8 +695,9 @@ pub struct ClaimedNode {
 }
 
 /// What one claim pass took, before any task id is minted: the nodes it
-/// claimed and the ones it refused for a disagreeing closure
-/// (stow#1481), which settled `failed` in the pass and never reach CI.
+/// claimed and the ones it refused for a closure their run could only
+/// fail on (stow#1481, stow#1593), which settled `failed` in the pass
+/// and never reach CI.
 #[derive(Debug, Default)]
 pub struct ClaimPass {
     claims: Vec<ClaimedNode>,
@@ -729,21 +730,25 @@ pub(super) struct ValidatedSubmission<'a> {
 }
 
 impl<'a> ValidatedSubmission<'a> {
-    /// A tree arriving at a submit route: its shape and identity, and a
-    /// closure that agrees (stow#1470) — a disagreeing one could only
-    /// fail on a runner.
+    /// A tree arriving at a submit route: its shape and identity, a
+    /// closure that agrees (stow#1470), no target-side node keyed at a
+    /// triple other than its owner's (stow#1593), and context edges one
+    /// build of each closure mints (stow#1566) — a tree breaking any
+    /// could only fail on a runner.
     pub(super) fn new(tree: &'a SubmissionTree) -> Result<Self, QueueError> {
         // The shape check first: the agreement walk needs deps in range.
         let validated = Self::logged(tree)?;
         tree.ensure_closure_agreement()
+            .and_then(|()| tree.ensure_target_side_keys())
+            .and_then(|()| tree.ensure_context_coherence())
             .map_err(|error| QueueError::Invariant(error.to_string()))?;
         Ok(validated)
     }
 
     /// A tree the log already accepted: its shape and identity only. A
-    /// `Submit` row older than the closure-agreement check may hold a
-    /// disagreeing closure; it replays as accepted, and the claim pass
-    /// refuses the task it carries (stow#1481).
+    /// `Submit` row older than the closure checks may break one; it
+    /// replays as accepted, and the claim pass refuses the task it
+    /// carries (stow#1481, stow#1593).
     pub(super) fn logged(tree: &'a SubmissionTree) -> Result<Self, QueueError> {
         Ok(Self {
             tree,
@@ -2354,7 +2359,9 @@ impl Graph {
     /// A picked node whose dependency closure holds two feature sets of
     /// one `(crate, version, target, side)` is refused instead
     /// (stow#1481): the build's wrapper manifest declares a package
-    /// version once per side, so its run could only fail. It settles
+    /// version once per side, so its run could only fail. So is one
+    /// whose closure holds a target-side node keyed at another triple
+    /// (stow#1593), whose payload re-derives another task id. It settles
     /// `failed` here and takes the slot it would have claimed for this
     /// pass, so a pass examines and mints no more nodes than its free
     /// slots; the pass logs the refusals beside its claims.
@@ -2491,6 +2498,89 @@ impl Graph {
         Some(format!(
             "dependency closure holds {}",
             stow_types::feature_sets::disagreement_text(self.intern.at(crate_name), conflict)
+        ))
+    }
+
+    /// Why `ix`'s dispatch payload could only fail, as its refusal names
+    /// it: a disagreeing closure ([`Self::closure_disagreement`]) or a
+    /// target-side node keyed at another triple (stow#1593), whose
+    /// subgraph re-derives another task id on the runner.
+    fn closure_refusal(&self, ix: u32) -> Option<String> {
+        self.closure_disagreement(ix)
+            .or_else(|| self.foreign_target_side(ix))
+            .or_else(|| self.context_incoherence(ix))
+    }
+
+    /// The context edges in `ix`'s closure no build of that closure mints,
+    /// as the refusal names them (stow#1566,
+    /// [`stow_types::task_graph::context_incoherence_below`]). One walk of
+    /// the closure the dispatch payload carries, plus one bottom-up pass
+    /// over it. Superset serving produced such closures before it kept
+    /// the rule; the submit path now refuses them, and this settles the
+    /// ones already merged.
+    fn context_incoherence(&self, ix: u32) -> Option<String> {
+        let found = stow_types::task_graph::context_incoherence_below(
+            ix as usize,
+            |at| {
+                let node = &self.nodes[at];
+                (
+                    node.crate_name,
+                    node.version,
+                    node.features,
+                    node.target,
+                    node.rustc,
+                    node.flags.profile(),
+                )
+            },
+            |at| self.nodes[at].flags.host(),
+            |at| {
+                let profile = self.nodes[at].flags.profile();
+                profile.host_can_share_target(profile)
+            },
+            |at, stack| {
+                let at = u32::try_from(at).expect("arena indexes fit u32");
+                stack.extend(self.deps_of(at).map(|dep| dep as usize));
+            },
+        )?;
+        Some(format!(
+            "dependency closure holds {}",
+            found.text(|at| {
+                let node = &self.nodes[at];
+                format!(
+                    "{} {}{}",
+                    self.intern.at(node.crate_name),
+                    self.intern.at(node.version),
+                    if node.flags.host() { " (host)" } else { "" }
+                )
+            })
+        ))
+    }
+
+    /// The target-side node in `ix`'s closure keyed at a triple other
+    /// than `ix`'s own, as the refusal names it (stow#1593). One walk of
+    /// the closure the dispatch payload carries. Superset serving
+    /// produced such subtrees before it kept the rule; the submit path
+    /// now refuses them, and this settles the ones already merged.
+    fn foreign_target_side(&self, ix: u32) -> Option<String> {
+        let foreign = stow_types::task_graph::foreign_target_side_below(
+            ix as usize,
+            |at| self.nodes[at].target,
+            |at| self.nodes[at].flags.host(),
+            |at, stack| {
+                let at = u32::try_from(at).expect("arena indexes fit u32");
+                stack.extend(self.deps_of(at).map(|dep| dep as usize));
+            },
+        )?;
+        let node = &self.nodes[foreign];
+        let target_name = |target: u8| &self.targets[usize::from(target)].name;
+        Some(format!(
+            "dependency closure holds {}",
+            stow_types::task_graph::foreign_target_side_text(
+                self.intern.at(node.crate_name),
+                self.intern.at(node.version),
+                target_name(node.target),
+                target_name(self.node(ix).target),
+            )
         ))
     }
 
@@ -2647,7 +2737,7 @@ impl Graph {
             if family_is_macos {
                 macos_taken += 1;
             }
-            if let Some(error) = self.closure_disagreement(ix) {
+            if let Some(error) = self.closure_refusal(ix) {
                 self.refuse_closure(ix, error, now);
                 pass.refusals.push(ix);
                 continue;
@@ -3805,6 +3895,21 @@ impl Graph {
                 || (self.has_ready() && !matches!(settings.dispatch, queue::Dispatch::Paused)))
     }
 
+    /// Whether the object should stay resident (stow#1574): while work
+    /// is in flight, completions and the alarm keep calling it; while
+    /// ready work can be claimed, the alarm or the next completion
+    /// claims it. Either way the next event comes soon, and a
+    /// hibernation between them would make it reload the snapshot.
+    /// Ready work that nothing will claim — dispatch frozen or paused —
+    /// waits for an operator, so it holds nothing, and an idle
+    /// scheduler hibernates as before. Counter and set reads only.
+    pub fn needs_residency(&self, settings: &queue::SchedulerSettings) -> bool {
+        !self.inflight.is_empty()
+            || (self.has_ready()
+                && self.freeze.is_none()
+                && !matches!(settings.dispatch, queue::Dispatch::Paused))
+    }
+
     /// Whether CI requests must wait for a rate-limit recovery.
     pub const fn ci_waiting(&self, now: i64) -> bool {
         self.ci_not_before > now
@@ -4881,6 +4986,9 @@ pub struct GraphCell {
     tokens: crate::github_app::TokenCache,
     /// The isolate's billed-but-unsettled row counts — see [`Unsettled`].
     unsettled: std::sync::Arc<Unsettled>,
+    /// The residency hold while the graph has work (stow#1574) —
+    /// see [`GraphCell::settle_residency`].
+    resident: std::sync::Arc<std::sync::Mutex<Option<skyzen::durable::KeepResident>>>,
 }
 
 impl std::fmt::Debug for GraphCell {
@@ -5043,6 +5151,17 @@ impl GraphCell {
         *self.graph.lock().expect("graph cell poisoned") = Graph::default();
         self.loaded
             .store(false, std::sync::atomic::Ordering::Release);
+    }
+    /// Hold residency while `needed` and release it otherwise, so an
+    /// idle scheduler still hibernates and costs nothing. Taken once
+    /// and kept, so the decision costs a lock and no storage.
+    pub(crate) fn settle_residency(&self, needed: bool, residency: &skyzen::durable::Residency) {
+        let mut held = self.resident.lock().expect("residency hold poisoned");
+        if needed {
+            held.get_or_insert_with(|| residency.keep_resident());
+        } else {
+            *held = None;
+        }
     }
     /// The isolate's installation-token cache.
     pub(crate) const fn tokens(&self) -> &crate::github_app::TokenCache {
@@ -5962,6 +6081,300 @@ mod tests {
         );
         let gcm = graph.node_ix(&id("aes-gcm")).expect("dependent");
         assert!(graph.node(gcm).flags.blocked(), "the dependent blocks");
+        assert!(graph.attempt_outcomes.is_empty(), "no run, no outcome");
+    }
+
+    /// The wasm target the stow#1593 tests key their consumer at.
+    const WASM: &str = "wasm32-unknown-unknown";
+
+    /// The stow#1593 pieces: `unicode-segmentation` on the target side
+    /// at the native triple, and a native consumer's host-side
+    /// `derive_more-impl` carrying its dedup-shadow edge onto it.
+    fn native_shadow_pair() -> (SubmissionNode, SubmissionNode) {
+        let segmentation = sub("unicode-segmentation");
+        let mut derive_impl = sub("derive_more-impl");
+        derive_impl.host_side = true;
+        derive_impl.task_id = minted_id(&derive_impl);
+        (segmentation, derive_impl)
+    }
+
+    /// The host-side `unicode-segmentation` whose target-side twin the
+    /// native consumer's shadow edges pin (stow#506).
+    fn segmentation_host() -> SubmissionNode {
+        let mut node = sub("unicode-segmentation");
+        node.host_side = true;
+        node.task_id = minted_id(&node);
+        node
+    }
+
+    /// `name` keyed at the wasm target, depending on `deps`.
+    fn wasm_sub(name: &str, deps: Vec<u32>) -> SubmissionNode {
+        let mut node = sub(name);
+        node.target = TargetTriple::parse(WASM).expect("target");
+        node.deps = deps;
+        node.task_id = minted_id(&node);
+        node
+    }
+
+    /// stow#1593: a wasm tree whose host-side node carries a native
+    /// consumer's shadow edge onto a target-side node at the native
+    /// triple is refused at the route — its payload would re-derive
+    /// another task id on the runner.
+    #[test]
+    fn a_target_side_node_at_another_triple_is_refused_at_submit() {
+        let (segmentation, mut derive_impl) = native_shadow_pair();
+        derive_impl.deps = vec![0];
+        let tree = SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![2],
+            nodes: vec![segmentation, derive_impl, wasm_sub("derive_more", vec![1])],
+        };
+        let error = Graph::default().merge(&tree, 0).expect_err("refused");
+        assert!(
+            error.to_string().contains(&format!(
+                "unicode-segmentation 1.0.0 on the target side for {TARGET}, which a node for {WASM} cannot carry"
+            )),
+            "{error}"
+        );
+    }
+
+    /// stow#1593: two trees that each keep the rule — a native one that
+    /// commits `derive_more-impl`'s shadow edge, and a wasm one naming
+    /// the published `derive_more-impl` bare — leave the wasm
+    /// `derive_more` with a native target-side node in its graph
+    /// closure. The claim refuses it without a run, naming that node,
+    /// while the native consumer dispatches.
+    #[test]
+    fn a_target_side_node_at_another_triple_in_the_graph_is_refused_at_claim() {
+        let (segmentation, mut derive_impl) = native_shadow_pair();
+        let segmentation_host = segmentation_host();
+        let rows = |node: &SubmissionNode, shapes: [(UnitSide, UnitInvocation, UnitKind); 2]| {
+            shapes.map(|(side, invocation, kind)| PublishedSliceRow {
+                crate_name: node.crate_name.clone(),
+                version: node.version.clone(),
+                features_json: node.features_json.clone(),
+                unit_shape: UnitShape {
+                    side,
+                    invocation,
+                    kind,
+                },
+                dependency_identity: node.dependency_identity.clone(),
+                node_profile: node.profile,
+            })
+        };
+        // A target-side node publishes its invocation's check and build
+        // shapes; a host-side one its linked shape on both invocations.
+        let published: Vec<_> = rows(
+            &segmentation,
+            [UnitKind::Unlinked, UnitKind::Linked]
+                .map(|kind| (UnitSide::Target, UnitInvocation::Native, kind)),
+        )
+        .into_iter()
+        .chain(
+            [&derive_impl, &segmentation_host]
+                .into_iter()
+                .flat_map(|node| {
+                    rows(
+                        node,
+                        [UnitInvocation::Native, UnitInvocation::Target]
+                            .map(|invocation| (UnitSide::Host, invocation, UnitKind::Linked)),
+                    )
+                }),
+        )
+        .collect();
+        let mut graph = Graph::default();
+        graph.apply_slice_report(TARGET, RUSTC, None, 1, &published, &[]);
+        // The native resolve: `derive_more-impl` reaches the host-side
+        // `unicode-segmentation` and pins its twin, and so does the
+        // `derive_more` above it (stow#506).
+        derive_impl.deps = vec![0, 3];
+        let mut native = sub("derive_more");
+        native.deps = vec![1, 0];
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![2],
+                    nodes: vec![segmentation, derive_impl.clone(), native, segmentation_host],
+                },
+                0,
+            )
+            .expect("the native tree keeps the rule");
+        derive_impl.deps.clear();
+        let wasm = wasm_sub("derive_more", vec![0]);
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![1],
+                    nodes: vec![derive_impl, wasm.clone()],
+                },
+                0,
+            )
+            .expect("the wasm tree keeps the rule on its own edges");
+        let pass = graph
+            .claim_nodes(&claim_settings(45, 16), 10_000, u32::MAX)
+            .expect("claim");
+        let minted = graph
+            .claimed(&pass, &mut graph.test_digest_source())
+            .expect("mint");
+        assert_eq!(
+            minted
+                .claims
+                .iter()
+                .map(|claim| claim.task_id.as_str())
+                .collect::<Vec<_>>(),
+            [id("derive_more")],
+            "the native consumer dispatches"
+        );
+        let [refusal] = minted.refusals.as_slice() else {
+            panic!("one refusal: {:?}", minted.refusals);
+        };
+        assert_eq!(refusal.task_id, wasm.task_id);
+        assert_eq!(
+            refusal.error,
+            format!(
+                "dependency closure holds unicode-segmentation 1.0.0 on the target side for {TARGET}, which a node for {WASM} cannot carry"
+            )
+        );
+        let ix = graph.node_ix(&wasm.task_id).expect("wasm derive_more");
+        assert_eq!(graph.node(ix).status, Status::Failed);
+        assert!(graph.attempt_outcomes.is_empty(), "no run, no outcome");
+    }
+
+    /// The stow#1566 clap pieces, in tree order: host-side `proc-macro2`,
+    /// host-side `clap_derive` over it, target-side `proc-macro2`, and
+    /// target-side `quote` over that.
+    fn clap_pieces() -> [SubmissionNode; 4] {
+        let mut proc_macro2_host = sub("proc-macro2");
+        proc_macro2_host.host_side = true;
+        proc_macro2_host.task_id = minted_id(&proc_macro2_host);
+        let mut clap_derive = sub("clap_derive");
+        clap_derive.host_side = true;
+        clap_derive.deps = vec![0];
+        clap_derive.task_id = minted_id(&clap_derive);
+        let mut quote = sub("quote");
+        quote.deps = vec![2];
+        [proc_macro2_host, clap_derive, sub("proc-macro2"), quote]
+    }
+
+    /// The refusal text for the first node of `clap`'s closure missing
+    /// its edge to `proc-macro2`'s target-side twin: `clap_derive`, below
+    /// `clap`.
+    const CLAP_REFUSAL: &str = "clap_derive 1.0.0 (host) without its edge to proc-macro2 1.0.0, which a build of the closure links";
+
+    /// stow#1566: `clap` reaches the host-side `proc-macro2` through
+    /// `clap_derive` while its closure holds the target-side twin through
+    /// `quote`, and carries no edge to it — the context superset serving
+    /// spliced for run 44199090441. No build of that closure mints it, so
+    /// the route refuses the tree.
+    #[test]
+    fn a_closure_whose_context_no_build_mints_is_refused_at_submit() {
+        let mut clap = sub("clap");
+        clap.deps = vec![1, 3];
+        let tree = SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![4],
+            nodes: clap_pieces().into_iter().chain([clap]).collect(),
+        };
+        let error = Graph::default().merge(&tree, 0).expect_err("refused");
+        assert!(
+            error
+                .to_string()
+                .contains("without its edge to proc-macro2-1.0.0-"),
+            "{error}"
+        );
+    }
+
+    /// stow#1566: a tree naming `clap_derive` bare keeps the rule on its
+    /// own edges, while `clap`'s graph closure — through `clap_derive`'s
+    /// committed edge — reaches host-side `proc-macro2` beside the twin
+    /// `clap` has no edge to. The claim refuses `clap` without a run.
+    #[test]
+    fn a_closure_whose_context_no_build_mints_in_the_graph_is_refused_at_claim() {
+        let [proc_macro2_host, clap_derive, proc_macro2, quote] = clap_pieces();
+        let rows = |node: &SubmissionNode| {
+            let shapes = if node.host_side {
+                [UnitInvocation::Native, UnitInvocation::Target]
+                    .map(|invocation| (UnitSide::Host, invocation, UnitKind::Linked))
+            } else {
+                [UnitKind::Unlinked, UnitKind::Linked]
+                    .map(|kind| (UnitSide::Target, UnitInvocation::Native, kind))
+            };
+            shapes.map(|(side, invocation, kind)| PublishedSliceRow {
+                crate_name: node.crate_name.clone(),
+                version: node.version.clone(),
+                features_json: node.features_json.clone(),
+                unit_shape: UnitShape {
+                    side,
+                    invocation,
+                    kind,
+                },
+                dependency_identity: node.dependency_identity.clone(),
+                node_profile: node.profile,
+            })
+        };
+        let published: Vec<_> = [&proc_macro2_host, &clap_derive, &proc_macro2, &quote]
+            .into_iter()
+            .flat_map(rows)
+            .collect();
+        let mut graph = Graph::default();
+        graph.apply_slice_report(TARGET, RUSTC, None, 1, &published, &[]);
+        // A consumer of `clap_derive` with no target-side `proc-macro2`
+        // commits `clap_derive`'s edge; its own closure keeps the rule.
+        let mut app = sub("app");
+        app.deps = vec![1];
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![2],
+                    nodes: vec![proc_macro2_host, clap_derive.clone(), app],
+                },
+                0,
+            )
+            .expect("the derive tree keeps the rule");
+        let mut bare_derive = clap_derive;
+        bare_derive.deps.clear();
+        let mut quote = quote;
+        quote.deps = vec![1];
+        let mut clap = sub("clap");
+        clap.deps = vec![0, 2];
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![3],
+                    nodes: vec![bare_derive, proc_macro2, quote, clap.clone()],
+                },
+                0,
+            )
+            .expect("the clap tree keeps the rule on its own edges");
+        let pass = graph
+            .claim_nodes(&claim_settings(45, 16), 10_000, u32::MAX)
+            .expect("claim");
+        let minted = graph
+            .claimed(&pass, &mut graph.test_digest_source())
+            .expect("mint");
+        assert_eq!(
+            minted
+                .claims
+                .iter()
+                .map(|claim| claim.task_id.as_str())
+                .collect::<Vec<_>>(),
+            [id("app")],
+            "the consumer whose closure keeps the rule dispatches"
+        );
+        let [refusal] = minted.refusals.as_slice() else {
+            panic!("one refusal: {:?}", minted.refusals);
+        };
+        assert_eq!(refusal.task_id, clap.task_id);
+        assert_eq!(
+            refusal.error,
+            format!("dependency closure holds {CLAP_REFUSAL}")
+        );
+        let ix = graph.node_ix(&clap.task_id).expect("clap");
+        assert_eq!(graph.node(ix).status, Status::Failed);
         assert!(graph.attempt_outcomes.is_empty(), "no run, no outcome");
     }
 
@@ -7120,6 +7533,101 @@ mod tests {
         let now = Graph::STATUS_RECONCILE_MS;
         assert!(!graph.reconcile_due(now, &settings));
         assert_eq!(graph.wake_plan(now, &settings), queue::AlarmPlan::Delete);
+    }
+
+    /// Counts residency holds the way the platform does.
+    #[derive(Clone, Default)]
+    struct CountedResidency(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl skyzen::durable::ResidencyInner for CountedResidency {
+        fn acquire(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn release(&self) {
+            let before = self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(before > 0, "released a hold that was never taken");
+        }
+        fn clone_box(&self) -> Box<dyn skyzen::durable::ResidencyInner> {
+            Box::new(self.clone())
+        }
+    }
+
+    /// stow#1574: the scheduler holds residency from the merge that
+    /// queues claimable work through the claim and the run, and lets go
+    /// once the completion leaves nothing — so an idle scheduler still
+    /// hibernates. Each settle along the way re-decides, holding at
+    /// most one guard.
+    #[test]
+    fn residency_is_held_while_the_graph_has_work() {
+        let settings = claim_settings(45, 16);
+        let holds = CountedResidency::default();
+        let residency = skyzen::durable::Residency::new(Box::new(holds.clone()));
+        let count = || holds.0.load(std::sync::atomic::Ordering::SeqCst);
+        let cell = GraphCell::default();
+        let loaded = cell.install(Graph::default());
+        let settle = || {
+            let needed = loaded.with(|graph| graph.needs_residency(&settings));
+            loaded.cell().settle_residency(needed, &residency);
+        };
+
+        settle();
+        assert_eq!(count(), 0, "an empty graph holds nothing");
+
+        loaded.with(|graph| graph.merge(&solo(), 0).expect("merge"));
+        settle();
+        assert_eq!(count(), 1, "claimable work holds");
+
+        let claimed = loaded.with(|graph| graph.claim(&settings, 0, u32::MAX).expect("claim"));
+        assert_eq!(claimed.len(), 1);
+        settle();
+        settle();
+        assert_eq!(count(), 1, "in-flight work keeps the one hold");
+
+        loaded.with(|graph| {
+            assert!(graph.bind(&id("solo"), claimed[0].generation, 4242, 1_000));
+            graph.run_finished(&id("solo"), completion(4242, true, false, None), 2_000);
+            assert_eq!(status_of(graph, "solo"), Some(Status::Completed));
+        });
+        settle();
+        assert_eq!(count(), 0, "a drained graph releases");
+    }
+
+    /// Ready work nothing will claim — dispatch paused or frozen —
+    /// waits for an operator and holds nothing; work already in flight
+    /// holds through a freeze, because its completions still arrive.
+    #[test]
+    fn residency_ignores_work_an_operator_holds_back() {
+        use stow_types::api::{ChannelOutcome, DispatchFreezeRecord, DispatchFreezeTrigger};
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        let paused = queue::SchedulerSettings {
+            dispatch: queue::Dispatch::Paused,
+            ..queue::SchedulerSettings::default()
+        };
+        assert!(!graph.needs_residency(&paused));
+        let settings = claim_settings(45, 16);
+        assert!(graph.needs_residency(&settings));
+
+        assert_eq!(graph.claim(&settings, 0, u32::MAX).expect("claim").len(), 1);
+        let trigger = DispatchFreezeTrigger::Manual {
+            actor: "test".to_owned(),
+        };
+        graph.apply(
+            &SchedulerEvent::Freeze {
+                at: "2026-11-17T03:00:00Z".to_owned(),
+                trigger: trigger.clone(),
+                record: Some(Box::new(DispatchFreezeRecord {
+                    frozen_at: "2026-11-17T03:00:00Z".to_owned(),
+                    trigger,
+                    notify: ChannelOutcome::Disabled {
+                        reason: "test".to_owned(),
+                    },
+                })),
+            },
+            0,
+        );
+        assert!(graph.needs_residency(&settings), "in flight under a freeze");
+        assert!(graph.needs_residency(&paused), "in flight while paused");
     }
 
     /// stow#1039: the operator's `set` replaces the binding caps in the

@@ -47,6 +47,11 @@ here.</p>
 <ul>{% for route in cost.top_routes %}<li><code>{{ route.label }}</code> — {{ route.requests }} requests</li>
 {% endfor %}</ul>
 {% endif %}
+{% endif %}{% if let Some(workflow) = workflow %}
+<p>Reason: <strong>a dispatch was refused</strong> and <code>{{ workflow.workflow }}</code>
+reads <code>{{ workflow.state }}</code>.</p>
+<p>Until the workflow is enabled again GitHub refuses every dispatch. Enable
+it, then clear the freeze.</p>
 {% endif %}{% endif %}
 <p>The queue still accepts misses; they stay pending until a human
 clears the freeze. Nothing unfreezes automatically.</p>

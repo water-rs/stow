@@ -30,6 +30,10 @@ Frozen at: {{ frozen_at }}
   today's top request groups (by scriptName):
 {% for route in cost.top_routes %}    {{ route.label }} — {{ route.requests }} requests
 {% endfor %}{% endif %}
+{% endif %}{% if let Some(workflow) = workflow %}Reason: a dispatch was refused and {{ workflow.workflow }} reads `{{ workflow.state }}`
+
+  Until the workflow is enabled again GitHub refuses every dispatch. Enable
+  it, then clear the freeze.
 {% endif %}{% endif %}
 The queue still accepts misses; they stay pending until a human clears
 the freeze. Nothing unfreezes automatically.

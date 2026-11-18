@@ -276,26 +276,108 @@ fn dispatch_window(settings: &super::queue::SchedulerSettings) -> u32 {
 /// The dependency ids of pending node `n`, every one a node already in
 /// the graph by the time `n`'s tree merges (rows above `pending_end`
 /// are built first, and pending deps point at lower `n`).
+///
+/// Every dep sits on `n`'s own target ([`target_of`] spreads rows by
+/// `n % targets`): a closure holding a target-side node at another
+/// triple is refused at submit and at claim (stow#1593), as no real
+/// resolve produces one.
+///
+/// A host-side node (every tenth row) depends on host-side rows only,
+/// as no real resolve gives a host unit a target-side child
+/// (stow#1566): each dep moves to the nearest host-side row on the same
+/// target inside its own status group. Rows `n % 90` apart share a
+/// target and a rustc, so the move keeps both. Fixture crates are
+/// distinct per row, so no node has a target-side twin and no shadow or
+/// self-twin edge arises.
 fn pending_deps(shape: FixtureShape, eligible_rows: u32, n: u32) -> Vec<u32> {
+    let deps = target_side_deps(shape, eligible_rows, n);
+    if !n.is_multiple_of(10) {
+        return deps;
+    }
+    let mut host: Vec<u32> = Vec::with_capacity(deps.len());
+    for dep in deps {
+        let moved = host_row_in_group(shape, n, dep);
+        if !host.contains(&moved) {
+            host.push(moved);
+        }
+    }
+    host
+}
+
+/// The row on `n`'s target and rustc nearest `dep` (below, else above)
+/// that is host-side, inside `dep`'s status group, the pool's first two
+/// completed rows excluded and pending deps kept below `n`. A pending
+/// dep with none moves to the first failed host row, a met-never edge.
+fn host_row_in_group(shape: FixtureShape, n: u32, dep: u32) -> u32 {
+    /// Host-side rows sharing `n`'s target and rustc, then, in a group
+    /// too small to hold one, those sharing its rustc alone, then any
+    /// host-side row: the strides are `lcm(10, 9)`, `lcm(10, 3)` and 10.
+    const HOST_STRIDES: [u32; 3] = [90, 30, 10];
+    let (first, last) = if dep <= shape.pending_end() {
+        (1, shape.pending_end().min(n - 1))
+    } else if dep <= shape.completed_end() {
+        (shape.completed_row(2), shape.completed_end())
+    } else if dep <= shape.failed_end() {
+        (shape.completed_end() + 1, shape.failed_end())
+    } else {
+        // Past the seeded groups (a human lane wider than the pending
+        // group at small sizes): the dep's own row stays in range.
+        (shape.failed_end() + 1, u32::MAX)
+    };
+    for stride in HOST_STRIDES {
+        let class = n % stride;
+        let below = dep.checked_sub((dep % stride + stride - class) % stride);
+        if let Some(row) = below.filter(|&row| row >= first && row <= last) {
+            return row;
+        }
+        let above = dep + (class + stride - dep % stride) % stride;
+        if above >= first && above <= last {
+            return above;
+        }
+    }
+    assert!(
+        dep <= shape.pending_end(),
+        "no host-side row of node {n}'s target in {first}..={last} for dep {dep}"
+    );
+    host_row_in_group(shape, n, shape.failed_row(0))
+}
+
+/// [`pending_deps`] before host-side nodes move their edges: every dep
+/// on `n`'s own target.
+fn target_side_deps(shape: FixtureShape, eligible_rows: u32, n: u32) -> Vec<u32> {
     let rows = shape.queue_rows;
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
     let eligible_end = human_end + eligible_rows;
-    // The pool starts at `completed_row(2)`, clear of the purge
-    // drive's `completed_row(0)`/`completed_row(1)`; the `n % 64` pool
-    // spreads the window's edges over 64 published leaves so no leaf
-    // accrues fan-in that grows with the window.
-    let pool = shape.pending_end() + 3 + n % 64;
+    let targets = u32::try_from(CI_TARGET_TRIPLES.len()).expect("target count fits u32");
+    // The first row at or above `pick` on `n`'s target.
+    let up = |pick: u32| pick + (n % targets + targets - pick % targets) % targets;
+    // The first failed row on `n`'s target: a met-never edge.
+    let failed = up(shape.failed_row(0));
+    // The last row at or below `pick` on `n`'s target, or the failed
+    // row when none is left above row 0.
+    let down =
+        |pick: u32| match pick.checked_sub((pick % targets + targets - n % targets) % targets) {
+            Some(row) if row > 0 => row,
+            _ => failed,
+        };
+    let pool = shape.pool_row(n % targets, n % 64);
     // A pending dep always points below `n`, so it merged earlier.
     let lower = |pick: u32| -> u32 {
         if pick <= shape.pending_end() && pick >= n {
             if n > 1 {
-                pick % (n - 1) + 1
+                down(pick % (n - 1) + 1)
             } else {
-                shape.failed_row(0)
+                failed
             }
+        } else if pick <= shape.pending_end() {
+            down(pick)
         } else {
-            pick
+            // Above the pending group: stay above it and within the
+            // queue, which ends on failed rows.
+            Some(down(pick))
+                .filter(|&row| row > shape.pending_end())
+                .unwrap_or_else(|| up(pick))
         }
     };
     if n > human_pin && n <= human_end {
@@ -308,17 +390,17 @@ fn pending_deps(shape: FixtureShape, eligible_rows: u32, n: u32) -> Vec<u32> {
         // unmet one — the production state a parked row holds.
         let mut deps = vec![pool];
         if n % 20 == 1 {
-            deps.push(spread(n, 7919, n - 1) + 1);
+            deps.push(down(spread(n, 7919, n - 1) + 1));
         }
         return deps;
     }
     // Bulk: the first edge is an unmet lower pending node (or a failed
-    // one for the first row), so no bulk row is claimable; every third
-    // row adds a spread edge onto the whole queue.
+    // one when none is left below), so no bulk row is claimable; every
+    // third row adds a spread edge onto the whole queue.
     let first = if n > 1 {
-        spread(n, 7919, n - 1) + 1
+        down(spread(n, 7919, n - 1) + 1)
     } else {
-        shape.failed_row(0)
+        failed
     };
     let mut deps = vec![first];
     if n.is_multiple_of(3) {

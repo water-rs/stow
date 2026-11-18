@@ -687,6 +687,10 @@ fn rate_limited_response(retry_after_secs: u64) -> skyzen::Response {
 pub struct TrustRateLimitGate;
 
 impl skyzen::middleware::Middleware for TrustRateLimitGate {
+    #[expect(
+        clippy::future_not_send,
+        reason = "skyzen's middleware chain runs on the thread that built its router and is not Send"
+    )]
     async fn handle(
         &self,
         request: &mut skyzen::Request,

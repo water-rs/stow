@@ -139,12 +139,25 @@ impl FixtureShape {
         }
     }
 
-    /// A `completed` dep for the submit batch's `depends_on` — `k` picks
-    /// inside the completed group so the dep's node is real and
-    /// published.
+    /// A `completed` dep on `CI_TARGET_TRIPLES[target_index]` for a
+    /// drive's tree — `k` picks among that target's completed rows, so
+    /// the dep's node is real and published and a closure keeps one
+    /// target (stow#1593).
     #[must_use]
-    pub const fn dep_row(self, k: u32) -> u32 {
-        self.pending_end() + 1 + k % (self.completed_end() - self.pending_end())
+    pub fn dep_row(self, target_index: u32, k: u32) -> u32 {
+        self.slice_first_row(target_index) + k % self.slice_live_rows(target_index) * target_count()
+    }
+
+    /// Pool leaf `leaf` (of 64) on `CI_TARGET_TRIPLES[target_index]`: the
+    /// published rows the dispatch window's pending nodes and the merge
+    /// drives' fresh nodes depend on, spread so no leaf's fan-in grows
+    /// with the window. The pool starts at `completed_row(2)`, clear of
+    /// the purge drive's `completed_row(0)` and `completed_row(1)`.
+    #[must_use]
+    pub fn pool_row(self, target_index: u32, leaf: u32) -> u32 {
+        let targets = target_count();
+        let base = self.completed_row(2) + leaf % 64 * targets;
+        base + (target_index + targets - base % targets) % targets
     }
 
     /// The first `n % TARGETS == target_index` row inside the completed

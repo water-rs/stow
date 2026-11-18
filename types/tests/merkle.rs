@@ -353,9 +353,10 @@ fn missing_lib_endpoints_self_edges_and_cycles_fail() {
         &rustc(),
     )
     .unwrap_err();
+    let message = format!("{self_edge:#}");
     assert!(
-        format!("{self_edge:#}").contains("depends on itself"),
-        "{self_edge:#}"
+        message.contains("selfish") && message.contains("cycle"),
+        "{message}"
     );
 
     let cycle = resolved_task_graph(
@@ -391,10 +392,11 @@ fn missing_lib_endpoints_self_edges_and_cycles_fail() {
     assert!(format!("{cycle:#}").contains("cycle"), "{cycle:#}");
 }
 
-/// Path/git-style interior units carry edges but mint no nodes: the
-/// registry lib on the far side becomes the node's direct dep.
+/// stow#1566: a registry lib linking a path/git-style unit mints no
+/// node — no build reproduces it from crates.io — while the registry lib
+/// on the far side still does.
 #[test]
-fn non_registry_units_traverse_without_minting_nodes() {
+fn a_registry_lib_linking_a_non_registry_unit_mints_no_node() {
     let graph = resolved_task_graph(
         &[
             lib(
@@ -434,14 +436,16 @@ fn non_registry_units_traverse_without_minting_nodes() {
         &rustc(),
     )
     .unwrap();
+    let names: Vec<&str> = graph
+        .nodes()
+        .iter()
+        .map(|node| node.identity.crate_name.as_str())
+        .collect();
     assert_eq!(
-        graph.nodes().len(),
-        2,
-        "only crates.io units mint nodes — middle is interior"
+        names,
+        ["inner"],
+        "root links the interior middle, so only inner mints"
     );
-    let root = node_index(&graph, "root");
-    let inner = node_index(&graph, "inner");
-    assert_eq!(graph.nodes()[root].dependencies, vec![inner]);
 }
 
 #[test]
@@ -454,7 +458,9 @@ fn dependency_endpoints_preserve_package_source() {
     path_unit.key.pkg = path;
     path_unit.is_crates_io = false;
 
-    for (endpoint, expected) in [(&registry_unit, "middle"), (&path_unit, "inner")] {
+    // The registry endpoint is root's node edge; the path endpoint makes
+    // root interior (stow#1566), so root mints nothing to carry an edge.
+    for (endpoint, expected) in [(&registry_unit, Some("middle")), (&path_unit, None)] {
         let root = lib("root", "1.0.0", &[], vec![dep_of(endpoint)]);
         let mut units = vec![
             root,
@@ -465,13 +471,18 @@ fn dependency_endpoints_preserve_package_source() {
         let forward = resolved_task_graph(&units, &rustc()).unwrap();
         units.reverse();
         let backward = resolved_task_graph(&units, &rustc()).unwrap();
-        let root = node_index(&forward, "root");
-        assert_eq!(
-            forward.nodes()[root].dependencies,
-            vec![node_index(&forward, expected)],
-        );
         assert_eq!(forward.nodes(), backward.nodes());
-        assert_eq!(forward.task_id(root), backward.task_id(root));
+        let root = forward
+            .nodes()
+            .iter()
+            .position(|node| node.identity.crate_name == "root");
+        assert_eq!(
+            root.map(|root| forward.nodes()[root].dependencies.clone()),
+            expected.map(|name| vec![node_index(&forward, name)]),
+        );
+        if let Some(root) = root {
+            assert_eq!(forward.task_id(root), backward.task_id(root));
+        }
     }
 
     // A same-tuple unit from another source is not the declared endpoint.

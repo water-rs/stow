@@ -95,6 +95,13 @@ impl github_auth::MutationPolicy for OperatorRoute {
     const WORKFLOWS: &'static [&'static str] = &[OPERATIONS_WORKFLOW];
 }
 
+/// `dispatch-freeze`: an operator's switch plus the watchdog, whose trip
+/// engages it before it disables the dispatching workflows.
+pub struct FreezeRoute;
+impl github_auth::MutationPolicy for FreezeRoute {
+    const WORKFLOWS: &'static [&'static str] = &[OPERATIONS_WORKFLOW, "watchdog.yml"];
+}
+
 /// `tasks/submit`: operator submits plus the scheduled and dispatched
 /// preheat lanes.
 pub struct SubmitRoute;
@@ -338,7 +345,7 @@ pub async fn get_dispatch_freeze(
 /// The manual transition that is also the freeze's only recovery path —
 /// clearing it resumes dispatch of everything that queued meanwhile.
 pub async fn set_dispatch_freeze(
-    Mutator { caller, actor, .. }: Mutator<OperatorRoute>,
+    Mutator { caller, actor, .. }: Mutator<FreezeRoute>,
     Json(switch): Json<stow_types::api::DispatchFreeze>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::DispatchFreeze>, GetArtifactError> {

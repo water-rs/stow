@@ -227,7 +227,7 @@ instead of building the production tools. The variables are in
 brew install hyperfine sqlite3
 npm i -g wrangler@4    # or use the version pinned in skyzen/cli
 cargo install wasm-bindgen-cli --version 0.2.120  # match Cargo.lock
-cargo install skyzen-cli --version 0.4.2  # provides `skyzen dev`/`deploy`/`provision`/`secret`
+cargo install --git https://github.com/zen-rs/skyzen --rev 1787296d7f618b3b6f44c0589739cc0dd99d03ed skyzen-cli  # the commit in Cargo.lock; provides `skyzen dev`/`deploy`/`provision`/`secret`
 ```
 
 You also need a sigstore-loadable PEM key pair. ECDSA P256 in PKCS#8

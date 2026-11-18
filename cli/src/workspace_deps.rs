@@ -789,6 +789,31 @@ impl UnitInfo<'_> {
     }
 }
 
+/// Clear the node flag of every crates.io lib that mints no task node
+/// (stow#1566, [`stow_types::unit_graph::minting_libs`]): one linking a
+/// path or git package, or a lib under a profile no node carries, is
+/// compiled locally like a project member, so it has no entry, no edge
+/// into it and no lookup. `task_units` carry the cargo unit each was
+/// projected from.
+fn demote_unminted(
+    infos: &mut [UnitInfo<'_>],
+    task_units: &[(stow_types::unit_graph::TaskUnit, u32)],
+) -> stow_types::error::Result<()> {
+    let lean: Vec<_> = task_units.iter().map(|(unit, _)| unit.clone()).collect();
+    let mints = stow_types::unit_graph::minting_libs(&lean)?;
+    for (unit, origin) in task_units {
+        if unit.key.kind == stow_types::unit_graph::TaskUnitKind::Lib
+            && unit.is_crates_io
+            && !mints.contains(&unit.key)
+        {
+            let info = &mut infos[*origin as usize];
+            info.parsed = None;
+            info.profile = None;
+        }
+    }
+    Ok(())
+}
+
 fn unit_infos<'a>(graph: &UnitGraph<'a>) -> stow_types::error::Result<Vec<UnitInfo<'a>>> {
     graph
         .units
@@ -1263,8 +1288,10 @@ fn emit_expanded_graph(
     Vec<SelectedRegistryDependency>,
     Vec<LocalManifestHash>,
 )> {
-    let infos = unit_infos(graph)?;
+    let mut infos = unit_infos(graph)?;
     let sides = unit_sides(graph, target)?;
+    let task_units: Vec<_> = unit_graph_task_units(graph, target, host_triple)?;
+    demote_unminted(&mut infos, &task_units)?;
     let unit_edges = unit_dep_edges(graph, &infos, &sides)?;
 
     // A package's build-dependencies hang under its build-script
@@ -1370,10 +1397,7 @@ fn emit_expanded_graph(
     // (stow#588). The node's explicit-spelling flag is derived on the
     // same pass — the shared projection computes it bottom-up from the
     // dep edges' proc-macro flags (stow#736).
-    let task_units: Vec<_> = unit_graph_task_units(graph, target, host_triple)?
-        .into_iter()
-        .map(|(unit, _)| unit)
-        .collect();
+    let task_units: Vec<_> = task_units.into_iter().map(|(unit, _)| unit).collect();
     let resolved = stow_types::unit_graph::resolved_task_graph(&task_units, rustc_version)?;
     for entry in entries.values_mut() {
         let (subgraph, spelling) = node_subgraph(&resolved, entry)?;
@@ -4015,6 +4039,85 @@ mod unit_graph_tests {
                 .collect::<Vec<_>>(),
             vec![("a", false), ("h", true)],
             "the unselected platform's units are excluded, host units kept"
+        );
+    }
+
+    /// stow#1566: a registry lib linking a path package — the consumer's
+    /// `[patch.crates-io]` of `postgres-types` under `rust_decimal`, the
+    /// shape run 44199081474 dispatched — has no entry and is no direct
+    /// registry dependency: it mints no node, so the consumer compiles
+    /// it locally. The registry libs around it keep theirs.
+    #[test]
+    fn a_registry_lib_over_a_patched_package_has_no_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("root");
+        let patched = root.join("postgres-types");
+        std::fs::create_dir_all(&patched).expect("package dirs");
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"root\"\n").expect("manifest");
+        std::fs::write(
+            patched.join("Cargo.toml"),
+            "[package]\nname = \"postgres-types\"\n",
+        )
+        .expect("manifest");
+        let json = r#"{
+            "version": 1,
+            "roots": [0],
+            "units": [
+                {"pkg_id": "path+file://ROOT#root@0.0.0",
+                 "target": {"kind": ["lib"]}, "platform": null, "mode": "build",
+                 "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0,
+                     "debug_assertions": true, "overflow_checks": true, "panic": "unwind",
+                     "strip": {"deferred": "None"}},
+                 "features": [],
+                 "dependencies": [{"index": 1, "extern_crate_name": "rust_decimal"}]},
+                {"pkg_id": "registry+https://github.com/rust-lang/crates.io-index#rust_decimal@1.43.0",
+                 "target": {"kind": ["lib"]}, "platform": null, "mode": "build",
+                 "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0,
+                     "debug_assertions": true, "overflow_checks": true, "panic": "unwind",
+                     "strip": {"deferred": "None"}},
+                 "features": [],
+                 "dependencies": [{"index": 2, "extern_crate_name": "arrayvec"},
+                                  {"index": 3, "extern_crate_name": "postgres_types"}]},
+                {"pkg_id": "registry+https://github.com/rust-lang/crates.io-index#arrayvec@0.7.8",
+                 "target": {"kind": ["lib"]}, "platform": null, "mode": "build",
+                 "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0,
+                     "debug_assertions": true, "overflow_checks": true, "panic": "unwind",
+                     "strip": {"deferred": "None"}},
+                 "features": [], "dependencies": []},
+                {"pkg_id": "path+file://ROOT/postgres-types#postgres-types@0.2.14",
+                 "target": {"kind": ["lib"]}, "platform": null, "mode": "build",
+                 "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0,
+                     "debug_assertions": true, "overflow_checks": true, "panic": "unwind",
+                     "strip": {"deferred": "None"}},
+                 "features": [],
+                 "dependencies": [{"index": 4, "extern_crate_name": "base64"}]},
+                {"pkg_id": "registry+https://github.com/rust-lang/crates.io-index#base64@0.23.1",
+                 "target": {"kind": ["lib"]}, "platform": null, "mode": "build",
+                 "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0,
+                     "debug_assertions": true, "overflow_checks": true, "panic": "unwind",
+                     "strip": {"deferred": "None"}},
+                 "features": [], "dependencies": []}
+            ]
+        }"#
+        .replace(
+            "file://ROOT",
+            url::Url::from_file_path(&root).expect("root url").as_str(),
+        );
+        let graph: UnitGraph<'_> = serde_json::from_str(&json).expect("parse");
+        let (entries, direct, _) =
+            emit_expanded_graph(&graph, None, "x86_64-unknown-linux-gnu", rustc_test())
+                .expect("the graph projects");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.crate_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["arrayvec", "base64"],
+            "rust_decimal links the patched postgres-types and mints no node"
+        );
+        assert!(
+            direct.is_empty(),
+            "the root's one registry dep mints no node: {direct:?}"
         );
     }
 }

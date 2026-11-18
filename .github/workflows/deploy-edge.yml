@@ -67,9 +67,6 @@ concurrency: deploy-edge
 env:
   DEPLOY_SHA: ${{ github.sha }}
   CANARY_SHARE: ${{ inputs.canary_share || '5' }}
-  # zen-rs/skyzen commit that provides `deploy --upload-only` — the
-  # squash-merged commit of zen-rs/skyzen#98 on skyzen's dev.
-  SKYZEN_REV: 0271f693d253a9b32660affacbafaeffca455620
   # The generated wrangler config, relative to edge/ (the manifest root).
   WRANGLER_CONFIG: .skyzen/gen/wrangler.toml
   # The synthetic suite's request count PER SIDE. Large enough that the
@@ -145,8 +142,6 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: ./.github/actions/install-skyzen-cli
-        with:
-          rev: ${{ env.SKYZEN_REV }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - run: bun install -g wrangler@4
       - run: skyzen doctor --provider cloudflare --manifest edge/Skyzen.toml

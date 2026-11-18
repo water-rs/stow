@@ -456,6 +456,30 @@ impl<T: CiTransport> CiInterface<T> {
         })
     }
 
+    /// The `state` GitHub documents on `GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}`
+    /// for `build-crate.yml`: `active`, `deleted`, `disabled_fork`,
+    /// `disabled_inactivity` or `disabled_manually`.
+    ///
+    /// # Errors
+    /// A transport failure, a refused read or an undecodable answer.
+    pub async fn build_workflow_state(&self) -> Result<String, DispatchError> {
+        #[derive(serde::Deserialize)]
+        struct WorkflowRow {
+            state: String,
+        }
+        let url = self.endpoint.resolve(&format!(
+            "repos/{}/actions/workflows/{}",
+            self.endpoint.repo(),
+            crate::trusted_builder::WORKFLOW_FILE,
+        ))?;
+        let response = self
+            .send_checked(self.endpoint.api_request("GET", &url, None))
+            .await?;
+        serde_json::from_slice::<WorkflowRow>(&response.body)
+            .map(|row| row.state)
+            .map_err(|error| DispatchError::Response(error.to_string()))
+    }
+
     /// Read the isolated verifier's conclusion for exactly this attempt.
     /// A job from a previous attempt never exempts the current failure.
     ///

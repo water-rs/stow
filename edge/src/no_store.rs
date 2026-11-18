@@ -99,7 +99,7 @@ mod tests {
         fn respond(
             &mut self,
             _: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             let mut response = Response::new(Body::empty());
             *response.status_mut() = self.0;
             ready(Ok(response))
@@ -117,7 +117,7 @@ mod tests {
         fn respond(
             &mut self,
             _: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             ready(Err(self.0.take().expect("each test calls respond once")))
         }
     }
@@ -184,7 +184,7 @@ mod tests {
         fn respond(
             &mut self,
             _: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             let mut response = Response::new(Body::empty());
             response.headers_mut().insert(
                 skyzen::header::CACHE_CONTROL,

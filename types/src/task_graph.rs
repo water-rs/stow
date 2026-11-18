@@ -562,6 +562,430 @@ fn declare_union_deps(
     }
 }
 
+/// A target-side node keyed at a triple other than that of a node whose
+/// dependency closure holds it (stow#1593): `owner` and `foreign` index
+/// the caller's node list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForeignTargetSide {
+    /// The node whose closure holds `foreign`.
+    pub owner: usize,
+    /// The target-side node at another triple.
+    pub foreign: usize,
+}
+
+/// The first node whose dependency closure, below the node itself, holds
+/// a target-side node at a triple other than the node's own — `None`
+/// when every node keeps the rule.
+///
+/// The rule is what a dispatch payload can carry: its wire subgraph
+/// ([`crate::api::TaskSubgraph`]) keys every target-side node at the
+/// task's own target and every host-side node at the runner family's
+/// host triple, so a node breaking it dispatches a subgraph that
+/// re-derives another task id, and no build of the task's target could
+/// compile a target-side unit for another triple anyway. A native
+/// consumer's host node legitimately depends on target-side nodes at the
+/// host triple — dedup-shadow and self-twin edges (stow#506, stow#723);
+/// the same node inside a closure rooted at another target does not.
+///
+/// One post-order pass, each node and edge visited once: every node
+/// records one target-side node its closure holds (itself when it is
+/// target-side), and because a node is checked only after its
+/// dependencies keep the rule, every target-side node in one closure
+/// shares that one's target. `deps` pushes a node's direct
+/// dependencies; a cycle is not this check's to report, so an edge
+/// back into the walk's own path is skipped.
+pub fn foreign_target_side<T: PartialEq>(
+    len: usize,
+    target: impl Fn(usize) -> T,
+    host_side: impl Fn(usize) -> bool,
+    deps: impl Fn(usize, &mut Vec<usize>),
+) -> Option<ForeignTargetSide> {
+    // `Some(held)` once a node is done: the target-side node its closure
+    // holds, if any.
+    let mut done = vec![None::<Option<usize>>; len];
+    let mut on_path = vec![false; len];
+    let mut children = Vec::new();
+    for start in 0..len {
+        if done[start].is_some() {
+            continue;
+        }
+        let mut stack = vec![(start, false)];
+        while let Some((at, expanded)) = stack.pop() {
+            if done[at].is_some() {
+                continue;
+            }
+            children.clear();
+            deps(at, &mut children);
+            if !expanded {
+                if on_path[at] {
+                    continue;
+                }
+                on_path[at] = true;
+                stack.push((at, true));
+                stack.extend(
+                    children
+                        .iter()
+                        .filter(|&&child| done[child].is_none() && !on_path[child])
+                        .map(|&child| (child, false)),
+                );
+                continue;
+            }
+            on_path[at] = false;
+            let mut held = (!host_side(at)).then_some(at);
+            for &child in &children {
+                let Some(Some(foreign)) = done[child] else {
+                    continue;
+                };
+                if target(foreign) != target(at) {
+                    return Some(ForeignTargetSide { owner: at, foreign });
+                }
+                held.get_or_insert(foreign);
+            }
+            done[at] = Some(held);
+        }
+    }
+    None
+}
+
+/// The first target-side node in `start`'s closure keyed at another triple.
+///
+/// It is [`foreign_target_side`]'s rule checked for one root, the closure
+/// its dispatch payload carries. One walk, each node visited once.
+pub fn foreign_target_side_below<T: PartialEq>(
+    start: usize,
+    target: impl Fn(usize) -> T,
+    host_side: impl Fn(usize) -> bool,
+    deps: impl Fn(usize, &mut Vec<usize>),
+) -> Option<usize> {
+    let own = target(start);
+    let mut seen = std::collections::HashSet::from([start]);
+    let mut stack = Vec::new();
+    deps(start, &mut stack);
+    while let Some(at) = stack.pop() {
+        if !seen.insert(at) {
+            continue;
+        }
+        if !host_side(at) && target(at) != own {
+            return Some(at);
+        }
+        deps(at, &mut stack);
+    }
+    None
+}
+
+/// What a closure breaking [`foreign_target_side`]'s rule holds, in the
+/// words every refusal of one uses: `<crate> <version> on the target
+/// side for <foreign>, which a node for <own> cannot carry`.
+#[must_use]
+pub fn foreign_target_side_text(
+    crate_name: impl std::fmt::Display,
+    version: impl std::fmt::Display,
+    foreign_target: impl std::fmt::Display,
+    own_target: impl std::fmt::Display,
+) -> String {
+    format!(
+        "{crate_name} {version} on the target side for {foreign_target}, which a node for {own_target} cannot carry"
+    )
+}
+
+/// One way a closure's context edges differ from the ones a single
+/// consumer build of that closure mints (stow#1566).
+///
+/// The resolver mints a node's dedup-shadow edges (stow#506) and its
+/// self-twin edge (stow#723) from the whole resolve it sits in, and the
+/// builder re-derives them from the closure the dispatch payload pins —
+/// so a closure is buildable only when every node in it carries exactly
+/// the context edges that closure implies. Each variant names the node
+/// whose context disagrees and the node the disagreement is about, as
+/// indexes of the caller's arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextIncoherence {
+    /// Two nodes of one identity — one unit in any build — over
+    /// different dependency contexts.
+    Duplicate {
+        /// The node met first.
+        first: usize,
+        /// The other node of the same identity.
+        second: usize,
+    },
+    /// `owner` reaches a host-side node whose target-side twin `twin`
+    /// the closure holds, and carries no edge to it.
+    MissingShadow {
+        /// The node lacking the edge.
+        owner: usize,
+        /// The target-side twin it must depend on.
+        twin: usize,
+    },
+    /// The host-side node `owner` depends on the target-side node
+    /// `child`, which is neither its own twin nor the twin of a host-side
+    /// node it reaches.
+    StrayTarget {
+        /// The host-side node.
+        owner: usize,
+        /// Its target-side child.
+        child: usize,
+    },
+    /// The host-side node `owner` carries a self-twin edge to `twin`
+    /// although a native build shares the pair, or lacks one although
+    /// the build keeps the pair apart.
+    SelfTwin {
+        /// The host-side node.
+        owner: usize,
+        /// Its target-side twin.
+        twin: usize,
+    },
+}
+
+impl ContextIncoherence {
+    /// The two nodes the disagreement is about: the node whose context
+    /// is wrong first.
+    #[must_use]
+    pub const fn nodes(self) -> [usize; 2] {
+        match self {
+            Self::Duplicate { first, second } => [first, second],
+            Self::MissingShadow { owner, twin } | Self::SelfTwin { owner, twin } => [owner, twin],
+            Self::StrayTarget { owner, child } => [owner, child],
+        }
+    }
+
+    /// The disagreement in the words every refusal of one uses, `name`
+    /// naming an arena node.
+    pub fn text(self, name: impl Fn(usize) -> String) -> String {
+        match self {
+            Self::Duplicate { first, second: _ } => format!(
+                "{} twice, over two dependency contexts, which one build cannot compile",
+                name(first)
+            ),
+            Self::MissingShadow { owner, twin } => format!(
+                "{} without its edge to {}, which a build of the closure links",
+                name(owner),
+                name(twin)
+            ),
+            Self::StrayTarget { owner, child } => format!(
+                "{} depending on {}, which no build of the closure links into it",
+                name(owner),
+                name(child)
+            ),
+            Self::SelfTwin { owner, twin } => format!(
+                "{} with a self-twin edge to {} that a build of the closure decides otherwise",
+                name(owner),
+                name(twin)
+            ),
+        }
+    }
+}
+
+/// The first [`ContextIncoherence`] in `start`'s closure, `start`
+/// included — `None` when one consumer build of the closure mints every
+/// node's context edges as the closure carries them (stow#1566).
+///
+/// The closure stands in for the resolve: it is what the builder pins.
+/// With `twin(D)` the target-side node of the closure sharing the
+/// host-side node `D`'s `identity` (every identity field but the side)
+/// whose profile `shares`, the rules are the resolver's own:
+///
+/// - one node per identity and side;
+/// - a node depends on `twin(D)` for every host-side `D` it reaches
+///   through host-side edges (`dedup_shadow_edges`);
+/// - a host-side node's target-side children are those twins and its own
+///   twin, nothing else — a host unit links host units only;
+/// - a host-side node `X` whose twin the closure holds depends on it
+///   exactly when a native build keeps the pair apart
+///   (`self_twin_edges`): the pair shares when every host-side child of
+///   `X` is a child of the twin or has a twin among the twin's children
+///   that shares in turn, and the twin has no host-side child `X` lacks.
+///   Same package and features give both sides the same dependency
+///   declarations, so this reads the raw pairing off the task edges:
+///   the twin's target-side children that pair with no host-side child
+///   of `X` are its shadow edges, which cargo's pairing never sees.
+///
+/// `identity` keys a node without its side; `deps` pushes a node's
+/// direct dependencies. A cycle is not this check's to report, so an
+/// edge back into the walk's own path is skipped. One walk collects the
+/// closure; each node's reached twins are computed once, bottom-up.
+#[allow(clippy::too_many_lines)] // one closure pass, its four rules in order
+pub fn context_incoherence_below<K: Ord>(
+    start: usize,
+    identity: impl Fn(usize) -> K,
+    host_side: impl Fn(usize) -> bool,
+    shares: impl Fn(usize) -> bool,
+    deps: impl Fn(usize, &mut Vec<usize>),
+) -> Option<ContextIncoherence> {
+    use std::collections::{BTreeMap, HashMap};
+
+    // Post-order over the closure: every node after its children.
+    let mut order = Vec::new();
+    let mut local = HashMap::<usize, usize>::new();
+    let mut children = Vec::<Vec<usize>>::new();
+    let mut done = std::collections::HashSet::new();
+    let mut on_path = std::collections::HashSet::new();
+    let mut stack = vec![(start, false)];
+    let mut pushed = Vec::new();
+    while let Some((at, expanded)) = stack.pop() {
+        if done.contains(&at) {
+            continue;
+        }
+        if expanded {
+            on_path.remove(&at);
+            done.insert(at);
+            local.insert(at, order.len());
+            order.push(at);
+            continue;
+        }
+        if !on_path.insert(at) {
+            continue;
+        }
+        stack.push((at, true));
+        pushed.clear();
+        deps(at, &mut pushed);
+        stack.extend(
+            pushed
+                .iter()
+                .filter(|child| !done.contains(*child) && !on_path.contains(*child))
+                .map(|&child| (child, false)),
+        );
+    }
+    // An edge back into the walk's own path closes a cycle, which is not
+    // this check's to report: it is skipped, as `foreign_target_side`
+    // skips it, so the local graph is a DAG in post-order.
+    for (position, &at) in order.iter().enumerate() {
+        pushed.clear();
+        deps(at, &mut pushed);
+        let mut mine: Vec<usize> = pushed
+            .iter()
+            .map(|child| local[child])
+            .filter(|&child| child < position)
+            .collect();
+        mine.sort_unstable();
+        mine.dedup();
+        children.push(mine);
+    }
+    let len = order.len();
+    let host: Vec<bool> = order.iter().map(|&at| host_side(at)).collect();
+    let keys: Vec<K> = order.iter().map(|&at| identity(at)).collect();
+    let has = |owner: usize, child: usize| children[owner].binary_search(&child).is_ok();
+
+    // One node per identity and side; the target-side one is a twin.
+    let mut seen = BTreeMap::<(&K, bool), usize>::new();
+    let mut targets = BTreeMap::<&K, usize>::new();
+    for at in 0..len {
+        if let Some(&first) = seen.get(&(&keys[at], host[at])) {
+            return Some(ContextIncoherence::Duplicate {
+                first: order[first],
+                second: order[at],
+            });
+        }
+        seen.insert((&keys[at], host[at]), at);
+        if !host[at] {
+            targets.insert(&keys[at], at);
+        }
+    }
+    let twin: Vec<Option<usize>> = (0..len)
+        .map(|at| {
+            (host[at] && shares(order[at]))
+                .then(|| targets.get(&keys[at]).copied())
+                .flatten()
+        })
+        .collect();
+
+    // The twins each host-side node reaches through host-side edges, its
+    // own included; children come first in `order`.
+    let mut reached = vec![Vec::<usize>::new(); len];
+    for at in 0..len {
+        if !host[at] {
+            continue;
+        }
+        let mut twins: Vec<usize> = twin[at].into_iter().collect();
+        for &child in children[at].iter().filter(|&&child| host[child]) {
+            twins.extend(&reached[child]);
+        }
+        twins.sort_unstable();
+        twins.dedup();
+        reached[at] = twins;
+    }
+    let shadows = |owner: usize| {
+        let mut twins: Vec<usize> = children[owner]
+            .iter()
+            .filter(|&&child| host[child])
+            .flat_map(|&child| reached[child].iter().copied())
+            .filter(|&twin| twin != owner)
+            .collect();
+        twins.sort_unstable();
+        twins.dedup();
+        twins
+    };
+
+    let mut pairs = HashMap::<(usize, usize), bool>::new();
+    for at in 0..len {
+        let shadows = shadows(at);
+        if let Some(&twin) = shadows.iter().find(|&&twin| !has(at, twin)) {
+            return Some(ContextIncoherence::MissingShadow {
+                owner: order[at],
+                twin: order[twin],
+            });
+        }
+        if !host[at] {
+            continue;
+        }
+        if let Some(&child) = children[at].iter().find(|&&child| {
+            !host[child] && Some(child) != twin[at] && shadows.binary_search(&child).is_err()
+        }) {
+            return Some(ContextIncoherence::StrayTarget {
+                owner: order[at],
+                child: order[child],
+            });
+        }
+        if let Some(own) = twin[at] {
+            let pair_shares = twins_share(at, own, &children, &host, &twin, &has, &mut pairs);
+            if has(at, own) == pair_shares {
+                return Some(ContextIncoherence::SelfTwin {
+                    owner: order[at],
+                    twin: order[own],
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Whether a native build shares the host-side node `host` with its
+/// target-side twin `target` — the pairing [`context_incoherence_below`]
+/// states, memoized per pair. Both are local indexes; the closure is
+/// acyclic, so the recursion ends.
+fn twins_share(
+    host: usize,
+    target: usize,
+    children: &[Vec<usize>],
+    host_side: &[bool],
+    twin: &[Option<usize>],
+    has: &impl Fn(usize, usize) -> bool,
+    pairs: &mut std::collections::HashMap<(usize, usize), bool>,
+) -> bool {
+    if let Some(&answer) = pairs.get(&(host, target)) {
+        return answer;
+    }
+    let mut answer = true;
+    for &child in children[host].iter().filter(|&&child| host_side[child]) {
+        if has(target, child) {
+            continue;
+        }
+        answer = twin[child].is_some_and(|child_twin| {
+            has(target, child_twin)
+                && twins_share(child, child_twin, children, host_side, twin, has, pairs)
+        });
+        if !answer {
+            break;
+        }
+    }
+    if answer {
+        answer = children[target]
+            .iter()
+            .all(|&child| !host_side[child] || has(host, child));
+    }
+    pairs.insert((host, target), answer);
+    answer
+}
+
 // The wire shape is the input nodes alone: computed digests and task
 // ids are re-derived by `resolve` on read, so a serialized graph can
 // never carry a forged identity.
