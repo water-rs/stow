@@ -138,12 +138,19 @@ fn publish_manifest_source(reg: &Path, fixture: &Fixture, manifest: &Value, lib:
     let cksum = write_crate_tarball(reg, fixture, manifest, lib, build_script);
 
     // The index line's deps are the manifest's own tables, so the two
-    // can never disagree: a `req` is the declared `version` made exact,
-    // everything else is fixed.
+    // can never disagree: a bare version is the caret requirement cargo
+    // reads it as, a requirement that opens with an operator or `*`
+    // (`<0.8.40`, `>=0.7, <0.9`) is already spelled out.
     let index_dep = |name: &str, spec: &Value, target: &Value, kind: &str| {
+        let version = spec["version"].as_str().expect("dep version");
+        let req = if version.starts_with(|c: char| c.is_ascii_digit()) {
+            format!("^{version}")
+        } else {
+            version.to_owned()
+        };
         json!({
             "name": name,
-            "req": format!("^{}", spec["version"].as_str().expect("dep version")),
+            "req": req,
             "features": spec["features"],
             "optional": false,
             "default_features": true,
@@ -1034,6 +1041,91 @@ fn a_grandchild_widened_by_another_consumer_reproduces() {
             .await
             .expect("widened grandchild context verifies");
     });
+}
+
+/// stow#1604: `yaml-rust2 0.13.0` asks for `encoding_rs <0.8.40`, a
+/// range over two semver series. A consumer that also needs
+/// `encoding_rs 0.7` resolves it to the newest 0.7.x, and the task for
+/// `yaml-rust2` carries that edge. The wrapper's lock has to keep it:
+/// without, cargo re-resolves the range to the newest series and the
+/// context check refuses the build. The other requirement shapes that
+/// span series (`>=a, <b`, `*`) go through the same lock.
+fn multi_series_requirement_keeps_the_consumers_series(req: &'static str) {
+    let (cargo_home, reg) = registry_home();
+    let scratch = tempfile::tempdir().unwrap();
+    let publish_encoding = |versions: &[&'static str]| {
+        for &version in versions {
+            publish(
+                &reg,
+                &Fixture {
+                    name: "encoding_rs",
+                    version,
+                    deps: vec![],
+                    build_deps: vec![],
+                    features: &[],
+                    proc_macro: false,
+                },
+            );
+        }
+    };
+    // The consumer locked `encoding_rs` while only the 0.7 series
+    // existed; the 0.8 series arrives afterwards, so its lockfile keeps
+    // the older series the way a real consumer's does.
+    publish_encoding(&["0.7.1", "0.7.2"]);
+    publish(
+        &reg,
+        &Fixture {
+            name: "yaml-rust2",
+            version: "0.13.0",
+            deps: vec![("encoding_rs", req, &[])],
+            build_deps: vec![],
+            features: &[],
+            proc_macro: false,
+        },
+    );
+    let manifest = consumer_project(
+        &scratch.path().join("consumer"),
+        &json!({ "yaml-rust2": "0.13" }),
+        &json!({}),
+    );
+    let requests = resolve_requests(cargo_home.path(), &manifest);
+    publish_encoding(&["0.8.34", "0.8.35"]);
+    let yaml = request_for(&requests, "yaml-rust2");
+    let encoding: Vec<String> = yaml
+        .dependency_subgraph
+        .nodes
+        .iter()
+        .filter(|node| node.crate_name.as_str() == "encoding_rs")
+        .map(|node| node.version.to_string())
+        .collect();
+    assert_eq!(encoding, ["0.7.2"], "the task pins the consumer's series");
+
+    let task = payload_for(&yaml);
+    smol::block_on(async {
+        let (_root, workspace) = wrapper_workspace(&reg, &task).await;
+        verify(cargo_home.path(), &task, &workspace)
+            .await
+            .unwrap_or_else(|error| panic!("`{req}` re-resolved off the task's graph: {error}"));
+        let lock = std::fs::read_to_string(workspace.workspace_root().join("Cargo.lock"))
+            .expect("fetched lock");
+        assert!(lock.contains("version = \"0.7.2\""), "{lock}");
+        assert!(!lock.contains("version = \"0.8."), "{lock}");
+    });
+}
+
+#[test]
+fn an_upper_bounded_requirement_keeps_the_consumers_older_series() {
+    multi_series_requirement_keeps_the_consumers_series("<0.8.40");
+}
+
+#[test]
+fn a_two_sided_requirement_keeps_the_consumers_older_series() {
+    multi_series_requirement_keeps_the_consumers_series(">=0.7.0, <0.9.0");
+}
+
+#[test]
+fn a_wildcard_requirement_keeps_the_consumers_older_series() {
+    multi_series_requirement_keeps_the_consumers_series("*");
 }
 
 /// A crate consumed as both a build-dependency and a normal
