@@ -4099,7 +4099,10 @@ mod unit_graph_tests {
                  "features": [], "dependencies": []}
             ]
         }"#
-        .replace("ROOT", &root.display().to_string());
+        .replace(
+            "file://ROOT",
+            url::Url::from_file_path(&root).expect("root url").as_str(),
+        );
         let graph: UnitGraph<'_> = serde_json::from_str(&json).expect("parse");
         let (entries, direct, _) =
             emit_expanded_graph(&graph, None, "x86_64-unknown-linux-gnu", rustc_test())
