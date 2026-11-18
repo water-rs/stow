@@ -1115,7 +1115,14 @@ immediately resumes dispatch, while
 `dispatch-freeze status` shows the trigger, the alert outcome, and the
 transition log (engaged/cleared events with their triggers). A manual
 trigger names the `actor` of the `operations.yml` run that flipped the
-switch, in the record, the transition log and the alert mail.
+switch, in the record, the transition log and the alert mail. Two
+automatic engagements also use the freeze: the watchdog's trip engages it
+(from `watchdog.yml`, the one other workflow the route admits) before it
+disables the dispatching workflows, and a dispatch pass whose first API
+refusal finds `build-crate.yml` not `active` (`GET
+/repos/{owner}/{repo}/actions/workflows/{workflow_id}`) engages it with
+the workflow and its `state` as the trigger, and releases the pass's
+refused claims to pending at once.
 
 Alerting is split by who owns the fact. The edge sends **email only** —
 one transition mail per change through the `send_email` binding

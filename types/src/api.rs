@@ -1238,6 +1238,20 @@ pub enum DispatchFreezeTrigger {
     Tripped(DispatchFreezeTrip),
     /// The scheduler object's own SQL meter crossed a daily budget.
     Cost(DispatchFreezeCost),
+    /// A dispatch pass was refused and the dispatching workflow's
+    /// `state` read anything but `active`: every dispatch would be
+    /// refused until the workflow is enabled again.
+    WorkflowDisabled(DispatchFreezeWorkflow),
+}
+
+/// The workflow a refused dispatch found not active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchFreezeWorkflow {
+    /// The workflow file, `build-crate.yml`.
+    pub workflow: String,
+    /// The `state` GitHub reports for it (`disabled_manually`,
+    /// `disabled_inactivity`, `disabled_fork`, `deleted`).
+    pub state: String,
 }
 
 impl DispatchFreezeTrigger {
@@ -1250,6 +1264,7 @@ impl DispatchFreezeTrigger {
             Self::Manual { .. } => "manual",
             Self::Tripped(_) => "tripped",
             Self::Cost(_) => "cost",
+            Self::WorkflowDisabled(_) => "workflow_disabled",
         }
     }
 }

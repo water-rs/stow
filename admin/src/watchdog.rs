@@ -2432,7 +2432,17 @@ fn select_trip_set(reads: &[TripState]) -> (BTreeSet<String>, Vec<String>) {
     (active, failures)
 }
 
-/// Trip the breaker: disable every dispatching workflow that reads
+/// The freeze write a trip sends: the edge keeps an engaged freeze as it
+/// is, so a repeated trip alerts nothing new.
+const fn trip_freeze() -> DispatchFreeze {
+    DispatchFreeze {
+        enabled: true,
+        record: None,
+        transitions: Vec::new(),
+    }
+}
+
+/// Trip the breaker: engage the dispatch freeze, then disable every dispatching workflow that reads
 /// `active` — the returned set is the trip's record, which the incident
 /// issue carries for `clear` to restore — then enable the
 /// zone's WAF rule for `scope`, the widest scope of the breaching
@@ -2447,6 +2457,15 @@ async fn apply_trip(
     scope: MaintenanceScope,
     outcome: &mut ApplyOutcome,
 ) -> BTreeSet<String> {
+    // The freeze comes first: once `build-crate.yml` is disabled every
+    // dispatch is refused, so the scheduler must already be holding its
+    // claims back. `clear` lifts it after the workflows are enabled.
+    match crate::write_dispatch_freeze(watcher.edge, &trip_freeze()).await {
+        Ok(_) => outcome.actions.push("dispatch freeze engaged".to_owned()),
+        Err(error) => outcome
+            .failures
+            .push(format!("engage dispatch freeze: {error}")),
+    }
     let (disabled, read_failures) = select_trip_set(&read_trip_states(watcher.gh_token).await);
     outcome.failures.extend(read_failures);
     let writes = disabled.iter().map(|workflow| async move {
@@ -3269,6 +3288,9 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
                 .actions
                 .push("alert only — nothing tripped".to_owned());
         } else if dry_run {
+            outcome
+                .actions
+                .push("would engage the dispatch freeze".to_owned());
             let reads = read_trip_states(&gh_token).await;
             let (planned, read_failures) = select_trip_set(&reads);
             for read in &reads {

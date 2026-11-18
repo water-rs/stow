@@ -1289,6 +1289,12 @@ fn summarize_trigger(trigger: &DispatchFreezeTrigger) -> String {
                 cost.metric, cost.used, cost.budget
             )
         }
+        DispatchFreezeTrigger::WorkflowDisabled(workflow) => {
+            format!(
+                "dispatch refused: {} is {}",
+                workflow.workflow, workflow.state
+            )
+        }
     }
 }
 
