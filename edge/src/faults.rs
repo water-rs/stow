@@ -210,7 +210,7 @@ mod tests {
         fn respond(
             &mut self,
             _: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             let mut response = Response::new(Body::empty());
             *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
             response.extensions_mut().insert(OverloadFault);
@@ -228,7 +228,7 @@ mod tests {
         fn respond(
             &mut self,
             _: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             let error: BoxError = Box::new(self.0.take().expect("each test calls respond once"));
             ready(Err(error))
         }
@@ -284,8 +284,7 @@ mod tests {
                     fn respond(
                         &mut self,
                         _: &mut Request,
-                    ) -> impl Future<Output = Result<Response, Self::Error>> + Send
-                    {
+                    ) -> impl Future<Output = Result<Response, Self::Error>> {
                         ready(Ok(Response::new(Body::empty())))
                     }
                 }

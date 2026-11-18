@@ -10,10 +10,15 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-skyzen = { version = "0.5.0", default-features = false, features = ["json", "query"] }
-skyzen-core = "0.2"
-skyzen-cloudflare = "0.5.0"
-skyzen-services = { version = "0.3.0", default-features = false }
+# Durable Object residency (`skyzen::durable::Residency`, stow#1574) is
+# not released: the edge's skyzen crates track skyzen's `main`, and the
+# generated Worker shim must come from the commit `Cargo.lock` pins
+# (`.github/actions/install-skyzen-cli`). `ci` stays on the skyzen release
+# whose native server it is written against.
+skyzen = { git = "https://github.com/zen-rs/skyzen", branch = "main", default-features = false, features = ["json", "query"] }
+skyzen-core = { git = "https://github.com/zen-rs/skyzen", branch = "main" }
+skyzen-cloudflare = { git = "https://github.com/zen-rs/skyzen", branch = "main" }
+skyzen-services = { git = "https://github.com/zen-rs/skyzen", branch = "main", default-features = false }
 stow-types = { workspace = true, features = ["ci"] }
 stow-shim.workspace = true
 http = "1"
@@ -37,7 +42,8 @@ askama = "0.14"
 # The wasm-bindgen family is exact-coupled (`js-sys =0.3.x` requires
 # `wasm-bindgen =0.2.y` of the same release), and `skyzen dev`/`skyzen build`
 # repackage the worker with the wasm-bindgen generator embedded in
-# skyzen-cli 0.4.2, which ships `=0.2.120` (see CONTRIBUTING.md). All four are
+# skyzen-cli (built from the pinned skyzen commit), which ships `=0.2.120`
+# (see CONTRIBUTING.md). All four are
 # pinned to that release line so `cargo update` cannot drift them.
 wasm-bindgen = "=0.2.120"
 wasm-bindgen-futures = "=0.4.70"
@@ -81,7 +87,7 @@ tar.workspace = true
 # so sqlx-sqlite must not enter the wasm32 dev-dep graph.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio"] }
-skyzen-services = { version = "0.3.0", default-features = false, features = ["sqlite", "runtime-tokio"] }
+skyzen-services = { git = "https://github.com/zen-rs/skyzen", branch = "main", default-features = false, features = ["sqlite"] }
 # The real index producer, so the transcode test decodes what a publish writes.
 stow-shim = { workspace = true, features = ["zstd"] }
 [lints]

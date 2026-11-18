@@ -406,6 +406,10 @@ impl MeterGuard {
 
 #[cfg(target_arch = "wasm32")]
 impl skyzen::middleware::Middleware for MeterGuard {
+    #[expect(
+        clippy::future_not_send,
+        reason = "skyzen's middleware chain runs on the thread that built its router and is not Send"
+    )]
     async fn handle(
         &self,
         request: &mut skyzen::Request,
@@ -414,6 +418,13 @@ impl skyzen::middleware::Middleware for MeterGuard {
         let Some(db) = request.extensions().get::<DurableDb>().cloned() else {
             return next.run(request).await;
         };
+        let residency = request
+            .extensions()
+            .get::<skyzen::durable::Residency>()
+            .cloned()
+            .ok_or_else(|| {
+                skyzen::Error::msg("the Durable Object runtime injected no Residency")
+            })?;
         let (metered, meter) = Meter::wrap(db.clone(), &self.graph);
         request.extensions_mut().insert(metered);
         let env = request
@@ -435,7 +446,8 @@ impl skyzen::middleware::Middleware for MeterGuard {
         };
         let response = next.run(request).await;
         if let Some(env) = env {
-            super::object::settle_meter(&self.graph, &db, &meter, &env, multiplier).await;
+            super::object::settle_meter(&self.graph, &db, &meter, &env, &residency, multiplier)
+                .await;
         }
         response
     }
