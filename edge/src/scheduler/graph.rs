@@ -3847,6 +3847,21 @@ impl Graph {
                 || (self.has_ready() && !matches!(settings.dispatch, queue::Dispatch::Paused)))
     }
 
+    /// Whether the object should stay resident (stow#1574): while work
+    /// is in flight, completions and the alarm keep calling it; while
+    /// ready work can be claimed, the alarm or the next completion
+    /// claims it. Either way the next event comes soon, and a
+    /// hibernation between them would make it reload the snapshot.
+    /// Ready work that nothing will claim — dispatch frozen or paused —
+    /// waits for an operator, so it holds nothing, and an idle
+    /// scheduler hibernates as before. Counter and set reads only.
+    pub fn needs_residency(&self, settings: &queue::SchedulerSettings) -> bool {
+        !self.inflight.is_empty()
+            || (self.has_ready()
+                && self.freeze.is_none()
+                && !matches!(settings.dispatch, queue::Dispatch::Paused))
+    }
+
     /// Whether CI requests must wait for a rate-limit recovery.
     pub const fn ci_waiting(&self, now: i64) -> bool {
         self.ci_not_before > now
@@ -4923,6 +4938,9 @@ pub struct GraphCell {
     tokens: crate::github_app::TokenCache,
     /// The isolate's billed-but-unsettled row counts — see [`Unsettled`].
     unsettled: std::sync::Arc<Unsettled>,
+    /// The residency hold while the graph has work (stow#1574) —
+    /// see [`GraphCell::settle_residency`].
+    resident: std::sync::Arc<std::sync::Mutex<Option<skyzen::durable::KeepResident>>>,
 }
 
 impl std::fmt::Debug for GraphCell {
@@ -5085,6 +5103,17 @@ impl GraphCell {
         *self.graph.lock().expect("graph cell poisoned") = Graph::default();
         self.loaded
             .store(false, std::sync::atomic::Ordering::Release);
+    }
+    /// Hold residency while `needed` and release it otherwise, so an
+    /// idle scheduler still hibernates and costs nothing. Taken once
+    /// and kept, so the decision costs a lock and no storage.
+    pub(crate) fn settle_residency(&self, needed: bool, residency: &skyzen::durable::Residency) {
+        let mut held = self.resident.lock().expect("residency hold poisoned");
+        if needed {
+            held.get_or_insert_with(|| residency.keep_resident());
+        } else {
+            *held = None;
+        }
     }
     /// The isolate's installation-token cache.
     pub(crate) const fn tokens(&self) -> &crate::github_app::TokenCache {
@@ -7301,6 +7330,101 @@ mod tests {
         let now = Graph::STATUS_RECONCILE_MS;
         assert!(!graph.reconcile_due(now, &settings));
         assert_eq!(graph.wake_plan(now, &settings), queue::AlarmPlan::Delete);
+    }
+
+    /// Counts residency holds the way the platform does.
+    #[derive(Clone, Default)]
+    struct CountedResidency(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl skyzen::durable::ResidencyInner for CountedResidency {
+        fn acquire(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn release(&self) {
+            let before = self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(before > 0, "released a hold that was never taken");
+        }
+        fn clone_box(&self) -> Box<dyn skyzen::durable::ResidencyInner> {
+            Box::new(self.clone())
+        }
+    }
+
+    /// stow#1574: the scheduler holds residency from the merge that
+    /// queues claimable work through the claim and the run, and lets go
+    /// once the completion leaves nothing — so an idle scheduler still
+    /// hibernates. Each settle along the way re-decides, holding at
+    /// most one guard.
+    #[test]
+    fn residency_is_held_while_the_graph_has_work() {
+        let settings = claim_settings(45, 16);
+        let holds = CountedResidency::default();
+        let residency = skyzen::durable::Residency::new(Box::new(holds.clone()));
+        let count = || holds.0.load(std::sync::atomic::Ordering::SeqCst);
+        let cell = GraphCell::default();
+        let loaded = cell.install(Graph::default());
+        let settle = || {
+            let needed = loaded.with(|graph| graph.needs_residency(&settings));
+            loaded.cell().settle_residency(needed, &residency);
+        };
+
+        settle();
+        assert_eq!(count(), 0, "an empty graph holds nothing");
+
+        loaded.with(|graph| graph.merge(&solo(), 0).expect("merge"));
+        settle();
+        assert_eq!(count(), 1, "claimable work holds");
+
+        let claimed = loaded.with(|graph| graph.claim(&settings, 0, u32::MAX).expect("claim"));
+        assert_eq!(claimed.len(), 1);
+        settle();
+        settle();
+        assert_eq!(count(), 1, "in-flight work keeps the one hold");
+
+        loaded.with(|graph| {
+            assert!(graph.bind(&id("solo"), claimed[0].generation, 4242, 1_000));
+            graph.run_finished(&id("solo"), completion(4242, true, false, None), 2_000);
+            assert_eq!(status_of(graph, "solo"), Some(Status::Completed));
+        });
+        settle();
+        assert_eq!(count(), 0, "a drained graph releases");
+    }
+
+    /// Ready work nothing will claim — dispatch paused or frozen —
+    /// waits for an operator and holds nothing; work already in flight
+    /// holds through a freeze, because its completions still arrive.
+    #[test]
+    fn residency_ignores_work_an_operator_holds_back() {
+        use stow_types::api::{ChannelOutcome, DispatchFreezeRecord, DispatchFreezeTrigger};
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        let paused = queue::SchedulerSettings {
+            dispatch: queue::Dispatch::Paused,
+            ..queue::SchedulerSettings::default()
+        };
+        assert!(!graph.needs_residency(&paused));
+        let settings = claim_settings(45, 16);
+        assert!(graph.needs_residency(&settings));
+
+        assert_eq!(graph.claim(&settings, 0, u32::MAX).expect("claim").len(), 1);
+        let trigger = DispatchFreezeTrigger::Manual {
+            actor: "test".to_owned(),
+        };
+        graph.apply(
+            &SchedulerEvent::Freeze {
+                at: "2026-11-17T03:00:00Z".to_owned(),
+                trigger: trigger.clone(),
+                record: Some(Box::new(DispatchFreezeRecord {
+                    frozen_at: "2026-11-17T03:00:00Z".to_owned(),
+                    trigger,
+                    notify: ChannelOutcome::Disabled {
+                        reason: "test".to_owned(),
+                    },
+                })),
+            },
+            0,
+        );
+        assert!(graph.needs_residency(&settings), "in flight under a freeze");
+        assert!(graph.needs_residency(&paused), "in flight while paused");
     }
 
     /// stow#1039: the operator's `set` replaces the binding caps in the

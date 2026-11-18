@@ -1,48 +1,25 @@
 name: Install skyzen-cli
 description: >-
-  Install the pinned skyzen-cli release binary for x86_64 Linux runners and
-  verify it against a digest recorded here, so a compromised upstream
-  release cannot run code in a job that holds deploy credentials. With
-  `rev` set, installs the exact upstream commit instead — for features not
-  yet in a release, where the commit SHA is itself the pin.
+  Install skyzen-cli from the pinned zen-rs/skyzen commit. The Worker shim
+  `skyzen build` generates must come from the same skyzen commit the edge
+  compiles against (the one in Cargo.lock): the unreleased Durable Object
+  residency (stow#1574) needs a shim that passes a residency controller.
+  The commit SHA is itself the pin.
 inputs:
   rev:
     description: >-
       Full commit SHA in zen-rs/skyzen to install from source
-      (`cargo install --git --rev`). Empty installs the pinned release
-      archive.
+      (`cargo install --git --rev`).
     required: false
-    default: ""
+    # Must equal the skyzen commit in Cargo.lock.
+    default: 1787296d7f618b3b6f44c0589739cc0dd99d03ed
 runs:
   using: composite
   steps:
-    - shell: bash
-      if: inputs.rev == ''
-      env:
-        SKYZEN_CLI_VERSION: 0.4.4
-        # sha256 of skyzen-cli-x86_64-unknown-linux-gnu.tar.xz from the
-        # cli/v0.4.4 release, recorded when the version was bumped.
-        SKYZEN_CLI_SHA256: 93f3af44ce9becfc8637e570ec9b20eac02442616432eb8931ec4f3bb3df3f5f
-      run: |
-        set -euo pipefail
-        if [ "$(uname -sm)" != "Linux x86_64" ]; then
-          echo "::error::install-skyzen-cli pins the x86_64 Linux archive; runner is $(uname -sm)" >&2
-          exit 1
-        fi
-        archive="skyzen-cli-x86_64-unknown-linux-gnu.tar.xz"
-        workdir="$(mktemp -d)"
-        curl --proto '=https' --tlsv1.2 -LsSf -o "$workdir/$archive" \
-          "https://github.com/zen-rs/skyzen/releases/download/cli/v${SKYZEN_CLI_VERSION}/${archive}"
-        echo "${SKYZEN_CLI_SHA256}  ${workdir}/${archive}" | sha256sum -c -
-        tar -xJf "$workdir/$archive" -C "$workdir"
-        install -m 0755 "$workdir/${archive%.tar.xz}/skyzen" "$HOME/.cargo/bin/skyzen"
-        rm -rf "$workdir"
-        skyzen --version
     # A commit pin is itself the integrity check — `--rev` resolves to that
     # exact tree, so no second digest is needed. skyzen's Cargo.lock is
     # gitignored upstream, so `--locked` cannot apply.
     - shell: bash
-      if: inputs.rev != ''
       env:
         SKYZEN_REV: ${{ inputs.rev }}
       run: |

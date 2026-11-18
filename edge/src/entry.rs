@@ -44,6 +44,10 @@ const STOW_NEWRELEASES_WEBHOOK_SECRET_BINDING: &str = "STOW_NEWRELEASES_WEBHOOK_
 /// only way to keep reading every binding eagerly at startup is to take the
 /// `env` that `launch` hands the endpoint factory.
 #[::skyzen::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = ::skyzen::wasm_bindgen)]
+#[expect(
+    clippy::future_not_send,
+    reason = "the isolate's router is per-thread and not Send; a wasm-bindgen export never crosses threads"
+)]
 pub async fn fetch(
     request: wasm::Request,
     env: wasm::Env,

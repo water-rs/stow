@@ -3,7 +3,7 @@
 
 use js_sys::Reflect;
 use serde::{Deserialize, Serialize};
-use skyzen::durable::DurableObject;
+use skyzen::durable::{DurableObject, Residency};
 use skyzen::routing::{CreateRouteNode, Params, Route, Router};
 use skyzen::runtime::wasm::WasmEnv;
 use skyzen::utils::{Json, State};
@@ -406,8 +406,8 @@ impl Scheduler {
         // carries its own handle to the graph.
         .on_alarm({
             let graph = self.graph.clone();
-            move |env: WasmEnv, db: DurableDb, alarm: Alarm| {
-                run_alarm(graph.clone(), env, db, alarm)
+            move |env: WasmEnv, db: DurableDb, alarm: Alarm, residency: Residency| {
+                run_alarm(graph.clone(), env, db, alarm, residency)
             }
         })
         // Route middleware, not a router layer: skyzen checks at build
@@ -1834,21 +1834,29 @@ async fn evaluate_dispatch_freeze(
 /// settle→verdict→freeze-append→settle sequence, on the metered
 /// handle). A settle failure is logged, never raised: a metering bug
 /// must not take dispatch down with it.
+///
+/// It ends every event the object runs, and nothing the scheduler
+/// starts outlives one, so the graph's work set as the object goes
+/// idle is the one seen here: this is where residency is held or
+/// released (stow#1574), after a cost trip that may freeze dispatch.
 pub(super) async fn settle_meter(
-    graph: &graph::GraphCell,
+    cell: &graph::GraphCell,
     db: &DurableDb,
     meter: &Meter,
     env: &WasmEnv,
+    residency: &Residency,
     multiplier: f64,
 ) {
     // A reset leaves the graph empty; settling wakes it first — on a
     // metered handle: the wake's reads and the freeze append below are
     // booked into the same settle (stow#931).
-    let (metered_db, aux_meter) = Meter::wrap(db.clone(), graph);
-    let graph = match ensure_graph(env, &metered_db, graph).await {
+    let (metered_db, aux_meter) = Meter::wrap(db.clone(), cell);
+    let graph = match ensure_graph(env, &metered_db, cell).await {
         Ok(graph) => graph,
         Err(error) => {
             tracing::error!(%error, "do meter settle: graph wake failed");
+            // Nothing is in memory to keep.
+            cell.settle_residency(false, residency);
             return;
         }
     };
@@ -1879,6 +1887,16 @@ pub(super) async fn settle_meter(
         Ok(_) => {}
         Err(error) => tracing::error!(%error, "do meter settle failed"),
     }
+    let needed = match scheduler_settings(env, graph) {
+        Ok(settings) => graph.with(|graph| graph.needs_residency(&settings)),
+        Err(error) => {
+            // Every route fails on the same settings, so nothing will
+            // claim work until they are fixed: hold nothing.
+            tracing::error!(%error, "do residency: scheduler settings unreadable");
+            false
+        }
+    };
+    cell.settle_residency(needed, residency);
 }
 
 /// Turn a trip verdict into the wire `Tripped` trigger — the example
@@ -2050,6 +2068,7 @@ async fn run_alarm(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
+    residency: Residency,
 ) -> Result<&'static str> {
     let _invocation = budget_probe_enabled(&env).then(|| graph.probe_invocation());
     let multiplier = cost_budget_multiplier(&env)?;
@@ -2075,7 +2094,7 @@ async fn run_alarm(
         Ok("ok")
     }
     .await;
-    settle_meter(&graph, &db, &meter, &env, multiplier).await;
+    settle_meter(&graph, &db, &meter, &env, &residency, multiplier).await;
     result
 }
 
