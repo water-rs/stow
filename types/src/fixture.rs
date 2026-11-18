@@ -213,7 +213,11 @@ pub const fn seeded_rustc(n: u64) -> &'static str {
 
 /// How the fixture's `n % len` target spread maps onto
 /// [`CI_TARGET_TRIPLES`].
-fn target_count() -> u32 {
+///
+/// # Panics
+/// When the target list holds more than `u32::MAX` entries.
+#[must_use]
+pub fn target_count() -> u32 {
     u32::try_from(CI_TARGET_TRIPLES.len()).expect("target count fits u32")
 }
 

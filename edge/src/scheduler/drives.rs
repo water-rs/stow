@@ -4071,8 +4071,10 @@ pub const DRIVES: &[Drive] = &[
         // every fixture size (a merge, claims, completions and a
         // published-slice report), so the measured run rewrites only
         // the spans the batch dirtied. Each event touches a constant
-        // number of chunks, so the snapshot's rows scale with the
-        // events since the last one, never with the stored graph. A
+        // number of chunks — the slice report's retire refreshes the
+        // `fixture::DELTA_DEPENDENTS` dependents the fixture plants on
+        // its members at every size — so the snapshot's rows scale with
+        // the events since the last one, never with the stored graph. A
         // dirty span rewrites its whole range as 64 KiB rows (up to 13
         // for the widest), upserted 16 to a statement; the derivation
         // is the drive's budget row in `DO_BUDGETS`. The turn also
