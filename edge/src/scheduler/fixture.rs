@@ -45,7 +45,7 @@ use stow_types::api::{
 pub use stow_types::fixture::FixtureShape;
 use stow_types::fixture::{
     REQUEST_FIXTURE_ENQUEUED, REQUEST_FIXTURE_FAILED, crate_identity, fixture_task_id,
-    named_task_id, seeded_rustc, target_of,
+    named_task_id, seeded_rustc, target_count, target_of,
 };
 use stow_types::identity::{
     CrateName, CrateVersion, DependencyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -102,6 +102,126 @@ const MINUTE_MS: i64 = 60_000;
 /// same number added. The dependent refresh must stay proportional to
 /// this, not to the slice.
 pub const DELTA_ROWS: u32 = 30;
+
+/// Pending dependents the delta report's retired members carry, all
+/// together: the fixture's mean fan-in onto a completed row times
+/// [`DELTA_ROWS`]. Pending rows are 60% of the queue and every third
+/// bulk row of each target adds one extra edge spread over the whole
+/// queue, so a row takes 0.6 / 3 = 0.2 such edges on average, and the
+/// retired members take `DELTA_ROWS / 5`. Each dependent the retire
+/// refreshes dirties its node and edge chunks, so the snapshot write's
+/// rows follow this count; the fixture plants it instead of leaving it
+/// to the spread arithmetic.
+pub const DELTA_DEPENDENTS: u32 = DELTA_ROWS / 5;
+
+/// Which rows the delta report retires and which pending rows depend on
+/// them: the [`DELTA_ROWS`] highest target-side members of the
+/// `(CI_TARGET_TRIPLES[0], '1.85.0')` slice, and [`DELTA_DEPENDENTS`]
+/// bulk pending rows on that target, spread evenly over the bulk, each
+/// carrying one edge onto one of them. No other edge reaches a retired
+/// member: target-side members take no host-side edge, and a spread
+/// edge landing on one moves to a lower member.
+struct DeltaFanIn {
+    /// The slice's lowest member clear of the purge drive's rows.
+    lo: u32,
+    /// The retired members, highest first.
+    retired: Vec<u32>,
+    /// `(dependent, retired member)` pairs, the planted edges.
+    planted: Vec<(u32, u32)>,
+}
+
+/// The delta report's retired members, highest first: the slice's
+/// [`DELTA_ROWS`] highest target-side members (`n % 10 != 0`).
+fn delta_retired(shape: FixtureShape) -> Vec<u32> {
+    let first = shape.slice_first_row(0);
+    let retired: Vec<u32> = (0..shape.slice_live_rows(0))
+        .rev()
+        .map(|i| first + i * target_count())
+        .filter(|row| !row.is_multiple_of(10))
+        .take(DELTA_ROWS as usize)
+        .collect();
+    assert!(
+        retired.len() == DELTA_ROWS as usize,
+        "the delta slice holds {} target-side members, needs {DELTA_ROWS}",
+        retired.len()
+    );
+    retired
+}
+
+impl DeltaFanIn {
+    fn new(shape: FixtureShape, eligible_rows: u32) -> Self {
+        let targets = target_count();
+        let lo = (shape.slice_first_row(0)..)
+            .step_by(targets as usize)
+            .find(|&row| row >= shape.completed_row(2))
+            .expect("a member clears the purge rows");
+        let retired = delta_retired(shape);
+        let lowest = *retired.last().expect("retired members");
+        assert!(
+            lowest > lo,
+            "no slice member below the retired ones from {lo}"
+        );
+        // Bulk rows: the pending rows up to the human pins, then those
+        // above the dispatch window.
+        let human_pin = FixtureShape::HUMAN_LANE_ROWS - FixtureShape::HUMAN_PROBE_ROWS;
+        let lower = human_pin.min(shape.pending_end());
+        let upper_start = FixtureShape::HUMAN_LANE_ROWS + eligible_rows + 1;
+        let upper = (shape.pending_end() + 1).saturating_sub(upper_start);
+        let bulk = lower + upper;
+        let planted: Vec<(u32, u32)> = (0..DELTA_DEPENDENTS)
+            .map(|k| {
+                // The middle of the k-th of DELTA_DEPENDENTS equal bulk
+                // stretches, moved up onto a target-side row of target 0.
+                let b = (2 * k + 1) * bulk / (2 * DELTA_DEPENDENTS);
+                let (row, end) = if b < lower {
+                    (b + 1, lower)
+                } else {
+                    (upper_start + b - lower, shape.pending_end())
+                };
+                let mut row = row + (targets - row % targets) % targets;
+                if row.is_multiple_of(10) {
+                    row += targets;
+                }
+                assert!(row <= end, "no bulk row on target 0 near bulk index {b}");
+                (row, retired[k as usize])
+            })
+            .collect();
+        assert!(
+            planted.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "the planted dependents are distinct rows"
+        );
+        Self {
+            lo,
+            retired,
+            planted,
+        }
+    }
+
+    /// `dep` unless it is a retired member: a member moves into the
+    /// slice below the retired ones, keeping its target.
+    fn clear(&self, dep: u32) -> u32 {
+        // The retired members are every target-side row of the slice's
+        // target from the lowest to the highest of them.
+        let lowest = *self.retired.last().expect("retired members");
+        let highest = self.retired[0];
+        let member = (lowest..=highest).contains(&dep)
+            && (dep - lowest).is_multiple_of(target_count())
+            && !dep.is_multiple_of(10);
+        if member {
+            self.lo + (dep - self.lo) % (lowest - self.lo)
+        } else {
+            dep
+        }
+    }
+
+    /// The retired member `n` carries a planted edge onto, if any.
+    fn planted_on(&self, n: u32) -> Option<u32> {
+        self.planted
+            .iter()
+            .find(|&&(row, _)| row == n)
+            .map(|&(_, member)| member)
+    }
+}
 
 /// A fixture node's dependency digest — its own hex id, the formula the
 /// edges and slice rows agree on.
@@ -289,10 +409,26 @@ fn dispatch_window(settings: &super::queue::SchedulerSettings) -> u32 {
 /// target and a rustc, so the move keeps both. Fixture crates are
 /// distinct per row, so no node has a target-side twin and no shadow or
 /// self-twin edge arises.
-fn pending_deps(shape: FixtureShape, eligible_rows: u32, n: u32) -> Vec<u32> {
-    let deps = target_side_deps(shape, eligible_rows, n);
-    if !n.is_multiple_of(10) {
+///
+/// The delta report's fan-in is planted ([`DeltaFanIn`]): a planted
+/// dependent's spread edge points at its retired member, and every
+/// other target-side edge onto a retired member moves off it.
+fn pending_deps(shape: FixtureShape, eligible_rows: u32, delta: &DeltaFanIn, n: u32) -> Vec<u32> {
+    let mut deps = target_side_deps(shape, eligible_rows, n);
+    if let Some(member) = delta.planted_on(n) {
+        deps.truncate(1);
+        deps.push(member);
         return deps;
+    }
+    if !n.is_multiple_of(10) {
+        let mut cleared: Vec<u32> = Vec::with_capacity(deps.len());
+        for dep in deps {
+            let dep = delta.clear(dep);
+            if !cleared.contains(&dep) {
+                cleared.push(dep);
+            }
+        }
+        return cleared;
     }
     let mut host: Vec<u32> = Vec::with_capacity(deps.len());
     for dep in deps {
@@ -349,7 +485,7 @@ fn target_side_deps(shape: FixtureShape, eligible_rows: u32, n: u32) -> Vec<u32>
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
     let eligible_end = human_end + eligible_rows;
-    let targets = u32::try_from(CI_TARGET_TRIPLES.len()).expect("target count fits u32");
+    let targets = target_count();
     // The first row at or above `pick` on `n`'s target.
     let up = |pick: u32| pick + (n % targets + targets - pick % targets) % targets;
     // The first failed row on `n`'s target: a met-never edge.
@@ -396,14 +532,19 @@ fn target_side_deps(shape: FixtureShape, eligible_rows: u32, n: u32) -> Vec<u32>
     }
     // Bulk: the first edge is an unmet lower pending node (or a failed
     // one when none is left below), so no bulk row is claimable; every
-    // third row adds a spread edge onto the whole queue.
+    // third row of each target adds a spread edge onto the whole queue.
+    // The pick counts rows within `n`'s target (`n / targets`): with a
+    // target count divisible by 3, `n % 3 == 0` holds only on the targets
+    // whose index is a multiple of 3, and as each extra edge stays on
+    // `n`'s target, their published rows would take three times the
+    // average fan-in and every other target's none.
     let first = if n > 1 {
         down(spread(n, 7919, n - 1) + 1)
     } else {
         failed
     };
     let mut deps = vec![first];
-    if n.is_multiple_of(3) {
+    if (n / targets).is_multiple_of(3) {
         let extra = lower(spread(n, 15_485_863, rows) + 1);
         if extra != first {
             deps.push(extra);
@@ -748,6 +889,7 @@ async fn build_pending<S: SeedStore>(
             SubmissionSource::CacheMiss,
         ),
     ];
+    let delta = DeltaFanIn::new(shape, eligible_rows);
     for (start, end, source) in segments {
         for (lo, hi) in runs(start, end) {
             merge_run(
@@ -756,7 +898,7 @@ async fn build_pending<S: SeedStore>(
                 source,
                 first_at(shape, now, lo),
                 ledger,
-                |n| pending_deps(shape, eligible_rows, n),
+                |n| pending_deps(shape, eligible_rows, &delta, n),
             )
             .await?;
         }
@@ -1188,25 +1330,22 @@ pub fn full_slice_report() -> Vec<PublishedSliceRow> {
 }
 
 /// The delta report for `(CI_TARGET_TRIPLES[0], '1.85.0')`: retire one
-/// required shape row of each of the slice's [`DELTA_ROWS`] tail
-/// members and add as many fresh rows (`DELTA_ROWS / 2` identities x
-/// their two shapes) — a `2 * DELTA_ROWS` change set. Every retired row
-/// is one the fixture published for that node — its first
-/// `required_unit_shapes` entry — so each retire leaves a real node
-/// partially published, the missing-shape probe the dependent refresh
-/// measures. The fixture's live members are the completed rows whose
-/// `n % 9` lands on that target; `n % 9 == 0` implies `n % 3 == 0`,
-/// the `1.85.0` rustc arm.
+/// required shape row of each of the slice's [`DELTA_ROWS`] highest
+/// target-side members and add as many fresh rows (`DELTA_ROWS / 2`
+/// identities x their two shapes) — a `2 * DELTA_ROWS` change set.
+/// Every retired row is one the fixture published for that node — its
+/// first `required_unit_shapes` entry — so each retire leaves a real
+/// node partially published, the missing-shape probe the dependent
+/// refresh measures. The retired members carry exactly
+/// [`DELTA_DEPENDENTS`] pending dependents at every size. The fixture's
+/// live members are the completed rows whose `n % 9` lands on that
+/// target; `n % 9 == 0` implies `n % 3 == 0`, the `1.85.0` rustc arm.
 #[must_use]
 pub fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<PublishedSliceRow>) {
-    let live = shape.slice_live_rows(0);
-    let first = shape.slice_first_row(0);
     let target = CI_TARGET_TRIPLES[0];
-    let retired = (0..DELTA_ROWS)
-        .map(|i| {
-            let n = first + (live - 1 - i) * 9;
-            slice_row(n, node_shapes(n.is_multiple_of(10), target)[0])
-        })
+    let retired = delta_retired(shape)
+        .into_iter()
+        .map(|n| slice_row(n, node_shapes(false, target)[0]))
         .collect();
     let mut added = Vec::new();
     for i in 0..DELTA_ROWS / 2 {
@@ -1224,4 +1363,38 @@ pub fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<P
         );
     }
     (added, retired)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The delta report's retired members carry exactly
+    /// [`DELTA_DEPENDENTS`] pending dependents at every size and window
+    /// a fixture is seeded with.
+    #[test]
+    fn the_delta_report_retires_members_with_the_planted_fan_in() {
+        for settings in [
+            super::super::queue::SchedulerSettings::default(),
+            claim_settings(45, 16),
+        ] {
+            let eligible = dispatch_window(&settings);
+            for queue_rows in [1_000, 4_000, 5_000, GATE.queue_rows, 100_000] {
+                let shape = FixtureShape { queue_rows };
+                let delta = DeltaFanIn::new(shape, eligible);
+                let retired = delta_retired(shape);
+                let dependents = (1..=shape.pending_end())
+                    .filter(|&n| {
+                        pending_deps(shape, eligible, &delta, n)
+                            .iter()
+                            .any(|dep| retired.contains(dep))
+                    })
+                    .count();
+                assert_eq!(
+                    dependents, DELTA_DEPENDENTS as usize,
+                    "{queue_rows} rows, window {eligible}"
+                );
+            }
+        }
+    }
 }
