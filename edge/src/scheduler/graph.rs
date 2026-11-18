@@ -731,14 +731,16 @@ pub(super) struct ValidatedSubmission<'a> {
 
 impl<'a> ValidatedSubmission<'a> {
     /// A tree arriving at a submit route: its shape and identity, a
-    /// closure that agrees (stow#1470), and no target-side node keyed at
-    /// a triple other than its owner's (stow#1593) — a tree breaking
-    /// either could only fail on a runner.
+    /// closure that agrees (stow#1470), no target-side node keyed at a
+    /// triple other than its owner's (stow#1593), and context edges one
+    /// build of each closure mints (stow#1566) — a tree breaking any
+    /// could only fail on a runner.
     pub(super) fn new(tree: &'a SubmissionTree) -> Result<Self, QueueError> {
         // The shape check first: the agreement walk needs deps in range.
         let validated = Self::logged(tree)?;
         tree.ensure_closure_agreement()
             .and_then(|()| tree.ensure_target_side_keys())
+            .and_then(|()| tree.ensure_context_coherence())
             .map_err(|error| QueueError::Invariant(error.to_string()))?;
         Ok(validated)
     }
@@ -2506,6 +2508,52 @@ impl Graph {
     fn closure_refusal(&self, ix: u32) -> Option<String> {
         self.closure_disagreement(ix)
             .or_else(|| self.foreign_target_side(ix))
+            .or_else(|| self.context_incoherence(ix))
+    }
+
+    /// The context edges in `ix`'s closure no build of that closure mints,
+    /// as the refusal names them (stow#1566,
+    /// [`stow_types::task_graph::context_incoherence_below`]). One walk of
+    /// the closure the dispatch payload carries, plus one bottom-up pass
+    /// over it. Superset serving produced such closures before it kept
+    /// the rule; the submit path now refuses them, and this settles the
+    /// ones already merged.
+    fn context_incoherence(&self, ix: u32) -> Option<String> {
+        let found = stow_types::task_graph::context_incoherence_below(
+            ix as usize,
+            |at| {
+                let node = &self.nodes[at];
+                (
+                    node.crate_name,
+                    node.version,
+                    node.features,
+                    node.target,
+                    node.rustc,
+                    node.flags.profile(),
+                )
+            },
+            |at| self.nodes[at].flags.host(),
+            |at| {
+                let profile = self.nodes[at].flags.profile();
+                profile.host_can_share_target(profile)
+            },
+            |at, stack| {
+                let at = u32::try_from(at).expect("arena indexes fit u32");
+                stack.extend(self.deps_of(at).map(|dep| dep as usize));
+            },
+        )?;
+        Some(format!(
+            "dependency closure holds {}",
+            found.text(|at| {
+                let node = &self.nodes[at];
+                format!(
+                    "{} {}{}",
+                    self.intern.at(node.crate_name),
+                    self.intern.at(node.version),
+                    if node.flags.host() { " (host)" } else { "" }
+                )
+            })
+        ))
     }
 
     /// The target-side node in `ix`'s closure keyed at a triple other
@@ -6021,6 +6069,15 @@ mod tests {
         (segmentation, derive_impl)
     }
 
+    /// The host-side `unicode-segmentation` whose target-side twin the
+    /// native consumer's shadow edges pin (stow#506).
+    fn segmentation_host() -> SubmissionNode {
+        let mut node = sub("unicode-segmentation");
+        node.host_side = true;
+        node.task_id = minted_id(&node);
+        node
+    }
+
     /// `name` keyed at the wasm target, depending on `deps`.
     fn wasm_sub(name: &str, deps: Vec<u32>) -> SubmissionNode {
         let mut node = sub(name);
@@ -6061,6 +6118,7 @@ mod tests {
     #[test]
     fn a_target_side_node_at_another_triple_in_the_graph_is_refused_at_claim() {
         let (segmentation, mut derive_impl) = native_shadow_pair();
+        let segmentation_host = segmentation_host();
         let rows = |node: &SubmissionNode, shapes: [(UnitSide, UnitInvocation, UnitKind); 2]| {
             shapes.map(|(side, invocation, kind)| PublishedSliceRow {
                 crate_name: node.crate_name.clone(),
@@ -6083,23 +6141,32 @@ mod tests {
                 .map(|kind| (UnitSide::Target, UnitInvocation::Native, kind)),
         )
         .into_iter()
-        .chain(rows(
-            &derive_impl,
-            [UnitInvocation::Native, UnitInvocation::Target]
-                .map(|invocation| (UnitSide::Host, invocation, UnitKind::Linked)),
-        ))
+        .chain(
+            [&derive_impl, &segmentation_host]
+                .into_iter()
+                .flat_map(|node| {
+                    rows(
+                        node,
+                        [UnitInvocation::Native, UnitInvocation::Target]
+                            .map(|invocation| (UnitSide::Host, invocation, UnitKind::Linked)),
+                    )
+                }),
+        )
         .collect();
         let mut graph = Graph::default();
         graph.apply_slice_report(TARGET, RUSTC, None, 1, &published, &[]);
-        derive_impl.deps = vec![0];
+        // The native resolve: `derive_more-impl` reaches the host-side
+        // `unicode-segmentation` and pins its twin, and so does the
+        // `derive_more` above it (stow#506).
+        derive_impl.deps = vec![0, 3];
         let mut native = sub("derive_more");
-        native.deps = vec![1];
+        native.deps = vec![1, 0];
         graph
             .merge(
                 &SubmissionTree {
                     source: SubmissionSource::CacheMiss,
                     roots: vec![2],
-                    nodes: vec![segmentation, derive_impl.clone(), native],
+                    nodes: vec![segmentation, derive_impl.clone(), native, segmentation_host],
                 },
                 0,
             )
@@ -6142,6 +6209,142 @@ mod tests {
             )
         );
         let ix = graph.node_ix(&wasm.task_id).expect("wasm derive_more");
+        assert_eq!(graph.node(ix).status, Status::Failed);
+        assert!(graph.attempt_outcomes.is_empty(), "no run, no outcome");
+    }
+
+    /// The stow#1566 clap pieces, in tree order: host-side `proc-macro2`,
+    /// host-side `clap_derive` over it, target-side `proc-macro2`, and
+    /// target-side `quote` over that.
+    fn clap_pieces() -> [SubmissionNode; 4] {
+        let mut proc_macro2_host = sub("proc-macro2");
+        proc_macro2_host.host_side = true;
+        proc_macro2_host.task_id = minted_id(&proc_macro2_host);
+        let mut clap_derive = sub("clap_derive");
+        clap_derive.host_side = true;
+        clap_derive.deps = vec![0];
+        clap_derive.task_id = minted_id(&clap_derive);
+        let mut quote = sub("quote");
+        quote.deps = vec![2];
+        [proc_macro2_host, clap_derive, sub("proc-macro2"), quote]
+    }
+
+    /// The refusal text for the first node of `clap`'s closure missing
+    /// its edge to `proc-macro2`'s target-side twin: `clap_derive`, below
+    /// `clap`.
+    const CLAP_REFUSAL: &str = "clap_derive 1.0.0 (host) without its edge to proc-macro2 1.0.0, which a build of the closure links";
+
+    /// stow#1566: `clap` reaches the host-side `proc-macro2` through
+    /// `clap_derive` while its closure holds the target-side twin through
+    /// `quote`, and carries no edge to it — the context superset serving
+    /// spliced for run 44199090441. No build of that closure mints it, so
+    /// the route refuses the tree.
+    #[test]
+    fn a_closure_whose_context_no_build_mints_is_refused_at_submit() {
+        let mut clap = sub("clap");
+        clap.deps = vec![1, 3];
+        let tree = SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![4],
+            nodes: clap_pieces().into_iter().chain([clap]).collect(),
+        };
+        let error = Graph::default().merge(&tree, 0).expect_err("refused");
+        assert!(
+            error
+                .to_string()
+                .contains("without its edge to proc-macro2-1.0.0-"),
+            "{error}"
+        );
+    }
+
+    /// stow#1566: a tree naming `clap_derive` bare keeps the rule on its
+    /// own edges, while `clap`'s graph closure — through `clap_derive`'s
+    /// committed edge — reaches host-side `proc-macro2` beside the twin
+    /// `clap` has no edge to. The claim refuses `clap` without a run.
+    #[test]
+    fn a_closure_whose_context_no_build_mints_in_the_graph_is_refused_at_claim() {
+        let [proc_macro2_host, clap_derive, proc_macro2, quote] = clap_pieces();
+        let rows = |node: &SubmissionNode| {
+            let shapes = if node.host_side {
+                [UnitInvocation::Native, UnitInvocation::Target]
+                    .map(|invocation| (UnitSide::Host, invocation, UnitKind::Linked))
+            } else {
+                [UnitKind::Unlinked, UnitKind::Linked]
+                    .map(|kind| (UnitSide::Target, UnitInvocation::Native, kind))
+            };
+            shapes.map(|(side, invocation, kind)| PublishedSliceRow {
+                crate_name: node.crate_name.clone(),
+                version: node.version.clone(),
+                features_json: node.features_json.clone(),
+                unit_shape: UnitShape {
+                    side,
+                    invocation,
+                    kind,
+                },
+                dependency_identity: node.dependency_identity.clone(),
+                node_profile: node.profile,
+            })
+        };
+        let published: Vec<_> = [&proc_macro2_host, &clap_derive, &proc_macro2, &quote]
+            .into_iter()
+            .flat_map(rows)
+            .collect();
+        let mut graph = Graph::default();
+        graph.apply_slice_report(TARGET, RUSTC, None, 1, &published, &[]);
+        // A consumer of `clap_derive` with no target-side `proc-macro2`
+        // commits `clap_derive`'s edge; its own closure keeps the rule.
+        let mut app = sub("app");
+        app.deps = vec![1];
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![2],
+                    nodes: vec![proc_macro2_host, clap_derive.clone(), app],
+                },
+                0,
+            )
+            .expect("the derive tree keeps the rule");
+        let mut bare_derive = clap_derive;
+        bare_derive.deps.clear();
+        let mut quote = quote;
+        quote.deps = vec![1];
+        let mut clap = sub("clap");
+        clap.deps = vec![0, 2];
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![3],
+                    nodes: vec![bare_derive, proc_macro2, quote, clap.clone()],
+                },
+                0,
+            )
+            .expect("the clap tree keeps the rule on its own edges");
+        let pass = graph
+            .claim_nodes(&claim_settings(45, 16), 10_000, u32::MAX)
+            .expect("claim");
+        let minted = graph
+            .claimed(&pass, &mut graph.test_digest_source())
+            .expect("mint");
+        assert_eq!(
+            minted
+                .claims
+                .iter()
+                .map(|claim| claim.task_id.as_str())
+                .collect::<Vec<_>>(),
+            [id("app")],
+            "the consumer whose closure keeps the rule dispatches"
+        );
+        let [refusal] = minted.refusals.as_slice() else {
+            panic!("one refusal: {:?}", minted.refusals);
+        };
+        assert_eq!(refusal.task_id, clap.task_id);
+        assert_eq!(
+            refusal.error,
+            format!("dependency closure holds {CLAP_REFUSAL}")
+        );
+        let ix = graph.node_ix(&clap.task_id).expect("clap");
         assert_eq!(graph.node(ix).status, Status::Failed);
         assert!(graph.attempt_outcomes.is_empty(), "no run, no outcome");
     }
