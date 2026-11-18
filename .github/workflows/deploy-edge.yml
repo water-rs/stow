@@ -176,7 +176,20 @@ jobs:
             fi
           done
           skyzen deploy --upload-only --provider cloudflare --manifest edge/Skyzen.toml
+          # The candidate is the version this upload created. Wrangler
+          # appends one `version-upload` entry per upload to
+          # WRANGLER_OUTPUT_FILE_PATH; a version listing is eventually
+          # consistent and may not hold the new version yet.
+          candidate=$(jq -r 'select(.type == "version-upload").version_id' "$WRANGLER_OUTPUT_FILE_PATH")
+          if [ -z "$candidate" ] || [ "$(wc -l <<< "$candidate")" -ne 1 ]; then
+            echo "::error::expected exactly one version-upload entry with a version id in $WRANGLER_OUTPUT_FILE_PATH, got: ${candidate:-none}" >&2
+            exit 1
+          fi
+          # Not CANDIDATE_VERSION: that name arms the rollback step, which
+          # needs the baseline the next step reads.
+          echo "UPLOADED_VERSION=$candidate" >> "$GITHUB_ENV"
         env:
+          WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           GITHUB_APP_PRIVATE_KEY: ${{ secrets.STOW_APP_PRIVATE_KEY }}
@@ -213,13 +226,14 @@ jobs:
           # split deployment left behind by something else.
           baseline=$(wrangler deployments status --config "$WRANGLER_CONFIG" --json \
             | jq -r '.versions | max_by(.percentage).version_id')
-          candidate=$(wrangler versions list --config "$WRANGLER_CONFIG" --json \
-            | jq -r 'max_by(.metadata.created_on).id')
+          # The candidate is the id the upload step reported, never read
+          # back from a listing.
+          candidate=$UPLOADED_VERSION
           if [ -z "$baseline" ] || [ "$baseline" = "null" ]; then
             echo "::error::could not read the deployed baseline version" >&2
             exit 1
           fi
-          if [ -z "$candidate" ] || [ "$candidate" = "null" ] || [ "$candidate" = "$baseline" ]; then
+          if [ "$candidate" = "$baseline" ]; then
             echo "::error::no new version to canary (candidate=$candidate, baseline=$baseline)" >&2
             exit 1
           fi
