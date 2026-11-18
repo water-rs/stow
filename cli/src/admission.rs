@@ -377,6 +377,29 @@ fn scan_nonces(
     (None, attempts)
 }
 
+/// The edge's update request when it refused the report with `426
+/// Upgrade Required` — the answer to a CLI older than its minimum
+/// version (stow#1605) — in the edge's own words. zenwave lifts the
+/// answer into an error carrying the body as `message`.
+fn upgrade_message(error: &crate::edge_client::EdgeError) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct ErrorBody {
+        error: String,
+    }
+    let zenwave::middleware::MiddlewareError::Endpoint(zenwave::Error::Http {
+        status,
+        message,
+        ..
+    }) = error
+    else {
+        return None;
+    };
+    (status.as_u16() == 426).then(|| {
+        serde_json::from_str::<ErrorBody>(message)
+            .map_or_else(|_| message.clone(), |body| body.error)
+    })
+}
+
 /// Post one solved ticket to `POST /api/v1/enqueue`. Returns the task
 /// id when the admission was not redeemed: the request could not be
 /// built or sent, or the edge answered a non-success status — a zenwave
@@ -384,7 +407,9 @@ fn scan_nonces(
 /// (stow#929).
 async fn submit_ticket(config: &StowConfig, ticket: EnqueueTicket) -> Option<String> {
     let url = format!("{}/api/v1/enqueue", config.edge_url.trim_end_matches('/'));
-    let mut client = match crate::edge_client::client(config) {
+    // The untimed client keeps the concrete error type the 426 check
+    // reads; the request bound is a tokio timeout around the call.
+    let mut client = match crate::edge_client::untimed_client(config) {
         Ok(client) => client,
         Err(error) => {
             tracing::warn!(task_id = %ticket.task_id, %error, "enqueue admission needs the network");
@@ -395,12 +420,16 @@ async fn submit_ticket(config: &StowConfig, ticket: EnqueueTicket) -> Option<Str
         .post(&url)
         .and_then(|request| request.json_body(&ticket));
     match result {
-        Ok(request) => match request.await {
-            Ok(response) if response.status().is_success() => {
+        Ok(request) => match tokio::time::timeout(config.request_timeout, request).await {
+            Err(_elapsed) => {
+                tracing::warn!(task_id = %ticket.task_id, "enqueue admission post timed out");
+                Some(ticket.task_id)
+            }
+            Ok(Ok(response)) if response.status().is_success() => {
                 tracing::debug!(task_id = %ticket.task_id, "redeemed enqueue admission");
                 None
             }
-            Ok(response) => {
+            Ok(Ok(response)) => {
                 tracing::warn!(
                     task_id = %ticket.task_id,
                     status = %response.status(),
@@ -408,7 +437,14 @@ async fn submit_ticket(config: &StowConfig, ticket: EnqueueTicket) -> Option<Str
                 );
                 Some(ticket.task_id)
             }
-            Err(error) => {
+            // The local build is unaffected; the user is told to update
+            // so their misses get queued.
+            Ok(Err(error)) if upgrade_message(&error).is_some() => {
+                let message = upgrade_message(&error).unwrap_or_default();
+                tracing::warn!(task_id = %ticket.task_id, "stow: {message}");
+                Some(ticket.task_id)
+            }
+            Ok(Err(error)) => {
                 tracing::warn!(
                     task_id = %ticket.task_id,
                     %error,
@@ -712,6 +748,33 @@ mod tests {
             status: status_line,
             body: Vec::new(),
         }])
+    }
+
+    /// stow#1605: a 426 answer is unredeemed like any refusal, and the
+    /// edge's update message is what the CLI reads from its body.
+    #[tokio::test]
+    async fn an_upgrade_required_answer_is_unredeemed_with_the_edge_message() {
+        use zenwave::Client as _;
+        let edge = crate::test_edge::serve(vec![crate::test_edge::Route {
+            path: "",
+            status: "426 Upgrade Required",
+            body: br#"{"error":"stow 0.21.6 is too old to report cache misses; update stow to 0.21.7 or newer so your cache misses get queued"}"#.to_vec(),
+        }]);
+        let mut config = test_config();
+        edge.configure(&mut config);
+        let mut collector = AdmissionCollector::default();
+
+        collector.record(&config, [test_admission("task-1", 0)]);
+
+        assert_eq!(collector.drain(&config).await, ["task-1"]);
+        let error = crate::edge_client::untimed_client(&config)
+            .expect("client")
+            .post(format!("{}/api/v1/enqueue", config.edge_url))
+            .expect("request")
+            .await
+            .expect_err("426 is an error");
+        let message = super::upgrade_message(&error).expect("a 426 carries the update message");
+        assert!(message.starts_with("stow 0.21.6 is too old"), "{message}");
     }
 
     /// stow#929: a 2xx enqueue answer is the only redeemed outcome.

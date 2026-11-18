@@ -3153,6 +3153,73 @@ pub const DRIVES: &[Drive] = &[
         }),
     },
     Drive {
+        // The minimum CLI version read (stow#1605): one read of state
+        // the graph holds.
+        name: "GET /min-cli-version",
+        setup: None,
+        run: |_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                ctx.loaded().with(|graph| {
+                    graph.min_cli_version_view(&super::queue::DEFAULT_MIN_CLI_VERSION)
+                });
+                Ok(())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // The operator's `set` (stow#1605): one `MinCliVersion` append
+        // and nothing after it — the submit lane reads the version per
+        // request, so the route runs no dispatch pass. Cleanup as
+        // `POST /release-priority`'s.
+        name: "POST /min-cli-version",
+        setup: Some(|_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                if ctx
+                    .loaded()
+                    .with(|graph| graph.min_cli_version_setting().is_some())
+                {
+                    return Err(
+                        "POST /min-cli-version drive expects the seed's unset version".to_owned(),
+                    );
+                }
+                Ok(())
+            })
+        }),
+        run: |db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                routes::commit_as(
+                    ctx.loaded(),
+                    db,
+                    Some(DRIVE_ACTOR),
+                    &[SchedulerEvent::MinCliVersion {
+                        setting: Box::new(stow_types::api::MinCliVersionSetting {
+                            version: semver::Version::new(0, 22, 0),
+                            set_at: "2026-01-01T00:00:00.000Z".to_owned(),
+                            actor: DRIVE_ACTOR.to_owned(),
+                        }),
+                    }],
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?;
+                ctx.loaded().with(|graph| {
+                    graph.min_cli_version_view(&super::queue::DEFAULT_MIN_CLI_VERSION)
+                });
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                ctx.loaded()
+                    .with(super::graph::Graph::restore_unset_min_cli_version);
+                routes::snapshot(ctx.loaded(), db, now_ms())
+                    .await
+                    .map_err(text)
+            })
+        }),
+    },
+    Drive {
         // The memory lines in force (stow#1501): the `memory_line` row,
         // read once per isolate, over the bindings. No wake.
         name: "GET /memory-line",

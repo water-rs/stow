@@ -830,12 +830,36 @@ async fn plan(
         } => {
             let request = miss_task(rustc, counter)?;
             let ticket = mint_ticket(secret, *min_bits, &request)?;
-            Ok(Plan::PostJson {
-                url: format!("{base}/api/v1/enqueue"),
-                bearer: None,
-                body: serde_json::to_value(&ticket).map_err(|error| error.to_string())?,
-            })
+            // The redemption is the stow CLI's route and the edge refuses
+            // a caller that does not identify as a CLI of at least the
+            // minimum version (stow#1605), so the driver names itself
+            // as the CLI of this workspace's version, in the CLI's
+            // `stow-cli/<version> (<os>)` form.
+            Ok(cli_post_plan(
+                format!("{base}/api/v1/enqueue"),
+                serde_json::to_vec(&ticket).map_err(|error| error.to_string())?,
+            ))
         }
+    }
+}
+
+/// A JSON `POST` of `body` the way the stow CLI makes it: its
+/// `stow-cli/<version> (<os>)` user agent, at this workspace's version.
+fn cli_post_plan(url: String, body: Vec<u8>) -> Plan {
+    Plan::PostBytes {
+        url,
+        headers: vec![
+            (
+                "User-Agent".to_owned(),
+                format!(
+                    "stow-cli/{} ({})",
+                    env!("CARGO_PKG_VERSION"),
+                    std::env::consts::OS
+                ),
+            ),
+            ("Content-Type".to_owned(), "application/json".to_owned()),
+        ],
+        body,
     }
 }
 

@@ -8,7 +8,7 @@ table). Commands that take `--yes` require it before applying their plan;
 Run outside GitHub Actions, the mutating commands — `scheduler reset`,
 `scheduler demand-feed`, `queue retry|cancel|promote|purge`,
 `dispatch-freeze engage|clear`, `dispatch-cap set`, `dispatch-rate set`,
-`release-priority set`,
+`release-priority set`, `min-cli-version set`,
 `memory-line set`, `submit`,
 `maintenance`, `watchdog`
 (not `--dry-run`), and the `preheat` lanes under `--yes` — do not call
@@ -72,6 +72,17 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   `stow-admin release-priority set --percent N` replaces it until the
   next `set` — there is no clear and no expiry, no ceiling is checked,
   and the new value re-ranks queued release nodes at the next claim.
+- `stow-admin min-cli-version status` — the oldest CLI whose miss and
+  inexact-hit reports the scheduler queues, and whether it is the
+  deploy default (`STOW_MIN_CLI_VERSION`, `0.21.7` when unset: the
+  first CLI that stops minting registry nodes over path and git
+  packages) or the operator setting. A report from an
+  older CLI, or from a caller whose `User-Agent` names no
+  `stow-cli/<version>`, is refused with `426` and a message telling the
+  user to update stow; the user's local build is unaffected.
+  `stow-admin min-cli-version set --version X.Y.Z` replaces it until
+  the next `set` — there is no clear and no expiry, no ceiling is
+  checked, and the next report is judged against it with no deploy.
 - `stow-admin memory-line status` — the scheduler graph's memory lines
   in force (normal line, small line and small increment, in resident
   bytes) and whether they are the deploy bindings

@@ -24,6 +24,8 @@ pub mod graph_alert;
 /// The operator's memory lines, stored outside the graph (stow#1501).
 pub mod memory_line;
 pub mod meter;
+/// The producer check of the anonymous submit lane (stow#1605).
+pub mod producer;
 pub mod queue;
 /// The graph-and-store cores of the routes, shared by the Durable
 /// Object handlers and the cost harness.

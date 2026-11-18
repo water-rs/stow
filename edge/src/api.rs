@@ -433,6 +433,34 @@ pub async fn set_release_priority(
     Ok(Json(stored))
 }
 
+/// GET /api/v1/admin/min-cli-version
+///
+/// The oldest CLI whose miss and inexact-hit reports the scheduler
+/// queues — the operator setting behind it when `stow-admin
+/// min-cli-version set` wrote one (stow#1605).
+pub async fn get_min_cli_version(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::MinCliVersion>, GetArtifactError> {
+    Ok(Json(
+        scheduler_client::get_min_cli_version(&scheduler).await?,
+    ))
+}
+
+/// POST /api/v1/admin/min-cli-version
+///
+/// The operator's `set` — the minimum CLI version in force until the
+/// next `set`.
+pub async fn set_min_cli_version(
+    Mutator { caller, actor, .. }: Mutator<OperatorRoute>,
+    Json(set): Json<stow_types::api::MinCliVersionSet>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::MinCliVersion>, GetArtifactError> {
+    let stored = scheduler_client::set_min_cli_version(&scheduler, &set, &actor).await?;
+    tracing::warn!(version = %stored.version, %caller, "minimum CLI version set via admin endpoint");
+    Ok(Json(stored))
+}
+
 /// GET /api/v1/admin/memory-line
 ///
 /// The scheduler graph's memory lines in force — the operator setting
@@ -1673,6 +1701,7 @@ pub async fn enqueue_admitted_task(
     State(admission): State<PowAdmission>,
     State(analytics): State<AnalyticsEngineDataset>,
     consent: stats::AnalyticsConsent,
+    user_agent: scheduler_client::UserAgent,
 ) -> Result<Response, GetArtifactError> {
     verify_enqueue_ticket(&ticket, &admission)?;
     // A client builds for whatever host it runs on, and plenty of those are
@@ -1715,7 +1744,16 @@ pub async fn enqueue_admitted_task(
     // The ticket is verified: the miss enters the scheduler's CLI
     // entry point directly (stow#886) — a failed send is the request's
     // own error, not a row a drain would retry.
-    match scheduler_client::send_enqueue(&scheduler, std::slice::from_ref(&ticket.tree)).await {
+    // The caller's own `User-Agent` rides to the scheduler, whose
+    // producer check refuses a CLI below the operator's minimum version
+    // and a caller naming none (stow#1605).
+    match scheduler_client::send_enqueue(
+        &scheduler,
+        std::slice::from_ref(&ticket.tree),
+        user_agent.0.as_deref(),
+    )
+    .await
+    {
         Ok(unpublished_ids) => {
             // The merge's born-published check is the coverage verdict:
             // one Analytics Engine point per node it found unpublished.

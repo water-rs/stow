@@ -1,4 +1,4 @@
-use skyzen::header::{CONTENT_TYPE, HeaderValue};
+use skyzen::header::{CONTENT_TYPE, HeaderValue, USER_AGENT};
 use skyzen::{Body, Method, Request, Response, Uri};
 use skyzen_cloudflare::CfDurableNamespace;
 
@@ -18,6 +18,7 @@ const SCHEDULER_FREEZE_URL: &str = "https://scheduler.internal/dispatch-freeze";
 const SCHEDULER_DISPATCH_CAP_URL: &str = "https://scheduler.internal/dispatch-cap";
 const SCHEDULER_DISPATCH_RATE_URL: &str = "https://scheduler.internal/dispatch-rate";
 const SCHEDULER_RELEASE_PRIORITY_URL: &str = "https://scheduler.internal/release-priority";
+const SCHEDULER_MIN_CLI_VERSION_URL: &str = "https://scheduler.internal/min-cli-version";
 const SCHEDULER_MEMORY_LINE_URL: &str = "https://scheduler.internal/memory-line";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
 const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
@@ -34,9 +35,36 @@ pub const ACTOR_HEADER: &str = "x-stow-actor";
 const SCHEDULER_PREHEAT_RELEASE_URL: &str = "https://scheduler.internal/preheat/release";
 const SCHEDULER_PERIODIC_DISPATCH_URL: &str = "https://scheduler.internal/periodic/dispatch";
 
+/// The request's `User-Agent` — `None` when the caller sent none or a
+/// non-ASCII one. The anonymous submit lane carries it from the edge's
+/// handler to the object's producer check (stow#1605); it names a
+/// producer's release and authenticates nothing.
+#[derive(Debug)]
+pub struct UserAgent(pub Option<String>);
+
+impl skyzen::extract::Extractor for UserAgent {
+    type Error = std::convert::Infallible;
+
+    fn extract(
+        request: &mut Request,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Error>> + Send {
+        let agent = request
+            .headers()
+            .get(USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        std::future::ready(Ok(Self(agent)))
+    }
+}
+
+/// The anonymous submit lane. `user_agent` is the caller's own header,
+/// forwarded for the object's producer check: a CLI below the
+/// operator's minimum version, or a caller naming none, is refused
+/// with 426 (stow#1605).
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
     trees: &[stow_types::api::SubmissionTree],
+    user_agent: Option<&str>,
 ) -> Result<Vec<String>, SchedulerClientError> {
     #[derive(serde::Deserialize)]
     struct SubmitResponse {
@@ -45,7 +73,20 @@ pub async fn send_enqueue(
     if trees.is_empty() {
         return Ok(Vec::new());
     }
-    let response: SubmitResponse = post_json(namespace, SCHEDULER_SUBMIT_URL, trees).await?;
+    let mut response = fetch_forwarding(
+        namespace,
+        Method::POST,
+        SCHEDULER_SUBMIT_URL,
+        Some(trees),
+        None,
+        user_agent,
+    )
+    .await?;
+    let response: SubmitResponse = response
+        .body_mut()
+        .into_json()
+        .await
+        .map_err(|error| SchedulerClientError::Decode(error.to_string()))?;
     Ok(response.unpublished_ids)
 }
 
@@ -289,6 +330,24 @@ pub async fn set_release_priority(
     actor: &str,
 ) -> Result<stow_types::api::ReleasePriority, SchedulerClientError> {
     post_json_as(namespace, SCHEDULER_RELEASE_PRIORITY_URL, set, actor).await
+}
+
+/// The oldest CLI whose reports are queued — the operator setting
+/// behind it when one was set, the default otherwise (stow#1605).
+pub async fn get_min_cli_version(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::MinCliVersion, SchedulerClientError> {
+    get_json(namespace, SCHEDULER_MIN_CLI_VERSION_URL).await
+}
+
+/// The operator's `min-cli-version set` — in force until the next
+/// `set`; the object answers the version it now enforces.
+pub async fn set_min_cli_version(
+    namespace: &CfDurableNamespace,
+    set: &stow_types::api::MinCliVersionSet,
+    actor: &str,
+) -> Result<stow_types::api::MinCliVersion, SchedulerClientError> {
+    post_json_as(namespace, SCHEDULER_MIN_CLI_VERSION_URL, set, actor).await
 }
 
 /// The scheduler graph's memory lines in force and the operator setting
@@ -581,6 +640,20 @@ async fn fetch(
     payload: Option<&(impl serde::Serialize + Sync + ?Sized)>,
     actor: Option<&str>,
 ) -> Result<Response, SchedulerClientError> {
+    fetch_forwarding(namespace, method, url, payload, actor, None).await
+}
+
+/// [`fetch`] that also forwards the caller's `User-Agent` — the one
+/// header the object reads for the producer check on the anonymous
+/// submit lane (stow#1605).
+async fn fetch_forwarding(
+    namespace: &CfDurableNamespace,
+    method: Method,
+    url: &str,
+    payload: Option<&(impl serde::Serialize + Sync + ?Sized)>,
+    actor: Option<&str>,
+    user_agent: Option<&str>,
+) -> Result<Response, SchedulerClientError> {
     let stub = namespace
         .get_by_name(SCHEDULER_SINGLETON_NAME)
         .map_err(|error| SchedulerClientError::Stub(error.to_string()))?;
@@ -602,6 +675,13 @@ async fn fetch(
         request.headers_mut().insert(
             ACTOR_HEADER,
             HeaderValue::from_str(actor)
+                .map_err(|error| SchedulerClientError::BuildRequest(error.to_string()))?,
+        );
+    }
+    if let Some(user_agent) = user_agent {
+        request.headers_mut().insert(
+            USER_AGENT,
+            HeaderValue::from_str(user_agent)
                 .map_err(|error| SchedulerClientError::BuildRequest(error.to_string()))?,
         );
     }

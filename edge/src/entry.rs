@@ -260,6 +260,9 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 2] {
                     "/dispatch-rate"
                         .at(api::get_dispatch_rate)
                         .post(api::set_dispatch_rate),
+                    "/min-cli-version"
+                        .at(api::get_min_cli_version)
+                        .post(api::set_min_cli_version),
                 )),
                 "/release-priority"
                     .at(api::get_release_priority)
