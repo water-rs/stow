@@ -1590,6 +1590,46 @@ pub struct ReleasePrioritySetting {
     pub actor: String,
 }
 
+/// The oldest CLI whose miss and inexact-hit reports the scheduler
+/// queues — wire shape of `GET`/`POST /api/v1/admin/min-cli-version`
+/// and of the scheduler object's `/min-cli-version` routes (stow#1605).
+///
+/// A report from an older CLI, or from a caller that does not identify
+/// itself as one, is refused. Until the first `set` the scheduler's
+/// default applies; there is no clear and no expiry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MinCliVersion {
+    /// The operator setting in force — absent until the first `set`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setting: Option<MinCliVersionSetting>,
+    /// The oldest CLI version whose reports are queued.
+    #[schema(value_type = String)]
+    pub version: semver::Version,
+}
+
+/// What an operator's `min-cli-version set` wrote — `POST`'s request
+/// body. No ceiling is checked: the operator is trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MinCliVersionSet {
+    /// The oldest CLI version whose reports are queued.
+    #[schema(value_type = String)]
+    pub version: semver::Version,
+}
+
+/// The operator setting a `set` appended to the scheduler's log — the
+/// `SchedulerEvent::MinCliVersion` payload, the graph's in-memory copy
+/// and the snapshot's field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MinCliVersionSetting {
+    /// The version the set named.
+    #[schema(value_type = String)]
+    pub version: semver::Version,
+    /// ISO 8601 timestamp of the set.
+    pub set_at: String,
+    /// The verified `actor` claim of the operations run that set it.
+    pub actor: String,
+}
+
 /// The scheduler graph's memory lines (stow#1501) — wire shape of
 /// `GET`/`POST /api/v1/admin/memory-line` and of the scheduler object's
 /// `/memory-line` routes.
@@ -7507,6 +7547,13 @@ pub enum SchedulerEvent {
     ReleasePriority {
         /// The setting the log row recorded.
         setting: Box<ReleasePrioritySetting>,
+    },
+    /// An operator's minimum-CLI-version setting (stow#1605): the
+    /// oldest CLI whose reports the scheduler queues, in force until
+    /// the next `set`. There is no clear.
+    MinCliVersion {
+        /// The setting the log row recorded.
+        setting: Box<MinCliVersionSetting>,
     },
     /// The dispatch freeze's transition record (`None` = cleared).
     Freeze {

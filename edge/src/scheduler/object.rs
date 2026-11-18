@@ -18,7 +18,7 @@ use crate::freeze::{self, FreezeSettings};
 use crate::github_app;
 use crate::scheduler::meter::{self, Meter, MeterGuard};
 use crate::scheduler::queue::SchedulerSettings;
-use crate::scheduler::{budget, fixture, graph_alert};
+use crate::scheduler::{budget, fixture, graph_alert, producer};
 use crate::scheduler::{dispatch, feed, graph, queue, routes, store};
 
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
@@ -384,6 +384,11 @@ impl Scheduler {
                 "/release-priority"
                     .at(read_release_priority)
                     .post(write_release_priority),
+                // The operator's minimum CLI version (stow#1605):
+                // reached from `GET`/`POST /api/v1/admin/min-cli-version`.
+                "/min-cli-version"
+                    .at(read_min_cli_version)
+                    .post(write_min_cli_version),
                 // The operator's memory lines (stow#1501): reached from
                 // `GET`/`POST /api/v1/admin/memory-line`, and served
                 // without a wake.
@@ -730,8 +735,19 @@ async fn submit_tasks(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
+    user_agent: crate::scheduler_client::UserAgent,
     Json(trees): Json<Vec<stow_types::api::SubmissionTree>>,
 ) -> Result<Json<InsertedResponse>> {
+    // Only the stow CLI submits here (stow#1605): a CLI below the
+    // operator's minimum version mints trees no build can reproduce,
+    // so it is refused before its tree reaches the graph — on the
+    // graph the submit loads anyway.
+    let loaded = ensure_graph(&env, &db, &graph).await?;
+    let minimum = loaded.with(|graph| graph.min_cli_version());
+    if let Err(refusal) = producer::check(user_agent.0.as_deref(), &minimum) {
+        tracing::info!(%refusal, "refused a submission from an outdated or unidentified producer");
+        return Err(Error::msg(refusal.to_string()).set_status(StatusCode::UPGRADE_REQUIRED));
+    }
     submit(&graph, &env, &db, &alarm, &trees, true, None).await
 }
 
@@ -1722,6 +1738,47 @@ async fn write_release_priority(
     .map_err(to_error)?;
     tracing::warn!(percent = set.percent, actor = %actor.0, "release priority set by operator");
     Ok(Json(graph.with(|graph| graph.release_priority_view())))
+}
+
+/// `GET /min-cli-version` — the oldest CLI whose reports are queued and
+/// the operator setting behind it (stow#1605).
+async fn read_min_cli_version(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::MinCliVersion>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    Ok(Json(graph.with(|graph| graph.min_cli_version_view())))
+}
+
+/// `POST /min-cli-version` — the operator's `set`: one `MinCliVersion`
+/// event appended, in force until the next `set`. The submit lane reads
+/// it per request, so the route runs no dispatch pass.
+async fn write_min_cli_version(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+    actor: Actor,
+    Json(set): Json<stow_types::api::MinCliVersionSet>,
+) -> Result<Json<stow_types::api::MinCliVersion>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    routes::commit_as(
+        graph,
+        &db,
+        Some(&actor.0),
+        &[SchedulerEvent::MinCliVersion {
+            setting: Box::new(stow_types::api::MinCliVersionSetting {
+                version: set.version.clone(),
+                set_at: iso_now(),
+                actor: actor.0.clone(),
+            }),
+        }],
+        now_ms(),
+    )
+    .await
+    .map_err(to_error)?;
+    tracing::warn!(version = %set.version, actor = %actor.0, "minimum CLI version set by operator");
+    Ok(Json(graph.with(|graph| graph.min_cli_version_view())))
 }
 
 /// `GET /memory-line` — the memory lines in force and the operator

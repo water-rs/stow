@@ -580,6 +580,11 @@ pub struct Graph {
     /// first `set`, when [`queue::DEFAULT_RELEASE_PRIORITY_PERCENT`]
     /// applies.
     release_priority: Option<stow_types::api::ReleasePrioritySetting>,
+    /// The operator's minimum-CLI-version setting (stow#1605): the
+    /// oldest CLI whose reports the anonymous submit lane queues.
+    /// `None` until the first `set`, when
+    /// [`queue::DEFAULT_MIN_CLI_VERSION`] applies.
+    min_cli_version: Option<stow_types::api::MinCliVersionSetting>,
 
     /// Completions and failures per UTC hour and target byte — the
     /// admin status's trailing-day tally, since a published node keeps
@@ -3594,6 +3599,35 @@ impl Graph {
         }
     }
 
+    /// The oldest CLI version whose reports are queued: the operator's
+    /// stored `min-cli-version set` or the default.
+    pub fn min_cli_version(&self) -> semver::Version {
+        self.min_cli_version
+            .as_ref()
+            .map_or(queue::DEFAULT_MIN_CLI_VERSION, |set| set.version.clone())
+    }
+
+    /// The operator's stored `min-cli-version set` (stow#1605), `None`
+    /// until the first one.
+    pub const fn min_cli_version_setting(&self) -> Option<&stow_types::api::MinCliVersionSetting> {
+        self.min_cli_version.as_ref()
+    }
+
+    /// `GET /min-cli-version`'s body.
+    pub fn min_cli_version_view(&self) -> stow_types::api::MinCliVersion {
+        stow_types::api::MinCliVersion {
+            setting: self.min_cli_version.clone(),
+            version: self.min_cli_version(),
+        }
+    }
+
+    /// Drop the stored min-cli-version setting — the budget drives'
+    /// restore of the unset state the fixture seed wrote. No route
+    /// reaches it: an operator `set` has no clear.
+    pub fn restore_unset_min_cli_version(&mut self) {
+        self.min_cli_version = None;
+    }
+
     /// Drop the stored release-priority setting — the budget drives'
     /// restore of the unset state the fixture seed wrote. No route
     /// reaches it: an operator `set` has no clear.
@@ -4066,6 +4100,16 @@ impl Graph {
         Ok(())
     }
 
+    /// The floor reads the weighted value, so a moved release
+    /// multiplier re-evaluates every node's admission.
+    fn refresh_floor_admission(&mut self) {
+        if self.floor > 0 {
+            for ix in 0..u32::try_from(self.nodes.len()).expect("node indexes fit u32") {
+                self.refresh_ready(ix);
+            }
+        }
+    }
+
     /// Apply any event that reads no published row, which is every kind
     /// but `Submit` (the replay reassembles and merges it) and
     /// `SliceReport` ([`Self::apply_slice_report_event`]).
@@ -4159,15 +4203,12 @@ impl Graph {
             SchedulerEvent::DispatchRate { setting } => {
                 self.dispatch_rate = Some((**setting).clone());
             }
+            SchedulerEvent::MinCliVersion { setting } => {
+                self.min_cli_version = Some((**setting).clone());
+            }
             SchedulerEvent::ReleasePriority { setting } => {
                 self.release_priority = Some((**setting).clone());
-                // The floor reads the weighted value, so a moved
-                // multiplier re-evaluates every node's admission.
-                if self.floor > 0 {
-                    for ix in 0..u32::try_from(self.nodes.len()).expect("node indexes fit u32") {
-                        self.refresh_ready(ix);
-                    }
-                }
+                self.refresh_floor_admission();
             }
             SchedulerEvent::Freeze {
                 record,
@@ -8161,6 +8202,44 @@ mod tests {
         // 1000% makes the one-minute-younger release node outrank the
         // dev node after two minutes.
         assert_eq!(first_claim(&mut graph, 180_000), release_id("lib"));
+    }
+
+    /// stow#1605: the minimum CLI version is the default until an
+    /// operator `set`, and the `set` changes the producer verdict with
+    /// no deploy.
+    #[test]
+    fn the_operator_minimum_changes_the_producer_verdict() {
+        use crate::scheduler::producer;
+        let mut graph = Graph::default();
+        let agent = Some("stow-cli/0.21.7 (linux)");
+        assert_eq!(graph.min_cli_version(), queue::DEFAULT_MIN_CLI_VERSION);
+        assert!(graph.min_cli_version_setting().is_none());
+        assert_eq!(producer::check(agent, &graph.min_cli_version()), Ok(()));
+        graph.apply(
+            &SchedulerEvent::MinCliVersion {
+                setting: Box::new(stow_types::api::MinCliVersionSetting {
+                    version: semver::Version::new(0, 22, 0),
+                    set_at: "2026-01-01T00:00:00Z".to_owned(),
+                    actor: "ops".to_owned(),
+                }),
+            },
+            0,
+        );
+        let view = graph.min_cli_version_view();
+        assert_eq!(view.version, semver::Version::new(0, 22, 0));
+        assert_eq!(view.setting.expect("setting").actor, "ops");
+        assert!(producer::check(agent, &graph.min_cli_version()).is_err());
+        graph.apply(
+            &SchedulerEvent::MinCliVersion {
+                setting: Box::new(stow_types::api::MinCliVersionSetting {
+                    version: semver::Version::new(0, 21, 0),
+                    set_at: "2026-01-02T00:00:00Z".to_owned(),
+                    actor: "ops".to_owned(),
+                }),
+            },
+            0,
+        );
+        assert_eq!(producer::check(agent, &graph.min_cli_version()), Ok(()));
     }
 
     /// stow#1012: the admission floor compares the weighted value. At

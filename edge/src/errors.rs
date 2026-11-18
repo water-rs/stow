@@ -363,6 +363,12 @@ pub enum GetArtifactError {
     /// report) or drops it (a superseded outcome).
     #[error("{0}", status = CONFLICT)]
     SchedulerConflict(String),
+    /// The scheduler refused a CLI submission because the CLI is older
+    /// than the operator's minimum version, or names no version
+    /// (stow#1605). The message tells the user to update stow; the CLI
+    /// prints it.
+    #[error("{0}", status = UPGRADE_REQUIRED)]
+    CliUpgradeRequired(String),
     /// The scheduler refused a submit with 429 — on the human lane the
     /// daily task budget, on the miss lane the pending-depth cap.
     /// Handlers that know the retry semantics answer a `Retry-After`
@@ -416,6 +422,11 @@ impl From<SchedulerClientError> for GetArtifactError {
             SchedulerClientError::Http {
                 status: 409, body, ..
             } => Self::SchedulerConflict(scheduler_error_message(&body).to_owned()),
+            // A 426 is the producer check of the anonymous submit lane
+            // (stow#1605); its message names the version to update to.
+            SchedulerClientError::Http {
+                status: 426, body, ..
+            } => Self::CliUpgradeRequired(scheduler_error_message(&body).to_owned()),
             // A 4xx from the scheduler is a client problem — e.g. a
             // submit naming a task the queue never held — and the body
             // is the scheduler's own client-safe message, so it reaches
@@ -489,6 +500,19 @@ mod tests {
             "fetch crates.io: refused".to_owned(),
         ));
         assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// stow#1605: the object's 426 keeps its status and its message,
+    /// which the CLI prints.
+    #[test]
+    fn scheduler_upgrade_required_maps_to_426() {
+        let error = GetArtifactError::from(SchedulerClientError::Http {
+            url: "https://scheduler.internal/tasks/submit".to_owned(),
+            status: 426,
+            body: r#"{"error":"stow 0.21.6 is too old to report cache misses; update stow to 0.21.7 or newer so your cache misses get queued"}"#.to_owned(),
+        });
+        assert_eq!(error.status(), StatusCode::UPGRADE_REQUIRED);
+        assert!(error.to_string().starts_with("stow 0.21.6 is too old"));
     }
 
     /// The scheduler's 409 — here a delta slice report on a stale

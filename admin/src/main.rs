@@ -50,7 +50,8 @@ use keyring_core::api::CredentialStoreApi;
 use stow_types::api::{
     AdminStatus, ChannelOutcome, DispatchCapSet, DispatchCaps, DispatchFreeze,
     DispatchFreezeTrigger, DispatchRate, DispatchRateSet, FreezeTransitionEvent, MemoryLineSet,
-    MemoryLines, ReleasePriority, ReleasePrioritySet, SchedulerSubmitResponse,
+    MemoryLines, MinCliVersion, MinCliVersionSet, ReleasePriority, ReleasePrioritySet,
+    SchedulerSubmitResponse,
 };
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -137,6 +138,9 @@ enum Command {
     /// Read or adjust the multiplier release-profile nodes rank under
     /// in the scheduler's aging rank (stow#1012).
     ReleasePriority(ReleasePriorityArgs),
+    /// Read or adjust the oldest CLI version whose miss and inexact-hit
+    /// reports the scheduler queues (stow#1605).
+    MinCliVersion(MinCliVersionArgs),
     /// Read or adjust the scheduler graph's memory lines — the bounds
     /// the deploy bindings `STOW_SCHEDULER_MEMORY_LINE`,
     /// `STOW_SCHEDULER_SMALL_MEMORY_LINE` and
@@ -291,6 +295,34 @@ struct ReleasePrioritySetArgs {
 }
 
 #[derive(Args)]
+struct MinCliVersionArgs {
+    /// `status` prints the minimum in force; `set` replaces it until
+    /// the next set — there is no clear.
+    #[command(subcommand)]
+    command: MinCliVersionCommand,
+}
+
+#[derive(Subcommand)]
+enum MinCliVersionCommand {
+    /// Print the minimum CLI version in force and whether it is the
+    /// default or the operator setting.
+    Status,
+    /// Set the minimum; without `--yes` prints the plan and exits 0.
+    Set(MinCliVersionSetArgs),
+}
+
+#[derive(Args)]
+struct MinCliVersionSetArgs {
+    /// The oldest CLI version whose reports are queued, such as
+    /// `0.21.7`. No ceiling is checked.
+    #[arg(long)]
+    version: semver::Version,
+    /// Apply the change.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
 struct MemoryLineArgs {
     /// `status` prints the lines in force and where they come from;
     /// `set` replaces the deploy bindings' values until the next set —
@@ -438,6 +470,9 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
         }
         Command::ReleasePriority(args) => {
             release_priority_command(&Edge::connect(&*store)?, args, output).await
+        }
+        Command::MinCliVersion(args) => {
+            min_cli_version_command(&Edge::connect(&*store)?, args, output).await
         }
         Command::MemoryLine(args) => {
             memory_line_command(&Edge::connect(&*store)?, args, output).await
@@ -1101,6 +1136,44 @@ async fn release_priority_command(
     }
 }
 
+/// `stow-admin min-cli-version status|set` — read the oldest CLI
+/// version whose reports the scheduler queues or write the operator
+/// setting that replaces its default (stow#1605). `set` is a mutation:
+/// it prints the plan and only applies under `--yes`.
+async fn min_cli_version_command(
+    edge: &Edge,
+    args: MinCliVersionArgs,
+    output: Output,
+) -> stow_types::error::Result<()> {
+    match args.command {
+        MinCliVersionCommand::Status => {
+            let view: MinCliVersion = edge.get_json("/api/v1/admin/min-cli-version").await?;
+            render::emit(output, &view, render_min_cli_version)
+        }
+        MinCliVersionCommand::Set(args) => {
+            let plan = MinCliVersionSet {
+                version: args.version,
+            };
+            render::mutation(
+                output,
+                plan,
+                |envelope: &render::Planned<MinCliVersionSet, MinCliVersion>| {
+                    let mut out = "set minimum CLI version\n".to_owned();
+                    if let Some(result) = &envelope.result {
+                        let _ = writeln!(out, "{}", render_min_cli_version(result));
+                    }
+                    let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
+                    out
+                },
+                args.yes.then_some(async move |plan: &MinCliVersionSet| {
+                    edge.post_json("/api/v1/admin/min-cli-version", plan).await
+                }),
+            )
+            .await
+        }
+    }
+}
+
 /// `stow-admin memory-line status|set` — read the scheduler graph's
 /// memory lines in force or write the operator setting that replaces
 /// the deploy bindings' (stow#1501). `set` is a mutation: it prints the
@@ -1174,6 +1247,24 @@ fn render_dispatch_rate(view: &DispatchRate) -> String {
         out,
         "\nstarted in the last minute {}",
         view.started_last_minute
+    );
+    if let Some(setting) = &view.setting {
+        let _ = write!(out, "\nset at {}", setting.set_at);
+        let _ = write!(out, "\nset by {}", setting.actor);
+    }
+    out
+}
+
+/// Human rendering of the minimum CLI version in force and its source.
+fn render_min_cli_version(view: &MinCliVersion) -> String {
+    let mut out = format!(
+        "minimum CLI version {} ({})",
+        view.version,
+        if view.setting.is_some() {
+            "operator"
+        } else {
+            "default"
+        }
     );
     if let Some(setting) = &view.setting {
         let _ = write!(out, "\nset at {}", setting.set_at);
