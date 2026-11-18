@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.7](https://github.com/water-rs/stow/compare/types/v0.21.6...types/v0.21.7) - 2026-11-18
+
+### Fixed
+
+- keep every dispatched closure's context one build mints ([#1597](https://github.com/water-rs/stow/pull/1597))
+- *(scheduler)* freeze dispatch when a refused dispatch finds build-crate.yml not active ([#1596](https://github.com/water-rs/stow/pull/1596))
+- *(scheduler)* refuse a closure holding a target-side node at another triple ([#1595](https://github.com/water-rs/stow/pull/1595))
+- *(types)* keep a native host subtree out of a cross-target closure ([#1594](https://github.com/water-rs/stow/pull/1594))
+
+### Other
+
+- Merge pull request #1601 from water-rs/dev
+- *(scheduler)* plant the delta report's fan-in and derive the snapshot bound from it ([#1600](https://github.com/water-rs/stow/pull/1600))
+
 ## [0.21.6](https://github.com/water-rs/stow/compare/types/v0.21.5...types/v0.21.6) - 2026-11-17
 
 ### Fixed

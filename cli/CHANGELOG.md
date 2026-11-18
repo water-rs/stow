@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.7](https://github.com/water-rs/stow/compare/v0.21.6...v0.21.7) - 2026-11-18
+
+### Fixed
+
+- keep every dispatched closure's context one build mints ([#1597](https://github.com/water-rs/stow/pull/1597))
+
+### Other
+
+- Merge pull request #1599 from water-rs/dev
+
 ## [0.21.6](https://github.com/water-rs/stow/compare/v0.21.5...v0.21.6) - 2026-11-17
 
 ### Other
