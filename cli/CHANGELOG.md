@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.8](https://github.com/water-rs/stow/compare/v0.21.7...v0.21.8) - 2026-11-20
+
+### Added
+
+- *(edge)* refuse miss reports from CLIs below a minimum version ([#1607](https://github.com/water-rs/stow/pull/1607))
+
+### Other
+
+- Merge pull request #1613 from water-rs/dev
+
 ## [0.21.7](https://github.com/water-rs/stow/compare/v0.21.6...v0.21.7) - 2026-11-18
 
 ### Fixed
