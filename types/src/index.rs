@@ -385,6 +385,87 @@ pub fn partition_build_scripts(
     (rows, scripts)
 }
 
+/// Streams up to `limit` bytes from `inner`, recording the first
+/// underlying I/O or bound-overflow error in `io_error` so a failure
+/// inside `serde_json::from_reader` still surfaces as
+/// [`IndexDecodeError::Decompress`] rather than a truncated JSON EOF.
+#[cfg(not(target_arch = "wasm32"))]
+struct BoundedIndexReader<'a, R> {
+    inner: R,
+    remaining: u64,
+    limit: u64,
+    io_error: &'a mut Option<std::io::Error>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<R: std::io::Read> BoundedIndexReader<'_, R> {
+    fn stash_error(&mut self, err: std::io::Error) -> std::io::Error {
+        let copy = std::io::Error::new(err.kind(), err.to_string());
+        *self.io_error = Some(err);
+        copy
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<R: std::io::Read> std::io::Read for BoundedIndexReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe) {
+                Ok(0) => Ok(0),
+                Ok(_) => Err(self.stash_error(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "index inflates past the {}-byte decompression bound",
+                        self.limit
+                    ),
+                ))),
+                Err(err) => Err(self.stash_error(err)),
+            };
+        }
+        let cap = usize::try_from(self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
+        match self.inner.read(&mut buf[..cap]) {
+            Ok(n) => {
+                self.remaining -= n as u64;
+                Ok(n)
+            }
+            Err(err) => Err(self.stash_error(err)),
+        }
+    }
+}
+
+/// Probe `header.format_version` alone when deserializing the full
+/// [`ArtifactIndex`] failed, so an older or newer schema reports its
+/// version instead of whichever field differed.
+#[cfg(not(target_arch = "wasm32"))]
+fn probe_foreign_format_version(bytes: &[u8], max_json_len: u64) -> Option<u32> {
+    #[derive(serde::Deserialize)]
+    struct VersionProbe {
+        header: HeaderVersion,
+    }
+    #[derive(serde::Deserialize)]
+    struct HeaderVersion {
+        format_version: u32,
+    }
+
+    let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let mut io_error = None;
+    let reader = std::io::BufReader::new(BoundedIndexReader {
+        inner: decoder,
+        remaining: max_json_len,
+        limit: max_json_len,
+        io_error: &mut io_error,
+    });
+    let probe: VersionProbe = serde_json::from_reader(reader).ok()?;
+    (probe.header.format_version != ARTIFACT_INDEX_FORMAT_VERSION)
+        .then_some(probe.header.format_version)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl ArtifactIndex {
     /// Decompress and parse index bytes, then check the header: a
@@ -398,42 +479,48 @@ impl ArtifactIndex {
     /// [`IndexDecodeError::Format`], or
     /// [`IndexDecodeError::RowCountMismatch`].
     pub fn decode(bytes: &[u8]) -> Result<Self, IndexDecodeError> {
-        use std::io::Read as _;
-
         /// Decompressed JSON the decoder will read before giving up — a
         /// bound on how much a hostile or corrupt blob can inflate into
-        /// memory. At ~1 KB per row this still covers a slice orders of
-        /// magnitude past any plausible pool size.
-        const MAX_INDEX_JSON_LEN: u64 = 256 * 1024 * 1024;
+        /// memory. Production slices measure ~2,080 B per row (`128,539`
+        /// rows at `254.9 MiB` in `x86_64-unknown-linux-gnu`), so `4 GiB`
+        /// covers ~2 million rows per `(target, rustc)` slice while
+        /// stopping a decompression bomb before host memory is exhausted.
+        const MAX_INDEX_JSON_LEN: u64 = 4 * 1024 * 1024 * 1024;
 
-        /// The header's version alone, read before the full shape: an
-        /// index of another format answers with its version, not with
-        /// whichever field that format happens to lack.
-        #[derive(serde::Deserialize)]
-        struct VersionProbe {
-            header: HeaderVersion,
-        }
-        #[derive(serde::Deserialize)]
-        struct HeaderVersion {
-            format_version: u32,
-        }
+        Self::decode_bounded(bytes, MAX_INDEX_JSON_LEN)
+    }
 
+    fn decode_bounded(bytes: &[u8], max_json_len: u64) -> Result<Self, IndexDecodeError> {
         let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(bytes))
             .map_err(IndexDecodeError::Decompress)?;
-        let mut json = Vec::new();
-        decoder
-            .take(MAX_INDEX_JSON_LEN)
-            .read_to_end(&mut json)
-            .map_err(IndexDecodeError::Decompress)?;
-        let probe: VersionProbe =
-            serde_json::from_slice(&json).map_err(IndexDecodeError::Deserialize)?;
-        if probe.header.format_version != ARTIFACT_INDEX_FORMAT_VERSION {
+        let mut io_error = None;
+        let reader = std::io::BufReader::new(BoundedIndexReader {
+            inner: decoder,
+            remaining: max_json_len,
+            limit: max_json_len,
+            io_error: &mut io_error,
+        });
+        let index: Self = match serde_json::from_reader(reader) {
+            Ok(index) => index,
+            Err(deserialize_error) => {
+                if let Some(err) = io_error {
+                    return Err(IndexDecodeError::Decompress(err));
+                }
+                if let Some(found) = probe_foreign_format_version(bytes, max_json_len) {
+                    return Err(IndexDecodeError::Format {
+                        found,
+                        expected: ARTIFACT_INDEX_FORMAT_VERSION,
+                    });
+                }
+                return Err(IndexDecodeError::Deserialize(deserialize_error));
+            }
+        };
+        if index.header.format_version != ARTIFACT_INDEX_FORMAT_VERSION {
             return Err(IndexDecodeError::Format {
-                found: probe.header.format_version,
+                found: index.header.format_version,
                 expected: ARTIFACT_INDEX_FORMAT_VERSION,
             });
         }
-        let index: Self = serde_json::from_slice(&json).map_err(IndexDecodeError::Deserialize)?;
         let actual = index.rows.len() as u64;
         if index.header.row_count != actual {
             return Err(IndexDecodeError::RowCountMismatch {
@@ -632,6 +719,29 @@ mod tests {
                 actual: 1
             }
         ));
+    }
+
+    #[test]
+    fn decode_surfaces_decompression_bound_overflow_instead_of_json_eof() {
+        let index = index(vec![row("aaaa"), row("bbbb")]);
+        let uncompressed_len = serde_json::to_vec(&index).expect("json").len() as u64;
+        let bytes = encode_for_test(&index).expect("encode");
+
+        assert_eq!(
+            ArtifactIndex::decode_bounded(&bytes, uncompressed_len).expect("exact bound fits"),
+            index
+        );
+
+        let error = ArtifactIndex::decode_bounded(&bytes, uncompressed_len - 1)
+            .expect_err("one byte over the bound must fail");
+        assert!(
+            matches!(error, IndexDecodeError::Decompress(_)),
+            "expected Decompress error rather than truncated JSON EOF, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("decompression bound"),
+            "unexpected message: {error}"
+        );
     }
 
     #[test]
