@@ -88,18 +88,11 @@ impl<P: github_auth::MutationPolicy> Extractor for Mutator<P> {
     }
 }
 
-/// Operator-only routes: the freeze switch, queue mutations, the store
-/// reset and the mock-only budget probe.
+/// Operator-only routes: queue mutations, the store reset and the
+/// mock-only budget probe.
 pub struct OperatorRoute;
 impl github_auth::MutationPolicy for OperatorRoute {
     const WORKFLOWS: &'static [&'static str] = &[OPERATIONS_WORKFLOW];
-}
-
-/// `dispatch-freeze`: an operator's switch plus the watchdog, whose trip
-/// engages it before it disables the dispatching workflows.
-pub struct FreezeRoute;
-impl github_auth::MutationPolicy for FreezeRoute {
-    const WORKFLOWS: &'static [&'static str] = &[OPERATIONS_WORKFLOW, "watchdog.yml"];
 }
 
 /// `tasks/submit`: operator submits plus the scheduled and dispatched
@@ -345,10 +338,21 @@ pub async fn get_dispatch_freeze(
 /// The manual transition that is also the freeze's only recovery path —
 /// clearing it resumes dispatch of everything that queued meanwhile.
 pub async fn set_dispatch_freeze(
-    Mutator { caller, actor, .. }: Mutator<FreezeRoute>,
+    SchedulerCaller(caller): SchedulerCaller,
+    State(config): State<github_auth::GitHubTrustConfig>,
     Json(switch): Json<stow_types::api::DispatchFreeze>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::DispatchFreeze>, GetArtifactError> {
+    let actor = github_auth::authorize_freeze_mutation(&caller, switch.enabled, &config.repo)
+        .map_err(|_| {
+            tracing::warn!(
+                %caller,
+                enabled = switch.enabled,
+                "mutation refused: caller outside dispatch-freeze policy"
+            );
+            GetArtifactError::Unauthorized
+        })?
+        .to_owned();
     let stored = scheduler_client::set_dispatch_freeze(&scheduler, switch.enabled, &actor).await?;
     tracing::warn!(enabled = stored.enabled, %caller, "dispatch freeze flipped via admin endpoint");
     Ok(Json(stored))
