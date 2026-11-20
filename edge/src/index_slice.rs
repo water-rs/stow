@@ -115,11 +115,22 @@ pub fn index_layer(manifest: &OciManifest) -> Result<&OciDescriptor, SliceError>
     Ok(layer)
 }
 
-/// Decompressed JSON the transcode reads before giving up — a bound on
-/// how much a hostile or corrupt blob can inflate inside one isolate's
-/// 128 MiB heap. At ~1 KB per row this still covers a slice orders of
-/// magnitude past any plausible pool size.
-const MAX_SLICE_JSON_LEN: u64 = 64 * 1024 * 1024;
+/// Decompressed JSON the transcode reads before giving up — matches
+/// `ArtifactIndex::decode`'s `4 GiB` bound (~2 million rows at the
+/// measured ~2,080 B/row slice density). Because chunks stream straight
+/// into the gzip encoder without buffering the uncompressed JSON, this
+/// bounds CPU/stream length rather than isolate heap.
+const MAX_SLICE_JSON_LEN: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Maximum compressed gzip output buffered inside a Worker isolate's
+/// `128 MiB` heap. A `255 MiB` JSON slice compresses to ~`22 MiB` of
+/// gzip; `64 MiB` leaves room for the input zstd blob and decoder state
+/// while stopping a non-compressible zstd bomb before isolate OOM.
+const MAX_SLICE_GZIP_LEN: usize = 64 * 1024 * 1024;
+
+/// Streaming chunk size between `ruzstd` and `GzEncoder` (`64 KiB`),
+/// keeping uncompressed JSON off the isolate heap.
+const TRANSCODE_CHUNK_LEN: usize = 64 * 1024;
 
 /// Turn the published zstd blob into the gzip body a non-zstd client
 /// gets. The `zstd` crate does not build for wasm32, so the worker's
@@ -129,25 +140,68 @@ const MAX_SLICE_JSON_LEN: u64 = 64 * 1024 * 1024;
 /// # Errors
 /// [`SliceError::Decompress`] when the blob is not a zstd frame or
 /// inflates past [`MAX_SLICE_JSON_LEN`], [`SliceError::Compress`] when
-/// gzip encoding fails.
+/// gzip encoding fails or exceeds [`MAX_SLICE_GZIP_LEN`].
 pub fn zstd_to_gzip(blob: &[u8]) -> Result<Vec<u8>, SliceError> {
-    let decoder = ruzstd::decoding::StreamingDecoder::new(blob)
-        .map_err(|error| SliceError::Decompress(error.to_string()))?;
-    let mut json = Vec::new();
-    decoder
-        .take(MAX_SLICE_JSON_LEN + 1)
-        .read_to_end(&mut json)
-        .map_err(|error| SliceError::Decompress(error.to_string()))?;
-    if json.len() as u64 > MAX_SLICE_JSON_LEN {
-        return Err(SliceError::Decompress(format!(
-            "slice inflates past the {MAX_SLICE_JSON_LEN}-byte transcode bound"
-        )));
+    zstd_to_gzip_bounded(blob, MAX_SLICE_JSON_LEN, MAX_SLICE_GZIP_LEN)
+}
+
+fn zstd_to_gzip_bounded(
+    blob: &[u8],
+    max_json_len: u64,
+    max_gzip_len: usize,
+) -> Result<Vec<u8>, SliceError> {
+    struct BoundedVec {
+        bytes: Vec<u8>,
+        max_len: usize,
     }
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    std::io::Write::write_all(&mut encoder, &json)
-        .map_err(|error| SliceError::Compress(error.to_string()))?;
+
+    impl std::io::Write for BoundedVec {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.bytes.len().saturating_add(buf.len()) > self.max_len {
+                return Err(std::io::Error::other(format!(
+                    "gzip slice exceeds the {}-byte output bound",
+                    self.max_len
+                )));
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(blob)
+        .map_err(|error| SliceError::Decompress(error.to_string()))?;
+    let mut encoder = flate2::write::GzEncoder::new(
+        BoundedVec {
+            bytes: Vec::new(),
+            max_len: max_gzip_len,
+        },
+        flate2::Compression::default(),
+    );
+    let mut chunk = vec![0u8; TRANSCODE_CHUNK_LEN];
+    let mut inflated = 0u64;
+    loop {
+        let read = decoder
+            .read(&mut chunk)
+            .map_err(|error| SliceError::Decompress(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        inflated = inflated.saturating_add(read as u64);
+        if inflated > max_json_len {
+            return Err(SliceError::Decompress(format!(
+                "slice inflates past the {max_json_len}-byte transcode bound"
+            )));
+        }
+        std::io::Write::write_all(&mut encoder, &chunk[..read])
+            .map_err(|error| SliceError::Compress(error.to_string()))?;
+    }
     encoder
         .finish()
+        .map(|out| out.bytes)
         .map_err(|error| SliceError::Compress(error.to_string()))
 }
 
@@ -297,5 +351,30 @@ mod tests {
     #[test]
     fn garbage_input_is_a_decompress_error() {
         assert!(zstd_to_gzip(b"not a zstd frame").is_err());
+    }
+
+    #[test]
+    fn multi_chunk_zstd_stream_transcodes_and_enforces_bounds() {
+        let payload: Vec<u8> = (0..(TRANSCODE_CHUNK_LEN * 3 + 17))
+            .map(|idx| b"abcdefghijklmnopqrstuvwxyz"[idx % 26])
+            .collect();
+        let zstd = stow_shim::compress(&payload).expect("compress");
+
+        let gzip =
+            zstd_to_gzip_bounded(&zstd, payload.len() as u64, MAX_SLICE_GZIP_LEN).expect("fits");
+        let mut round_trip = Vec::new();
+        flate2::read::GzDecoder::new(&gzip[..])
+            .read_to_end(&mut round_trip)
+            .expect("gzip decodes");
+        assert_eq!(round_trip, payload);
+
+        let over_inflated =
+            zstd_to_gzip_bounded(&zstd, payload.len() as u64 - 1, MAX_SLICE_GZIP_LEN)
+                .expect_err("inflated bound exceeded");
+        assert!(matches!(over_inflated, SliceError::Decompress(_)));
+
+        let over_gzip = zstd_to_gzip_bounded(&zstd, payload.len() as u64, 16)
+            .expect_err("gzip output bound exceeded");
+        assert!(matches!(over_gzip, SliceError::Compress(_)));
     }
 }
