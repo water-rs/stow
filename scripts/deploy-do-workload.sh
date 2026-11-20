@@ -86,7 +86,7 @@ while :; do
   fi
   probe=$((probe + 1))
   next_ms=$((next_ms + interval_ms))
-  code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 10 --retry 2 \
+  code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 10 --retry 2 --retry-all-errors \
     "$STOW_EDGE_URL/api/v1/scheduler/status?deploy-do-workload=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$side-$probe")
   if [ "$code" != 200 ]; then
     echo "::error::DO workload probe $probe answered $code" >&2

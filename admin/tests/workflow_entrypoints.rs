@@ -1808,6 +1808,32 @@ fn watchdog_entry_points_pass_the_history_levels() {
     }
 }
 
+#[test]
+fn watchdog_resolves_release_toolchain_on_non_tag_runs() {
+    let wf = support::load_workflow("watchdog.yml");
+    let steps = support::job_steps(&wf, "watchdog");
+    let resolve = steps
+        .iter()
+        .find(|s| s.id.as_deref() == Some("toolchain"))
+        .expect("watchdog.yml must carry a toolchain resolution step");
+    let script = resolve.run.as_deref().expect("toolchain step runs shell");
+    assert!(
+        script.contains(r#"if [ "$REF_TYPE" = "tag" ]"#)
+            && script.contains("releases/latest")
+            && script.contains("commits/$tag"),
+        "non-tag watchdog runs must resolve a release tag's commit sha: {script}"
+    );
+    let pull = steps
+        .iter()
+        .find(|s| s.uses.as_deref() == Some("./.github/actions/stow-toolchain"))
+        .expect("stow-toolchain step");
+    assert_eq!(
+        pull.with.get("sha").map(String::as_str),
+        Some("${{ steps.toolchain.outputs.sha }}"),
+        "stow-toolchain must pull the resolved release commit"
+    );
+}
+
 // ===========================================================================
 // index-publish.yml (stow#1104)
 // ===========================================================================

@@ -419,13 +419,16 @@ fn pin_alias(crate_name: &str, version: &str) -> String {
 
 /// The seeded `Cargo.lock` for the generated wrapper package.
 ///
-/// Two `[[package]]` entries are always synthesized — the wrapper root,
-/// naming the task crate by its qualified registry identity, and the task
-/// crate itself with the `.crate` tarball checksum — so even a yanked task
-/// version resolves through the lock rather than the index, exactly as a
-/// real dependent's `cargo update`-generated lockfile allows.
+/// The wrapper root, the task crate (with the `.crate` tarball checksum, so
+/// even a yanked task version resolves through the lock rather than the
+/// index, exactly as a real dependent's `cargo update`-generated lockfile
+/// allows) and every node of the task's dependency subgraph are
+/// synthesized, with the edges the task names (`pinned_lock_packages`). A
+/// dependency's entry carries no checksum: the task does not carry one, and
+/// cargo fills it in from the registry on fetch.
 ///
-/// Under `preserve_lockfile` the crate's bundled lockfile supplies every
+/// Under `preserve_lockfile` the wrapper root and the task crate are the
+/// only synthesized entries, and the crate's bundled lockfile supplies every
 /// other entry: the pins `cargo install --locked` would honor seed the
 /// resolve verbatim (bundled dev-dependency entries survive in the file;
 /// cargo prunes what the wrapper graph cannot reach when it rewrites the
@@ -463,10 +466,131 @@ fn wrapper_lockfile(
     // package; in the wrapper graph it is a registry dependency, so its
     // entry is rewritten with source and checksum below.
     packages.retain(|package| !(is_lock_package(package, task) && package.get("source").is_none()));
-    packages.push(wrapper_lock_entry(task));
-    packages.push(task_lock_entry(task, crate_checksum));
+    if bundled_lockfile.is_some() {
+        packages.push(wrapper_lock_entry(task));
+        packages.push(task_lock_entry(task, crate_checksum));
+    } else {
+        packages.extend(pinned_lock_packages(task, crate_checksum));
+    }
     toml::to_string(&lock)
         .map_err(|error| stow_types::stow_error!("serialize generated Cargo.lock: {error}"))
+}
+
+/// One package of the generated lock: a registry node of the task's
+/// graph, keyed by name and version.
+type LockKey = (String, semver::Version);
+
+/// The wrapper's whole graph as lockfile entries: the wrapper root, the
+/// task crate and every subgraph node, each with the edges the task
+/// names. Cargo keeps a lockfile's resolution wherever the lock still
+/// satisfies the manifests, so a requirement wider than one semver series
+/// (`<0.8.40`, `>=0.7, <0.9`, `*`) stays on the series the task's
+/// consumer resolved it to instead of moving to the newest match, which
+/// the exact `=version` pins in the manifest can only add beside, never
+/// steer.
+///
+/// A node reached on both sides, or at several feature sets, is one
+/// package: the lock knows name and version, not identity. Dependencies
+/// are spelled as cargo spells them — `name` while the lock holds one
+/// version of it, `name version` once it holds several — and every
+/// package sits in cargo's order, so a fetch leaves the file as written.
+fn pinned_lock_packages(task: &BuildTaskPayload, crate_checksum: &str) -> Vec<toml::Value> {
+    let subgraph = &task.dependency_subgraph;
+    let key = |name: &stow_types::identity::CrateName,
+               version: &stow_types::identity::CrateVersion|
+     -> LockKey { (name.as_str().to_owned(), version.as_semver().clone()) };
+    let task_key = key(&task.crate_name, &task.version);
+    let mut edges: BTreeMap<LockKey, BTreeSet<LockKey>> = BTreeMap::new();
+    let node_key = |index: u32| {
+        let node = &subgraph.nodes[index as usize];
+        key(&node.crate_name, &node.version)
+    };
+    edges
+        .entry(task_key.clone())
+        .or_default()
+        .extend(subgraph.root_deps.iter().map(|&index| node_key(index)));
+    for (index, node) in subgraph.nodes.iter().enumerate() {
+        let dependencies = node.deps.iter().map(|&dep| node_key(dep));
+        let index = u32::try_from(index).expect("subgraph indexes fit u32 on the wire");
+        edges
+            .entry(node_key(index))
+            .or_default()
+            .extend(dependencies);
+    }
+    let mut versions_of_name: BTreeMap<&str, usize> = BTreeMap::new();
+    for (name, _) in edges.keys() {
+        *versions_of_name.entry(name.as_str()).or_default() += 1;
+    }
+    let spell = |(name, version): &LockKey| {
+        if versions_of_name.get(name.as_str()) == Some(&1) {
+            name.clone()
+        } else {
+            format!("{name} {version}")
+        }
+    };
+    let mut root = toml::Table::new();
+    root.insert(
+        "name".to_owned(),
+        toml::Value::String(WRAPPER_PACKAGE_NAME.to_owned()),
+    );
+    root.insert(
+        "version".to_owned(),
+        toml::Value::String("0.0.0".to_owned()),
+    );
+    root.insert(
+        "dependencies".to_owned(),
+        toml::Value::Array(
+            edges
+                .keys()
+                .map(|key| toml::Value::String(spell(key)))
+                .collect(),
+        ),
+    );
+    let mut packages = vec![toml::Value::Table(root)];
+    for (package_key, dependencies) in &edges {
+        let (name, version) = package_key;
+        let mut package = toml::Table::new();
+        package.insert("name".to_owned(), toml::Value::String(name.clone()));
+        package.insert(
+            "version".to_owned(),
+            toml::Value::String(version.to_string()),
+        );
+        package.insert(
+            "source".to_owned(),
+            toml::Value::String(REGISTRY_SOURCE.to_owned()),
+        );
+        if *package_key == task_key {
+            package.insert(
+                "checksum".to_owned(),
+                toml::Value::String(crate_checksum.to_owned()),
+            );
+        }
+        if !dependencies.is_empty() {
+            package.insert(
+                "dependencies".to_owned(),
+                toml::Value::Array(
+                    dependencies
+                        .iter()
+                        .map(|key| toml::Value::String(spell(key)))
+                        .collect(),
+                ),
+            );
+        }
+        packages.push(toml::Value::Table(package));
+    }
+    // Cargo orders packages by name, then version.
+    packages.sort_by(|a, b| {
+        let id = |package: &toml::Value| {
+            (
+                package["name"].as_str().unwrap_or_default().to_owned(),
+                package["version"]
+                    .as_str()
+                    .and_then(|version| semver::Version::parse(version).ok()),
+            )
+        };
+        id(a).cmp(&id(b))
+    });
+    packages
 }
 
 /// Whether a `[[package]]` lockfile entry names the task crate.
@@ -3817,14 +3941,82 @@ mod tests {
         let wrapper = lockfile_package(&lockfile, "stow-ci-wrapper").expect("wrapper root entry");
         assert_eq!(
             wrapper["dependencies"].as_array().map(Vec::as_slice),
-            Some(
-                [toml::Value::String(
-                    "itoa 1.0.15 (registry+https://github.com/rust-lang/crates.io-index)"
-                        .to_owned(),
-                )]
-                .as_slice()
-            ),
-            "the wrapper root names the task crate by its qualified registry identity"
+            Some([toml::Value::String("itoa".to_owned())].as_slice()),
+            "the wrapper root names the task crate as cargo spells a name the lock holds once"
+        );
+    }
+
+    /// stow#1604: every subgraph node is a locked package with the edges
+    /// the task names, spelled as cargo spells them: a bare name while
+    /// the lock holds one version of it, `name version` once it holds
+    /// two.
+    #[test]
+    fn wrapper_lockfile_pins_every_subgraph_node_with_its_edges() {
+        let mut task = task_with_features(&["default"]);
+        let node = |name: &str, version: &str, deps: Vec<u32>| SubgraphNode {
+            crate_name: CrateName::parse(name).expect("crate name"),
+            version: CrateVersion::new(semver::Version::parse(version).expect("version")),
+            features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
+            host_side: false,
+            keys_apart: false,
+            deps,
+            profile: stow_types::node_profile::NodeProfile::Dev,
+        };
+        task.dependency_subgraph = TaskSubgraph {
+            root_deps: vec![0, 1],
+            nodes: vec![
+                node("syn", "1.0.109", vec![2]),
+                node("syn", "2.0.106", vec![2]),
+                node("quote", "1.0.40", Vec::new()),
+            ],
+        };
+        let lockfile: toml::Table =
+            toml::from_str(&wrapper_lockfile(&task, &"ab".repeat(32), None).expect("seed lock"))
+                .expect("seed lockfile parses");
+        let strings = |package: &toml::Table| -> Vec<String> {
+            package["dependencies"]
+                .as_array()
+                .expect("dependencies")
+                .iter()
+                .map(|dependency| dependency.as_str().expect("string").to_owned())
+                .collect()
+        };
+
+        let packages = lockfile["package"].as_array().expect("packages");
+        let names: Vec<_> = packages
+            .iter()
+            .map(|package| {
+                let package = package.as_table().expect("table");
+                format!(
+                    "{} {}",
+                    package["name"].as_str().expect("name"),
+                    package["version"].as_str().expect("version")
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "itoa 1.0.15",
+                "quote 1.0.40",
+                "stow-ci-wrapper 0.0.0",
+                "syn 1.0.109",
+                "syn 2.0.106"
+            ],
+            "every node is one package, in cargo's order"
+        );
+        let itoa = lockfile_package(&lockfile, "itoa").expect("task entry");
+        assert_eq!(strings(itoa), ["syn 1.0.109", "syn 2.0.106"]);
+        let quote = lockfile_package(&lockfile, "quote").expect("quote entry");
+        assert_eq!(
+            quote["source"].as_str(),
+            Some("registry+https://github.com/rust-lang/crates.io-index")
+        );
+        assert!(quote.get("dependencies").is_none());
+        let wrapper = lockfile_package(&lockfile, "stow-ci-wrapper").expect("wrapper entry");
+        assert_eq!(
+            strings(wrapper),
+            ["itoa", "quote", "syn 1.0.109", "syn 2.0.106"]
         );
     }
 

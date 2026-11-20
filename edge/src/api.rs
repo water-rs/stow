@@ -88,18 +88,11 @@ impl<P: github_auth::MutationPolicy> Extractor for Mutator<P> {
     }
 }
 
-/// Operator-only routes: the freeze switch, queue mutations, the store
-/// reset and the mock-only budget probe.
+/// Operator-only routes: queue mutations, the store reset and the
+/// mock-only budget probe.
 pub struct OperatorRoute;
 impl github_auth::MutationPolicy for OperatorRoute {
     const WORKFLOWS: &'static [&'static str] = &[OPERATIONS_WORKFLOW];
-}
-
-/// `dispatch-freeze`: an operator's switch plus the watchdog, whose trip
-/// engages it before it disables the dispatching workflows.
-pub struct FreezeRoute;
-impl github_auth::MutationPolicy for FreezeRoute {
-    const WORKFLOWS: &'static [&'static str] = &[OPERATIONS_WORKFLOW, "watchdog.yml"];
 }
 
 /// `tasks/submit`: operator submits plus the scheduled and dispatched
@@ -345,10 +338,21 @@ pub async fn get_dispatch_freeze(
 /// The manual transition that is also the freeze's only recovery path —
 /// clearing it resumes dispatch of everything that queued meanwhile.
 pub async fn set_dispatch_freeze(
-    Mutator { caller, actor, .. }: Mutator<FreezeRoute>,
+    SchedulerCaller(caller): SchedulerCaller,
+    State(config): State<github_auth::GitHubTrustConfig>,
     Json(switch): Json<stow_types::api::DispatchFreeze>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::DispatchFreeze>, GetArtifactError> {
+    let actor = github_auth::authorize_freeze_mutation(&caller, switch.enabled, &config.repo)
+        .map_err(|_| {
+            tracing::warn!(
+                %caller,
+                enabled = switch.enabled,
+                "mutation refused: caller outside dispatch-freeze policy"
+            );
+            GetArtifactError::Unauthorized
+        })?
+        .to_owned();
     let stored = scheduler_client::set_dispatch_freeze(&scheduler, switch.enabled, &actor).await?;
     tracing::warn!(enabled = stored.enabled, %caller, "dispatch freeze flipped via admin endpoint");
     Ok(Json(stored))
@@ -430,6 +434,34 @@ pub async fn set_release_priority(
 ) -> Result<Json<stow_types::api::ReleasePriority>, GetArtifactError> {
     let stored = scheduler_client::set_release_priority(&scheduler, &set, &actor).await?;
     tracing::warn!(percent = stored.percent, %caller, "release priority set via admin endpoint");
+    Ok(Json(stored))
+}
+
+/// GET /api/v1/admin/min-cli-version
+///
+/// The oldest CLI whose miss and inexact-hit reports the scheduler
+/// queues — the operator setting behind it when `stow-admin
+/// min-cli-version set` wrote one (stow#1605).
+pub async fn get_min_cli_version(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::MinCliVersion>, GetArtifactError> {
+    Ok(Json(
+        scheduler_client::get_min_cli_version(&scheduler).await?,
+    ))
+}
+
+/// POST /api/v1/admin/min-cli-version
+///
+/// The operator's `set` — the minimum CLI version in force until the
+/// next `set`.
+pub async fn set_min_cli_version(
+    Mutator { caller, actor, .. }: Mutator<OperatorRoute>,
+    Json(set): Json<stow_types::api::MinCliVersionSet>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::MinCliVersion>, GetArtifactError> {
+    let stored = scheduler_client::set_min_cli_version(&scheduler, &set, &actor).await?;
+    tracing::warn!(version = %stored.version, %caller, "minimum CLI version set via admin endpoint");
     Ok(Json(stored))
 }
 
@@ -1673,6 +1705,7 @@ pub async fn enqueue_admitted_task(
     State(admission): State<PowAdmission>,
     State(analytics): State<AnalyticsEngineDataset>,
     consent: stats::AnalyticsConsent,
+    user_agent: scheduler_client::UserAgent,
 ) -> Result<Response, GetArtifactError> {
     verify_enqueue_ticket(&ticket, &admission)?;
     // A client builds for whatever host it runs on, and plenty of those are
@@ -1715,7 +1748,16 @@ pub async fn enqueue_admitted_task(
     // The ticket is verified: the miss enters the scheduler's CLI
     // entry point directly (stow#886) — a failed send is the request's
     // own error, not a row a drain would retry.
-    match scheduler_client::send_enqueue(&scheduler, std::slice::from_ref(&ticket.tree)).await {
+    // The caller's own `User-Agent` rides to the scheduler, whose
+    // producer check refuses a CLI below the operator's minimum version
+    // and a caller naming none (stow#1605).
+    match scheduler_client::send_enqueue(
+        &scheduler,
+        std::slice::from_ref(&ticket.tree),
+        user_agent.0.as_deref(),
+    )
+    .await
+    {
         Ok(unpublished_ids) => {
             // The merge's born-published check is the coverage verdict:
             // one Analytics Engine point per node it found unpublished.

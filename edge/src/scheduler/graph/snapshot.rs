@@ -307,6 +307,10 @@ struct SnapshotHead {
     /// until the first `set`, when the default applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     release_priority: Option<stow_types::api::ReleasePrioritySetting>,
+    /// The operator's minimum-CLI-version setting (stow#1605) — `None`
+    /// until the first `set`, when the default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_cli_version: Option<stow_types::api::MinCliVersionSetting>,
     external_runs: Vec<(u64, u8)>,
     /// The generation of the index each reported slice last applied,
     /// by target and rustc id.
@@ -907,6 +911,7 @@ impl Graph {
             dispatch_rate: self.dispatch_rate.clone(),
             recent_claims: self.recent_claims.iter().copied().collect(),
             release_priority: self.release_priority.clone(),
+            min_cli_version: self.min_cli_version.clone(),
             external_runs: self.external_runs.iter().map(|(&k, &v)| (k, v)).collect(),
             slice_generations: self
                 .slice_generations
@@ -1214,6 +1219,7 @@ impl SnapshotLoader {
         graph.dispatch_rate = head.dispatch_rate;
         graph.recent_claims = head.recent_claims.into();
         graph.release_priority = head.release_priority;
+        graph.min_cli_version = head.min_cli_version;
         graph.external_runs = head.external_runs.into_iter().collect();
         graph.slice_generations = head.slice_generations.into_iter().collect();
         graph.human_budget = head.human_budget;

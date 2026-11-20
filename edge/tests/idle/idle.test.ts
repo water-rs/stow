@@ -45,6 +45,8 @@ const DO = "https://scheduler.invalid";
 
 type Env2 = typeof env & Record<string, string>;
 
+declare const RELEASE_TAG: string;
+
 // The submission wire (`SubmissionTree`): every node once, `deps` and
 // `roots` as indexes into `nodes`. The scheduler merges by task id,
 // re-derives it from the node's columns and refuses any other id, so a
@@ -121,10 +123,18 @@ async function reset(stub: DurableObjectStub) {
 	return res.json();
 }
 
+// The anonymous submit lane is the stow CLI's: the object refuses a
+// caller that does not identify as a CLI of at least the minimum version
+// (stow#1605). The suite names itself the CLI of the workspace version —
+// `RELEASE_TAG` is `v` and that version (vitest.config.ts).
+const CLI_AGENT = {
+	"user-agent": `stow-cli/${RELEASE_TAG.slice(1)} (linux)`,
+};
+
 async function submit(stub: DurableObjectStub, requests: unknown[]) {
 	const res = await stub.fetch(`${DO}/tasks/submit`, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: { "content-type": "application/json", ...CLI_AGENT },
 		body: JSON.stringify(requests),
 	});
 	return { status: res.status, body: await res.json() };
@@ -275,6 +285,36 @@ describe("scheduler idle proof (stow#593)", () => {
 		const report = await reset(stub);
 		expect(report).toBeTruthy();
 		await expectQuiescent(stub, {});
+	});
+
+	// stow#1605: the anonymous submit lane admits only a CLI of at least
+	// the minimum version, the deploy's or the operator's.
+	it("the producer check refuses an unidentified or outdated CLI and an operator set moves it", async () => {
+		const stub = await freshStub();
+		await reset(stub);
+		const post = (headers: Record<string, string>) =>
+			stub.fetch(`${DO}/tasks/submit`, {
+				method: "POST",
+				headers: { "content-type": "application/json", ...headers },
+				body: JSON.stringify([enqueue("idle-producer")]),
+			});
+		const set = (version: string) =>
+			stub.fetch(`${DO}/min-cli-version`, {
+				method: "POST",
+				headers: { "content-type": "application/json", ...ACTOR },
+				body: JSON.stringify({ version }),
+			});
+
+		expect((await post({})).status).toBe(426);
+		expect((await post({ "user-agent": "curl/8.4.0" })).status).toBe(426);
+
+		expect((await set("99.0.0")).status).toBe(200);
+		const outdated = await post(CLI_AGENT);
+		expect(outdated.status).toBe(426);
+		expect(await outdated.text()).toContain("update stow to 99.0.0");
+
+		expect((await set("0.0.0")).status).toBe(200);
+		expect((await post(CLI_AGENT)).status).toBe(200);
 	});
 
 	it("completed work: a drained queue also stops waking", async () => {

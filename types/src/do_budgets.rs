@@ -615,6 +615,23 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
+        name: "GET /min-cli-version",
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
+        wall_ms: 300,
+    },
+    DriveBudget {
+        // stow#1605 provisional: one `MinCliVersion` append and no
+        // dispatch pass — priced as `POST /release-priority`, which has
+        // the same shape.
+        name: "POST /min-cli-version",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 400,
+    },
+    DriveBudget {
         // stow#1501: the `memory_line` row, read once per isolate (the
         // cold read priced here), and no wake: measured 1 statement,
         // 0 rows read (no row before a set), 0 written.

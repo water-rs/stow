@@ -42,6 +42,13 @@ pub const PREHEAT_PRIORITY: i64 = 10;
 /// The inexact-hit report — a hundredth of the CLI's priority.
 pub const INEXACT_PRIORITY: i64 = 1;
 
+/// Default for the operator's `min-cli-version set`: the oldest CLI
+/// whose miss and inexact-hit reports the scheduler queues. 0.21.7 is
+/// the first CLI that stops minting registry nodes over path and git
+/// packages (stow#1566, stow#1597); the trees older CLIs submit carry
+/// such nodes, which no build can reproduce.
+pub const DEFAULT_MIN_CLI_VERSION: semver::Version = semver::Version::new(0, 21, 7);
+
 /// The scale a profile's weight is a share of: the dev profile ranks at
 /// the whole scale, so a rank is `priority × weight × waited` with the
 /// weight a whole number of hundredths (stow#1012).

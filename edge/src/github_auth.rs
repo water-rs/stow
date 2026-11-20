@@ -80,6 +80,15 @@ pub fn release_ref() -> String {
 /// operator's mutation to another.
 pub const OPERATIONS_WORKFLOW: &str = "operations.yml";
 
+/// The external incident watchdog workflow, whose trip engages the
+/// dispatch freeze before disabling the dispatching workflows.
+pub const WATCHDOG_WORKFLOW: &str = "watchdog.yml";
+
+/// Trunk branch refs on which GitHub's `schedule` clock executes
+/// [`WATCHDOG_WORKFLOW`] (`dev` until single-trunk retirement, `main`
+/// after). Topic branches and pull request merge refs never appear here.
+const WATCHDOG_SCHEDULE_REFS: &[&str] = &["refs/heads/main", "refs/heads/dev"];
+
 /// Which workflows' runs may call a mutating route (stow#955). Each
 /// route names its own policy type, so the set it admits is fixed where
 /// the route is mounted; only a GitHub Actions OIDC identity of one of
@@ -160,6 +169,50 @@ pub fn authorize_mutation<'a>(
         return Err(AuthError::Unauthorized);
     }
     if run_attempt != "1" {
+        return Err(AuthError::Unauthorized);
+    }
+    Ok(actor)
+}
+
+/// Gate `POST /api/v1/admin/dispatch-freeze`:
+/// - [`OPERATIONS_WORKFLOW`] at [`release_ref`] may both engage and clear;
+/// - [`WATCHDOG_WORKFLOW`] may only *engage* (`enabled == true`), at
+///   [`release_ref`] (Cron Trigger dispatch) or one of
+///   [`WATCHDOG_SCHEDULE_REFS`] (GitHub's `schedule` clock), never clear.
+///
+/// # Errors
+/// [`AuthError::Unauthorized`] for any caller, ref, workflow or re-run
+/// attempt outside that policy.
+pub fn authorize_freeze_mutation<'a>(
+    caller: &'a TrustedCaller,
+    enabled: bool,
+    repo: &str,
+) -> Result<&'a str, AuthError> {
+    if let Ok(actor) = authorize_mutation(caller, &[OPERATIONS_WORKFLOW], repo) {
+        return Ok(actor);
+    }
+    if !enabled {
+        return Err(AuthError::Unauthorized);
+    }
+    let TrustedCaller::Actions {
+        job_workflow_ref,
+        workflow_ref,
+        run_attempt,
+        git_ref,
+        actor,
+        ..
+    } = caller
+    else {
+        return Err(AuthError::Unauthorized);
+    };
+    let release_ref = release_ref();
+    let ref_ok = *git_ref == release_ref || WATCHDOG_SCHEDULE_REFS.contains(&git_ref.as_str());
+    let expected = format!("{repo}/.github/workflows/{WATCHDOG_WORKFLOW}@{git_ref}");
+    if !ref_ok
+        || job_workflow_ref != workflow_ref
+        || *workflow_ref != expected
+        || run_attempt != "1"
+    {
         return Err(AuthError::Unauthorized);
     }
     Ok(actor)
@@ -1489,6 +1542,44 @@ mod tests {
                 Err(AuthError::Unauthorized)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn freeze_mutation_admits_scheduled_watchdog_engage_only_on_trunk_or_release() {
+        let release = release_ref();
+        for git_ref in [release.as_str(), "refs/heads/main", "refs/heads/dev"] {
+            let caller = oidc_caller(&workflow_claims("watchdog.yml", git_ref)).await;
+            assert_eq!(
+                authorize_freeze_mutation(&caller, true, "water-rs/stow").expect("engage admitted"),
+                "octo-dispatcher"
+            );
+            assert!(
+                matches!(
+                    authorize_freeze_mutation(&caller, false, "water-rs/stow"),
+                    Err(AuthError::Unauthorized)
+                ),
+                "watchdog must never clear the freeze ({git_ref})"
+            );
+        }
+
+        for bad_ref in [
+            "refs/heads/feature",
+            "refs/tags/v0.0.1",
+            "refs/pull/1/merge",
+        ] {
+            let caller = oidc_caller(&workflow_claims("watchdog.yml", bad_ref)).await;
+            assert!(
+                matches!(
+                    authorize_freeze_mutation(&caller, true, "water-rs/stow"),
+                    Err(AuthError::Unauthorized)
+                ),
+                "{bad_ref} must not engage"
+            );
+        }
+
+        let ops = oidc_caller(&workflow_claims("operations.yml", &release)).await;
+        assert!(authorize_freeze_mutation(&ops, true, "water-rs/stow").is_ok());
+        assert!(authorize_freeze_mutation(&ops, false, "water-rs/stow").is_ok());
     }
 
     /// An Actions token missing a claim the gate judges is refused at
