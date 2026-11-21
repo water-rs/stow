@@ -2096,7 +2096,7 @@ async fn record_published_index(
     actor: Actor,
     Json(report): Json<stow_types::api::PublishedRunReport>,
 ) -> Result<Json<OkResponse>> {
-    published_index_pass(&graph, &env, &db, &alarm, &report.slices, &actor.0).await?;
+    published_index_pass(&graph, &env, &db, &alarm, report.slices, &actor.0).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -2110,7 +2110,7 @@ pub(super) async fn published_index_pass(
     env: &WasmEnv,
     db: &DurableDb,
     alarm: &Alarm,
-    slices: &[stow_types::api::PublishedSlice],
+    slices: Vec<stow_types::api::PublishedSlice>,
     actor: &str,
 ) -> Result<Vec<String>> {
     binding_settings(env)?;

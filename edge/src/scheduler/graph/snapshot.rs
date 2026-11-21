@@ -1089,8 +1089,10 @@ impl SnapshotLoader {
         graph: &mut Graph,
         (slice, generation, parts, part, rows): StagedItem,
     ) -> Result<(), QueueError> {
+        let base_generation = rows.is_empty().then_some(generation - 1);
         if part == 0 {
             let staged = StagedSlice {
+                base_generation,
                 generation,
                 parts,
                 rows: vec![rows],
@@ -1105,7 +1107,8 @@ impl SnapshotLoader {
         let staged = graph.staged_slices.get_mut(&slice).ok_or_else(|| {
             QueueError::Invariant(format!("staged part {part} of unknown slice {slice:?}"))
         })?;
-        if staged.generation != generation
+        if staged.base_generation != base_generation
+            || staged.generation != generation
             || staged.parts != parts
             || staged.rows.len() != part as usize
         {

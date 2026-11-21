@@ -720,20 +720,21 @@ pub(super) async fn demand(
 }
 
 /// `POST /index/published`: one `SliceReport` event per slice (or per
-/// part of a multi-part full report) in the body, committed in ONE
-/// append (stow#940); each apply flips its matched dependency edges,
-/// and a multi-part report applies with its last part only.
+/// part of a multi-part report) in the body, committed in ONE append
+/// (stow#940); each apply flips its matched dependency edges, a
+/// multi-part full report applies with its last part, and a multi-part
+/// delta streams its rows per part and advances the generation with its
+/// last.
 ///
 /// # Errors
 /// `QueueError::SliceReportConflict` when a delta does not extend its
-/// slice's live generation or lands on a staged report, or a part
-/// does not continue its staged report, `QueueError::Invariant` on a
-/// slice named twice or contradictory part metadata,
-/// `QueueError::Sql` on a failed append.
+/// slice's live generation or a later part does not continue its staged
+/// report, `QueueError::Invariant` on a slice named twice or
+/// contradictory part metadata, `QueueError::Sql` on a failed append.
 pub(super) async fn slice_reports(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
-    slices: &[stow_types::api::PublishedSlice],
+    slices: Vec<stow_types::api::PublishedSlice>,
     actor: Option<&str>,
     now: i64,
 ) -> Result<(), QueueError> {
@@ -747,6 +748,20 @@ pub(super) async fn slice_reports(
                     slice.target, slice.rustc_version
                 )));
             }
+            if slice.parts > 1 && slice.base_generation.is_none() {
+                if !slice.retired.is_empty() {
+                    return Err(QueueError::Invariant(format!(
+                        "multi-part full slice report {}/{} carries retired rows",
+                        slice.target, slice.rustc_version
+                    )));
+                }
+                if slice.added.is_empty() {
+                    return Err(QueueError::Invariant(format!(
+                        "multi-part full slice report {}/{} part {} is empty",
+                        slice.target, slice.rustc_version, slice.part
+                    )));
+                }
+            }
             graph.check_slice_report(
                 slice.target.as_str(),
                 slice.rustc_version.as_str(),
@@ -758,16 +773,16 @@ pub(super) async fn slice_reports(
         })
     })?;
     let events: Vec<SchedulerEvent> = slices
-        .iter()
+        .into_iter()
         .map(|slice| SchedulerEvent::SliceReport {
-            target: slice.target.clone(),
-            rustc_version: slice.rustc_version.clone(),
+            target: slice.target,
+            rustc_version: slice.rustc_version,
             base_generation: slice.base_generation,
             generation: slice.generation,
             part: slice.part,
             parts: slice.parts,
-            added: slice.added.clone(),
-            retired: slice.retired.clone(),
+            added: slice.added,
+            retired: slice.retired,
         })
         .collect();
     commit_as(graph, db, actor, &events, now).await
@@ -1665,7 +1680,7 @@ mod eviction_tests {
         slice_reports(
             live,
             &db,
-            &[slice(fixture::full_slice_report())],
+            vec![slice(fixture::full_slice_report())],
             None,
             HOST_NOW_MS,
         )
@@ -1679,7 +1694,7 @@ mod eviction_tests {
         );
         assert_eq!(live.with(|graph| graph.published_overlay_len()), 0);
         // The report that follows drops every member; none is in memory.
-        slice_reports(live, &db, &[slice(Vec::new())], None, HOST_NOW_MS)
+        slice_reports(live, &db, vec![slice(Vec::new())], None, HOST_NOW_MS)
             .await
             .expect("empty full report");
         assert_eq!(
@@ -2101,7 +2116,7 @@ mod inline_dispatch_tests {
             retired: Vec::new(),
         };
         let before = log_rows(&db).await;
-        let error = slice_reports(cell, &db, &[slice(Some(4), 5)], None, HOST_NOW_MS)
+        let error = slice_reports(cell, &db, vec![slice(Some(4), 5)], None, HOST_NOW_MS)
             .await
             .expect_err("a delta on an unreported slice");
         assert!(
@@ -2113,10 +2128,10 @@ mod inline_dispatch_tests {
             before,
             "a refused report appends nothing"
         );
-        slice_reports(cell, &db, &[slice(None, 4)], None, HOST_NOW_MS)
+        slice_reports(cell, &db, vec![slice(None, 4)], None, HOST_NOW_MS)
             .await
             .expect("a full report");
-        slice_reports(cell, &db, &[slice(Some(4), 5)], None, HOST_NOW_MS)
+        slice_reports(cell, &db, vec![slice(Some(4), 5)], None, HOST_NOW_MS)
             .await
             .expect("the next delta");
         let woken_owner = wake(&db).await;
@@ -2214,11 +2229,11 @@ mod inline_dispatch_tests {
                 .expect("loaded")
                 .with(|g| g.staged_part_count())
         };
-        for (at, body) in bodies.iter().enumerate() {
+        for (at, body) in bodies.into_iter().enumerate() {
             slice_reports(
                 owner.loaded().expect("loaded"),
                 &db,
-                &body.slices,
+                body.slices,
                 None,
                 HOST_NOW_MS,
             )
@@ -2261,6 +2276,139 @@ mod inline_dispatch_tests {
             assert_eq!(generation(&woken, at), Some(generation_at), "slice {at}");
         }
         assert_eq!(staged(&woken), 0);
+    }
+
+    fn delta_test_slice(
+        target: &str,
+        rustc: &str,
+        base_generation: Option<i64>,
+        generation: i64,
+        parts: (u32, u32),
+        added: std::ops::Range<usize>,
+        retired: std::ops::Range<usize>,
+    ) -> stow_types::api::PublishedSlice {
+        use stow_types::api::PublishedSliceRow;
+        use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+
+        let row = |i: usize| PublishedSliceRow {
+            crate_name: format!("delta-crate-{i:05}").parse().expect("crate"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: stow_types::identity::FeaturesJson::default(),
+            unit_shape: UnitShape {
+                side: UnitSide::Host,
+                invocation: UnitInvocation::Native,
+                kind: UnitKind::Linked,
+            },
+            dependency_identity: format!("{:064x}", 900_000 + i).parse().expect("digest"),
+            node_profile: stow_types::node_profile::NodeProfile::Dev,
+        };
+        stow_types::api::PublishedSlice {
+            target: target.parse().expect("target"),
+            rustc_version: rustc.parse().expect("rustc"),
+            base_generation,
+            generation,
+            part: parts.0,
+            parts: parts.1,
+            added: added.map(row).collect(),
+            retired: retired.map(row).collect(),
+        }
+    }
+
+    /// stow#1614: a delta over `SLICE_REPORT_PART_BYTES` supersedes an
+    /// incomplete staged full report (persisted across a snapshot),
+    /// reads its retired rows from the `published` table on each part,
+    /// survives a mid-delta snapshot without retaining row vectors in
+    /// `staged_slices`, and advances the generation with its last part.
+    #[tokio::test]
+    async fn a_multi_part_delta_supersedes_staged_full_and_lands_in_parts() {
+        use stow_types::api::{
+            PublishedRunReport, REQUEST_BODY_LIMIT_BYTES, SLICE_REPORT_PART_BYTES,
+        };
+
+        const RUSTC: &str = "1.100.0";
+        let target = stow_types::api::CI_TARGET_TRIPLES[4];
+        let (db, mut owner) = seeded().await;
+        let base = delta_test_slice(target, RUSTC, None, 292, (0, 1), 0..20, 0..0);
+        slice_reports(
+            owner.loaded().expect("loaded"),
+            &db,
+            vec![base],
+            None,
+            HOST_NOW_MS,
+        )
+        .await
+        .expect("base 292");
+        snapshot(owner.loaded().expect("loaded"), &db, HOST_NOW_MS)
+            .await
+            .expect("flush base to published table");
+
+        let part0 = delta_test_slice(target, RUSTC, None, 293, (0, 4), 20..60, 0..0);
+        slice_reports(
+            owner.loaded().expect("loaded"),
+            &db,
+            vec![part0],
+            None,
+            HOST_NOW_MS,
+        )
+        .await
+        .expect("stage interrupted full part 0");
+        snapshot(owner.loaded().expect("loaded"), &db, HOST_NOW_MS)
+            .await
+            .expect("snapshot staged full part 0");
+        owner = wake(&db).await;
+        assert_eq!(
+            owner
+                .loaded()
+                .expect("loaded")
+                .with(|g| g.staged_part_count()),
+            1
+        );
+
+        let delta = delta_test_slice(target, RUSTC, Some(292), 293, (0, 1), 100..4_100, 0..10);
+        assert!(serde_json::to_vec(&delta).expect("encode").len() > SLICE_REPORT_PART_BYTES);
+        let bodies = PublishedRunReport::into_bodies(
+            vec![delta],
+            SLICE_REPORT_PART_BYTES,
+            REQUEST_BODY_LIMIT_BYTES,
+        )
+        .expect("split delta");
+        assert!(bodies.len() > 1);
+        for (at, body) in bodies.into_iter().enumerate() {
+            slice_reports(
+                owner.loaded().expect("loaded"),
+                &db,
+                body.slices,
+                None,
+                HOST_NOW_MS,
+            )
+            .await
+            .expect("delta part");
+            if at == 0 {
+                assert_eq!(
+                    owner
+                        .loaded()
+                        .expect("loaded")
+                        .with(|g| g.slice_generation(target, RUSTC)),
+                    Some(292)
+                );
+                snapshot(owner.loaded().expect("loaded"), &db, HOST_NOW_MS)
+                    .await
+                    .expect("snapshot mid-delta");
+                owner = wake(&db).await;
+            }
+        }
+        let generation = |c: &GraphCell| {
+            c.loaded()
+                .expect("loaded")
+                .with(|g| g.slice_generation(target, RUSTC))
+        };
+        let staged = |c: &GraphCell| c.loaded().expect("loaded").with(|g| g.staged_part_count());
+        assert_eq!((generation(&owner), staged(&owner)), (Some(293), 0));
+        snapshot(owner.loaded().expect("loaded"), &db, HOST_NOW_MS)
+            .await
+            .expect("final snapshot");
+        let woken = wake(&db).await;
+        assert_eq!((generation(&woken), staged(&woken)), (Some(293), 0));
     }
 
     /// A bounded claim is a prefix of the unbounded claim — the bound

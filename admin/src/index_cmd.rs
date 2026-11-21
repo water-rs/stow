@@ -1333,10 +1333,10 @@ const REPORT_PATH: &str = "/api/v1/admin/index/published";
 /// `Err` covers a slice that cannot split and build/auth failures.
 async fn post_report_unchecked(
     edge: &Edge,
-    slices: &[stow_types::api::PublishedSlice],
+    slices: Vec<stow_types::api::PublishedSlice>,
 ) -> stow_types::error::Result<std::result::Result<(), zenwave::Error>> {
     let bodies = stow_types::api::PublishedRunReport::into_bodies(
-        slices.to_vec(),
+        slices,
         stow_types::api::SLICE_REPORT_PART_BYTES,
         stow_types::api::REQUEST_BODY_LIMIT_BYTES,
     )?;
@@ -1364,17 +1364,26 @@ async fn post_report_unchecked(
 /// route.
 async fn post_report(
     edge: &Edge,
-    slices: &[stow_types::api::PublishedSlice],
+    slices: Vec<stow_types::api::PublishedSlice>,
 ) -> stow_types::error::Result<()> {
     post_report_unchecked(edge, slices)
         .await?
         .map_err(|error| stow_error!("POST {}{REPORT_PATH}: {error}", edge.base()))
 }
 
+fn report_summary_of(slices: &[stow_types::api::PublishedSlice]) -> IndexReportSummary {
+    IndexReportSummary {
+        slices: slices.len(),
+        added: slices.iter().map(|slice| slice.added.len()).sum(),
+        retired: slices.iter().map(|slice| slice.retired.len()).sum(),
+        full: !slices.is_empty() && slices.iter().all(|slice| slice.base_generation.is_none()),
+    }
+}
+
 /// `stow-admin index report` - post every slice the run published to
 /// the edge admin route (stow#940), so the scheduler applies a run's
 /// slices in one append and one dispatch pass when they fit one body,
-/// and a full membership in parts when they do not.
+/// and in bounded parts when they do not.
 /// Each slice's set is the servable subset of its export: a row whose
 /// measured glibc floor exceeds the builder baseline publishes in the
 /// index but a baseline host cannot load it, so it releases no
@@ -1388,10 +1397,22 @@ async fn index_report<H: SliceHistory>(
     for file in &args.file {
         slices.extend(slice_report_for(file, args.full).await?);
     }
+    let has_delta = slices.iter().any(|slice| slice.base_generation.is_some());
+    let reported: Vec<(TargetTriple, WireRustcVersion, i64)> = slices
+        .iter()
+        .map(|slice| {
+            (
+                slice.target.clone(),
+                slice.rustc_version.clone(),
+                slice.generation,
+            )
+        })
+        .collect();
+    let mut summary = report_summary_of(&slices);
     let outcome = if slices.is_empty() {
         Ok(())
     } else {
-        post_report_unchecked(edge, &slices).await?
+        post_report_unchecked(edge, slices).await?
     };
     match outcome {
         Ok(()) => {}
@@ -1402,16 +1423,15 @@ async fn index_report<H: SliceHistory>(
         // report is an error.
         Err(zenwave::Error::Http {
             status, message, ..
-        }) if status == zenwave::StatusCode::CONFLICT
-            && slices.iter().any(|slice| slice.base_generation.is_some()) =>
-        {
+        }) if status == zenwave::StatusCode::CONFLICT && has_delta => {
             tracing::warn!(
                 answer = %message,
                 "slice report refused - replaying each slice from the generation the scheduler holds"
             );
-            slices = recover_reported(edge, &slices, connect).await?;
-            if !slices.is_empty() {
-                post_report(edge, &slices)
+            let replayed = recover_reported(edge, &reported, connect).await?;
+            summary = report_summary_of(&replayed);
+            if !replayed.is_empty() {
+                post_report(edge, replayed)
                     .await
                     .map_err(|error| error.wrap_err("replayed slice report"))?;
             }
@@ -1420,12 +1440,6 @@ async fn index_report<H: SliceHistory>(
             return Err(stow_error!("POST {}{REPORT_PATH}: {error}", edge.base()));
         }
     }
-    let summary = IndexReportSummary {
-        slices: slices.len(),
-        added: slices.iter().map(|slice| slice.added.len()).sum(),
-        retired: slices.iter().map(|slice| slice.retired.len()).sum(),
-        full: !slices.is_empty() && slices.iter().all(|slice| slice.base_generation.is_none()),
-    };
     tracing::info!(
         slices = summary.slices,
         added = summary.added,
@@ -1499,7 +1513,7 @@ fn delta_slice(
         .into_iter()
         .filter(|row| !current.contains(&row_key(row)))
         .collect();
-    let delta = stow_types::api::PublishedSlice {
+    Ok(stow_types::api::PublishedSlice {
         target: index.header.target.clone(),
         rustc_version: index.header.rustc_version.clone(),
         base_generation: Some(prev.header.generation),
@@ -1508,37 +1522,22 @@ fn delta_slice(
         parts: 1,
         added,
         retired,
-    };
-    // A delta is one scheduler log row and cannot split: one that
-    // outgrows a part (a long gap between publishes) is reported as the
-    // slice's full membership, which does.
-    if stow_types::api::json_len(&delta)? > stow_types::api::SLICE_REPORT_PART_BYTES {
-        return Ok(full_slice_of(index, rows));
-    }
-    Ok(delta)
+    })
 }
 
 /// The explicit full report of a slice: its whole servable membership,
 /// which the scheduler takes as the slice's set.
 fn full_slice(index: &ArtifactIndex) -> stow_types::error::Result<stow_types::api::PublishedSlice> {
-    Ok(full_slice_of(index, semantic_rows(index)?))
-}
-
-/// [`full_slice`] over `index`'s already computed servable rows.
-fn full_slice_of(
-    index: &ArtifactIndex,
-    rows: Vec<PublishedSliceRow>,
-) -> stow_types::api::PublishedSlice {
-    stow_types::api::PublishedSlice {
+    Ok(stow_types::api::PublishedSlice {
         target: index.header.target.clone(),
         rustc_version: index.header.rustc_version.clone(),
         base_generation: None,
         generation: index.header.generation,
         part: 0,
         parts: 1,
-        added: rows,
+        added: semantic_rows(index)?,
         retired: Vec::new(),
-    }
+    })
 }
 
 /// What the scheduler holds of one slice, from `GET /api/v1/admin/status`.
@@ -1546,7 +1545,7 @@ fn full_slice_of(
 struct HeldSlice {
     /// The generation it last applied.
     generation: i64,
-    /// The generation of a multi-part full report it holds staged.
+    /// The generation of a multi-part report it holds staged.
     staged: Option<i64>,
 }
 
@@ -1577,15 +1576,16 @@ async fn held_slices(
 /// holds, so a report it never received is replayed: the walk follows
 /// `live`'s `previous` links back to the manifest at the held
 /// generation, and each later manifest is reported as the delta from
-/// its predecessor — the report its own publish run sent or lost. The
-/// cost is the rows that moved since the held generation, never the
-/// slice's size. A full report is sent only where no base exists: the
-/// scheduler holds nothing of the slice (a reset, or a slice it was
-/// never reported), it holds a full report staged (which refuses every
-/// delta until a full one lands), or the walk reaches a generation-1
-/// manifest — a first or `full` publish, whose own report was full —
-/// before the held generation, and the replay starts from its full
-/// report.
+/// its predecessor — the report its own publish run sent or lost. Part 0
+/// of the first replayed delta supersedes any incomplete staged report
+/// on that slice, so the cost is always the rows that moved since the
+/// held generation, never the slice's size. A full report is sent only
+/// where no base exists: the scheduler holds nothing of the slice (a
+/// reset, or a slice it was never reported), an incomplete full resync
+/// is staged at the live generation itself, or the walk reaches a
+/// generation-1 manifest — a first or `full` publish, whose own report
+/// was full — before the held generation, and the replay starts from
+/// its full report.
 ///
 /// # Errors
 /// When a manifest above the held generation links no predecessor, or
@@ -1602,8 +1602,11 @@ async fn recovery_reports(
         Some(held) if held.staged.is_none() && held.generation == live_generation => {
             return Ok(Vec::new());
         }
-        Some(held) if held.staged.is_none() => held.generation,
-        _ => return full_slice(&live.index).map(|full| vec![full]),
+        None => return full_slice(&live.index).map(|full| vec![full]),
+        Some(held) if held.generation == live_generation => {
+            return full_slice(&live.index).map(|full| vec![full]);
+        }
+        Some(held) => held.generation,
     };
     let target = live.index.header.target.clone();
     let rustc_version = live.index.header.rustc_version.clone();
@@ -1658,40 +1661,27 @@ async fn recovery_reports(
 /// the generation the run reported — the run published it.
 async fn recover_reported<H: SliceHistory>(
     edge: &Edge,
-    slices: &[stow_types::api::PublishedSlice],
+    slices: &[(TargetTriple, WireRustcVersion, i64)],
     connect: ConnectHistory<'_, H>,
 ) -> stow_types::error::Result<Vec<stow_types::api::PublishedSlice>> {
     let held = held_slices(edge).await?;
     let mut histories: BTreeMap<WireRustcVersion, H> = BTreeMap::new();
     let mut reports = Vec::new();
-    for slice in slices {
-        if !histories.contains_key(&slice.rustc_version) {
-            histories.insert(
-                slice.rustc_version.clone(),
-                connect(slice.rustc_version.clone()).await?,
-            );
+    for (target, rustc_version, generation) in slices {
+        if !histories.contains_key(rustc_version) {
+            histories.insert(rustc_version.clone(), connect(rustc_version.clone()).await?);
         }
-        let history = &histories[&slice.rustc_version];
-        let live = history
-            .live(&slice.target, &slice.rustc_version)
-            .await?
-            .ok_or_else(|| {
-                stow_error!(
-                    "{}/{}: the reported slice has no published index",
-                    slice.target,
-                    slice.rustc_version
-                )
-            })?;
-        if live.index.header.generation != slice.generation {
+        let history = &histories[rustc_version];
+        let live = history.live(target, rustc_version).await?.ok_or_else(|| {
+            stow_error!("{target}/{rustc_version}: the reported slice has no published index")
+        })?;
+        if live.index.header.generation != *generation {
             return Err(stow_error!(
-                "{}/{}: the live index is generation {}, not the reported {}",
-                slice.target,
-                slice.rustc_version,
+                "{target}/{rustc_version}: the live index is generation {}, not the reported {generation}",
                 live.index.header.generation,
-                slice.generation
             ));
         }
-        let key = (slice.target.clone(), slice.rustc_version.clone());
+        let key = (target.clone(), rustc_version.clone());
         reports.extend(recovery_reports(history, live, held.get(&key).copied()).await?);
     }
     Ok(reports)
@@ -1776,7 +1766,7 @@ async fn reconcile(
         "replayed the published slices the scheduler does not hold at their live generation"
     );
     if !reports.is_empty() {
-        post_report(edge, &reports)
+        post_report(edge, reports)
             .await
             .map_err(|error| error.wrap_err("reconcile slice report"))?;
     }
@@ -3602,12 +3592,30 @@ mod tests {
             replay(Some(held(4))),
             [] as [stow_types::api::PublishedSlice; 0]
         );
-        // No base: a scheduler holding nothing, or a staged full report
-        // that refuses every delta, takes the live slice in full.
+        // An interrupted staged report behind the live generation
+        // recovers by replaying the delta from the held generation —
+        // part 0 supersedes the staged state instead of re-sending the
+        // whole slice (stow#1614).
+        let interrupted = replay(Some(HeldSlice {
+            generation: 3,
+            staged: Some(4),
+        }));
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(
+            (interrupted[0].base_generation, interrupted[0].generation),
+            (Some(3), 4)
+        );
+        assert_eq!(
+            (interrupted[0].added.len(), interrupted[0].retired.len()),
+            (1, 0)
+        );
+        // No base — a scheduler holding nothing, or an incomplete full
+        // resync staged at the live generation itself — takes the live
+        // slice in full.
         for no_base in [
             None,
             Some(HeldSlice {
-                generation: 3,
+                generation: 4,
                 staged: Some(4),
             }),
         ] {
@@ -3616,6 +3624,39 @@ mod tests {
             assert_eq!((full[0].base_generation, full[0].generation), (None, 4));
             assert_eq!(full[0].added.len(), 3);
         }
+    }
+
+    /// stow#1614: a delta over `SLICE_REPORT_PART_BYTES` stays a delta
+    /// rather than degrading into a full slice report.
+    #[test]
+    fn a_delta_over_one_part_stays_a_delta() {
+        let base_rows: Vec<_> = (0..10).map(|i| row(&format!("base-{i:04}"))).collect();
+        let mut next_rows = base_rows.clone();
+        next_rows.extend((0..3_500).map(|i| row(&format!("added-crate-{i:05}"))));
+        let prev = prev_index(base_rows, 292);
+        let live = prev_index(next_rows, 293);
+        let delta = delta_slice(&prev, &live).expect("delta");
+        assert!(
+            stow_types::api::json_len(&delta).expect("len")
+                > stow_types::api::SLICE_REPORT_PART_BYTES,
+            "fixture delta exceeds one part"
+        );
+        assert_eq!(delta.base_generation, Some(292));
+        assert_eq!(delta.generation, 293);
+        assert_eq!(delta.added.len(), 3_500);
+        let bodies = stow_types::api::PublishedRunReport::into_bodies(
+            vec![delta],
+            stow_types::api::SLICE_REPORT_PART_BYTES,
+            stow_types::api::REQUEST_BODY_LIMIT_BYTES,
+        )
+        .expect("split bodies");
+        assert!(bodies.len() > 1);
+        assert!(
+            bodies
+                .iter()
+                .flat_map(|body| &body.slices)
+                .all(|part| part.base_generation == Some(292))
+        );
     }
 
     /// A `full` publish restamps generation 1 and links the manifest it
