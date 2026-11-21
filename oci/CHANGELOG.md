@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.10](https://github.com/water-rs/stow/compare/oci/v0.21.9...oci/v0.21.10) - 2026-11-21
+
+### Other
+
+- *(oci)* inline records signatures and share empty bundle config (stow#1627)
+
 ## [0.21.6](https://github.com/water-rs/stow/compare/oci/v0.21.5...oci/v0.21.6) - 2026-11-17
 
 ### Fixed

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.10](https://github.com/water-rs/stow/compare/v0.21.9...v0.21.10) - 2026-11-21
+
+### Added
+
+- *(cli)* add stow setup --no-build-dir and interactive skill install (stow#1637)
+
+### Fixed
+
+- *(cli)* evaluate stow-resolver lockfile synthesis in stow predict (stow#1630)
+- *(cli)* move mirror prefetch to daemon and cache pinned resolver seed (stow#1631)
+
+### Other
+
+- Merge pull request #1633 from water-rs/fix/async-prefetch-warm-resolver-1631
+
 ## [0.21.9](https://github.com/water-rs/stow/compare/v0.21.8...v0.21.9) - 2026-11-21
 
 ### Other
