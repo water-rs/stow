@@ -14,6 +14,59 @@ pub fn state_db_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(STATE_DB_FILE_NAME)
 }
 
+/// Whether a top-level file name in `cache_dir` belongs to the SQLite state
+/// database (`state-v3.sqlite3` and its WAL / shared-memory sidecars).
+#[must_use]
+pub fn is_state_db_file(name: &str) -> bool {
+    matches!(
+        name,
+        "state-v3.sqlite3" | "state-v3.sqlite3-wal" | "state-v3.sqlite3-shm"
+    )
+}
+
+/// Delete `state-v3.sqlite3` and its WAL/SHM sidecars without opening SQLite,
+/// used when `stow clean` recovers a state database created under a different
+/// schema version.
+pub async fn remove_state_db_files(cache_dir: &Path) -> stow_types::error::Result<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let path = cache_dir.join(format!("{STATE_DB_FILE_NAME}{suffix}"));
+        match async_fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).wrap_err_with(|| format!("remove {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Clear every cached-artifact, C/C++ object, build-dir, materialized-output,
+/// negative-cache and lockfile-graph row while keeping `crate_stats`,
+/// `metadata_values`, `circuit_state` and `link_resolution_cache` intact.
+pub async fn clear_cached_entries(pool: &SqlitePool) -> stow_types::error::Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .wrap_err("begin state database clean transaction")?;
+    for statement in [
+        "DELETE FROM artifact_cache_entries",
+        "DELETE FROM cc_cache_entries",
+        "DELETE FROM build_directories",
+        "DELETE FROM materialized_outputs",
+        "DELETE FROM negative_cache_entries",
+        "DELETE FROM lockfile_graph_cache",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut *tx)
+            .await
+            .wrap_err_with(|| format!("execute `{statement}`"))?;
+    }
+    tx.commit()
+        .await
+        .wrap_err("commit state database clean transaction")
+}
+
 /// The process's one handle on the state database.
 ///
 /// The command entry point creates it, every config the process loads
