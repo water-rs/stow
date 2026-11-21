@@ -388,21 +388,44 @@ against rate limits or a private mirror.
 
 ## GitHub Actions
 
-The composite action at the repository root installs the pinned
-`stow-cli` release for the runner's target and exports the wrapper
-environment for the whole job, so an unchanged `cargo test` step is
-accelerated:
+Two composite actions ship in this repository:
 
-```yaml
-- uses: water-rs/stow@main
-- run: cargo test
-```
+- **`water-rs/stow@main` (recommended default — public + local cache):** installs
+  the pinned `stow-cli` release for the runner's target, fetches the verified
+  signed index slice for the active toolchain, and wires the wrapper environment
+  for the whole job so an unchanged `cargo test` streams prebuilt dependencies
+  from the public cache:
+
+  ```yaml
+  - uses: water-rs/stow@main
+  - run: cargo test
+  ```
+
+- **`water-rs/stow/local@main` (local cache only — `[cache] remote = false`):**
+  writes `remote = false` into the runner's stow `config.toml` before running
+  `stow setup`, so no request is made to `stow.waterui.dev` or GHCR and nothing
+  about the dependency graph leaves the runner. Cold runs lose public prebuilt
+  acceleration; pair with `actions/cache` on `~/.stow` only when repository
+  policy forbids remote cache access:
+
+  ```yaml
+  - uses: actions/cache@v4
+    with:
+      path: ~/.stow
+      key: stow-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+      restore-keys: stow-${{ runner.os }}-
+  - uses: water-rs/stow/local@main
+  - run: cargo test
+  ```
+
+Inputs (`water-rs/stow@main` accepts all three; `water-rs/stow/local@main`
+accepts `version` only):
 
 | Input | Default | Purpose |
 |---|---|---|
 | `version` | `latest` | `stow-cli` release to install — `latest` (the newest stable release that already carries its archives), a bare version (`1.2.3`), or the full `v1.2.3` tag. |
-| `edge-url` | `https://stow.waterui.dev` | Edge worker URL, exported as `STOW_EDGE_URL`. |
-| `verify-mode` | `github-ci` | Signature verification mode, exported as `STOW_VERIFY_MODE`. `mock-key` additionally needs `STOW_MOCK_PUBLIC_KEY_PATH` in the job environment. |
+| `edge-url` | `https://stow.waterui.dev` | Edge worker URL, exported as `STOW_EDGE_URL` (`water-rs/stow@main` only). |
+| `verify-mode` | `github-ci` | Signature verification mode, exported as `STOW_VERIFY_MODE` (`water-rs/stow@main` only). `mock-key` additionally needs `STOW_MOCK_PUBLIC_KEY_PATH` in the job environment. |
 
 The action downloads `stow-cli-<target>.tar.xz` (`.zip` on Windows) and
 its `.sha256` from the `v<version>` GitHub Release, verifies

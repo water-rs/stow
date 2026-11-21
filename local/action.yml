@@ -1,0 +1,36 @@
+name: stow (local cache only)
+description: >-
+  Install the pinned stow-cli release with `[cache] remote = false` and wire
+  the rustc/cc cache wrappers for local-only caching without remote lookups or
+  miss reports. Prefer `water-rs/stow@main` whenever the public cache is allowed.
+inputs:
+  version:
+    description: >-
+      stow-cli release to install: `latest` or a version matching the
+      `v<version>` release tag (a bare `<version>` also works).
+    required: false
+    default: latest
+runs:
+  using: composite
+  steps:
+    - name: Install stow-cli (local cache only)
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RUNNER_OS: ${{ runner.os }}
+        RUNNER_ARCH: ${{ runner.arch }}
+        STOW_VERSION: ${{ inputs.version }}
+        STOW_LOCAL_ONLY: "1"
+      run: bash "${{ github.action_path }}/../.github/action-scripts/install.sh"
+
+    - name: Install stow-cli (local cache only)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RUNNER_OS: ${{ runner.os }}
+        RUNNER_ARCH: ${{ runner.arch }}
+        STOW_VERSION: ${{ inputs.version }}
+        STOW_LOCAL_ONLY: "1"
+      run: '& "${{ github.action_path }}\..\.github\action-scripts\install.ps1"'
