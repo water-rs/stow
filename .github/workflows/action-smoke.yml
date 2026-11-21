@@ -127,8 +127,8 @@ jobs:
           cargo check
           exe="$(cargo test --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "smoke_it") | .executable')"
           [ -f "$exe" ]
-          case "$exe" in
-            */target/*|*'\\target\\'*) ;;
+          case "${exe//\\//}" in
+            */target/*) ;;
             *)
               echo "::error::expected test binary inside target/, got: $exe" >&2
               exit 1
