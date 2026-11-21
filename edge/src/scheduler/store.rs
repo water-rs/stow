@@ -44,8 +44,8 @@ use stow_types::api::{
 
 use super::graph::{
     ChunkSpan, Digest, Digests, Fetched, FreshDigest, Graph, GraphCell, IdKey, Meter,
-    PublishedNeeds, PublishedRow, SNAPSHOT_SPAN_ROWS, STATEMENT_ROWS, SnapshotLoader, SnapshotPlan,
-    SpanEncoder, ValidatedSubmission, slice_column, utc_day,
+    PublishedNeeds, PublishedRow, SNAPSHOT_EPOCH_SHIFT, SNAPSHOT_SPAN_ROWS, STATEMENT_ROWS,
+    SnapshotLoader, SnapshotPlan, SpanEncoder, ValidatedSubmission, slice_column, utc_day,
 };
 use crate::errors::QueueError;
 
@@ -315,18 +315,56 @@ pub async fn log_page(
         .collect()
 }
 
-/// The snapshot watermark — the highest `seq` the current snapshot
-/// covers (`0` before the first snapshot).
+#[derive(skyzen::FromRow)]
+struct SnapshotMetaRow {
+    key: String,
+    value: i64,
+}
+
+const fn epoch_bounds(epoch: i64) -> (i64, i64) {
+    let base = epoch << SNAPSHOT_EPOCH_SHIFT;
+    (base, base + (1i64 << SNAPSHOT_EPOCH_SHIFT))
+}
+
+/// The committed snapshot `(watermark_seq, epoch)` (`(0, 0)` before the
+/// first snapshot).
 ///
 /// # Errors
-/// `QueueError::Sql` on a failed read.
-pub async fn watermark(db: &DurableDb) -> Result<i64, QueueError> {
-    let seq = db
-        .query("SELECT value FROM store_meta WHERE key = 'snapshot_seq'")
-        .fetch_scalar_optional::<i64>()
+/// `QueueError::Sql` on a failed read, `QueueError::Invariant` on an
+/// unknown epoch.
+pub(super) async fn snapshot_state(db: &DurableDb) -> Result<(i64, i64), QueueError> {
+    let rows = db
+        .query("SELECT key, value FROM store_meta WHERE key IN ('snapshot_seq', 'snapshot_epoch')")
+        .fetch_all::<SnapshotMetaRow>()
         .await
-        .map_err(|error| QueueError::Sql(format!("watermark: {error}")))?;
-    Ok(seq.unwrap_or(0))
+        .map_err(|error| QueueError::Sql(format!("snapshot meta: {error}")))?;
+    let mut seq = 0;
+    let mut epoch = 0;
+    for row in rows {
+        match row.key.as_str() {
+            "snapshot_seq" => seq = row.value,
+            "snapshot_epoch" if matches!(row.value, 0 | 1) => epoch = row.value,
+            "snapshot_epoch" => {
+                return Err(QueueError::Invariant(format!(
+                    "unknown snapshot_epoch {}",
+                    row.value
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok((seq, epoch))
+}
+
+async fn clear_epoch(db: &DurableDb, epoch: i64) -> Result<(), QueueError> {
+    let (lo, hi) = epoch_bounds(epoch);
+    db.query("DELETE FROM snapshot_chunks WHERE chunk >= ? AND chunk < ?")
+        .bind(lo)
+        .bind(hi)
+        .execute()
+        .await
+        .map_err(|error| QueueError::Sql(format!("snapshot clear: {error}")))?;
+    Ok(())
 }
 
 /// The `meter` table's one row — the checkpoint the day meter
@@ -497,22 +535,19 @@ pub async fn write_snapshot_parts(
     cell: &GraphCell,
     now_ms: i64,
 ) -> Result<i64, QueueError> {
+    let (_, cur_epoch) = snapshot_state(db).await?;
     let covered = db
         .query("SELECT COALESCE(MAX(seq), 0) FROM event_log")
         .fetch_scalar::<i64>()
         .await
         .map_err(|error| QueueError::Sql(format!("snapshot watermark: {error}")))?;
+    // A full (`all`) snapshot writes into the alternate epoch so an
+    // interrupted multi-statement write leaves `cur_epoch` intact.
+    let target_epoch = if plan.all { 1 - cur_epoch } else { cur_epoch };
+    let (epoch_base, _) = epoch_bounds(target_epoch);
     if plan.all {
-        db.query("DELETE FROM snapshot_chunks")
-            .execute()
-            .await
-            .map_err(|error| QueueError::Sql(format!("snapshot clear: {error}")))?;
+        clear_epoch(db, target_epoch).await?;
     }
-    // Rows upsert in batches — a statement's row count is what the
-    // store bills, and one multi-row UPSERT keeps a many-span plan a
-    // few statements instead of one per row. The buffer holds at most
-    // STATEMENT_ROWS payloads (~1 MiB): still one row at a time in
-    // flight, never a serialized graph.
     let mut pending: Vec<(i64, String)> = Vec::with_capacity(STATEMENT_ROWS);
     let mut stale: Vec<(i64, i64)> = Vec::new();
     for &span in &plan.spans {
@@ -525,29 +560,24 @@ pub async fn write_snapshot_parts(
                     span.lo_key()
                 )));
             }
-            pending.push((span.lo_key() + sub, payload));
+            pending.push((epoch_base + span.lo_key() + sub, payload));
             if pending.len() == STATEMENT_ROWS {
                 flush_upserts(db, &mut pending).await?;
             }
             sub += 1;
         }
-        // The span's emitted rows stay; anything past them is a stale
-        // sub-row of a longer previous encoding. Empty neighboring
-        // spans share a range, without deleting any newly emitted row.
-        let lo = span.lo_key() + sub;
+        let lo = epoch_base + span.lo_key() + sub;
+        let span_hi = epoch_base + span.hi_key();
         if let Some((_, hi)) = stale.last_mut()
             && *hi + 1 == lo
         {
-            *hi = span.hi_key();
+            *hi = span_hi;
         } else {
-            stale.push((lo, span.hi_key()));
+            stale.push((lo, span_hi));
         }
     }
     flush_upserts(db, &mut pending).await?;
     if !plan.all {
-        // A fixed pair of bindings per range stays independent of the
-        // dirty-set size. Storage-only awaits retain the input gate;
-        // the watermark cannot commit until every stale tail is gone.
         for (lo, hi) in stale {
             db.query("DELETE FROM snapshot_chunks WHERE chunk BETWEEN ? AND ?")
                 .bind(lo)
@@ -559,13 +589,17 @@ pub async fn write_snapshot_parts(
     }
     write_published_changes(db, published).await?;
     db.query(
-        "INSERT INTO store_meta(key, value) VALUES ('snapshot_seq', ?) \
+        "INSERT INTO store_meta(key, value) VALUES ('snapshot_seq', ?), ('snapshot_epoch', ?) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     )
     .bind(covered)
+    .bind(target_epoch)
     .execute()
     .await
     .map_err(|error| QueueError::Sql(format!("snapshot meta: {error}")))?;
+    if plan.all {
+        clear_epoch(db, cur_epoch).await?;
+    }
     // The row at the watermark stays: `seq` is a plain rowid, so an
     // emptied log would number the next append from 1 - under the
     // watermark, where a wake's tail read skips it. The tail read is
@@ -921,24 +955,26 @@ struct SnapshotRow {
 /// covered `seq` — and the snapshot watermark the log tail starts
 /// after.
 async fn load(db: &DurableDb, budget: u64) -> Result<(Graph, i64), QueueError> {
-    let seq = watermark(db).await?;
+    let (seq, epoch) = snapshot_state(db).await?;
+    let (epoch_base, epoch_end) = epoch_bounds(epoch);
     let mut loader = SnapshotLoader::new(budget);
-    let mut key = -1i64;
+    let mut key = epoch_base - 1;
     let limit = i64::try_from(STATEMENT_ROWS).expect("statement rows fit i64");
     loop {
         let batch = db
             .query(
-                "SELECT chunk, payload FROM snapshot_chunks WHERE chunk > ? \
-                 ORDER BY chunk LIMIT ?",
+                "SELECT chunk, payload FROM snapshot_chunks \
+                 WHERE chunk > ? AND chunk < ? ORDER BY chunk LIMIT ?",
             )
             .bind(key)
+            .bind(epoch_end)
             .bind(limit)
             .fetch_all::<SnapshotRow>()
             .await
             .map_err(|error| QueueError::Sql(format!("snapshot read: {error}")))?;
         let done = batch.len() < STATEMENT_ROWS;
         for row in batch {
-            loader.apply(row.chunk, &row.payload)?;
+            loader.apply(row.chunk - epoch_base, &row.payload)?;
             key = row.chunk;
         }
         if done {
@@ -2597,5 +2633,92 @@ mod tests {
                 "an attributed row decodes to the unattributed event"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_full_snapshot_preserves_the_committed_epoch() {
+        let db = test_db::memory_db().await.expect("db");
+        let mut graph = Graph::default();
+        commit_to(&db, &mut graph, &[], 0).await;
+        graph.merge(&chain(), 0).expect("merge");
+        let covered1 = write_snapshot(&db, &mut graph, &GraphCell::default(), NOW_MS)
+            .await
+            .expect("initial snapshot");
+
+        // Purge `a` so compaction marks `plan.all = true`, then fail mid-write
+        // after the meta row of the alternate epoch has already been flushed.
+        commit_to(
+            &db,
+            &mut graph,
+            &[
+                SchedulerEvent::Mutate {
+                    op: MutationKind::Cancel,
+                    task_ids: vec![id("a")],
+                },
+                SchedulerEvent::Mutate {
+                    op: MutationKind::Purge,
+                    task_ids: vec![id("a")],
+                },
+            ],
+            1_000,
+        )
+        .await;
+        graph.compact();
+        let plan = graph.snapshot_plan().expect("plan");
+        assert!(plan.all, "compaction requests a full snapshot");
+        let graph_ref = &graph;
+        let mut emitted = 0usize;
+        let err = write_snapshot_parts(
+            &db,
+            &plan,
+            |span, encoder| {
+                if emitted >= 2 {
+                    return Err(QueueError::Sql("simulated isolate OOM mid-snapshot".into()));
+                }
+                if encoder.is_none() {
+                    *encoder = Some(graph_ref.snapshot_encoder(span));
+                }
+                let next = encoder.as_mut().expect("encoder").next_row(graph_ref)?;
+                if next.is_some() {
+                    emitted += 1;
+                }
+                Ok(next)
+            },
+            |after, limit| graph_ref.published_page(after, limit),
+            &graph_ref.meter,
+            &GraphCell::default(),
+            NOW_MS + 1_000,
+        )
+        .await
+        .expect_err("simulated mid-snapshot failure must propagate");
+        assert!(err.to_string().contains("simulated isolate OOM"));
+        assert_eq!(
+            snapshot_state(&db).await.expect("snapshot state"),
+            (covered1, 0)
+        );
+
+        // Wake must recover cleanly from the untouched committed epoch and
+        // replay the post-watermark mutations, then succeed on a retry of
+        // the full snapshot across epochs.
+        let (mut restored, replayed) = restore(&db, u64::MAX)
+            .await
+            .expect("wake from untouched committed epoch");
+        assert_eq!(replayed, 2);
+        restored.adopt_test_store(&graph);
+        assert_eq!(restored.status(), graph.status());
+
+        let covered2 = write_snapshot(&db, &mut restored, &GraphCell::default(), NOW_MS + 2_000)
+            .await
+            .expect("retried full snapshot commits into alternate epoch");
+        assert!(covered2 > covered1);
+        assert_eq!(
+            snapshot_state(&db).await.expect("snapshot state"),
+            (covered2, 1)
+        );
+        let (reloaded, replayed2) = restore(&db, u64::MAX)
+            .await
+            .expect("wake from alternate epoch");
+        assert_eq!(replayed2, 0);
+        assert_eq!(reloaded.status(), restored.status());
     }
 }

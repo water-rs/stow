@@ -2851,7 +2851,7 @@ mod snapshot_trigger_tests {
     }
 
     async fn tail_bytes(db: &DurableDb) -> u64 {
-        let covered = store::watermark(db).await.expect("watermark");
+        let (covered, _) = store::snapshot_state(db).await.expect("watermark");
         db.query("SELECT COALESCE(SUM(LENGTH(event)), 0) FROM event_log WHERE seq > ?")
             .bind(covered)
             .fetch_scalar::<i64>()
