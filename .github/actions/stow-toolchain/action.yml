@@ -64,14 +64,33 @@ runs:
         esac
         repo="ghcr.io/water-rs/stow-toolchain"
         ref="${repo}:${TOOLCHAIN_SHA}-${key}"
+        with_ghcr_retry() {
+          local attempt=1 delay=1 err_file
+          err_file="$(mktemp)"
+          while true; do
+            if "$@" 2>"$err_file"; then
+              cat "$err_file" >&2
+              rm -f "$err_file"
+              return 0
+            fi
+            cat "$err_file" >&2
+            if [ "$attempt" -ge 6 ] || ! grep -Eiq 'toomanyrequests|429|502|503|504|i/o timeout|connection reset' "$err_file"; then
+              rm -f "$err_file"
+              return 1
+            fi
+            sleep "$((delay + RANDOM % 2))"
+            attempt=$((attempt + 1))
+            delay=$((delay * 2))
+          done
+        }
         echo "$GHCR_TOKEN" | oras login ghcr.io \
           --username "$GITHUB_ACTOR" --password-stdin
-        digest="$(oras manifest fetch --descriptor "$ref" | jq -r .digest)"
-        cosign verify "${repo}@${digest}" \
+        digest="$(with_ghcr_retry oras manifest fetch --descriptor "$ref" | jq -r .digest)"
+        with_ghcr_retry cosign verify "${repo}@${digest}" \
           --certificate-identity-regexp '^https://github\.com/water-rs/stow/\.github/workflows/toolchain-publish\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
           --certificate-github-workflow-sha "$TOOLCHAIN_SHA" \
           --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
-        oras pull "${repo}@${digest}" --output "$RUNNER_TEMP/stow-toolchain"
+        with_ghcr_retry oras pull "${repo}@${digest}" --output "$RUNNER_TEMP/stow-toolchain"
         bin_dir="$RUNNER_TEMP/stow-toolchain/bin"
         mkdir -p "$bin_dir"
         members=()

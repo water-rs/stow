@@ -93,15 +93,34 @@ jobs:
           tar -C target/release -czf stow-toolchain.tar.gz "${bins[@]}"
 
           ref="ghcr.io/water-rs/stow-toolchain:${GITHUB_SHA}-${PLATFORM_KEY}"
+          with_ghcr_retry() {
+            local attempt=1 delay=1 err_file
+            err_file="$(mktemp)"
+            while true; do
+              if "$@" 2>"$err_file"; then
+                cat "$err_file" >&2
+                rm -f "$err_file"
+                return 0
+              fi
+              cat "$err_file" >&2
+              if [ "$attempt" -ge 6 ] || ! grep -Eiq 'toomanyrequests|429|502|503|504|i/o timeout|connection reset' "$err_file"; then
+                rm -f "$err_file"
+                return 1
+              fi
+              sleep "$((delay + RANDOM % 2))"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
           echo "$GHCR_TOKEN" | oras login ghcr.io \
             --username "$GITHUB_ACTOR" --password-stdin
-          oras push "$ref" \
+          with_ghcr_retry oras push "$ref" \
             "stow-toolchain.tar.gz:application/vnd.oci.image.layer.v1.tar+gzip"
-          digest="$(oras manifest fetch --descriptor "$ref" | jq -r .digest)"
+          digest="$(with_ghcr_retry oras manifest fetch --descriptor "$ref" | jq -r .digest)"
           # Sign by digest: the signature attests these exact bytes came
           # from this workflow on this release tag — the identity the
           # consumer pins.
-          cosign sign --yes "ghcr.io/water-rs/stow-toolchain@${digest}"
+          with_ghcr_retry cosign sign --yes "ghcr.io/water-rs/stow-toolchain@${digest}"
           echo "published ${ref} digest ${digest}"
 
   # Deploys the edge from this release once every platform's toolchain is
