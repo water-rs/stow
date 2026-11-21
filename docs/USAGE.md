@@ -196,7 +196,10 @@ The output also includes recommended compatible upgrades — direct deps
 where a newer semver-compatible patch would push the dep into the cached
 set.
 
-`predict` runs the same local index analysis as `stow check`. A prediction
+`predict` runs the same local index analysis and `stow-resolver` lockfile
+synthesis as `stow check` (inside a temporary read-only workspace mirror, so
+nothing on disk is modified; pass `--no-stow-resolver` to evaluate the
+workspace's unmodified `Cargo.lock` instead). A prediction
 that cannot be computed — stow not configured, the registry unreachable,
 the lockfile unwalkable because the crates.io index or a git dependency
 is not in the local cargo cache yet — exits non-zero with the reason.

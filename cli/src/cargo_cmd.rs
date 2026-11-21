@@ -708,8 +708,15 @@ async fn analyze_for_prediction(
         write_stdout(&format!("{message}\n"))?;
         return Ok(None);
     }
+    let slices = index::SliceFetches::default();
+    if invocation.use_stow_resolver
+        && let Some(analysis) =
+            predict_with_stow_resolver(&config, &project, &invocation, &slices).await?
+    {
+        return Ok(Some(analysis));
+    }
     analyze_workspace_prediction(
-        AnalysisScope::of(&project, &index::SliceFetches::default()),
+        AnalysisScope::of(&project, &slices),
         project.facts.current_dir(),
         &project.facts.manifest_path,
         &config,
@@ -720,6 +727,47 @@ async fn analyze_for_prediction(
     .map_err(|error| {
         stow_types::stow_error!("{}", render_prediction_failure(&config, &error).trim_end())
     })
+}
+
+/// Evaluate `stow predict` against the same `stow-resolver` lockfile takeover
+/// `stow check`/`stow build` apply by default, inside an ephemeral read-only
+/// workspace mirror so neither the workspace nor `$STOW_CACHE_DIR/pinned-mirrors`
+/// is mutated (stow#1630).
+async fn predict_with_stow_resolver(
+    config: &StowConfig,
+    project: &ProjectContext,
+    invocation: &CargoInvocation,
+    slices: &index::SliceFetches,
+) -> stow_types::error::Result<Option<WorkspacePrediction>> {
+    let (slice, host_slice) = ensure_consumer_slices(config, &project.facts, slices)
+        .await
+        .map_err(|error| {
+            let error = stow_types::error::Error::from(error);
+            stow_types::stow_error!("{}", render_prediction_failure(config, &error).trim_end())
+        })?;
+    let Some(stow_lockfile_toml) =
+        synthesize_lockfile_from_slices(&project.facts, slice, host_slice).await?
+    else {
+        return Ok(None);
+    };
+    let mirror = create_workspace_mirror(&project.facts, &project.facts.workspace_root).await?;
+    async_fs::write(mirror.root().join("Cargo.lock"), &stow_lockfile_toml)
+        .await
+        .wrap_err("write synthesized lockfile into prediction mirror")?;
+    let mirror_project = build_mirror_project_facts(&project.facts, &mirror)?;
+    if !validate_pinned_lockfile(&mirror_project).await? {
+        return Ok(None);
+    }
+    let _ = invocation;
+    Ok(analyze_pinned_mirror(
+        config,
+        AnalysisScope {
+            project: &mirror_project,
+            env: &project.env,
+            slices,
+        },
+    )
+    .await)
 }
 
 #[derive(Debug, Clone)]
@@ -2763,16 +2811,21 @@ async fn synthesize_lockfile(
 ) -> stow_types::error::Result<Option<String>> {
     // The resolver needs a cached slice to pin against — read it first,
     // so a cold cache skips the manifest walk entirely (stow#608).
-    let (slice, host_slice) = {
-        let (slice, host_slice, _) = cached_consumer_slices(config, project)
-            .instrument(tracing::debug_span!("stow.precargo.cached_slices"))
-            .await?;
-        (slice, host_slice)
-    };
+    let (slice, host_slice, _) = cached_consumer_slices(config, project)
+        .instrument(tracing::debug_span!("stow.precargo.cached_slices"))
+        .await?;
     let Some(slice) = slice else {
         tracing::info!("no cached index slice; nothing for the resolver to pin to");
         return Ok(None);
     };
+    synthesize_lockfile_from_slices(project, slice, host_slice).await
+}
+
+async fn synthesize_lockfile_from_slices(
+    project: &ProjectFacts,
+    slice: index::IndexSlice,
+    host_slice: Option<index::IndexSlice>,
+) -> stow_types::error::Result<Option<String>> {
     let direct = collect_user_direct_dependencies(
         &project.manifest_path,
         &project.workspace_root,
@@ -6652,5 +6705,32 @@ mod tests {
             &manifests_v2,
         );
         assert_ne!(digest_v1, digest_manifest_changed);
+    }
+
+    #[tokio::test]
+    async fn synthesize_lockfile_from_slices_pins_covered_direct_dependency_for_predict() {
+        let ws = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            ws.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nitoa = \"1.0\"\n",
+        )
+        .expect("write manifest");
+        std::fs::create_dir_all(ws.path().join("src")).expect("src");
+        std::fs::write(ws.path().join("src/main.rs"), "fn main() {}\n").expect("main");
+
+        let facts = ProjectFacts {
+            action: "predict".to_owned(),
+            workspace_root: ws.path().to_path_buf(),
+            current_dir: ws.path().to_path_buf(),
+            manifest_path: ws.path().join("Cargo.toml"),
+            ..project_facts()
+        };
+        let slice = slice_for(vec![index_row("itoa", "1.0.18")]);
+        let lock = super::synthesize_lockfile_from_slices(&facts, slice, None)
+            .await
+            .expect("synthesize")
+            .expect("pinned lockfile");
+        assert!(lock.contains("name = \"itoa\"") && lock.contains("version = \"1.0.18\""));
+        assert!(!ws.path().join("Cargo.lock").exists());
     }
 }

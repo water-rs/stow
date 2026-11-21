@@ -36,9 +36,9 @@ irm https://stow.waterui.dev/install.ps1 | iex
 ## 2. Running Builds and Maximizing Hit Rate
 
 - **After `stow setup`:** ordinary `cargo check`, `cargo build`, and `cargo test` automatically route through the per-user `stow` daemon.
-- **Driver commands (with or without `stow setup`):** `stow check`, `stow build`, and `stow test` accept Cargo flags (`--release`, `--manifest-path`, `--target`, `-p`, `--bin`), prefetch covered bundles ahead of Cargo, confine build scripts/proc-macros under `heel`, and fall back to plain Cargo if the toolchain is unsupported (e.g. nightly) or the edge is unreachable.
+- **Driver commands (with or without `stow setup`):** `stow check`, `stow build`, and `stow test` accept Cargo flags (`--release`, `--manifest-path`, `--target`, `-p`, `--bin`), synthesize a cache-pinned `Cargo.lock` in a persistent per-workspace mirror, warm covered bundles asynchronously inside the daemon while Cargo runs, confine build scripts/proc-macros under `heel`, and fall back to plain Cargo if the toolchain is unsupported (e.g. nightly) or the edge is unreachable.
 - **Non-interactive compatible upgrades:** the public cache builds the latest patch on each semver-compatible line. In agent sessions and CI, pass `--silent-compatible-upgrades` (`stow check --silent-compatible-upgrades`) so recommended patch upgrades apply in a workspace mirror without blocking on an interactive prompt. Pass `--no-stow-resolver` when Cargo must use the exact unmodified `Cargo.lock` without lockfile synthesis.
-- **Check coverage first (read-only, zero network posts):**
+- **Check coverage first (read-only, zero network posts, evaluates `stow-resolver` synthesis unless `--no-stow-resolver` is passed):**
   ```sh
   stow predict --manifest-path Cargo.toml
   ```
