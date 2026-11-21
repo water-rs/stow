@@ -102,12 +102,12 @@ const ISOLATE_MEMORY_BYTES: u64 = 128_000_000;
 
 /// Default for `STOW_SCHEDULER_SMALL_MEMORY_LINE`: the resident graph
 /// up to which a small submission goes straight in. It leaves the
-/// 110 MB to 128 MB of [`ISOLATE_MEMORY_BYTES`] for what the resident
-/// formula does not count: the transient memory of loading and
-/// admitting a batch, the JavaScript heap and allocator fragmentation
-/// (production held 15.6 MB of linear memory above the bytes its
-/// occupancy line accounted for, stow#1501).
-pub const DEFAULT_SMALL_MEMORY_LINE: u64 = ISOLATE_MEMORY_BYTES - 18_000_000;
+/// 85 MB to 128 MB of [`ISOLATE_MEMORY_BYTES`] for what the resident
+/// formula does not count: transient snapshot and batch buffers,
+/// unflushed `published` overlay changes, the JavaScript heap and
+/// allocator fragmentation (production reached 121.6 MB of linear
+/// memory at 105.4 MB resident, stow#1621).
+pub const DEFAULT_SMALL_MEMORY_LINE: u64 = ISOLATE_MEMORY_BYTES - 43_000_000;
 
 /// Default for `STOW_SCHEDULER_MEMORY_LINE`: the resident graph up to
 /// which any submission goes straight in, 10 MB under the
@@ -1139,8 +1139,8 @@ mod tests {
             "nothing to add goes in at any size"
         );
         let defaults = super::SchedulerSettings::default();
-        assert_eq!(defaults.memory_line_bytes, 100_000_000);
-        assert_eq!(defaults.small_memory_line_bytes, 110_000_000);
+        assert_eq!(defaults.memory_line_bytes, 75_000_000);
+        assert_eq!(defaults.small_memory_line_bytes, 85_000_000);
         assert_eq!(defaults.small_increment_bytes, 65_536);
     }
 

@@ -74,9 +74,19 @@ pub const STATEMENT_ROWS: usize = (1 << 20) / CHUNK_TEXT_BYTES;
 /// and distinct ranges own disjoint runs of `SNAPSHOT_SPAN_ROWS` keys.
 pub const SNAPSHOT_SPAN_ROWS: i64 = 1024;
 
+/// Bit above every `ChunkKind` key (`0..=8` at `<< 48`) that selects
+/// which of the two `snapshot_chunks` epochs a row belongs to, while
+/// keeping `(1 << 52) | raw_key` inside JavaScript's
+/// `Number.MAX_SAFE_INTEGER` (`2^53 - 1`).
+pub const SNAPSHOT_EPOCH_SHIFT: u32 = 52;
+
 const _: () = assert!(
     (u32::MAX as i64 + 1) * SNAPSHOT_SPAN_ROWS <= 1 << 48,
     "a span's keys must stay under the kind bits"
+);
+const _: () = assert!(
+    (1i64 << SNAPSHOT_EPOCH_SHIFT) | (9i64 << 48) < (1i64 << 53),
+    "epoch-prefixed snapshot keys must fit JS safe integers"
 );
 
 /// Interned strings per `intern` range: the dirty granularity of an

@@ -66,7 +66,8 @@ use sparse::SparseDemand;
 use vacant::VacantSlots;
 
 pub use snapshot::{
-    ChunkSpan, SNAPSHOT_SPAN_ROWS, STATEMENT_ROWS, SnapshotLoader, SnapshotPlan, SpanEncoder,
+    ChunkSpan, SNAPSHOT_EPOCH_SHIFT, SNAPSHOT_SPAN_ROWS, STATEMENT_ROWS, SnapshotLoader,
+    SnapshotPlan, SpanEncoder,
 };
 
 /// The edge's required-shape mask, derived exactly like
