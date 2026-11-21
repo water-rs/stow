@@ -176,13 +176,52 @@ impl CacheSwitchArgs {
     }
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillInstallPolicy {
+    PromptIfDetected,
+    Install,
+    Skip,
+}
+
+#[derive(Debug, Clone, Copy, Args, Default)]
+pub struct SkillSetupArgs {
+    /// Install the bundled `stow` agent skill into detected `~/.agents` /
+    /// `~/.claude` directories without prompting.
+    #[arg(long, conflicts_with = "no_install_skill")]
+    pub install_skill: bool,
+    /// Skip offering or installing the `stow` agent skill.
+    #[arg(long, conflicts_with = "install_skill")]
+    pub no_install_skill: bool,
+}
+
+impl SkillSetupArgs {
+    #[must_use]
+    pub const fn policy(self) -> SkillInstallPolicy {
+        if self.no_install_skill {
+            SkillInstallPolicy::Skip
+        } else if self.install_skill {
+            SkillInstallPolicy::Install
+        } else {
+            SkillInstallPolicy::PromptIfDetected
+        }
+    }
+}
+
+#[derive(Debug, Clone, Args, Default)]
 pub struct SetupArgs {
     /// Print the wrapper wiring as `KEY=VALUE` lines on stdout instead of
     /// writing the global cargo config, for CI systems that configure the
     /// job environment (`stow setup --github-env >> "$GITHUB_ENV"`).
     #[arg(long)]
     pub github_env: bool,
+    /// Leave Cargo's standard `target/` build directory untouched instead of
+    /// placing `build.build-dir` under `$STOW_CACHE_DIR/build-dir/` (removing
+    /// any previously stow-placed `build.build-dir`), for ephemeral CI
+    /// runners.
+    #[arg(long)]
+    pub no_build_dir: bool,
+    #[command(flatten)]
+    pub skill: SkillSetupArgs,
 }
 
 /// `stow stats`: print this install's own cache statistics — hits,

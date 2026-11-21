@@ -60,6 +60,7 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
     // placed the build directory (stow#1538).
     let build_dir = match user_build_dir(&cargo_home, &env)? {
         Some(user) => BuildDirPlacement::User(user),
+        None if args.no_build_dir => BuildDirPlacement::Disabled,
         None => BuildDirPlacement::Stow(stow_build_dir_template(&config::cache_dir(&env)?)?),
     };
     let (config_path, selects_mold) = write_cargo_config(
@@ -163,6 +164,7 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
         let task = register_daemon_task(&wrappers.runtime_executable).await?;
         write_stdout(&format!("scheduled task: {task}\n"))?;
     }
+    maybe_setup_stow_skill(&args).await?;
 
     Ok(())
 }
@@ -1248,6 +1250,118 @@ fn document_build_dir_is_stow(document: &DocumentMut) -> bool {
         .is_some_and(is_stow_build_dir)
 }
 
+const BUNDLED_STOW_SKILL: &str = include_str!("../skills/stow/SKILL.md");
+const DETECTED_AGENT_DIR_NAMES: [&str; 2] = [".agents", ".claude"];
+
+async fn maybe_setup_stow_skill(args: &SetupArgs) -> stow_types::error::Result<()> {
+    use crate::cli_args::SkillInstallPolicy;
+
+    let policy = args.skill.policy();
+    if policy == SkillInstallPolicy::Skip {
+        return Ok(());
+    }
+    let Some(home) = dirs::home_dir() else {
+        if policy == SkillInstallPolicy::Install {
+            return Err(stow_types::stow_error!(
+                "resolve home directory for --install-skill"
+            ));
+        }
+        return Ok(());
+    };
+    let detected = detected_agent_homes(&home);
+    if policy == SkillInstallPolicy::Install {
+        let targets = if detected.is_empty() {
+            vec![home.join(".agents")]
+        } else {
+            detected
+        };
+        let written = install_bundled_stow_skill(&targets)?;
+        for path in written {
+            write_stdout(&format!("stow skill: {}\n", path.display()))?;
+        }
+        return Ok(());
+    }
+    if detected.is_empty() || !agent_homes_need_skill_update(&detected, BUNDLED_STOW_SKILL) {
+        return Ok(());
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || !std::io::IsTerminal::is_terminal(&std::io::stderr())
+    {
+        return Ok(());
+    }
+    let labels = detected
+        .iter()
+        .filter_map(|dir| {
+            dir.file_name()
+                .map(|n| format!("~/{}", n.to_string_lossy()))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let approved = smol::unblock(move || prompt_skill_install(&labels)).await?;
+    if approved {
+        let written = install_bundled_stow_skill(&detected)?;
+        for path in written {
+            write_stdout(&format!("stow skill: {}\n", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn detected_agent_homes(home: &Path) -> Vec<PathBuf> {
+    DETECTED_AGENT_DIR_NAMES
+        .into_iter()
+        .map(|name| home.join(name))
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+fn agent_homes_need_skill_update(agent_homes: &[PathBuf], expected: &str) -> bool {
+    agent_homes.iter().any(|agent_home| {
+        let skill_file = agent_home.join("skills/stow/SKILL.md");
+        std::fs::read_to_string(&skill_file).map_or(true, |current| current != expected)
+    })
+}
+
+fn prompt_skill_install(labels: &str) -> stow_types::error::Result<bool> {
+    use std::io::Write as _;
+    let mut stderr = std::io::stderr();
+    write!(
+        stderr,
+        "Install the stow skill for coding agents ({labels})? [Y/n]: "
+    )
+    .wrap_err("write skill install prompt")?;
+    stderr.flush().wrap_err("flush skill install prompt")?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .wrap_err("read skill install answer")?;
+    let trimmed = answer.trim();
+    Ok(trimmed.is_empty() || matches!(trimmed, "y" | "Y" | "yes" | "YES"))
+}
+
+fn install_bundled_stow_skill(agent_homes: &[PathBuf]) -> stow_types::error::Result<Vec<PathBuf>> {
+    let mut seen_canonical_dirs = std::collections::BTreeSet::new();
+    let mut written = Vec::new();
+    for agent_home in agent_homes {
+        let skill_dir = agent_home.join("skills").join("stow");
+        if let Ok(canonical) = std::fs::canonicalize(&skill_dir)
+            && !seen_canonical_dirs.insert(canonical)
+        {
+            continue;
+        }
+        std::fs::create_dir_all(&skill_dir)
+            .wrap_err_with(|| format!("create {}", skill_dir.display()))?;
+        if let Ok(canonical) = std::fs::canonicalize(&skill_dir) {
+            seen_canonical_dirs.insert(canonical);
+        }
+        let skill_file = skill_dir.join("SKILL.md");
+        std::fs::write(&skill_file, BUNDLED_STOW_SKILL)
+            .wrap_err_with(|| format!("write {}", skill_file.display()))?;
+        written.push(skill_file);
+    }
+    Ok(written)
+}
+
 /// Where setup left this machine's build directory.
 enum BuildDirPlacement {
     /// Stow's own template, written by this setup.
@@ -1256,13 +1370,17 @@ enum BuildDirPlacement {
     /// scope of the current directory or `CARGO_BUILD_BUILD_DIR` — which
     /// setup leaves alone.
     User(String),
+    /// Explicitly skipped via `--no-build-dir`: Cargo keeps its standard
+    /// `target/` layout and any previously stow-placed `build.build-dir`
+    /// is removed.
+    Disabled,
 }
 
 impl BuildDirPlacement {
     fn stow_template(&self) -> Option<&str> {
         match self {
             Self::Stow(template) => Some(template),
-            Self::User(_) => None,
+            Self::User(_) | Self::Disabled => None,
         }
     }
 
@@ -1270,6 +1388,7 @@ impl BuildDirPlacement {
         match self {
             Self::Stow(template) => format!("build-dir: {template}"),
             Self::User(user) => format!("build-dir: {user} (already configured, left alone)"),
+            Self::Disabled => "build-dir: target/ (--no-build-dir)".to_owned(),
         }
     }
 }
@@ -2070,5 +2189,86 @@ mod tests {
         assert!(slice_dir.join("current.json").is_file());
         assert!(!crate::state_db::state_db_path(cache).exists());
         state_db.close().await;
+    }
+
+    #[test]
+    fn skill_detection_only_matches_existing_claude_or_agents_dirs_and_preserves_symlinks() {
+        let home = tempfile::tempdir().expect("temp home");
+        assert_eq!(
+            super::detected_agent_homes(home.path()),
+            Vec::<PathBuf>::new()
+        );
+
+        let agents = home.path().join(".agents");
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&agents).expect("create .agents");
+        std::fs::create_dir_all(claude.join("skills")).expect("create .claude/skills");
+        std::fs::create_dir_all(agents.join("skills/stow")).expect("create .agents/skills/stow");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(agents.join("skills/stow"), claude.join("skills/stow"))
+            .expect("symlink claude skill to agents skill");
+
+        let detected = super::detected_agent_homes(home.path());
+        assert_eq!(detected, vec![agents.clone(), claude.clone()]);
+        assert!(super::agent_homes_need_skill_update(
+            &detected,
+            super::BUNDLED_STOW_SKILL
+        ));
+
+        let written = super::install_bundled_stow_skill(&detected).expect("install bundled skill");
+        #[cfg(unix)]
+        {
+            assert_eq!(written, vec![agents.join("skills/stow/SKILL.md")]);
+            assert!(
+                std::fs::symlink_metadata(claude.join("skills/stow"))
+                    .expect("stat claude skill")
+                    .file_type()
+                    .is_symlink(),
+                "existing symlink into ~/.agents/skills/stow must stay intact"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(claude.join("skills/stow/SKILL.md")).expect("read skill"),
+            super::BUNDLED_STOW_SKILL
+        );
+        assert!(!super::agent_homes_need_skill_update(
+            &detected,
+            super::BUNDLED_STOW_SKILL
+        ));
+    }
+
+    #[test]
+    fn no_build_dir_placement_strips_stow_owned_build_dir_while_keeping_user_build_dir() {
+        let wrappers = test_wrappers();
+        let mut doc: toml_edit::DocumentMut =
+            "[build]\nbuild-dir = \"/Users/u/.stow/build-dir/{workspace-path-hash}\"\n"
+                .parse()
+                .expect("parse stow build-dir");
+        super::configure_document(
+            &mut doc,
+            &wrappers,
+            Vec::new(),
+            None,
+            super::BuildDirPlacement::Disabled.stow_template(),
+        )
+        .expect("configure with --no-build-dir");
+        assert!(!doc.to_string().contains("build-dir ="), "{doc}");
+
+        let mut user_doc: toml_edit::DocumentMut = "[build]\nbuild-dir = \"/custom/build\"\n"
+            .parse()
+            .expect("parse user build-dir");
+        super::configure_document(
+            &mut user_doc,
+            &wrappers,
+            Vec::new(),
+            None,
+            super::BuildDirPlacement::Disabled.stow_template(),
+        )
+        .expect("configure keeping user build-dir");
+        assert!(
+            user_doc
+                .to_string()
+                .contains("build-dir = \"/custom/build\"")
+        );
     }
 }
