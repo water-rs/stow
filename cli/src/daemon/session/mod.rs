@@ -99,7 +99,11 @@ impl Origin for DriverFacts {
     }
 
     fn manifests(&self) -> Vec<PathBuf> {
-        vec![self.project.workspace_root.join("Cargo.toml")]
+        let root = self
+            .real_workspace_root
+            .as_deref()
+            .unwrap_or(&self.project.workspace_root);
+        vec![root.join("Cargo.toml")]
     }
 
     fn journal(
@@ -332,38 +336,22 @@ impl<O: Origin> Session<O> {
         };
         spawn_build_dir_bookkeeping(&span, config.as_ref(), &build.roots, origin.manifests());
         let env_cache = WrapperEnvCache::for_session(config.clone(), toolchain);
-        let enrichment = if seed.deferred
-            && let Some(config) = config
-            && let Some(driver) = origin.driver()
-        {
-            // Aborted when the build's cargo exits: what the analysis
-            // commits for this build lands while cargo runs, and whatever
-            // is still running afterwards is warming a build that is
-            // over; the plan path fetches on demand.
-            Some(crate::cargo_cmd::spawn_build_enrichment(
-                span.clone(),
-                crate::cargo_cmd::BuildEnrichment {
-                    project: driver.project.clone(),
-                    env,
-                    config,
-                    circuit: env_cache.circuit.clone(),
-                    cell: analysis,
-                    map: serve_map_writer,
-                    allow: allow_writer,
-                    readiness: serve_waiters,
-                    policy_ready: (!policy_ready.has_completed())
-                        .then(|| crate::facade::ServeMapWaiters::new(Arc::clone(&policy_ready))),
-                    resolution_done: resolution_done.clone(),
-                    slices: handles.slice_fetches(),
-                },
-            ))
-        } else {
-            // No enrichment, so no fetch will ever land a slice: release
-            // whatever waits on one now, not when the build ends
-            // (stow#735).
-            drop(serve_waiters);
-            None
-        };
+        let enrichment = spawn_session_background(SessionBackground {
+            span: &span,
+            seed,
+            driver: origin.driver(),
+            config,
+            env,
+            circuit: env_cache.circuit.clone(),
+            cell: analysis,
+            map: serve_map_writer,
+            allow: allow_writer,
+            readiness: serve_waiters,
+            policy_ready: (!policy_ready.has_completed())
+                .then(|| crate::facade::ServeMapWaiters::new(Arc::clone(&policy_ready))),
+            resolution_done: resolution_done.clone(),
+            slices: handles.slice_fetches(),
+        });
         let session = Arc::new(Self {
             id,
             span: span.clone(),
@@ -767,6 +755,59 @@ impl<O: Origin> Handler for Session<O> {
     fn refused(self: &Arc<Self>, refusal: Refusal) {
         self.refusals.lock().expect("refusals mutex").push(refusal);
     }
+}
+
+struct SessionBackground<'a> {
+    span: &'a tracing::Span,
+    seed: &'a Seed,
+    driver: Option<&'a DriverFacts>,
+    config: Option<StowConfig>,
+    env: SessionEnv,
+    circuit: crate::circuit::BuildCircuit,
+    cell: Arc<std::sync::OnceLock<AnalysisFacts>>,
+    map: Option<crate::facade::ServeMapWriter>,
+    allow: Option<cache_policy::AllowWriter>,
+    readiness: Option<crate::facade::ServeMapWaiters>,
+    policy_ready: Option<crate::facade::ServeMapWaiters>,
+    resolution_done: ResolutionDone,
+    slices: crate::index::SliceFetches,
+}
+
+fn spawn_session_background(bg: SessionBackground<'_>) -> Option<tokio::task::JoinHandle<()>> {
+    if bg.seed.deferred
+        && let Some(ref config) = bg.config
+        && let Some(driver) = bg.driver
+    {
+        return Some(crate::cargo_cmd::spawn_build_enrichment(
+            bg.span.clone(),
+            crate::cargo_cmd::BuildEnrichment {
+                project: driver.project.clone(),
+                env: bg.env,
+                config: config.clone(),
+                circuit: bg.circuit,
+                cell: bg.cell,
+                map: bg.map,
+                allow: bg.allow,
+                readiness: bg.readiness,
+                policy_ready: bg.policy_ready,
+                resolution_done: bg.resolution_done,
+                slices: bg.slices,
+            },
+        ));
+    }
+    drop(bg.readiness);
+    let config = bg.config.filter(|cfg| cfg.cache.reaches_network())?;
+    let artifacts = bg
+        .seed
+        .prefetch_artifacts
+        .as_ref()
+        .filter(|artifacts| !artifacts.is_empty())?;
+    Some(crate::cargo_cmd::spawn_seeded_prefetch(
+        bg.span.clone(),
+        config,
+        bg.env,
+        artifacts.clone(),
+    ))
 }
 
 /// The analysis cell, written now when the driver's analysis was complete

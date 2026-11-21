@@ -70,8 +70,13 @@ pub struct BuildFacts {
 /// The facts only a driver has: what its pre-cargo analysis resolved.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DriverFacts {
-    /// The build's project: its layout, targets and rustc.
+    /// The build's project: its layout, targets and rustc (the mirror's
+    /// facts when the driver built inside a workspace mirror).
     pub project: ProjectFacts,
+    /// When `project` names a workspace mirror, the user's real workspace
+    /// root so `build-dir` attribution tracks the real manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_workspace_root: Option<PathBuf>,
     /// The rustc spelling the build's own cargo configuration names: what
     /// the miss journal records for the drain to run.
     pub build_rustc: OsString,
@@ -91,7 +96,8 @@ pub struct Seed {
     pub cache_policy_entries: Option<Vec<CachePolicyEntry>>,
     /// The build's per-side unit node table.
     pub unit_nodes: Option<UnitNodeTable>,
-    /// The artifacts the driver already fetched.
+    /// The artifacts for the session to warm in the background when the
+    /// analysis was settled before cargo started.
     pub prefetch_artifacts: Option<Vec<PrefetchArtifact>>,
     /// Whether the plan path may serve a semver upgrade.
     pub semantic_fallback_enabled: bool,
@@ -142,6 +148,7 @@ impl SessionFacts {
             },
             driver: DriverFacts {
                 project,
+                real_workspace_root: None,
                 build_rustc: OsString::from("rustc"),
                 seed: Seed::default(),
             },
