@@ -35,6 +35,11 @@ on:
         required: false
         default: false
         type: boolean
+      migrate_records:
+        description: "Inline existing .sig signatures onto legacy records-* and built-* manifests of the scoped rustc before the export (the one-time run of stow#1627; rerun-safe)"
+        required: false
+        default: false
+        type: boolean
       report:
         description: "Report the published slices to the edge's scheduler (the repository's STOW_EDGE_URL)"
         required: false
@@ -125,6 +130,14 @@ jobs:
         run: |
           set -euo pipefail
           stow-admin index resign --rustc-version "$RUSTC_VERSION"
+      - name: Migrate legacy records signatures inline
+        if: inputs.migrate_records
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          stow-admin index migrate-records --rustc-version "$RUSTC_VERSION"
       # A published generation the scheduler never received — the report
       # of an earlier run failed, or that run died between a slice's
       # index and folded tags — is replayed, one delta per generation the

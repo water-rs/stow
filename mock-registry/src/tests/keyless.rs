@@ -679,16 +679,12 @@ async fn publication_write_cost(session_put: bool, artifact_count: usize) {
         let plans = (0..artifact_count)
             .map(|offset| plan(&stack.root, index * artifact_count + offset))
             .collect::<Vec<_>>();
-        let sign = |reference: String, digest: String| {
-            let (signer, session) = (&signer, &session);
-            async move { signer.sign(session, &reference, &digest).await }
-        };
-        let sign_node = |reference: String, digest: String| {
+        let sign_detached = |reference: String, digest: String| {
             let signer = &signer;
             async move { signer.sign_detached(&reference, &digest).await }
         };
         let before = stack.writes();
-        let outcome = stow_oci::push_artifacts_with(&session, &plans, sign_node)
+        let outcome = stow_oci::push_artifacts_with(&session, &plans, &sign_detached)
             .await
             .expect("artifacts");
         let artifacts = stow_types::upload_plan::build_artifact_records(
@@ -713,15 +709,18 @@ async fn publication_write_cost(session_put: bool, artifact_count: usize) {
                 run_attempt: 1,
             },
             &records,
-            sign,
+            &sign_detached,
         )
         .await
         .expect("signed records");
-        // Each node is its bundle alone: the layer, the config and the
-        // manifest, a blob two writes when the registry answers its `POST`
-        // with an upload session. The records costs are unchanged.
+        // Each artifact pushes its bundle layer + `<tag>.bundle` manifest
+        // against the shared `{}` config (uploaded once on the cold first
+        // publication); records push their JSON layer + `records-*` and
+        // `built-*` manifests with inline signatures and no `.sig` image
+        // (stow#1627). A missing blob costs two writes under upload-session
+        // `POST` + `PUT` and one under monolithic `POST`.
         let (per_artifact, cold_records, warm_records) =
-            if session_put { (5, 11, 9) } else { (3, 7, 6) };
+            if session_put { (3, 6, 4) } else { (2, 4, 3) };
         assert_eq!(
             stack.writes() - before,
             per_artifact * artifact_count
@@ -848,15 +847,24 @@ impl GrantLog {
 #[tokio::test]
 async fn a_sweep_stays_under_the_write_budget() {
     let stack = Stack::new().await;
+    // A sweep runs against a warm repository that already holds the shared
+    // `{}` config blob (stow#1627).
+    let blobs = stack.root.join("blobs");
+    std::fs::create_dir_all(&blobs).expect("blobs dir");
+    std::fs::write(
+        blobs.join(stow_types::registry::sha256_digest(b"{}").replace(':', "_")),
+        b"{}",
+    )
+    .expect("shared empty config");
     // 3000 a minute is 50 a second with a 50-write bucket: at most 100
     // writes in any second, under the registry's 110.
     stack.probe.cap_writes(110, Duration::from_secs(1));
     let budget = stow_oci::WriteBudget::per_minute(NonZeroU32::new(3000).expect("rate"));
     let grants = GrantLog::install();
     let session = stack.session(&budget);
-    // 72 nodes at three writes each: 216 writes, past the budget's
+    // 108 nodes at two writes each: 216 writes, past the budget's
     // 100-write first second.
-    let nodes = 72;
+    let nodes = 108;
     let plans = (0..nodes)
         .map(|index| plan(&stack.root, index))
         .collect::<Vec<_>>();
@@ -869,7 +877,7 @@ async fn a_sweep_stays_under_the_write_budget() {
     let grants = grants.instants();
     assert_eq!(
         arrivals.len(),
-        nodes * 3,
+        nodes * 2,
         "requests: {:?}",
         stack.probe.request_log()
     );
@@ -942,16 +950,12 @@ async fn independent_publishers_recover_without_re_signing() {
                 stack.sigstore.services(),
                 CERTIFICATE_IDENTITY,
             );
-            let sign = |reference: String, digest: String| {
-                let (session, signer) = (&session, &signer);
-                async move { signer.sign(session, &reference, &digest).await }
-            };
-            let sign_node = |reference: String, digest: String| {
+            let sign_detached = |reference: String, digest: String| {
                 let signer = &signer;
                 async move { signer.sign_detached(&reference, &digest).await }
             };
             let outcome =
-                stow_oci::push_artifacts_with(&session, std::slice::from_ref(plan), sign_node)
+                stow_oci::push_artifacts_with(&session, std::slice::from_ref(plan), &sign_detached)
                     .await?;
             let artifacts = row_of(plan, &outcome)?;
             let records = stow_types::records::BuildRecords {
@@ -967,19 +971,15 @@ async fn independent_publishers_recover_without_re_signing() {
                     run_attempt: 1,
                 },
                 &records,
-                sign,
+                &sign_detached,
             )
             .await?;
-            let reference: stow_oci::Reference = published_records.oci_reference.parse()?;
-            stow_oci::verify_artifact_signature(
-                &session,
+            let pulled = stow_oci::pull_records_by_tag(&session, &published_records.tag).await?;
+            pulled.verify(
                 &stow_oci::verify::Trust::GithubCi(stack.sigstore.trust()),
-                &reference,
                 &published_records.oci_reference,
-                &published_records.manifest_digest,
                 &reader_identity(),
-            )
-            .await?;
+            )?;
             stack.verify(&session, &artifacts[0]).await?;
             Ok::<_, stow_types::error::Error>(())
         }
@@ -1097,23 +1097,18 @@ fn old_identity() -> stow_oci::resign::ExactIdentity {
 /// and the rows they name.
 struct OldTask {
     tag: String,
-    manifest_digest: String,
     rows: Vec<ArtifactRecord>,
 }
 
 impl Stack {
     async fn publish_old_task(&self, session: &stow_oci::RegistrySession) -> OldTask {
         let old_signer = self.signer_as(OLD_IDENTITY);
-        let sign = |reference: String, digest: String| {
-            let (signer, session) = (&old_signer, session);
-            async move { signer.sign(session, &reference, &digest).await }
-        };
-        let sign_node = |reference: String, digest: String| {
+        let sign_detached = |reference: String, digest: String| {
             let signer = &old_signer;
             async move { signer.sign_detached(&reference, &digest).await }
         };
         let plans = vec![plan(&self.root, 0), plan(&self.root, 1)];
-        let outcome = stow_oci::push_artifacts_with(session, &plans, &sign_node)
+        let outcome = stow_oci::push_artifacts_with(session, &plans, &sign_detached)
             .await
             .expect("a build publishes");
         let rows = stow_types::upload_plan::build_artifact_records(
@@ -1138,19 +1133,17 @@ impl Stack {
                 artifacts: rows.clone(),
                 local_programs: Vec::new(),
             },
-            &sign,
+            &sign_detached,
         )
         .await
         .expect("records publish");
         OldTask {
             tag: pushed.tag,
-            manifest_digest: pushed.manifest_digest,
             rows,
         }
     }
 
-    /// Whether the manifest under `tag` verifies under `policy` as a
-    /// reader checks it.
+    /// Whether the `.sig`-signed manifest under `tag` verifies under `policy`.
     async fn tag_verifies(
         &self,
         session: &stow_oci::RegistrySession,
@@ -1169,6 +1162,27 @@ impl Stack {
         )
         .await
         .is_ok()
+    }
+
+    /// Whether the records artifact under `tag` verifies under `policy` as
+    /// a reader checks its inline signature envelope.
+    async fn records_tag_verifies(
+        &self,
+        session: &stow_oci::RegistrySession,
+        tag: &str,
+        policy: &(impl stow_oci::resign::VerificationPolicy + Sync),
+    ) -> bool {
+        let reference = session.reference(tag).expect("reference");
+        let pulled = stow_oci::pull_records_by_tag(session, tag)
+            .await
+            .expect("records pull");
+        pulled
+            .verify(
+                &stow_oci::verify::Trust::GithubCi(self.sigstore.trust()),
+                &reference.to_string(),
+                policy,
+            )
+            .is_ok()
     }
 }
 
@@ -1202,33 +1216,24 @@ async fn a_task_signed_under_the_old_identity_resigns_under_the_new_one() {
 
     assert!(
         !stack
-            .tag_verifies(
-                &session,
-                &task.tag,
-                &task.manifest_digest,
-                &reader_identity()
-            )
+            .records_tag_verifies(&session, &task.tag, &reader_identity())
             .await,
         "the old records do not verify under the release-tag identity"
     );
     assert!(
         stack
-            .tag_verifies(&session, &task.tag, &task.manifest_digest, &old_identity())
+            .records_tag_verifies(&session, &task.tag, &old_identity())
             .await
     );
 
     let new_signer = stack.signer_as(CERTIFICATE_IDENTITY);
-    let sign = |reference: String, digest: String| {
-        let (signer, session) = (&new_signer, &session);
-        async move { signer.sign(session, &reference, &digest).await }
-    };
-    let sign_node = |reference: String, digest: String| {
+    let sign_detached = |reference: String, digest: String| {
         let signer = &new_signer;
         async move { signer.sign_detached(&reference, &digest).await }
     };
     let signers = || Signers {
-        records: &sign,
-        node: &sign_node,
+        records: &sign_detached,
+        node: &sign_detached,
     };
     let resigned = stow_oci::resign::resign_task(
         &session,
@@ -1258,12 +1263,7 @@ async fn a_task_signed_under_the_old_identity_resigns_under_the_new_one() {
     );
     assert!(
         stack
-            .tag_verifies(
-                &session,
-                &task.tag,
-                &task.manifest_digest,
-                &reader_identity()
-            )
+            .records_tag_verifies(&session, &task.tag, &reader_identity())
             .await,
         "the old records artifact now verifies under the new identity"
     );
@@ -1271,12 +1271,7 @@ async fn a_task_signed_under_the_old_identity_resigns_under_the_new_one() {
     let published = resigned.published.expect("a new records artifact");
     assert!(
         stack
-            .tag_verifies(
-                &session,
-                &published.tag,
-                &published.manifest_digest,
-                &reader_identity()
-            )
+            .records_tag_verifies(&session, &published.tag, &reader_identity())
             .await
     );
     let new_rows = stow_oci::pull_records_by_tag(&session, &published.tag)
@@ -1445,4 +1440,223 @@ async fn an_index_slice_signed_under_the_old_identity_resigns_under_the_new_one(
         stow_oci::resign::Resigned::Already
     );
     assert_eq!(stack.writes(), writes, "a rerun writes nothing");
+}
+
+/// Duplicate-dispatch retagging reads the `built-*` marker's inline signed
+/// manifest, signs it for the new run's `records-*` tag, and writes only
+/// that one manifest (stow#1627).
+#[tokio::test]
+async fn retag_records_writes_one_manifest_and_verifies() {
+    let stack = Stack::new().await;
+    let session = stack.session(&unbounded());
+    let signer = stack.signer();
+    let trust = stow_oci::verify::Trust::GithubCi(stack.sigstore.trust());
+    let rustc = WireRustcVersion::parse(super::RUSTC).expect("rustc");
+    let task_id = "serde-1.0.0-dup-task";
+
+    let sign_detached = |reference: String, digest: String| {
+        let signer = &signer;
+        async move { signer.sign_detached(&reference, &digest).await }
+    };
+    let first = stow_oci::push_records_with(
+        &session,
+        &rustc,
+        task_id,
+        BuildRun {
+            run_id: 10,
+            run_attempt: 1,
+        },
+        &BuildRecords::default(),
+        &sign_detached,
+    )
+    .await
+    .expect("first publish");
+
+    let marker_tag = stow_types::records::published_tag(rustc.as_str(), task_id);
+    let marker_ref = session.reference(&marker_tag).expect("marker ref");
+    let marker_repo = format!("{}/{}", marker_ref.registry(), marker_ref.repository());
+    let marker = stow_oci::pull_optional_records_by_tag(&session, &marker_tag)
+        .await
+        .expect("pull marker")
+        .expect("marker exists");
+    assert!(marker.verify_marker(&trust, &marker_repo, rustc.as_str(), &reader_identity()));
+
+    let before = stack.writes();
+    let second = stow_oci::retag_records_with(
+        &session,
+        &rustc,
+        task_id,
+        BuildRun {
+            run_id: 11,
+            run_attempt: 1,
+        },
+        &marker.envelope.signed_manifest,
+        &sign_detached,
+    )
+    .await
+    .expect("retag");
+    assert_eq!(
+        stack.writes() - before,
+        1,
+        "retagging writes only the new records-* manifest"
+    );
+    assert_eq!(second.signed_digest, first.signed_digest);
+    assert!(
+        stack
+            .records_tag_verifies(&session, &second.tag, &reader_identity())
+            .await
+    );
+}
+
+/// Legacy `records-*` and `built-*` tags backed by standalone `.sig` images
+/// are rejected by normal readers until migrated, convert in one manifest
+/// `PUT` per tag without minting new signatures, and write nothing on rerun
+/// (stow#1627).
+#[tokio::test]
+async fn legacy_records_and_markers_migrate_inline_and_rerun_writes_nothing() {
+    let stack = Stack::new().await;
+    let session = stack.session(&unbounded());
+    let signer = stack.signer();
+    let trust = stow_oci::verify::Trust::GithubCi(stack.sigstore.trust());
+    let rustc = WireRustcVersion::parse(super::RUSTC).expect("rustc");
+    let task_id = "legacy-task-1.0.0";
+    let tag = stow_types::records::records_tag(
+        rustc.as_str(),
+        task_id,
+        BuildRun {
+            run_id: 7,
+            run_attempt: 1,
+        },
+    );
+    let marker_tag = stow_types::records::published_tag(rustc.as_str(), task_id);
+    let reference = session.reference(&tag).expect("records ref");
+    let marker_ref = session.reference(&marker_tag).expect("marker ref");
+
+    let body = serde_json::to_vec(&BuildRecords::default()).expect("body");
+    let layer_digest = stow_types::registry::sha256_digest(&body);
+    let config = b"{}";
+    let config_digest = stow_types::registry::sha256_digest(config);
+    session
+        .push_blob(&layer_digest, &body)
+        .await
+        .expect("layer");
+    session
+        .push_blob(&config_digest, config)
+        .await
+        .expect("config");
+    let legacy_manifest = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": stow_types::bundle::OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+        "artifactType": stow_types::records::RECORDS_ARTIFACT_TYPE,
+        "config": {
+            "mediaType": stow_types::records::RECORDS_CONFIG_MEDIA_TYPE,
+            "digest": config_digest,
+            "size": config.len(),
+        },
+        "layers": [{
+            "mediaType": stow_types::records::RECORDS_ARTIFACT_TYPE,
+            "digest": layer_digest,
+            "size": body.len(),
+        }],
+        "annotations": {
+            stow_types::records::RECORDS_TASK_ID_ANNOTATION: task_id,
+        },
+    }))
+    .expect("legacy manifest");
+    let session_ref = &session;
+    let signer_ref = &signer;
+    let ref_str = reference.to_string();
+    stow_oci::put_signed_manifest(&session, &reference, &legacy_manifest, |digest| {
+        let ref_str = ref_str.clone();
+        async move { signer_ref.sign(session_ref, &ref_str, &digest).await }
+    })
+    .await
+    .expect("legacy signed push");
+    session
+        .put_manifest(&marker_ref, &legacy_manifest)
+        .await
+        .expect("legacy marker");
+
+    // Normal readers do not fall back to `.sig`.
+    assert!(stow_oci::pull_records_by_tag(&session, &tag).await.is_err());
+
+    let entries_before = stack.sigstore.entries();
+    let writes_before = stack.writes();
+    let migrated = stow_oci::migrate_records::migrate_records_tag(
+        &session,
+        &trust,
+        &ref_str,
+        &tag,
+        &reader_identity(),
+    )
+    .await
+    .expect("migrate records");
+    let stow_oci::migrate_records::RecordsTagMigration::Migrated { outer_bytes } = migrated else {
+        panic!("expected Migrated");
+    };
+    let marker_repo = format!("{}/{}", marker_ref.registry(), marker_ref.repository());
+    let marker_migrated = stow_oci::migrate_records::migrate_marker_tag(
+        &session,
+        &trust,
+        &marker_repo,
+        rustc.as_str(),
+        &marker_tag,
+        Some(&outer_bytes),
+        &reader_identity(),
+    )
+    .await
+    .expect("migrate marker");
+    assert!(matches!(
+        marker_migrated,
+        stow_oci::migrate_records::RecordsTagMigration::Migrated { .. }
+    ));
+    assert_eq!(
+        stack.writes() - writes_before,
+        2,
+        "one PUT per migrated tag"
+    );
+    assert_eq!(
+        stack.sigstore.entries(),
+        entries_before,
+        "migration mints no new Rekor signature"
+    );
+
+    assert!(
+        stack
+            .records_tag_verifies(&session, &tag, &reader_identity())
+            .await
+    );
+    let pulled_marker = stow_oci::pull_records_by_tag(&session, &marker_tag)
+        .await
+        .expect("pull migrated marker");
+    assert!(pulled_marker.verify_marker(&trust, &marker_repo, rustc.as_str(), &reader_identity()));
+
+    let writes_rerun = stack.writes();
+    assert!(matches!(
+        stow_oci::migrate_records::migrate_records_tag(
+            &session,
+            &trust,
+            &ref_str,
+            &tag,
+            &reader_identity(),
+        )
+        .await
+        .expect("rerun records"),
+        stow_oci::migrate_records::RecordsTagMigration::Already { .. }
+    ));
+    assert!(matches!(
+        stow_oci::migrate_records::migrate_marker_tag(
+            &session,
+            &trust,
+            &marker_repo,
+            rustc.as_str(),
+            &marker_tag,
+            Some(&outer_bytes),
+            &reader_identity(),
+        )
+        .await
+        .expect("rerun marker"),
+        stow_oci::migrate_records::RecordsTagMigration::Already { .. }
+    ));
+    assert_eq!(stack.writes(), writes_rerun, "a rerun writes nothing");
 }

@@ -9,6 +9,7 @@ mod artifacts;
 mod bundle;
 mod client;
 mod index;
+pub mod migrate_records;
 mod publisher;
 mod records;
 mod registry;
@@ -35,7 +36,8 @@ pub use oci_client::Reference;
 pub use publisher::Publisher;
 pub use records::{
     PulledRecords, RecordsPublishOutcome, list_records_tags, pull_listed_records_by_tag,
-    pull_records, pull_records_by_tag, push_records, push_records_with,
+    pull_optional_records_by_tag, pull_records, pull_records_by_tag, push_records,
+    push_records_with, records_manifest_with_envelope, retag_records_with,
 };
 pub use registry::{RegistryBase, RegistryCredentials, pull_blob_verified, pull_tagged_manifest};
 pub use repack::repack_record;

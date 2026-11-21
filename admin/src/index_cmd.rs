@@ -121,6 +121,11 @@ pub enum IndexCommand {
     /// identity; `index-publish.yml` runs it with `resign: true`. A rerun
     /// writes nothing.
     Resign(crate::index_resign::IndexResignArgs),
+    /// The one-time migration of legacy `records-*` and `built-*` tags
+    /// from standalone `.sig` images to inline `dev.stow.records.signatures`
+    /// annotations (stow#1627); `index-publish.yml` runs it with
+    /// `migrate_records: true`. Idempotent; deleted once run.
+    MigrateRecords(crate::index_migrate_records::IndexMigrateRecordsArgs),
     /// Resolve the public hit leaderboard's bundle digests to crate
     /// identities through the signed index slices (stow#889) — the
     /// edge keeps no identity store, so the offline join lives here.
@@ -280,6 +285,7 @@ pub async fn run(
             Ok(())
         }
         IndexCommand::Resign(args) => crate::index_resign::run(args).await,
+        IndexCommand::MigrateRecords(args) => crate::index_migrate_records::run(args).await,
         IndexCommand::Join(args) => index_join(args).await,
     }
 }
@@ -558,16 +564,11 @@ impl PullContext {
     /// would export a slice that quietly misses crates.
     async fn records(&self, tag: &str) -> stow_types::error::Result<BuildRecords> {
         let pulled = stow_oci::pull_listed_records_by_tag(&self.session, tag).await?;
-        let reference = self.session.reference(tag)?;
-        verify_listed_artifact(
-            &self.session,
+        pulled.verify(
             &self.trust,
-            &reference,
             &self.repository.reference(tag),
-            &pulled.manifest_digest,
-            TrustedWorkflow::BUILD,
-        )
-        .await?;
+            &stow_oci::verify::ReleaseIdentity::new(TrustedWorkflow::BUILD),
+        )?;
         Ok(pulled.records)
     }
 }

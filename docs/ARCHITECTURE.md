@@ -435,11 +435,15 @@ every file against it. Decompression speed does not depend on the level,
 so the cost is paid once, at publish. Index slices are compressed at the
 same level, multithreaded.
 The trusted publish stage pushes `<tag>.bundle`, a single-layer image whose
+config is the shared empty `{}` blob (`STOW_BUNDLE_CONFIG_MEDIA_TYPE`) and whose
 layer is the bundle tar a CLI consumes (`stow_types::bundle::assemble_bundle`).
 The bundle needs no signature of its own: it embeds the signed manifest and
 config, the signature materials, and the pack byte-for-byte; the CLI and
 the repack and re-sign tools verify that material from the bundle, and
-nothing else holds a node's signature. The build's records artifact
+nothing else holds a node's signature. Likewise, a build's `records-*` (and
+`built-*`) manifest embeds its Sigstore signature envelope on the
+`dev.stow.records.signatures` annotation over the canonical unsigned records
+manifest rather than pushing a separate `.sig` image (stow#1627). The build's records artifact
 carries the bundle layer's digest and size (`bundle_digest`,
 `bundle_size`), republished verbatim into the index row; the CLI asks the
 edge for `GET /api/v1/bundles/{rustc_version}/{bundle_digest}`, which

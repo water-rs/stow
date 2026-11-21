@@ -26,11 +26,10 @@ use sigstore::crypto::signing_key::SigStoreKeyPair;
 use sigstore::crypto::{SigStoreSigner, SigningScheme};
 use stow_types::api::{ArtifactRecord, DemandFeedHour};
 use stow_types::bundle::{
-    ArtifactBlobConfig, BundleArtifactConfig, BundleParts, BundleSignatureMaterial,
-    OCI_IMAGE_MANIFEST_MEDIA_TYPE, SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE,
-    SIGSTORE_SIGNATURE_ANNOTATION, STOW_ARTIFACT_CONFIG_MEDIA_TYPE, STOW_BUNDLE_CONFIG_MEDIA_TYPE,
-    STOW_BUNDLE_MEDIA_TYPE, STOW_PACK_MEDIA_TYPE, assemble_bundle, sigstore_payload_path,
-    sigstore_signature_tag,
+    ArtifactBlobConfig, BundleParts, BundleSignatureMaterial, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+    SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE, SIGSTORE_SIGNATURE_ANNOTATION,
+    STOW_ARTIFACT_CONFIG_MEDIA_TYPE, STOW_BUNDLE_CONFIG_MEDIA_TYPE, STOW_BUNDLE_MEDIA_TYPE,
+    STOW_PACK_MEDIA_TYPE, assemble_bundle, sigstore_payload_path, sigstore_signature_tag,
 };
 use stow_types::bundle_schema::validate_bundle_schema;
 use stow_types::identity::{TargetTriple, WireRustcVersion};
@@ -41,8 +40,8 @@ use stow_types::index::{
     content_sha256, folded_tag, index_tag,
 };
 use stow_types::records::{
-    BuildRun, RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_TASK_ID_ANNOTATION,
-    records_tag,
+    BuildRun, RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_SIGNATURES_ANNOTATION,
+    RECORDS_TASK_ID_ANNOTATION, RecordsSignature, RecordsSignatureEnvelope, records_tag,
 };
 use stow_types::registry::{bundle_oci_reference, cache_repository, sha256_digest};
 use stow_types::upload_plan::{PlannedArtifact, PublishedArtifact};
@@ -283,7 +282,7 @@ async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()>
     let config_bytes = b"{}".to_vec();
     let config_digest = sha256_digest(&config_bytes);
     write_blob(&request.registry_root, &config_digest, &config_bytes).await?;
-    let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+    let signed_manifest = serde_json::to_string(&serde_json::json!({
         "schemaVersion": 2,
         "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
         "artifactType": RECORDS_ARTIFACT_TYPE,
@@ -301,8 +300,26 @@ async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()>
             RECORDS_TASK_ID_ANNOTATION: request.task_id,
         },
     }))?;
-    let manifest_digest = sha256_digest(&manifest_bytes);
+    let signed_digest = sha256_digest(signed_manifest.as_bytes());
     let (repo, tag) = split_reference(&oci_reference)?;
+
+    let key_pair = load_key_pair(&request.private_key_path).await?;
+    let signer = key_pair
+        .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
+        .map_err(|error| stow_types::stow_error!("create mock signer from private key: {error}"))?;
+    let (signature_b64, payload_bytes) = mock_signature(&signer, &oci_reference, &signed_digest)?;
+    let envelope = RecordsSignatureEnvelope {
+        signed_manifest,
+        signatures: vec![RecordsSignature {
+            payload: String::from_utf8(payload_bytes)
+                .map_err(|error| stow_types::stow_error!("mock payload UTF-8: {error}"))?,
+            signature: signature_b64,
+            certificate_pem: MOCK_CERTIFICATE.to_owned(),
+            rekor_bundle_json: None,
+        }],
+    };
+    let manifest_bytes = mock_records_manifest_with_envelope(&envelope)?;
+    let manifest_digest = sha256_digest(&manifest_bytes);
     write_manifest(
         &request.registry_root,
         &repo,
@@ -310,19 +327,6 @@ async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()>
         &manifest_bytes,
     )
     .await?;
-
-    let key_pair = load_key_pair(&request.private_key_path).await?;
-    let signer = key_pair
-        .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
-        .map_err(|error| stow_types::stow_error!("create mock signer from private key: {error}"))?;
-    write_mock_signature(
-        &request.registry_root,
-        &signer,
-        &oci_reference,
-        &manifest_digest,
-    )
-    .await?;
-    // Tagged only once signed, as `stow_oci::put_signed_manifest` pushes.
     write_manifest(&request.registry_root, &repo, &tag, &manifest_bytes).await?;
     // The `built-<rustc>-<task_id hash>` marker `push_records` also
     // points at the same manifest (stow#877): a run checking whether
@@ -338,6 +342,7 @@ async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()>
     tracing::info!(
         oci_reference = %oci_reference,
         digest = %manifest_digest,
+        signed_digest = %signed_digest,
         task_id = %request.task_id,
         records = records.artifacts.len(),
         "pushed mock records artifact"
@@ -346,9 +351,9 @@ async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()>
 }
 
 /// `retag-records` — the early-exited run's publish: the `built-`
-/// marker's manifest is re-tagged under this run's `records-` tag AND
-/// signed for it, so the `sha256-<digest>.sig` bundle gains a layer
-/// binding this tag alongside the original run's (stow#877).
+/// marker's signed inner manifest is re-signed under this run's
+/// `records-` tag and written with its inline envelope (stow#877,
+/// stow#1627).
 async fn retag_records(request: RetagRecordsArgs) -> stow_types::error::Result<()> {
     let rustc = WireRustcVersion::parse(&request.rustc_version)
         .map_err(|error| stow_types::stow_error!("--rustc-version: {error}"))?;
@@ -357,10 +362,22 @@ async fn retag_records(request: RetagRecordsArgs) -> stow_types::error::Result<(
     let marker_path = request.registry_root.join("manifests").join(&repo).join(
         stow_types::records::published_tag(rustc.as_str(), &request.task_id),
     );
-    let manifest_bytes = read(&marker_path).await.map_err(|error| {
+    let marker_bytes = read(&marker_path).await.map_err(|error| {
         stow_types::stow_error!("read built- marker {}: {error}", marker_path.display())
     })?;
-    let manifest_digest = sha256_digest(&manifest_bytes);
+    let marker_json: serde_json::Value = serde_json::from_slice(&marker_bytes)?;
+    let existing_envelope_json = marker_json
+        .get("annotations")
+        .and_then(|map| map.get(RECORDS_SIGNATURES_ANNOTATION))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "built- marker {} lacks {RECORDS_SIGNATURES_ANNOTATION}",
+                marker_path.display()
+            )
+        })?;
+    let existing_envelope: RecordsSignatureEnvelope = serde_json::from_str(existing_envelope_json)?;
+    let signed_digest = sha256_digest(existing_envelope.signed_manifest.as_bytes());
     let oci_reference = repository.reference(&records_tag(
         rustc.as_str(),
         &request.task_id,
@@ -373,11 +390,24 @@ async fn retag_records(request: RetagRecordsArgs) -> stow_types::error::Result<(
     let signer = key_pair
         .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
         .map_err(|error| stow_types::stow_error!("create mock signer from private key: {error}"))?;
-    write_mock_signature(
+    let (signature_b64, payload_bytes) = mock_signature(&signer, &oci_reference, &signed_digest)?;
+    let envelope = RecordsSignatureEnvelope {
+        signed_manifest: existing_envelope.signed_manifest,
+        signatures: vec![RecordsSignature {
+            payload: String::from_utf8(payload_bytes)
+                .map_err(|error| stow_types::stow_error!("mock payload UTF-8: {error}"))?,
+            signature: signature_b64,
+            certificate_pem: MOCK_CERTIFICATE.to_owned(),
+            rekor_bundle_json: None,
+        }],
+    };
+    let manifest_bytes = mock_records_manifest_with_envelope(&envelope)?;
+    let manifest_digest = sha256_digest(&manifest_bytes);
+    write_manifest(
         &request.registry_root,
-        &signer,
-        &oci_reference,
+        &repo,
         &manifest_digest,
+        &manifest_bytes,
     )
     .await?;
     let (_, tag) = split_reference(&oci_reference)?;
@@ -389,6 +419,22 @@ async fn retag_records(request: RetagRecordsArgs) -> stow_types::error::Result<(
         "re-tagged and re-signed mock records artifact"
     );
     Ok(())
+}
+
+fn mock_records_manifest_with_envelope(
+    envelope: &RecordsSignatureEnvelope,
+) -> stow_types::error::Result<Vec<u8>> {
+    let mut outer: serde_json::Value = serde_json::from_str(&envelope.signed_manifest)?;
+    let envelope_json = serde_json::to_string(envelope)?;
+    outer
+        .get_mut("annotations")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| stow_types::stow_error!("signed mock records manifest lacks annotations"))?
+        .insert(
+            RECORDS_SIGNATURES_ANNOTATION.to_owned(),
+            serde_json::Value::String(envelope_json),
+        );
+    Ok(serde_json::to_vec(&outer)?)
 }
 
 /// The shared tail of `publish-index` and `index-from-records`: write the
@@ -478,20 +524,7 @@ async fn write_signed_index(
     )
     .await?;
 
-    let payload = SimpleSigning::new(&reference.parse()?, &manifest_digest);
-    let payload_bytes = serde_json::to_vec(&payload)?;
-    let signature = signer.sign(&payload_bytes).map_err(|error| {
-        stow_types::stow_error!("sign mock index payload for {reference}: {error}")
-    })?;
-    let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
-    append_mock_signature(
-        registry_root,
-        repository.as_str(),
-        &manifest_digest,
-        &payload_bytes,
-        &signature_b64,
-    )
-    .await?;
+    write_mock_signature(registry_root, &signer, &reference, &manifest_digest).await?;
     // Tagged only once signed, as `stow_oci::put_signed_manifest` pushes.
     write_manifest(registry_root, repository.as_str(), &tag, &manifest_bytes).await?;
     tracing::info!(%reference, %manifest_digest, "published mock index artifact");
@@ -1012,12 +1045,9 @@ async fn write_mock_registry_entry(
     let bundle_digest = sha256_digest(&bundle_bytes);
     let bundle_size = u64::try_from(bundle_bytes.len())?;
     write_blob(registry_root, &bundle_digest, &bundle_bytes).await?;
-    let bundle_config_bytes = serde_json::to_vec(&BundleArtifactConfig {
-        oci_reference: plan.oci_reference.clone(),
-        oci_digest: manifest_digest.clone(),
-    })?;
-    let bundle_config_digest = sha256_digest(&bundle_config_bytes);
-    write_blob(registry_root, &bundle_config_digest, &bundle_config_bytes).await?;
+    let bundle_config_bytes = b"{}";
+    let bundle_config_digest = sha256_digest(bundle_config_bytes);
+    write_blob(registry_root, &bundle_config_digest, bundle_config_bytes).await?;
     let bundle_manifest_bytes = serde_json::to_vec(&serde_json::json!({
         "schemaVersion": 2,
         "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,

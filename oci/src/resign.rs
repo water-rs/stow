@@ -29,12 +29,17 @@ use stow_types::api::{ArtifactRecord, CI_TARGET_TRIPLES};
 use stow_types::bundle::{BundleSignatureMaterial, STOW_BUNDLE_PACK_PATH, STOW_PACK_MEDIA_TYPE};
 use stow_types::error::Context as _;
 use stow_types::identity::WireRustcVersion;
-use stow_types::records::{BuildRecords, BuildRun, is_records_tag, parse_records_tag};
+use stow_types::records::{
+    BuildRecords, BuildRun, RecordsSignature, is_records_tag, parse_records_tag, published_tag,
+};
 
 use crate::artifacts::{publish_packed, pull_signature_materials};
 use crate::bundle::pull_bundle;
 use crate::client::RegistrySession;
-use crate::records::{RecordsPublishOutcome, pull_listed_records_by_tag, push_records_with};
+use crate::records::{
+    PulledRecords, RecordsPublishOutcome, pull_listed_records_by_tag, push_records_with,
+    records_manifest_with_envelope,
+};
 use crate::verify::{Trust, verify_materials};
 
 /// What a tag of a rustc's repository is.
@@ -222,6 +227,54 @@ where
     Ok(Resigned::Signed)
 }
 
+/// Add an inline signature under the new identity to `pulled`'s records manifest.
+///
+/// Skips signing when the manifest already carries a valid signature under the
+/// new identity; otherwise verifies the old identity first (stow#1515,
+/// stow#1627). Returns the resulting `(Resigned, Option<Vec<u8>>)` —
+/// `Some(outer_bytes)` when the tag's manifest was rewritten so the task's
+/// `built-` marker can mirror the newest build.
+///
+/// # Errors
+/// Fails when the manifest fails verification under the old identity, signing
+/// fails, or writing the updated manifest fails.
+pub async fn resign_records<O, N, S, Fut>(
+    session: &RegistrySession,
+    trust: &Trust,
+    reference: &Reference,
+    identity_reference: &str,
+    pulled: &mut PulledRecords,
+    identities: Identities<'_, O, N>,
+    sign: &S,
+) -> stow_types::error::Result<(Resigned, Option<Vec<u8>>)>
+where
+    O: VerificationPolicy + Sync,
+    N: VerificationPolicy + Sync,
+    S: Fn(String, String) -> Fut + Send + Sync,
+    Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
+{
+    let Identities { old, new } = identities;
+    if pulled.verify(trust, identity_reference, new).is_ok() {
+        return Ok((Resigned::Already, None));
+    }
+    pulled
+        .verify(trust, identity_reference, old)
+        .wrap_err_with(|| format!("verify {identity_reference} under the old identity"))?;
+    let material = sign(identity_reference.to_owned(), pulled.signed_digest.clone()).await?;
+    pulled
+        .envelope
+        .signatures
+        .push(RecordsSignature::from_material(&material)?);
+    let outer_bytes = records_manifest_with_envelope(&pulled.envelope)?;
+    pulled.manifest_digest = session
+        .put_manifest(reference, &outer_bytes)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("write re-signed records manifest {reference}: {error}")
+        })?;
+    Ok((Resigned::Signed, Some(outer_bytes)))
+}
+
 /// What [`resign_node`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeResigned {
@@ -406,21 +459,27 @@ where
         published: None,
     };
     let mut pulled = Vec::with_capacity(tags.len());
-    for tag in tags {
-        let records = pull_listed_records_by_tag(session, tag).await?;
+    let mut newest_rewritten: Option<Vec<u8>> = None;
+    for (index, tag) in tags.iter().enumerate() {
+        let mut records = pull_listed_records_by_tag(session, tag).await?;
         let reference = session.reference(tag)?;
-        let resigned = resign_manifest(
+        let (resigned, rewritten) = resign_records(
             session,
             trust,
             &reference,
             &reference.to_string(),
-            &records.manifest_digest,
+            &mut records,
             identities,
             sign,
         )
         .await?;
         match resigned {
-            Resigned::Signed => outcome.records_signed += 1,
+            Resigned::Signed => {
+                outcome.records_signed += 1;
+                if index == 0 {
+                    newest_rewritten = rewritten;
+                }
+            }
             Resigned::Already => outcome.records_already += 1,
         }
         pulled.push(records);
@@ -448,6 +507,16 @@ where
         }
     }
     if outcome.nodes_republished == 0 {
+        if let Some(outer_bytes) = newest_rewritten {
+            let marker =
+                session.reference(&published_tag(rustc_version.as_str(), &first.task_id))?;
+            session
+                .put_manifest(&marker, &outer_bytes)
+                .await
+                .map_err(|error| {
+                    stow_types::stow_error!("update published marker {marker}: {error}")
+                })?;
+        }
         return Ok(outcome);
     }
     let local_programs = first.records.local_programs.clone();

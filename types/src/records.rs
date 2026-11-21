@@ -76,6 +76,83 @@ pub const RECORDS_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.records.config
 /// readers never parse the tag for it.
 pub const RECORDS_TASK_ID_ANNOTATION: &str = "dev.stow.records.task-id";
 
+/// Manifest annotation carrying the JSON [`RecordsSignatureEnvelope`] —
+/// the canonical unsigned manifest bytes and the Sigstore signatures
+/// binding them to the records tag (stow#1627).
+pub const RECORDS_SIGNATURES_ANNOTATION: &str = "dev.stow.records.signatures";
+
+/// Inline Sigstore signature material carried on a records manifest's
+/// [`RECORDS_SIGNATURES_ANNOTATION`] so neither a build publish nor a
+/// duplicate-dispatch retag pushes a standalone `.sig` image (stow#1627).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordsSignatureEnvelope {
+    /// Exact UTF-8 JSON bytes of the unsigned records OCI manifest whose
+    /// SHA-256 digest each entry in [`Self::signatures`] binds.
+    pub signed_manifest: String,
+    /// Sigstore signatures over `sha256(signed_manifest)`.
+    pub signatures: Vec<RecordsSignature>,
+}
+
+/// One Sigstore simple-signing entry inside [`RecordsSignatureEnvelope`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordsSignature {
+    /// Exact simple-signing JSON payload the signer signed.
+    pub payload: String,
+    /// Base64 signature over `payload`.
+    pub signature: String,
+    /// PEM-encoded Fulcio leaf certificate of the signing identity.
+    pub certificate_pem: String,
+    /// Rekor transparency-log bundle JSON, when uploaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rekor_bundle_json: Option<String>,
+}
+
+impl RecordsSignature {
+    /// Encode one [`crate::bundle::BundleSignatureMaterial`] for inline
+    /// manifest storage.
+    ///
+    /// # Errors
+    /// Fails when `material.payload_bytes` is not UTF-8 JSON.
+    pub fn from_material(
+        material: &crate::bundle::BundleSignatureMaterial,
+    ) -> crate::error::Result<Self> {
+        let payload = String::from_utf8(material.payload_bytes.clone()).map_err(|error| {
+            crate::stow_error!("records signature payload is not UTF-8: {error}")
+        })?;
+        Ok(Self {
+            payload,
+            signature: material.signature.clone(),
+            certificate_pem: material.certificate_pem.clone(),
+            rekor_bundle_json: material.rekor_bundle_json.clone(),
+        })
+    }
+
+    /// Convert back to [`crate::bundle::BundleSignatureMaterial`] for
+    /// `stow_oci::verify`.
+    #[must_use]
+    pub fn to_material(&self, index: usize) -> crate::bundle::BundleSignatureMaterial {
+        crate::bundle::BundleSignatureMaterial {
+            payload_path: crate::bundle::sigstore_payload_path(index),
+            payload_bytes: self.payload.as_bytes().to_vec(),
+            signature: self.signature.clone(),
+            certificate_pem: self.certificate_pem.clone(),
+            rekor_bundle_json: self.rekor_bundle_json.clone(),
+        }
+    }
+}
+
+impl RecordsSignatureEnvelope {
+    /// Every carried signature as [`crate::bundle::BundleSignatureMaterial`].
+    #[must_use]
+    pub fn materials(&self) -> Vec<crate::bundle::BundleSignatureMaterial> {
+        self.signatures
+            .iter()
+            .enumerate()
+            .map(|(index, sig)| sig.to_material(index))
+            .collect()
+    }
+}
+
 /// The `run-name` `build-crate.yml` stamps on its run —
 /// `<rustc>-<task_id>`, unhashed.
 ///
@@ -151,6 +228,13 @@ pub struct BuildRun {
 /// OCI tag grammar. The embedded rustc lets an export pass select its
 /// records by tag alone.
 pub const RECORDS_TAG_PREFIX: &str = "records-";
+
+/// Hex-encoded blake3 digest of `task_id`, the fixed-length segment carried
+/// by [`records_tag`] and [`published_tag`].
+#[must_use]
+pub fn task_id_hash(task_id: &str) -> String {
+    blake3::hash(task_id.as_bytes()).to_hex().to_string()
+}
 
 /// The OCI tag of `task_id`'s records artifact as `build` published it
 /// at `rustc_version`.

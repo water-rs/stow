@@ -314,80 +314,40 @@ async fn records_exist_stage() -> stow_types::error::Result<()> {
     Ok(())
 }
 
-/// The `built-` marker's manifest bytes when they name a records
-/// artifact for `task` — `None` when no earlier run published it. The
-/// bytes are the value a re-tag puts under the run's own records tag.
+/// The `built-` marker's canonical signed-manifest JSON when it names a
+/// complete verified records artifact for `task` — `None` when no earlier
+/// run published it or its signature/shapes do not hold. The string is the
+/// value a duplicate run re-signs and puts under its own records tag.
 async fn published_manifest(
     task: &BuildTaskPayload,
     session: &stow_oci::RegistrySession,
     trust: &stow_oci::verify::Trust,
-) -> stow_types::error::Result<Option<Vec<u8>>> {
-    let reference = session.reference(&stow_types::records::published_tag(
-        task.rustc_version.as_str(),
-        &task.task_id,
-    ))?;
-    let (manifest, manifest_digest) = match session.pull_manifest(&reference).await {
-        Ok(pulled) => pulled,
-        Err(error) if error.is_not_found() => return Ok(None),
-        Err(error) => {
-            return Err(stow_types::stow_error!(
-                "pull published marker {reference}: {error}"
-            ));
-        }
+) -> stow_types::error::Result<Option<String>> {
+    let tag = stow_types::records::published_tag(task.rustc_version.as_str(), &task.task_id);
+    let reference = session.reference(&tag)?;
+    let Some(published) = stow_oci::pull_optional_records_by_tag(session, &tag).await? else {
+        return Ok(None);
     };
-    let manifest_json: serde_json::Value = serde_json::from_slice(&manifest)
-        .map_err(|error| stow_types::stow_error!("parse published marker manifest: {error}"))?;
-    let is_records = manifest_json
-        .get("artifactType")
-        .and_then(serde_json::Value::as_str)
-        == Some(stow_types::records::RECORDS_ARTIFACT_TYPE)
-        && manifest_json
-            .get("annotations")
-            .and_then(|a| a.get(stow_types::records::RECORDS_TASK_ID_ANNOTATION))
-            .and_then(serde_json::Value::as_str)
-            == Some(task.task_id.as_str());
-    if !is_records {
+    if published.task_id != task.task_id {
         return Err(stow_types::stow_error!(
             "published marker {reference} does not name a records artifact for {}",
             task.task_id
         ));
     }
     // Every reader verifies the signature before trusting a row: the
-    // marker's manifest must carry a records signature bound to the
-    // pinned builder identity — an unverifiable marker means build
-    // normally (stow#877).
+    // marker's manifest must carry an inline records signature bound to
+    // the pinned builder identity — an unverifiable marker means build
+    // normally (stow#877, stow#1627).
     let build_identity =
         stow_oci::verify::ReleaseIdentity::new(stow_types::trusted_builder::TrustedWorkflow::BUILD);
-    if !marker_signature_verified(
-        session,
+    let repository = format!("{}/{}", reference.registry(), reference.repository());
+    if !published.verify_marker(
         trust,
-        &reference,
-        &manifest_digest,
+        &repository,
+        task.rustc_version.as_str(),
         &build_identity,
-    )
-    .await?
-    {
+    ) {
         return Ok(None);
-    }
-    // A signed marker proves a build ran, not that it published the whole
-    // node: a record set short of a shape the node owes (an earlier builder
-    // never published the build script's explicit spelling) would complete
-    // the node for consumers that then fail on the missing key. Such a set
-    // is no proof — the task builds, and its publish refuses nothing short.
-    // The rows judged are the verified manifest's own: a tag that moved
-    // between the two reads names another artifact, and nothing here has
-    // checked that one's signature.
-    let published = stow_oci::pull_records_by_tag(
-        session,
-        &stow_types::records::published_tag(task.rustc_version.as_str(), &task.task_id),
-    )
-    .await
-    .map_err(|error| stow_types::stow_error!("pull published records {reference}: {error}"))?;
-    if published.manifest_digest != manifest_digest {
-        return Err(stow_types::stow_error!(
-            "published marker {reference} moved from {manifest_digest} to {} while it was read",
-            published.manifest_digest
-        ));
     }
     if let Some(gap) = shapes::published_records_gap(task, &published.records)? {
         tracing::warn!(
@@ -397,55 +357,7 @@ async fn published_manifest(
         );
         return Ok(None);
     }
-    Ok(Some(manifest))
-}
-
-/// The `built-` marker's manifest verifies only when one signature
-/// layer both checks out under the build trust *and* binds a
-/// `records-` tag in this repository at this digest — tag aliases
-/// share the manifest's digest, so the `sha256-<digest>.sig` bundle
-/// indexes the signature the records push wrote, which names the
-/// `records-` tag rather than the marker's own.
-async fn marker_signature_verified(
-    session: &stow_oci::RegistrySession,
-    trust: &stow_oci::verify::Trust,
-    reference: &stow_oci::Reference,
-    manifest_digest: &str,
-    policy: &(impl stow_oci::resign::VerificationPolicy + Sync),
-) -> stow_types::error::Result<bool> {
-    let Ok(materials) =
-        stow_oci::pull_signature_materials(session, reference, manifest_digest).await
-    else {
-        return Ok(false);
-    };
-    let repository = format!("{}/{}", reference.registry(), reference.repository());
-    Ok(materials.iter().any(|material| {
-        let Some(bound) = stow_oci::verify::payload_docker_reference(&material.payload_bytes)
-        else {
-            return false;
-        };
-        let Some((bound_repo, bound_tag)) = bound.rsplit_once(':') else {
-            return false;
-        };
-        if bound_repo != repository || !stow_types::records::is_records_tag(bound_tag) {
-            return false;
-        }
-        let signature = stow_types::bundle::SigstoreSignature {
-            payload_path: material.payload_path.clone(),
-            signature: material.signature.clone(),
-            certificate_pem: material.certificate_pem.clone(),
-            rekor_bundle_json: material.rekor_bundle_json.clone(),
-        };
-        stow_oci::verify::verify_material(
-            trust,
-            &bound,
-            manifest_digest,
-            &signature,
-            &material.payload_bytes,
-            policy,
-        )
-        .is_ok()
-    }))
+    Ok(Some(published.envelope.signed_manifest))
 }
 
 async fn publish(
@@ -468,29 +380,19 @@ async fn publish(
     // A run whose task's signed records already exist re-tags the
     // proven manifest under its own `records-<…>-<run_id>-<attempt>`
     // tag — the webhook's per-run check still resolves — instead of
-    // validating and pushing a second build (stow#877).
-    if let Some(manifest) = published_manifest(task, &session, &trust).await? {
-        let reference = session.reference(&stow_types::records::records_tag(
-            task.rustc_version.as_str(),
+    // validating and pushing a second build (stow#877, stow#1627).
+    if let Some(signed_manifest) = published_manifest(task, &session, &trust).await? {
+        stow_oci::retag_records_with(
+            &session,
+            &task.rustc_version,
             &task.task_id,
             build_run_from_env()?,
-        ))?;
-        // The proven manifest is re-signed, not just re-tagged: every
-        // reader binds the signature to the tag it pulled, so this
-        // run's `records-…-<run>-<attempt>` tag needs its own layer
-        // in the shared `sha256-<digest>.sig` bundle (stow#877).
-        let reference_string = reference.to_string();
-        stow_oci::put_signed_manifest(&session, &reference, &manifest, |digest| {
-            let (reference_string, session) = (&reference_string, &session);
-            async move {
-                publisher
-                    .signer()
-                    .sign(session, reference_string, &digest)
-                    .await
-            }
-        })
-        .await
-        .map_err(|error| stow_types::stow_error!("retag records manifest {reference}: {error}"))?;
+            &signed_manifest,
+            |reference, digest| async move {
+                publisher.signer().sign_detached(&reference, &digest).await
+            },
+        )
+        .await?;
         tracing::info!(
             task_id = %task.task_id,
             "records already published — re-tagged, nothing built"
