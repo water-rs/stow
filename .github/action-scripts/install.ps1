@@ -54,6 +54,7 @@ Add-Content -Path $env:GITHUB_PATH -Value $dest
 & (Join-Path $dest 'stow.exe') setup --github-env | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 if ($LASTEXITCODE -ne 0) { throw 'stow setup --github-env failed' }
 # The linker selection cannot ride in the job environment; setup
-# writes it into the runner's global cargo config.
-& (Join-Path $dest 'stow.exe') setup
+# writes it into the runner's global cargo config while leaving
+# Cargo's standard `target/` layout untouched.
+& (Join-Path $dest 'stow.exe') setup --no-build-dir --no-install-skill
 if ($LASTEXITCODE -ne 0) { throw 'stow setup failed' }

@@ -74,5 +74,6 @@ echo "$dest" >> "$GITHUB_PATH"
 # The linker selection cannot ride in the job environment (env
 # rustflags would replace a project's configured rustflags
 # wholesale), so setup also writes it into the runner's global
-# cargo config — including the managed mold install on Linux.
-"$dest/stow" setup
+# cargo config — including the managed mold install on Linux —
+# while leaving Cargo's standard `target/` layout untouched.
+"$dest/stow" setup --no-build-dir --no-install-skill

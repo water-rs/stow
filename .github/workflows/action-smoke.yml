@@ -122,4 +122,8 @@ jobs:
           # not define.
           cargo new ../smoke-crate
           cd ../smoke-crate
+          mkdir -p tests
+          printf '#[test]\nfn smoke_it() {}\n' > tests/smoke_it.rs
           cargo check
+          cargo test --no-run
+          compgen -G "target/debug/deps/smoke_it-*" > /dev/null
