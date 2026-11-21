@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.9](https://github.com/water-rs/stow/compare/types/v0.21.8...types/v0.21.9) - 2026-11-21
+
+### Fixed
+
+- *(scheduler)* stream multi-part slice deltas instead of full resyncs ([#1614](https://github.com/water-rs/stow/pull/1614)) ([#1615](https://github.com/water-rs/stow/pull/1615))
+
+### Other
+
+- Merge pull request #1616 from water-rs/dev
+
 ## [0.21.8](https://github.com/water-rs/stow/compare/types/v0.21.7...types/v0.21.8) - 2026-11-20
 
 ### Added
