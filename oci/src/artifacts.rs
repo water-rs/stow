@@ -6,11 +6,10 @@ use oci_client::Reference;
 use oci_client::client::{Config, ImageLayer};
 use oci_client::manifest::OciImageManifest;
 use stow_types::bundle::{
-    ArtifactBlobConfig, BundleArtifactConfig, BundleParts, BundleSignatureMaterial,
-    SIGSTORE_BUNDLE_ANNOTATION, SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE,
-    SIGSTORE_SIGNATURE_ANNOTATION, STOW_ARTIFACT_CONFIG_MEDIA_TYPE, STOW_BUNDLE_CONFIG_MEDIA_TYPE,
-    STOW_BUNDLE_MEDIA_TYPE, STOW_PACK_MEDIA_TYPE, assemble_bundle, sigstore_payload_path,
-    sigstore_signature_tag,
+    ArtifactBlobConfig, BundleParts, BundleSignatureMaterial, SIGSTORE_BUNDLE_ANNOTATION,
+    SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE, SIGSTORE_SIGNATURE_ANNOTATION,
+    STOW_ARTIFACT_CONFIG_MEDIA_TYPE, STOW_BUNDLE_CONFIG_MEDIA_TYPE, STOW_BUNDLE_MEDIA_TYPE,
+    STOW_PACK_MEDIA_TYPE, assemble_bundle, sigstore_payload_path, sigstore_signature_tag,
 };
 use stow_types::bundle_schema::validate_bundle_schema;
 use stow_types::identity::WireRustcVersion;
@@ -56,6 +55,13 @@ pub async fn push_artifacts(
     .await
 }
 
+/// Shared empty OCI config blob of every `<tag>.bundle` manifest: no reader
+/// fetches the outer bundle manifest or its config (readers pull
+/// `bundle_digest` directly and verify the signed config inside the tar), so
+/// a constant `{}` blob keeps `bundle_digest` tagged at zero per-artifact
+/// config writes once the repository holds `{}` (stow#1627).
+const EMPTY_BUNDLE_CONFIG: &[u8] = b"{}";
+
 /// [`push_artifacts`] with the session and signer supplied — the mock
 /// registry tests push through this with the mock key's signer.
 ///
@@ -75,11 +81,30 @@ where
     S: Fn(String, String) -> Fut + Send + Sync,
     Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
 {
+    if plans.is_empty() {
+        return Ok(UploadOutcome {
+            published_by_reference: BTreeMap::new(),
+            newly_pushed: 0,
+        });
+    }
     let sign = &sign;
+    // Sign every plan before touching the registry: a failed signature leaves
+    // zero writes, and ensuring the shared `{}` config once afterwards avoids
+    // concurrent first-upload races across plans in flight.
+    let signed: Vec<SignedArtifact> = stream::iter(plans)
+        .map(|plan| sign_plan(plan, sign))
+        .buffered(PUBLISH_CONCURRENCY)
+        .try_collect()
+        .await?;
+    let empty_config_digest = sha256_digest(EMPTY_BUNDLE_CONFIG);
+    session
+        .push_blob(&empty_config_digest, EMPTY_BUNDLE_CONFIG)
+        .await
+        .map_err(|error| stow_types::stow_error!("push shared bundle config: {error}"))?;
     // `buffered` yields in plan order, so a repeated reference keeps the
     // later plan's coordinates exactly as the one-by-one loop did.
-    let artifacts: Vec<PublishedArtifact> = stream::iter(plans)
-        .map(|plan| publish_artifact(session, plan, sign))
+    let artifacts: Vec<PublishedArtifact> = stream::iter(signed)
+        .map(|artifact| push_signed_artifact(session, artifact))
         .buffered(PUBLISH_CONCURRENCY)
         .try_collect()
         .await?;
@@ -97,11 +122,20 @@ where
     })
 }
 
-async fn publish_artifact<S, Fut>(
-    session: &RegistrySession,
+struct SignedArtifact {
+    oci_reference: String,
+    oci_digest: String,
+    manifest_bytes: Vec<u8>,
+    config_bytes: Vec<u8>,
+    config: ArtifactBlobConfig,
+    signature: BundleSignatureMaterial,
+    pack: Vec<u8>,
+}
+
+async fn sign_plan<S, Fut>(
     plan: &PlannedArtifact,
     sign: &S,
-) -> stow_types::error::Result<PublishedArtifact>
+) -> stow_types::error::Result<SignedArtifact>
 where
     S: Fn(String, String) -> Fut + Send + Sync,
     Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
@@ -109,15 +143,76 @@ where
     let config = artifact_config(plan);
     let config_bytes = serde_json::to_vec(&config)?;
     let pack = build_pack(plan).await?;
-    publish_packed(
+    let (manifest_bytes, oci_digest, signature) =
+        sign_packed(&plan.oci_reference, &config_bytes, &pack, sign).await?;
+    Ok(SignedArtifact {
+        oci_reference: plan.oci_reference.clone(),
+        oci_digest,
+        manifest_bytes,
+        config_bytes,
+        config,
+        signature,
+        pack,
+    })
+}
+
+async fn push_signed_artifact(
+    session: &RegistrySession,
+    signed: SignedArtifact,
+) -> stow_types::error::Result<PublishedArtifact> {
+    let signatures = [signed.signature];
+    let (bundle_digest, bundle_size) = push_bundle(
         session,
-        &plan.oci_reference,
-        &config,
-        &config_bytes,
-        &pack,
-        sign,
+        &BundleParts {
+            oci_reference: &signed.oci_reference,
+            oci_digest: &signed.oci_digest,
+            manifest_bytes: &signed.manifest_bytes,
+            config_bytes: &signed.config_bytes,
+            config: &signed.config,
+            signatures: &signatures,
+            pack: &signed.pack,
+        },
+        true,
     )
-    .await
+    .await?;
+    Ok(PublishedArtifact {
+        oci_digest: signed.oci_digest,
+        bundle_digest,
+        bundle_size,
+    })
+}
+
+async fn sign_packed<S, Fut>(
+    oci_reference: &str,
+    config_bytes: &[u8],
+    pack: &[u8],
+    sign: &S,
+) -> stow_types::error::Result<(Vec<u8>, String, BundleSignatureMaterial)>
+where
+    S: Fn(String, String) -> Fut + Send + Sync,
+    Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
+{
+    let layer = ImageLayer::new(pack.to_vec(), STOW_PACK_MEDIA_TYPE.to_owned(), None);
+    let manifest = OciImageManifest::build(
+        std::slice::from_ref(&layer),
+        &Config::new(
+            config_bytes.to_vec(),
+            STOW_ARTIFACT_CONFIG_MEDIA_TYPE.to_owned(),
+            None,
+        ),
+        None,
+    );
+    let manifest_bytes = canonical_manifest_bytes(&manifest)?;
+    let oci_digest = sha256_digest(&manifest_bytes);
+    let signature = sign(oci_reference.to_owned(), oci_digest.clone())
+        .await
+        .map_err(|error| stow_types::stow_error!("sign OCI artifact {oci_reference}: {error}"))?;
+    tracing::info!(
+        oci_reference = %oci_reference,
+        digest = %oci_digest,
+        "signed OCI artifact"
+    );
+    Ok((manifest_bytes, oci_digest, signature))
 }
 
 /// Sign the artifact whose one layer is `pack` and push the bundle
@@ -149,27 +244,8 @@ where
     S: Fn(String, String) -> Fut + Send + Sync,
     Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
 {
-    let layer = ImageLayer::new(pack.to_vec(), STOW_PACK_MEDIA_TYPE.to_owned(), None);
-    let manifest = OciImageManifest::build(
-        std::slice::from_ref(&layer),
-        &Config::new(
-            config_bytes.to_vec(),
-            STOW_ARTIFACT_CONFIG_MEDIA_TYPE.to_owned(),
-            None,
-        ),
-        None,
-    );
-    let manifest_bytes = canonical_manifest_bytes(&manifest)?;
-    let oci_digest = sha256_digest(&manifest_bytes);
-    let signature = sign(oci_reference.to_owned(), oci_digest.clone())
-        .await
-        .map_err(|error| stow_types::stow_error!("sign OCI artifact {oci_reference}: {error}"))?;
-    tracing::info!(
-        oci_reference = %oci_reference,
-        digest = %oci_digest,
-        "signed OCI artifact"
-    );
-
+    let (manifest_bytes, oci_digest, signature) =
+        sign_packed(oci_reference, config_bytes, pack, sign).await?;
     let signatures = [signature];
 
     let (bundle_digest, bundle_size) = push_bundle(
@@ -183,6 +259,7 @@ where
             signatures: &signatures,
             pack,
         },
+        false,
     )
     .await?;
 
@@ -199,6 +276,7 @@ where
 async fn push_bundle(
     session: &RegistrySession,
     parts: &BundleParts<'_>,
+    empty_config_present: bool,
 ) -> stow_types::error::Result<(String, u64)> {
     let oci_reference = parts.oci_reference;
     let bundle_bytes = assemble_bundle(parts)
@@ -213,26 +291,31 @@ async fn push_bundle(
         .map_err(|_| stow_types::stow_error!("bundle for {oci_reference} exceeds u64 bytes"))?;
     let bundle_layer = ImageLayer::new(bundle_bytes, STOW_BUNDLE_MEDIA_TYPE.to_owned(), None);
     let bundle_digest = bundle_layer.sha256_digest();
-    let bundle_config = serde_json::to_vec(&BundleArtifactConfig {
-        oci_reference: oci_reference.to_owned(),
-        oci_digest: parts.oci_digest.to_owned(),
-    })?;
     let parsed_bundle_reference: Reference = bundle_reference.parse().map_err(|error| {
         stow_types::stow_error!("parse bundle reference {bundle_reference}: {error}")
     })?;
-    session
-        .push_blob_pair(
-            (&bundle_digest, &bundle_layer.data),
-            (&sha256_digest(&bundle_config), &bundle_config),
-        )
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("push bundle artifact {bundle_reference}: {error}")
-        })?;
+    if empty_config_present {
+        session
+            .push_blob(&bundle_digest, &bundle_layer.data)
+            .await
+            .map_err(|error| {
+                stow_types::stow_error!("push bundle artifact {bundle_reference}: {error}")
+            })?;
+    } else {
+        session
+            .push_blob_pair(
+                (&bundle_digest, &bundle_layer.data),
+                (&sha256_digest(EMPTY_BUNDLE_CONFIG), EMPTY_BUNDLE_CONFIG),
+            )
+            .await
+            .map_err(|error| {
+                stow_types::stow_error!("push bundle artifact {bundle_reference}: {error}")
+            })?;
+    }
     let manifest = OciImageManifest::build(
         std::slice::from_ref(&bundle_layer),
         &Config::new(
-            bundle_config,
+            EMPTY_BUNDLE_CONFIG.to_vec(),
             STOW_BUNDLE_CONFIG_MEDIA_TYPE.to_owned(),
             None,
         ),
@@ -276,6 +359,14 @@ pub async fn pull_signature_materials(
     oci_digest: &str,
 ) -> stow_types::error::Result<Vec<BundleSignatureMaterial>> {
     pull_signature_materials_as(session, reference, oci_digest, Presence::Unknown).await
+}
+
+pub async fn pull_listed_signature_materials(
+    session: &RegistrySession,
+    reference: &Reference,
+    oci_digest: &str,
+) -> stow_types::error::Result<Vec<BundleSignatureMaterial>> {
+    pull_signature_materials_as(session, reference, oci_digest, Presence::Listed).await
 }
 
 async fn pull_signature_materials_as(

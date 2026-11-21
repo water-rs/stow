@@ -205,13 +205,7 @@ pub async fn run(
 impl Resigner<'_> {
     /// Re-sign one task whose records tags are `tags`, newest first.
     async fn task(&self, tags: &[&str]) -> stow_types::error::Result<TaskResigned> {
-        let sign = |reference: String, digest: String| async move {
-            self.publisher
-                .signer()
-                .sign(self.session, &reference, &digest)
-                .await
-        };
-        let sign_node = |reference: String, digest: String| async move {
+        let sign_detached = |reference: String, digest: String| async move {
             self.publisher
                 .signer()
                 .sign_detached(&reference, &digest)
@@ -228,8 +222,8 @@ impl Resigner<'_> {
             },
             self.build,
             Signers {
-                records: &sign,
-                node: &sign_node,
+                records: &sign_detached,
+                node: &sign_detached,
             },
         )
         .await?;
@@ -244,28 +238,22 @@ impl Resigner<'_> {
     }
 
     /// Check that the `built-` marker `tag` resolves to a records manifest
-    /// carrying a signature under the new identity.
+    /// carrying an inline signature under the new identity.
     async fn marker(&self, tag: &str) -> stow_types::error::Result<()> {
         let reference = self.session.reference(tag)?;
-        let digest = self
-            .session
-            .fetch_manifest_digest(&reference)
-            .await
-            .map_err(|error| stow_types::stow_error!("head marker {reference}: {error}"))?;
-        if crate::marker_signature_verified(
-            self.session,
+        let pulled = stow_oci::pull_listed_records_by_tag(self.session, tag).await?;
+        let repository = format!("{}/{}", reference.registry(), reference.repository());
+        if pulled.verify_marker(
             self.trust,
-            &reference,
-            &digest,
+            &repository,
+            self.rustc_version.as_str(),
             &self.new,
-        )
-        .await?
-        {
+        ) {
             Ok(())
         } else {
             Err(stow_types::stow_error!(
-                "marker {reference} names {digest}, which no records tag of this repository \
-                 carries a new-identity signature for"
+                "marker {reference} carries no inline records signature for {} under the new identity",
+                pulled.signed_digest
             ))
         }
     }

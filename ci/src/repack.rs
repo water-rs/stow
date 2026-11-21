@@ -144,16 +144,11 @@ impl Sweeper<'_> {
         let mut pulled = Vec::with_capacity(tags.len());
         for tag in tags {
             let records = stow_oci::pull_listed_records_by_tag(self.session, tag).await?;
-            let reference = self.session.reference(tag)?;
-            stow_oci::verify_listed_artifact_signature(
-                self.session,
+            records.verify(
                 self.trust,
-                &reference,
                 &cache_repository(self.rustc_version).reference(tag),
-                &records.manifest_digest,
                 &ReleaseIdentity::new(TrustedWorkflow::BUILD),
-            )
-            .await?;
+            )?;
             pulled.push(records);
         }
         let Some(task_id) = pulled.first().map(|records| records.task_id.clone()) else {
@@ -168,13 +163,7 @@ impl Sweeper<'_> {
             .filter(|record| seen.insert(record.oci_reference.as_str()))
             .collect::<Vec<_>>();
 
-        let sign = |reference: String, digest: String| async move {
-            self.publisher
-                .signer()
-                .sign(self.session, &reference, &digest)
-                .await
-        };
-        let sign_node = |reference: String, digest: String| async move {
+        let sign_detached = |reference: String, digest: String| async move {
             self.publisher
                 .signer()
                 .sign_detached(&reference, &digest)
@@ -188,7 +177,7 @@ impl Sweeper<'_> {
                 self.trust,
                 &ReleaseIdentity::new(TrustedWorkflow::BUILD),
                 record,
-                &sign_node,
+                &sign_detached,
             )
             .await?;
             if row.is_some() {
@@ -213,7 +202,7 @@ impl Sweeper<'_> {
                     .local_programs
                     .clone(),
             },
-            sign,
+            sign_detached,
         )
         .await?;
         tracing::info!(task_id, repacked, records_tag = %published.tag, "repacked task");

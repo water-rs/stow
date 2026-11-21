@@ -79,16 +79,6 @@ pub fn sigstore_payload_path(index: usize) -> String {
     format!("{STOW_SIGSTORE_PAYLOAD_DIR}/payload-{index}.json")
 }
 
-/// Config blob of the `<tag>.bundle` artifact: which signed artifact the
-/// bundle was assembled from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BundleArtifactConfig {
-    /// Canonical stow reference of the signed artifact.
-    pub oci_reference: String,
-    /// Manifest digest of the signed artifact.
-    pub oci_digest: String,
-}
-
 /// One cosign signature as read off the signature image: the payload blob
 /// plus the annotations carried on its layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
