@@ -125,5 +125,13 @@ jobs:
           mkdir -p tests
           printf '#[test]\nfn smoke_it() {}\n' > tests/smoke_it.rs
           cargo check
-          cargo test --no-run
-          compgen -G "target/debug/deps/smoke_it-*" > /dev/null
+          exe="$(cargo test --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "smoke_it") | .executable')"
+          [ -f "$exe" ]
+          case "$exe" in
+            */target/*|*'\\target\\'*) ;;
+            *)
+              echo "::error::expected test binary inside target/, got: $exe" >&2
+              exit 1
+              ;;
+          esac
+          [ ! -d "${HOME}/.stow/build-dir" ]
