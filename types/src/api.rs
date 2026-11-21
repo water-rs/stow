@@ -2262,14 +2262,15 @@ pub const SLICE_REPORT_PART_BYTES: usize = 512 * 1024;
 ///   `stow-admin index report --full` resync, and the resync a refused
 ///   delta triggers.
 ///
-/// A full report whose membership does not fit one
+/// A report — full or delta — that does not fit one
 /// [`SLICE_REPORT_PART_BYTES`] part arrives as `parts` consecutive
 /// parts (`part` `0..parts`), each carrying a disjoint share of
-/// `added` and the same `target`, `rustc_version`, `generation` and
-/// `parts`. The scheduler stages the parts and replaces the slice's set
-/// only when the last one arrives; a newer part 0 supersedes an
-/// incomplete earlier report, and a delta is refused while one is
-/// staged.
+/// `retired` and `added` and the same `target`, `rustc_version`,
+/// `base_generation`, `generation` and `parts`. The scheduler stages a
+/// full report's parts and replaces the slice's set when the last one
+/// arrives; it applies each delta part's rows as it arrives and advances
+/// the slice's generation with the last; a part 0 supersedes an
+/// incomplete earlier staged report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PublishedSlice {
     /// The slice's compilation target triple.
@@ -2287,13 +2288,14 @@ pub struct PublishedSlice {
     /// This part's index inside its report; `0` for a single-part
     /// report.
     pub part: u32,
-    /// How many parts the report was split into; `1` for a delta and
-    /// for a full report that fits one part.
+    /// How many parts the report was split into; `1` when the report
+    /// fits one part.
     pub parts: u32,
-    /// Rows entering the slice — on a part of a full report, that
-    /// part's share of the membership.
+    /// Rows entering the slice — on a multi-part report, that part's
+    /// share of the entering rows.
     pub added: Vec<PublishedSliceRow>,
-    /// Rows leaving the slice — always empty on a full report.
+    /// Rows leaving the slice — always empty on a full report; on a
+    /// multi-part delta, that part's share of the leaving rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired: Vec<PublishedSliceRow>,
 }
@@ -2315,14 +2317,13 @@ pub struct PublishedRunReport {
 
 impl PublishedRunReport {
     /// Split a run's slices into consecutive request bodies, each at
-    /// most `body_bytes` serialized, to be posted in order. A full
-    /// report over `part_bytes` becomes several parts of at most
-    /// `part_bytes` each, in order, no two in one body; a delta, or a
-    /// full report that fits, travels whole.
+    /// most `body_bytes` serialized, to be posted in order. A report
+    /// over `part_bytes` becomes several parts of at most `part_bytes`
+    /// each, in order, no two in one body; one that fits travels whole.
     ///
     /// # Errors
-    /// When a row alone is larger than a part, a delta or whole report
-    /// is larger than a body, or a slice is already split.
+    /// When a row alone is larger than a part, a part is larger than a
+    /// body, or a slice is already split.
     pub fn into_bodies(
         slices: Vec<PublishedSlice>,
         part_bytes: usize,
@@ -2344,17 +2345,21 @@ impl PublishedRunReport {
                 ));
             }
             let whole = json_len(&slice)?;
-            if slice.base_generation.is_some() || whole <= part_bytes {
-                if whole > budget {
-                    return Err(stow_error!(
-                        "slice {}/{} serializes to {whole} bytes, over the {body_bytes}-byte body",
-                        slice.target,
-                        slice.rustc_version
-                    ));
-                }
+            if whole <= part_bytes {
                 parts.push((slice, whole));
             } else {
                 parts.extend(slice.into_parts(part_bytes)?);
+            }
+        }
+        for (part, bytes) in &parts {
+            if *bytes > budget {
+                return Err(stow_error!(
+                    "slice {}/{} part {}/{} serializes to {bytes} bytes, over the {body_bytes}-byte body",
+                    part.target,
+                    part.rustc_version,
+                    part.part,
+                    part.parts
+                ));
             }
         }
         let mut bodies = Vec::new();
@@ -2382,9 +2387,10 @@ impl PublishedRunReport {
 }
 
 impl PublishedSlice {
-    /// Split a full report into parts of at most `part_bytes`
-    /// serialized each, with each part's size bound (the part index
-    /// and count counted at their widest).
+    /// Split a report into parts of at most `part_bytes` serialized
+    /// each, `retired` rows first and `added` rows after, with each
+    /// part's size bound (the part index and count counted at their
+    /// widest).
     fn into_parts(self, part_bytes: usize) -> crate::error::Result<Vec<(Self, usize)>> {
         let Self {
             target,
@@ -2395,7 +2401,7 @@ impl PublishedSlice {
             retired,
             ..
         } = self;
-        let shell = |part, parts, added| Self {
+        let shell = |part, parts, added, retired| Self {
             target: target.clone(),
             rustc_version: rustc_version.clone(),
             base_generation,
@@ -2403,42 +2409,116 @@ impl PublishedSlice {
             part,
             parts,
             added,
-            retired: retired.clone(),
+            retired,
         };
-        let envelope = json_len(&shell(u32::MAX, u32::MAX, Vec::new()))?;
-        let mut shares: Vec<(Vec<PublishedSliceRow>, usize)> = Vec::new();
-        let mut share = Vec::new();
-        let mut share_len = envelope;
-        for row in added {
-            let bytes = json_len(&row)?;
-            if envelope + bytes > part_bytes {
-                return Err(stow_error!(
-                    "a row of slice {target}/{rustc_version} serializes to {bytes} bytes, \
-                     over the {part_bytes}-byte part"
-                ));
-            }
-            // A part's rows are `,`-separated.
-            if !share.is_empty() && share_len + 1 + bytes > part_bytes {
-                shares.push((std::mem::take(&mut share), share_len));
-                share_len = envelope;
-            }
-            share_len += if share.is_empty() { bytes } else { 1 + bytes };
-            share.push(row);
-        }
-        shares.push((share, share_len));
+        let base_envelope = json_len(&shell(u32::MAX, u32::MAX, Vec::new(), Vec::new()))?;
+        let retired_envelope = if let Some(first) = retired.first() {
+            json_len(&shell(u32::MAX, u32::MAX, Vec::new(), vec![first.clone()]))?
+                - json_len(first)?
+        } else {
+            base_envelope
+        };
+        let slice_name = format!("{target}/{rustc_version}");
+        let shares = pack_part_shares(
+            &slice_name,
+            part_bytes,
+            base_envelope,
+            retired_envelope,
+            retired,
+            added,
+        )?;
         let parts = u32::try_from(shares.len())
             .map_err(|_| stow_error!("slice report part count overflows u32"))?;
         Ok(shares
             .into_iter()
             .enumerate()
-            .map(|(part, (added, bytes))| {
+            .map(|(part, (added, retired, bytes))| {
                 (
-                    shell(u32::try_from(part).expect("part fits u32"), parts, added),
+                    shell(
+                        u32::try_from(part).expect("part fits u32"),
+                        parts,
+                        added,
+                        retired,
+                    ),
                     bytes,
                 )
             })
             .collect())
     }
+}
+
+type SlicePartShare = (Vec<PublishedSliceRow>, Vec<PublishedSliceRow>, usize);
+
+fn pack_part_shares(
+    slice_name: &str,
+    part_bytes: usize,
+    base_envelope: usize,
+    retired_envelope: usize,
+    retired: Vec<PublishedSliceRow>,
+    added: Vec<PublishedSliceRow>,
+) -> crate::error::Result<Vec<SlicePartShare>> {
+    let mut shares: Vec<SlicePartShare> = Vec::new();
+    let mut share_added: Vec<PublishedSliceRow> = Vec::new();
+    let mut share_retired: Vec<PublishedSliceRow> = Vec::new();
+    let mut share_len = if retired.is_empty() {
+        base_envelope
+    } else {
+        retired_envelope
+    };
+    for row in retired {
+        let bytes = json_len(&row)?;
+        if retired_envelope + bytes > part_bytes {
+            return Err(stow_error!(
+                "a row of slice {slice_name} serializes to {bytes} bytes, \
+                 over the {part_bytes}-byte part"
+            ));
+        }
+        if !share_retired.is_empty() && share_len + 1 + bytes > part_bytes {
+            shares.push((Vec::new(), std::mem::take(&mut share_retired), share_len));
+            share_len = retired_envelope;
+        }
+        share_len += if share_retired.is_empty() {
+            bytes
+        } else {
+            1 + bytes
+        };
+        share_retired.push(row);
+    }
+    for row in added {
+        let bytes = json_len(&row)?;
+        if base_envelope + bytes > part_bytes {
+            return Err(stow_error!(
+                "a row of slice {slice_name} serializes to {bytes} bytes, \
+                 over the {part_bytes}-byte part"
+            ));
+        }
+        let addition = if share_added.is_empty() {
+            bytes
+        } else {
+            1 + bytes
+        };
+        if (!share_retired.is_empty() || !share_added.is_empty())
+            && share_len + addition > part_bytes
+        {
+            shares.push((
+                std::mem::take(&mut share_added),
+                std::mem::take(&mut share_retired),
+                share_len,
+            ));
+            share_len = base_envelope + bytes;
+        } else {
+            share_len += addition;
+        }
+        share_added.push(row);
+    }
+    if share_added.is_empty() && share_retired.is_empty() {
+        return Err(stow_error!(
+            "slice {slice_name} serializes to {base_envelope} bytes, \
+             over the {part_bytes}-byte part"
+        ));
+    }
+    shares.push((share_added, share_retired, share_len));
+    Ok(shares)
 }
 
 // ===== Operations API (`stow-admin` under `/api/v1/admin/*`) =====
@@ -5194,10 +5274,9 @@ mod tests {
         assert_eq!(rows, whole.added);
     }
 
-    /// Slices that fit travel whole and share a body; a delta is never
-    /// split.
+    /// Slices that fit travel whole and share a body.
     #[test]
-    fn fitting_slices_share_a_body_and_a_delta_stays_whole() {
+    fn fitting_slices_share_a_body() {
         let a = full_report("x86_64-unknown-linux-gnu", 3);
         let mut b = full_report("aarch64-apple-darwin", 3);
         b.base_generation = Some(6);
@@ -5211,14 +5290,50 @@ mod tests {
         assert_eq!(bodies, vec![PublishedRunReport { slices: vec![a, b] }]);
     }
 
-    /// A delta over the body, and a row over the part, fail on the
+    /// A delta over the part bound splits its `retired` and `added`
+    /// rows into bounded parts without falling back to a full report.
+    #[test]
+    fn a_delta_slice_report_splits_into_bounded_parts() {
+        let mut whole = full_report("x86_64-unknown-linux-gnu", 260);
+        whole.base_generation = Some(292);
+        whole.generation = 293;
+        whole.retired = (1_000..1_140).map(report_row).collect();
+        let part_bytes = json_len(&whole).unwrap() / 4;
+        let body_bytes = part_bytes * 2 + 1024;
+        let bodies = PublishedRunReport::into_bodies(vec![whole.clone()], part_bytes, body_bytes)
+            .expect("split delta");
+        assert!(bodies.len() > 2);
+        let mut next = 0;
+        let mut added = Vec::new();
+        let mut retired = Vec::new();
+        let mut parts = None;
+        for body in &bodies {
+            assert!(json_len(body).unwrap() <= body_bytes);
+            assert_eq!(body.slices.len(), 1);
+            for part in &body.slices {
+                assert!(json_len(part).unwrap() <= part_bytes);
+                assert_eq!(part.part, next);
+                assert_eq!(*parts.get_or_insert(part.parts), part.parts);
+                assert_eq!(part.base_generation, Some(292));
+                assert_eq!(part.generation, 293);
+                next += 1;
+                retired.extend(part.retired.clone());
+                added.extend(part.added.clone());
+            }
+        }
+        assert_eq!(Some(next), parts);
+        assert_eq!(retired, whole.retired);
+        assert_eq!(added, whole.added);
+    }
+
+    /// A part over the body, and a row over the part, fail on the
     /// client with a message naming the slice.
     #[test]
     fn an_unsplittable_slice_is_an_error() {
         let mut delta = full_report("x86_64-unknown-linux-gnu", 400);
         delta.base_generation = Some(6);
-        let error = PublishedRunReport::into_bodies(vec![delta], 1 << 10, 4 << 10)
-            .expect_err("delta over the body");
+        let error = PublishedRunReport::into_bodies(vec![delta], 8 << 10, 4 << 10)
+            .expect_err("part over the body");
         assert!(error.to_string().contains("x86_64-unknown-linux-gnu"));
         let error = PublishedRunReport::into_bodies(
             vec![full_report("x86_64-unknown-linux-gnu", 400)],

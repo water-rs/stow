@@ -177,18 +177,27 @@ pub struct HeldSlice {
     pub rustc_version: String,
     /// The generation the slice last applied.
     pub generation: i64,
-    /// The generation of the full report staged for the slice, if any.
+    /// The generation of the multi-part report staged for the slice, if any.
     pub staged_generation: Option<i64>,
 }
 
-/// The parts received so far of one slice's multi-part full report.
+/// The parts received so far of one slice's multi-part report.
+///
+/// A full report (`base_generation` `None`) keeps each part's non-empty
+/// `added` rows until the last part replaces the slice's set; a delta
+/// (`base_generation` `Some`) applies each part's `retired` and `added`
+/// rows as it arrives and keeps only empty part slots (`rows.len()` is
+/// the next part index) until the last part advances the generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StagedSlice {
+    /// Base generation every part of a delta names; `None` for a full report.
+    base_generation: Option<i64>,
     /// The generation every part of the report names.
     generation: i64,
     /// The part count every part of the report names.
     parts: u32,
-    /// The rows of parts `0..rows.len()`, in order.
+    /// For a full report, the rows of parts `0..rows.len()`; for a delta,
+    /// `rows.len()` empty vectors marking the applied parts.
     rows: Vec<Vec<PublishedSliceRow>>,
 }
 
@@ -1905,12 +1914,12 @@ impl Graph {
     }
 
     /// Whether a slice report part extends its slice. A delta applies
-    /// only on top of exactly the generation it was diffed against,
-    /// publishes the next one, and never lands on a staged full report;
-    /// anything else is a gap the reporter resyncs. A full report's
-    /// part 0 always does — it replaces the set, supersedes any staged
-    /// report and restarts the sequence — and a later part extends the
-    /// staged report its metadata names, in order.
+    /// only on top of exactly the generation it was diffed against and
+    /// publishes the next one; its part 0 supersedes any incomplete
+    /// staged report, and each later part continues the staged delta in
+    /// order. A full report's part 0 replaces the set, supersedes any
+    /// staged report and restarts the sequence; each later part extends
+    /// the staged full report its metadata names, in order.
     ///
     /// # Errors
     /// `QueueError::SliceReportConflict` naming the live or staged
@@ -1934,63 +1943,51 @@ impl Graph {
             .target_lookup(target)
             .zip(self.rustc_lookup(rustc_version))
             .and_then(|slice| self.staged_slices.get(&slice));
-        let Some(base) = base_generation else {
-            if part == 0 {
-                return Ok(());
-            }
-            let Some(staged) = staged else {
+        if let Some(base) = base_generation {
+            let live = self.slice_generation(target, rustc_version);
+            if live != Some(base) {
                 return Err(QueueError::SliceReportConflict(format!(
-                    "slice report part {part} of {parts} has no staged earlier part"
+                    "slice report base generation {base} conflicts with the live generation {}",
+                    live.map_or_else(|| "none".to_owned(), |live| live.to_string()),
                 )));
-            };
-            if staged.generation != generation {
+            }
+            if generation != base + 1 {
                 return Err(QueueError::SliceReportConflict(format!(
-                    "slice report generation {generation} part {part} does not continue the \
-                     staged generation {}",
-                    staged.generation
+                    "slice report generation {generation} is not the generation after its base {base}"
                 )));
             }
-            if staged.parts != parts {
-                return Err(QueueError::Invariant(format!(
-                    "slice report generation {generation} changed its part count from {} to {parts}",
-                    staged.parts
-                )));
-            }
-            if staged.rows.len() != part as usize {
-                return Err(QueueError::SliceReportConflict(format!(
-                    "slice report part {part} arrived where part {} was next",
-                    staged.rows.len()
-                )));
-            }
+        }
+        if part == 0 {
             return Ok(());
+        }
+        let Some(staged) = staged else {
+            return Err(QueueError::SliceReportConflict(format!(
+                "slice report part {part} of {parts} has no staged earlier part"
+            )));
         };
-        if parts != 1 {
+        if staged.base_generation != base_generation || staged.generation != generation {
+            return Err(QueueError::SliceReportConflict(format!(
+                "slice report generation {generation} (base {base_generation:?}) part {part} \
+                 does not continue the staged generation {} (base {:?})",
+                staged.generation, staged.base_generation
+            )));
+        }
+        if staged.parts != parts {
             return Err(QueueError::Invariant(format!(
-                "a delta slice report is one part, not {parts}"
+                "slice report generation {generation} changed its part count from {} to {parts}",
+                staged.parts
             )));
         }
-        if let Some(staged) = staged {
+        if staged.rows.len() != part as usize {
             return Err(QueueError::SliceReportConflict(format!(
-                "a delta slice report cannot land on the staged full report of generation {}",
-                staged.generation
-            )));
-        }
-        let live = self.slice_generation(target, rustc_version);
-        if live != Some(base) {
-            return Err(QueueError::SliceReportConflict(format!(
-                "slice report base generation {base} conflicts with the live generation {}",
-                live.map_or_else(|| "none".to_owned(), |live| live.to_string()),
-            )));
-        }
-        if generation != base + 1 {
-            return Err(QueueError::SliceReportConflict(format!(
-                "slice report generation {generation} is not the generation after its base {base}"
+                "slice report part {part} arrived where part {} was next",
+                staged.rows.len()
             )));
         }
         Ok(())
     }
 
-    /// Parts held in staged, incomplete full reports.
+    /// Parts held in staged, incomplete reports.
     #[cfg(test)]
     pub fn staged_part_count(&self) -> usize {
         self.staged_slices
@@ -2026,18 +2023,17 @@ impl Graph {
 
     /// The published rows applying `report` reads, added to `needs`.
     ///
-    /// A delta reads the key of each row it adds or retires; a full
-    /// report reads its slice's members, and only with its last part —
-    /// the earlier parts stage and read nothing. Keys the changes since
-    /// the last snapshot answer are left out, and a slice the graph has
-    /// never held has no rows to read.
+    /// Every part of a delta reads the key of each row it adds or
+    /// retires; a full report reads its slice's members, and only with
+    /// its last part — the earlier parts stage and read nothing. Keys
+    /// the changes since the last snapshot answer are left out, and a
+    /// slice the graph has never held has no rows to read.
     pub fn slice_report_needs(&self, report: &SliceReportPart<'_>, needs: &mut PublishedNeeds) {
-        if report.part + 1 < report.parts {
-            return;
-        }
         let known = self.slice_lookup(report.target, report.rustc_version);
         if report.base_generation.is_none() {
-            if let Some(slice) = known {
+            if report.part + 1 == report.parts
+                && let Some(slice) = known
+            {
                 needs.want_slice(slice);
             }
             return;
@@ -2071,23 +2067,35 @@ impl Graph {
             return self.apply_full_slice(of, report.generation, report.added, base);
         }
         self.slice_generations.insert(of.id, report.generation);
-        let mut flips = 0;
-        for row in report.retired {
-            flips += self.apply_slice_row(of, row, false, base)?;
-        }
-        for row in report.added {
-            flips += self.apply_slice_row(of, row, true, base)?;
-        }
+        let flips = self.apply_delta_rows(of, report.retired, report.added, base)?;
         self.maybe_compact();
         Ok(flips)
     }
 
-    /// Apply one validated part of a slice report. A delta, and a full
-    /// report that is its only part, apply at once (the latter
-    /// dropping any staged report it supersedes). Part 0 of a longer
-    /// full report starts staging, superseding an earlier staged one;
-    /// each later part joins it, and the last applies the whole
-    /// membership as one full report. Returns the edge flips.
+    fn apply_delta_rows(
+        &mut self,
+        of: &ReportSlice<'_>,
+        retired: &[PublishedSliceRow],
+        added: &[PublishedSliceRow],
+        base: &mut impl PublishedSource,
+    ) -> Result<u32, QueueError> {
+        let mut flips = 0;
+        for row in retired {
+            flips += self.apply_slice_row(of, row, false, base)?;
+        }
+        for row in added {
+            flips += self.apply_slice_row(of, row, true, base)?;
+        }
+        Ok(flips)
+    }
+
+    /// Apply one validated part of a slice report. A single-part report
+    /// applies at once, dropping any staged report it supersedes. Part 0
+    /// of a multi-part full report stages its rows, each later part
+    /// joins it, and the last applies the whole membership; each part of
+    /// a multi-part delta applies its rows on arrival, stages an empty
+    /// cursor slot, and advances `slice_generations` on the last part.
+    /// Returns the edge flips.
     ///
     /// `base` holds the rows [`Self::slice_report_needs`] named.
     ///
@@ -2130,17 +2138,23 @@ impl Graph {
             }
             return self.apply_single_part(&of, report, base);
         }
-        assert!(
-            base_generation.is_none() && retired.is_empty(),
-            "a multi-part slice report is a full report"
-        );
+        let staged_rows = if base_generation.is_some() {
+            Vec::new()
+        } else {
+            assert!(
+                retired.is_empty() && !added.is_empty(),
+                "a multi-part full slice report carries non-empty added rows and no retired rows"
+            );
+            added.to_vec()
+        };
         if part == 0 {
             self.staged_slices.insert(
                 slice,
                 StagedSlice {
+                    base_generation,
                     generation,
                     parts,
-                    rows: vec![added.to_vec()],
+                    rows: vec![staged_rows],
                 },
             );
         } else {
@@ -2149,18 +2163,29 @@ impl Graph {
                 .get_mut(&slice)
                 .expect("a later slice report part follows its staged part 0");
             assert!(
-                staged.generation == generation
+                staged.base_generation == base_generation
+                    && staged.generation == generation
                     && staged.parts == parts
                     && staged.rows.len() == part as usize,
-                "slice report part {part} of {parts} (generation {generation}) does not \
-                 continue the staged {}/{} (generation {})",
+                "slice report part {part} of {parts} (generation {generation}, base {base_generation:?}) \
+                 does not continue the staged {}/{} (generation {}, base {:?})",
                 staged.rows.len(),
                 staged.parts,
-                staged.generation
+                staged.generation,
+                staged.base_generation
             );
-            staged.rows.push(added.to_vec());
+            staged.rows.push(staged_rows);
         }
         self.touch_staged(slice);
+        if base_generation.is_some() {
+            let flips = self.apply_delta_rows(&of, retired, added, base)?;
+            if part + 1 == parts {
+                self.staged_slices.remove(&slice);
+                self.slice_generations.insert(of.id, generation);
+            }
+            self.maybe_compact();
+            return Ok(flips);
+        }
         if part + 1 < parts {
             return Ok(0);
         }
@@ -6615,8 +6640,9 @@ mod tests {
     }
 
     /// A multi-part full report acts on nothing until its last part
-    /// arrives, applies as one replacement then, and a delta cannot
-    /// land while it is staged.
+    /// arrives and applies as one replacement then; a delta part 0 on
+    /// the live generation supersedes an incomplete staged full report
+    /// (stow#1614).
     #[test]
     fn a_multi_part_full_report_applies_with_its_last_part() {
         let mut graph = Graph::default();
@@ -6637,11 +6663,6 @@ mod tests {
         assert!(graph.is_published(&id("x")), "the live set stands");
         assert!(!graph.is_published(&id("c")) && !graph.is_published(&id("b")));
         assert!(!is_ready(&graph, "b"), "nothing acts on a staged report");
-        let delta = report(&mut graph, Some(1), 2, &["z"], &[]);
-        assert!(
-            matches!(delta, Err(QueueError::SliceReportConflict(_))),
-            "{delta:?}"
-        );
         part_report(&mut graph, 5, 2, 3, &["a"]).expect("last part");
         assert_eq!(graph.staged_part_count(), 0);
         assert_eq!(graph.slice_generation(TARGET, RUSTC), Some(5));
@@ -6656,7 +6677,79 @@ mod tests {
             graph.node_ix(&id("a")).is_none(),
             "the nodes the report serves leave the graph with the last part"
         );
-        report(&mut graph, Some(5), 6, &["z"], &[]).expect("a delta extends it");
+        // An interrupted full report behind the live generation is
+        // superseded cleanly by a delta on that live generation.
+        part_report(&mut graph, 6, 0, 2, &["w"]).expect("interrupted full part 0");
+        assert_eq!(graph.staged_part_count(), 1);
+        report(&mut graph, Some(5), 6, &["z"], &[]).expect("delta supersedes staged full");
+        assert_eq!(graph.staged_part_count(), 0);
+        assert_eq!(graph.slice_generation(TARGET, RUSTC), Some(6));
+        assert!(graph.is_published(&id("z")) && !graph.is_published(&id("w")));
+    }
+
+    /// stow#1614: a multi-part delta applies each part's rows without
+    /// retaining `PublishedSliceRow` vectors in `staged_slices`,
+    /// survives a mid-report snapshot, and advances `slice_generations`
+    /// with its last part.
+    #[test]
+    fn a_multi_part_delta_streams_rows_and_survives_the_snapshot() {
+        let mut graph = Graph::default();
+        report(&mut graph, None, 292, &["a", "b"], &[]).expect("live 292");
+        let delta_part = |graph: &mut Graph,
+                          part: u32,
+                          parts: u32,
+                          added: &[&str],
+                          retired: &[&str]|
+         -> Result<(), QueueError> {
+            graph.check_slice_report(TARGET, RUSTC, Some(292), 293, part, parts)?;
+            let rows = |names: &[&str]| -> Vec<PublishedSliceRow> {
+                names
+                    .iter()
+                    .flat_map(|name| {
+                        [
+                            published_row(name, UnitKind::Linked),
+                            published_row(name, UnitKind::Unlinked),
+                        ]
+                    })
+                    .collect()
+            };
+            graph.apply_slice_report_part(SliceReportPart {
+                target: TARGET,
+                rustc_version: RUSTC,
+                base_generation: Some(292),
+                generation: 293,
+                part,
+                parts,
+                added: &rows(added),
+                retired: &rows(retired),
+            });
+            Ok(())
+        };
+        delta_part(&mut graph, 0, 3, &["c"], &["a"]).expect("delta part 0");
+        assert_eq!(graph.slice_generation(TARGET, RUSTC), Some(292));
+        assert_eq!(graph.staged_part_count(), 1);
+        assert!(
+            graph
+                .staged_slices
+                .values()
+                .flat_map(|s| &s.rows)
+                .all(Vec::is_empty),
+            "staged delta parts retain no PublishedSliceRow allocations"
+        );
+        let mut restored = round_trip(&graph);
+        assert_eq!(restored.staged_slices, graph.staged_slices);
+        // Restarting from part 0 after an interruption is idempotent.
+        delta_part(&mut restored, 0, 3, &["c"], &["a"]).expect("replayed part 0");
+        delta_part(&mut restored, 1, 3, &["d"], &[]).expect("delta part 1");
+        let mut restored = round_trip(&restored);
+        assert_eq!(restored.slice_generation(TARGET, RUSTC), Some(292));
+        delta_part(&mut restored, 2, 3, &["e"], &[]).expect("delta last part");
+        assert_eq!(restored.staged_part_count(), 0);
+        assert_eq!(restored.slice_generation(TARGET, RUSTC), Some(293));
+        assert!(!restored.is_published(&id("a")));
+        for name in ["b", "c", "d", "e"] {
+            assert!(restored.is_published(&id(name)), "{name}");
+        }
     }
 
     /// A staged report is part of the snapshot: the parts that arrived
@@ -6734,8 +6827,8 @@ mod tests {
         part_report(&mut graph, 5, 1, 3, &["b"]).expect("part 1");
         // Repeating one.
         conflict(part_report(&mut graph, 5, 1, 3, &["b"]));
-        // A multi-part delta is a contradiction.
-        invariant(graph.check_slice_report(TARGET, RUSTC, Some(1), 2, 0, 2));
+        // Continuing a staged full report with a delta part > 0 is a conflict.
+        conflict(graph.check_slice_report(TARGET, RUSTC, Some(5), 6, 2, 3));
         assert_eq!(graph.staged_part_count(), 2, "refusals stage nothing");
     }
 
