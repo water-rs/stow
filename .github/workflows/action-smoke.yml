@@ -2,16 +2,16 @@ name: Action smoke
 
 on:
   push:
-    branches: [dev]
+    branches: [main]
   pull_request:
-  # `installable release` is a required check on dev, so the merge queue
+  # `installable release` is a required check on main, so the merge queue
   # waits for it on the merge_group ref; without this trigger the queue
   # would wait forever.
   merge_group:
 
 # A branch pushed several times in a row only needs its newest run: the older
-# ones test a tree nobody will merge. Pushes to main and dev keep theirs,
-# because those runs are the record of what the branch did.
+# ones test a tree nobody will merge. Pushes to main keep theirs, because
+# those runs are the record of what the branch did.
 concurrency:
   group: smoke-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -26,7 +26,7 @@ jobs:
   # Documentation cannot change what a compiler or a test observes, so the
   # jobs below skip it. The condition lives on the jobs and never on the
   # workflow's triggers: a workflow skipped by `paths-ignore` leaves its
-  # checks Pending forever and the dev ruleset requires seven of them, while
+  # checks Pending forever and the main ruleset requires it, while
   # a job skipped by `if:` reports success and satisfies them.
   changes:
     name: Changed paths

@@ -1,9 +1,9 @@
 //! The Worker's scheduled handler core (stow#1100): the Cloudflare Cron
 //! Trigger fires an event carrying the cron expression that fired, the
 //! deployed [`PeriodicSchedule`] names the workflows due on it, and each
-//! is dispatched on the branch its entry names (`main` unless the
-//! map says `dev`) through the scheduler Durable Object (which
-//! holds the GitHub App token cache). The handler creates, alters and
+//! is dispatched on the edge's own release tag through the scheduler
+//! Durable Object (which holds the GitHub App token cache). The handler
+//! creates, alters and
 //! backfills nothing; its cost is one Durable Object request and one
 //! outbound `workflow_dispatch` per due workflow, independent of stored
 //! data.

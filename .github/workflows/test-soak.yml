@@ -63,7 +63,7 @@ jobs:
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: nextest
-      # Restores the cache the test job saves on `dev` and never saves one
+      # Restores the cache the test job saves on `main` and never saves one
       # of its own: N legs writing N copies would evict the caches the
       # merge queue depends on.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

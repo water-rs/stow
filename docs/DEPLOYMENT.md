@@ -973,9 +973,7 @@ ships. The flow:
 `scripts/release-flow-e2e.sh` runs steps 2 and 3 on the mock stack
 (`MOCK.md`) as the release gate's `release-flow` leg, so a change to
 release-plz, to either script or to the mock that breaks the flow fails
-the certification before the release it would have gated. Until `dev` is
-retired (stow#1516), `pr-base-gate.yml` admits `release-plz-*` branches
-into `main` besides `dev`.
+the certification before the release it would have gated.
 
 Required GitHub App configuration — two Apps, so the identity that can
 open a release PR is not the one that can create a release tag:
@@ -1030,11 +1028,12 @@ tag. Operator setup (once per repository), under Settings:
   [Automated deploys](#automated-deploys)). `deploy-canary` and
   `deploy-promoted` are created with their wait timers; `operations` is
   created as before, with this deployment rule.
-- **The `main` ruleset** requires the checks `PR source gate`, `CI gate`
-  and `installable release`. `Release gate` and `toolchain gate` are not
-  required: certification is the dispatched `release-gate.yml`, and the
-  toolchain is published by the tag's `toolchain-publish.yml`, so a merge
-  to `main` waits for neither.
+- **The `main` ruleset** (`main` is the default and only long-lived branch)
+  requires signed commits, merge-queue merges, and the checks `CI gate` and
+  `installable release`, and forbids deletion and force-pushes. `Release gate`
+  and `toolchain gate` are not required: certification is the dispatched
+  `release-gate.yml`, and the toolchain is published by the tag's
+  `toolchain-publish.yml`, so a merge to `main` waits for neither.
 
 ### The switching release and the one-time re-sign
 

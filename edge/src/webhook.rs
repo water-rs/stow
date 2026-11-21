@@ -880,7 +880,7 @@ mod tests {
                     serde_json::json!(".github/workflows/index-publish.yml");
             }),
             completed_event(|event| {
-                event["workflow_run"]["head_branch"] = serde_json::json!("dev");
+                event["workflow_run"]["head_branch"] = serde_json::json!("topic");
             }),
             completed_event(|event| {
                 event["workflow_run"]["head_branch"] = serde_json::json!("main");
@@ -1179,7 +1179,7 @@ mod tests {
     async fn a_task_run_outside_the_authority_boundary_is_ignored() {
         let cases = [
             task_completed_event(|event| {
-                event["workflow_run"]["head_branch"] = serde_json::json!("dev");
+                event["workflow_run"]["head_branch"] = serde_json::json!("topic");
             }),
             task_completed_event(|event| {
                 event["workflow_run"]["head_branch"] = serde_json::json!("main");
