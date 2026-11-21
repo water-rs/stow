@@ -338,15 +338,6 @@ async fn run_inner(
         return Ok(status);
     }
 
-    // One allowance for every phase between here and cargo's launch, sized by
-    // the number of units the cache says it can serve. See `budget`.
-    let budget = CacheBudget::for_covered_units(
-        maybe_analysis
-            .as_ref()
-            .map_or(0, |analysis| analysis.prefetch_artifacts.len()),
-        &project.env,
-    );
-
     let selected = select_upgrades(
         maybe_analysis.as_ref(),
         invocation.silent_compatible_upgrades,
@@ -368,7 +359,6 @@ async fn run_inner(
             &project,
             &invocation,
             &public_cache_mode,
-            &budget,
             &selected,
             &slices,
         ))
@@ -533,6 +523,7 @@ async fn run_original_workspace_build(
     let covered_units = prefetch_artifacts.map_or(0, <[PrefetchArtifact]>::len);
     run_cargo(&CargoRunPlan {
         project,
+        analysis_facts: None,
         config,
         action: &invocation.action,
         cargo_args: &invocation.cargo_args,
@@ -557,21 +548,20 @@ async fn run_original_workspace_build(
 }
 
 /// The upgrades path: apply the selected upgrades inside a mirror
-/// workspace, re-analyze the upgraded graph, then run cargo there.
+/// workspace, re-analyze the upgraded graph, then run cargo there while
+/// the daemon prefetches covered bundles asynchronously in the background.
 /// Returns cargo's own exit status.
 async fn run_mirrored_upgrade_build(
     config: Option<&StowConfig>,
     project: &ProjectContext,
     invocation: &CargoInvocation,
     public_cache_mode: &PublicCacheMode,
-    budget: &CacheBudget,
     selected: &[CompatibleUpgrade],
     slices: &index::SliceFetches,
 ) -> stow_types::error::Result<ExitStatus> {
     let mirror = create_workspace_mirror(&project.facts, &project.facts.workspace_root).await?;
     apply_selected_upgrades(&project.facts, &mirror, selected).await?;
     let mirror_args = rewrite_args_for_mirror(&invocation.cargo_args, &project.facts, &mirror)?;
-    let mirror_manifest_path = mirror_manifest_path(&project.facts, &mirror)?;
 
     // After applying upgrades, re-analyze the mirror so the wrapper's exact +
     // semantic paths get the post-upgrade transitive graph + prefetch list.
@@ -620,27 +610,20 @@ async fn run_mirrored_upgrade_build(
     let mirror_inexact = mirror_analysis
         .as_ref()
         .map(|analysis| analysis.inexact_entries.clone());
-
-    let cache_policy_entries = Box::pin(prepare_build_cache_plan(
-        config,
-        AnalysisScope::of(project, slices),
-        &mirror.current_dir(),
-        &mirror_manifest_path,
-        public_cache_mode,
-        mirror_analysis,
-        budget,
-    ))
-    .await?;
+    let mirror_policy = mirror_analysis.and_then(|analysis| {
+        (!analysis.cache_policy_entries.is_empty()).then_some(analysis.cache_policy_entries)
+    });
 
     let mirror_current_dir = mirror.current_dir();
     run_cargo(&CargoRunPlan {
         project,
+        analysis_facts: Some(&mirror_project),
         config,
         action: &invocation.action,
         cargo_args: &mirror_args,
         source_root: mirror.root(),
         current_dir: &mirror_current_dir,
-        cache_policy_entries: cache_policy_entries.as_deref(),
+        cache_policy_entries: mirror_policy.as_deref(),
         public_cache_mode,
         unit_nodes: mirror_unit_nodes.as_ref(),
         prefetch_artifacts: mirror_prefetch.as_deref(),
@@ -2447,20 +2430,94 @@ fn prediction_fetch_lists(
     (artifacts, cache_policy_entries)
 }
 
+const PINNED_RESOLVER_STAMP_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PinnedResolverStamp {
+    version: u32,
+    input_digest: String,
+    outcome: CachedResolverOutcome,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum CachedResolverOutcome {
+    Rejected,
+    Accepted {
+        lockfile_toml: String,
+        seed: crate::daemon::session::Seed,
+        covered_units: usize,
+    },
+}
+
 async fn try_stow_resolver(
     config: &StowConfig,
     project: &ProjectContext,
     invocation: &CargoInvocation,
     slices: &index::SliceFetches,
 ) -> stow_types::error::Result<Option<ExitStatus>> {
+    // Read only `current.json` (~120 B) first: when no cached slice exists,
+    // or when a persisted stamp already settled this exact `(manifests,
+    // invocation, slice digest)` tuple, the short-lived CLI driver never
+    // decompresses the multi-hundred-MiB index slice or spawns pre-Cargo
+    // validation subprocesses (stow#1631).
+    let (consumer_digest, host_digest) =
+        consumer_slice_pointer_digests(config, &project.facts).await?;
+    if consumer_digest.is_none() && host_digest.is_none() {
+        tracing::info!("no cached index slice pointer; nothing for the resolver to pin to");
+        return Ok(None);
+    }
+
+    let (mirror_base, input_digest) = resolver_cache_slot(
+        config,
+        &project.facts,
+        invocation,
+        consumer_digest.as_deref(),
+        host_digest.as_deref(),
+    )
+    .await?;
+    let mirror_dir = mirror_base.join("mirror");
+    let stamp_path = mirror_base.join("stamp.json");
+
+    if let Some(stamp) = read_pinned_resolver_stamp(&stamp_path, &input_digest).await {
+        return match stamp.outcome {
+            CachedResolverOutcome::Rejected => Ok(None),
+            CachedResolverOutcome::Accepted {
+                lockfile_toml,
+                seed,
+                covered_units,
+            } => {
+                let pinned =
+                    reuse_pinned_mirror(&project.facts, invocation, &mirror_dir, &lockfile_toml)
+                        .await?;
+                let public_cache_mode =
+                    PublicCacheMode::for_build(&project.facts.rustc_version, config.cache);
+                run_pinned_mirror_seed_build(
+                    config,
+                    project,
+                    invocation,
+                    &pinned,
+                    &public_cache_mode,
+                    &seed,
+                    covered_units,
+                )
+                .await
+                .map(Some)
+            }
+        };
+    }
+
     let Some(stow_lockfile_toml) = synthesize_lockfile(config, &project.facts).await? else {
+        write_pinned_resolver_stamp(&stamp_path, &input_digest, CachedResolverOutcome::Rejected)
+            .await;
         return Ok(None);
     };
 
     let public_cache_mode = PublicCacheMode::for_build(&project.facts.rustc_version, config.cache);
     let Some(pinned) =
-        prepare_pinned_mirror(&project.facts, invocation, &stow_lockfile_toml).await?
+        prepare_pinned_mirror(&project.facts, invocation, &mirror_dir, &stow_lockfile_toml).await?
     else {
+        write_pinned_resolver_stamp(&stamp_path, &input_digest, CachedResolverOutcome::Rejected)
+            .await;
         return Ok(None);
     };
     let Some(mirror_analysis) = analyze_pinned_mirror(
@@ -2473,20 +2530,220 @@ async fn try_stow_resolver(
     )
     .await
     else {
+        write_pinned_resolver_stamp(&stamp_path, &input_digest, CachedResolverOutcome::Rejected)
+            .await;
         return Ok(None);
     };
 
-    Box::pin(run_pinned_mirror_build(
+    let (seed, covered_units) = seed_from_mirror_analysis(mirror_analysis);
+    write_pinned_resolver_stamp(
+        &stamp_path,
+        &input_digest,
+        CachedResolverOutcome::Accepted {
+            lockfile_toml: stow_lockfile_toml,
+            seed: seed.clone(),
+            covered_units,
+        },
+    )
+    .await;
+
+    run_pinned_mirror_seed_build(
         config,
         project,
         invocation,
         &pinned,
         &public_cache_mode,
-        mirror_analysis,
-        slices,
-    ))
+        &seed,
+        covered_units,
+    )
     .await
     .map(Some)
+}
+
+async fn consumer_slice_pointer_digests(
+    config: &StowConfig,
+    project: &ProjectFacts,
+) -> stow_types::error::Result<(Option<String>, Option<String>)> {
+    let consumer =
+        index::cached_slice_pointer_digest(config, &project.target, &project.rustc_version);
+    if project.target_given && project.host_target != project.target {
+        let host = index::cached_slice_pointer_digest(
+            config,
+            &project.host_target,
+            &project.rustc_version,
+        );
+        tokio::try_join!(consumer, host)
+    } else {
+        Ok((consumer.await?, None))
+    }
+}
+
+async fn resolver_cache_slot(
+    config: &StowConfig,
+    project: &ProjectFacts,
+    invocation: &CargoInvocation,
+    consumer_digest: Option<&str>,
+    host_digest: Option<&str>,
+) -> stow_types::error::Result<(PathBuf, String)> {
+    let canonical_root = workspace_deps::canonicalize_or_original(&project.workspace_root);
+    let ws_key = blake3::hash(canonical_root.to_string_lossy().as_bytes())
+        .to_hex()
+        .to_string();
+    let mirror_base = config.cache_dir.join("pinned-mirrors").join(&ws_key[..32]);
+    let manifests =
+        workspace_manifest_files(&project.workspace_root, &project.manifest_path).await?;
+    let input_digest = compute_resolver_stamp_digest(
+        project,
+        &invocation.action,
+        &invocation.cargo_args,
+        consumer_digest,
+        host_digest,
+        &manifests,
+    );
+    Ok((mirror_base, input_digest))
+}
+
+async fn workspace_manifest_files(
+    workspace_root: &Path,
+    entry_manifest: &Path,
+) -> stow_types::error::Result<Vec<(PathBuf, Vec<u8>)>> {
+    let mut paths = BTreeSet::new();
+    paths.insert(entry_manifest.to_path_buf());
+    let root_manifest = workspace_root.join("Cargo.toml");
+    if root_manifest.exists() {
+        paths.insert(root_manifest.clone());
+        if let Ok(text) = async_fs::read_to_string(&root_manifest).await
+            && let Ok(doc) = text.parse::<toml_edit::DocumentMut>()
+            && let Some(members) = doc
+                .get("workspace")
+                .and_then(toml_edit::Item::as_table_like)
+                .and_then(|ws| ws.get("members"))
+                .and_then(toml_edit::Item::as_array)
+        {
+            let patterns: Vec<String> = members
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_owned))
+                .collect();
+            for pattern in patterns {
+                for dir in expand_member_pattern(workspace_root, &pattern) {
+                    let member_manifest = dir.join("Cargo.toml");
+                    if member_manifest.exists() {
+                        paths.insert(member_manifest);
+                    }
+                }
+            }
+        }
+    }
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let bytes = async_fs::read(&path)
+            .await
+            .wrap_err_with(|| format!("read manifest {}", path.display()))?;
+        let rel = path
+            .strip_prefix(workspace_root)
+            .map_or_else(|_| path.clone(), Path::to_path_buf);
+        files.push((rel, bytes));
+    }
+    Ok(files)
+}
+
+fn compute_resolver_stamp_digest(
+    project: &ProjectFacts,
+    action: &str,
+    cargo_args: &[OsString],
+    consumer_digest: Option<&str>,
+    host_digest: Option<&str>,
+    manifests: &[(PathBuf, Vec<u8>)],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&PINNED_RESOLVER_STAMP_VERSION.to_le_bytes());
+    let feed = |hasher: &mut blake3::Hasher, bytes: &[u8]| {
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        hasher.update(&len.to_le_bytes());
+        hasher.update(bytes);
+    };
+    feed(&mut hasher, action.as_bytes());
+    feed(
+        &mut hasher,
+        project.current_dir_relative.to_string_lossy().as_bytes(),
+    );
+    feed(&mut hasher, project.target.as_bytes());
+    hasher.update(&[u8::from(project.target_given)]);
+    feed(&mut hasher, project.host_target.as_bytes());
+    feed(&mut hasher, project.rustc_version.as_bytes());
+    feed(&mut hasher, consumer_digest.unwrap_or("").as_bytes());
+    feed(&mut hasher, host_digest.unwrap_or("").as_bytes());
+    let arg_count = u64::try_from(cargo_args.len()).unwrap_or(u64::MAX);
+    hasher.update(&arg_count.to_le_bytes());
+    for arg in cargo_args {
+        feed(&mut hasher, arg.to_string_lossy().as_bytes());
+    }
+    let manifest_count = u64::try_from(manifests.len()).unwrap_or(u64::MAX);
+    hasher.update(&manifest_count.to_le_bytes());
+    for (rel, bytes) in manifests {
+        feed(&mut hasher, rel.to_string_lossy().as_bytes());
+        feed(&mut hasher, bytes);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+async fn read_pinned_resolver_stamp(
+    stamp_path: &Path,
+    expected_digest: &str,
+) -> Option<PinnedResolverStamp> {
+    let bytes = async_fs::read(stamp_path).await.ok()?;
+    let stamp: PinnedResolverStamp = serde_json::from_slice(&bytes).ok()?;
+    (stamp.version == PINNED_RESOLVER_STAMP_VERSION && stamp.input_digest == expected_digest)
+        .then_some(stamp)
+}
+
+async fn write_pinned_resolver_stamp(
+    stamp_path: &Path,
+    input_digest: &str,
+    outcome: CachedResolverOutcome,
+) {
+    let Some(parent) = stamp_path.parent() else {
+        return;
+    };
+    if async_fs::create_dir_all(parent).await.is_err() {
+        return;
+    }
+    let stamp = PinnedResolverStamp {
+        version: PINNED_RESOLVER_STAMP_VERSION,
+        input_digest: input_digest.to_owned(),
+        outcome,
+    };
+    let Ok(bytes) = serde_json::to_vec(&stamp) else {
+        return;
+    };
+    let tmp = parent.join(format!("stamp.{}.tmp", std::process::id()));
+    if async_fs::write(&tmp, bytes).await.is_ok() {
+        let _ = async_fs::rename(&tmp, stamp_path).await;
+    }
+}
+
+fn seed_from_mirror_analysis(
+    mirror_analysis: WorkspacePrediction,
+) -> (crate::daemon::session::Seed, usize) {
+    let covered_units = mirror_analysis.prefetch_artifacts.len();
+    let semantic_fallback_enabled = mirror_analysis
+        .unit_nodes
+        .as_ref()
+        .is_some_and(|table| !table.nodes.is_empty());
+    let cache_policy_entries = (!mirror_analysis.cache_policy_entries.is_empty())
+        .then_some(mirror_analysis.cache_policy_entries);
+    (
+        crate::daemon::session::Seed {
+            serve_map: mirror_analysis.servable_units,
+            cache_policy_entries,
+            unit_nodes: mirror_analysis.unit_nodes,
+            prefetch_artifacts: Some(mirror_analysis.prefetch_artifacts),
+            semantic_fallback_enabled,
+            deferred: false,
+            inexact_entries: mirror_analysis.inexact_entries,
+        },
+        covered_units,
+    )
 }
 
 /// Ask the local resolver for a cache-optimized lockfile covering
@@ -2558,24 +2815,45 @@ async fn synthesize_lockfile(
 struct PinnedMirror {
     mirror: WorkspaceMirror,
     args: Vec<OsString>,
-    manifest_path: PathBuf,
     project: ProjectFacts,
 }
 
-/// Mirror `project`, install the synthesized lockfile, and run cargo's
-/// `--locked` dry-run correctness gate. Returns `None` when the gate
-/// rejects the lockfile.
+async fn reuse_pinned_mirror(
+    project: &ProjectFacts,
+    invocation: &CargoInvocation,
+    mirror_dir: &Path,
+    stow_lockfile_toml: &str,
+) -> stow_types::error::Result<PinnedMirror> {
+    let mirror = sync_persistent_workspace_mirror(
+        project,
+        &project.workspace_root,
+        mirror_dir,
+        stow_lockfile_toml,
+    )
+    .await?;
+    let args = rewrite_args_for_mirror(&invocation.cargo_args, project, &mirror)?;
+    let mirror_project = build_mirror_project_facts(project, &mirror)?;
+    Ok(PinnedMirror {
+        mirror,
+        args,
+        project: mirror_project,
+    })
+}
+
+/// Mirror `project` into its deterministic persistent mirror directory,
+/// install the synthesized lockfile, and run cargo's `--locked` dry-run
+/// correctness gate. Returns `None` when the gate rejects the lockfile.
 async fn prepare_pinned_mirror(
     project: &ProjectFacts,
     invocation: &CargoInvocation,
+    mirror_dir: &Path,
     stow_lockfile_toml: &str,
 ) -> stow_types::error::Result<Option<PinnedMirror>> {
-    let mirror = create_workspace_mirror(project, &project.workspace_root).await?;
-    write_lockfile_into_mirror(&mirror, stow_lockfile_toml).await?;
+    let pinned = reuse_pinned_mirror(project, invocation, mirror_dir, stow_lockfile_toml).await?;
 
-    // Note: we do NOT add `--locked` here. The synthesized lockfile
-    // covers only the runtime graph the resolver could cache-pin from
-    // the artifacts table. Manifest-declared optional/dev/build deps
+    // Note: we do NOT add `--locked` to `pinned.args`. The synthesized
+    // lockfile covers only the runtime graph the resolver could cache-pin
+    // from the artifacts table. Manifest-declared optional/dev/build deps
     // that the user's project doesn't enable for `cargo check` may not
     // appear in the lockfile, and `--locked` would block cargo from
     // augmenting those missing entries — failing the build with a
@@ -2583,10 +2861,7 @@ async fn prepare_pinned_mirror(
     // preserves every cache-hit pin (matching versions never get
     // rewritten unless the manifest forbids them) and only consults
     // the local index for the gaps the resolver intentionally omitted.
-    let args = rewrite_args_for_mirror(&invocation.cargo_args, project, &mirror)?;
-    let manifest_path = mirror_manifest_path(project, &mirror)?;
-    let mirror_project = build_mirror_project_facts(project, &mirror)?;
-
+    //
     // Correctness gate: cargo's own resolver verifies the synthesized
     // lockfile against the workspace's `Cargo.toml`. Under `--locked`,
     // cargo rejects any lockfile that violates a declared semver
@@ -2594,18 +2869,13 @@ async fn prepare_pinned_mirror(
     // here is provably semver-compatible — anything it rejects we fall
     // back from, so the takeover never produces a less-correct build than
     // cargo would on its own.
-    if !validate_pinned_lockfile(&mirror_project).await? {
+    if !validate_pinned_lockfile(&pinned.project).await? {
         tracing::info!(
             "cargo --locked dry-run rejected stow-synthesized lockfile; falling back to cargo's resolver"
         );
         return Ok(None);
     }
-    Ok(Some(PinnedMirror {
-        mirror,
-        args,
-        manifest_path,
-        project: mirror_project,
-    }))
+    Ok(Some(pinned))
 }
 
 /// Analyze the pinned mirror's graph. Returns `None` on failure: the
@@ -2646,58 +2916,36 @@ async fn analyze_pinned_mirror(
     }
 }
 
-/// Run cargo against a `PinnedMirror` whose analysis succeeded: cargo under
-/// the wrapper with the pinned graph's cache plan. Returns cargo's own exit
-/// status — success or not (stow#652).
-async fn run_pinned_mirror_build(
+/// Run cargo against a `PinnedMirror` whose seed is settled: cargo spawns
+/// immediately while the daemon warms `seed.prefetch_artifacts` in the
+/// background (stow#652, stow#1631).
+async fn run_pinned_mirror_seed_build(
     config: &StowConfig,
     project: &ProjectContext,
     invocation: &CargoInvocation,
     pinned: &PinnedMirror,
     public_cache_mode: &PublicCacheMode,
-    mirror_analysis: WorkspacePrediction,
-    slices: &index::SliceFetches,
+    seed: &crate::daemon::session::Seed,
+    covered_units: usize,
 ) -> stow_types::error::Result<ExitStatus> {
-    let mirror_unit_nodes = mirror_analysis.unit_nodes.clone();
-    let mirror_prefetch = mirror_analysis.prefetch_artifacts.clone();
-    let mirror_servable = mirror_analysis.servable_units.clone();
-    let mirror_inexact = mirror_analysis.inexact_entries.clone();
-    let mirror_semantic_fallback = mirror_unit_nodes
-        .as_ref()
-        .is_some_and(|table| !table.nodes.is_empty());
-
-    // The resolver path builds its own graph analysis for the pinned mirror,
-    // so it sizes its own allowance from that.
-    let budget = CacheBudget::for_covered_units(mirror_prefetch.len(), &project.env);
-
-    let cache_policy_entries = Box::pin(prepare_build_cache_plan(
-        Some(config),
-        AnalysisScope::of(project, slices),
-        &pinned.mirror.current_dir(),
-        &pinned.manifest_path,
-        public_cache_mode,
-        Some(mirror_analysis),
-        &budget,
-    ))
-    .await?;
-
     let mirror_current_dir = pinned.mirror.current_dir();
     run_cargo(&CargoRunPlan {
         project,
+        analysis_facts: Some(&pinned.project),
         config: Some(config),
         action: &invocation.action,
         cargo_args: &pinned.args,
         source_root: pinned.mirror.root(),
         current_dir: &mirror_current_dir,
-        cache_policy_entries: cache_policy_entries.as_deref(),
+        cache_policy_entries: seed.cache_policy_entries.as_deref(),
         public_cache_mode,
-        unit_nodes: mirror_unit_nodes.as_ref(),
-        prefetch_artifacts: Some(&mirror_prefetch),
-        servable_units: mirror_servable.as_ref(),
-        inexact_entries: Some(&mirror_inexact),
+        unit_nodes: seed.unit_nodes.as_ref(),
+        prefetch_artifacts: seed.prefetch_artifacts.as_deref(),
+        servable_units: seed.serve_map.as_ref(),
+        inexact_entries: Some(&seed.inexact_entries),
         deferred_analysis: false,
-        semantic_fallback_enabled: mirror_semantic_fallback,
-        covered_units: mirror_prefetch.len(),
+        semantic_fallback_enabled: seed.semantic_fallback_enabled,
+        covered_units,
         isolation: &invocation.isolation,
     })
     .await
@@ -2933,21 +3181,6 @@ fn extract_dependency_features(item: &toml_edit::Item) -> Vec<String> {
     features
 }
 
-async fn write_lockfile_into_mirror(
-    mirror: &WorkspaceMirror,
-    lockfile_toml: &str,
-) -> stow_types::error::Result<()> {
-    let target = mirror.root().join("Cargo.lock");
-    async_fs::write(&target, lockfile_toml)
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!(
-                "write pinned lockfile to mirror {}: {error}",
-                target.display()
-            )
-        })
-}
-
 /// Run `cargo metadata --locked --no-deps --offline` against the pinned
 /// mirror. cargo's resolver loads `Cargo.lock` strictly under `--locked`
 /// and rejects anything that violates the workspace `Cargo.toml`'s semver
@@ -3064,64 +3297,6 @@ async fn prefetch_graph_artifacts(
         );
     }
     Ok(())
-}
-
-async fn prepare_build_cache_plan(
-    config: Option<&StowConfig>,
-    scope: AnalysisScope<'_>,
-    current_dir: &Path,
-    manifest_path: &Path,
-    public_cache_mode: &PublicCacheMode,
-    precomputed_analysis: Option<WorkspacePrediction>,
-    budget: &CacheBudget,
-) -> stow_types::error::Result<Option<Vec<CachePolicyEntry>>> {
-    let Some(config) = config else {
-        return Ok(None);
-    };
-    if !public_cache_mode.is_enabled() {
-        return Ok(None);
-    }
-
-    let analysis = match precomputed_analysis {
-        Some(analysis) => analysis,
-        None => {
-            match analyze_workspace_prediction(scope, current_dir, manifest_path, config, None)
-                .await
-            {
-                Ok(analysis) => analysis,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        current_dir = %current_dir.display(),
-                        manifest_path = %manifest_path.display(),
-                        "failed to analyze build graph for exact artifact prefetch"
-                    );
-                    return Ok(None);
-                }
-            }
-        }
-    };
-
-    // Never fatal. Prefetch is an optimization: the per-rustc wrapper fetches
-    // whatever is missing on demand, and cargo compiles whatever it cannot
-    // fetch. Propagating the error here meant a degraded edge - one HTTP 500
-    // on one batch - failed `stow build` outright, which is not "slower than
-    // cargo", it is broken.
-    if let Err(error) = prefetch_graph_artifacts(config, &analysis.prefetch_artifacts, budget).await
-    {
-        tracing::warn!(
-            %error,
-            manifest_path = %manifest_path.display(),
-            "exact graph artifact prefetch failed; the build continues and the \
-             wrapper will fetch on demand"
-        );
-    }
-
-    if analysis.cache_policy_entries.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(analysis.cache_policy_entries))
 }
 
 /// The allow entries a deferred-analysis build starts cargo with: none
@@ -3350,14 +3525,23 @@ fn has_candidate_ancestor(
 }
 
 #[derive(Debug)]
+enum MirrorBacking {
+    Temp(TempDir),
+    Persistent(PathBuf),
+}
+
+#[derive(Debug)]
 struct WorkspaceMirror {
-    tempdir: TempDir,
+    backing: MirrorBacking,
     current_dir_relative: PathBuf,
 }
 
 impl WorkspaceMirror {
     fn root(&self) -> &Path {
-        self.tempdir.path()
+        match &self.backing {
+            MirrorBacking::Temp(dir) => dir.path(),
+            MirrorBacking::Persistent(dir) => dir.as_path(),
+        }
     }
 
     fn current_dir(&self) -> PathBuf {
@@ -3408,11 +3592,100 @@ async fn create_workspace_mirror(
         }
 
         Ok(WorkspaceMirror {
-            tempdir,
+            backing: MirrorBacking::Temp(tempdir),
             current_dir_relative,
         })
     })
     .await
+}
+
+/// Synchronize a deterministic persistent workspace mirror under
+/// `<cache_dir>/pinned-mirrors/<key>/mirror` so warm `stow build` runs keep
+/// a stable workspace root and leave `Cargo.lock`'s mtime untouched when its
+/// bytes already match `lockfile_toml` (stow#1631).
+async fn sync_persistent_workspace_mirror(
+    project: &ProjectFacts,
+    source_root: &Path,
+    mirror_dir: &Path,
+    lockfile_toml: &str,
+) -> stow_types::error::Result<WorkspaceMirror> {
+    let workspace_root = source_root.to_path_buf();
+    let mirror_root = mirror_dir.to_path_buf();
+    let current_dir_relative = project.current_dir_relative.clone();
+    let lockfile_toml = lockfile_toml.to_owned();
+    smol::unblock(move || {
+        std::fs::create_dir_all(&mirror_root)
+            .wrap_err_with(|| format!("create workspace mirror {}", mirror_root.display()))?;
+
+        let mut wanted = BTreeSet::new();
+        for entry in std::fs::read_dir(&workspace_root)
+            .wrap_err_with(|| format!("read workspace root {}", workspace_root.display()))?
+        {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+            if matches!(file_name_str.as_ref(), ".git" | "target" | "Cargo.lock") {
+                continue;
+            }
+            wanted.insert(file_name.clone());
+            let source_path = entry.path();
+            let destination_path = mirror_root.join(&file_name);
+            let same_link =
+                std::fs::read_link(&destination_path).is_ok_and(|existing| existing == source_path);
+            if !same_link {
+                remove_mirror_entry(&destination_path)?;
+                symlink_path(&source_path, &destination_path).wrap_err_with(|| {
+                    format!(
+                        "symlink {} into workspace mirror {}",
+                        source_path.display(),
+                        destination_path.display()
+                    )
+                })?;
+            }
+        }
+
+        for existing in std::fs::read_dir(&mirror_root)
+            .wrap_err_with(|| format!("read workspace mirror {}", mirror_root.display()))?
+        {
+            let existing = existing?;
+            let name = existing.file_name();
+            if name == "Cargo.lock" || wanted.contains(&name) {
+                continue;
+            }
+            remove_mirror_entry(&existing.path())?;
+        }
+
+        let lock_path = mirror_root.join("Cargo.lock");
+        let already_matches =
+            std::fs::read_to_string(&lock_path).is_ok_and(|current| current == lockfile_toml);
+        if !already_matches {
+            std::fs::write(&lock_path, &lockfile_toml)
+                .wrap_err_with(|| format!("write pinned lockfile {}", lock_path.display()))?;
+        }
+
+        Ok(WorkspaceMirror {
+            backing: MirrorBacking::Persistent(mirror_root),
+            current_dir_relative,
+        })
+    })
+    .await
+}
+
+fn remove_mirror_entry(path: &Path) -> stow_types::error::Result<()> {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if meta.file_type().is_symlink() {
+        // On Windows a directory symlink is removed with `remove_dir`,
+        // while a file symlink or Unix symlink is removed with `remove_file`.
+        std::fs::remove_file(path)
+            .or_else(|_| std::fs::remove_dir(path))
+            .wrap_err_with(|| format!("remove {}", path.display()))
+    } else if meta.is_file() {
+        std::fs::remove_file(path).wrap_err_with(|| format!("remove {}", path.display()))
+    } else {
+        std::fs::remove_dir_all(path).wrap_err_with(|| format!("remove {}", path.display()))
+    }
 }
 
 async fn apply_selected_upgrades(
@@ -3859,6 +4132,11 @@ async fn passthrough_command(
 /// computed for this build.
 struct CargoRunPlan<'a> {
     project: &'a ProjectContext,
+    /// When building inside a workspace mirror, the mirror's `ProjectFacts`
+    /// so the daemon session's analysis and miss journal read the mirror's
+    /// `Cargo.lock` while `DriverFacts::real_workspace_root` still tracks
+    /// the real workspace.
+    analysis_facts: Option<&'a ProjectFacts>,
     config: Option<&'a StowConfig>,
     action: &'a str,
     cargo_args: &'a [OsString],
@@ -3931,6 +4209,11 @@ fn session_facts(
     build_dir: Option<PathBuf>,
 ) -> stow_types::error::Result<crate::daemon::session::SessionFacts> {
     let project = plan.project;
+    let driver_project = plan
+        .analysis_facts
+        .map_or_else(|| project.facts.clone(), Clone::clone);
+    let real_workspace_root = (driver_project.workspace_root != project.facts.workspace_root)
+        .then(|| project.facts.workspace_root.clone());
     Ok(crate::daemon::session::SessionFacts {
         build: crate::daemon::session::BuildFacts {
             environ: project.env.environ().to_vec(),
@@ -3951,7 +4234,8 @@ fn session_facts(
             rustc_extra_args: rustc_wrapper_extra_args(plan.source_root)?,
         },
         driver: crate::daemon::session::DriverFacts {
-            project: project.facts.clone(),
+            project: driver_project,
+            real_workspace_root,
             build_rustc: project.build_rustc.executable().to_owned(),
             seed: crate::daemon::session::Seed {
                 serve_map: plan.servable_units.cloned(),
@@ -3976,7 +4260,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     } = *plan;
     let (setup, registry_sources) = futures_util::try_join!(
         prepare_cargo_run(plan),
-        crate::RegistrySources::from_lockfile(&project.facts.workspace_root, &project.env)
+        crate::RegistrySources::from_lockfile(plan.source_root, &project.env)
             .instrument(tracing::debug_span!("stow.precargo.registry_sources")),
     )?;
     let CargoRunSetup { wrappers, launch } = setup;
@@ -4582,6 +4866,28 @@ pub fn spawn_build_enrichment(
     )
 }
 
+/// Warm pre-settled `artifacts` asynchronously inside the daemon session
+/// while cargo runs instead of blocking before cargo spawns (stow#1631).
+pub fn spawn_seeded_prefetch(
+    span: tracing::Span,
+    config: StowConfig,
+    env: SessionEnv,
+    artifacts: Vec<PrefetchArtifact>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn(
+        async move {
+            let budget = CacheBudget::for_covered_units(artifacts.len(), &env);
+            if let Err(error) = prefetch_graph_artifacts(&config, &artifacts, &budget).await {
+                tracing::warn!(
+                    %error,
+                    "seeded background artifact prefetch failed; the plan path fetches on demand"
+                );
+            }
+        }
+        .instrument(span),
+    )
+}
+
 async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::Result<()> {
     // Everything the build consults downstream reads the fetched
     // generation, so the consumer slices are fetched first — the coarse
@@ -4639,8 +4945,18 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     // waiters; an early return releases them the same way (stow#347).
     if work.readiness.is_some() {
         if let Some(map) = &work.map {
-            let lite =
-                analyze_workspace_prediction_lite(&work.project, &work.env, &work.config).await?;
+            let expanded = expanded_graph_cached(&work.config, &work.project, &work.env).await?;
+            let lite = analyze_workspace_prediction_from(
+                &work.project,
+                &work.config,
+                AnalysisInputs {
+                    slice: Some(slice.clone()),
+                    host_slice: host_slice.clone(),
+                    expanded,
+                    slice_pending: false,
+                },
+            )
+            .await?;
             map.publish(lite.servable_units.unwrap_or_default());
         }
         drop(work.readiness.take());
@@ -5154,7 +5470,7 @@ mod tests {
             ..project_facts()
         };
         let mirror = WorkspaceMirror {
-            tempdir: mirror_dir,
+            backing: super::MirrorBacking::Temp(mirror_dir),
             current_dir_relative: PathBuf::new(),
         };
         let mirror_manifest = mirror.root().join("Cargo.toml");
@@ -5239,7 +5555,7 @@ mod tests {
             ..project_facts()
         };
         let mirror = WorkspaceMirror {
-            tempdir: tempfile::tempdir().expect("mirror"),
+            backing: super::MirrorBacking::Temp(tempfile::tempdir().expect("mirror")),
             current_dir_relative: PathBuf::new(),
         };
         let rewritten = rewrite_args_for_mirror(
@@ -5333,6 +5649,7 @@ mod tests {
         let command = tokio::spawn(async move {
             let plan = CargoRunPlan {
                 project: &project,
+                analysis_facts: None,
                 config: None,
                 action: "check",
                 cargo_args: &cargo_args,
@@ -5961,6 +6278,7 @@ mod tests {
         };
         let plan = CargoRunPlan {
             project: &project,
+            analysis_facts: None,
             config: Some(&config),
             action: "check",
             cargo_args: &[],
@@ -6217,5 +6535,122 @@ mod tests {
         let below = build_dir.strip_prefix(root.path()).expect("under the root");
         assert!(below.components().count() >= 1, "{}", build_dir.display());
         assert!(!build_dir.to_string_lossy().contains('{'));
+    }
+
+    #[tokio::test]
+    async fn persistent_workspace_mirror_preserves_unchanged_lockfile_mtime_and_syncs_entries() {
+        let ws = tempfile::tempdir().expect("workspace");
+        let mirror_parent = tempfile::tempdir().expect("mirror parent");
+        let mirror_dir = mirror_parent.path().join("mirror");
+        std::fs::write(ws.path().join("Cargo.toml"), "[package]\nname = \"p\"\n").expect("toml");
+        std::fs::create_dir_all(ws.path().join("src")).expect("src");
+        std::fs::write(ws.path().join("src/main.rs"), "fn main() {}\n").expect("main");
+        std::fs::write(ws.path().join("extra.txt"), "hello").expect("extra");
+
+        let facts = ProjectFacts {
+            workspace_root: ws.path().to_path_buf(),
+            current_dir: ws.path().to_path_buf(),
+            manifest_path: ws.path().join("Cargo.toml"),
+            ..project_facts()
+        };
+        let lock_v1 = "version = 4\n";
+        let m1 = super::sync_persistent_workspace_mirror(&facts, ws.path(), &mirror_dir, lock_v1)
+            .await
+            .expect("first sync");
+        assert_eq!(m1.root(), mirror_dir.as_path());
+        assert!(mirror_dir.join("extra.txt").exists());
+        let backdate = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        filetime::set_file_mtime(mirror_dir.join("Cargo.lock"), backdate).expect("backdate lock");
+
+        std::fs::remove_file(ws.path().join("extra.txt")).expect("remove extra");
+        super::sync_persistent_workspace_mirror(&facts, ws.path(), &mirror_dir, lock_v1)
+            .await
+            .expect("second sync with unchanged lock");
+        assert!(!mirror_dir.join("extra.txt").exists());
+        let kept = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(mirror_dir.join("Cargo.lock")).expect("lock metadata"),
+        );
+        assert_eq!(kept, backdate, "unchanged Cargo.lock must not bump mtime");
+
+        super::sync_persistent_workspace_mirror(&facts, ws.path(), &mirror_dir, "version = 3\n")
+            .await
+            .expect("sync with updated lock");
+        assert_eq!(
+            std::fs::read_to_string(mirror_dir.join("Cargo.lock")).expect("read lock"),
+            "version = 3\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_resolver_stamp_roundtrips_and_invalidates_on_manifest_or_slice_change() {
+        let dir = tempfile::tempdir().expect("stamp dir");
+        let stamp_path = dir.path().join("stamp.json");
+        let facts = project_facts();
+        let manifests_v1 = vec![(
+            PathBuf::from("Cargo.toml"),
+            b"[dependencies]\na = \"1\"\n".to_vec(),
+        )];
+        let digest_v1 = super::compute_resolver_stamp_digest(
+            &facts,
+            "build",
+            &[],
+            Some("sha256:1111"),
+            None,
+            &manifests_v1,
+        );
+        let seed = crate::daemon::session::Seed {
+            semantic_fallback_enabled: true,
+            ..crate::daemon::session::Seed::default()
+        };
+        super::write_pinned_resolver_stamp(
+            &stamp_path,
+            &digest_v1,
+            super::CachedResolverOutcome::Accepted {
+                lockfile_toml: "version = 4\n".to_owned(),
+                seed,
+                covered_units: 12,
+            },
+        )
+        .await;
+
+        let hit = super::read_pinned_resolver_stamp(&stamp_path, &digest_v1)
+            .await
+            .expect("warm stamp hit");
+        assert!(matches!(
+            hit.outcome,
+            super::CachedResolverOutcome::Accepted {
+                covered_units: 12,
+                ..
+            }
+        ));
+
+        let digest_slice_moved = super::compute_resolver_stamp_digest(
+            &facts,
+            "build",
+            &[],
+            Some("sha256:2222"),
+            None,
+            &manifests_v1,
+        );
+        assert_ne!(digest_v1, digest_slice_moved);
+        assert!(
+            super::read_pinned_resolver_stamp(&stamp_path, &digest_slice_moved)
+                .await
+                .is_none()
+        );
+
+        let manifests_v2 = vec![(
+            PathBuf::from("Cargo.toml"),
+            b"[dependencies]\na = \"2\"\n".to_vec(),
+        )];
+        let digest_manifest_changed = super::compute_resolver_stamp_digest(
+            &facts,
+            "build",
+            &[],
+            Some("sha256:1111"),
+            None,
+            &manifests_v2,
+        );
+        assert_ne!(digest_v1, digest_manifest_changed);
     }
 }

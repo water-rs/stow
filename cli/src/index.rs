@@ -273,6 +273,22 @@ pub async fn cached_slice(
     load_cached(&slice_dir(config, target, rustc_version)).await
 }
 
+/// The cached slice's manifest digest from `current.json` without reading or
+/// decompressing the slice blob (`None` when no cached slice pointer exists).
+///
+/// # Errors
+///
+/// Returns an error when `current.json` exists and cannot be read or parsed.
+pub async fn cached_slice_pointer_digest(
+    config: &StowConfig,
+    target: &str,
+    rustc_version: &str,
+) -> stow_types::error::Result<Option<String>> {
+    Ok(read_pointer(&slice_dir(config, target, rustc_version))
+        .await?
+        .map(|pointer| pointer.manifest_digest))
+}
+
 /// `stow index refresh` — hit the registry even when the pointer is fresh.
 ///
 /// # Errors
