@@ -84,10 +84,10 @@ pub const OPERATIONS_WORKFLOW: &str = "operations.yml";
 /// dispatch freeze before disabling the dispatching workflows.
 pub const WATCHDOG_WORKFLOW: &str = "watchdog.yml";
 
-/// Trunk branch refs on which GitHub's `schedule` clock executes
-/// [`WATCHDOG_WORKFLOW`] (`dev` until single-trunk retirement, `main`
-/// after). Topic branches and pull request merge refs never appear here.
-const WATCHDOG_SCHEDULE_REFS: &[&str] = &["refs/heads/main", "refs/heads/dev"];
+/// Default branch ref on which GitHub's `schedule` clock executes
+/// [`WATCHDOG_WORKFLOW`]. Topic branches and pull request merge refs
+/// never match it.
+const MAIN_REF: &str = "refs/heads/main";
 
 /// Which workflows' runs may call a mutating route (stow#955). Each
 /// route names its own policy type, so the set it admits is fixed where
@@ -177,8 +177,8 @@ pub fn authorize_mutation<'a>(
 /// Gate `POST /api/v1/admin/dispatch-freeze`:
 /// - [`OPERATIONS_WORKFLOW`] at [`release_ref`] may both engage and clear;
 /// - [`WATCHDOG_WORKFLOW`] may only *engage* (`enabled == true`), at
-///   [`release_ref`] (Cron Trigger dispatch) or one of
-///   [`WATCHDOG_SCHEDULE_REFS`] (GitHub's `schedule` clock), never clear.
+///   [`release_ref`] (Cron Trigger dispatch) or [`MAIN_REF`] (GitHub's
+///   `schedule` clock), never clear.
 ///
 /// # Errors
 /// [`AuthError::Unauthorized`] for any caller, ref, workflow or re-run
@@ -206,7 +206,7 @@ pub fn authorize_freeze_mutation<'a>(
         return Err(AuthError::Unauthorized);
     };
     let release_ref = release_ref();
-    let ref_ok = *git_ref == release_ref || WATCHDOG_SCHEDULE_REFS.contains(&git_ref.as_str());
+    let ref_ok = *git_ref == release_ref || *git_ref == MAIN_REF;
     let expected = format!("{repo}/.github/workflows/{WATCHDOG_WORKFLOW}@{git_ref}");
     if !ref_ok
         || job_workflow_ref != workflow_ref
@@ -1545,9 +1545,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn freeze_mutation_admits_scheduled_watchdog_engage_only_on_trunk_or_release() {
+    async fn freeze_mutation_admits_scheduled_watchdog_engage_only_on_main_or_release() {
         let release = release_ref();
-        for git_ref in [release.as_str(), "refs/heads/main", "refs/heads/dev"] {
+        for git_ref in [release.as_str(), "refs/heads/main"] {
             let caller = oidc_caller(&workflow_claims("watchdog.yml", git_ref)).await;
             assert_eq!(
                 authorize_freeze_mutation(&caller, true, "water-rs/stow").expect("engage admitted"),
@@ -1563,6 +1563,7 @@ mod tests {
         }
 
         for bad_ref in [
+            "refs/heads/dev",
             "refs/heads/feature",
             "refs/tags/v0.0.1",
             "refs/pull/1/merge",
