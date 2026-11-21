@@ -726,16 +726,74 @@ fn local_stats_table(report: &StatsReport) -> String {
     )
 }
 
-/// `stow clean`: remove the local stow cache directory.
-pub async fn clean_project() -> stow_types::error::Result<()> {
+/// `stow clean`: remove cached artifacts and build directories while
+/// preserving verified index slices and local stats (`--all` removes the
+/// entire `$STOW_CACHE_DIR`).
+pub async fn clean_project(
+    args: crate::cli_args::CleanArgs,
+    state_db: &StateDb,
+) -> stow_types::error::Result<()> {
     let cache_dir = config::cache_dir(&SessionEnv::of_this_process()?)?;
-    if cache_dir.exists() {
-        async_fs::remove_dir_all(&cache_dir)
-            .await
-            .wrap_err_with(|| format!("remove cache dir {}", cache_dir.display()))?;
-        write_stdout(&format!("removed {}\n", cache_dir.display()))?;
-    } else {
+    if !cache_dir.exists() {
         write_stdout(&format!("cache dir missing: {}\n", cache_dir.display()))?;
+        return Ok(());
+    }
+    clean_cache_dir(&cache_dir, args.all, state_db).await?;
+    write_stdout(&format!("removed {}\n", cache_dir.display()))
+}
+
+async fn clean_cache_dir(
+    cache_dir: &Path,
+    all: bool,
+    state_db: &StateDb,
+) -> stow_types::error::Result<()> {
+    if all {
+        return async_fs::remove_dir_all(cache_dir)
+            .await
+            .wrap_err_with(|| format!("remove cache dir {}", cache_dir.display()));
+    }
+
+    let mut entries = async_fs::read_dir(cache_dir)
+        .await
+        .wrap_err_with(|| format!("read cache dir {}", cache_dir.display()))?;
+    while let Some(entry) = futures_lite::StreamExt::try_next(&mut entries)
+        .await
+        .wrap_err_with(|| format!("iterate cache dir {}", cache_dir.display()))?
+    {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if matches!(name_str.as_ref(), "index" | "stats.json")
+            || crate::state_db::is_state_db_file(&name_str)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .await
+            .wrap_err_with(|| format!("stat {}", path.display()))?;
+        if kind.is_dir() {
+            async_fs::remove_dir_all(&path)
+                .await
+                .wrap_err_with(|| format!("remove {}", path.display()))?;
+        } else {
+            async_fs::remove_file(&path)
+                .await
+                .wrap_err_with(|| format!("remove {}", path.display()))?;
+        }
+    }
+
+    if crate::state_db::state_db_path(cache_dir).exists() {
+        match state_db.pool(cache_dir).await {
+            Ok(pool) => crate::state_db::clear_cached_entries(&pool).await?,
+            Err(error) => {
+                tracing::info!(
+                    %error,
+                    "state database could not be opened under current schema; removing it"
+                );
+                crate::state_db::remove_state_db_files(cache_dir).await?;
+            }
+        }
     }
     Ok(())
 }
@@ -1937,5 +1995,80 @@ mod tests {
             }),
         );
         assert!(output.contains("STOW_VERIFY_MODE=mock-key\n"));
+    }
+
+    #[tokio::test]
+    async fn clean_preserves_index_slices_and_stats_unless_all_is_set() {
+        let dir = tempfile::tempdir().expect("temp cache dir");
+        let cache = dir.path();
+        let slice_dir = cache.join("index/x86_64-unknown-linux-gnu/1.100.0");
+        std::fs::create_dir_all(&slice_dir).expect("slice dir");
+        std::fs::write(slice_dir.join("current.json"), b"{\"row_count\":42}").expect("pointer");
+        std::fs::write(cache.join("stats.json"), b"{\"hits\":9}").expect("stats");
+        std::fs::create_dir_all(cache.join("cache/1.100.0/entry")).expect("artifact dir");
+        std::fs::create_dir_all(cache.join("cc")).expect("cc dir");
+        std::fs::create_dir_all(cache.join("build-dir/ws")).expect("build dir");
+
+        let state_db = crate::state_db::StateDb::default();
+        let pool = state_db.pool(cache).await.expect("open state db");
+        sqlx::query(
+            "INSERT INTO crate_stats (crate_name, hits, misses, errors) VALUES ('serde', 7, 1, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert crate_stats");
+        sqlx::query(
+            "INSERT INTO cc_cache_entries (cache_key, size_bytes, last_accessed_ms) VALUES ('k1', 128, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert cc_cache_entries");
+
+        super::clean_cache_dir(cache, false, &state_db)
+            .await
+            .expect("default clean");
+
+        assert!(slice_dir.join("current.json").is_file());
+        assert!(cache.join("stats.json").is_file());
+        assert!(!cache.join("cache").exists());
+        assert!(!cache.join("cc").exists());
+        assert!(!cache.join("build-dir").exists());
+        let cc_rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cc_cache_entries")
+            .fetch_one(&pool)
+            .await
+            .expect("count cc rows");
+        assert_eq!(cc_rows.0, 0);
+        let hits: (i64,) =
+            sqlx::query_as("SELECT hits FROM crate_stats WHERE crate_name = 'serde'")
+                .fetch_one(&pool)
+                .await
+                .expect("read preserved crate_stats");
+        assert_eq!(hits.0, 7);
+        state_db.close().await;
+
+        let fresh_db = crate::state_db::StateDb::default();
+        super::clean_cache_dir(cache, true, &fresh_db)
+            .await
+            .expect("clean --all");
+        assert!(!cache.exists());
+    }
+
+    #[tokio::test]
+    async fn clean_removes_schema_mismatched_state_db_without_touching_index() {
+        let dir = tempfile::tempdir().expect("temp cache dir");
+        let cache = dir.path();
+        let slice_dir = cache.join("index/aarch64-apple-darwin/1.100.0");
+        std::fs::create_dir_all(&slice_dir).expect("slice dir");
+        std::fs::write(slice_dir.join("current.json"), b"{}").expect("pointer");
+        std::fs::write(crate::state_db::state_db_path(cache), b"not-a-valid-sqlite")
+            .expect("corrupt db");
+
+        let state_db = crate::state_db::StateDb::default();
+        super::clean_cache_dir(cache, false, &state_db)
+            .await
+            .expect("clean recovers broken state db");
+        assert!(slice_dir.join("current.json").is_file());
+        assert!(!crate::state_db::state_db_path(cache).exists());
+        state_db.close().await;
     }
 }

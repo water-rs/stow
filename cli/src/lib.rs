@@ -410,7 +410,7 @@ async fn run_cli(
         CliCommand::Update => commands::update_self().await,
         CliCommand::Status => commands::status_project(state_db).await,
         CliCommand::Stats(args) => commands::stats_command(args, state_db).await,
-        CliCommand::Clean => commands::clean_project().await,
+        CliCommand::Clean(args) => commands::clean_project(args, state_db).await,
         CliCommand::CheckArtifact(command) => commands::check_artifact(command, state_db).await,
         CliCommand::FetchArtifact(command) => commands::fetch_artifact(command, state_db).await,
         CliCommand::Index(args) => match args.command {
@@ -433,7 +433,7 @@ const fn subcommand_name(command: &CliCommand) -> &'static str {
         CliCommand::Update => "update",
         CliCommand::Status => "status",
         CliCommand::Stats(_) => "stats",
-        CliCommand::Clean => "clean",
+        CliCommand::Clean(_) => "clean",
         CliCommand::CheckArtifact(_) => "check-artifact",
         CliCommand::FetchArtifact(_) => "fetch-artifact",
         CliCommand::Index(_) => "index",

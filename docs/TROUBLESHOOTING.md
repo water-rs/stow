@@ -164,6 +164,7 @@ The local state database's schema is versioned by a blake3 identity of
 `cli/src/state-db-schema.sql` stamped into `PRAGMA user_version` — a
 build that does not recognize the file on disk refuses to open it rather
 than read a shape it was not written against. Run `stow clean` (it
-deletes the cache directory without opening the database) and retry; the
+removes a mismatched state database while keeping cached index slices) or
+`stow clean --all` and retry; the
 stats, cache entries and link resolutions it held are rebuilt by the
 next builds.

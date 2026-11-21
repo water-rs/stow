@@ -131,4 +131,4 @@ steps:
 - `stow stats` (`--json`) — local hits, misses, bytes downloaded, and compile CPU time saved.
 - `stow index status` / `stow index refresh` — inspect or force-revalidate cached `(target, rustc)` signed index slices (`~/.stow/index/`).
 - `STOW_IDENTITY_TRACE=/tmp/stow-trace cargo check` — writes per-invocation JSON identity records to diagnose why a specific unit missed an index row.
-- `stow clean` — deletes `~/.stow` (`$STOW_CACHE_DIR`, including state DB on schema mismatch) while keeping wrapper shims intact.
+- `stow clean` — deletes cached artifacts and build directories under `~/.stow` (`$STOW_CACHE_DIR`, resetting `state-v3.sqlite3` if its schema mismatches) while preserving verified index slices (`~/.stow/index/`), local stats, and wrapper shims; pass `stow clean --all` to wipe `~/.stow` completely.

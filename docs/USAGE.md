@@ -478,9 +478,16 @@ Nothing leaves the machine: the command reads local counters only. See
 
 ## `stow clean`
 
-Removes the local stow cache directory (`$STOW_CACHE_DIR`, or `~/.stow`
-by default; see [`ENVIRONMENT.md`](ENVIRONMENT.md)). Does NOT remove the
-local stats DB or wrapper shims.
+Removes cached Rust and C/C++ artifacts and managed workspace build
+directories under `$STOW_CACHE_DIR` (`~/.stow` by default; see
+[`ENVIRONMENT.md`](ENVIRONMENT.md)) while keeping verified index slices
+(`~/.stow/index/`), local usage stats, and wrapper shims intact — so the
+next plain `cargo build` still hits the public cache without needing a
+manual `stow index refresh`. If `state-v3.sqlite3` fails to open under the
+current schema, `stow clean` removes and resets it automatically.
+
+Pass `--all` (`stow clean --all`) to delete the entire `$STOW_CACHE_DIR`,
+including cached index slices and local stats.
 
 ## `stow index refresh` / `stow index status`
 

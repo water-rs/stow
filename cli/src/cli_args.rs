@@ -23,7 +23,7 @@ pub enum Command {
     Update,
     Status,
     Stats(StatsArgs),
-    Clean,
+    Clean(CleanArgs),
     CheckArtifact(CheckArtifactArgs),
     FetchArtifact(FetchArtifactArgs),
     /// Manage the signed local artifact index this toolchain resolves
@@ -193,6 +193,14 @@ pub struct StatsArgs {
     /// Print the counters as JSON instead of a table.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Clone, Args, Default)]
+pub struct CleanArgs {
+    /// Remove the entire `$STOW_CACHE_DIR` including cached index slices and
+    /// local usage stats.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Clone, Args)]
