@@ -2499,7 +2499,7 @@ pub const DRIVES: &[Drive] = &[
                 routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &[PublishedSlice {
+                    vec![PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
                         base_generation: None,
@@ -2524,7 +2524,7 @@ pub const DRIVES: &[Drive] = &[
                 routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &[PublishedSlice {
+                    vec![PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
                         base_generation: None,
@@ -2560,7 +2560,7 @@ pub const DRIVES: &[Drive] = &[
                 routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &[PublishedSlice {
+                    vec![PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
                         base_generation: None,
@@ -2596,7 +2596,7 @@ pub const DRIVES: &[Drive] = &[
                 routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &[PublishedSlice {
+                    vec![PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
                         base_generation: None,
@@ -2632,7 +2632,7 @@ pub const DRIVES: &[Drive] = &[
                 routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &[PublishedSlice {
+                    vec![PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
                         base_generation: None,
@@ -2664,7 +2664,7 @@ pub const DRIVES: &[Drive] = &[
                 routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &[PublishedSlice {
+                    vec![PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
                         base_generation: Some(live),
@@ -2701,7 +2701,7 @@ pub const DRIVES: &[Drive] = &[
                 routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &[PublishedSlice {
+                    vec![PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
                         base_generation: Some(live),
@@ -2842,7 +2842,7 @@ pub const DRIVES: &[Drive] = &[
                 routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &[refusal_slice(&nodes, false)?],
+                    vec![refusal_slice(&nodes, false)?],
                     Some(DRIVE_ACTOR),
                     now_ms(),
                 )
@@ -2923,7 +2923,7 @@ pub const DRIVES: &[Drive] = &[
                 routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &[refusal_slice(&nodes, true)?],
+                    vec![refusal_slice(&nodes, true)?],
                     Some(DRIVE_ACTOR),
                     now_ms(),
                 )
@@ -3531,7 +3531,7 @@ pub const DRIVES: &[Drive] = &[
                         env,
                         db,
                         alarm,
-                        std::slice::from_ref(&slice),
+                        vec![slice],
                         DRIVE_ACTOR,
                     )
                     .await
@@ -3540,15 +3540,9 @@ pub const DRIVES: &[Drive] = &[
                 #[cfg(not(target_arch = "wasm32"))]
                 let claimed = {
                     let now = now_ms();
-                    routes::slice_reports(
-                        ctx.loaded(),
-                        db,
-                        std::slice::from_ref(&slice),
-                        Some(DRIVE_ACTOR),
-                        now,
-                    )
-                    .await
-                    .map_err(text)?;
+                    routes::slice_reports(ctx.loaded(), db, vec![slice], Some(DRIVE_ACTOR), now)
+                        .await
+                        .map_err(text)?;
                     let claims = routes::claim_pass(
                         ctx.loaded(),
                         db,
@@ -3595,7 +3589,7 @@ pub const DRIVES: &[Drive] = &[
                 routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &[PublishedSlice {
+                    vec![PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.87.0").map_err(text)?,
                         base_generation: None,
@@ -4277,7 +4271,7 @@ async fn snapshot_slice_report(
     routes::slice_reports(
         ctx.loaded(),
         db,
-        &[PublishedSlice {
+        vec![PublishedSlice {
             target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
             rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
             base_generation: Some(live),
