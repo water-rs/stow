@@ -79,7 +79,7 @@ jobs:
           echo "installable release: ${tag:-none}"
 
   smoke:
-    name: smoke (${{ matrix.os }})
+    name: smoke (${{ matrix.os }}, ${{ matrix.mode }})
     needs: [changes, release]
     if: needs.changes.outputs.code == 'true' && needs.release.outputs.exists == 'true'
     runs-on: ${{ matrix.os }}
@@ -87,15 +87,31 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        mode: [remote, local]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
-      - uses: ./
+      - if: matrix.mode == 'remote'
+        uses: ./
+        with:
+          version: latest
+      - if: matrix.mode == 'local'
+        uses: ./local
         with:
           version: latest
       - run: stow --version
+      - name: verify local-only mode disables remote requests
+        if: matrix.mode == 'local'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if out="$(stow index refresh 2>&1)"; then
+            echo "::error::stow index refresh unexpectedly succeeded under ./local: $out" >&2
+            exit 1
+          fi
+          grep -q "remote cache is off" <<<"$out"
       - name: cargo check through the wrappers
         shell: bash
         run: |

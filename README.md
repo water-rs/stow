@@ -47,8 +47,11 @@ without that task a build fails naming `stow setup`. See
 
 Without `stow setup`, `stow check`, `stow build` and `stow test` are
 drop-in replacements for the cargo subcommands. `stow update` updates the
-install. In GitHub Actions, `- uses: water-rs/stow@main` does the same
-for the job. Every command and flag is in [docs/USAGE.md](docs/USAGE.md).
+install. In GitHub Actions, `- uses: water-rs/stow@main` accelerates the job
+with the public cache (`- uses: water-rs/stow/local@main` runs local-only when
+remote cache access is forbidden). Coding agents can install the bundled skill
+with `npx skills add water-rs/stow`. Every command and flag is in
+[docs/USAGE.md](docs/USAGE.md).
 
 ## What you get
 
