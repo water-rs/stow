@@ -7,11 +7,10 @@ use stow_types::identity::TargetTriple;
 
 use crate::errors::QueueError;
 
-// Dispatch ceiling defaults, used when neither a deploy binding nor an
-// operator `dispatch-cap set` names one. Sized against the org's 60
-// GitHub-hosted runners (15 of them macOS): 45 total leaves 15 runners
-// for the repo's own CI, and the macOS cap keeps a full wave from
-// queueing on the smallest pool while leaving 4 macOS runners free.
+// Conservative bootstrap dispatch ceilings used when neither a deploy
+// binding nor an operator `dispatch-cap set` names one. Production runs
+// under the `water-rs` Enterprise allocation (`--jobs 500 --macos 60`
+// paired with `dispatch-rate set --per-minute 150`; see `docs/DEPLOYMENT.md`).
 const DEFAULT_MAX_CONCURRENT_JOBS: NonZeroU32 = NonZeroU32::new(45).unwrap();
 const DEFAULT_MAX_CONCURRENT_MACOS_JOBS: u32 = 11;
 const DEFAULT_DISPATCH_MIN_AGE_MINUTES: u32 = 5;

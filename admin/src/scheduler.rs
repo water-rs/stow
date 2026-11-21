@@ -7,7 +7,9 @@
 
 use clap::{Args, Subcommand};
 use stow_types::api::{
-    SchedulerBudgetReport, SchedulerBudgetRequest, SchedulerResetReport, SchedulerSeedReport,
+    DispatchCapSet, DispatchCaps, DispatchRate, DispatchRateSet, MemoryLineSet, MemoryLines,
+    MinCliVersion, MinCliVersionSet, ReleasePriority, ReleasePrioritySet, SchedulerBudgetReport,
+    SchedulerBudgetRequest, SchedulerResetReport, SchedulerSeedReport,
 };
 
 use crate::Edge;
@@ -95,6 +97,83 @@ pub async fn run(
     }
 }
 
+/// Runtime operator settings captured before a `scheduler reset` and
+/// re-applied immediately after `schema.sql` recreates the store,
+/// before `operations.yml` dispatches refill workflows.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PreservedSettings {
+    memory_line: Option<MemoryLineSet>,
+    dispatch_rate: Option<DispatchRateSet>,
+    dispatch_cap: Option<DispatchCapSet>,
+    release_priority: Option<ReleasePrioritySet>,
+    min_cli_version: Option<MinCliVersionSet>,
+}
+
+impl PreservedSettings {
+    async fn capture(edge: &Edge) -> Self {
+        // `memory-line` lives outside the graph: if this read fails the
+        // store is uninitialized (first deploy), so skip the four
+        // graph-backed probes; if it succeeds, preserve `memory_line`
+        // even when the graph itself cannot wake.
+        let Ok(memory) = edge
+            .get_json::<MemoryLines>("/api/v1/admin/memory-line")
+            .await
+        else {
+            return Self::default();
+        };
+        let (rate, cap, release, min_cli) = futures_util::join!(
+            edge.get_json::<DispatchRate>("/api/v1/admin/dispatch-rate"),
+            edge.get_json::<DispatchCaps>("/api/v1/admin/dispatch-cap"),
+            edge.get_json::<ReleasePriority>("/api/v1/admin/release-priority"),
+            edge.get_json::<MinCliVersion>("/api/v1/admin/min-cli-version"),
+        );
+        Self {
+            memory_line: memory.setting.map(|s| s.lines),
+            dispatch_rate: rate.ok().and_then(|v| v.setting).map(|s| DispatchRateSet {
+                max_runs_per_minute: s.max_runs_per_minute,
+            }),
+            dispatch_cap: cap.ok().and_then(|v| v.setting).map(|s| DispatchCapSet {
+                max_concurrent_jobs: s.max_concurrent_jobs,
+                max_concurrent_macos_jobs: s.max_concurrent_macos_jobs,
+            }),
+            release_priority: release
+                .ok()
+                .and_then(|v| v.setting)
+                .map(|s| ReleasePrioritySet { percent: s.percent }),
+            min_cli_version: min_cli
+                .ok()
+                .and_then(|v| v.setting)
+                .map(|s| MinCliVersionSet { version: s.version }),
+        }
+    }
+
+    async fn restore(self, edge: &Edge) -> stow_types::error::Result<()> {
+        if let Some(plan) = &self.memory_line {
+            let _: MemoryLines = edge.post_json("/api/v1/admin/memory-line", plan).await?;
+        }
+        // Restore `dispatch-rate` strictly ahead of `dispatch-cap` so a
+        // subsequent refill never sees a raised concurrency ceiling
+        // without its per-minute start bound.
+        if let Some(plan) = &self.dispatch_rate {
+            let _: DispatchRate = edge.post_json("/api/v1/admin/dispatch-rate", plan).await?;
+        }
+        if let Some(plan) = &self.dispatch_cap {
+            let _: DispatchCaps = edge.post_json("/api/v1/admin/dispatch-cap", plan).await?;
+        }
+        if let Some(plan) = &self.release_priority {
+            let _: ReleasePriority = edge
+                .post_json("/api/v1/admin/release-priority", plan)
+                .await?;
+        }
+        if let Some(plan) = &self.min_cli_version {
+            let _: MinCliVersion = edge
+                .post_json("/api/v1/admin/min-cli-version", plan)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 async fn reset(edge: &Edge, yes: bool, output: Output) -> stow_types::error::Result<()> {
     if !yes {
         return Err(stow_types::error::Error::msg(
@@ -104,9 +183,11 @@ async fn reset(edge: &Edge, yes: bool, output: Output) -> stow_types::error::Res
              succeeds; re-run with --yes",
         ));
     }
+    let preserved = PreservedSettings::capture(edge).await;
     let report: SchedulerResetReport = edge
         .post_json("/api/v1/admin/scheduler/reset", &serde_json::json!({}))
         .await?;
+    preserved.restore(edge).await?;
     render::emit(output, &report, |report| {
         format!("scheduler store reset — {} objects dropped", report.dropped)
     })
@@ -207,4 +288,256 @@ fn render_budget_table(report: &SchedulerBudgetReport) -> String {
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse as _;
+    use serde_json::{Value, json};
+    use tokio::sync::mpsc;
+
+    use super::{Output, reset};
+    use crate::Edge;
+
+    type RouteMap = BTreeMap<&'static str, (StatusCode, Value)>;
+
+    struct StubShared {
+        routes: RouteMap,
+        calls: mpsc::Sender<(String, Value)>,
+    }
+
+    struct StubEdge {
+        edge: Edge,
+        calls: mpsc::Receiver<(String, Value)>,
+    }
+
+    async fn stub_handler(
+        axum::extract::State(shared): axum::extract::State<Arc<StubShared>>,
+        request: axum::extract::Request,
+    ) -> axum::response::Response {
+        let key = format!("{} {}", request.method(), request.uri().path());
+        let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body = serde_json::from_slice::<Value>(&bytes).unwrap_or_default();
+        shared.calls.try_send((key.clone(), body)).expect("record");
+        let (status, payload) = shared
+            .routes
+            .get(key.as_str())
+            .cloned()
+            .unwrap_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": key})));
+        (status, axum::Json(payload)).into_response()
+    }
+
+    async fn spawn_stub(routes: RouteMap) -> StubEdge {
+        let (calls, rx) = mpsc::channel(32);
+        let app = axum::Router::new()
+            .fallback(axum::routing::any(stub_handler))
+            .with_state(Arc::new(StubShared { routes, calls }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        StubEdge {
+            edge: Edge::for_test(format!("http://{addr}")),
+            calls: rx,
+        }
+    }
+
+    fn drain_posts(calls: &mut mpsc::Receiver<(String, Value)>) -> Vec<(String, Value)> {
+        let mut posts = Vec::new();
+        while let Ok((key, body)) = calls.try_recv() {
+            if key.starts_with("POST ") {
+                posts.push((key, body));
+            }
+        }
+        posts
+    }
+
+    fn configured_gets() -> RouteMap {
+        BTreeMap::from([
+            (
+                "GET /api/v1/admin/memory-line",
+                (
+                    StatusCode::OK,
+                    json!({
+                        "setting": {
+                            "normal_line_bytes": 75_000_000,
+                            "small_line_bytes": 85_000_000,
+                            "small_increment_bytes": 65_536,
+                            "set_at": "2026-11-21T00:00:00Z",
+                            "actor": "lexoliu"
+                        },
+                        "normal_line_bytes": 75_000_000,
+                        "small_line_bytes": 85_000_000,
+                        "small_increment_bytes": 65_536
+                    }),
+                ),
+            ),
+            (
+                "GET /api/v1/admin/dispatch-rate",
+                (
+                    StatusCode::OK,
+                    json!({
+                        "setting": {
+                            "max_runs_per_minute": 150,
+                            "set_at": "2026-11-21T00:00:00Z",
+                            "actor": "lexoliu"
+                        },
+                        "max_runs_per_minute": 150,
+                        "started_last_minute": 12
+                    }),
+                ),
+            ),
+            (
+                "GET /api/v1/admin/dispatch-cap",
+                (
+                    StatusCode::OK,
+                    json!({
+                        "setting": {
+                            "max_concurrent_jobs": 500,
+                            "max_concurrent_macos_jobs": 60,
+                            "set_at": "2026-11-21T00:00:00Z",
+                            "actor": "lexoliu"
+                        },
+                        "max_concurrent_jobs": 500,
+                        "max_concurrent_macos_jobs": 60
+                    }),
+                ),
+            ),
+            (
+                "GET /api/v1/admin/release-priority",
+                (StatusCode::OK, json!({ "percent": 10 })),
+            ),
+            (
+                "GET /api/v1/admin/min-cli-version",
+                (
+                    StatusCode::OK,
+                    json!({
+                        "setting": {
+                            "version": "0.21.8",
+                            "set_at": "2026-11-21T00:00:00Z",
+                            "actor": "lexoliu"
+                        },
+                        "version": "0.21.8"
+                    }),
+                ),
+            ),
+        ])
+    }
+
+    fn configured_routes() -> RouteMap {
+        let mut routes = configured_gets();
+        routes.extend([
+            (
+                "POST /api/v1/admin/scheduler/reset",
+                (StatusCode::OK, json!({ "dropped": 8 })),
+            ),
+            (
+                "POST /api/v1/admin/memory-line",
+                (
+                    StatusCode::OK,
+                    json!({
+                        "normal_line_bytes": 75_000_000,
+                        "small_line_bytes": 85_000_000,
+                        "small_increment_bytes": 65_536
+                    }),
+                ),
+            ),
+            (
+                "POST /api/v1/admin/dispatch-rate",
+                (
+                    StatusCode::OK,
+                    json!({ "max_runs_per_minute": 150, "started_last_minute": 0 }),
+                ),
+            ),
+            (
+                "POST /api/v1/admin/dispatch-cap",
+                (
+                    StatusCode::OK,
+                    json!({ "max_concurrent_jobs": 500, "max_concurrent_macos_jobs": 60 }),
+                ),
+            ),
+            (
+                "POST /api/v1/admin/min-cli-version",
+                (StatusCode::OK, json!({ "version": "0.21.8" })),
+            ),
+        ]);
+        routes
+    }
+
+    #[tokio::test]
+    async fn reset_preserves_operator_settings_and_restores_rate_before_cap() {
+        let mut stub = spawn_stub(configured_routes()).await;
+        reset(&stub.edge, true, Output::Json).await.expect("reset");
+        let posts = drain_posts(&mut stub.calls);
+        let keys: Vec<&str> = posts.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "POST /api/v1/admin/scheduler/reset",
+                "POST /api/v1/admin/memory-line",
+                "POST /api/v1/admin/dispatch-rate",
+                "POST /api/v1/admin/dispatch-cap",
+                "POST /api/v1/admin/min-cli-version",
+            ]
+        );
+        assert_eq!(
+            posts[2].1,
+            json!({ "max_runs_per_minute": 150 }),
+            "dispatch-rate restores ahead of dispatch-cap"
+        );
+        assert_eq!(
+            posts[3].1,
+            json!({ "max_concurrent_jobs": 500, "max_concurrent_macos_jobs": 60 })
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_preserves_memory_line_on_unwakeable_graph_and_skips_uninitialized_store() {
+        let mut torn = BTreeMap::from([
+            configured_routes()
+                .remove_entry("GET /api/v1/admin/memory-line")
+                .expect("memory-line get"),
+            (
+                "POST /api/v1/admin/scheduler/reset",
+                (StatusCode::OK, json!({ "dropped": 8 })),
+            ),
+            configured_routes()
+                .remove_entry("POST /api/v1/admin/memory-line")
+                .expect("memory-line post"),
+        ]);
+        let mut stub = spawn_stub(torn.clone()).await;
+        reset(&stub.edge, true, Output::Json)
+            .await
+            .expect("reset over torn graph");
+        let posts = drain_posts(&mut stub.calls);
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0].0, "POST /api/v1/admin/scheduler/reset");
+        assert_eq!(posts[1].0, "POST /api/v1/admin/memory-line");
+
+        torn.remove("GET /api/v1/admin/memory-line");
+        let mut fresh = spawn_stub(torn).await;
+        reset(&fresh.edge, true, Output::Json)
+            .await
+            .expect("first-deploy reset");
+        let mut all = Vec::new();
+        while let Ok((key, _)) = fresh.calls.try_recv() {
+            all.push(key);
+        }
+        assert_eq!(
+            all,
+            vec![
+                "GET /api/v1/admin/memory-line",
+                "POST /api/v1/admin/scheduler/reset",
+            ]
+        );
+    }
 }

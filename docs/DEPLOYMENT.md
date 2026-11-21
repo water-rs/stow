@@ -74,8 +74,16 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    same pass is how a schema change lands: it drops every table,
    index and trigger in the store and re-executes
    `edge/src/scheduler/schema.sql`; the queue and recorded slices are
-   destroyed. The same run then refills them, so no other step follows
-   the reset: once the reset succeeds, `operations.yml` runs
+   destroyed. Before dropping the store, `stow-admin scheduler reset --yes`
+   reads any operator settings already in force (`memory-line` even when
+   the graph cannot wake, plus `dispatch-rate`, `dispatch-cap`,
+   `release-priority` and `min-cli-version` when the graph wakes) and
+   re-applies them immediately after the reset (with `dispatch-rate`
+   ahead of `dispatch-cap`) before `operations.yml` refills the store;
+   when a reset recovers a store whose graph could not wake, re-apply
+   the graph-backed settings from
+   [Production quotas and runtime limits](#production-quotas-and-runtime-limits).
+   Once `stow-admin scheduler reset --yes` finishes, `operations.yml` runs
    `stow-admin index published-rustcs`, which probes every stable
    release `static.rust-lang.org/manifests.txt` lists for a published
    `stow-cache-v2-<rustc>` package through the registry's anonymous tag
@@ -759,6 +767,28 @@ the edge directly instead of dispatching. The scheduled and dispatched
 lanes (`preheat-admin.yml`, `preheat-missed.yml`, `demand-feed.yml`,
 `index-publish.yml`, `resolve-request.yml`) call their own routes with
 their own tokens.
+
+### Production quotas and runtime limits
+
+`water-rs` runs on GitHub Enterprise Cloud and Cloudflare Workers Paid.
+The bootstrap bindings in `edge/Skyzen.toml` (`STOW_MAX_CONCURRENT_JOBS = "45"`,
+`STOW_MAX_CONCURRENT_MACOS_JOBS = "11"`) stay conservative for cold
+deploys and local cost harnesses; production operates under these
+vendor quotas and runtime settings:
+
+| Resource | Allocation / ceiling | Runtime setting in force |
+|---|---|---|
+| GitHub Actions total concurrency | **500** concurrent jobs across all runner families (the scheduler subtracts non-builder `external_runs` occupancy automatically) | `stow-admin dispatch-cap set --jobs 500 --macos 60 --yes` |
+| GitHub Actions macOS concurrency | **60** concurrent `macos-*` jobs granted within the 500 total (**160** requested from GitHub Support, pending Actions engineering capacity review) | `--macos 60` on `dispatch-cap set` above |
+| GitHub `workflow_dispatch` & GHCR write rate | ~180 dispatches/min GitHub secondary limit (inside the 15,000/h Enterprise App installation token quota) and ~2,000 writes/min on the `ghcr.io/water-rs` namespace | `stow-admin dispatch-rate set --per-minute 150 --yes` (apply **before** raising `dispatch-cap`) |
+| Scheduler Durable Object isolate memory | 128 MB combined JavaScript heap + Wasm linear memory | `75 MB` normal / `85 MB` small / `64 KiB` small increment (code defaults; override via `stow-admin memory-line set --normal 75000000 --small 85000000 --small-increment 65536 --yes`) |
+
+`stow-admin scheduler reset --yes` automatically snapshots and restores
+`memory-line` (stored outside the graph) and, whenever the graph can
+still wake before the reset, `dispatch-rate`, `dispatch-cap`,
+`release-priority` and `min-cli-version`. After resetting a store whose
+graph could **not** wake beforehand, re-apply `dispatch-rate` first and
+`dispatch-cap` second using the commands above.
 
 ### Repack follow-up
 

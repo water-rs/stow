@@ -93,9 +93,10 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   expiry, and no bound is checked. The setting is stored outside the
   graph, so both commands work while the graph is too large to wake:
   raising `--small` above the graph's size is how it wakes again
-  (`stow-admin scheduler reset --yes` is the other way, and drops the
-  queue and the backlog). Admission and the wake apply the new lines
-  from the next request on.
+  (`stow-admin scheduler reset --yes` is the other way: it drops the
+  queue and the backlog while preserving `memory-line` and any
+  graph-backed operator settings reachable before the reset). Admission
+  and the wake apply the new lines from the next request on.
 - `stow-admin submit --crate-name X --version 1.2.3 --features-json '["default"]' --target aarch64-apple-darwin --rustc-version 1.91.1 --yes`
   — enqueue one specific build task.
 - `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`
