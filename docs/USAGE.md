@@ -293,8 +293,21 @@ wiring as `KEY=VALUE` lines (plus the resolved `STOW_EDGE_URL` /
 the composite action below appends it to `$GITHUB_ENV`. The linker
 selection cannot be expressed this way (env rustflags would replace the
 project's configured rustflags wholesale), so a job on Linux also runs
-plain `stow setup`, which writes the mold selection into the runner's
-`$CARGO_HOME/config.toml`.
+`stow setup --no-build-dir --no-install-skill`, which writes the mold
+selection into the runner's `$CARGO_HOME/config.toml` while leaving
+Cargo's standard `target/` build directory untouched (so compiled
+integration test binaries remain under `target/<profile>/deps/`).
+
+On an interactive terminal, when `~/.claude` or `~/.agents` exists in your
+home directory and does not yet have the current `stow` skill, `stow setup`
+asks whether to install the bundled `SKILL.md` into the detected agent skill
+directory (pass `--install-skill` or `--no-install-skill` to decide without
+prompting). On machines where `stow setup` placed `build.build-dir` under
+`~/.stow/build-dir/{workspace-path-hash}`, final `[[bin]]`/`cdylib`/`staticlib`
+outputs are still copied to `target/<profile>/`, while intermediate `deps/`
+artifacts (including integration test binaries) live under the per-workspace
+build directory — read their paths via `cargo test --no-run --message-format=json`
+or set `CARGO_BUILD_BUILD_DIR=target` when a script requires `target/debug/deps/`.
 
 ### Sandboxes
 
