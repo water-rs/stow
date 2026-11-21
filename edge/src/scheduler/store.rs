@@ -321,10 +321,18 @@ struct SnapshotMetaRow {
     value: i64,
 }
 
+/// Inclusive `[lo, hi]` chunk-key bounds of snapshot epoch `epoch`
+/// (`0` or `1`), staying inside JavaScript's `Number.MAX_SAFE_INTEGER`
+/// (`2^53 - 1`) for every `workerd` SQLite parameter binding.
 const fn epoch_bounds(epoch: i64) -> (i64, i64) {
     let base = epoch << SNAPSHOT_EPOCH_SHIFT;
-    (base, base + (1i64 << SNAPSHOT_EPOCH_SHIFT))
+    (base, base + ((1i64 << SNAPSHOT_EPOCH_SHIFT) - 1))
 }
+
+const _: () = assert!(
+    epoch_bounds(1).1 < (1i64 << 53),
+    "epoch 1 upper bound must fit JS safe integers"
+);
 
 /// The committed snapshot `(watermark_seq, epoch)` (`(0, 0)` before the
 /// first snapshot).
@@ -358,7 +366,7 @@ pub(super) async fn snapshot_state(db: &DurableDb) -> Result<(i64, i64), QueueEr
 
 async fn clear_epoch(db: &DurableDb, epoch: i64) -> Result<(), QueueError> {
     let (lo, hi) = epoch_bounds(epoch);
-    db.query("DELETE FROM snapshot_chunks WHERE chunk >= ? AND chunk < ?")
+    db.query("DELETE FROM snapshot_chunks WHERE chunk BETWEEN ? AND ?")
         .bind(lo)
         .bind(hi)
         .execute()
@@ -964,7 +972,7 @@ async fn load(db: &DurableDb, budget: u64) -> Result<(Graph, i64), QueueError> {
         let batch = db
             .query(
                 "SELECT chunk, payload FROM snapshot_chunks \
-                 WHERE chunk > ? AND chunk < ? ORDER BY chunk LIMIT ?",
+                 WHERE chunk > ? AND chunk <= ? ORDER BY chunk LIMIT ?",
             )
             .bind(key)
             .bind(epoch_end)
@@ -2720,5 +2728,21 @@ mod tests {
             .expect("wake from alternate epoch");
         assert_eq!(replayed2, 0);
         assert_eq!(reloaded.status(), restored.status());
+    }
+
+    #[tokio::test]
+    async fn test_db_rejects_integers_outside_js_safe_range() {
+        let db = test_db::memory_db().await.expect("db");
+        let err = db
+            .query("DELETE FROM snapshot_chunks WHERE chunk < ?")
+            .bind(1i64 << 53)
+            .execute()
+            .await
+            .expect_err("2^53 must be rejected like workerd");
+        assert!(
+            err.to_string()
+                .contains("exceeds JavaScript safe integer range"),
+            "unexpected error: {err}"
+        );
     }
 }

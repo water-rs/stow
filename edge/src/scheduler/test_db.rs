@@ -565,14 +565,28 @@ impl DurableDbBackend for SqliteBackend {
     }
 }
 
-/// The documented DO SQLite bound-parameter limit, independent of the
-/// host SQLite build's much larger limit.
+/// JavaScript `Number.MAX_SAFE_INTEGER` (`2^53 - 1`): `workerd` rejects
+/// any Durable Object SQLite integer parameter outside
+/// `[-JS_MAX_SAFE_INTEGER, JS_MAX_SAFE_INTEGER]`.
+const JS_MAX_SAFE_INTEGER: i64 = (1i64 << 53) - 1;
+
+/// The documented DO SQLite bound-parameter and safe-integer limits,
+/// independent of the host SQLite build's wider limits.
 /// <https://developers.cloudflare.com/durable-objects/platform/limits/#sql-storage-limits>
 fn check_do_bindings(params: &[DbValue]) -> Result<(), DurableDbError> {
     if params.len() > 100 {
         return Err(backend_error(
             "too many SQL variables: Durable Objects allow 100 bound parameters",
         ));
+    }
+    for param in params {
+        if let DbValue::Integer(value) = param
+            && !(-JS_MAX_SAFE_INTEGER..=JS_MAX_SAFE_INTEGER).contains(value)
+        {
+            return Err(backend_error(format!(
+                "durable sql integer parameter exceeds JavaScript safe integer range: {value}"
+            )));
+        }
     }
     Ok(())
 }
