@@ -1498,13 +1498,27 @@ pub fn find_exact_artifact<'a>(
 
 /// The identity half of a semantic request — crate, features, dep chain,
 /// profile, crate types, kind — shared by [`find_semantic_artifact`] and
-/// the serve path's refusal check: the lookup filters and ranks on
-/// this plus version/emit, while refusal detection only needs to know a
-/// matching row exists at all.
-pub fn semantic_identity_match(row: &ArtifactIndexRow, request: &SemanticFetchRequest) -> bool {
+/// the serve path's refusal check, widened to feature supersets only for
+/// `c_metadata`s whose whole downstream chain the build's graph analysis
+/// already proved is published in the slice (`stow#881`).
+pub fn semantic_identity_match(
+    row: &ArtifactIndexRow,
+    request: &SemanticFetchRequest,
+    allowed_superset_c_metadatas: Option<&BTreeSet<String>>,
+) -> bool {
+    let features_match = if row.features_json.raw() == request.features_json {
+        true
+    } else if allowed_superset_c_metadatas.is_some_and(|set| set.contains(row.c_metadata.as_str()))
+    {
+        serde_json::from_str::<Vec<String>>(&request.features_json).is_ok_and(|requested| {
+            stow_types::feature_sets::contains_all(row.features_json.features(), &requested)
+        })
+    } else {
+        false
+    };
     row.crate_name.as_str() == request.crate_name
         && Version::parse(&request.version).is_ok_and(|version| row.version.as_semver() == &version)
-        && row.features_json.raw() == request.features_json
+        && features_match
         && row.dependency_c_metadata_json.raw() == request.dependency_c_metadata_json
         && row.artifact_kind == request.kind
         && row.crate_types == request.crate_types
@@ -1513,7 +1527,12 @@ pub fn semantic_identity_match(row: &ArtifactIndexRow, request: &SemanticFetchRe
 
 /// The wrapper's semantic lookup, resolved locally: the index row whose
 /// exact version and identity match `request` (differing only in Cargo's
-/// local `-C metadata` or a wider covering `--emit` set).
+/// local `-C metadata` or a wider covering `--emit` set), also admitting
+/// graph-validated feature-superset `c_metadata`s (`allowed_superset_c_metadatas`)
+/// when background prefetch has not landed them locally yet or hit its
+/// `CacheBudget` deadline (`stow#881`, `stow#1631`). Exact feature matches
+/// always outrank supersets; supersets rank by smallest containing feature set,
+/// ties broken by sorted feature list.
 ///
 /// Semver-compatible upgrades belong strictly in lockfile resolution
 /// (`stow-resolver` / `--silent-compatible-upgrades`), never in substituting
@@ -1527,6 +1546,7 @@ pub fn semantic_identity_match(row: &ArtifactIndexRow, request: &SemanticFetchRe
 pub fn find_semantic_artifact<'a>(
     rows: &'a [ArtifactIndexRow],
     request: &SemanticFetchRequest,
+    allowed_superset_c_metadatas: Option<&BTreeSet<String>>,
     host_glibc: Option<GlibcVersion>,
 ) -> stow_types::error::Result<Option<&'a ArtifactIndexRow>> {
     validate_emit_sorted(&request.emit)?;
@@ -1540,7 +1560,7 @@ pub fn find_semantic_artifact<'a>(
     let mut candidates = rows
         .iter()
         .filter(|row| {
-            semantic_identity_match(row, request)
+            semantic_identity_match(row, request, allowed_superset_c_metadatas)
                 && row.version.as_semver() == &requested_version
                 && row_servable_on_host(row, host_glibc)
                 && emit_covers_request(&row.emit, &request.emit)
@@ -1548,10 +1568,18 @@ pub fn find_semantic_artifact<'a>(
         .collect::<Vec<_>>();
 
     candidates.sort_by(|left, right| {
-        row_has_canonical_metadata(right)
-            .cmp(&row_has_canonical_metadata(left))
-            .then(left.emit.len().cmp(&right.emit.len()))
-            .then(right.bundle_digest.cmp(&left.bundle_digest))
+        left.features_json
+            .features()
+            .len()
+            .cmp(&right.features_json.features().len())
+            .then_with(|| {
+                left.features_json
+                    .features()
+                    .cmp(right.features_json.features())
+            })
+            .then_with(|| row_has_canonical_metadata(right).cmp(&row_has_canonical_metadata(left)))
+            .then_with(|| left.emit.len().cmp(&right.emit.len()))
+            .then_with(|| right.bundle_digest.cmp(&left.bundle_digest))
     });
 
     Ok(candidates.into_iter().next())
@@ -2320,7 +2348,7 @@ mod tests {
             build_script: stow_types::upload_plan::BuildScriptInputs::default(),
         };
 
-        let found = find_semantic_artifact(&rows, &request, None)
+        let found = find_semantic_artifact(&rows, &request, None, None)
             .expect("lookup")
             .expect("exact version candidate");
         assert_eq!(found.version.as_semver(), &Version::parse("1.4.3").unwrap());
@@ -2329,11 +2357,59 @@ mod tests {
         older_pin.crate_name = "wasm-bindgen-shared".to_owned();
         older_pin.version = "0.2.120".to_owned();
         assert!(
-            find_semantic_artifact(&rows, &older_pin, None)
+            find_semantic_artifact(&rows, &older_pin, None, None)
                 .expect("lookup")
                 .is_none(),
             "newer patch release 0.2.130 must never serve a 0.2.120 invocation"
         );
+    }
+
+    #[test]
+    fn semantic_lookup_admits_only_graph_validated_superset_candidates() {
+        let rows = vec![
+            row(
+                "once_cell",
+                "1.21.4",
+                "1111111111111111",
+                &["alloc", "default", "race", "std"],
+                &[],
+            ),
+            row(
+                "once_cell",
+                "1.21.4",
+                "2222222222222222",
+                &["alloc", "race", "std"],
+                &[],
+            ),
+        ];
+        let request = SemanticFetchRequest {
+            crate_name: "once_cell".to_owned(),
+            version: "1.21.4".to_owned(),
+            features_json: "[\"alloc\",\"race\"]".to_owned(),
+            dependency_c_metadata_json: "[]".to_owned(),
+            target: TARGET.to_owned(),
+            rustc_version: RUSTC.to_owned(),
+            profile: rows[0].profile.clone(),
+            emit: vec!["link".to_owned()],
+            kind: ArtifactKind::Rlib,
+            crate_types: vec![RustCrateType::Rlib],
+            consumer: stow_types::upload_plan::ConsumerInputs::stock(),
+            build_script: stow_types::upload_plan::BuildScriptInputs::default(),
+        };
+
+        assert!(
+            find_semantic_artifact(&rows, &request, None, None)
+                .expect("unseeded lookup")
+                .is_none(),
+            "unseeded semantic lookup must not pick an unvalidated feature superset"
+        );
+
+        let allowed =
+            BTreeSet::from(["1111111111111111".to_owned(), "2222222222222222".to_owned()]);
+        let found = find_semantic_artifact(&rows, &request, Some(&allowed), None)
+            .expect("seeded lookup")
+            .expect("smallest validated superset");
+        assert_eq!(found.c_metadata.as_str(), "2222222222222222");
     }
 
     /// A row whose floor the host glibc cannot reach is not servable:
@@ -2392,7 +2468,7 @@ mod tests {
             consumer: stow_types::upload_plan::ConsumerInputs::stock(),
             build_script: stow_types::upload_plan::BuildScriptInputs::default(),
         };
-        let found = find_semantic_artifact(&rows, &request, host)
+        let found = find_semantic_artifact(&rows, &request, None, host)
             .expect("lookup")
             .expect("a servable candidate remains");
         assert_eq!(found.version.as_semver(), &Version::parse("1.4.3").unwrap());
@@ -2405,12 +2481,12 @@ mod tests {
             patch: 0,
         });
         assert!(
-            find_semantic_artifact(&rows, &request, strict_host)
+            find_semantic_artifact(&rows, &request, None, strict_host)
                 .expect("lookup")
                 .is_none()
         );
         assert!(rows.iter().any(|row| {
-            semantic_identity_match(row, &request) && !row_servable_on_host(row, strict_host)
+            semantic_identity_match(row, &request, None) && !row_servable_on_host(row, strict_host)
         }));
     }
 

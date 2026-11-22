@@ -2461,9 +2461,12 @@ async fn try_remote_serves(
         env,
         parsed,
         request,
-        &slice,
-        exact_public_cache_allowed,
-        fetch_pending,
+        ctx,
+        SliceLookup {
+            slice: &slice,
+            exact_public_cache_allowed,
+            fetch_pending,
+        },
         tally,
     )
     .await;
@@ -2492,9 +2495,12 @@ async fn try_remote_serves(
                 env,
                 parsed,
                 request,
-                &slice,
-                exact_public_cache_allowed,
-                false,
+                ctx,
+                SliceLookup {
+                    slice: &slice,
+                    exact_public_cache_allowed,
+                    fetch_pending: false,
+                },
                 tally,
             )
             .await
@@ -2512,6 +2518,12 @@ async fn try_remote_serves(
     }
 }
 
+struct SliceLookup<'a> {
+    slice: &'a SliceIndex,
+    exact_public_cache_allowed: bool,
+    fetch_pending: bool,
+}
+
 /// The two registry serves over one decoded slice: exact first, then
 /// the semantic fallback when it is enabled and the exact path did not
 /// serve or disqualify the cache outright. `fetch_pending` marks the
@@ -2521,9 +2533,8 @@ async fn serves_against_slice(
     env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
-    slice: &SliceIndex,
-    exact_public_cache_allowed: bool,
-    fetch_pending: bool,
+    ctx: &BuildContext,
+    lookup: SliceLookup<'_>,
     tally: &mut LookupTally,
 ) -> RemoteServe {
     // A refusal does not end the lookup: the exact row may be unservable
@@ -2531,16 +2542,35 @@ async fn serves_against_slice(
     // way, one refusal anywhere means no build should be enqueued —
     // `Refused` outranks `Miss` in the merge.
     let mut refused = false;
-    if exact_public_cache_allowed {
-        match try_remote_exact_serve(env, parsed, request, slice, fetch_pending, tally).await {
+    if lookup.exact_public_cache_allowed {
+        match try_remote_exact_serve(
+            env,
+            parsed,
+            request,
+            lookup.slice,
+            lookup.fetch_pending,
+            tally,
+        )
+        .await
+        {
             RemoteServe::Miss => {}
             RemoteServe::Refused => refused = true,
             outcome => return outcome,
         }
     }
     if let Some(semantic_request) = env.semantic_request.as_ref() {
-        return match try_remote_semantic_serve(env, parsed, semantic_request, &slice.slice, tally)
-            .await
+        let allowed_supersets = ctx.prefetch_candidates().and_then(|candidates| {
+            candidates.get(&canonical_crate_name(&semantic_request.crate_name))
+        });
+        return match try_remote_semantic_serve(
+            env,
+            parsed,
+            semantic_request,
+            allowed_supersets,
+            &lookup.slice.slice,
+            tally,
+        )
+        .await
         {
             RemoteServe::Miss | RemoteServe::Refused if refused => RemoteServe::Refused,
             outcome => outcome,
@@ -2679,6 +2709,7 @@ async fn try_remote_semantic_serve(
     env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     semantic_request: &fetch::SemanticFetchRequest,
+    allowed_supersets: Option<&std::collections::BTreeSet<String>>,
     slice: &index::IndexSlice,
     tally: &mut LookupTally,
 ) -> RemoteServe {
@@ -2695,6 +2726,7 @@ async fn try_remote_semantic_serve(
     let row = match resolve::find_semantic_artifact(
         &slice.index.rows,
         semantic_request,
+        allowed_supersets,
         env.host_glibc,
     ) {
         Ok(row) => row,
@@ -2713,7 +2745,7 @@ async fn try_remote_semantic_serve(
         // filtered out only for its glibc floor, this is a refusal, not
         // a miss: the artifact exists and no rebuild can serve it here.
         let refused = slice.index.rows.iter().any(|row| {
-            resolve::semantic_identity_match(row, semantic_request)
+            resolve::semantic_identity_match(row, semantic_request, allowed_supersets)
                 && !resolve::row_servable_on_host(row, env.host_glibc)
         });
         return if refused {
@@ -2728,14 +2760,20 @@ async fn try_remote_semantic_serve(
             RemoteServe::Miss
         };
     };
+    let allow_superset = allowed_supersets.is_some_and(|set| set.contains(row.c_metadata.as_str()));
     let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
     let outcome = download_unless_circuit_opens(env, &bundle_ref).await;
     match outcome {
-        Ok(bundle) => {
-            try_serve_semantic_downloaded_bundle(env, parsed, semantic_request, &bundle, tally)
-                .await
-                .map_or(RemoteServe::Bypass, RemoteServe::Served)
-        }
+        Ok(bundle) => try_serve_semantic_downloaded_bundle(
+            env,
+            parsed,
+            semantic_request,
+            allow_superset,
+            &bundle,
+            tally,
+        )
+        .await
+        .map_or(RemoteServe::Bypass, RemoteServe::Served),
         Err(fetch::FetchError::CircuitOpen) => {
             tally.fail(
                 ServeSource::SemanticDownload,
@@ -3280,11 +3318,19 @@ async fn remote_slice_covers_unit(
         return true;
     }
     env.semantic_request.as_ref().is_some_and(|semantic| {
+        let allowed_supersets = ctx
+            .prefetch_candidates()
+            .and_then(|candidates| candidates.get(&canonical_crate_name(&semantic.crate_name)));
         semantic.consumer.is_publishable_shape()
-            && resolve::find_semantic_artifact(&slice.slice.index.rows, semantic, env.host_glibc)
-                .ok()
-                .flatten()
-                .is_some()
+            && resolve::find_semantic_artifact(
+                &slice.slice.index.rows,
+                semantic,
+                allowed_supersets,
+                env.host_glibc,
+            )
+            .ok()
+            .flatten()
+            .is_some()
     })
 }
 
@@ -4464,10 +4510,13 @@ async fn try_serve_semantic_downloaded_bundle(
     env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     semantic_request: &fetch::SemanticFetchRequest,
+    allow_superset: bool,
     bundle: &fetch::ArtifactBundle,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
-    if let Err(error) = fetch::validate_semantic_bundle_identity(bundle, semantic_request) {
+    if let Err(error) =
+        fetch::validate_semantic_bundle_identity(bundle, semantic_request, allow_superset)
+    {
         tracing::debug!(
             error = %error,
             crate_name = %parsed.crate_name,
