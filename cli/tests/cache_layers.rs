@@ -273,8 +273,19 @@ fn remote_off_does_not_serve_downloaded_entries(config: &str, flags: &[&str]) {
     let filled = project.entries();
     assert_eq!(filled.len(), CACHEABLE_UNITS);
 
-    // Move the filled entries into `crates-io/` with remote provenance, as an
-    // earlier online run would have downloaded them.
+    // Drain the daemon before renaming `local-crates-io/` on Windows, where an
+    // open SQLite catalog inside the directory refuses `MoveFileExW`.
+    let stop_out = stow_cli_in(
+        project.dir.path(),
+        &["daemon", "stop"],
+        project.cache.path(),
+        project.cargo_home.path(),
+    );
+    assert!(
+        stop_out.status.success(),
+        "stow daemon stop failed:\n{}",
+        stderr_of(&stop_out)
+    );
     move_local_crates_io_to_remote(project.cache.path());
     let before = stats(&project).0;
 
