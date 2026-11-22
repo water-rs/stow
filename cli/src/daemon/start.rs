@@ -255,6 +255,130 @@ pub fn status_of(exe: &Path, settings: Settings) -> Result<StatusReply> {
     }
 }
 
+/// Drain and stop a running daemon if one is serving `RunDir::locate()`,
+/// waiting until `daemon.lock` is released. Returns `Ok(false)` without
+/// starting a daemon when none is running.
+pub fn stop_if_running(exe: &Path, settings: Settings) -> Result<bool> {
+    let run_dir = match RunDir::locate() {
+        Ok(dir) if dir.exists() => RunDir::prepare(dir)?,
+        Ok(_) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let endpoint = run_dir.endpoint();
+    let lock_path = run_dir.daemon_lock();
+    let mut waited_for_retire = false;
+    loop {
+        match try_connect(&endpoint, settings.answer)? {
+            Attempt::Down => {
+                return wait_for_daemon_lock_release(&lock_path, settings.drain + settings.answer)
+                    .map(|()| waited_for_retire);
+            }
+            Attempt::Connected(stream) => {
+                #[cfg(unix)]
+                let outcome = send_stop(&stream, exe);
+                #[cfg(windows)]
+                let outcome = {
+                    let stream = stream
+                        .try_clone()
+                        .wrap_err("share the daemon connection with the stop thread")?;
+                    let exe = exe.to_owned();
+                    with_deadline(settings.answer, move || send_stop(stream, &exe))
+                };
+                match outcome? {
+                    StopOutcome::Draining => {
+                        wait_for_daemon_lock_release(&lock_path, settings.drain + settings.answer)?;
+                        return Ok(true);
+                    }
+                    StopOutcome::Retiring { until } => {
+                        waited_for_retire = true;
+                        std::thread::sleep(
+                            until
+                                .min(LONGEST_RECONNECT_PAUSE)
+                                .max(FIRST_RECONNECT_PAUSE),
+                        );
+                    }
+                    StopOutcome::Unsupported { pid } => {
+                        let pid = pid
+                            .or_else(|| super::peer::server_pid(&stream).ok())
+                            .ok_or_else(|| {
+                                stow_types::stow_error!(
+                                    "the running stow daemon speaks an older protocol without Stop and its pid could not be determined"
+                                )
+                            })?;
+                        drop(stream);
+                        super::peer::end(pid, settings.start)?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum StopOutcome {
+    Draining,
+    Retiring { until: Duration },
+    Unsupported { pid: Option<u32> },
+}
+
+fn send_stop<S: Read + Write>(mut stream: S, exe: &Path) -> Result<StopOutcome> {
+    let mut request = protocol::encode(&Hello::new(Role::Control, exe))?;
+    request.extend(protocol::encode(&ControlRequest::Stop)?);
+    stream
+        .write_all(&request)
+        .and_then(|()| stream.flush())
+        .wrap_err("send Hello and Stop to the daemon")?;
+    let frame = protocol::read_frame(&mut stream)?;
+    match protocol::read_response(&frame)? {
+        Response::Stopped => Ok(StopOutcome::Draining),
+        Response::Retiring { until_millis, .. } => Ok(StopOutcome::Retiring {
+            until: Duration::from_millis(until_millis),
+        }),
+        Response::Rejected { .. } if frame.protocol < 5 => {
+            Ok(StopOutcome::Unsupported { pid: None })
+        }
+        Response::Rejected { reason } => {
+            Err(stow_types::stow_error!("the daemon refused Stop: {reason}"))
+        }
+        other => Err(stow_types::stow_error!(
+            "the daemon answered Stop with {other:?}"
+        )),
+    }
+}
+
+fn wait_for_daemon_lock_release(lock_path: &Path, bound: Duration) -> Result<()> {
+    if !lock_path.exists() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + bound;
+    let mut pause = FIRST_RECONNECT_PAUSE;
+    loop {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .wrap_err_with(|| format!("open {}", lock_path.display()))?;
+        if let Some(lock) = FileLock::try_exclusive(file)
+            .wrap_err_with(|| format!("lock {}", lock_path.display()))?
+        {
+            drop(lock);
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(stow_types::stow_error!(
+                "the stow daemon did not release {} within {} s",
+                lock_path.display(),
+                bound.as_secs()
+            ));
+        }
+        std::thread::sleep(pause.min(deadline - now));
+        pause = (pause * 2).min(LONGEST_RECONNECT_PAUSE);
+    }
+}
+
 /// End the daemon at the other end of a connection that refused this
 /// stow's hello in a protocol too old to be asked to retire, so that the
 /// start path starts one of this stow's. A daemon that is ended once and is

@@ -740,6 +740,12 @@ pub async fn clean_project(
         write_stdout(&format!("cache dir missing: {}\n", cache_dir.display()))?;
         return Ok(());
     }
+    let _ = tokio::task::spawn_blocking(|| -> stow_types::error::Result<bool> {
+        let exe = std::env::current_exe().wrap_err("resolve current executable")?;
+        let settings = crate::daemon::Settings::from_env()?;
+        crate::daemon::stop_if_running(&exe, settings)
+    })
+    .await;
     clean_cache_dir(&cache_dir, args.all, state_db).await?;
     write_stdout(&format!("removed {}\n", cache_dir.display()))
 }
@@ -750,10 +756,12 @@ async fn clean_cache_dir(
     state_db: &StateDb,
 ) -> stow_types::error::Result<()> {
     if all {
+        state_db.close().await;
         return async_fs::remove_dir_all(cache_dir)
             .await
             .wrap_err_with(|| format!("remove cache dir {}", cache_dir.display()));
     }
+    state_db.close_tiers().await;
 
     let mut entries = async_fs::read_dir(cache_dir)
         .await
@@ -2124,8 +2132,10 @@ mod tests {
         std::fs::create_dir_all(&slice_dir).expect("slice dir");
         std::fs::write(slice_dir.join("current.json"), b"{\"row_count\":42}").expect("pointer");
         std::fs::write(cache.join("stats.json"), b"{\"hits\":9}").expect("stats");
-        std::fs::create_dir_all(cache.join("cache/1.100.0/entry")).expect("artifact dir");
-        std::fs::create_dir_all(cache.join("cc")).expect("cc dir");
+        std::fs::create_dir_all(cache.join("crates-io/1.100.0/entry")).expect("artifact dir");
+        std::fs::create_dir_all(cache.join("local-crates-io/1.100.0/entry"))
+            .expect("local-crates-io dir");
+        std::fs::create_dir_all(cache.join("local/cc")).expect("cc dir");
         std::fs::create_dir_all(cache.join("build-dir/ws")).expect("build dir");
 
         let state_db = crate::state_db::StateDb::default();
@@ -2136,12 +2146,17 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert crate_stats");
+        let local_pool = state_db
+            .tier_pool(cache, crate::state_db::CacheTier::Local)
+            .await
+            .expect("open local tier db");
         sqlx::query(
             "INSERT INTO cc_cache_entries (cache_key, size_bytes, last_accessed_ms) VALUES ('k1', 128, 1)",
         )
-        .execute(&pool)
+        .execute(&local_pool)
         .await
         .expect("insert cc_cache_entries");
+        drop(local_pool);
 
         super::clean_cache_dir(cache, false, &state_db)
             .await
@@ -2149,14 +2164,10 @@ mod tests {
 
         assert!(slice_dir.join("current.json").is_file());
         assert!(cache.join("stats.json").is_file());
-        assert!(!cache.join("cache").exists());
-        assert!(!cache.join("cc").exists());
+        assert!(!cache.join("crates-io").exists());
+        assert!(!cache.join("local-crates-io").exists());
+        assert!(!cache.join("local").exists());
         assert!(!cache.join("build-dir").exists());
-        let cc_rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cc_cache_entries")
-            .fetch_one(&pool)
-            .await
-            .expect("count cc rows");
-        assert_eq!(cc_rows.0, 0);
         let hits: (i64,) =
             sqlx::query_as("SELECT hits FROM crate_stats WHERE crate_name = 'serde'")
                 .fetch_one(&pool)

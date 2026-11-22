@@ -34,7 +34,7 @@ try {
 		assert(relative && !relative.startsWith("..") && !path.isAbsolute(relative),
 			`module must come from Wrangler's deployment output: ${module.path}`);
 	}
-	const response = await fetch(new URL("/", ready.url), { signal: AbortSignal.timeout(5_000) });
+	const response = await fetch(new URL("/api/v1/crates/serde/versions", ready.url), { signal: AbortSignal.timeout(5_000) });
 	assert.equal(response.status, 200, await response.text());
 	const inspector = new URL(ready.inspector);
 	assert.equal(inspector.protocol, "ws:");

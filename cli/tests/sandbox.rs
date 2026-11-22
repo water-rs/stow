@@ -1020,7 +1020,7 @@ fn a_sandboxed_c_wrapper_never_opens_the_state_database() {
         !stderr.contains("STATE-DB-LOCK-LOST"),
         "a sandboxed process disturbed the driver's state database:\n{stderr}"
     );
-    let stored = std::fs::read_dir(cache.path().join("cc"))
+    let stored = std::fs::read_dir(cache.path().join("local/cc"))
         .expect("the daemon created the C object cache")
         .filter_map(Result::ok)
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "o"))

@@ -9001,6 +9001,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "stow-site"
+version = "0.21.10"
+dependencies = [
+ "askama 0.14.0",
+ "stow-types",
+]
+
+[[package]]
 name = "stow-types"
 version = "0.21.10"
 dependencies = [

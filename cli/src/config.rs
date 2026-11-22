@@ -14,7 +14,7 @@ use stow_types::public_cache::UnitSource;
 
 use crate::artifact_cache::ArtifactProvenance;
 use crate::session_env::SessionEnv;
-use crate::state_db::StateDb;
+use crate::state_db::{CacheTier, StateDb};
 use crate::wrapper_shim;
 
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
@@ -203,19 +203,19 @@ pub struct StowConfig {
     /// session made each index fetch pay that scan again (stow#624).
     #[serde(skip, default = "Arc::default")]
     pub registry_http: Arc<OnceCell<stow_oci::RegistryHttp>>,
-    /// This process's artifact cache staging directory, created on its
-    /// first store and held for its whole life: every staged entry is a
-    /// temp dir under `<version>/staging/<name>/` renamed into place,
-    /// while the sibling `<name>.lock` marks the owner alive to the
-    /// `prepare_local_cache` sweep that reclaims dead processes'
-    /// staging. Most wrapper processes never store, so it must not be
-    /// paid for eagerly.
-    #[serde(skip, default = "Arc::default")]
-    pub artifact_cache_staging: Arc<OnceCell<Arc<crate::artifact_cache::StagingDir>>>,
+    /// This process's per-tier artifact cache staging directories, created
+    /// lazily on the first store into each tier and held for the process's
+    /// life.
+    #[serde(skip, default = "default_tier_staging")]
+    pub artifact_cache_staging: Arc<[OnceCell<Arc<crate::artifact_cache::StagingDir>>; 3]>,
+}
+
+pub fn default_tier_staging() -> Arc<[OnceCell<Arc<crate::artifact_cache::StagingDir>>; 3]> {
+    Arc::new(std::array::from_fn(|_| OnceCell::new()))
 }
 
 impl StowConfig {
-    /// Get (lazily opening) the process's `SQLite` pool for this config.
+    /// Get (lazily opening) the process's host `SQLite` pool for this config.
     ///
     /// # Errors
     ///
@@ -223,6 +223,30 @@ impl StowConfig {
     /// process closed its handle.
     pub async fn state_db_pool(&self) -> stow_types::error::Result<SqlitePool> {
         self.state_db.pool(&self.cache_dir).await
+    }
+
+    /// Get (lazily opening or creating) `tier`'s self-contained catalog pool.
+    ///
+    /// # Errors
+    ///
+    /// Whatever opening the catalog fails with, and any use after the
+    /// process closed its handle.
+    pub async fn tier_db_pool(&self, tier: CacheTier) -> stow_types::error::Result<SqlitePool> {
+        self.state_db.tier_pool(&self.cache_dir, tier).await
+    }
+
+    /// Open `tier`'s catalog pool only when its file already exists on disk.
+    ///
+    /// # Errors
+    ///
+    /// Stat/open failures, schema mismatches, and any use after close.
+    pub async fn existing_tier_db_pool(
+        &self,
+        tier: CacheTier,
+    ) -> stow_types::error::Result<Option<SqlitePool>> {
+        self.state_db
+            .existing_tier_pool(&self.cache_dir, tier)
+            .await
     }
 
     /// Get (lazily loading) the Sigstore trust root for this config.
@@ -281,7 +305,7 @@ impl StowConfig {
     }
 
     /// Get (lazily creating) this process's staging directory inside
-    /// `rustc_version`'s artifact cache: `<version_dir>/staging/<name>/`,
+    /// `tier`'s `rustc_version` artifact cache: `<tier>/<version>/staging/<name>/`,
     /// with its `<name>.lock` held until the handle drops.
     ///
     /// # Errors
@@ -291,13 +315,13 @@ impl StowConfig {
     /// created for a different one.
     pub async fn artifact_cache_staging_dir(
         &self,
+        tier: CacheTier,
         rustc_version: &str,
     ) -> stow_types::error::Result<Arc<crate::artifact_cache::StagingDir>> {
         let staging_root = self
-            .artifact_cache_version_dir(rustc_version)
+            .tier_version_dir(tier, rustc_version)
             .join(crate::artifact_cache::STAGING_DIR);
-        let staging = self
-            .artifact_cache_staging
+        let staging = self.artifact_cache_staging[tier.index()]
             .get_or_try_init(|| {
                 let staging_root = staging_root.clone();
                 let rustc_version = rustc_version.to_owned();
@@ -313,7 +337,8 @@ impl StowConfig {
             .await?;
         if staging.rustc_version() != rustc_version {
             return Err(stow_types::stow_error!(
-                "artifact cache staging is bound to rustc {}, cannot stage {rustc_version}",
+                "artifact cache staging in {} is bound to rustc {}, cannot stage {rustc_version}",
+                tier.dir_name(),
                 staging.rustc_version()
             ));
         }
@@ -411,7 +436,7 @@ impl StowConfig {
             state_db,
             trust_material: Arc::default(),
             registry_http: Arc::default(),
-            artifact_cache_staging: Arc::default(),
+            artifact_cache_staging: default_tier_staging(),
         })
     }
 
@@ -421,12 +446,14 @@ impl StowConfig {
             .wrap_err_with(|| format!("create cache directory {}", self.cache_dir.display()))
     }
 
-    pub fn artifact_cache_root(&self) -> PathBuf {
-        self.cache_dir.join("cache")
+    #[must_use]
+    pub fn tier_dir(&self, tier: CacheTier) -> PathBuf {
+        crate::state_db::tier_dir(&self.cache_dir, tier)
     }
 
-    pub fn artifact_cache_version_dir(&self, rustc_version: &str) -> PathBuf {
-        self.artifact_cache_root().join(rustc_version)
+    #[must_use]
+    pub fn tier_version_dir(&self, tier: CacheTier, rustc_version: &str) -> PathBuf {
+        self.tier_dir(tier).join(rustc_version)
     }
 
     pub fn artifact_cache_purge_root(&self) -> PathBuf {
@@ -434,11 +461,10 @@ impl StowConfig {
     }
 
     /// The directory the C/C++ object cache lives in — `<key>.o` files
-    /// the `cc`/`cxx` shims store and serve, each with a
-    /// `cc_cache_entries` row in the state database's shared LRU
-    /// (stow#980).
+    /// under `~/.stow/local/cc/`, each with a `cc_cache_entries` row in
+    /// `local/`'s self-contained catalog.
     pub fn cc_cache_dir(&self) -> PathBuf {
-        self.cache_dir.join("cc")
+        self.tier_dir(CacheTier::Local).join("cc")
     }
 }
 

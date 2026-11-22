@@ -55,9 +55,9 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    and every mutation runs through `operations.yml` (see
    [Operator mutations](#operator-mutations)).
 
-2. Deploys run from GitHub Actions — see below. The first deploy also
-   attaches the `stow.waterui.dev` custom domain (Cloudflare creates the
-   DNS record in the `waterui.dev` zone automatically).
+2. Deploys run from GitHub Actions — see below. The site is a Cloudflare
+   Pages project (see [The Pages site](#the-pages-site)); the Worker
+   itself carries only the `stow.waterui.dev/api/*` route.
 
 3. Initialize the scheduler store. The scheduler Durable Object's
    schema exists only through the operator reset route — once the first
@@ -299,7 +299,38 @@ usage and catches metrics no per-service alert names. See the
 [Cloudflare budget alerts docs](https://developers.cloudflare.com/billing/manage/budget-alerts/).
 The #450 watchdog remains the outer circuit.
 
-## Automated deploys
+### The Pages site
+
+The pages — `/`, `/stats`, `/requests/{id}` and the two installers — are
+a Cloudflare Pages project (`stow-site`) on the `stow.waterui.dev`
+custom domain, deployed by `.github/workflows/deploy-site.yml` on every
+`main` push touching `site/`; a page edit never touches the Worker. The
+Worker's route is path-scoped (`stow.waterui.dev/api/*`), which is more
+specific than the Pages custom domain, so API traffic still reaches it.
+
+One-time setup:
+
+1. Create the project: `wrangler pages project create stow-site
+   --production-branch main`.
+2. Build and upload: `cargo run --release -p stow-site -- site/dist`,
+   then `wrangler pages deploy site/dist --project-name stow-site
+   --branch main` (what `deploy-site.yml` runs).
+3. Attach the custom domain — Workers & Pages → stow-site → Custom
+   domains → `stow.waterui.dev`. Cloudflare replaces the DNS record the
+   Worker's Custom Domain managed, and `/api/*` requests keep reaching
+   the Worker on its more-specific route. Order the swap against a
+   deploy whose manifest carries the `/api/*` route (a Worker release
+   with this change, or `wrangler triggers deploy` with the generated
+   config): detaching the Worker Custom Domain before the Pages one
+   attaches leaves the hostname unresolvable for page traffic.
+
+Migrating an edge that still served the site: deploy the new Worker
+first (its route narrows to `/api/*` and the site routes 404 — brief
+page outage), or attach Pages while the old Worker still serves the
+pages — the Custom Domain keeps page traffic on the Worker until the
+swap, so attaching first is the no-outage path.
+
+### Automated deploys
 
 `.github/workflows/deploy-edge.yml` deploys a release only. It has one
 trigger, `workflow_dispatch` with `canary_share` (default `5`), and
@@ -404,6 +435,10 @@ Required GitHub Actions secrets:
   `analytics_engine/sql` `overloaded`-event query), Email Sending
   (the `POST …/email/sending/send` alert mail), and `Zone WAF:Edit` on
   `waterui.dev` (the maintenance rules below and the watchdog's trip).
+  `deploy-site.yml` adds `Account Cloudflare Pages:Edit` (the
+  `wrangler pages deploy` step) plus the `User Memberships:Read` and
+  `User User Details:Read` scopes Wrangler needs for its account
+  lookup — the zone-level `Custom Pages` permission is unrelated.
   The zone's id goes in the `CF_ZONE_ID` repository variable — the
   WAF step below and `stow-admin maintenance`/`watchdog` read it,
   `operations.yml` among them.

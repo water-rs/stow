@@ -256,23 +256,60 @@ async fn serve(
         "stow daemon serving"
     );
     notify_ready(ready, &run_dir, Notification::Ready).await?;
+    let table = daemon.table.clone();
     #[cfg(unix)]
     {
         let retired = accept_loop(&listener, daemon).await?;
-        replace_image(&retired, &run_dir, &lock, &listener, log).await
+        table.checkpoint_and_close().await;
+        finish_unix_retirement(retired, &run_dir, endpoint, lock, listener, log).await
     }
     #[cfg(windows)]
     {
         let retired = accept_loop(listener, daemon).await?;
-        // The pipe is closed with the listener; the lock is released as the
-        // last thing, so the successor the next client starts finds both
-        // free.
+        table.checkpoint_and_close().await;
         drop(lock);
-        tracing::info!(
-            successor = %retired.successor.display(),
-            "drained; the pipe and the lock are released for the successor"
-        );
+        match &retired.target {
+            super::retire::RetirementTarget::Successor(successor) => {
+                tracing::info!(
+                    successor = %successor.display(),
+                    "drained; the pipe and the lock are released for the successor"
+                );
+            }
+            super::retire::RetirementTarget::Exit => {
+                tracing::info!("drained; state databases checkpointed and daemon exiting");
+            }
+        }
+        flush_log(log).await?;
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+async fn finish_unix_retirement(
+    retired: super::retire::Pending,
+    run_dir: &RunDir,
+    endpoint: PathBuf,
+    lock: FileLock,
+    listener: tokio::net::UnixListener,
+    log: &LogWriter,
+) -> Result<()> {
+    match &retired.target {
+        super::retire::RetirementTarget::Successor(successor) => {
+            replace_image(successor, run_dir, &lock, &listener, log).await
+        }
+        super::retire::RetirementTarget::Exit => {
+            blocking(move || match std::fs::remove_file(&endpoint) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error).wrap_err_with(|| format!("remove {}", endpoint.display())),
+            })
+            .await?;
+            tracing::info!("drained; state databases checkpointed and daemon exiting");
+            flush_log(log).await?;
+            drop(listener);
+            drop(lock);
+            Ok(())
+        }
     }
 }
 
@@ -281,21 +318,21 @@ async fn serve(
 /// which releases the lock, and the next client starts a daemon.
 #[cfg(unix)]
 async fn replace_image(
-    retired: &Pending,
+    successor: &Path,
     run_dir: &RunDir,
     lock: &FileLock,
     listener: &Listener,
     log: &LogWriter,
 ) -> Result<()> {
     tracing::info!(
-        successor = %retired.successor.display(),
+        successor = %successor.display(),
         "drained; replacing this daemon's image with its successor's"
     );
     // The log's thread dies with the old image: what it has queued, this
     // drain's own record included, is written first.
     flush_log(log).await?;
     let error = super::retire::exec_into(
-        &retired.successor,
+        successor,
         run_dir.path(),
         lock.as_raw_fd(),
         std::os::fd::AsRawFd::as_raw_fd(listener),
@@ -303,7 +340,7 @@ async fn replace_image(
     Err(error).wrap_err_with(|| {
         format!(
             "replace the stow daemon with its successor {}",
-            retired.successor.display()
+            successor.display()
         )
     })
 }
@@ -880,6 +917,19 @@ where
                 )
                 .await;
             }
+            Ok(ControlRequest::Stop) => {
+                if !super::protocol::gates::can_stop(at) {
+                    return reject(
+                        &mut stream,
+                        at,
+                        format!("Stop is not supported at protocol {}", at.protocol()),
+                    )
+                    .await;
+                }
+                daemon.retirement.stop();
+                write_frame_async(&mut stream, at, &Response::Stopped).await?;
+                request = None;
+            }
             Err(error) => return reject(&mut stream, at, error.to_string()).await,
         }
     }
@@ -1100,15 +1150,16 @@ where
                     write_frame_async(write, at, &Response::Event(Event::ResolutionDone)).await?;
                 }
                 () = retirement.cut() => {
-                    let successor = retirement
-                        .pending()
-                        .map_or_default(|pending| pending.successor.display().to_string());
-                    reject(
-                        write,
-                        at,
-                        format!("the stow daemon is restarting onto {successor} and this build's session cannot carry over; run the build again"),
-                    )
-                    .await?;
+                    let message = match retirement.pending().map(|pending| pending.target) {
+                        Some(super::retire::RetirementTarget::Successor(successor)) => format!(
+                            "the stow daemon is restarting onto {} and this build's session cannot carry over; run the build again",
+                            successor.display()
+                        ),
+                        Some(super::retire::RetirementTarget::Exit) | None => {
+                            "the stow daemon is stopping and this build's session cannot carry over; run the build again".to_owned()
+                        }
+                    };
+                    reject(write, at, message).await?;
                     return Ok(Driven::Restarted);
                 }
             }
@@ -2080,10 +2131,10 @@ mod tests {
         assert_eq!(stow_version, env!("CARGO_PKG_VERSION"));
         assert!(until_millis <= 400, "{until_millis}");
         assert_eq!(
-            daemon.retirement.pending().expect("retiring").successor,
-            std::path::PathBuf::from(
+            daemon.retirement.pending().expect("retiring").target,
+            crate::daemon::retire::RetirementTarget::Successor(std::path::PathBuf::from(
                 crate::daemon::session::os_bytes::decode(&executable()).expect("decode")
-            )
+            ))
         );
     }
 
@@ -2354,10 +2405,10 @@ mod tests {
             "{response:?}"
         );
         assert_eq!(
-            daemon.retirement.pending().expect("retiring").successor,
-            std::path::PathBuf::from(
+            daemon.retirement.pending().expect("retiring").target,
+            crate::daemon::retire::RetirementTarget::Successor(std::path::PathBuf::from(
                 crate::daemon::session::os_bytes::decode(&executable()).expect("decode")
-            )
+            ))
         );
     }
 
@@ -2417,10 +2468,10 @@ mod tests {
         };
         assert_eq!(stow_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(
-            daemon.retirement.pending().expect("retiring").successor,
-            std::path::PathBuf::from(
+            daemon.retirement.pending().expect("retiring").target,
+            crate::daemon::retire::RetirementTarget::Successor(std::path::PathBuf::from(
                 crate::daemon::session::os_bytes::decode(&executable()).expect("decode")
-            )
+            ))
         );
     }
 
@@ -2459,8 +2510,8 @@ mod tests {
             Response::Retiring { .. }
         ));
         assert_eq!(
-            daemon.retirement.pending().expect("retiring").successor,
-            path
+            daemon.retirement.pending().expect("retiring").target,
+            crate::daemon::retire::RetirementTarget::Successor(path)
         );
     }
 

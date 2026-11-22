@@ -135,11 +135,22 @@ impl Busy {
     }
 }
 
+/// What a retiring daemon does once its drain completes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetirementTarget {
+    /// Replace the daemon's image with `successor` (or exit on Windows so
+    /// the Task Scheduler starts it).
+    Successor(PathBuf),
+    /// Checkpoint and close all state databases, release the endpoint and
+    /// lock, and exit cleanly with no successor.
+    Exit,
+}
+
 /// A retirement under way: onto what, and by when the drain ends.
 #[derive(Debug, Clone)]
 pub struct Pending {
-    /// The executable that serves from here on.
-    pub successor: PathBuf,
+    /// What happens once the drain completes.
+    pub target: RetirementTarget,
     /// When the drain ends and the open builds are cut.
     pub deadline: Instant,
 }
@@ -171,27 +182,43 @@ impl Retirement {
     }
 
     /// Begin retiring onto `successor`, unless a retirement is under way:
-    /// the first one's successor and deadline stand. Returns what stands.
+    /// the first one's target and deadline stand. Returns what stands.
     pub fn begin(&self, successor: PathBuf) -> Pending {
+        self.begin_target(RetirementTarget::Successor(successor))
+    }
+
+    /// Begin draining to exit without starting a successor.
+    pub fn stop(&self) -> Pending {
+        self.begin_target(RetirementTarget::Exit)
+    }
+
+    fn begin_target(&self, target: RetirementTarget) -> Pending {
         let deadline = Instant::now() + self.drain;
         let mut began = false;
         self.state.send_if_modified(|state| {
             began = state.is_none();
             if began {
-                *state = Some(Pending {
-                    successor,
-                    deadline,
-                });
+                *state = Some(Pending { target, deadline });
             }
             began
         });
         let pending = self.pending().expect("a retirement stands once begun");
         if began {
-            tracing::info!(
-                successor = %pending.successor.display(),
-                drain_secs = self.drain.as_secs(),
-                "retiring: draining before the successor takes over"
-            );
+            match &pending.target {
+                RetirementTarget::Successor(successor) => {
+                    tracing::info!(
+                        successor = %successor.display(),
+                        drain_secs = self.drain.as_secs(),
+                        "retiring: draining before the successor takes over"
+                    );
+                }
+                RetirementTarget::Exit => {
+                    tracing::info!(
+                        drain_secs = self.drain.as_secs(),
+                        "stopping: draining before exiting"
+                    );
+                }
+            }
         }
         pending
     }
@@ -442,7 +469,10 @@ mod tests {
         let first = retirement.begin(PathBuf::from("/first"));
         tokio::time::advance(Duration::from_secs(4)).await;
         let second = retirement.begin(PathBuf::from("/second"));
-        assert_eq!(second.successor, PathBuf::from("/first"));
+        assert_eq!(
+            second.target,
+            super::RetirementTarget::Successor(PathBuf::from("/first"))
+        );
         assert_eq!(second.deadline, first.deadline);
         let Some(Response::Retiring { until_millis, .. }) = retirement.reply() else {
             panic!("a retiring daemon says so");
@@ -469,7 +499,10 @@ mod tests {
         drop(cargo);
         let started = tokio::time::Instant::now();
         let pending = drained.await;
-        assert_eq!(pending.successor, PathBuf::from("/next"));
+        assert_eq!(
+            pending.target,
+            super::RetirementTarget::Successor(PathBuf::from("/next"))
+        );
         assert_eq!(
             started,
             tokio::time::Instant::now(),
@@ -493,7 +526,10 @@ mod tests {
         let pending = retirement.drained(&busy, Duration::from_secs(1)).await;
         session.await.expect("the driver's session");
         assert_eq!(tokio::time::Instant::now() - began, DRAIN);
-        assert_eq!(pending.successor, PathBuf::from("/next"));
+        assert_eq!(
+            pending.target,
+            super::RetirementTarget::Successor(PathBuf::from("/next"))
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -271,11 +271,12 @@ refusal — gets a gzip transcode the platform caches under its own
 
 ## `GET /requests/{task_id}`
 
-The same state as `GET /api/v1/requests/{task_id}`, rendered as a page
-for a person: the request form's result table links here. The page
-refreshes itself every 20 seconds while the task is pending, dispatched,
-or running, and stops once it completes or fails. `404` renders a page
-saying the scheduler does not know the id.
+The same state as `GET /api/v1/requests/{task_id}`, rendered for a
+person: the request form's result table links here. The page is a
+Cloudflare Pages shell (`_redirects` rewrites `/requests/*` to
+`request.html`) whose script reads the JSON route and polls it every 20
+seconds while the record is unsettled; a `404` renders a page saying the
+scheduler does not know the id.
 
 ## `GET /api/v1/stats`
 
@@ -311,7 +312,8 @@ distinct daily-salted install hashes per day.
 
 ## `GET /stats`
 
-The `GET /api/v1/stats` numbers rendered as a page for a person, linked
-from the landing page's nav. Both stats routes are anonymous and the
-JSON is Workers-Cached for one hour. The collected fields, sampling,
-retention, and opt-out are documented in [`PRIVACY.md`](../PRIVACY.md).
+The `GET /api/v1/stats` numbers rendered for a person, linked from the
+landing page's nav — a Cloudflare Pages page whose script fetches the
+JSON route. The JSON is anonymous and Workers-Cached for one hour. The
+collected fields, sampling, retention, and opt-out are documented in
+[`PRIVACY.md`](../PRIVACY.md).

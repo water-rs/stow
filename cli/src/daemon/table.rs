@@ -105,6 +105,9 @@ enum Command {
         reply: oneshot::Sender<Option<Arc<String>>>,
     },
     RememberToolchainProbe(ToolchainKey, Arc<String>),
+    CheckpointAndClose {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 /// A handle on the table's task. Clones share it; the task ends when the
@@ -153,6 +156,10 @@ impl SessionTable {
                     }
                     Command::RememberToolchainProbe(key, vv) => {
                         probes.insert(key, vv);
+                    }
+                    Command::CheckpointAndClose { reply } => {
+                        resources.checkpoint_and_close_all().await;
+                        let _ = reply.send(());
                     }
                 }
             }
@@ -222,6 +229,13 @@ impl SessionTable {
     /// Remember the `rustc -vV` answer for `key`.
     pub fn remember_toolchain_probe(&self, key: ToolchainKey, vv: Arc<String>) {
         self.send(Command::RememberToolchainProbe(key, vv));
+    }
+
+    /// Checkpoint, truncate WALs, and close every cached database handle.
+    pub async fn checkpoint_and_close(&self) {
+        let (reply, answer) = oneshot::channel();
+        self.send(Command::CheckpointAndClose { reply });
+        let _ = answer.await;
     }
 
     fn send(&self, command: Command) {

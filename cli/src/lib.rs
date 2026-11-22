@@ -105,7 +105,6 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use async_process::Command;
-use clap::Parser;
 use stow_types::error::Context;
 use stow_types::identity::DependencyCompileKeyIdentity;
 use stow_types::public_cache::{
@@ -119,10 +118,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer as _};
 
 use crate::artifact_cache::{
-    DependencyCMetadataResolution, DependencyInstanceIdentity, load_cached_bundle,
-    load_cached_bundle_by_compile_key, load_semantic_cached_bundle, prepare_local_cache,
-    record_materialized_bundle_outputs, record_materialized_local_build_outputs,
-    remove_cached_bundle, remove_loaded_bundle_entry, resolve_dependency_c_metadata_json,
+    DependencyCMetadataResolution, DependencyInstanceIdentity, load_cached_bundle_by_compile_key,
+    prepare_local_cache, record_materialized_bundle_outputs,
+    record_materialized_local_build_outputs, remove_cached_bundle, remove_loaded_bundle_entry,
+    resolve_dependency_c_metadata_json,
 };
 use crate::cli_args::{Cli, Command as CliCommand, WrapperCommandArgs};
 use crate::config::StowConfig;
@@ -1664,6 +1663,41 @@ async fn serve_or_compile(
 /// The lookup chain for one invocation: local entries, then the remote
 /// serves a keyed or semantic request could hit. A local serve ends it
 /// the way a remote one does.
+async fn try_serve_tier_exact_or_semantic(
+    parsed: &rustc_args::ParsedRustcArgs,
+    env: &WrapperEnvironment<'_>,
+    request: &FetchRequest<'_>,
+    invocation_env: &daemon::wrapper::InvocationEnv,
+    tier: state_db::CacheTier,
+    tally: &mut LookupTally,
+) -> Option<daemon::wrapper::ArtifactNotifications> {
+    if let Some(notifications) = try_serve_local_invocation_in_tiers(
+        &env.env_base.config,
+        parsed,
+        &env.source,
+        request,
+        invocation_env,
+        &[tier],
+        tally,
+    )
+    .await
+    {
+        return Some(notifications);
+    }
+    if let Some(semantic_request) = env.semantic_request.as_ref() {
+        return try_serve_local_semantic_cached_bundle_in_tiers(
+            &env.env_base.config,
+            parsed,
+            &env.source,
+            semantic_request,
+            &[tier],
+            tally,
+        )
+        .await;
+    }
+    None
+}
+
 async fn lookup_chain(
     parsed: &rustc_args::ParsedRustcArgs,
     env: &WrapperEnvironment<'_>,
@@ -1677,44 +1711,69 @@ async fn lookup_chain(
         rustc_version: &env.rustc_version,
         c_metadata: env.request_c_metadata.as_str(),
     };
-    if let Some(notifications) = try_serve_local_invocation(
+    if let Some(notifications) = try_serve_local_invocation_in_tiers(
         &env.env_base.config,
         parsed,
         &env.source,
         &request,
         invocation_env,
+        &[state_db::CacheTier::CratesIo],
         tally,
     )
     .await
     {
         return RemoteServe::Served(notifications);
     }
-    if let Some(notifications) = try_serve_local_prefetched_graph_bundle(
-        &env.env_base.config,
-        parsed,
-        &env.source,
-        &env.target,
-        &env.rustc_version,
-        ctx,
-        tally,
-    )
-    .await
-    {
-        return RemoteServe::Served(notifications);
-    }
-    if let Some(semantic_request) = env.semantic_request.as_ref()
-        && let Some(notifications) = try_serve_local_semantic_cached_bundle(
+    if env.env_base.config.cache.remote
+        && let Some(notifications) = try_serve_local_prefetched_graph_bundle(
             &env.env_base.config,
             parsed,
             &env.source,
-            semantic_request,
+            &env.target,
+            &env.rustc_version,
+            ctx,
             tally,
         )
         .await
     {
         return RemoteServe::Served(notifications);
     }
-    try_remote_serves(
+    if env.env_base.config.cache.remote
+        && let Some(semantic_request) = env.semantic_request.as_ref()
+        && let Some(notifications) = try_serve_local_semantic_cached_bundle_in_tiers(
+            &env.env_base.config,
+            parsed,
+            &env.source,
+            semantic_request,
+            &[state_db::CacheTier::CratesIo],
+            tally,
+        )
+        .await
+    {
+        return RemoteServe::Served(notifications);
+    }
+
+    // When the remote cache now publishes this unit, download into
+    // `crates-io/` first so transitional `local-crates-io/` entries are
+    // superseded; otherwise serve `local-crates-io/` immediately.
+    let remote_publishes_unit =
+        remote_slice_covers_unit(env, ctx, &request, exact_public_cache_allowed).await;
+    if !remote_publishes_unit
+        && env.env_base.config.cache.local_crates_io
+        && let Some(notifications) = try_serve_tier_exact_or_semantic(
+            parsed,
+            env,
+            &request,
+            invocation_env,
+            state_db::CacheTier::LocalCratesIo,
+            tally,
+        )
+        .await
+    {
+        return RemoteServe::Served(notifications);
+    }
+
+    let remote_outcome = try_remote_serves(
         env,
         parsed,
         &request,
@@ -1722,7 +1781,30 @@ async fn lookup_chain(
         exact_public_cache_allowed,
         tally,
     )
+    .await;
+    if matches!(remote_outcome, RemoteServe::Served(_))
+        || !remote_publishes_unit
+        || !env.env_base.config.cache.local_crates_io
+    {
+        return remote_outcome;
+    }
+
+    // Remote index listed the unit, but remote serve missed/refused (e.g.
+    // host glibc below the remote artifact's floor, or transient network
+    // error): fall back to `local-crates-io/` if this host already built it.
+    if let Some(notifications) = try_serve_tier_exact_or_semantic(
+        parsed,
+        env,
+        &request,
+        invocation_env,
+        state_db::CacheTier::LocalCratesIo,
+        tally,
+    )
     .await
+    {
+        return RemoteServe::Served(notifications);
+    }
+    remote_outcome
 }
 
 /// Everything the cache path needs once every bypass-capable preparation
@@ -3091,8 +3173,30 @@ async fn try_serve_local_invocation(
     invocation_env: &daemon::wrapper::InvocationEnv,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
+    let tiers = artifact_cache::enabled_lookup_tiers(config);
+    try_serve_local_invocation_in_tiers(
+        config,
+        parsed,
+        source,
+        request,
+        invocation_env,
+        &tiers,
+        tally,
+    )
+    .await
+}
+
+async fn try_serve_local_invocation_in_tiers(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    source: &UnitSource,
+    request: &FetchRequest<'_>,
+    invocation_env: &daemon::wrapper::InvocationEnv,
+    tiers: &[state_db::CacheTier],
+    tally: &mut LookupTally,
+) -> Option<ArtifactNotifications> {
     if let Some(notifications) =
-        try_serve_local_cached_bundle(config, parsed, source, request, tally).await
+        try_serve_local_cached_bundle_in_tiers(config, parsed, source, request, tiers, tally).await
     {
         return Some(notifications);
     }
@@ -3106,30 +3210,33 @@ async fn try_serve_local_invocation(
         rustc_version: request.rustc_version,
         c_metadata: scoped.as_str(),
     };
-    try_serve_local_cached_bundle(config, parsed, source, &scoped_request, tally).await
+    try_serve_local_cached_bundle_in_tiers(config, parsed, source, &scoped_request, tiers, tally)
+        .await
 }
 
-async fn try_serve_local_cached_bundle(
+async fn try_serve_local_cached_bundle_in_tiers(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
     source: &UnitSource,
     request: &FetchRequest<'_>,
+    tiers: &[state_db::CacheTier],
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
-    let cached_bundle = match load_cached_bundle(config, request).await {
-        Ok(bundle) => bundle,
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                crate_name = %parsed.crate_name,
-                target = %request.target,
-                rustc_version = %request.rustc_version,
-                "failed to read local stow artifact cache entry"
-            );
-            tally.fail(ServeSource::LocalEntry, ServeStage::Read, &error);
-            return None;
-        }
-    };
+    let cached_bundle =
+        match artifact_cache::load_cached_bundle_in_tiers(config, request, tiers).await {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    crate_name = %parsed.crate_name,
+                    target = %request.target,
+                    rustc_version = %request.rustc_version,
+                    "failed to read local stow artifact cache entry"
+                );
+                tally.fail(ServeSource::LocalEntry, ServeStage::Read, &error);
+                return None;
+            }
+        };
     let cached_bundle = cached_bundle?;
     try_serve_loaded_local_cached_bundle(
         config,
@@ -3141,6 +3248,44 @@ async fn try_serve_local_cached_bundle(
         tally,
     )
     .await
+}
+
+/// Whether the cached remote index slice currently publishes an entry for
+/// `request` (exact or semantic) while the network circuit is closed.
+async fn remote_slice_covers_unit(
+    env: &WrapperEnvironment<'_>,
+    ctx: &BuildContext,
+    request: &FetchRequest<'_>,
+    exact_public_cache_allowed: bool,
+) -> bool {
+    if !env.env_base.config.cache.reaches_network() || env.circuit_tripped {
+        return false;
+    }
+    let Ok(memo) = env
+        .env_cache
+        .slice(
+            &env.env_base.config,
+            &env.target,
+            &env.rustc_version,
+            &ctx.serve_map_ready,
+        )
+        .await
+    else {
+        return false;
+    };
+    let (Some(slice), _) = memo.read() else {
+        return false;
+    };
+    if exact_public_cache_allowed && slice.exact_row(request.c_metadata).is_some() {
+        return true;
+    }
+    env.semantic_request.as_ref().is_some_and(|semantic| {
+        semantic.consumer.is_publishable_shape()
+            && resolve::find_semantic_artifact(&slice.slice.index.rows, semantic, env.host_glibc)
+                .ok()
+                .flatten()
+                .is_some()
+    })
 }
 
 async fn try_serve_local_prefetched_graph_bundle(
@@ -3194,7 +3339,13 @@ async fn try_serve_local_prefetched_graph_bundle(
             rustc_version,
             c_metadata: c_metadata.as_str(),
         };
-        let cached_bundle = match load_cached_bundle(config, &request).await {
+        let cached_bundle = match artifact_cache::load_cached_bundle_in_tiers(
+            config,
+            &request,
+            &[state_db::CacheTier::CratesIo],
+        )
+        .await
+        {
             Ok(Some(bundle)) => bundle,
             Ok(None) => continue,
             Err(error) => {
@@ -3479,6 +3630,78 @@ async fn finish_local_serve(
 /// holds — this invocation compiles — with every stale local entry already
 /// evicted so a later local compile can store a consistent replacement;
 /// `Err` is a failure of the cache path itself.
+async fn resolve_closure_dependency_bundles(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    request: &FetchRequest<'_>,
+    cached_bundle: artifact_cache::CachedArtifactBundle,
+) -> stow_types::error::Result<
+    Option<(
+        artifact_cache::CachedArtifactBundle,
+        BTreeMap<String, artifact_cache::CachedArtifactBundle>,
+    )>,
+> {
+    let mut bundles_by_compile_key = BTreeMap::new();
+    let mut pending = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
+        &cached_bundle.dependency_compile_keys_json,
+    )?;
+    let mut visited = BTreeSet::new();
+    while let Some(dependency) = pending.pop() {
+        if !visited.insert(dependency.compile_key.clone()) {
+            continue;
+        }
+        let dependency_bundle = if let Some(bundle) = load_cached_bundle_by_compile_key(
+            config,
+            request.rustc_version,
+            &dependency.compile_key,
+        )
+        .await?
+        {
+            bundle
+        } else {
+            if cached_bundle.provenance == artifact_cache::ArtifactProvenance::Local
+                && (!config.cache.reaches_network()
+                    || !remote_slice_has_compile_key(
+                        config,
+                        request.target,
+                        request.rustc_version,
+                        &dependency.compile_key,
+                    )
+                    .await)
+            {
+                tracing::debug!(
+                    crate_name = %parsed.crate_name,
+                    dependency = %dependency.crate_name,
+                    dependency_compile_key = %dependency.compile_key,
+                    "evicting local cached entry whose unindexed closure dependency is absent"
+                );
+                if let Err(error) =
+                    artifact_cache::remove_loaded_bundle_entry(config, cached_bundle).await
+                {
+                    tracing::debug!(
+                        %error,
+                        "deferred evicting local cached entry missing closure dependency"
+                    );
+                }
+                return Ok(None);
+            }
+            download_closure_dependency_bundle(
+                config,
+                request.target,
+                request.rustc_version,
+                &dependency,
+            )
+            .await?
+        };
+        let nested = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
+            &dependency_bundle.dependency_compile_keys_json,
+        )?;
+        pending.extend(nested);
+        bundles_by_compile_key.insert(dependency.compile_key, dependency_bundle);
+    }
+    Ok(Some((cached_bundle, bundles_by_compile_key)))
+}
+
 pub(crate) async fn prune_materialized_aliases_for_cached_closure(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
@@ -3504,39 +3727,11 @@ pub(crate) async fn prune_materialized_aliases_for_cached_closure(
         }
     };
 
-    let mut bundles_by_compile_key = BTreeMap::new();
-    let mut pending = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
-        &cached_bundle.dependency_compile_keys_json,
-    )?;
-    let mut visited = BTreeSet::new();
-    while let Some(dependency) = pending.pop() {
-        if !visited.insert(dependency.compile_key.clone()) {
-            continue;
-        }
-        let dependency_bundle = match load_cached_bundle_by_compile_key(
-            config,
-            request.rustc_version,
-            &dependency.compile_key,
-        )
-        .await?
-        {
-            Some(bundle) => bundle,
-            None => {
-                download_closure_dependency_bundle(
-                    config,
-                    request.target,
-                    request.rustc_version,
-                    &dependency,
-                )
-                .await?
-            }
-        };
-        let nested = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
-            &dependency_bundle.dependency_compile_keys_json,
-        )?;
-        pending.extend(nested);
-        bundles_by_compile_key.insert(dependency.compile_key, dependency_bundle);
-    }
+    let Some((cached_bundle, bundles_by_compile_key)) =
+        resolve_closure_dependency_bundles(config, parsed, request, cached_bundle).await?
+    else {
+        return Ok(None);
+    };
 
     let binding =
         check_served_closure_binding(parsed, &cached_bundle, &externs, &bundles_by_compile_key)?;
@@ -3825,6 +4020,22 @@ fn served_binding_matches_externs(
     Ok(matches)
 }
 
+async fn remote_slice_has_compile_key(
+    config: &StowConfig,
+    target: &str,
+    rustc_version: &str,
+    compile_key: &str,
+) -> bool {
+    let Ok(Some(slice)) = index::cached_slice(config, target, rustc_version).await else {
+        return false;
+    };
+    slice
+        .index
+        .rows
+        .iter()
+        .any(|row| row.compile_key == compile_key)
+}
+
 async fn download_closure_dependency_bundle(
     config: &StowConfig,
     target: &str,
@@ -4042,29 +4253,33 @@ async fn try_serve_downloaded_bundle(
     try_serve_verified_downloaded_bundle(env, parsed, request, bundle, tally).await
 }
 
-async fn try_serve_local_semantic_cached_bundle(
+async fn try_serve_local_semantic_cached_bundle_in_tiers(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
     source: &UnitSource,
     semantic_request: &fetch::SemanticFetchRequest,
+    tiers: &[state_db::CacheTier],
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
-    let cached_bundle = match load_semantic_cached_bundle(config, semantic_request).await {
-        Ok(bundle) => bundle,
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                crate_name = %parsed.crate_name,
-                semantic_crate_name = %semantic_request.crate_name,
-                semantic_version = %semantic_request.version,
-                target = %semantic_request.target,
-                rustc_version = %semantic_request.rustc_version,
-                "failed to read local semantic stow artifact cache entry"
-            );
-            tally.fail(ServeSource::LocalSemanticEntry, ServeStage::Read, &error);
-            return None;
-        }
-    };
+    let cached_bundle =
+        match artifact_cache::load_semantic_cached_bundle_in_tiers(config, semantic_request, tiers)
+            .await
+        {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    crate_name = %parsed.crate_name,
+                    semantic_crate_name = %semantic_request.crate_name,
+                    semantic_version = %semantic_request.version,
+                    target = %semantic_request.target,
+                    rustc_version = %semantic_request.rustc_version,
+                    "failed to read local semantic stow artifact cache entry"
+                );
+                tally.fail(ServeSource::LocalSemanticEntry, ServeStage::Read, &error);
+                return None;
+            }
+        };
     let cached_bundle = cached_bundle?;
     if !config.cache.serves(cached_bundle.provenance, source) {
         return None;
@@ -5200,7 +5415,7 @@ pub(crate) fn log_nonfatal_result(context: &'static str, result: stow_types::err
 }
 
 fn parse_cli_or_exit(args: &[std::ffi::OsString]) -> stow_types::error::Result<Cli> {
-    match Cli::try_parse_from(args.iter().cloned()) {
+    match Cli::try_parse_normalized(args.iter().cloned()) {
         Ok(cli) => Ok(cli),
         Err(error) => {
             let kind = error.kind();
@@ -6222,7 +6437,7 @@ mod tests {
         };
 
         let mut tally = super::LookupTally::default();
-        let served = super::try_serve_local_semantic_cached_bundle(
+        let served = super::try_serve_local_semantic_cached_bundle_in_tiers(
             &config,
             &parsed,
             &super::UnitSource::CratesIo {
@@ -6230,6 +6445,7 @@ mod tests {
                 version: "1.0.103".to_owned(),
             },
             &semantic_request,
+            &[crate::state_db::CacheTier::CratesIo],
             &mut tally,
         )
         .await;
@@ -7314,13 +7530,27 @@ mod tests {
         }
 
         async fn stored_crates(config: &crate::config::StowConfig) -> Vec<String> {
-            let connection = config.state_db_pool().await.expect("state db pool");
-            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
-                "SELECT crate_name FROM artifact_cache_entries ORDER BY crate_name".to_owned(),
-            ))
-            .fetch_all(&connection)
-            .await
-            .expect("list stored crates")
+            let mut crates = Vec::new();
+            for tier in crate::state_db::CacheTier::ALL {
+                let Some(connection) = config
+                    .existing_tier_db_pool(tier)
+                    .await
+                    .expect("tier db pool")
+                else {
+                    continue;
+                };
+                crates.extend(
+                    sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
+                        "SELECT crate_name FROM artifact_cache_entries ORDER BY crate_name"
+                            .to_owned(),
+                    ))
+                    .fetch_all(&connection)
+                    .await
+                    .expect("list stored crates"),
+                );
+            }
+            crates.sort();
+            crates
         }
 
         /// The `BuildContext` a deferred build hands its session when

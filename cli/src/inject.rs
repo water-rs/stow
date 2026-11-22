@@ -1035,6 +1035,7 @@ mod tests {
             crate_types,
             outputs: manifest.config.outputs,
             sigstore_signatures: manifest.sigstore_signatures,
+            tier: crate::state_db::CacheTier::CratesIo,
             entry_dir: cache_dir,
             rustc_version: "1.91.1".to_owned(),
             cache_key: "v2/aarch64-apple-darwin/0123abcd".to_owned(),

@@ -87,7 +87,7 @@ impl Project {
 
     /// The crates the project's local cache holds.
     fn stored_crates(&self) -> Vec<String> {
-        let mut crates: Vec<String> = stored_entries(&self.cache.path().join("state-v3.sqlite3"))
+        let mut crates: Vec<String> = stored_entries(self.cache.path())
             .into_iter()
             .map(|entry| entry.crate_name)
             .collect();

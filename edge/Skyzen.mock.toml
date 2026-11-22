@@ -56,8 +56,8 @@ STOW_POW_CHALLENGE_SECRET = "mock-pow-challenge-secret"
 STOW_GITHUB_WEBHOOK_SECRET = "mock-github-webhook-secret"
 STOW_NEWRELEASES_WEBHOOK_SECRET = "mock-newreleases-webhook-secret"
 # Cloudflare's documented always-pass Turnstile test pair: any token sent
-# through the request API verifies in the mock deployment.
-TURNSTILE_SITE_KEY = "1x00000000000000000000AA"
+# through the request API verifies in the mock deployment. The site key
+# renders in the Pages site build (`TURNSTILE_SITE_KEY` env), not here.
 TURNSTILE_SECRET_KEY = "1x0000000000000000000000000000000AA"
 # Cloudflare's test keys always report this hostname.
 TURNSTILE_HOSTNAME = "example.com"

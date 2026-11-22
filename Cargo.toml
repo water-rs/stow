@@ -16,6 +16,7 @@ members = [
     "oci",
     "resolver",
     "shim",
+    "site",
     "types",
 ]
 

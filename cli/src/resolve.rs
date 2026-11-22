@@ -1503,6 +1503,7 @@ pub fn find_exact_artifact<'a>(
 /// matching row exists at all.
 pub fn semantic_identity_match(row: &ArtifactIndexRow, request: &SemanticFetchRequest) -> bool {
     row.crate_name.as_str() == request.crate_name
+        && Version::parse(&request.version).is_ok_and(|version| row.version.as_semver() == &version)
         && row.features_json.raw() == request.features_json
         && row.dependency_c_metadata_json.raw() == request.dependency_c_metadata_json
         && row.artifact_kind == request.kind
@@ -1511,19 +1512,12 @@ pub fn semantic_identity_match(row: &ArtifactIndexRow, request: &SemanticFetchRe
 }
 
 /// The wrapper's semantic lookup, resolved locally: the index row whose
-/// full identity matches `request`, or the newest semver-compatible
-/// upgrade the slice carries.
+/// exact version and identity match `request` (differing only in Cargo's
+/// local `-C metadata` or a wider covering `--emit` set).
 ///
-/// Mirrors the edge's `get_semantic_artifact_reference`: exact-identity
-/// rows (crate, features, dep chain, profile, crate types, kind) first
-/// pass a version/emit filter, then rank by version descending,
-/// canonical metadata, narrowest emit set, and finally `bundle_digest`
-/// descending — the slice's deterministic stand-in for the row's OCI
-/// digest, which the index does not carry.
-///
-/// `host_glibc` ([`host_glibc`]) drops candidates whose `min_glibc` the
-/// host cannot load *before* the version ranking runs, so a servable
-/// older row wins over an unservable newer one.
+/// Semver-compatible upgrades belong strictly in lockfile resolution
+/// (`stow-resolver` / `--silent-compatible-upgrades`), never in substituting
+/// another release's `.rmeta`/`.rlib` behind Cargo's back (stow#1656).
 ///
 /// # Errors
 ///
@@ -1546,22 +1540,16 @@ pub fn find_semantic_artifact<'a>(
     let mut candidates = rows
         .iter()
         .filter(|row| {
-            semantic_identity_match(row, request) && row_servable_on_host(row, host_glibc)
-        })
-        .filter(|row| {
-            let candidate_version = row.version.as_semver();
-            (candidate_version == &requested_version
-                || is_semver_compatible_upgrade(&requested_version, candidate_version))
+            semantic_identity_match(row, request)
+                && row.version.as_semver() == &requested_version
+                && row_servable_on_host(row, host_glibc)
                 && emit_covers_request(&row.emit, &request.emit)
         })
         .collect::<Vec<_>>();
 
     candidates.sort_by(|left, right| {
-        right
-            .version
-            .as_semver()
-            .cmp(left.version.as_semver())
-            .then(row_has_canonical_metadata(right).cmp(&row_has_canonical_metadata(left)))
+        row_has_canonical_metadata(right)
+            .cmp(&row_has_canonical_metadata(left))
             .then(left.emit.len().cmp(&right.emit.len()))
             .then(right.bundle_digest.cmp(&left.bundle_digest))
     });
@@ -2303,12 +2291,18 @@ mod tests {
         );
     }
 
-    /// Semantic lookup: the newest compatible upgrade wins over an exact
-    /// version match, and emit coverage gates the candidates.
+    /// Semantic lookup matches only the exact requested version — never a
+    /// newer semver-compatible patch release behind Cargo's back (stow#1656).
     #[test]
-    fn semantic_lookup_prefers_newest_compatible_version_and_covering_emit() {
+    fn semantic_lookup_matches_only_exact_version_and_covering_emit() {
         let rows = vec![
-            row("serde", "1.4.9", "aaaaaaaaaaaaaaaa", &["default"], &[]),
+            row(
+                "wasm-bindgen-shared",
+                "0.2.130",
+                "aaaaaaaaaaaaaaaa",
+                &["default"],
+                &[],
+            ),
             row("serde", "1.4.3", "bbbbbbbbbbbbbbbb", &["default"], &[]),
         ];
         let request = SemanticFetchRequest {
@@ -2318,7 +2312,7 @@ mod tests {
             dependency_c_metadata_json: "[]".to_owned(),
             target: TARGET.to_owned(),
             rustc_version: RUSTC.to_owned(),
-            profile: rows[0].profile.clone(),
+            profile: rows[1].profile.clone(),
             emit: vec!["link".to_owned()],
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Rlib],
@@ -2328,15 +2322,17 @@ mod tests {
 
         let found = find_semantic_artifact(&rows, &request, None)
             .expect("lookup")
-            .expect("candidate");
-        assert_eq!(found.version.as_semver(), &Version::parse("1.4.9").unwrap());
+            .expect("exact version candidate");
+        assert_eq!(found.version.as_semver(), &Version::parse("1.4.3").unwrap());
 
-        let mut upgrade_only = request.clone();
-        upgrade_only.version = "9.9.9".to_owned();
+        let mut older_pin = request;
+        older_pin.crate_name = "wasm-bindgen-shared".to_owned();
+        older_pin.version = "0.2.120".to_owned();
         assert!(
-            find_semantic_artifact(&rows, &upgrade_only, None)
+            find_semantic_artifact(&rows, &older_pin, None)
                 .expect("lookup")
-                .is_none()
+                .is_none(),
+            "newer patch release 0.2.130 must never serve a 0.2.120 invocation"
         );
     }
 
