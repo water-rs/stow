@@ -94,6 +94,24 @@ pub enum Command {
     /// Drop-in replacement for `cargo test`: units the caches cover
     /// are served, the rest compile.
     Test(CargoCommandArgs),
+    /// Drop-in replacement for `cargo run`: the binary and its
+    /// dependencies are the units `cargo build` compiles; argv after
+    /// `--` passes to the program.
+    Run(CargoCommandArgs),
+    /// Drop-in replacement for `cargo clippy`: dependencies the caches
+    /// cover are served; workspace members lint through clippy-driver
+    /// and are never cached.
+    Clippy(CargoCommandArgs),
+    /// Drop-in replacement for `cargo bench`: units the caches cover
+    /// are served, the rest compile.
+    Bench(CargoCommandArgs),
+    /// Drop-in replacement for `cargo doc`: dependencies the caches
+    /// cover are served; the rustdoc output itself is not cached.
+    Doc(CargoCommandArgs),
+    /// Drop-in replacement for `cargo nextest`: the build compiles the
+    /// units `cargo test` compiles, serving whatever the caches cover.
+    /// cargo-nextest is the user's own tool; stow does not install it.
+    Nextest(CargoCommandArgs),
     /// Report this workspace's cache coverage. Read-only: nothing is
     /// posted and nothing is enqueued.
     Predict(CargoCommandArgs),
@@ -540,7 +558,9 @@ mod tests {
 
     #[test]
     fn every_cargo_running_command_takes_the_cache_flags() {
-        for command in ["check", "build", "test", "predict"] {
+        for command in [
+            "check", "build", "test", "run", "clippy", "bench", "doc", "nextest", "predict",
+        ] {
             Cli::try_parse_normalized([
                 "stow",
                 command,
