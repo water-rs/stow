@@ -41,7 +41,7 @@ fn an_errored_unit_names_its_stage_and_reason() {
         String::from_utf8_lossy(&first.stderr)
     );
 
-    let db = cache.path().join("state-v3.sqlite3");
+    let db = cache.path().join("local-crates-io/catalog-v1.sqlite3");
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

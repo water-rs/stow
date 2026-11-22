@@ -494,16 +494,27 @@ Nothing leaves the machine: the command reads local counters only. See
 
 ## `stow clean`
 
-Removes cached Rust and C/C++ artifacts and managed workspace build
-directories under `$STOW_CACHE_DIR` (`~/.stow` by default; see
-[`ENVIRONMENT.md`](ENVIRONMENT.md)) while keeping verified index slices
-(`~/.stow/index/`), local usage stats, and wrapper shims intact — so the
-next plain `cargo build` still hits the public cache without needing a
-manual `stow index refresh`. If `state-v3.sqlite3` fails to open under the
-current schema, `stow clean` removes and resets it automatically.
+Removes the three self-contained artifact cache directories (`crates-io/`,
+`local-crates-io/`, and `local/`, including C/C++ objects under `local/cc/`)
+and managed workspace build directories under `$STOW_CACHE_DIR` (`~/.stow` by
+default; see [`ENVIRONMENT.md`](ENVIRONMENT.md)) while keeping verified index
+slices (`~/.stow/index/`), local usage stats, and wrapper shims intact — so the
+next plain `cargo build` still hits the public cache without needing a manual
+`stow index refresh`. Eviction across the three tiers follows
+`crates-io` > `local-crates-io` > `local`. If `state-v3.sqlite3` fails to open
+under the current schema, `stow clean` removes and resets it automatically.
 
 Pass `--all` (`stow clean --all`) to delete the entire `$STOW_CACHE_DIR`,
 including cached index slices and local stats.
+
+## `stow daemon status` / `stow daemon stop`
+
+`stow daemon status` prints the running daemon's stow version and protocol,
+starting the daemon first if none is running. `stow daemon stop` drains the
+running daemon (if any) within `STOW_DAEMON_DRAIN_SECS`, optionally caps
+`local-crates-io/` with `--local-crates-io-max-bytes <BYTES>`, checkpoints and
+truncates every SQLite WAL under `$STOW_CACHE_DIR`, and exits with no daemon
+holding files open.
 
 ## `stow index refresh` / `stow index status`
 

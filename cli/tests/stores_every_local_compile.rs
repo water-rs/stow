@@ -33,29 +33,33 @@ fn expected_stored_crates() -> std::collections::BTreeSet<&'static str> {
         .collect()
 }
 
-fn stored_crate_names(db: &Path) -> std::collections::BTreeSet<String> {
+fn stored_crate_names(cache_dir: &Path) -> std::collections::BTreeSet<String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime")
         .block_on(async {
-            let options = sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(db)
-                .read_only(true);
-            let pool = sqlx::SqlitePool::connect_with(options)
+            let mut stored = std::collections::BTreeSet::new();
+            for tier in ["crates-io", "local-crates-io", "local"] {
+                let db = cache_dir.join(tier).join("catalog-v1.sqlite3");
+                if !db.exists() {
+                    continue;
+                }
+                let options = sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&db)
+                    .read_only(true);
+                let pool = sqlx::SqlitePool::connect_with(options)
+                    .await
+                    .expect("open the tier catalog read-only");
+                let rows = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
+                    "SELECT crate_name FROM artifact_cache_entries".to_owned(),
+                ))
+                .fetch_all(&pool)
                 .await
-                .expect("open the state db read-only");
-            let stored = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
-                "SELECT crate_name FROM artifact_cache_entries".to_owned(),
-            ))
-            .fetch_all(&pool)
-            .await
-            .expect("list stored crates")
-            .into_iter()
-            .collect();
-            // The next run's stow opens a database of its own; this
-            // reader leaves nothing open behind it (stow#682).
-            pool.close().await;
+                .expect("list stored crates");
+                pool.close().await;
+                stored.extend(rows);
+            }
             stored
         })
 }
@@ -99,7 +103,7 @@ fn every_compiled_unit_is_stored_before_the_build_exits() {
                 .any(|line| line.contains("failed to resolve local artifact identity")),
             "run {run}: a never-cacheable unit is not an identity failure:\n{stderr}"
         );
-        let stored = stored_crate_names(&cache.path().join("state-v3.sqlite3"));
+        let stored = stored_crate_names(cache.path());
         let expected = expected_stored_crates()
             .iter()
             .map(|name| (*name).to_owned())
@@ -221,7 +225,7 @@ fn a_plain_builds_wrappers_exit_with_their_compilers() {
     );
 
     // The session has ended, so the daemon's bookkeeping is complete.
-    let stored = stored_crate_names(&cache.path().join("state-v3.sqlite3"));
+    let stored = stored_crate_names(cache.path());
     let expected = expected_stored_crates()
         .iter()
         .map(|name| (*name).to_owned())

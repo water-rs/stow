@@ -92,6 +92,17 @@ pub enum DaemonCommand {
     /// Print the running daemon's stow version and protocol, starting the
     /// daemon first when it is not running.
     Status,
+    /// Drain the running daemon if any, checkpoint and truncate every cache
+    /// catalog's WAL, and exit with no daemon holding files open.
+    Stop(DaemonStopArgs),
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub struct DaemonStopArgs {
+    /// Evict `local-crates-io/` down to at most this many reclaimable bytes
+    /// before checkpointing the catalogs.
+    #[arg(long)]
+    pub local_crates_io_max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Args)]

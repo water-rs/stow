@@ -59,6 +59,17 @@ impl Resources {
             .or_default()
             .clone()
     }
+
+    /// Checkpoint, truncate WALs, and close every opened state/tier database.
+    pub async fn checkpoint_and_close_all(&mut self) {
+        let handles: Vec<CacheDirHandles> = self.by_cache_dir.drain().map(|(_, h)| h).collect();
+        futures_util::future::join_all(
+            handles
+                .iter()
+                .map(|handle| handle.state_db.checkpoint_and_close()),
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]

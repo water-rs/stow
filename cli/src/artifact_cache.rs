@@ -24,9 +24,10 @@ use crate::fetch::{ArtifactBundle, FetchRequest, SemanticFetchRequest, bundle_fi
 use crate::file_lock::FileLock;
 use crate::inject::parsed_with_stable_identity;
 use crate::rustc_args::ParsedRustcArgs;
-use crate::state_db::{db_int, now_millis};
+use crate::state_db::{CacheTier, db_int, now_millis};
 
 const BUNDLES_DIR: &str = "bundles";
+const CC_DIR: &str = "cc";
 const VERSION_LEASES_DIR: &str = "leases";
 /// `<version_dir>/staging/` — beside `bundles/` and `locks/` on the same
 /// filesystem, so a staged entry's rename into place stays atomic. One
@@ -77,7 +78,7 @@ impl ArtifactProvenance {
 
 #[derive(Debug)]
 pub struct RustcVersionLease {
-    _lock: FileLock,
+    _locks: Vec<FileLock>,
 }
 
 /// Everything the rustc wrapper resolved about a finished local build that
@@ -227,6 +228,7 @@ pub struct CachedArtifactBundle {
     pub crate_types: Vec<RustCrateType>,
     pub outputs: Vec<ArtifactBundleFile>,
     pub sigstore_signatures: Vec<SigstoreSignature>,
+    pub(crate) tier: CacheTier,
     pub(crate) entry_dir: PathBuf,
     pub(crate) rustc_version: String,
     pub(crate) cache_key: String,
@@ -248,54 +250,143 @@ impl CachedArtifactBundle {
     }
 }
 
+/// Which cache tiers `config.cache` permits reading from, in lookup priority
+/// order (`CratesIo`, `LocalCratesIo`, `Local`).
+#[must_use]
+pub fn enabled_lookup_tiers(config: &StowConfig) -> Vec<CacheTier> {
+    let mut tiers = Vec::with_capacity(3);
+    if config.cache.remote {
+        tiers.push(CacheTier::CratesIo);
+    }
+    if config.cache.local_crates_io {
+        tiers.push(CacheTier::LocalCratesIo);
+    }
+    if config.cache.local_crates_io || config.cache.local_git {
+        tiers.push(CacheTier::Local);
+    }
+    tiers
+}
+
 #[tracing::instrument(name = "stow.cache.prepare_local", skip_all)]
 pub async fn prepare_local_cache(
     config: &StowConfig,
     rustc_version: &str,
 ) -> stow_types::error::Result<RustcVersionLease> {
-    let artifact_cache_root = config.artifact_cache_root();
     let purge_root = config.artifact_cache_purge_root();
     let rustc_version = rustc_version.to_owned();
-    let connection = config.state_db_pool().await?;
-    let active_rustc_version = sqlx::query_scalar::<_, String>(
+    let host_connection = config.state_db_pool().await?;
+    let host_active = sqlx::query_scalar::<_, String>(
         "SELECT value FROM metadata_values WHERE key = 'active_rustc_version'",
     )
-    .fetch_optional(&connection)
+    .fetch_optional(&host_connection)
     .await?;
-    let active_version_matches = active_rustc_version.as_deref() == Some(rustc_version.as_str());
-    let rustc_version_for_prepare = rustc_version.clone();
-    let prepared = tokio::task::spawn_blocking(move || {
-        prepare_local_cache_blocking(
-            &artifact_cache_root,
-            &purge_root,
-            &rustc_version_for_prepare,
-            active_version_matches,
-        )
-    })
-    .await
-    .wrap_err("join prepare_local_cache blocking task")??;
-    if !active_version_matches {
+    if host_active.as_deref() != Some(rustc_version.as_str()) {
         sqlx::query(
             "INSERT INTO metadata_values (key, value) VALUES ('active_rustc_version', ?) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
         .bind(&rustc_version)
-        .execute(&connection)
+        .execute(&host_connection)
         .await?;
     }
-    let stale_dirs = prepared.stale_dirs;
+
+    let enabled = enabled_lookup_tiers(config);
+    let mut locks = Vec::with_capacity(CacheTier::ALL.len());
+    let mut stale_dirs = Vec::new();
+    for tier in CacheTier::ALL {
+        let tier_root = config.tier_dir(tier);
+        if !enabled.contains(&tier) && !tier_root.exists() {
+            continue;
+        }
+        let existing_pool = config.existing_tier_db_pool(tier).await?;
+        let tier_active = match &existing_pool {
+            Some(pool) => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT value FROM tier_metadata WHERE key = 'active_rustc_version'",
+                )
+                .fetch_optional(pool)
+                .await?
+            }
+            None => None,
+        };
+        let active_version_matches = tier_active.as_deref() == Some(rustc_version.as_str());
+        let tier_root_for_prepare = tier_root.clone();
+        let purge_root_for_prepare = purge_root.clone();
+        let rustc_version_for_prepare = rustc_version.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            prepare_tier_cache_blocking(
+                tier,
+                &tier_root_for_prepare,
+                &purge_root_for_prepare,
+                &rustc_version_for_prepare,
+                active_version_matches,
+            )
+        })
+        .await
+        .wrap_err("join prepare_local_cache blocking task")??;
+        if let Some(pool) = &existing_pool {
+            for purged_version in &prepared.purged_versions {
+                sqlx::query("DELETE FROM artifact_cache_entries WHERE rustc_version = ?")
+                    .bind(purged_version)
+                    .execute(pool)
+                    .await?;
+            }
+            if !active_version_matches {
+                sqlx::query(
+                    "INSERT INTO tier_metadata (key, value) VALUES ('active_rustc_version', ?) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                )
+                .bind(&rustc_version)
+                .execute(pool)
+                .await?;
+            }
+        }
+        locks.push(prepared.version_lock);
+        stale_dirs.extend(prepared.stale_dirs);
+    }
     if !stale_dirs.is_empty() {
         spawn_purge_worker(stale_dirs)?;
     }
-    Ok(prepared.version_lease)
+    Ok(RustcVersionLease { _locks: locks })
 }
 
 #[tracing::instrument(name = "stow.cache.load_cached_bundle", skip_all)]
+#[cfg(test)]
 pub async fn load_cached_bundle(
     config: &StowConfig,
     request: &FetchRequest<'_>,
 ) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
-    let version_dir = config.artifact_cache_version_dir(request.rustc_version);
+    let tiers = enabled_lookup_tiers(config);
+    load_cached_bundle_in_tiers(config, request, &tiers).await
+}
+
+pub async fn load_cached_bundle_in_tiers(
+    config: &StowConfig,
+    request: &FetchRequest<'_>,
+    tiers: &[CacheTier],
+) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
+    for &tier in tiers {
+        if let Some(bundle) = load_cached_bundle_in_tier(config, tier, request).await? {
+            if tier == CacheTier::CratesIo {
+                retire_superseded_local_crates_io_entry(
+                    config,
+                    &bundle.rustc_version,
+                    &bundle.cache_key,
+                )
+                .await;
+            }
+            return Ok(Some(bundle));
+        }
+    }
+    Ok(None)
+}
+
+async fn load_cached_bundle_in_tier(
+    config: &StowConfig,
+    tier: CacheTier,
+    request: &FetchRequest<'_>,
+) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
+    let version_dir = config.tier_version_dir(tier, request.rustc_version);
     let entry_relative_dir = entry_relative_dir(request);
     let cache_key = cache_key(request);
     let rustc_version = request.rustc_version.to_owned();
@@ -314,21 +405,23 @@ pub async fn load_cached_bundle(
         return Ok(None);
     }
 
-    let connection = config.state_db_pool().await?;
+    let connection = config
+        .existing_tier_db_pool(tier)
+        .await?
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "artifact cache entry {cache_key} for rustc {rustc_version} in {} has no catalog database",
+                tier.dir_name()
+            )
+        })?;
     let entry = load_artifact_cache_entry(&connection, &rustc_version, &cache_key)
         .await?
         .ok_or_else(|| {
             stow_types::stow_error!(
-                "artifact cache entry {cache_key} for rustc {rustc_version} is missing from the state database"
+                "artifact cache entry {cache_key} for rustc {rustc_version} is missing from the {} state database",
+                tier.dir_name()
             )
         })?;
-    // Only write the LRU stamp when it is actually stale. This read runs
-    // once per unit served *and* once per member of that unit's dependency
-    // closure, so a build of a few dozen crates was making thousands of
-    // UPDATEs — every one a write transaction, and SQLite serialises
-    // those, which turned a parallel build's cache hits into a queue.
-    // Eviction orders by the hour, not the millisecond; a stamp that can
-    // be a minute stale costs it nothing.
     if now_millis().saturating_sub(recorded_millis(entry.last_accessed_ms)) > LRU_STAMP_INTERVAL_MS
     {
         touch_artifact_cache_entry(&connection, &rustc_version, &cache_key, now_millis()).await?;
@@ -363,6 +456,7 @@ pub async fn load_cached_bundle(
         crate_types: shape.crate_types,
         outputs,
         sigstore_signatures,
+        tier,
         entry_dir,
         rustc_version,
         cache_key,
@@ -429,29 +523,45 @@ pub async fn load_cached_bundle_by_compile_key(
     rustc_version: &str,
     compile_key: &str,
 ) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
-    let connection = config.state_db_pool().await?;
-    let lookup = sqlx::query_as::<_, CompileKeyLookupRow>(
-        "SELECT target, c_metadata \
-         FROM artifact_cache_entries \
-         WHERE rustc_version = ? AND compile_key = ?",
-    )
-    .bind(rustc_version)
-    .bind(compile_key)
-    .fetch_optional(&connection)
-    .await?;
-    let Some(lookup) = lookup else {
-        return Ok(None);
-    };
-
-    load_cached_bundle(
-        config,
-        &FetchRequest {
-            target: &lookup.target,
-            rustc_version,
-            c_metadata: &lookup.c_metadata,
-        },
-    )
-    .await
+    for tier in enabled_lookup_tiers(config) {
+        let Some(connection) = config.existing_tier_db_pool(tier).await? else {
+            continue;
+        };
+        let lookup = sqlx::query_as::<_, CompileKeyLookupRow>(
+            "SELECT target, c_metadata \
+             FROM artifact_cache_entries \
+             WHERE rustc_version = ? AND compile_key = ?",
+        )
+        .bind(rustc_version)
+        .bind(compile_key)
+        .fetch_optional(&connection)
+        .await?;
+        let Some(lookup) = lookup else {
+            continue;
+        };
+        if let Some(bundle) = load_cached_bundle_in_tier(
+            config,
+            tier,
+            &FetchRequest {
+                target: &lookup.target,
+                rustc_version,
+                c_metadata: &lookup.c_metadata,
+            },
+        )
+        .await?
+        {
+            if tier == CacheTier::CratesIo {
+                retire_superseded_local_crates_io_entry(
+                    config,
+                    &bundle.rustc_version,
+                    &bundle.cache_key,
+                )
+                .await;
+            }
+            return Ok(Some(bundle));
+        }
+    }
+    Ok(None)
 }
 
 /// Store a verified bundle's contents into `entry_dir` — the same layout a
@@ -524,6 +634,7 @@ pub fn load_bundle_entry_dir(
         crate_types: manifest.config.crate_types,
         outputs: manifest.config.outputs,
         sigstore_signatures: manifest.sigstore_signatures,
+        tier: CacheTier::CratesIo,
         entry_dir: entry_dir.to_path_buf(),
         rustc_version: manifest.config.rustc_version.as_str().to_owned(),
         cache_key: cache_key.to_owned(),
@@ -555,11 +666,26 @@ fn directory_size(root: &Path) -> stow_types::error::Result<u64> {
 }
 
 #[tracing::instrument(name = "stow.cache.load_semantic_cached_bundle", skip_all)]
+#[cfg(test)]
 pub async fn load_semantic_cached_bundle(
     config: &StowConfig,
     request: &SemanticFetchRequest,
 ) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
-    let connection = config.state_db_pool().await?;
+    let mut tiers = Vec::with_capacity(2);
+    if config.cache.remote {
+        tiers.push(CacheTier::CratesIo);
+    }
+    if config.cache.local_crates_io {
+        tiers.push(CacheTier::LocalCratesIo);
+    }
+    load_semantic_cached_bundle_in_tiers(config, request, &tiers).await
+}
+
+pub async fn load_semantic_cached_bundle_in_tiers(
+    config: &StowConfig,
+    request: &SemanticFetchRequest,
+    tiers: &[CacheTier],
+) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
     let profile_json = serde_json::to_string(&request.profile)?;
     let kind_json = serde_json::to_string(&request.kind)?;
     let crate_types_json = serde_json::to_string(&request.crate_types)?;
@@ -567,52 +693,45 @@ pub async fn load_semantic_cached_bundle(
         .wrap_err_with(|| format!("parse semantic cache request version {}", request.version))?;
     let requested_features = serde_json::from_str::<Vec<String>>(&request.features_json)
         .wrap_err("parse semantic cache request features_json")?;
-    // `features_json` and `dependency_c_metadata_json` stay out of the
-    // WHERE clause (stow#881): a contained request is served from the
-    // smallest published set containing it, whose dependency identity
-    // is the serving set's own build context — the Rust-side filter
-    // keeps containment while the chain check that gates a move ran
-    // upstream at prefetch-staging time.
-    let rows = sqlx::query_as::<_, SemanticCacheCandidateRow>(
-        "SELECT c_metadata, crate_version, emit_json, features_json, crate_name, \
-                compile_key, dependency_c_metadata_json \
-         FROM artifact_cache_entries \
-         WHERE rustc_version = ? AND target = ? AND crate_name = ? \
-           AND profile_json = ? AND kind_json = ? AND crate_types_json = ? \
-           AND reach = ?",
-    )
-    .bind(&request.rustc_version)
-    .bind(&request.target)
-    .bind(&request.crate_name)
-    .bind(profile_json)
-    .bind(kind_json)
-    .bind(crate_types_json)
-    .bind(stow_types::public_cache::Reach::Public.to_int())
-    .fetch_all(&connection)
-    .await?;
-    let mut candidates = rows
-        .into_iter()
-        .filter_map(|row| {
-            match semantic_candidate_from_row(
+    let mut candidates = Vec::new();
+    for &tier in tiers {
+        let Some(connection) = config.existing_tier_db_pool(tier).await? else {
+            continue;
+        };
+        let rows = sqlx::query_as::<_, SemanticCacheCandidateRow>(
+            "SELECT c_metadata, crate_version, emit_json, features_json, crate_name, \
+                    compile_key, dependency_c_metadata_json \
+             FROM artifact_cache_entries \
+             WHERE rustc_version = ? AND target = ? AND crate_name = ? \
+               AND profile_json = ? AND kind_json = ? AND crate_types_json = ? \
+               AND reach = ?",
+        )
+        .bind(&request.rustc_version)
+        .bind(&request.target)
+        .bind(&request.crate_name)
+        .bind(&profile_json)
+        .bind(&kind_json)
+        .bind(&crate_types_json)
+        .bind(stow_types::public_cache::Reach::Public.to_int())
+        .fetch_all(&connection)
+        .await?;
+        for row in rows {
+            if let Some(candidate) = semantic_candidate_from_row(
+                tier,
                 row,
                 &requested_version,
                 &request.emit,
                 &requested_features,
-            ) {
-                Ok(Some(candidate)) => Some(Ok(candidate)),
-                Ok(None) => None,
-                Err(error) => Some(Err(error)),
+            )? {
+                candidates.push(candidate);
             }
-        })
-        .collect::<stow_types::error::Result<Vec<_>>>()?;
+        }
+    }
     candidates.sort_by(compare_semantic_candidates);
-    // The first candidate in order that was also compiled with the
-    // request's own cfgs, codegen and link options (stow#1047). One that
-    // was not is a plain miss for this request, never an eviction: it is
-    // a sound artifact for the requests it does match.
     for candidate in candidates {
-        let loaded = load_cached_bundle(
+        let loaded = load_cached_bundle_in_tier(
             config,
+            candidate.tier,
             &FetchRequest {
                 target: &request.target,
                 rustc_version: &request.rustc_version,
@@ -624,6 +743,14 @@ pub async fn load_semantic_cached_bundle(
             continue;
         };
         if semantic_candidate_honours_consumer(request, &candidate, &loaded)? {
+            if candidate.tier == CacheTier::CratesIo {
+                retire_superseded_local_crates_io_entry(
+                    config,
+                    &loaded.rustc_version,
+                    &loaded.cache_key,
+                )
+                .await;
+            }
             return Ok(Some(loaded));
         }
         tracing::debug!(
@@ -698,7 +825,8 @@ pub async fn store_downloaded_bundle(
 ) -> stow_types::error::Result<CachedArtifactBundle> {
     let request = OwnedFetchRequest::from(request);
     let bundle = bundle.clone();
-    let version_dir = config.artifact_cache_version_dir(&request.rustc_version);
+    let tier = CacheTier::CratesIo;
+    let version_dir = config.tier_version_dir(tier, &request.rustc_version);
     let bundles_dir = version_dir.join(BUNDLES_DIR);
     async_fs::create_dir_all(&bundles_dir)
         .await
@@ -716,31 +844,11 @@ pub async fn store_downloaded_bundle(
         .await
         .wrap_err_with(|| format!("create artifact cache parent {}", entry_parent.display()))?;
     let cache_key = cache_key_owned(&request);
-    let connection = config.state_db_pool().await?;
+    let connection = config.tier_db_pool(tier).await?;
 
-    // Serialize writers on the entry lock: a concurrent local store or a
-    // second download of the same identity must not interleave temp dirs or
-    // row writes.
-    let mut write_lease = acquire_entry_exclusive_lock_async(&version_dir, &cache_key).await?;
-    let existing = loop {
-        let existing =
-            load_artifact_cache_entry(&connection, &request.rustc_version, &cache_key).await?;
-        // Local-first: a self-produced entry already serves this identity, so
-        // a later remote bundle must not displace it.
-        if !local_entry_covers(existing.as_ref(), &entry_dir)? {
-            break existing;
-        }
-        // The reload goes through the normal read path, which needs the
-        // shared lock — the exclusive lock has to be dropped first or the
-        // load deadlocks on itself.
-        drop(write_lease);
-        if let Some(cached) = load_existing_local_bundle(config, &connection, &request).await? {
-            return Ok(cached);
-        }
-        // The entry vanished between the check and the reload (a concurrent
-        // eviction raced us); re-lock and re-evaluate under the fresh lease.
-        write_lease = acquire_entry_exclusive_lock_async(&version_dir, &cache_key).await?;
-    };
+    let write_lease = acquire_entry_exclusive_lock_async(&version_dir, &cache_key).await?;
+    let existing =
+        load_artifact_cache_entry(&connection, &request.rustc_version, &cache_key).await?;
 
     // A remote row whose directory exists already serves this identity: a
     // further bundle of the same compile key merges its original-named
@@ -750,7 +858,7 @@ pub async fn store_downloaded_bundle(
     if let Some(entry) = existing
         && entry_dir.exists()
     {
-        return merge_downloaded_bundle_into_entry(
+        let merged = merge_downloaded_bundle_into_entry(
             config,
             &connection,
             &request,
@@ -759,7 +867,10 @@ pub async fn store_downloaded_bundle(
             entry_dir,
             write_lease,
         )
-        .await;
+        .await?;
+        retire_superseded_local_crates_io_entry(config, &merged.rustc_version, &merged.cache_key)
+            .await;
+        return Ok(merged);
     }
 
     // A leftover entry dir with no row is a crashed writer's stage output:
@@ -770,7 +881,7 @@ pub async fn store_downloaded_bundle(
     }
 
     let staging_dir = config
-        .artifact_cache_staging_dir(&request.rustc_version)
+        .artifact_cache_staging_dir(tier, &request.rustc_version)
         .await?;
     let size_bytes = tokio::task::spawn_blocking({
         let entry_dir = entry_dir.clone();
@@ -792,10 +903,6 @@ pub async fn store_downloaded_bundle(
     )
     .await?;
     drop(write_lease);
-    // Hold the shared lease BEFORE running eviction: `protected_key` only
-    // shields the fresh entry from our own eviction pass, while the lease is
-    // what stops a concurrent process's eviction from acquiring the
-    // exclusive lock and deleting the entry we are about to hand out.
     let lease_lock = tokio::task::spawn_blocking({
         let version_dir = version_dir.clone();
         let cache_key = cache_key.clone();
@@ -803,13 +910,11 @@ pub async fn store_downloaded_bundle(
     })
     .await
     .wrap_err("join store_downloaded_bundle lock task")??;
+    retire_superseded_local_crates_io_entry(config, &request.rustc_version, &cache_key).await;
     evict_entries(
-        &connection,
+        config,
         &request.rustc_version,
-        &version_dir,
-        &config.cc_cache_dir(),
-        config.artifact_cache_max_bytes,
-        &ProtectedEntry::Rustc(&cache_key),
+        &ProtectedEntry::Rustc(tier, &cache_key),
     )
     .await?;
     Ok(cached_bundle_for_entry(
@@ -820,6 +925,30 @@ pub async fn store_downloaded_bundle(
         size_bytes,
         lease_lock,
     ))
+}
+
+/// Retire a transitional `local-crates-io/` entry once the published
+/// `crates-io/` bundle is stored or served. Best-effort when another
+/// process currently holds a lease on the transitional entry.
+async fn retire_superseded_local_crates_io_entry(
+    config: &StowConfig,
+    rustc_version: &str,
+    cache_key: &str,
+) {
+    let Ok(Some(pool)) = config.existing_tier_db_pool(CacheTier::LocalCratesIo).await else {
+        return;
+    };
+    let version_dir = config.tier_version_dir(CacheTier::LocalCratesIo, rustc_version);
+    if let Err(error) =
+        remove_cached_bundle_locked(&pool, &version_dir, rustc_version, cache_key).await
+    {
+        tracing::debug!(
+            %error,
+            rustc_version,
+            cache_key,
+            "deferred retiring superseded local-crates-io entry"
+        );
+    }
 }
 
 /// The `CachedArtifactBundle` a just-stored remote bundle serves from —
@@ -855,6 +984,7 @@ fn cached_bundle_for_entry(
         crate_types: bundle.manifest.config.crate_types.clone(),
         outputs: bundle.manifest.config.outputs.clone(),
         sigstore_signatures: bundle.manifest.sigstore_signatures.clone(),
+        tier: CacheTier::CratesIo,
         entry_dir,
         rustc_version,
         cache_key,
@@ -879,7 +1009,8 @@ async fn merge_downloaded_bundle_into_entry(
     entry_dir: PathBuf,
     write_lease: FileLock,
 ) -> stow_types::error::Result<CachedArtifactBundle> {
-    let version_dir = config.artifact_cache_version_dir(&request.rustc_version);
+    let tier = CacheTier::CratesIo;
+    let version_dir = config.tier_version_dir(tier, &request.rustc_version);
     let cache_key = cache_key_owned(request);
     let recorded = load_artifact_outputs(connection, &request.rustc_version, &cache_key).await?;
     let merge = tokio::task::spawn_blocking({
@@ -900,9 +1031,6 @@ async fn merge_downloaded_bundle_into_entry(
     )
     .await?;
     drop(write_lease);
-    // Same post-store discipline as the fresh path: the shared lease before
-    // eviction, so the entry this call hands out cannot be deleted from
-    // under the caller.
     let lease_lock = tokio::task::spawn_blocking({
         let version_dir = version_dir.clone();
         let cache_key = cache_key.clone();
@@ -911,12 +1039,9 @@ async fn merge_downloaded_bundle_into_entry(
     .await
     .wrap_err("join store_downloaded_bundle lock task")??;
     evict_entries(
-        connection,
+        config,
         &request.rustc_version,
-        &version_dir,
-        &config.cc_cache_dir(),
-        config.artifact_cache_max_bytes,
-        &ProtectedEntry::Rustc(&cache_key),
+        &ProtectedEntry::Rustc(tier, &cache_key),
     )
     .await?;
     Ok(cached_bundle_for_entry(
@@ -1257,11 +1382,29 @@ pub async fn store_local_build_outputs(
         }
     }
 
-    let version_dir = config.artifact_cache_version_dir(&build.rustc_version);
+    let tier = CacheTier::for_local_reach(build.reach);
+    let version_dir = config.tier_version_dir(tier, &build.rustc_version);
     let entry_relative_dir = PathBuf::from(BUNDLES_DIR)
         .join(ARTIFACT_CACHE_LAYOUT_VERSION)
         .join(&build.target)
         .join(entry_key.as_str());
+    let cache_key = artifact_cache_key(&build.target, entry_key.as_str());
+    // When the remote tier already holds a published entry for this
+    // public unit, `local-crates-io/` is already superseded.
+    if tier == CacheTier::LocalCratesIo
+        && config.cache.remote
+        && config
+            .tier_version_dir(CacheTier::CratesIo, &build.rustc_version)
+            .join(&entry_relative_dir)
+            .exists()
+        && let Some(remote_pool) = config.existing_tier_db_pool(CacheTier::CratesIo).await?
+        && load_artifact_cache_entry(&remote_pool, &build.rustc_version, &cache_key)
+            .await?
+            .is_some()
+    {
+        return Ok(false);
+    }
+
     let entry_dir = version_dir.join(&entry_relative_dir);
     let entry_parent = entry_dir.parent().ok_or_else(|| {
         stow_types::stow_error!(
@@ -1277,42 +1420,26 @@ pub async fn store_local_build_outputs(
                 entry_parent.display()
             )
         })?;
-    let cache_key = artifact_cache_key(&build.target, entry_key.as_str());
-    let connection = config.state_db_pool().await?;
+    let connection = config.tier_db_pool(tier).await?;
 
     let write_lease = acquire_entry_exclusive_lock_async(&version_dir, &cache_key).await?;
     let existing = load_artifact_cache_entry(&connection, &build.rustc_version, &cache_key).await?;
     if let Some(entry) = existing.as_ref() {
-        // Surface corrupt rows even when the entry is already covered.
-        let provenance = ArtifactProvenance::from_column(&entry.provenance)?;
+        let _ = ArtifactProvenance::from_column(&entry.provenance)?;
         if entry_dir.exists() {
-            if provenance == ArtifactProvenance::Remote && !config.cache.remote {
-                // With the remote cache off the downloaded entry serves
-                // nothing, and one row holds the key: this build's own
-                // compile replaces it as a local entry.
-                remove_orphaned_entry_dir(entry_dir.clone()).await?;
-            } else {
-                // Another writer — a local store or a completed download —
-                // already covers this identity; either provenance serves
-                // future hits.
-                return Ok(false);
-            }
+            return Ok(false);
         }
     }
     if existing.is_none() && entry_dir.exists() {
-        // Same orphan-dir rule as the download path: a leftover stage dir is
-        // not an entry and must not be adopted by the row written below.
         remove_orphaned_entry_dir(entry_dir.clone()).await?;
     }
 
-    let Some(binding) =
-        bind_dependency_instances(&connection, parsed, build, host, &version_dir).await?
-    else {
+    let Some(binding) = bind_dependency_instances(config, parsed, build, host).await? else {
         return Ok(false);
     };
 
     let staging_dir = config
-        .artifact_cache_staging_dir(&build.rustc_version)
+        .artifact_cache_staging_dir(tier, &build.rustc_version)
         .await?;
     let written = tokio::task::spawn_blocking({
         let staging_dir = staging_dir.clone();
@@ -1335,15 +1462,10 @@ pub async fn store_local_build_outputs(
     .await?;
     drop(write_lease);
 
-    // Same post-insert discipline as the download path: the new entry joins
-    // the shared LRU budget immediately, protected from this eviction pass.
     evict_entries(
-        &connection,
+        config,
         &build.rustc_version,
-        &version_dir,
-        &config.cc_cache_dir(),
-        config.artifact_cache_max_bytes,
-        &ProtectedEntry::Rustc(&cache_key),
+        &ProtectedEntry::Rustc(tier, &cache_key),
     )
     .await?;
     Ok(true)
@@ -1360,22 +1482,24 @@ struct DependencyBinding {
 /// against, or `None` when the cache does not hold them: rustc binds a
 /// dependent to its deps by SVH, so an artifact whose recorded instances the
 /// cache does not hold could only ever be served into a broken pair
-/// (E0460/E0463, stow#836). First-writer-wins per unit lets concurrent cold
-/// builds split a dep set across different instances; the store refuses
-/// the mismatched half rather than admit it.
+/// (E0460/E0463, stow#836).
 async fn bind_dependency_instances(
-    connection: &sqlx::SqlitePool,
+    config: &StowConfig,
     parsed: &ParsedRustcArgs,
     build: &LocalBuildArtifact,
     host: &str,
-    version_dir: &Path,
 ) -> stow_types::error::Result<Option<DependencyBinding>> {
-    let dep_entries = load_dependency_entry_instances(connection, build, host).await?;
+    let dep_entries = load_dependency_entry_instances(config, build, host).await?;
     let mut dependency_compile_keys = Vec::with_capacity(build.dependencies.externs.len());
     let mut dependency_instances = Vec::with_capacity(build.dependencies.externs.len());
     for extern_dep in &build.dependencies.externs {
         match dep_entries.get(extern_dep.c_metadata.as_str()) {
-            Some(dep_entry) if !version_dir.join(&dep_entry.relative_dir).exists() => {
+            Some(dep_entry)
+                if !config
+                    .tier_version_dir(dep_entry.tier, &build.rustc_version)
+                    .join(&dep_entry.relative_dir)
+                    .exists() =>
+            {
                 tracing::debug!(
                     crate_name = %parsed.crate_name,
                     dependency = %extern_dep.crate_name,
@@ -1667,7 +1791,6 @@ pub async fn load_artifact_dep_identities(
     if c_metadatas.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let connection = config.state_db_pool().await?;
     let placeholders = c_metadatas
         .iter()
         .map(|_| "?")
@@ -1678,29 +1801,38 @@ pub async fn load_artifact_dep_identities(
          FROM artifact_cache_entries \
          WHERE rustc_version = ? AND c_metadata IN ({placeholders})"
     );
-    let mut rows =
-        sqlx::query_as::<_, ObservedDepIdentityRow>(sqlx::AssertSqlSafe(sql)).bind(rustc_version);
-    for c_metadata in c_metadatas {
-        rows = rows.bind(c_metadata);
-    }
-    let rows = rows.fetch_all(&connection).await?;
     let mut identities = BTreeMap::new();
-    for row in rows {
-        let Ok(features) = serde_json::from_str::<Vec<String>>(&row.features_json) else {
+    for tier in CacheTier::ALL {
+        let Some(connection) = config.existing_tier_db_pool(tier).await? else {
             continue;
         };
-        let proc_macro = serde_json::from_str::<ArtifactKind>(&row.kind_json)
-            .is_ok_and(|kind| kind == ArtifactKind::ProcMacro);
-        identities.insert(
-            row.c_metadata,
-            ObservedDepIdentity {
-                crate_name: row.crate_name,
-                crate_version: row.crate_version,
-                features,
-                unit_shape: None,
-                proc_macro,
-            },
-        );
+        let mut rows =
+            sqlx::query_as::<_, ObservedDepIdentityRow>(sqlx::AssertSqlSafe(sql.as_str()))
+                .bind(rustc_version);
+        for c_metadata in c_metadatas {
+            rows = rows.bind(c_metadata);
+        }
+        let rows = rows.fetch_all(&connection).await?;
+        for row in rows {
+            if identities.contains_key(&row.c_metadata) {
+                continue;
+            }
+            let Ok(features) = serde_json::from_str::<Vec<String>>(&row.features_json) else {
+                continue;
+            };
+            let proc_macro = serde_json::from_str::<ArtifactKind>(&row.kind_json)
+                .is_ok_and(|kind| kind == ArtifactKind::ProcMacro);
+            identities.insert(
+                row.c_metadata,
+                ObservedDepIdentity {
+                    crate_name: row.crate_name,
+                    crate_version: row.crate_version,
+                    features,
+                    unit_shape: None,
+                    proc_macro,
+                },
+            );
+        }
     }
     Ok(identities)
 }
@@ -1715,22 +1847,28 @@ struct ObservedDepIdentityRow {
 }
 
 /// Every `(crate_name, crate_version, target)` the local artifact cache
-/// holds for this rustc — one query per build so the serve map can name
-/// the pairs a local lookup could answer (stow#347).
+/// holds for this rustc — across all enabled cache tiers (stow#347).
 pub async fn locally_covered_units(
     config: &StowConfig,
     rustc_version: &str,
 ) -> stow_types::error::Result<Vec<(String, String, String)>> {
-    let connection = config.state_db_pool().await?;
-    sqlx::query_as::<_, (String, String, String)>(sqlx::AssertSqlSafe(
-        "SELECT crate_name, crate_version, target \
-         FROM artifact_cache_entries \
-         WHERE rustc_version = ?",
-    ))
-    .bind(rustc_version)
-    .fetch_all(&connection)
-    .await
-    .wrap_err("read locally covered crate units")
+    let mut units = BTreeSet::new();
+    for tier in enabled_lookup_tiers(config) {
+        let Some(connection) = config.existing_tier_db_pool(tier).await? else {
+            continue;
+        };
+        let rows = sqlx::query_as::<_, (String, String, String)>(sqlx::AssertSqlSafe(
+            "SELECT crate_name, crate_version, target \
+             FROM artifact_cache_entries \
+             WHERE rustc_version = ?",
+        ))
+        .bind(rustc_version)
+        .fetch_all(&connection)
+        .await
+        .wrap_err("read locally covered crate units")?;
+        units.extend(rows);
+    }
+    Ok(units.into_iter().collect())
 }
 
 /// The `(crate_name, output_path)` pairs a unit's `--extern` arguments
@@ -1897,27 +2035,33 @@ pub async fn remove_cached_bundle(
     config: &StowConfig,
     request: &FetchRequest<'_>,
 ) -> stow_types::error::Result<()> {
-    let version_dir = config.artifact_cache_version_dir(request.rustc_version);
     let cache_key = cache_key(request);
     let rustc_version = request.rustc_version.to_owned();
-    let connection = config.state_db_pool().await?;
-    remove_cached_bundle_locked(&connection, &version_dir, &rustc_version, &cache_key).await
+    for tier in CacheTier::ALL {
+        let Some(connection) = config.existing_tier_db_pool(tier).await? else {
+            continue;
+        };
+        let version_dir = config.tier_version_dir(tier, &rustc_version);
+        remove_cached_bundle_locked(&connection, &version_dir, &rustc_version, &cache_key).await?;
+    }
+    Ok(())
 }
 
-/// Remove the entry a loaded bundle was read from — the same removal path
-/// as [`remove_cached_bundle`], addressed by the bundle's own `cache_key`
-/// for a serve path that holds the bundle rather than the request that
-/// found it (stow#836). The bundle is consumed: its shared lease goes
-/// before the removal takes the entry's exclusive lock.
+/// Remove the entry a loaded bundle was read from — addressed by the
+/// bundle's own `(tier, cache_key)` (stow#836). The bundle is consumed:
+/// its shared lease goes before the removal takes the entry's exclusive lock.
 pub async fn remove_loaded_bundle_entry(
     config: &StowConfig,
     bundle: CachedArtifactBundle,
 ) -> stow_types::error::Result<()> {
+    let tier = bundle.tier;
     let rustc_version = bundle.rustc_version.clone();
     let cache_key = bundle.cache_key.clone();
     drop(bundle);
-    let version_dir = config.artifact_cache_version_dir(&rustc_version);
-    let connection = config.state_db_pool().await?;
+    let Some(connection) = config.existing_tier_db_pool(tier).await? else {
+        return Ok(());
+    };
+    let version_dir = config.tier_version_dir(tier, &rustc_version);
     remove_cached_bundle_locked(&connection, &version_dir, &rustc_version, &cache_key).await
 }
 
@@ -1999,25 +2143,22 @@ impl Drop for StagingDir {
     }
 }
 
-fn prepare_local_cache_blocking(
-    artifact_cache_root: &Path,
+fn prepare_tier_cache_blocking(
+    tier: CacheTier,
+    tier_root: &Path,
     purge_root: &Path,
     rustc_version: &str,
     active_version_matches: bool,
-) -> stow_types::error::Result<PreparedLocalCache> {
-    std::fs::create_dir_all(artifact_cache_root).wrap_err_with(|| {
-        format!(
-            "create artifact cache root {}",
-            artifact_cache_root.display()
-        )
-    })?;
+) -> stow_types::error::Result<PreparedTierCache> {
+    std::fs::create_dir_all(tier_root)
+        .wrap_err_with(|| format!("create artifact cache tier {}", tier_root.display()))?;
     std::fs::create_dir_all(purge_root)
         .wrap_err_with(|| format!("create artifact purge root {}", purge_root.display()))?;
-    let leases_root = artifact_cache_root.join(VERSION_LEASES_DIR);
+    let leases_root = tier_root.join(VERSION_LEASES_DIR);
     std::fs::create_dir_all(&leases_root)
         .wrap_err_with(|| format!("create artifact lease root {}", leases_root.display()))?;
 
-    let version_dir = artifact_cache_root.join(rustc_version);
+    let version_dir = tier_root.join(rustc_version);
     std::fs::create_dir_all(version_dir.join(BUNDLES_DIR)).wrap_err_with(|| {
         format!(
             "create rustc artifact cache directory {}",
@@ -2036,30 +2177,28 @@ fn prepare_local_cache_blocking(
             version_dir.display()
         )
     })?;
-    let version_lease = RustcVersionLease {
-        _lock: acquire_version_shared_lock(&leases_root, rustc_version)?,
-    };
-    // Under the version lease, so a concurrent stale-version purge cannot
-    // move this directory while its staging is being swept.
+    let version_lock = acquire_version_shared_lock(&leases_root, rustc_version)?;
     sweep_staging_locks(&version_dir.join(STAGING_DIR))?;
 
     if active_version_matches {
-        return Ok(PreparedLocalCache {
+        return Ok(PreparedTierCache {
             stale_dirs: Vec::new(),
-            version_lease,
+            purged_versions: Vec::new(),
+            version_lock,
         });
     }
 
     let mut stale_dirs = Vec::new();
-    for entry in std::fs::read_dir(artifact_cache_root)
-        .wrap_err_with(|| format!("read artifact cache root {}", artifact_cache_root.display()))?
+    let mut purged_versions = Vec::new();
+    for entry in std::fs::read_dir(tier_root)
+        .wrap_err_with(|| format!("read artifact cache tier {}", tier_root.display()))?
     {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
         let file_name = entry.file_name();
-        if file_name == rustc_version || file_name == VERSION_LEASES_DIR {
+        if file_name == rustc_version || file_name == VERSION_LEASES_DIR || file_name == CC_DIR {
             continue;
         }
         let stale_path = entry.path();
@@ -2068,8 +2207,12 @@ fn prepare_local_cache_blocking(
         else {
             continue;
         };
-        let purge_path =
-            purge_root.join(format!("{}-{}", file_name.to_string_lossy(), now_millis()));
+        let purge_path = purge_root.join(format!(
+            "{}-{}-{}",
+            tier.dir_name(),
+            file_name.to_string_lossy(),
+            now_millis()
+        ));
         std::fs::rename(&stale_path, &purge_path).wrap_err_with(|| {
             format!(
                 "move stale rustc cache directory {} to {}",
@@ -2077,12 +2220,14 @@ fn prepare_local_cache_blocking(
                 purge_path.display()
             )
         })?;
+        purged_versions.push(stale_version);
         stale_dirs.push(purge_path);
     }
 
-    Ok(PreparedLocalCache {
+    Ok(PreparedTierCache {
         stale_dirs,
-        version_lease,
+        purged_versions,
+        version_lock,
     })
 }
 
@@ -2341,20 +2486,17 @@ impl DependencyInstanceIdentity {
 /// A dependency's current cache entry reduced to what the store's instance
 /// check reads.
 struct DependencyEntryInstance {
+    tier: CacheTier,
     compile_key: String,
     relative_dir: String,
     instance: String,
 }
 
-/// The current cache entries for a local build's direct dependencies in one
-/// batched primary-key query — the `c_metadata → (compile_key, entry dir,
-/// instance)` map the store's refusal check reads. A dep's entry sits under
-/// the dependent's own target or, for a host-side dep such as a proc-macro
-/// of a `--target` build, under the host triple; the stable `c_metadata`
-/// already carries the target, so one dep naming entries under both is a
-/// corrupt cache and fails.
+/// The current cache entries for a local build's direct dependencies across
+/// the enabled cache tiers (`CratesIo` preferred over `LocalCratesIo` and
+/// `Local`).
 async fn load_dependency_entry_instances(
-    connection: &sqlx::SqlitePool,
+    config: &StowConfig,
     build: &LocalBuildArtifact,
     host: &str,
 ) -> stow_types::error::Result<BTreeMap<String, DependencyEntryInstance>> {
@@ -2385,43 +2527,59 @@ async fn load_dependency_entry_instances(
          WHERE e.rustc_version = ? AND e.cache_key IN ({placeholders}) \
          ORDER BY e.cache_key, o.ordinal"
     );
-    let mut query = sqlx::query_as::<_, (String, String, String, String, Option<String>)>(
-        sqlx::AssertSqlSafe(sql),
-    )
-    .bind(&build.rustc_version);
-    for cache_key in &cache_keys {
-        query = query.bind(cache_key);
-    }
-    let rows = query.fetch_all(connection).await?;
-    let mut entries: BTreeMap<String, (String, String, String, Vec<String>)> = BTreeMap::new();
-    for (c_metadata, cache_key, compile_key, relative_dir, sha256) in rows {
-        let entry = entries
-            .entry(c_metadata.clone())
-            .or_insert_with(|| (cache_key.clone(), compile_key, relative_dir, Vec::new()));
-        if entry.0 != cache_key {
-            return Err(stow_types::stow_error!(
-                "dependency c_metadata {c_metadata} has cache entries under both {} and {cache_key}",
-                entry.0
-            ));
+    let mut resolved = BTreeMap::new();
+    for tier in enabled_lookup_tiers(config) {
+        let Some(connection) = config.existing_tier_db_pool(tier).await? else {
+            continue;
+        };
+        let mut query = sqlx::query_as::<_, (String, String, String, String, Option<String>)>(
+            sqlx::AssertSqlSafe(sql.as_str()),
+        )
+        .bind(&build.rustc_version);
+        for cache_key in &cache_keys {
+            query = query.bind(cache_key);
         }
-        if let Some(sha256) = sha256 {
-            entry.3.push(sha256);
+        let rows = query.fetch_all(&connection).await?;
+        let mut tier_entries: BTreeMap<String, (String, String, String, Vec<String>)> =
+            BTreeMap::new();
+        for (c_metadata, cache_key, compile_key, relative_dir, sha256) in rows {
+            let entry = tier_entries
+                .entry(c_metadata.clone())
+                .or_insert_with(|| (cache_key.clone(), compile_key, relative_dir, Vec::new()));
+            if entry.0 != cache_key {
+                return Err(stow_types::stow_error!(
+                    "dependency c_metadata {c_metadata} has cache entries under both {} and {cache_key}",
+                    entry.0
+                ));
+            }
+            if let Some(sha256) = sha256 {
+                entry.3.push(sha256);
+            }
         }
-    }
-    Ok(entries
-        .into_iter()
-        .map(|(c_metadata, (_, compile_key, relative_dir, sha256s))| {
+        for (c_metadata, (_, compile_key, relative_dir, sha256s)) in tier_entries {
+            if resolved.contains_key(&c_metadata) {
+                continue;
+            }
+            if !config
+                .tier_version_dir(tier, &build.rustc_version)
+                .join(&relative_dir)
+                .exists()
+            {
+                continue;
+            }
             let instance = outputs_instance_digest(sha256s.iter().map(String::as_str));
-            (
+            resolved.insert(
                 c_metadata,
                 DependencyEntryInstance {
+                    tier,
                     compile_key,
                     relative_dir,
                     instance,
                 },
-            )
-        })
-        .collect())
+            );
+        }
+    }
+    Ok(resolved)
 }
 
 fn output_file_name(path: &Path) -> stow_types::error::Result<String> {
@@ -2490,34 +2648,34 @@ async fn remove_cached_bundle_locked(
 
 /// The entry the store that just ran shields from its own eviction
 /// pass: it already joined the shared budget, and being its own pass's
-/// first victim serves no one. `Rustc` names an `artifact_cache_entries`
-/// row under `version_dir`; `Cc` names a `cc_cache_entries` object under
-/// `cc_dir`.
+/// first victim serves no one.
 enum ProtectedEntry<'a> {
-    Rustc(&'a str),
+    None,
+    Rustc(CacheTier, &'a str),
     Cc(&'a str),
 }
 
 impl ProtectedEntry<'_> {
     fn matches(&self, candidate: &EvictionCandidate) -> bool {
-        let key = match self {
-            Self::Rustc(key) | Self::Cc(key) => *key,
-        };
-        let same_kind = matches!(
-            (self, &candidate.location),
-            (Self::Rustc(_), EvictionLocation::Rustc) | (Self::Cc(_), EvictionLocation::Cc)
-        );
-        same_kind && key == candidate.cache_key
+        match (self, &candidate.location) {
+            (Self::Rustc(tier, key), EvictionLocation::Rustc) => {
+                *tier == candidate.tier && *key == candidate.cache_key
+            }
+            (Self::Cc(key), EvictionLocation::Cc) => {
+                candidate.tier == CacheTier::Local && *key == candidate.cache_key
+            }
+            _ => false,
+        }
     }
 }
 
 /// Where an eviction candidate's bytes live.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum EvictionLocation {
     /// An `artifact_cache_entries` row; its `relative_dir` in the pass's
-    /// listing names the entry dir under `version_dir`.
+    /// listing names the entry dir under `<tier>/<version>`.
     Rustc,
-    /// A `cc_cache_entries` row; the object file is `cc_dir/<key>.o`.
+    /// A `cc_cache_entries` row; the object file is `local/cc/<key>.o`.
     Cc,
 }
 
@@ -2531,20 +2689,16 @@ impl EvictionLocation {
     }
 }
 
-/// One entry under the shared `artifact_cache_max_bytes` budget — a rustc
-/// bundle entry under `version_dir` or a C/C++ object under `cc_dir`
-/// (stow#980) — at its place in the eviction order (stow#1539): entries
-/// a clone shares last, then remote before local, then `last_accessed_ms`.
+/// One entry under the `artifact_cache_max_bytes` budget at its place in
+/// the three-tier eviction order (`crates-io > local-crates-io > local`):
+/// shared entries last, then `tier` (`CratesIo < LocalCratesIo < Local`),
+/// then `last_accessed_ms`, `cache_key`, and `location`.
 struct EvictionCandidate {
+    tier: CacheTier,
     cache_key: String,
-    /// The row's recorded share: some of its bytes were shared when last
-    /// measured.
     shared: bool,
-    /// A local compile: only compiling again rebuilds it.
-    local_only: bool,
     last_accessed_ms: u64,
     location: EvictionLocation,
-    /// The entry dir or object file whose bytes the candidate holds.
     path: PathBuf,
 }
 
@@ -2579,8 +2733,7 @@ impl EvictionCandidate {
 }
 
 /// Write a measurement onto an entry's row; the totals' triggers carry
-/// the change into `shared_bytes` of the budget. A row another process
-/// removed meanwhile matches nothing.
+/// the change into `shared_bytes` of the budget.
 async fn record_shared_bytes(
     connection: &mut sqlx::SqliteConnection,
     rustc_version: &str,
@@ -2620,33 +2773,56 @@ async fn record_shared_bytes(
     Ok(())
 }
 
-/// Post-store eviction for a C/C++ object store: the object joined the
-/// shared budget already, and its own pass protects it the way a rustc
-/// store protects its entry. The rustc half of the pass is the active
-/// version's entries — the same set every rustc-triggered pass sees.
+/// Post-store eviction for a C/C++ object store under `local/cc/`.
 pub async fn evict_after_cc_store(
     config: &StowConfig,
-    connection: &sqlx::SqlitePool,
     cache_key: &str,
 ) -> stow_types::error::Result<()> {
+    let host_connection = config.state_db_pool().await?;
     let rustc_version: Option<String> =
         sqlx::query_scalar("SELECT value FROM metadata_values WHERE key = 'active_rustc_version'")
-            .fetch_optional(connection)
+            .fetch_optional(&host_connection)
             .await?;
-    // No active version means no rustc build has prepared the cache yet, so
-    // no `artifact_cache_entries` row exists and the pass is the `cc/` half
-    // alone; no row carries the empty version.
     let rustc_version = rustc_version.unwrap_or_default();
-    evict_entries(
-        connection,
+    evict_entries(config, &rustc_version, &ProtectedEntry::Cc(cache_key)).await
+}
+
+/// Evict entries inside a single `tier` down to `max_bytes` (used when an
+/// archive policy gives a transitional tier such as `local-crates-io/` a
+/// tighter per-tier ceiling than the global budget).
+pub async fn evict_tier_to_max_bytes(
+    config: &StowConfig,
+    tier: CacheTier,
+    max_bytes: u64,
+) -> stow_types::error::Result<()> {
+    let Some(pool) = config.existing_tier_db_pool(tier).await? else {
+        return Ok(());
+    };
+    let rustc_version: Option<String> =
+        sqlx::query_scalar("SELECT value FROM tier_metadata WHERE key = 'active_rustc_version'")
+            .fetch_optional(&pool)
+            .await?;
+    let rustc_version = match rustc_version {
+        Some(v) => v,
+        None => sqlx::query_scalar::<_, String>(
+            "SELECT rustc_version FROM artifact_cache_totals ORDER BY total_bytes DESC LIMIT 1",
+        )
+        .fetch_optional(&pool)
+        .await?
+        .unwrap_or_default(),
+    };
+    evict_entries_in_scope(
+        config,
+        &[tier],
         &rustc_version,
-        &config.artifact_cache_version_dir(&rustc_version),
-        &config.cc_cache_dir(),
-        config.artifact_cache_max_bytes,
-        &ProtectedEntry::Cc(cache_key),
+        max_bytes,
+        EvictionBudgetMetric::Logical,
+        &ProtectedEntry::None,
     )
     .await
 }
+
+type TieredKey = (CacheTier, String);
 
 /// One entry of the closure walk: what an eviction pass needs of an
 /// `artifact_cache_entries` row besides its LRU position.
@@ -2657,31 +2833,24 @@ struct GraphRow {
     compile_key: String,
 }
 
-/// The dependency-closure view of one eviction pass (stow#1005), read
-/// lazily (stow#1053): each question — the row of a cache key, the
-/// compile keys it depends on, the entries providing or depending on a
-/// compile key — is one indexed query, remembered for the rest of the
-/// pass, so a pass reads the entries its victims touch and not the
-/// table. A victim carries out every entry its removal would leave
-/// without a dependency entry. Remote and local rows both record the
-/// columns, so the rule is provenance-agnostic.
+/// Cross-tier dependency-closure view of one eviction pass (stow#1005,
+/// stow#1053): a victim in `crates-io/` or `local-crates-io/` carries out
+/// every entry across the active tiers whose dependency `compile_key`
+/// would lose its last provider, while nothing in the protected entry's
+/// transitive dependency closure across tiers may be evicted.
 struct ClosureGraph<'a> {
-    connection: &'a sqlx::SqlitePool,
+    pools: &'a [(CacheTier, sqlx::SqlitePool)],
     rustc_version: &'a str,
-    /// Cache key → its row; `None` once another process removed it.
-    rows: BTreeMap<String, Option<GraphRow>>,
-    /// Cache key → the compile keys the entry depends on.
-    dep_keys_of: BTreeMap<String, Vec<String>>,
-    /// Compile key → cache keys of the entries carrying it.
-    providers: BTreeMap<String, BTreeSet<String>>,
-    /// Compile key → cache keys of the entries depending on it.
-    dependents_of: BTreeMap<String, BTreeSet<String>>,
+    rows: BTreeMap<TieredKey, Option<GraphRow>>,
+    dep_keys_of: BTreeMap<TieredKey, Vec<String>>,
+    providers: BTreeMap<String, BTreeSet<TieredKey>>,
+    dependents_of: BTreeMap<String, BTreeSet<TieredKey>>,
 }
 
 impl<'a> ClosureGraph<'a> {
-    const fn new(connection: &'a sqlx::SqlitePool, rustc_version: &'a str) -> Self {
+    const fn new(pools: &'a [(CacheTier, sqlx::SqlitePool)], rustc_version: &'a str) -> Self {
         Self {
-            connection,
+            pools,
             rustc_version,
             rows: BTreeMap::new(),
             dep_keys_of: BTreeMap::new(),
@@ -2690,17 +2859,27 @@ impl<'a> ClosureGraph<'a> {
         }
     }
 
-    async fn row(&mut self, cache_key: &str) -> stow_types::error::Result<Option<GraphRow>> {
-        if let Some(row) = self.rows.get(cache_key) {
+    fn pool(&self, tier: CacheTier) -> Option<&'a sqlx::SqlitePool> {
+        self.pools
+            .iter()
+            .find_map(|(candidate, pool)| (*candidate == tier).then_some(pool))
+    }
+
+    async fn row(&mut self, key: &TieredKey) -> stow_types::error::Result<Option<GraphRow>> {
+        if let Some(row) = self.rows.get(key) {
             return Ok(row.clone());
         }
+        let Some(connection) = self.pool(key.0) else {
+            self.rows.insert(key.clone(), None);
+            return Ok(None);
+        };
         let row = sqlx::query_as::<_, (String, i64, String)>(
             "SELECT relative_dir, size_bytes, compile_key FROM artifact_cache_entries \
              WHERE rustc_version = ? AND cache_key = ?",
         )
         .bind(self.rustc_version)
-        .bind(cache_key)
-        .fetch_optional(self.connection)
+        .bind(&key.1)
+        .fetch_optional(connection)
         .await?
         .map(|(relative_dir, size_bytes, compile_key)| {
             Ok::<_, stow_types::error::Error>(GraphRow {
@@ -2710,44 +2889,49 @@ impl<'a> ClosureGraph<'a> {
             })
         })
         .transpose()?;
-        self.rows.insert(cache_key.to_owned(), row.clone());
+        self.rows.insert(key.clone(), row.clone());
         Ok(row)
     }
 
-    async fn dep_keys(&mut self, cache_key: &str) -> stow_types::error::Result<Vec<String>> {
-        if let Some(dep_keys) = self.dep_keys_of.get(cache_key) {
+    async fn dep_keys(&mut self, key: &TieredKey) -> stow_types::error::Result<Vec<String>> {
+        if let Some(dep_keys) = self.dep_keys_of.get(key) {
             return Ok(dep_keys.clone());
         }
+        let Some(connection) = self.pool(key.0) else {
+            self.dep_keys_of.insert(key.clone(), Vec::new());
+            return Ok(Vec::new());
+        };
         let dep_keys: Vec<String> = sqlx::query_scalar(
             "SELECT dependency_compile_key FROM artifact_cache_dependencies \
              WHERE rustc_version = ? AND cache_key = ?",
         )
         .bind(self.rustc_version)
-        .bind(cache_key)
-        .fetch_all(self.connection)
+        .bind(&key.1)
+        .fetch_all(connection)
         .await?;
-        self.dep_keys_of
-            .insert(cache_key.to_owned(), dep_keys.clone());
+        self.dep_keys_of.insert(key.clone(), dep_keys.clone());
         Ok(dep_keys)
     }
 
     async fn providers(
         &mut self,
         compile_key: &str,
-    ) -> stow_types::error::Result<BTreeSet<String>> {
+    ) -> stow_types::error::Result<BTreeSet<TieredKey>> {
         if let Some(providers) = self.providers.get(compile_key) {
             return Ok(providers.clone());
         }
-        let providers: BTreeSet<String> = sqlx::query_scalar(
-            "SELECT cache_key FROM artifact_cache_entries \
-             WHERE rustc_version = ? AND compile_key = ?",
-        )
-        .bind(self.rustc_version)
-        .bind(compile_key)
-        .fetch_all(self.connection)
-        .await?
-        .into_iter()
-        .collect();
+        let mut providers = BTreeSet::new();
+        for (tier, connection) in self.pools {
+            let keys: Vec<String> = sqlx::query_scalar(
+                "SELECT cache_key FROM artifact_cache_entries \
+                 WHERE rustc_version = ? AND compile_key = ?",
+            )
+            .bind(self.rustc_version)
+            .bind(compile_key)
+            .fetch_all(connection)
+            .await?;
+            providers.extend(keys.into_iter().map(|key| (*tier, key)));
+        }
         self.providers
             .insert(compile_key.to_owned(), providers.clone());
         Ok(providers)
@@ -2756,36 +2940,35 @@ impl<'a> ClosureGraph<'a> {
     async fn dependents(
         &mut self,
         compile_key: &str,
-    ) -> stow_types::error::Result<BTreeSet<String>> {
+    ) -> stow_types::error::Result<BTreeSet<TieredKey>> {
         if let Some(dependents) = self.dependents_of.get(compile_key) {
             return Ok(dependents.clone());
         }
-        let dependents: BTreeSet<String> = sqlx::query_scalar(
-            "SELECT cache_key FROM artifact_cache_dependencies \
-             WHERE rustc_version = ? AND dependency_compile_key = ?",
-        )
-        .bind(self.rustc_version)
-        .bind(compile_key)
-        .fetch_all(self.connection)
-        .await?
-        .into_iter()
-        .collect();
+        let mut dependents = BTreeSet::new();
+        for (tier, connection) in self.pools {
+            let keys: Vec<String> = sqlx::query_scalar(
+                "SELECT cache_key FROM artifact_cache_dependencies \
+                 WHERE rustc_version = ? AND dependency_compile_key = ?",
+            )
+            .bind(self.rustc_version)
+            .bind(compile_key)
+            .fetch_all(connection)
+            .await?;
+            dependents.extend(keys.into_iter().map(|key| (*tier, key)));
+        }
         self.dependents_of
             .insert(compile_key.to_owned(), dependents.clone());
         Ok(dependents)
     }
 
-    /// The cache keys no victim group may touch: the protected entry and
-    /// every entry it transitively depends on — evicting inside that
-    /// closure would orphan the just-stored entry on the spot.
     async fn untouchable_closure(
         &mut self,
-        protected_key: &str,
-    ) -> stow_types::error::Result<BTreeSet<String>> {
-        let mut closure = BTreeSet::from([protected_key.to_owned()]);
-        let mut frontier = vec![protected_key.to_owned()];
-        while let Some(cache_key) = frontier.pop() {
-            for dep_key in self.dep_keys(&cache_key).await? {
+        protected_key: TieredKey,
+    ) -> stow_types::error::Result<BTreeSet<TieredKey>> {
+        let mut closure = BTreeSet::from([protected_key.clone()]);
+        let mut frontier = vec![protected_key];
+        while let Some(node) = frontier.pop() {
+            for dep_key in self.dep_keys(&node).await? {
                 for provider in self.providers(&dep_key).await? {
                     if closure.insert(provider.clone()) {
                         frontier.push(provider);
@@ -2796,22 +2979,15 @@ impl<'a> ClosureGraph<'a> {
         Ok(closure)
     }
 
-    /// The victim's eviction group: the victim plus every entry that
-    /// depends on it, transitively — an entry joins the group when the
-    /// group and the already-evicted set together hold every remaining
-    /// provider of a compile key it needs. `None` when a member would be
-    /// in the protected entry's closure, which is never a victim: the
-    /// group cannot complete, so the victim keeps its place.
     async fn victim_group(
         &mut self,
-        victim: &str,
-        evicted: &BTreeSet<String>,
-        untouchable: &BTreeSet<String>,
-    ) -> stow_types::error::Result<Option<BTreeSet<String>>> {
-        let mut group = BTreeSet::from([victim.to_owned()]);
-        let mut frontier = vec![victim.to_owned()];
+        victim: TieredKey,
+        evicted: &BTreeSet<TieredKey>,
+        untouchable: &BTreeSet<TieredKey>,
+    ) -> stow_types::error::Result<Option<BTreeSet<TieredKey>>> {
+        let mut group = BTreeSet::from([victim.clone()]);
+        let mut frontier = vec![victim];
         while let Some(member) = frontier.pop() {
-            // A member another process removed meanwhile provides nothing.
             let Some(row) = self.row(&member).await? else {
                 continue;
             };
@@ -2837,171 +3013,156 @@ impl<'a> ClosureGraph<'a> {
         Ok(Some(group))
     }
 
-    /// `(cache_key, relative_dir)` for each member of a victim group, in
-    /// cache-key order — the order `try_lock_entry_group` takes the locks
-    /// in — and the group's byte total. A member another process removed
-    /// meanwhile has no dir to remove and no bytes to count.
     async fn group_members(
         &mut self,
-        group: &BTreeSet<String>,
-    ) -> stow_types::error::Result<(Vec<(String, String)>, u64)> {
+        group: &BTreeSet<TieredKey>,
+    ) -> stow_types::error::Result<(Vec<(CacheTier, String, String)>, u64)> {
         let mut members = Vec::with_capacity(group.len());
         let mut bytes = 0u64;
-        for cache_key in group {
-            if let Some(row) = self.row(cache_key).await? {
+        for key in group {
+            if let Some(row) = self.row(key).await? {
                 bytes = bytes.saturating_add(row.size_bytes);
-                members.push((cache_key.clone(), row.relative_dir));
+                members.push((key.0, key.1.clone(), row.relative_dir));
             }
         }
         Ok((members, bytes))
     }
 }
 
-/// Candidates fetched from the eviction-order indexes per round trip, and
-/// recorded shares re-measured per table by an over-cap store.
 const EVICTION_BATCH: i64 = 64;
-
-/// How long a recorded share is trusted. Deleting a build directory's
-/// clone changes no row, so an over-cap store re-measures the shared
-/// entries measured longer ago than this, `EVICTION_BATCH` per table, and
-/// an entry whose clone went away counts its full size again within a
-/// minute of over-cap stores. One minute is the LRU stamp's own
-/// granularity (`LRU_STAMP_INTERVAL_MS`): the order is never staler in
-/// its share than in its access time.
 const SHARE_REFRESH_INTERVAL_MS: u64 = LRU_STAMP_INTERVAL_MS;
 
-/// The shared budget's totals: the active version's rustc entries plus
-/// every C/C++ object, read from the totals the state database's triggers
-/// keep in the transaction of every row change — two primary-key
-/// lookups, whatever the entry count.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct ResidentBytes {
-    /// The entries' file sizes.
     logical: u64,
-    /// Of those, the bytes a clone shared when last measured.
     shared: u64,
 }
 
 impl ResidentBytes {
-    /// What deleting every entry would free, by the recorded shares.
     const fn reclaimable(self) -> u64 {
         self.logical.saturating_sub(self.shared)
     }
 }
 
-async fn resident_bytes(
-    connection: &sqlx::SqlitePool,
+async fn resident_bytes_across(
+    pools: &[(CacheTier, sqlx::SqlitePool)],
     rustc_version: &str,
 ) -> stow_types::error::Result<ResidentBytes> {
-    let (logical, shared): (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(rustc.total_bytes, 0) + cc.total_bytes, \
-                COALESCE(rustc.shared_bytes, 0) + cc.shared_bytes \
-         FROM cc_cache_totals AS cc \
-         LEFT JOIN artifact_cache_totals AS rustc ON rustc.rustc_version = ?",
-    )
-    .bind(rustc_version)
-    .fetch_one(connection)
-    .await?;
-    Ok(ResidentBytes {
-        logical: db_int(logical, "artifact cache resident bytes")?,
-        shared: db_int(shared, "artifact cache shared bytes")?,
-    })
+    let mut total = ResidentBytes::default();
+    for (_, connection) in pools {
+        let (logical, shared): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(rustc.total_bytes, 0) + cc.total_bytes, \
+                    COALESCE(rustc.shared_bytes, 0) + cc.shared_bytes \
+             FROM cc_cache_totals AS cc \
+             LEFT JOIN artifact_cache_totals AS rustc ON rustc.rustc_version = ?",
+        )
+        .bind(rustc_version)
+        .fetch_one(connection)
+        .await?;
+        total.logical = total
+            .logical
+            .saturating_add(db_int(logical, "artifact cache resident bytes")?);
+        total.shared = total
+            .shared
+            .saturating_add(db_int(shared, "artifact cache shared bytes")?);
+    }
+    Ok(total)
 }
 
-/// Re-measure the shared entries whose share was recorded longer than
-/// `SHARE_REFRESH_INTERVAL_MS` ago, oldest first, at most
-/// `EVICTION_BATCH` per table, and record what the filesystem reports
-/// now. Only a recorded share can be stale in the direction that hides
-/// bytes from the cap: an entry recorded unshared already counts its
-/// full size, and the pass measures it before evicting it.
-async fn refresh_stale_shares(
-    connection: &sqlx::SqlitePool,
+async fn refresh_stale_shares_across(
+    config: &StowConfig,
+    pools: &[(CacheTier, sqlx::SqlitePool)],
     rustc_version: &str,
-    version_dir: &Path,
-    cc_dir: &Path,
 ) -> stow_types::error::Result<()> {
     let now = now_millis();
     let stale_before = db_int::<_, i64>(
         now.saturating_sub(SHARE_REFRESH_INTERVAL_MS),
         "share refresh cutoff",
     )?;
-    let rustc_rows = sqlx::query_as::<_, (String, String)>(
-        "SELECT cache_key, relative_dir FROM artifact_cache_entries \
-         WHERE rustc_version = ? AND shared_bytes > 0 AND shared_measured_ms < ? \
-         ORDER BY shared_measured_ms LIMIT ?",
-    )
-    .bind(rustc_version)
-    .bind(stale_before)
-    .bind(EVICTION_BATCH)
-    .fetch_all(connection)
-    .await?;
-    let cc_rows: Vec<String> = sqlx::query_scalar(
-        "SELECT cache_key FROM cc_cache_entries \
-         WHERE shared_bytes > 0 AND shared_measured_ms < ? \
-         ORDER BY shared_measured_ms LIMIT ?",
-    )
-    .bind(stale_before)
-    .bind(EVICTION_BATCH)
-    .fetch_all(connection)
-    .await?;
-    if rustc_rows.is_empty() && cc_rows.is_empty() {
-        return Ok(());
-    }
-    let stale: Vec<(String, EvictionLocation, PathBuf)> = rustc_rows
-        .into_iter()
-        .map(|(cache_key, relative_dir)| {
-            let path = version_dir.join(relative_dir);
-            (cache_key, EvictionLocation::Rustc, path)
-        })
-        .chain(cc_rows.into_iter().map(|cache_key| {
-            let path = crate::cc::cc_object_path(cc_dir, &cache_key);
-            (cache_key, EvictionLocation::Cc, path)
-        }))
-        .collect();
-    let measured = tokio::task::spawn_blocking(move || {
-        stale
-            .into_iter()
-            .map(|(cache_key, location, path)| {
-                let shared_bytes = crate::reclaimable::shared_bytes(&path)
-                    .wrap_err_with(|| format!("measure shared bytes of {}", path.display()))?;
-                Ok((cache_key, location, shared_bytes))
-            })
-            .collect::<stow_types::error::Result<Vec<_>>>()
-    })
-    .await
-    .wrap_err("join share refresh task")??;
-    let mut transaction = connection.begin().await?;
-    for (cache_key, location, shared_bytes) in measured {
-        record_shared_bytes(
-            &mut transaction,
-            rustc_version,
-            &cache_key,
-            location,
-            shared_bytes,
-            now,
+    let cc_dir = config.cc_cache_dir();
+    for (tier, connection) in pools {
+        let version_dir = config.tier_version_dir(*tier, rustc_version);
+        let rustc_rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT cache_key, relative_dir FROM artifact_cache_entries \
+             WHERE rustc_version = ? AND shared_bytes > 0 AND shared_measured_ms < ? \
+             ORDER BY shared_measured_ms LIMIT ?",
         )
+        .bind(rustc_version)
+        .bind(stale_before)
+        .bind(EVICTION_BATCH)
+        .fetch_all(connection)
         .await?;
+        let cc_rows: Vec<String> = if *tier == CacheTier::Local {
+            sqlx::query_scalar(
+                "SELECT cache_key FROM cc_cache_entries \
+                 WHERE shared_bytes > 0 AND shared_measured_ms < ? \
+                 ORDER BY shared_measured_ms LIMIT ?",
+            )
+            .bind(stale_before)
+            .bind(EVICTION_BATCH)
+            .fetch_all(connection)
+            .await?
+        } else {
+            Vec::new()
+        };
+        if rustc_rows.is_empty() && cc_rows.is_empty() {
+            continue;
+        }
+        let cc_dir_for_tier = cc_dir.clone();
+        let stale: Vec<(String, EvictionLocation, PathBuf)> = rustc_rows
+            .into_iter()
+            .map(|(cache_key, relative_dir)| {
+                let path = version_dir.join(relative_dir);
+                (cache_key, EvictionLocation::Rustc, path)
+            })
+            .chain(cc_rows.into_iter().map(|cache_key| {
+                let path = crate::cc::cc_object_path(&cc_dir_for_tier, &cache_key);
+                (cache_key, EvictionLocation::Cc, path)
+            }))
+            .collect();
+        let measured = tokio::task::spawn_blocking(move || {
+            stale
+                .into_iter()
+                .map(|(cache_key, location, path)| {
+                    let shared_bytes = crate::reclaimable::shared_bytes(&path)
+                        .wrap_err_with(|| format!("measure shared bytes of {}", path.display()))?;
+                    Ok((cache_key, location, shared_bytes))
+                })
+                .collect::<stow_types::error::Result<Vec<_>>>()
+        })
+        .await
+        .wrap_err("join share refresh task")??;
+        let mut transaction = connection.begin().await?;
+        for (cache_key, location, shared_bytes) in measured {
+            record_shared_bytes(
+                &mut transaction,
+                rustc_version,
+                &cache_key,
+                location,
+                shared_bytes,
+                now,
+            )
+            .await?;
+        }
+        transaction.commit().await?;
     }
-    transaction.commit().await?;
     Ok(())
 }
 
-/// A position in the shared eviction order: the shared flag, the
-/// local-only flag, `last_accessed_ms`, then cache key, then location
-/// rank.
+/// Cursor in the global eviction order:
+/// `(shared, tier, last_accessed_ms, cache_key, location)`.
 struct EvictionPosition {
     shared: i64,
-    local_only: i64,
+    tier: CacheTier,
     last_accessed_ms: i64,
     cache_key: String,
     location: EvictionLocation,
 }
 
 impl EvictionPosition {
-    /// Before every row: both flags are 0 or 1.
     const START: Self = Self {
         shared: -1,
-        local_only: 0,
+        tier: CacheTier::CratesIo,
         last_accessed_ms: 0,
         cache_key: String::new(),
         location: EvictionLocation::Cc,
@@ -3010,7 +3171,7 @@ impl EvictionPosition {
     fn of(candidate: &EvictionCandidate) -> stow_types::error::Result<Self> {
         Ok(Self {
             shared: i64::from(candidate.shared),
-            local_only: i64::from(candidate.local_only),
+            tier: candidate.tier,
             last_accessed_ms: db_int(
                 candidate.last_accessed_ms,
                 "eviction cursor last_accessed_ms",
@@ -3021,84 +3182,135 @@ impl EvictionPosition {
     }
 }
 
-/// The next `EVICTION_BATCH` candidates in eviction order strictly after
-/// `after`, merged from the two eviction-order indexes.
-async fn next_eviction_candidates(
+async fn query_tier_rustc_candidates(
+    tier: CacheTier,
     connection: &sqlx::SqlitePool,
-    rustc_version: &str,
     version_dir: &Path,
-    cc_dir: &Path,
+    rustc_version: &str,
     after: &EvictionPosition,
 ) -> stow_types::error::Result<Vec<EvictionCandidate>> {
-    let rustc_rows = sqlx::query_as::<_, (String, String, bool, bool, i64)>(
-        "SELECT cache_key, relative_dir, shared, local_only, last_accessed_ms \
-         FROM artifact_cache_entries \
-         WHERE rustc_version = ? \
-           AND (shared, local_only, last_accessed_ms, cache_key) > (?, ?, ?, ?) \
-         ORDER BY shared, local_only, last_accessed_ms, cache_key LIMIT ?",
-    )
-    .bind(rustc_version)
-    .bind(after.shared)
-    .bind(after.local_only)
-    .bind(after.last_accessed_ms)
-    .bind(&after.cache_key)
-    .bind(EVICTION_BATCH)
-    .fetch_all(connection)
-    .await?;
-    // Every object is local-only. Behind a remote cursor every object of
-    // the cursor's share class or a later one follows; behind a local
-    // one the order is the share flag, stamp and key, where an object
-    // tied with a rustc cursor follows it (rank 0 before rank 1) and a
-    // rustc row never ties after an object cursor.
-    let cc_query = if after.local_only == 0 {
-        sqlx::query_as::<_, (String, bool, i64)>(
-            "SELECT cache_key, shared, last_accessed_ms FROM cc_cache_entries \
-             WHERE shared >= ? \
-             ORDER BY shared, last_accessed_ms, cache_key LIMIT ?",
-        )
-        .bind(after.shared)
-        .bind(EVICTION_BATCH)
-    } else {
-        let comparison = match after.location {
-            EvictionLocation::Rustc => ">=",
-            EvictionLocation::Cc => ">",
-        };
-        sqlx::query_as::<_, (String, bool, i64)>(sqlx::AssertSqlSafe(format!(
-            "SELECT cache_key, shared, last_accessed_ms FROM cc_cache_entries \
-             WHERE (shared, last_accessed_ms, cache_key) {comparison} (?, ?, ?) \
-             ORDER BY shared, last_accessed_ms, cache_key LIMIT ?"
-        )))
-        .bind(after.shared)
-        .bind(after.last_accessed_ms)
-        .bind(&after.cache_key)
-        .bind(EVICTION_BATCH)
+    let rustc_rows: Vec<(String, String, bool, i64)> = match tier.cmp(&after.tier) {
+        std::cmp::Ordering::Less => {
+            sqlx::query_as(
+                "SELECT cache_key, relative_dir, shared, last_accessed_ms \
+                 FROM artifact_cache_entries \
+                 WHERE rustc_version = ? AND shared > ? \
+                 ORDER BY shared, last_accessed_ms, cache_key LIMIT ?",
+            )
+            .bind(rustc_version)
+            .bind(after.shared)
+            .bind(EVICTION_BATCH)
+            .fetch_all(connection)
+            .await?
+        }
+        std::cmp::Ordering::Equal => {
+            sqlx::query_as(
+                "SELECT cache_key, relative_dir, shared, last_accessed_ms \
+                 FROM artifact_cache_entries \
+                 WHERE rustc_version = ? \
+                   AND (shared, last_accessed_ms, cache_key) > (?, ?, ?) \
+                 ORDER BY shared, last_accessed_ms, cache_key LIMIT ?",
+            )
+            .bind(rustc_version)
+            .bind(after.shared)
+            .bind(after.last_accessed_ms)
+            .bind(&after.cache_key)
+            .bind(EVICTION_BATCH)
+            .fetch_all(connection)
+            .await?
+        }
+        std::cmp::Ordering::Greater => {
+            sqlx::query_as(
+                "SELECT cache_key, relative_dir, shared, last_accessed_ms \
+                 FROM artifact_cache_entries \
+                 WHERE rustc_version = ? AND shared >= ? \
+                 ORDER BY shared, last_accessed_ms, cache_key LIMIT ?",
+            )
+            .bind(rustc_version)
+            .bind(after.shared)
+            .bind(EVICTION_BATCH)
+            .fetch_all(connection)
+            .await?
+        }
     };
-    let cc_rows = cc_query.fetch_all(connection).await?;
-    let mut candidates = Vec::with_capacity(rustc_rows.len() + cc_rows.len());
-    for (cache_key, relative_dir, shared, local_only, last_accessed_ms) in rustc_rows {
-        candidates.push(EvictionCandidate {
-            cache_key,
-            shared,
-            local_only,
-            last_accessed_ms: db_int(last_accessed_ms, "eviction candidate last_accessed_ms")?,
-            location: EvictionLocation::Rustc,
-            path: version_dir.join(relative_dir),
-        });
+    rustc_rows
+        .into_iter()
+        .map(|(cache_key, relative_dir, shared, last_accessed_ms)| {
+            Ok(EvictionCandidate {
+                tier,
+                cache_key,
+                shared,
+                last_accessed_ms: db_int(last_accessed_ms, "eviction candidate last_accessed_ms")?,
+                location: EvictionLocation::Rustc,
+                path: version_dir.join(relative_dir),
+            })
+        })
+        .collect()
+}
+
+/// Fetch the next `EVICTION_BATCH` candidates strictly after `after` in
+/// `(shared, tier, last_accessed_ms, cache_key, location)` order.
+async fn next_eviction_candidates(
+    config: &StowConfig,
+    pools: &[(CacheTier, sqlx::SqlitePool)],
+    rustc_version: &str,
+    after: &EvictionPosition,
+) -> stow_types::error::Result<Vec<EvictionCandidate>> {
+    let cc_dir = config.cc_cache_dir();
+    let mut candidates = Vec::new();
+    for (tier, connection) in pools {
+        let version_dir = config.tier_version_dir(*tier, rustc_version);
+        candidates.extend(
+            query_tier_rustc_candidates(*tier, connection, &version_dir, rustc_version, after)
+                .await?,
+        );
+        if *tier == CacheTier::Local {
+            let cc_rows: Vec<(String, bool, i64)> = if after.tier < CacheTier::Local {
+                sqlx::query_as(
+                    "SELECT cache_key, shared, last_accessed_ms FROM cc_cache_entries \
+                     WHERE shared >= ? \
+                     ORDER BY shared, last_accessed_ms, cache_key LIMIT ?",
+                )
+                .bind(after.shared)
+                .bind(EVICTION_BATCH)
+                .fetch_all(connection)
+                .await?
+            } else {
+                let comparison = match after.location {
+                    EvictionLocation::Rustc => ">=",
+                    EvictionLocation::Cc => ">",
+                };
+                sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT cache_key, shared, last_accessed_ms FROM cc_cache_entries \
+                     WHERE (shared, last_accessed_ms, cache_key) {comparison} (?, ?, ?) \
+                     ORDER BY shared, last_accessed_ms, cache_key LIMIT ?"
+                )))
+                .bind(after.shared)
+                .bind(after.last_accessed_ms)
+                .bind(&after.cache_key)
+                .bind(EVICTION_BATCH)
+                .fetch_all(connection)
+                .await?
+            };
+            for (cache_key, shared, last_accessed_ms) in cc_rows {
+                candidates.push(EvictionCandidate {
+                    tier: CacheTier::Local,
+                    path: crate::cc::cc_object_path(&cc_dir, &cache_key),
+                    cache_key,
+                    shared,
+                    last_accessed_ms: db_int(
+                        last_accessed_ms,
+                        "eviction candidate last_accessed_ms",
+                    )?,
+                    location: EvictionLocation::Cc,
+                });
+            }
+        }
     }
-    for (cache_key, shared, last_accessed_ms) in cc_rows {
-        let path = crate::cc::cc_object_path(cc_dir, &cache_key);
-        candidates.push(EvictionCandidate {
-            cache_key,
-            shared,
-            local_only: true,
-            last_accessed_ms: db_int(last_accessed_ms, "eviction candidate last_accessed_ms")?,
-            location: EvictionLocation::Cc,
-            path,
-        });
-    }
+
     candidates.sort_by(|left, right| {
-        (left.shared, left.local_only, left.last_accessed_ms)
-            .cmp(&(right.shared, right.local_only, right.last_accessed_ms))
+        (left.shared, left.tier, left.last_accessed_ms)
+            .cmp(&(right.shared, right.tier, right.last_accessed_ms))
             .then_with(|| left.cache_key.cmp(&right.cache_key))
             .then_with(|| left.location.rank().cmp(&right.location.rank()))
     });
@@ -3106,146 +3318,213 @@ async fn next_eviction_candidates(
     Ok(candidates)
 }
 
-/// The store's own entry as a candidate, if its row is still there.
 async fn protected_candidate(
-    connection: &sqlx::SqlitePool,
+    config: &StowConfig,
+    pools: &[(CacheTier, sqlx::SqlitePool)],
     rustc_version: &str,
-    version_dir: &Path,
-    cc_dir: &Path,
     protected: &ProtectedEntry<'_>,
 ) -> stow_types::error::Result<Option<EvictionCandidate>> {
+    let find_pool = |target: CacheTier| {
+        pools
+            .iter()
+            .find_map(|(tier, pool)| (*tier == target).then_some(pool))
+    };
     let candidate = match protected {
-        ProtectedEntry::Rustc(cache_key) => sqlx::query_as::<_, (String, bool, bool, i64)>(
-            "SELECT relative_dir, shared, local_only, last_accessed_ms \
-             FROM artifact_cache_entries WHERE rustc_version = ? AND cache_key = ?",
-        )
-        .bind(rustc_version)
-        .bind(*cache_key)
-        .fetch_optional(connection)
-        .await?
-        .map(|(relative_dir, shared, local_only, last_accessed_ms)| {
-            Ok::<_, stow_types::error::Error>(EvictionCandidate {
-                cache_key: (*cache_key).to_owned(),
-                shared,
-                local_only,
-                last_accessed_ms: db_int(last_accessed_ms, "protected entry last_accessed_ms")?,
-                location: EvictionLocation::Rustc,
-                path: version_dir.join(relative_dir),
+        ProtectedEntry::None => None,
+        ProtectedEntry::Rustc(tier, cache_key) => {
+            let Some(connection) = find_pool(*tier) else {
+                return Ok(None);
+            };
+            let version_dir = config.tier_version_dir(*tier, rustc_version);
+            sqlx::query_as::<_, (String, bool, i64)>(
+                "SELECT relative_dir, shared, last_accessed_ms \
+                 FROM artifact_cache_entries WHERE rustc_version = ? AND cache_key = ?",
+            )
+            .bind(rustc_version)
+            .bind(*cache_key)
+            .fetch_optional(connection)
+            .await?
+            .map(|(relative_dir, shared, last_accessed_ms)| {
+                Ok::<_, stow_types::error::Error>(EvictionCandidate {
+                    tier: *tier,
+                    cache_key: (*cache_key).to_owned(),
+                    shared,
+                    last_accessed_ms: db_int(last_accessed_ms, "protected entry last_accessed_ms")?,
+                    location: EvictionLocation::Rustc,
+                    path: version_dir.join(relative_dir),
+                })
             })
-        }),
-        ProtectedEntry::Cc(cache_key) => sqlx::query_as::<_, (bool, i64)>(
-            "SELECT shared, last_accessed_ms FROM cc_cache_entries WHERE cache_key = ?",
-        )
-        .bind(*cache_key)
-        .fetch_optional(connection)
-        .await?
-        .map(|(shared, last_accessed_ms)| {
-            Ok(EvictionCandidate {
-                cache_key: (*cache_key).to_owned(),
-                shared,
-                local_only: true,
-                last_accessed_ms: db_int(last_accessed_ms, "protected entry last_accessed_ms")?,
-                location: EvictionLocation::Cc,
-                path: crate::cc::cc_object_path(cc_dir, cache_key),
+        }
+        ProtectedEntry::Cc(cache_key) => {
+            let Some(connection) = find_pool(CacheTier::Local) else {
+                return Ok(None);
+            };
+            let cc_dir = config.cc_cache_dir();
+            sqlx::query_as::<_, (bool, i64)>(
+                "SELECT shared, last_accessed_ms FROM cc_cache_entries WHERE cache_key = ?",
+            )
+            .bind(*cache_key)
+            .fetch_optional(connection)
+            .await?
+            .map(|(shared, last_accessed_ms)| {
+                Ok(EvictionCandidate {
+                    tier: CacheTier::Local,
+                    cache_key: (*cache_key).to_owned(),
+                    shared,
+                    last_accessed_ms: db_int(last_accessed_ms, "protected entry last_accessed_ms")?,
+                    location: EvictionLocation::Cc,
+                    path: crate::cc::cc_object_path(&cc_dir, cache_key),
+                })
             })
-        }),
+        }
     };
     candidate.transpose()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvictionBudgetMetric {
+    /// Local volume cap (`stow#1539`): count `logical - shared` bytes freed on
+    /// disk and prefer unshared entries over `CoW`-cloned ones.
+    Reclaimable,
+    /// Archive cap (`evict_tier_to_max_bytes`): count full logical bytes
+    /// regardless of `CoW` clones into a live `target/` directory, since tar
+    /// archives pack logical bytes.
+    Logical,
+}
+
+impl EvictionBudgetMetric {
+    const fn measure(self, resident: ResidentBytes) -> u64 {
+        match self {
+            Self::Reclaimable => resident.reclaimable(),
+            Self::Logical => resident.logical,
+        }
+    }
+}
+
+async fn open_tier_pools_for_scope(
+    config: &StowConfig,
+    scope_tiers: &[CacheTier],
+) -> stow_types::error::Result<(
+    Vec<(CacheTier, sqlx::SqlitePool)>,
+    Vec<(CacheTier, sqlx::SqlitePool)>,
+)> {
+    let mut scope_pools = Vec::with_capacity(scope_tiers.len());
+    for &tier in scope_tiers {
+        if let Some(pool) = config.existing_tier_db_pool(tier).await? {
+            scope_pools.push((tier, pool));
+        }
+    }
+    if scope_pools.is_empty() {
+        return Ok((scope_pools, Vec::new()));
+    }
+    let mut graph_pools = Vec::with_capacity(CacheTier::ALL.len());
+    for tier in CacheTier::ALL {
+        if let Some((_, pool)) = scope_pools.iter().find(|(t, _)| *t == tier) {
+            graph_pools.push((tier, pool.clone()));
+        } else if let Some(pool) = config.existing_tier_db_pool(tier).await? {
+            graph_pools.push((tier, pool));
+        }
+    }
+    Ok((scope_pools, graph_pools))
+}
+
 async fn evict_entries(
-    connection: &sqlx::SqlitePool,
+    config: &StowConfig,
     rustc_version: &str,
-    version_dir: &Path,
-    cc_dir: &Path,
-    max_bytes: u64,
     protected: &ProtectedEntry<'_>,
 ) -> stow_types::error::Result<()> {
-    // stow#1053: under the cap a store reads the maintained totals and
-    // nothing else. stow#1539: the cap counts reclaimable bytes — what
-    // deleting an entry frees — which never exceed the logical size, so
-    // a logical total within the cap needs no measurement at all.
-    if resident_bytes(connection, rustc_version).await?.logical <= max_bytes {
-        return Ok(());
-    }
-    // Over the logical cap, shares recorded long enough ago to be stale
-    // are re-measured, a bounded batch per store, and the recorded
-    // reclaimable total decides.
-    refresh_stale_shares(connection, rustc_version, version_dir, cc_dir).await?;
-    if resident_bytes(connection, rustc_version)
-        .await?
-        .reclaimable()
-        <= max_bytes
+    evict_entries_in_scope(
+        config,
+        &CacheTier::ALL,
+        rustc_version,
+        config.artifact_cache_max_bytes,
+        EvictionBudgetMetric::Reclaimable,
+        protected,
+    )
+    .await
+}
+
+async fn evict_entries_in_scope(
+    config: &StowConfig,
+    scope_tiers: &[CacheTier],
+    rustc_version: &str,
+    max_bytes: u64,
+    metric: EvictionBudgetMetric,
+    protected: &ProtectedEntry<'_>,
+) -> stow_types::error::Result<()> {
+    let (scope_pools, graph_pools) = open_tier_pools_for_scope(config, scope_tiers).await?;
+    if scope_pools.is_empty()
+        || resident_bytes_across(&scope_pools, rustc_version)
+            .await?
+            .logical
+            <= max_bytes
     {
         return Ok(());
     }
+    if metric == EvictionBudgetMetric::Reclaimable {
+        refresh_stale_shares_across(config, &scope_pools, rustc_version).await?;
+        if metric.measure(resident_bytes_across(&scope_pools, rustc_version).await?) <= max_bytes {
+            return Ok(());
+        }
+    }
 
-    // Over it, candidates stream in eviction order, a batch at a time;
-    // each is measured before it goes, and the total is re-read after
-    // each measurement or removal.
-    //
-    // stow#1005: eviction is closure-aware — a victim carries out every
-    // entry that depends on it, transitively, in the same pass, and
-    // nothing in the protected entry's own dependency closure is ever a
-    // victim. The order picks victims; the closure rule decides what
-    // goes with them.
+    let cc_dir = config.cc_cache_dir();
     let mut pass = EvictionPass {
-        connection,
+        config,
+        pools: &graph_pools,
         rustc_version,
-        version_dir,
-        graph: ClosureGraph::new(connection, rustc_version),
+        graph: ClosureGraph::new(&graph_pools, rustc_version),
         evicted: BTreeSet::new(),
     };
-    let untouchable: BTreeSet<String> = match protected {
-        ProtectedEntry::Rustc(cache_key) => pass.graph.untouchable_closure(cache_key).await?,
-        ProtectedEntry::Cc(_) => BTreeSet::new(),
+    let untouchable: BTreeSet<TieredKey> = match protected {
+        ProtectedEntry::Rustc(tier, cache_key) => {
+            pass.graph
+                .untouchable_closure((*tier, (*cache_key).to_owned()))
+                .await?
+        }
+        ProtectedEntry::None | ProtectedEntry::Cc(_) => BTreeSet::new(),
     };
     let mut cursor = EvictionPosition::START;
     loop {
-        let batch =
-            next_eviction_candidates(connection, rustc_version, version_dir, cc_dir, &cursor)
-                .await?;
+        let batch = next_eviction_candidates(config, &scope_pools, rustc_version, &cursor).await?;
         let Some(last) = batch.last() else {
             break;
         };
         cursor = EvictionPosition::of(last)?;
         for candidate in &batch {
+            let tiered_key = (candidate.tier, candidate.cache_key.clone());
             if protected.matches(candidate)
-                || untouchable.contains(&candidate.cache_key)
-                || pass.evicted.contains(&candidate.cache_key)
+                || (candidate.location == EvictionLocation::Rustc
+                    && (untouchable.contains(&tiered_key) || pass.evicted.contains(&tiered_key)))
             {
                 continue;
             }
-            let shared = candidate.measure(connection, rustc_version).await?;
-            if shared && !candidate.shared {
-                // A clone appeared since the row was recorded: the entry
-                // moved to the shared tail of the order, where the cursor
-                // meets it again, and its share may already settle the cap.
-                if resident_bytes(connection, rustc_version)
-                    .await?
-                    .reclaimable()
-                    <= max_bytes
-                {
-                    return Ok(());
-                }
+            let Some((_, tier_pool)) = scope_pools.iter().find(|(t, _)| *t == candidate.tier)
+            else {
                 continue;
+            };
+            if metric == EvictionBudgetMetric::Reclaimable {
+                let shared = candidate.measure(tier_pool, rustc_version).await?;
+                if shared && !candidate.shared {
+                    if metric.measure(resident_bytes_across(&scope_pools, rustc_version).await?)
+                        <= max_bytes
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
             }
             match &candidate.location {
                 EvictionLocation::Rustc => {
-                    if !pass
-                        .try_evict_lru_victim(&candidate.cache_key, &untouchable)
-                        .await?
-                    {
+                    if !pass.try_evict_lru_victim(tiered_key, &untouchable).await? {
                         continue;
                     }
                 }
                 EvictionLocation::Cc => {
-                    evict_cc_object(connection, cc_dir, &candidate.cache_key).await?;
+                    evict_cc_object(tier_pool, &cc_dir, &candidate.cache_key).await?;
                 }
             }
-            if resident_bytes(connection, rustc_version)
-                .await?
-                .reclaimable()
+            if metric.measure(resident_bytes_across(&scope_pools, rustc_version).await?)
                 <= max_bytes
             {
                 return Ok(());
@@ -3254,9 +3533,9 @@ async fn evict_entries(
     }
 
     if let Some(candidate) =
-        protected_candidate(connection, rustc_version, version_dir, cc_dir, protected).await?
+        protected_candidate(config, &scope_pools, rustc_version, protected).await?
     {
-        pass.evict_protected_entry(cc_dir, &candidate).await?;
+        pass.evict_protected_entry(&cc_dir, &candidate).await?;
         return Err(stow_types::stow_error!(
             "artifact cache entry {} exceeds max local cache size {} bytes",
             candidate.cache_key,
@@ -3269,27 +3548,19 @@ async fn evict_entries(
     ))
 }
 
-/// One eviction pass's working state (stow#1005): the lazily read closure
-/// graph and the cache keys already removed — group computation treats
-/// them as gone.
 struct EvictionPass<'a> {
-    connection: &'a sqlx::SqlitePool,
+    config: &'a StowConfig,
+    pools: &'a [(CacheTier, sqlx::SqlitePool)],
     rustc_version: &'a str,
-    version_dir: &'a Path,
     graph: ClosureGraph<'a>,
-    evicted: BTreeSet<String>,
+    evicted: BTreeSet<TieredKey>,
 }
 
 impl EvictionPass<'_> {
-    /// One victim's group eviction — the victim plus every entry its
-    /// removal would orphan. `false` when the group cannot go — it would
-    /// touch the protected closure, or another process holds a member's
-    /// lock — in which case no member is removed, so no pass leaves a
-    /// dependent without its dependency.
     async fn try_evict_lru_victim(
         &mut self,
-        victim: &str,
-        untouchable: &BTreeSet<String>,
+        victim: TieredKey,
+        untouchable: &BTreeSet<TieredKey>,
     ) -> stow_types::error::Result<bool> {
         let Some(group) = self
             .graph
@@ -3299,13 +3570,8 @@ impl EvictionPass<'_> {
             return Ok(false);
         };
         let (members, _) = self.graph.group_members(&group).await?;
-        if !try_evict_rustc_entry_group(
-            self.connection,
-            self.rustc_version,
-            self.version_dir,
-            &members,
-        )
-        .await?
+        if !try_evict_rustc_entry_group(self.config, self.pools, self.rustc_version, &members)
+            .await?
         {
             return Ok(false);
         }
@@ -3313,10 +3579,6 @@ impl EvictionPass<'_> {
         Ok(true)
     }
 
-    /// Evict the store's own entry — the last resort when every other
-    /// candidate left the cache over budget. A rustc entry goes out with
-    /// its whole victim group, like any other group; a member another
-    /// process has locked fails here rather than being skipped.
     async fn evict_protected_entry(
         &mut self,
         cc_dir: &Path,
@@ -3326,14 +3588,19 @@ impl EvictionPass<'_> {
             EvictionLocation::Rustc => {
                 let group = self
                     .graph
-                    .victim_group(&candidate.cache_key, &self.evicted, &BTreeSet::new())
+                    .victim_group(
+                        (candidate.tier, candidate.cache_key.clone()),
+                        &self.evicted,
+                        &BTreeSet::new(),
+                    )
                     .await?
                     .expect("the protected entry's group has no untouchable member");
                 let (members, _) = self.graph.group_members(&group).await?;
                 let Some(eviction_locks) = tokio::task::spawn_blocking({
-                    let version_dir = self.version_dir.to_path_buf();
+                    let config = self.config.clone();
+                    let rustc_version = self.rustc_version.to_owned();
                     let members = members.clone();
-                    move || try_lock_entry_group(&version_dir, &members)
+                    move || try_lock_entry_group(&config, &rustc_version, &members)
                 })
                 .await
                 .wrap_err("join evict_entries protected lock task")??
@@ -3343,34 +3610,30 @@ impl EvictionPass<'_> {
                         candidate.cache_key
                     ));
                 };
-                remove_entry_group(
-                    self.connection,
-                    self.rustc_version,
-                    self.version_dir,
-                    &members,
-                )
-                .await?;
+                remove_entry_group(self.config, self.pools, self.rustc_version, &members).await?;
                 drop(eviction_locks);
             }
             EvictionLocation::Cc => {
-                evict_cc_object(self.connection, cc_dir, &candidate.cache_key).await?;
+                if let Some((_, pool)) = self.pools.iter().find(|(t, _)| *t == CacheTier::Local) {
+                    evict_cc_object(pool, cc_dir, &candidate.cache_key).await?;
+                }
             }
         }
         Ok(())
     }
 }
 
-/// Exclusive entry locks on every group member, taken in the members'
-/// cache-key order; `None` when another process holds one — the locks
-/// already taken release with the `Vec`, so a skipped group loses no
-/// member.
+/// Exclusive entry locks on every group member, taken in `(tier, cache_key)`
+/// order; `None` when another process holds one.
 fn try_lock_entry_group(
-    version_dir: &Path,
-    members: &[(String, String)],
+    config: &StowConfig,
+    rustc_version: &str,
+    members: &[(CacheTier, String, String)],
 ) -> stow_types::error::Result<Option<Vec<FileLock>>> {
     let mut locks = Vec::with_capacity(members.len());
-    for (cache_key, _) in members {
-        match try_acquire_entry_exclusive_lock(version_dir, cache_key)? {
+    for (tier, cache_key, _) in members {
+        let version_dir = config.tier_version_dir(*tier, rustc_version);
+        match try_acquire_entry_exclusive_lock(&version_dir, cache_key)? {
             Some(lock) => locks.push(lock),
             None => return Ok(None),
         }
@@ -3378,17 +3641,19 @@ fn try_lock_entry_group(
     Ok(Some(locks))
 }
 
-/// Delete each member's state-db row, then its entry dir — called under
-/// the group's held locks.
 async fn remove_entry_group(
-    connection: &sqlx::SqlitePool,
+    config: &StowConfig,
+    pools: &[(CacheTier, sqlx::SqlitePool)],
     rustc_version: &str,
-    version_dir: &Path,
-    members: &[(String, String)],
+    members: &[(CacheTier, String, String)],
 ) -> stow_types::error::Result<()> {
-    for (cache_key, relative_dir) in members {
-        delete_artifact_cache_entry(connection, rustc_version, cache_key).await?;
-        let entry_dir = version_dir.join(relative_dir);
+    for (tier, cache_key, relative_dir) in members {
+        if let Some((_, connection)) = pools.iter().find(|(t, _)| t == tier) {
+            delete_artifact_cache_entry(connection, rustc_version, cache_key).await?;
+        }
+        let entry_dir = config
+            .tier_version_dir(*tier, rustc_version)
+            .join(relative_dir);
         if entry_dir.exists() {
             tokio::task::spawn_blocking({
                 let entry_dir = entry_dir.clone();
@@ -3405,26 +3670,24 @@ async fn remove_entry_group(
     Ok(())
 }
 
-/// Try to evict a victim group under one lock hold for the whole group:
-/// `false` when another process uses any member, in which case no member
-/// is removed.
 async fn try_evict_rustc_entry_group(
-    connection: &sqlx::SqlitePool,
+    config: &StowConfig,
+    pools: &[(CacheTier, sqlx::SqlitePool)],
     rustc_version: &str,
-    version_dir: &Path,
-    members: &[(String, String)],
+    members: &[(CacheTier, String, String)],
 ) -> stow_types::error::Result<bool> {
     let Some(eviction_locks) = tokio::task::spawn_blocking({
-        let version_dir = version_dir.to_path_buf();
+        let config = config.clone();
+        let rustc_version = rustc_version.to_owned();
         let members = members.to_vec();
-        move || try_lock_entry_group(&version_dir, &members)
+        move || try_lock_entry_group(&config, &rustc_version, &members)
     })
     .await
     .wrap_err("join evict_entries lock task")??
     else {
         return Ok(false);
     };
-    remove_entry_group(connection, rustc_version, version_dir, members).await?;
+    remove_entry_group(config, pools, rustc_version, members).await?;
     drop(eviction_locks);
     Ok(true)
 }
@@ -3706,50 +3969,6 @@ async fn acquire_entry_exclusive_lock_async(
     .wrap_err("join entry exclusive lock task")?
 }
 
-/// Under a held exclusive entry lock: does a local entry already cover this
-/// identity? The `entry_dir.exists()` conjunct matters — a local row whose
-/// directory was pruned underneath us does not shield the store.
-fn local_entry_covers(
-    existing: Option<&ArtifactCacheEntryRow>,
-    entry_dir: &Path,
-) -> stow_types::error::Result<bool> {
-    match existing {
-        Some(entry) => Ok(ArtifactProvenance::from_column(&entry.provenance)?
-            == ArtifactProvenance::Local
-            && entry_dir.exists()),
-        None => Ok(false),
-    }
-}
-
-/// Reload the local entry that already covers `request` through the shared
-/// read path. `None` means the entry vanished between the existence check
-/// and the reload — a concurrent eviction raced us.
-async fn load_existing_local_bundle(
-    config: &StowConfig,
-    connection: &sqlx::SqlitePool,
-    request: &OwnedFetchRequest,
-) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
-    if load_artifact_cache_entry(
-        connection,
-        &request.rustc_version,
-        &cache_key_owned(request),
-    )
-    .await?
-    .is_none()
-    {
-        return Ok(None);
-    }
-    load_cached_bundle(
-        config,
-        &FetchRequest {
-            target: &request.target,
-            rustc_version: &request.rustc_version,
-            c_metadata: &request.c_metadata,
-        },
-    )
-    .await
-}
-
 /// A leftover entry dir with no row is a crashed writer's stage output: not
 /// an entry, and never silently adopted by the row about to be written.
 async fn remove_orphaned_entry_dir(entry_dir: PathBuf) -> stow_types::error::Result<()> {
@@ -3837,9 +4056,10 @@ struct ArtifactCacheIndexEntry {
 }
 
 #[derive(Debug)]
-struct PreparedLocalCache {
+struct PreparedTierCache {
     stale_dirs: Vec<PathBuf>,
-    version_lease: RustcVersionLease,
+    purged_versions: Vec<String>,
+    version_lock: FileLock,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -3881,6 +4101,7 @@ struct SemanticCacheCandidateRow {
 
 #[derive(Debug, Clone)]
 struct SemanticCacheCandidate {
+    tier: CacheTier,
     version: Version,
     c_metadata: String,
     emit_len: usize,
@@ -3968,6 +4189,7 @@ async fn list_artifact_cache_entries(
 }
 
 fn semantic_candidate_from_row(
+    tier: CacheTier,
     row: SemanticCacheCandidateRow,
     requested_version: &Version,
     requested_emit: &[String],
@@ -3999,6 +4221,7 @@ fn semantic_candidate_from_row(
         return Ok(None);
     }
     Ok(Some(SemanticCacheCandidate {
+        tier,
         version: candidate_version,
         c_metadata: row.c_metadata.clone(),
         emit_len: candidate_emit.len(),
@@ -4010,9 +4233,9 @@ fn semantic_candidate_from_row(
 
 /// The deterministic order a staged semantic candidate is tried in: the
 /// smallest containing feature set first (the stow#881 serving set —
-/// an exactly-matching bundle always precedes a superset), then the
-/// previous order of version descending, shortest emit list and
-/// `c_metadata`.
+/// an exactly-matching bundle always precedes a superset), then version
+/// descending, shortest emit list, `tier` (`CratesIo` ahead of
+/// `LocalCratesIo`), and `c_metadata`.
 fn compare_semantic_candidates(
     left: &SemanticCacheCandidate,
     right: &SemanticCacheCandidate,
@@ -4023,6 +4246,7 @@ fn compare_semantic_candidates(
         .then(left.features.cmp(&right.features))
         .then(right.version.cmp(&left.version))
         .then(left.emit_len.cmp(&right.emit_len))
+        .then(left.tier.cmp(&right.tier))
         .then(left.c_metadata.cmp(&right.c_metadata))
 }
 
@@ -4330,7 +4554,7 @@ pub async fn persist_cached_bundle_trust_marker(
             bundle.provenance.as_column()
         ));
     }
-    let connection = config.state_db_pool().await?;
+    let connection = config.tier_db_pool(bundle.tier).await?;
     let result = sqlx::query(
         "UPDATE artifact_cache_entries \
          SET verified_marker_version = ?, verified_marker_policy = ? \
@@ -4363,18 +4587,12 @@ async fn delete_artifact_cache_entry(
     Ok(())
 }
 
-/// Batched "which of these artifacts are already materialized locally?".
+/// Batched "which of these public remote artifacts are already materialized
+/// in `crates-io/`?".
 ///
-/// The prefetch pre-pass only needs a yes/no per artifact, but
-/// [`load_cached_bundle`] pays a file lock, an LRU `UPDATE` and three `SELECT`s
-/// per entry — and the pre-pass runs them serially. On a warm cache that alone
-/// cost roughly 90 ms per artifact (over 10 s for a 115-crate graph, twice per
-/// build) before a single rustc ran. One indexed query plus one batched LRU
-/// update replaces all of it.
-///
-/// Returns the subset of `cache_keys` that has both a state-database row and a
-/// materialized entry directory; anything else is reported as missing so the
-/// caller re-fetches it through the normal path.
+/// Queries `CacheTier::CratesIo` specifically so prefetch downloads newly
+/// published remote bundles even when `local-crates-io/` held an earlier
+/// transitional local build.
 pub async fn filter_locally_cached_keys(
     config: &StowConfig,
     rustc_version: &str,
@@ -4386,8 +4604,10 @@ pub async fn filter_locally_cached_keys(
     if cache_keys.is_empty() {
         return Ok(std::collections::BTreeSet::new());
     }
-    let connection = config.state_db_pool().await?;
-    let version_dir = config.artifact_cache_version_dir(rustc_version);
+    let Some(connection) = config.existing_tier_db_pool(CacheTier::CratesIo).await? else {
+        return Ok(std::collections::BTreeSet::new());
+    };
+    let version_dir = config.tier_version_dir(CacheTier::CratesIo, rustc_version);
     let mut present = std::collections::BTreeSet::new();
     for chunk in cache_keys.chunks(CHUNK) {
         let placeholders = std::iter::repeat_n("?", chunk.len())
@@ -4487,14 +4707,36 @@ pub mod tests {
 
     use super::{
         CachedArtifactBundle, STAGING_DIR, cache_key, join_relative_path,
-        list_artifact_cache_entries, load_bundle_entry_dir, load_semantic_cached_bundle,
-        prepare_local_cache, prepare_local_cache_blocking, store_bundle_entry_dir,
-        touch_artifact_cache_entry, write_downloaded_bundle_to_entry,
+        list_artifact_cache_entries, load_bundle_entry_dir, load_cached_bundle,
+        load_semantic_cached_bundle, prepare_local_cache, prepare_tier_cache_blocking,
+        store_bundle_entry_dir, touch_artifact_cache_entry, write_downloaded_bundle_to_entry,
     };
     use crate::config::{StowConfig, VerifyMode};
     use crate::fetch::{ArtifactBundle, FetchRequest, SemanticFetchRequest, bundle_file_path};
     use crate::rustc_args::ParsedRustcArgs;
-    use crate::state_db::connect;
+    use crate::state_db::{CacheTier, connect, connect_tier, tier_db_path};
+
+    async fn list_all_tier_entries(
+        config: &StowConfig,
+        rustc_version: &str,
+    ) -> BTreeMap<String, super::ArtifactCacheIndexEntry> {
+        let mut merged = BTreeMap::new();
+        for tier in CacheTier::ALL {
+            if !tier_db_path(&config.cache_dir, tier).exists() {
+                continue;
+            }
+            let pool = connect_tier(&config.cache_dir, tier)
+                .await
+                .expect("connect tier db");
+            let entries = list_artifact_cache_entries(&pool, rustc_version)
+                .await
+                .expect("list tier entries");
+            for (k, v) in entries {
+                merged.entry(k).or_insert(v);
+            }
+        }
+        merged
+    }
 
     /// The consume-store layout the build prefetch and the serve path
     /// share — an entry under `store_dir/<slice target>/<compile key>`:
@@ -4533,24 +4775,21 @@ pub mod tests {
     fn prepare_local_cache_only_purges_on_version_change() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
-        std::fs::create_dir_all(config.artifact_cache_root().join("1.90.0"))
-            .expect("create stale dir");
-        std::fs::write(
-            config
-                .artifact_cache_root()
-                .join("1.90.0")
-                .join("stale.txt"),
-            b"stale",
-        )
-        .expect("write stale file");
+        for tier in CacheTier::ALL {
+            let stale_dir = config.tier_version_dir(tier, "1.90.0");
+            std::fs::create_dir_all(&stale_dir).expect("create stale dir");
+            std::fs::write(stale_dir.join("stale.txt"), b"stale").expect("write stale file");
+        }
 
         run_async(async {
             let lease = prepare_local_cache(&config, "1.91.1")
                 .await
                 .expect("prepare cache");
             drop(lease);
-            assert!(config.artifact_cache_root().join("1.91.1").exists());
-            assert!(!config.artifact_cache_root().join("1.90.0").exists());
+            for tier in CacheTier::ALL {
+                assert!(config.tier_version_dir(tier, "1.91.1").exists());
+                assert!(!config.tier_version_dir(tier, "1.90.0").exists());
+            }
 
             let pool = connect(&config.cache_dir).await.expect("connect state db");
             let active = sqlx::query_scalar::<_, String>(
@@ -4569,18 +4808,30 @@ pub mod tests {
         let artifact_root = tempdir.path().join("cache");
         let purge_root = tempdir.path().join("purge");
 
-        let first = prepare_local_cache_blocking(&artifact_root, &purge_root, "1.90.0", false)
-            .expect("prepare old rustc cache");
+        let first = prepare_tier_cache_blocking(
+            CacheTier::CratesIo,
+            &artifact_root,
+            &purge_root,
+            "1.90.0",
+            false,
+        )
+        .expect("prepare old rustc cache");
         std::fs::write(artifact_root.join("1.90.0").join("busy.txt"), b"busy")
             .expect("write busy marker");
 
-        let switched = prepare_local_cache_blocking(&artifact_root, &purge_root, "1.91.1", false)
-            .expect("prepare new rustc cache");
+        let switched = prepare_tier_cache_blocking(
+            CacheTier::CratesIo,
+            &artifact_root,
+            &purge_root,
+            "1.91.1",
+            false,
+        )
+        .expect("prepare new rustc cache");
         assert_eq!(switched.stale_dirs, Vec::<PathBuf>::new());
         assert!(artifact_root.join("1.90.0").exists());
         assert!(artifact_root.join("1.91.1").exists());
 
-        drop(first.version_lease);
+        drop(first.version_lock);
     }
 
     const STAGING_HELPER_ENV: &str = "STOW_TEST_STAGING_HELPER";
@@ -4609,7 +4860,7 @@ pub mod tests {
         let config = test_config(&root);
         run_async(async move {
             let staging = config
-                .artifact_cache_staging_dir("1.91.1")
+                .artifact_cache_staging_dir(CacheTier::CratesIo, "1.91.1")
                 .await
                 .expect("acquire staging dir");
             let staged = tempfile::Builder::new()
@@ -4682,15 +4933,16 @@ pub mod tests {
         child.kill();
 
         let config = test_config(tempdir.path());
-        let prepared = prepare_local_cache_blocking(
-            &config.artifact_cache_root(),
+        let prepared = prepare_tier_cache_blocking(
+            CacheTier::CratesIo,
+            &config.tier_dir(CacheTier::CratesIo),
             &config.artifact_cache_purge_root(),
             "1.91.1",
             true,
         )
         .expect("prepare cache");
         let staging_root = config
-            .artifact_cache_version_dir("1.91.1")
+            .tier_version_dir(CacheTier::CratesIo, "1.91.1")
             .join(STAGING_DIR);
         let leftovers = std::fs::read_dir(&staging_root)
             .expect("read staging root")
@@ -4699,7 +4951,7 @@ pub mod tests {
             leftovers, 0,
             "the dead process's staging dir and lock must be swept"
         );
-        drop(prepared.version_lease);
+        drop(prepared.version_lock);
     }
 
     /// Every stow process of a build sweeps, so the same dead locks are
@@ -4753,15 +5005,16 @@ pub mod tests {
         wait_for_staging_marker(&marker);
 
         let config = test_config(tempdir.path());
-        let prepared = prepare_local_cache_blocking(
-            &config.artifact_cache_root(),
+        let prepared = prepare_tier_cache_blocking(
+            CacheTier::CratesIo,
+            &config.tier_dir(CacheTier::CratesIo),
             &config.artifact_cache_purge_root(),
             "1.91.1",
             true,
         )
         .expect("prepare cache");
         let staging_root = config
-            .artifact_cache_version_dir("1.91.1")
+            .tier_version_dir(CacheTier::CratesIo, "1.91.1")
             .join(STAGING_DIR);
         let entries = std::fs::read_dir(&staging_root)
             .expect("read staging root")
@@ -4784,7 +5037,7 @@ pub mod tests {
         assert_eq!(staged.len(), 1);
         assert!(staged[0].join("partial.txt").exists());
         child.kill();
-        drop(prepared.version_lease);
+        drop(prepared.version_lock);
     }
 
     /// A completed store renames its staged entry out of the process's
@@ -4832,7 +5085,7 @@ pub mod tests {
             );
 
             let staging = config
-                .artifact_cache_staging_dir("1.91.1")
+                .artifact_cache_staging_dir(CacheTier::LocalCratesIo, "1.91.1")
                 .await
                 .expect("staging dir");
             assert_eq!(
@@ -4843,7 +5096,7 @@ pub mod tests {
                 "the rename moves the staged entry out of <name>/"
             );
             let entry_dir = config
-                .artifact_cache_version_dir("1.91.1")
+                .tier_version_dir(CacheTier::LocalCratesIo, "1.91.1")
                 .join("bundles/v3/aarch64-apple-darwin")
                 .join(stable_c_metadata);
             assert!(
@@ -5024,7 +5277,10 @@ pub mod tests {
         let config = test_config(tempdir.path());
         let bundle = sample_bundle("aabbccddeeff0011", "libdemo-aabbccddeeff0011.rmeta");
         run_async(async {
-            let pool = config.state_db_pool().await.expect("state db");
+            let pool = config
+                .tier_db_pool(CacheTier::CratesIo)
+                .await
+                .expect("crates-io tier db");
             let original = super::CacheEntryMetadata::remote(&bundle);
             super::replace_artifact_cache_metadata(
                 &pool, "1.91.1", "entry", "original", 100, 1, &original,
@@ -5307,12 +5563,7 @@ pub mod tests {
                     .await
                     .expect("store first bundle");
             let first_entry_dir = first_cached.entry_dir.clone();
-            let first_index = list_artifact_cache_entries(
-                &connect(&config.cache_dir).await.expect("connect state db"),
-                "1.91.1",
-            )
-            .await
-            .expect("list entries");
+            let first_index = list_all_tier_entries(&config, "1.91.1").await;
             let first_size = first_index
                 .get(&cache_key(&first_request))
                 .expect("first entry")
@@ -5324,12 +5575,7 @@ pub mod tests {
                 .await
                 .expect("store second bundle");
 
-            let index = list_artifact_cache_entries(
-                &connect(&config.cache_dir).await.expect("connect state db"),
-                "1.91.1",
-            )
-            .await
-            .expect("list entries");
+            let index = list_all_tier_entries(&config, "1.91.1").await;
             assert!(index.contains_key(&cache_key(&second_request)));
             assert!(!index.contains_key(&cache_key(&first_request)));
             assert!(!first_entry_dir.exists());
@@ -5352,12 +5598,14 @@ pub mod tests {
                 .expect("store bundle");
             drop(cached);
 
-            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            let pool = connect_tier(&config.cache_dir, CacheTier::CratesIo)
+                .await
+                .expect("connect tier db");
             touch_artifact_cache_entry(&pool, "1.91.1", &cache_key(&request), 1)
                 .await
                 .expect("set stale lru timestamp");
 
-            let loaded = super::load_cached_bundle(&config, &request)
+            let loaded = load_cached_bundle(&config, &request)
                 .await
                 .expect("load bundle")
                 .expect("cached bundle");
@@ -5454,7 +5702,9 @@ pub mod tests {
             assert_eq!(stored.provenance, super::ArtifactProvenance::Remote);
             drop(stored);
 
-            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            let pool = connect_tier(&config.cache_dir, CacheTier::CratesIo)
+                .await
+                .expect("connect tier db");
             sqlx::query(
                 "UPDATE artifact_cache_entries SET provenance = 'bogus' \
                  WHERE rustc_version = '1.91.1' AND cache_key = ?",
@@ -5504,6 +5754,7 @@ pub mod tests {
             crate_types: vec![RustCrateType::Lib],
             outputs: Vec::new(),
             sigstore_signatures: Vec::new(),
+            tier: CacheTier::LocalCratesIo,
             entry_dir: tempdir.path().join("entry"),
             rustc_version: "1.91.1".to_owned(),
             cache_key: "cache-key".to_owned(),
@@ -5544,12 +5795,7 @@ pub mod tests {
                 .await
                 .expect("remove cached bundle");
 
-            let index = list_artifact_cache_entries(
-                &connect(&config.cache_dir).await.expect("connect state db"),
-                "1.91.1",
-            )
-            .await
-            .expect("list entries");
+            let index = list_all_tier_entries(&config, "1.91.1").await;
             assert!(!index.contains_key(&cache_key(&request)));
             assert!(!entry_dir.exists());
         });
@@ -5763,7 +6009,7 @@ pub mod tests {
             assert!(stored);
 
             let entry_dir = config
-                .artifact_cache_version_dir("1.91.1")
+                .tier_version_dir(CacheTier::LocalCratesIo, "1.91.1")
                 .join("bundles/v3/aarch64-apple-darwin")
                 .join(stable_c_metadata);
             // Outputs land under the stable-name file names a remote bundle
@@ -5843,16 +6089,11 @@ pub mod tests {
             .expect("store must not error on a dirty build");
             assert!(!stored);
 
-            let version_dir = config.artifact_cache_version_dir("1.91.1");
+            let version_dir = config.tier_version_dir(CacheTier::LocalCratesIo, "1.91.1");
             let leftovers = std::fs::read_dir(version_dir.join("bundles/v3/aarch64-apple-darwin"))
                 .map_or(0, std::iter::Iterator::count);
             assert_eq!(leftovers, 0, "no staged dir or entry may remain");
-            let index = list_artifact_cache_entries(
-                &connect(&config.cache_dir).await.expect("connect state db"),
-                "1.91.1",
-            )
-            .await
-            .expect("list entries");
+            let index = list_all_tier_entries(&config, "1.91.1").await;
             assert!(index.is_empty());
         });
     }
@@ -6163,16 +6404,26 @@ pub mod tests {
         config: &StowConfig,
         cache_key: &str,
     ) -> Vec<super::DependencyInstanceIdentity> {
-        let pool = connect(&config.cache_dir).await.expect("connect state db");
-        let instances_json: String = sqlx::query_scalar(
-            "SELECT dependency_instances_json FROM artifact_cache_entries \
-             WHERE rustc_version = '1.91.1' AND cache_key = ?",
-        )
-        .bind(cache_key)
-        .fetch_one(&pool)
-        .await
-        .expect("read dependency instances");
-        serde_json::from_str(&instances_json).expect("parse dependency instances")
+        for tier in CacheTier::ALL {
+            if !tier_db_path(&config.cache_dir, tier).exists() {
+                continue;
+            }
+            let pool = connect_tier(&config.cache_dir, tier)
+                .await
+                .expect("connect tier db");
+            if let Some(instances_json) = sqlx::query_scalar::<_, String>(
+                "SELECT dependency_instances_json FROM artifact_cache_entries \
+                 WHERE rustc_version = '1.91.1' AND cache_key = ?",
+            )
+            .bind(cache_key)
+            .fetch_optional(&pool)
+            .await
+            .expect("read dependency instances")
+            {
+                return serde_json::from_str(&instances_json).expect("parse dependency instances");
+            }
+        }
+        panic!("missing cache entry {cache_key} across tiers");
     }
 
     /// Serve the cached entry under `stable_c_metadata` into `parsed`'s
@@ -6523,20 +6774,32 @@ pub mod tests {
     }
 
     #[test]
-    fn remote_download_does_not_displace_local_entry() {
+    fn remote_download_retires_superseded_local_crates_io_entry_and_preserves_local_tier() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
         let out_dir = tempdir.path().join("deps");
         std::fs::create_dir_all(&out_dir).expect("create dep out dir");
 
         let stable_c_metadata = "1122334455667788";
-        let parsed = local_build_parsed("demo", "cargo-meta-4", out_dir, &["link"]);
+        let parsed = local_build_parsed("demo", "cargo-meta-4", out_dir.clone(), &["link"]);
         std::fs::write(
             parsed.output_rlib_path().expect("rlib output path"),
             b"locally-built",
         )
         .expect("write rlib");
         let build = local_build_artifact(&parsed, stable_c_metadata);
+
+        let private_meta = "9988776655443322";
+        let private_parsed = local_build_parsed("priv", "cargo-meta-priv", out_dir, &["link"]);
+        std::fs::write(
+            private_parsed.output_rlib_path().expect("rlib output path"),
+            b"private-built",
+        )
+        .expect("write private rlib");
+        let mut private_build = local_build_artifact(&private_parsed, private_meta);
+        private_build.reach = stow_types::public_cache::Reach::LocalOnly;
+        private_build.identity.reach = stow_types::public_cache::Reach::LocalOnly;
+
         let request = fetch_request(stable_c_metadata);
         let bundle = sample_bundle(stable_c_metadata, "libdemo-1122334455667788.rlib");
 
@@ -6553,34 +6816,67 @@ pub mod tests {
                     &super::LocalEntryKey::plain(build.identity.c_metadata.as_str()),
                 )
                 .await
+                .expect("store local-crates-io build")
+            );
+            assert!(
+                super::store_local_build_outputs(
+                    &config,
+                    &private_parsed,
+                    &private_build,
+                    "aarch64-apple-darwin",
+                    &super::LocalEntryKey::plain(private_build.identity.c_metadata.as_str()),
+                )
+                .await
                 .expect("store local build")
             );
 
-            // The remote later gains the same identity: the download must not
-            // displace the self-produced entry — it serves the local one.
+            // Once the public cache publishes the unit, downloading into
+            // `crates-io/` supersedes and retires the transitional
+            // `local-crates-io/` entry while leaving `local/` untouched.
             let served = super::store_downloaded_bundle(&config, &request, &bundle)
                 .await
-                .expect("download with local entry present");
-            assert_eq!(served.provenance, super::ArtifactProvenance::Local);
+                .expect("download into crates-io");
+            assert_eq!(served.provenance, super::ArtifactProvenance::Remote);
+            assert_eq!(served.tier, CacheTier::CratesIo);
             drop(served);
 
-            let pool = connect(&config.cache_dir).await.expect("connect state db");
-            let (provenance, oci_reference): (String, String) = sqlx::query_as(
-                "SELECT provenance, oci_reference FROM artifact_cache_entries \
-                 WHERE rustc_version = '1.91.1' AND cache_key = ?",
-            )
-            .bind(cache_key(&request))
-            .fetch_one(&pool)
-            .await
-            .expect("load provenance row");
-            assert_eq!(provenance, "local");
-            assert_eq!(oci_reference, "local");
+            let local_crates_io_pool = connect_tier(&config.cache_dir, CacheTier::LocalCratesIo)
+                .await
+                .expect("connect local-crates-io db");
+            assert!(
+                !list_artifact_cache_entries(&local_crates_io_pool, "1.91.1")
+                    .await
+                    .expect("list local-crates-io")
+                    .contains_key(&cache_key(&request)),
+                "transitional local-crates-io entry must be retired on remote hit"
+            );
+            assert!(
+                !config
+                    .tier_version_dir(CacheTier::LocalCratesIo, "1.91.1")
+                    .join("bundles/v3/aarch64-apple-darwin")
+                    .join(stable_c_metadata)
+                    .exists()
+            );
+
+            let local_pool = connect_tier(&config.cache_dir, CacheTier::Local)
+                .await
+                .expect("connect local db");
+            assert!(
+                list_artifact_cache_entries(&local_pool, "1.91.1")
+                    .await
+                    .expect("list local")
+                    .contains_key(&super::artifact_cache_key(
+                        "aarch64-apple-darwin",
+                        private_meta,
+                    )),
+                "private local/ entry must never be displaced by remote stores"
+            );
         });
     }
 
     /// stow#1007: with the remote cache off an entry downloaded earlier is
-    /// replaced by this build's own compile, stored as a local entry; with it
-    /// on the download keeps the key.
+    /// superseded in lookup by this build's own compile stored in
+    /// `local-crates-io/`; with it on the `crates-io/` download keeps serving.
     #[test]
     fn a_local_store_replaces_a_downloaded_entry_only_with_the_remote_off() {
         for remote in [true, false] {
@@ -6621,7 +6917,14 @@ pub mod tests {
                 .expect("store local build");
                 assert_eq!(stored, !remote, "remote {remote}: store outcome");
 
-                let pool = connect(&config.cache_dir).await.expect("connect state db");
+                let expected_tier = if remote {
+                    CacheTier::CratesIo
+                } else {
+                    CacheTier::LocalCratesIo
+                };
+                let pool = connect_tier(&config.cache_dir, expected_tier)
+                    .await
+                    .expect("connect tier db");
                 let provenance: String = sqlx::query_scalar(
                     "SELECT provenance FROM artifact_cache_entries \
                      WHERE rustc_version = '1.91.1' AND cache_key = ?",
@@ -6690,15 +6993,17 @@ pub mod tests {
                 .await
                 .expect("store remote bundle");
 
-            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            let local_pool = connect_tier(&config.cache_dir, CacheTier::LocalCratesIo)
+                .await
+                .expect("connect local-crates-io db");
             // Only the third entry fits: the remote entry goes first
             // (stow#1539), and the local one must go too.
             config.artifact_cache_max_bytes = third_size;
-            touch_artifact_cache_entry(&pool, "1.91.1", &local_key, 1)
+            touch_artifact_cache_entry(&local_pool, "1.91.1", &local_key, 1)
                 .await
                 .expect("stale local lru timestamp");
             let local_dir = config
-                .artifact_cache_version_dir("1.91.1")
+                .tier_version_dir(CacheTier::LocalCratesIo, "1.91.1")
                 .join("bundles/v3/aarch64-apple-darwin")
                 .join(local_meta);
             assert!(local_dir.exists());
@@ -6707,9 +7012,7 @@ pub mod tests {
                 .await
                 .expect("store third bundle");
 
-            let index = list_artifact_cache_entries(&pool, "1.91.1")
-                .await
-                .expect("list entries after eviction");
+            let index = list_all_tier_entries(&config, "1.91.1").await;
             assert!(
                 !index.contains_key(&local_key),
                 "local entry must be evicted by the shared budget like a remote one"
@@ -6757,8 +7060,10 @@ pub mod tests {
             super::store_downloaded_bundle(&config, &remote_request, &remote_bundle)
                 .await
                 .expect("store remote bundle");
-            let pool = connect(&config.cache_dir).await.expect("connect state db");
-            touch_artifact_cache_entry(&pool, "1.91.1", &cache_key(&remote_request), 1)
+            let remote_pool = connect_tier(&config.cache_dir, CacheTier::CratesIo)
+                .await
+                .expect("connect crates-io db");
+            touch_artifact_cache_entry(&remote_pool, "1.91.1", &cache_key(&remote_request), 1)
                 .await
                 .expect("stale remote lru timestamp");
 
@@ -6773,9 +7078,8 @@ pub mod tests {
                 .await
                 .expect("store local build")
             );
-            let local_size = list_artifact_cache_entries(&pool, "1.91.1")
+            let local_size = list_all_tier_entries(&config, "1.91.1")
                 .await
-                .expect("list entries")
                 .get(&local_key)
                 .expect("local entry")
                 .size_bytes;
@@ -6785,9 +7089,7 @@ pub mod tests {
                 .await
                 .expect("store third bundle");
 
-            let index = list_artifact_cache_entries(&pool, "1.91.1")
-                .await
-                .expect("list entries after eviction");
+            let index = list_all_tier_entries(&config, "1.91.1").await;
             assert!(
                 !index.contains_key(&cache_key(&remote_request)),
                 "the stale remote entry is evicted before the newer local one"
@@ -6839,11 +7141,16 @@ pub mod tests {
             super::store_downloaded_bundle(&config, &remote_request, &remote_bundle)
                 .await
                 .expect("store remote bundle");
-            let pool = connect(&config.cache_dir).await.expect("connect state db");
-            touch_artifact_cache_entry(&pool, "1.91.1", &local_key, 1)
+            let local_pool = connect_tier(&config.cache_dir, CacheTier::LocalCratesIo)
+                .await
+                .expect("connect local-crates-io db");
+            let remote_pool = connect_tier(&config.cache_dir, CacheTier::CratesIo)
+                .await
+                .expect("connect crates-io db");
+            touch_artifact_cache_entry(&local_pool, "1.91.1", &local_key, 1)
                 .await
                 .expect("older local lru timestamp");
-            touch_artifact_cache_entry(&pool, "1.91.1", &cache_key(&remote_request), 2)
+            touch_artifact_cache_entry(&remote_pool, "1.91.1", &cache_key(&remote_request), 2)
                 .await
                 .expect("newer remote lru timestamp");
             let third_size = write_downloaded_bundle_to_entry(
@@ -6851,16 +7158,17 @@ pub mod tests {
                 &third_bundle,
             )
             .expect("measure third bundle size");
-            let resident = resident_logical(&pool).await;
+            let resident = list_all_tier_entries(&config, "1.91.1")
+                .await
+                .values()
+                .fold(0u64, |sum, entry| sum.saturating_add(entry.size_bytes));
             config.artifact_cache_max_bytes = resident + third_size - 1;
 
             super::store_downloaded_bundle(&config, &third_request, &third_bundle)
                 .await
                 .expect("store third bundle");
 
-            let index = list_artifact_cache_entries(&pool, "1.91.1")
-                .await
-                .expect("list entries after eviction");
+            let index = list_all_tier_entries(&config, "1.91.1").await;
             assert!(
                 !index.contains_key(&cache_key(&remote_request)),
                 "the remote entry goes first: it can be downloaded again"
@@ -6873,6 +7181,7 @@ pub mod tests {
         });
     }
 
+    #[cfg(target_os = "macos")]
     async fn resident_logical(pool: &sqlx::SqlitePool) -> u64 {
         list_artifact_cache_entries(pool, "1.91.1")
             .await
@@ -6907,11 +7216,12 @@ pub mod tests {
     /// it.
     #[cfg(target_os = "macos")]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn a_cloned_entry_outlasts_unshared_ones_until_its_clone_is_deleted() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let mut config = test_config(tempdir.path());
         let entries_dir = config
-            .artifact_cache_version_dir("1.91.1")
+            .tier_version_dir(CacheTier::CratesIo, "1.91.1")
             .join("bundles/v3/aarch64-apple-darwin");
         let build_dir = tempdir.path().join("project/target/debug/deps");
         let bundles: Vec<(FetchRequest<'_>, ArtifactBundle, u64)> =
@@ -6944,7 +7254,9 @@ pub mod tests {
             super::store_downloaded_bundle(&config, &plain_request, &plain_bundle)
                 .await
                 .expect("store the unshared entry");
-            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            let pool = connect_tier(&config.cache_dir, CacheTier::CratesIo)
+                .await
+                .expect("connect crates-io db");
             touch_artifact_cache_entry(&pool, "1.91.1", &cache_key(&cloned_request), 1)
                 .await
                 .expect("oldest stamp on the cloned entry");
@@ -6974,9 +7286,10 @@ pub mod tests {
                 "the unshared entry is evicted first although touched later"
             );
             assert!(index.contains_key(&cache_key(&third_request)));
-            let resident = super::resident_bytes(&pool, "1.91.1")
-                .await
-                .expect("resident after the first pass");
+            let resident =
+                super::resident_bytes_across(&[(CacheTier::CratesIo, pool.clone())], "1.91.1")
+                    .await
+                    .expect("resident after the first pass");
             assert_eq!(
                 resident.shared, cloned_size,
                 "the pass recorded the clone's share of the whole entry"
@@ -7011,7 +7324,7 @@ pub mod tests {
             assert!(index.contains_key(&cache_key(&third_request)));
             assert!(index.contains_key(&cache_key(&fourth_request)));
             assert_eq!(
-                super::resident_bytes(&pool, "1.91.1")
+                super::resident_bytes_across(&[(CacheTier::CratesIo, pool)], "1.91.1")
                     .await
                     .expect("resident after the second pass")
                     .shared,
@@ -7042,7 +7355,9 @@ pub mod tests {
             super::store_downloaded_bundle(&config, &first_request, &first_bundle)
                 .await
                 .expect("store first bundle");
-            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            let pool = connect_tier(&config.cache_dir, CacheTier::CratesIo)
+                .await
+                .expect("connect crates-io db");
             config.artifact_cache_max_bytes = second_size;
             super::store_downloaded_bundle(&config, &second_request, &second_bundle)
                 .await
@@ -7052,7 +7367,7 @@ pub mod tests {
                 .expect("list entries after eviction");
             assert!(!index.contains_key(&cache_key(&first_request)));
             assert!(index.contains_key(&cache_key(&second_request)));
-            let resident = super::resident_bytes(&pool, "1.91.1")
+            let resident = super::resident_bytes_across(&[(CacheTier::CratesIo, pool)], "1.91.1")
                 .await
                 .expect("resident after eviction");
             assert_eq!(
@@ -7164,10 +7479,11 @@ pub mod tests {
                 store_dependent(&config, &derive, derive_stable, "aarch64-apple-darwin").await;
             assert!(stored, "the proc-macro dependent binds to the dep");
 
-            let pool = connect(&config.cache_dir).await.expect("connect state db");
-            let resident: u64 = list_artifact_cache_entries(&pool, "1.91.1")
+            let pool = connect_tier(&config.cache_dir, CacheTier::LocalCratesIo)
                 .await
-                .expect("list entries")
+                .expect("connect local-crates-io db");
+            let resident: u64 = list_all_tier_entries(&config, "1.91.1")
+                .await
                 .values()
                 .fold(0u64, |sum, entry| sum.saturating_add(entry.size_bytes));
             config.artifact_cache_max_bytes = resident + leaf_size - 1;
@@ -7181,9 +7497,7 @@ pub mod tests {
                 "the leaf store triggers the pass"
             );
 
-            let index = list_artifact_cache_entries(&pool, "1.91.1")
-                .await
-                .expect("list entries after eviction");
+            let index = list_all_tier_entries(&config, "1.91.1").await;
             assert!(!index.contains_key(&dep_key), "the dep is evicted");
             assert!(
                 !index.contains_key(&derive_key),
@@ -7191,7 +7505,7 @@ pub mod tests {
             );
             assert!(index.contains_key(&leaf_key));
             let entries_dir = config
-                .artifact_cache_version_dir("1.91.1")
+                .tier_version_dir(CacheTier::LocalCratesIo, "1.91.1")
                 .join("bundles/v3/aarch64-apple-darwin");
             assert!(!entries_dir.join(dep_stable).exists());
             assert!(!entries_dir.join(derive_stable).exists());
@@ -7249,7 +7563,9 @@ pub mod tests {
             assert!(store_dependency(&config, &dep, &dep_build).await);
             assert!(store_dependency(&config, &leaf, &leaf_build).await);
 
-            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            let pool = connect_tier(&config.cache_dir, CacheTier::LocalCratesIo)
+                .await
+                .expect("connect local-crates-io db");
             let dep_size = list_artifact_cache_entries(&pool, "1.91.1")
                 .await
                 .expect("list entries")
@@ -7269,9 +7585,7 @@ pub mod tests {
                 .await
                 .expect("store remote dependent");
 
-            let index = list_artifact_cache_entries(&pool, "1.91.1")
-                .await
-                .expect("list entries after eviction");
+            let index = list_all_tier_entries(&config, "1.91.1").await;
             assert!(
                 index.contains_key(&dep_key),
                 "the protected entry's dependency is never a victim"
@@ -7338,10 +7652,10 @@ pub mod tests {
             assert!(stored, "the dependent binds to the dep");
             assert!(store_dependency(&config, &leaf, &leaf_build).await);
 
-            let pool = connect(&config.cache_dir).await.expect("connect state db");
-            let index = list_artifact_cache_entries(&pool, "1.91.1")
+            let pool = connect_tier(&config.cache_dir, CacheTier::LocalCratesIo)
                 .await
-                .expect("list entries");
+                .expect("connect local-crates-io db");
+            let index = list_all_tier_entries(&config, "1.91.1").await;
             let leaf_size = index.get(&leaf_key).expect("leaf entry").size_bytes;
             let resident: u64 = index
                 .values()
@@ -7362,7 +7676,7 @@ pub mod tests {
 
             // Another process holds the dependent's lease.
             let _dependent_lease = super::acquire_entry_shared_lock(
-                &config.artifact_cache_version_dir("1.91.1"),
+                &config.tier_version_dir(CacheTier::LocalCratesIo, "1.91.1"),
                 &toml_key,
             )
             .expect("lease the dependent entry");
@@ -7372,9 +7686,7 @@ pub mod tests {
                 "the trigger store runs the pass"
             );
 
-            let index = list_artifact_cache_entries(&pool, "1.91.1")
-                .await
-                .expect("list entries after eviction");
+            let index = list_all_tier_entries(&config, "1.91.1").await;
             assert!(
                 index.contains_key(&dep_key),
                 "a locked member skips the whole group — the dep stays"
@@ -7447,10 +7759,11 @@ pub mod tests {
                 store_dependent(&config, &top, top_stable, "aarch64-apple-darwin").await;
             assert!(stored, "toml_edit binds to toml");
 
-            let pool = connect(&config.cache_dir).await.expect("connect state db");
-            let resident: u64 = list_artifact_cache_entries(&pool, "1.91.1")
+            let pool = connect_tier(&config.cache_dir, CacheTier::LocalCratesIo)
                 .await
-                .expect("list entries")
+                .expect("connect local-crates-io db");
+            let resident: u64 = list_all_tier_entries(&config, "1.91.1")
+                .await
                 .values()
                 .fold(0u64, |sum, entry| sum.saturating_add(entry.size_bytes));
             config.artifact_cache_max_bytes = resident + leaf_size - 1;
@@ -7464,9 +7777,7 @@ pub mod tests {
                 "the leaf store triggers the pass"
             );
 
-            let index = list_artifact_cache_entries(&pool, "1.91.1")
-                .await
-                .expect("list entries after eviction");
+            let index = list_all_tier_entries(&config, "1.91.1").await;
             assert!(!index.contains_key(&dep_key), "the dep is evicted");
             assert!(
                 !index.contains_key(&toml_key),
@@ -7562,7 +7873,9 @@ pub mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
         run_async(async {
-            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            let pool = connect_tier(&config.cache_dir, CacheTier::Local)
+                .await
+                .expect("connect local tier db");
             seed_entries(&pool, 5).await;
             assert_eq!(counted_total(&pool).await, summed_total(&pool).await);
             assert_eq!(counted_total(&pool).await, (5, 0));
@@ -7626,7 +7939,7 @@ pub mod tests {
             assert_eq!(counted_total(&pool).await.1, 50);
             assert_eq!(counted_total(&pool).await, summed_total(&pool).await);
             assert_eq!(
-                super::resident_bytes(&pool, "1.91.1")
+                super::resident_bytes_across(&[(CacheTier::Local, pool.clone())], "1.91.1")
                     .await
                     .expect("resident")
                     .logical,
@@ -7652,7 +7965,7 @@ pub mod tests {
                 .await
                 .expect("delete shared entry");
             assert_eq!(shared_totals(&pool).await, summed_shares(&pool).await);
-            let resident = super::resident_bytes(&pool, "1.91.1")
+            let resident = super::resident_bytes_across(&[(CacheTier::Local, pool)], "1.91.1")
                 .await
                 .expect("resident after shares");
             assert_eq!(resident.shared, 3 + 20);
@@ -7697,7 +8010,9 @@ pub mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
         run_async(async {
-            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            let pool = connect_tier(&config.cache_dir, CacheTier::CratesIo)
+                .await
+                .expect("connect crates-io db");
             sqlx::query(
                 "INSERT INTO artifact_cache_entries \
                  (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, \
@@ -7737,22 +8052,23 @@ pub mod tests {
         let mut over_cap = Vec::new();
         for entries in [1_i64, 500, 5_000] {
             let tempdir = tempfile::tempdir().expect("tempdir");
-            let config = test_config(tempdir.path());
-            let version_dir = config.artifact_cache_version_dir("1.91.1");
+            let mut config = test_config(tempdir.path());
+            let version_dir = config.tier_version_dir(CacheTier::CratesIo, "1.91.1");
             std::fs::create_dir_all(version_dir.join("locks")).expect("locks dir");
             run_async(async {
-                let pool = connect(&config.cache_dir).await.expect("connect state db");
+                let pool = config
+                    .tier_db_pool(CacheTier::CratesIo)
+                    .await
+                    .expect("connect crates-io db");
                 seed_entries(&pool, entries).await;
                 let protected_key = format!("key-{entries}");
+                config.artifact_cache_max_bytes = u64::try_from(entries).expect("count");
                 let (instructions, result) = vm_instructions(
                     &pool,
                     super::evict_entries(
-                        &pool,
+                        &config,
                         "1.91.1",
-                        &version_dir,
-                        &config.cc_cache_dir(),
-                        u64::try_from(entries).expect("count"),
-                        &super::ProtectedEntry::Rustc(&protected_key),
+                        &super::ProtectedEntry::Rustc(CacheTier::CratesIo, &protected_key),
                     ),
                 )
                 .await;
@@ -7768,15 +8084,13 @@ pub mod tests {
                 under_cap.push(instructions);
 
                 if entries > 1 {
+                    config.artifact_cache_max_bytes = u64::try_from(entries - 1).expect("count");
                     let (instructions, result) = vm_instructions(
                         &pool,
                         super::evict_entries(
-                            &pool,
+                            &config,
                             "1.91.1",
-                            &version_dir,
-                            &config.cc_cache_dir(),
-                            u64::try_from(entries - 1).expect("count"),
-                            &super::ProtectedEntry::Rustc(&protected_key),
+                            &super::ProtectedEntry::Rustc(CacheTier::CratesIo, &protected_key),
                         ),
                     )
                     .await;
@@ -8136,6 +8450,7 @@ pub mod tests {
             crate_types: artifact_bundle.manifest.config.crate_types.clone(),
             outputs: artifact_bundle.manifest.config.outputs.clone(),
             sigstore_signatures: artifact_bundle.manifest.sigstore_signatures.clone(),
+            tier: CacheTier::CratesIo,
             entry_dir: temp_dir.join("bundle-entry"),
             rustc_version: artifact_bundle
                 .manifest
@@ -8173,5 +8488,330 @@ pub mod tests {
         assert_eq!(loaded.compile_key, bundle.manifest.config.compile_key);
         assert_eq!(loaded.crate_name, "demo");
         assert_eq!(loaded.outputs.len(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn three_tier_eviction_order_evicts_crates_io_then_local_crates_io_then_local() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tempdir.path());
+        let private_dir = tempdir.path().join("private/deps");
+        let public_local_dir = tempdir.path().join("public-local/deps");
+        for dir in [&private_dir, &public_local_dir] {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+
+        let private_meta = "10ca10ca10ca10ca";
+        let private_parsed = local_build_parsed("priv", "cargo-priv", private_dir, &["metadata"]);
+        std::fs::write(
+            private_parsed.output_rmeta_path().expect("priv rmeta"),
+            b"private-tier-bytes",
+        )
+        .expect("write priv rmeta");
+        let mut private_build = local_build_artifact(&private_parsed, private_meta);
+        private_build.reach = stow_types::public_cache::Reach::LocalOnly;
+        private_build.identity.reach = stow_types::public_cache::Reach::LocalOnly;
+        let private_key = super::artifact_cache_key("aarch64-apple-darwin", private_meta);
+
+        let public_local_meta = "20ca20ca20ca20ca";
+        let public_local_parsed = local_build_parsed(
+            "pub_local",
+            "cargo-pub-local",
+            public_local_dir,
+            &["metadata"],
+        );
+        std::fs::write(
+            public_local_parsed
+                .output_rmeta_path()
+                .expect("pub_local rmeta"),
+            b"local-crates-io-bytes",
+        )
+        .expect("write pub_local rmeta");
+        let public_local_build = local_build_artifact(&public_local_parsed, public_local_meta);
+        let public_local_key = super::artifact_cache_key("aarch64-apple-darwin", public_local_meta);
+
+        let remote_request = fetch_request("30ca30ca30ca30ca");
+        let remote_bundle = sample_bundle("30ca30ca30ca30ca", "libdemo-30ca30ca30ca30ca.rmeta");
+        let trigger1_request = fetch_request("40ca40ca40ca40ca");
+        let trigger1_bundle = sample_bundle("40ca40ca40ca40ca", "libdemo-40ca40ca40ca40ca.rmeta");
+        let trigger1_size = write_downloaded_bundle_to_entry(
+            &tempdir.path().join("scratch-trigger1"),
+            &trigger1_bundle,
+        )
+        .expect("measure trigger1");
+
+        let trigger2_dir = tempdir.path().join("trigger2/deps");
+        std::fs::create_dir_all(&trigger2_dir).expect("trigger2 dir");
+        let second_trigger_id = "50ca50ca50ca50ca";
+        let trigger2_parsed =
+            local_build_parsed("trigger2", "cargo-trigger2", trigger2_dir, &["metadata"]);
+        let second_output = trigger2_parsed.output_rmeta_path().expect("trigger2 rmeta");
+        std::fs::write(&second_output, b"trigger2").expect("write trigger2");
+        let mut trigger2_build = local_build_artifact(&trigger2_parsed, second_trigger_id);
+        trigger2_build.reach = stow_types::public_cache::Reach::LocalOnly;
+        trigger2_build.identity.reach = stow_types::public_cache::Reach::LocalOnly;
+        let trigger2_size = std::fs::metadata(&second_output)
+            .expect("trigger2 metadata")
+            .len();
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(store_dependency(&config, &private_parsed, &private_build).await);
+            assert!(store_dependency(&config, &public_local_parsed, &public_local_build).await);
+            super::store_downloaded_bundle(&config, &remote_request, &remote_bundle)
+                .await
+                .expect("store remote");
+
+            clean_build_dirs(tempdir.path(), &["private", "public-local"]);
+            let local_pool = connect_tier(&config.cache_dir, CacheTier::Local)
+                .await
+                .expect("local db");
+            let local_crates_io_pool = connect_tier(&config.cache_dir, CacheTier::LocalCratesIo)
+                .await
+                .expect("local-crates-io db");
+            let crates_io_pool = connect_tier(&config.cache_dir, CacheTier::CratesIo)
+                .await
+                .expect("crates-io db");
+            touch_artifact_cache_entry(&local_pool, "1.91.1", &private_key, 1)
+                .await
+                .expect("oldest stamp on local/");
+            touch_artifact_cache_entry(&local_crates_io_pool, "1.91.1", &public_local_key, 2)
+                .await
+                .expect("middle stamp on local-crates-io/");
+            touch_artifact_cache_entry(&crates_io_pool, "1.91.1", &cache_key(&remote_request), 3)
+                .await
+                .expect("newest stamp on crates-io/");
+
+            let before = list_all_tier_entries(&config, "1.91.1").await;
+            let private_size = before.get(&private_key).expect("private").size_bytes;
+            let public_local_size = before
+                .get(&public_local_key)
+                .expect("public_local")
+                .size_bytes;
+
+            // Pass 1: `crates-io/` goes first even though it has the newest LRU timestamp.
+            config.artifact_cache_max_bytes = private_size + public_local_size + trigger1_size;
+            super::store_downloaded_bundle(&config, &trigger1_request, &trigger1_bundle)
+                .await
+                .expect("store trigger1");
+            let after_pass1 = list_all_tier_entries(&config, "1.91.1").await;
+            assert!(!after_pass1.contains_key(&cache_key(&remote_request)));
+            assert!(after_pass1.contains_key(&public_local_key));
+            assert!(after_pass1.contains_key(&private_key));
+
+            // Pass 2: once `crates-io/` is exhausted, `local-crates-io/` goes before `local/`.
+            config.artifact_cache_max_bytes = private_size + trigger2_size;
+            assert!(store_dependency(&config, &trigger2_parsed, &trigger2_build).await);
+            clean_build_dirs(tempdir.path(), &["trigger2"]);
+            let after_pass2 = list_all_tier_entries(&config, "1.91.1").await;
+            assert!(!after_pass2.contains_key(&cache_key(&trigger1_request)));
+            assert!(!after_pass2.contains_key(&public_local_key));
+            assert!(
+                after_pass2.contains_key(&private_key),
+                "local/ outlasts both crates-io/ and local-crates-io/"
+            );
+        });
+    }
+
+    #[test]
+    fn evicting_local_crates_io_dependency_evicts_cross_tier_local_dependent() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let dep_dir = tempdir.path().join("dep/deps");
+        let dependent_dir = tempdir.path().join("dependent/deps");
+        let leaf_dir = tempdir.path().join("leaf/deps");
+        for dir in [&dep_dir, &dependent_dir, &leaf_dir] {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+
+        let dep_stable = "5edec0de5edec0de";
+        let dep = local_build_parsed("serde_core", "cargo-meta-dep", dep_dir, &["metadata"]);
+        let dep_rmeta = dep.output_rmeta_path().expect("dep rmeta");
+        std::fs::write(&dep_rmeta, b"dep-rmeta").expect("write dep");
+        let dep_build = local_build_artifact(&dep, dep_stable);
+
+        let dependent_stable = "70a170a170a170a1";
+        let dependent = toml_dependent(&dependent_dir, dep_rmeta);
+        let mut dependent_build = local_build_artifact(&dependent, dependent_stable);
+        dependent_build.reach = stow_types::public_cache::Reach::LocalOnly;
+        dependent_build.identity.reach = stow_types::public_cache::Reach::LocalOnly;
+
+        let leaf_stable = "1eaf1eaf1eaf1eaf";
+        let leaf = local_build_parsed("priv_leaf", "cargo-leaf", leaf_dir, &["metadata"]);
+        std::fs::write(leaf.output_rmeta_path().expect("leaf rmeta"), b"leaf-rmeta")
+            .expect("write leaf");
+        let mut leaf_build = local_build_artifact(&leaf, leaf_stable);
+        leaf_build.reach = stow_types::public_cache::Reach::LocalOnly;
+        leaf_build.identity.reach = stow_types::public_cache::Reach::LocalOnly;
+
+        let dep_key = super::artifact_cache_key("aarch64-apple-darwin", dep_stable);
+        let dependent_key = super::artifact_cache_key("aarch64-apple-darwin", dependent_stable);
+        let leaf_key = super::artifact_cache_key("aarch64-apple-darwin", leaf_stable);
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(store_dependency(&config, &dep, &dep_build).await);
+            let deps = match super::resolve_dependency_c_metadata_json(&config, &dependent)
+                .await
+                .expect("resolve deps")
+            {
+                super::DependencyCMetadataResolution::Resolved(mut resolved) => {
+                    resolved.reach = stow_types::public_cache::Reach::LocalOnly;
+                    resolved
+                }
+                super::DependencyCMetadataResolution::Unrecorded(_) => {
+                    panic!("expected resolved deps")
+                }
+            };
+            dependent_build.dependencies = deps;
+            assert!(
+                super::store_local_build_outputs(
+                    &config,
+                    &dependent,
+                    &dependent_build,
+                    "aarch64-apple-darwin",
+                    &super::LocalEntryKey::plain(dependent_build.identity.c_metadata.as_str()),
+                )
+                .await
+                .expect("store local/ dependent")
+            );
+            assert!(store_dependency(&config, &leaf, &leaf_build).await);
+            clean_build_dirs(tempdir.path(), &["dep", "dependent", "leaf"]);
+
+            super::evict_tier_to_max_bytes(&config, CacheTier::LocalCratesIo, 0)
+                .await
+                .expect("cap local-crates-io to 0");
+
+            let index = list_all_tier_entries(&config, "1.91.1").await;
+            assert!(!index.contains_key(&dep_key));
+            assert!(
+                !index.contains_key(&dependent_key),
+                "cross-tier dependent in local/ must be evicted with its local-crates-io/ dependency"
+            );
+            assert!(
+                index.contains_key(&leaf_key),
+                "unrelated local/ entry stays untouched"
+            );
+            assert_closure_complete(&index);
+        });
+    }
+
+    #[test]
+    fn restoring_only_local_or_local_and_local_crates_io_serves_self_contained_tiers() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let full_config = test_config(&tempdir.path().join("full"));
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("out dir");
+
+        let pub_meta = "aaaa1111bbbb2222";
+        let pub_parsed = local_build_parsed("pub_unit", "cargo-pub", out_dir.clone(), &["link"]);
+        std::fs::write(pub_parsed.output_rlib_path().expect("rlib"), b"pub-rlib").expect("write");
+        let pub_build = local_build_artifact(&pub_parsed, pub_meta);
+
+        let priv_meta = "cccc3333dddd4444";
+        let priv_parsed = local_build_parsed("priv_unit", "cargo-priv", out_dir, &["link"]);
+        std::fs::write(priv_parsed.output_rlib_path().expect("rlib"), b"priv-rlib").expect("write");
+        let mut priv_build = local_build_artifact(&priv_parsed, priv_meta);
+        priv_build.reach = stow_types::public_cache::Reach::LocalOnly;
+        priv_build.identity.reach = stow_types::public_cache::Reach::LocalOnly;
+
+        let remote_meta = "eeee5555ffff6666";
+        let remote_bundle = sample_bundle(remote_meta, "libdemo-eeee5555ffff6666.rmeta");
+
+        run_async(async {
+            prepare_local_cache(&full_config, "1.91.1")
+                .await
+                .expect("prepare full cache");
+            super::store_downloaded_bundle(
+                &full_config,
+                &fetch_request(remote_meta),
+                &remote_bundle,
+            )
+            .await
+            .expect("store remote");
+            assert!(store_dependency(&full_config, &pub_parsed, &pub_build).await);
+            assert!(store_dependency(&full_config, &priv_parsed, &priv_build).await);
+            full_config.state_db.checkpoint_and_close().await;
+
+            // Case 1: restore ONLY `local/` (no `crates-io/`, no `local-crates-io/`, no `state-v3.sqlite3`).
+            let local_only_root = tempdir.path().join("restored-local");
+            copy_tree(
+                &full_config.tier_dir(CacheTier::Local),
+                &local_only_root.join(".stow/local"),
+            );
+            let local_only_config = test_config(&local_only_root);
+            let served_priv = load_cached_bundle(&local_only_config, &fetch_request(priv_meta))
+                .await
+                .expect("load restored local/")
+                .expect("local/ entry must hit");
+            assert_eq!(served_priv.tier, CacheTier::Local);
+            assert!(
+                load_cached_bundle(&local_only_config, &fetch_request(pub_meta))
+                    .await
+                    .expect("lookup absent local-crates-io/")
+                    .is_none()
+            );
+            assert!(
+                load_cached_bundle(&local_only_config, &fetch_request(remote_meta))
+                    .await
+                    .expect("lookup absent crates-io/")
+                    .is_none()
+            );
+
+            // Case 2: restore `local/` + `local-crates-io/` (no `crates-io/`, no `state-v3.sqlite3`).
+            let two_tier_root = tempdir.path().join("restored-two");
+            copy_tree(
+                &full_config.tier_dir(CacheTier::Local),
+                &two_tier_root.join(".stow/local"),
+            );
+            copy_tree(
+                &full_config.tier_dir(CacheTier::LocalCratesIo),
+                &two_tier_root.join(".stow/local-crates-io"),
+            );
+            let two_tier_config = test_config(&two_tier_root);
+            assert_eq!(
+                load_cached_bundle(&two_tier_config, &fetch_request(priv_meta))
+                    .await
+                    .expect("load local/")
+                    .expect("local/ hit")
+                    .tier,
+                CacheTier::Local
+            );
+            assert_eq!(
+                load_cached_bundle(&two_tier_config, &fetch_request(pub_meta))
+                    .await
+                    .expect("load local-crates-io/")
+                    .expect("local-crates-io/ hit")
+                    .tier,
+                CacheTier::LocalCratesIo
+            );
+            assert!(
+                load_cached_bundle(&two_tier_config, &fetch_request(remote_meta))
+                    .await
+                    .expect("lookup absent crates-io/")
+                    .is_none()
+            );
+        });
+    }
+
+    fn copy_tree(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).expect("create dst dir");
+        for entry in walkdir::WalkDir::new(src) {
+            let entry = entry.expect("walk src");
+            let rel = entry.path().strip_prefix(src).expect("strip prefix");
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let target = dst.join(rel);
+            if entry.file_type().is_dir() {
+                std::fs::create_dir_all(&target).expect("create subdir");
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy file");
+            }
+        }
     }
 }

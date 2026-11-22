@@ -123,27 +123,33 @@ fn expected_stored_crates() -> std::collections::BTreeSet<&'static str> {
         .collect()
 }
 
-fn stored_crate_names(db: &Path) -> std::collections::BTreeSet<String> {
+fn stored_crate_names(cache_dir: &Path) -> std::collections::BTreeSet<String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime")
         .block_on(async {
-            let options = sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(db)
-                .read_only(true);
-            let pool = sqlx::SqlitePool::connect_with(options)
+            let mut stored = std::collections::BTreeSet::new();
+            for tier in ["crates-io", "local-crates-io", "local"] {
+                let db = cache_dir.join(tier).join("catalog-v1.sqlite3");
+                if !db.exists() {
+                    continue;
+                }
+                let options = sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&db)
+                    .read_only(true);
+                let pool = sqlx::SqlitePool::connect_with(options)
+                    .await
+                    .expect("open the tier catalog read-only");
+                let rows = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
+                    "SELECT crate_name FROM artifact_cache_entries".to_owned(),
+                ))
+                .fetch_all(&pool)
                 .await
-                .expect("open the state db read-only");
-            let stored = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
-                "SELECT crate_name FROM artifact_cache_entries".to_owned(),
-            ))
-            .fetch_all(&pool)
-            .await
-            .expect("list stored crates")
-            .into_iter()
-            .collect();
-            pool.close().await;
+                .expect("list stored crates");
+                pool.close().await;
+                stored.extend(rows);
+            }
             stored
         })
 }
@@ -177,7 +183,7 @@ fn refused_registry_and_edge_run_the_build_local_only() {
     );
     assert_single_unreachable_warning(&output, &registry_url, "fill build");
     assert_eq!(
-        stored_crate_names(&cache.path().join("state-v3.sqlite3")),
+        stored_crate_names(cache.path()),
         expected_stored_crates()
             .iter()
             .map(|name| (*name).to_owned())
@@ -233,7 +239,7 @@ fn blackholed_registry_and_edge_run_the_build_local_only() {
     );
     assert_single_unreachable_warning(&output, &blackholed_url, "fill build");
     assert_eq!(
-        stored_crate_names(&cache.path().join("state-v3.sqlite3")),
+        stored_crate_names(cache.path()),
         expected_stored_crates()
             .iter()
             .map(|name| (*name).to_owned())

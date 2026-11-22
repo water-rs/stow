@@ -178,7 +178,7 @@ impl Scenario {
     }
 
     fn entries(&self) -> Vec<StoredEntry> {
-        stored_entries(&self.cache.path().join("state-v3.sqlite3"))
+        stored_entries(self.cache.path())
     }
 
     /// Nothing about the local-only `entries` left the machine: no

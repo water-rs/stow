@@ -48,6 +48,7 @@ pub mod scheduled_task;
 mod serve;
 pub mod session;
 mod start;
+pub use start::stop_if_running;
 mod table;
 #[cfg(windows)]
 mod windows;
@@ -346,7 +347,9 @@ impl RunDir {
 #[must_use]
 pub fn is_serving(args: &[OsString]) -> bool {
     args.get(1).is_some_and(|word| word == "daemon")
-        && args.get(2).is_none_or(|word| word != "status")
+        && args
+            .get(2)
+            .is_none_or(|word| word != "status" && word != "stop")
 }
 
 /// Make this process the daemon's: close every inherited descriptor above
@@ -408,6 +411,7 @@ fn inherited_descriptors(args: &[OsString]) -> Vec<std::os::fd::RawFd> {
 pub async fn run(args: DaemonArgs) -> Result<()> {
     match args.command {
         Some(DaemonCommand::Status) => status().await,
+        Some(DaemonCommand::Stop(stop_args)) => stop(stop_args).await,
         None => {
             #[cfg(unix)]
             let inherited = args
@@ -423,6 +427,37 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
             .await
         }
     }
+}
+
+/// `stow daemon stop`: drain and stop the running daemon if any, optionally
+/// cap `local-crates-io/`, then checkpoint and truncate every existing SQLite
+/// catalog in `$STOW_CACHE_DIR`.
+async fn stop(args: crate::cli_args::DaemonStopArgs) -> Result<()> {
+    let stopped = tokio::task::spawn_blocking(|| {
+        let exe = std::env::current_exe().wrap_err("resolve the current executable")?;
+        let settings = Settings::from_env()?;
+        start::stop_if_running(&exe, settings)
+    })
+    .await
+    .wrap_err("run the daemon stop client")??;
+    let env = crate::session_env::SessionEnv::of_this_process()?;
+    let cache_dir = crate::config::cache_dir(&env)?;
+    if cache_dir.exists() {
+        if let Some(max_bytes) = args.local_crates_io_max_bytes {
+            let state_db = crate::state_db::StateDb::default();
+            let config = crate::config::StowConfig::load(state_db.clone())?;
+            crate::artifact_cache::evict_tier_to_max_bytes(
+                &config,
+                crate::state_db::CacheTier::LocalCratesIo,
+                max_bytes,
+            )
+            .await?;
+            state_db.checkpoint_and_close().await;
+        }
+        crate::state_db::checkpoint_existing_databases(&cache_dir).await?;
+    }
+    tracing::debug!(stopped, cache_dir = %cache_dir.display(), "stow daemon stop completed");
+    Ok(())
 }
 
 /// `stow daemon status`: reach the daemon through the start path and

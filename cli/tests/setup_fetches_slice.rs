@@ -81,23 +81,32 @@ fn stored_unit(cache_dir: &Path, crate_name: &str) -> StoredUnit {
         .build()
         .expect("tokio runtime")
         .block_on(async {
-            let options = sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(cache_dir.join("state-v3.sqlite3"))
-                .read_only(true);
-            let pool = sqlx::SqlitePool::connect_with(options)
+            for tier in ["crates-io", "local-crates-io", "local"] {
+                let db = cache_dir.join(tier).join("catalog-v1.sqlite3");
+                if !db.exists() {
+                    continue;
+                }
+                let options = sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&db)
+                    .read_only(true);
+                let pool = sqlx::SqlitePool::connect_with(options)
+                    .await
+                    .expect("open the tier catalog read-only");
+                let unit: Option<StoredUnit> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT rustc_version, relative_dir, crate_name, crate_version, \
+                     c_metadata, compile_key, features_json, dependency_c_metadata_json, \
+                     dependency_compile_keys_json, target, profile_json, emit_json, kind_json, crate_types_json \
+                     FROM artifact_cache_entries WHERE crate_name = '{crate_name}'"
+                )))
+                .fetch_optional(&pool)
                 .await
-                .expect("open the state db read-only");
-            let unit: StoredUnit = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "SELECT rustc_version, relative_dir, crate_name, crate_version, \
-                 c_metadata, compile_key, features_json, dependency_c_metadata_json, \
-                 dependency_compile_keys_json, target, profile_json, emit_json, kind_json, crate_types_json \
-                 FROM artifact_cache_entries WHERE crate_name = '{crate_name}'"
-            )))
-            .fetch_one(&pool)
-            .await
-            .expect("the fill build stored the unit");
-            pool.close().await;
-            unit
+                .expect("query stored unit");
+                pool.close().await;
+                if let Some(unit) = unit {
+                    return unit;
+                }
+            }
+            panic!("the fill build stored no {crate_name} unit across tiers");
         })
 }
 
@@ -116,32 +125,42 @@ fn stored_outputs(cache_dir: &Path, unit: &StoredUnit) -> Vec<ArtifactBundleFile
         .build()
         .expect("tokio runtime")
         .block_on(async {
-            let options = sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(cache_dir.join("state-v3.sqlite3"))
-                .read_only(true);
-            let pool = sqlx::SqlitePool::connect_with(options)
+            for tier in ["crates-io", "local-crates-io", "local"] {
+                let db = cache_dir.join(tier).join("catalog-v1.sqlite3");
+                if !db.exists() {
+                    continue;
+                }
+                let options = sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&db)
+                    .read_only(true);
+                let pool = sqlx::SqlitePool::connect_with(options)
+                    .await
+                    .expect("open the tier catalog read-only");
+                let rows: Vec<(String, String, String)> = sqlx::query_as(
+                    "SELECT o.file_name, o.media_type, o.sha256 \
+                     FROM artifact_cache_outputs o \
+                     JOIN artifact_cache_entries e \
+                       ON e.rustc_version = o.rustc_version AND e.cache_key = o.cache_key \
+                     WHERE e.rustc_version = ? AND e.c_metadata = ? ORDER BY o.ordinal",
+                )
+                .bind(&unit.rustc_version)
+                .bind(&unit.c_metadata)
+                .fetch_all(&pool)
                 .await
-                .expect("open the state db read-only");
-            let rows: Vec<(String, String, String)> = sqlx::query_as(
-                "SELECT o.file_name, o.media_type, o.sha256 \
-                 FROM artifact_cache_outputs o \
-                 JOIN artifact_cache_entries e \
-                   ON e.rustc_version = o.rustc_version AND e.cache_key = o.cache_key \
-                 WHERE e.rustc_version = ? AND e.c_metadata = ? ORDER BY o.ordinal",
-            )
-            .bind(&unit.rustc_version)
-            .bind(&unit.c_metadata)
-            .fetch_all(&pool)
-            .await
-            .expect("the fill build recorded the unit's outputs");
-            pool.close().await;
-            rows.into_iter()
-                .map(|(file_name, media_type, sha256)| ArtifactBundleFile {
-                    file_name,
-                    media_type,
-                    sha256,
-                })
-                .collect()
+                .expect("the fill build recorded the unit's outputs");
+                pool.close().await;
+                if !rows.is_empty() {
+                    return rows
+                        .into_iter()
+                        .map(|(file_name, media_type, sha256)| ArtifactBundleFile {
+                            file_name,
+                            media_type,
+                            sha256,
+                        })
+                        .collect();
+                }
+            }
+            panic!("the fill build recorded no outputs for {}", unit.crate_name);
         })
 }
 
@@ -515,6 +534,7 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
         bundle_size: u64::try_from(bundle_bytes.len()).expect("bundle size"),
         artifact_kind: serde_json::from_str(&unit.kind_json).expect("artifact kind"),
         crate_types: serde_json::from_str(&unit.crate_types_json).expect("crate types"),
+        node_profile: stow_types::node_profile::NodeProfile::Dev,
         profile: serde_json::from_str(&unit.profile_json).expect("profile"),
         emit: serde_json::from_str(&unit.emit_json).expect("emit"),
         unit_shape: UnitShape {
@@ -663,7 +683,63 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
     // verified bundle manifest a local store never writes.
     let served = entry_dir(cache.path(), &unit.relative_dir);
     assert!(
+        served.starts_with(cache.path().join("crates-io")),
+        "remote download must land under crates-io/: {}",
+        served.display()
+    );
+    assert!(
         served.join("manifest.json").is_file(),
         "cfg-if must be served from the slice setup fetched, not compiled:\n{stderr}"
     );
+
+    // When `fill_cache` already holds a transitional `local-crates-io/` entry
+    // for `cfg-if` and the public slice later covers it, an online build
+    // downloads the signed bundle into `crates-io/` and retires the
+    // superseded `local-crates-io/` entry.
+    assert!(
+        entry.starts_with(fill_cache.path().join("local-crates-io")),
+        "offline fill must store public crates.io units under local-crates-io/: {}",
+        entry.display()
+    );
+    let mut refresh = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    refresh
+        .arg("setup")
+        .arg("--no-install-skill")
+        .current_dir(dir.path())
+        .env("CARGO_HOME", cargo_home.path());
+    hermetic_stow_env(&mut refresh, &stack.url, fill_cache.path(), &home);
+    let refresh = refresh
+        .env("STOW_VERIFY_MODE", "mock-key")
+        .env("STOW_MOCK_PUBLIC_KEY_PATH", &public_key_path)
+        .output()
+        .expect("refresh fill_cache slice");
+    assert!(
+        refresh.status.success(),
+        "fill_cache setup failed:\n{}",
+        String::from_utf8_lossy(&refresh.stderr)
+    );
+    let supersede = plain_build(
+        dir.path(),
+        cargo_home.path(),
+        &shim,
+        &stack.url,
+        fill_cache.path(),
+        &home,
+        &dir.path().join("supersede-target"),
+        &[
+            ("STOW_VERIFY_MODE", Path::new("mock-key")),
+            ("STOW_MOCK_PUBLIC_KEY_PATH", public_key_path.as_path()),
+        ],
+    );
+    assert!(
+        supersede.status.success(),
+        "supersede build failed:\n{}",
+        String::from_utf8_lossy(&supersede.stderr)
+    );
+    assert!(
+        !entry.exists(),
+        "transitional local-crates-io/ entry must be retired once crates-io/ serves it"
+    );
+    let promoted = entry_dir(&fill_cache.path().join("crates-io"), &unit.relative_dir);
+    assert!(promoted.join("manifest.json").is_file());
 }

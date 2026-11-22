@@ -53,11 +53,22 @@ use super::session::{SessionEnd, SessionFacts, SessionId, os_bytes};
 /// The protocol number this build speaks. Bumped when a message changes
 /// in a way an older peer cannot read. Protocols 2 and 3 were never
 /// released.
-pub const PROTOCOL: u16 = 4;
+pub const PROTOCOL: u16 = 5;
 
 /// The oldest protocol number this build still reads. A daemon serves
 /// `PROTOCOL_FLOOR..=PROTOCOL`.
 pub const PROTOCOL_FLOOR: u16 = 4;
+
+/// Feature gates keyed by negotiated protocol version.
+pub mod gates {
+    use super::Negotiated;
+
+    /// Whether the negotiated protocol carries [`super::ControlRequest::Stop`].
+    #[must_use]
+    pub const fn can_stop(at: Negotiated) -> bool {
+        at.protocol() >= 5
+    }
+}
 
 /// The first protocol whose daemons give way to a newer stow when asked.
 ///
@@ -258,6 +269,9 @@ pub enum ControlRequest {
     /// The build is over: drain the session's bookkeeping, write its miss
     /// journal and close it.
     EndSession,
+    /// Drain open sessions, checkpoint and close every state/tier catalog,
+    /// release the endpoint and lock, and exit.
+    Stop,
 }
 
 /// What a wrapper asks of its session.
@@ -325,6 +339,9 @@ pub enum Response {
     Working,
     /// The answer to a [`WrapperRequest`].
     Answer(crate::daemon::wrapper::Answer),
+    /// The answer to [`ControlRequest::Stop`]: the daemon has begun draining
+    /// to exit without starting a successor.
+    Stopped,
 }
 
 impl Response {
