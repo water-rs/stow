@@ -1,0 +1,20 @@
+name: Drain stow daemon before archiving cache
+description: >-
+  Registers a post-job hook that drains the running stow-daemon, enforces any
+  configured byte ceiling on local-crates-io/, and checkpoints SQLite WALs
+  before actions/cache archives the local tiers.
+inputs:
+  stow-bin:
+    description: Absolute path to the installed stow executable.
+    required: true
+  local-crates-io-max-bytes:
+    description: >-
+      Optional byte ceiling passed to `stow daemon stop --local-crates-io-max-bytes`.
+      Empty disables tier-specific capping.
+    required: false
+    default: ""
+runs:
+  using: node24
+  main: noop.mjs
+  post: drain.mjs
+  post-if: always()
