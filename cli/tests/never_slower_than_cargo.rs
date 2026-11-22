@@ -624,10 +624,10 @@ fn a_tripped_circuit_still_serves_local_entries() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let pool = state_db_pool(&cache.path().join("state-v3.sqlite3"));
+    let tier_pool = state_db_pool(&cache.path().join("local-crates-io/catalog-v1.sqlite3"));
     assert_eq!(
         state_db_query_i64(
-            &pool,
+            &tier_pool,
             "SELECT count(*) FROM artifact_cache_entries WHERE provenance = 'local'"
         ),
         1,
@@ -637,6 +637,7 @@ fn a_tripped_circuit_still_serves_local_entries() {
     // Trip the breaker exactly the way a run of fetch failures would. The
     // window must not disable the local cache — a local hit never reaches the
     // network, so it keeps paying off through the outage that tripped it.
+    let pool = state_db_pool(&cache.path().join("state-v3.sqlite3"));
     let tripped_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock")
@@ -1097,15 +1098,16 @@ fn a_disabled_public_cache_still_serves_local_entries() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let pool = state_db_pool(&cache.path().join("state-v3.sqlite3"));
+    let tier_pool = state_db_pool(&cache.path().join("local-crates-io/catalog-v1.sqlite3"));
     assert_eq!(
         state_db_query_i64(
-            &pool,
+            &tier_pool,
             "SELECT count(*) FROM artifact_cache_entries WHERE provenance = 'local'"
         ),
         1,
         "the passthrough build must store cfg-if as a local entry"
     );
+    let pool = state_db_pool(&cache.path().join("state-v3.sqlite3"));
 
     // Second build, fresh target dir, local-only mode still set: cfg-if is served
     // from the local entry — it is not a public artifact.

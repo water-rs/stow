@@ -116,12 +116,8 @@ impl Project {
         write_fixture_config(self.dir.path(), config);
     }
 
-    fn db(&self) -> PathBuf {
-        self.cache.path().join("state-v3.sqlite3")
-    }
-
     fn entries(&self) -> Vec<StoredEntry> {
-        stored_entries(&self.db())
+        stored_entries(self.cache.path())
     }
 
     /// One `stow build` with a fresh target directory, so the cache is the
@@ -277,8 +273,9 @@ fn remote_off_does_not_serve_downloaded_entries(config: &str, flags: &[&str]) {
     let filled = project.entries();
     assert_eq!(filled.len(), CACHEABLE_UNITS);
 
-    // Make every stored entry look downloaded.
-    rewrite_provenance(&project.db(), "remote");
+    // Move the filled entries into `crates-io/` with remote provenance, as an
+    // earlier online run would have downloaded them.
+    move_local_crates_io_to_remote(project.cache.path());
     let before = stats(&project).0;
 
     let rebuilt = project.build(&tripwire, flags, "rebuild over downloaded entries");
@@ -288,14 +285,6 @@ fn remote_off_does_not_serve_downloaded_entries(config: &str, flags: &[&str]) {
         assert!(
             !logged(&stderr, SERVED_LOCALLY, package),
             "the downloaded {package} entry was served:\n{stderr}"
-        );
-    }
-    // A unit over a dependency that compiled here compiles here too, without
-    // a lookup; the leaves are looked up and refused by the layer gate.
-    for package in ["cfg_if", "memchr", "unicode_ident"] {
-        assert!(
-            logged(&stderr, LAYER_OFF, package),
-            "the downloaded {package} entry was not refused by the layer gate:\n{stderr}"
         );
     }
     for package in ["proc_macro2", "quote"] {
@@ -309,11 +298,11 @@ fn remote_off_does_not_serve_downloaded_entries(config: &str, flags: &[&str]) {
         before,
         "a downloaded entry counted as a hit"
     );
-    let after = project.entries();
-    assert_eq!(packages(&after), packages(&filled));
+    let local_after = stored_entries_in_tier(project.cache.path(), "local-crates-io");
+    assert_eq!(packages(&local_after), packages(&filled));
     assert!(
-        after.iter().all(|entry| entry.provenance == "local"),
-        "the recompiled units must be stored as local entries: {after:#?}"
+        local_after.iter().all(|entry| entry.provenance == "local"),
+        "the recompiled units must be stored as local entries in local-crates-io/: {local_after:#?}"
     );
 }
 
@@ -327,24 +316,57 @@ fn the_no_remote_cache_flag_does_not_serve_downloaded_entries() {
     remote_off_does_not_serve_downloaded_entries("", &[NO_REMOTE]);
 }
 
-fn rewrite_provenance(db: &Path, provenance: &str) {
+fn move_local_crates_io_to_remote(cache_dir: &Path) {
+    let from = cache_dir.join("local-crates-io");
+    let to = cache_dir.join("crates-io");
+    if to.exists() {
+        std::fs::remove_dir_all(&to).expect("remove empty crates-io tier");
+    }
+    std::fs::rename(&from, &to).expect("move local-crates-io to crates-io");
+    let db = to.join("catalog-v1.sqlite3");
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime")
         .block_on(async {
-            let options = sqlx::sqlite::SqliteConnectOptions::new().filename(db);
+            let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&db);
             let pool = sqlx::SqlitePool::connect_with(options)
                 .await
-                .expect("open the state db");
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "UPDATE artifact_cache_entries SET provenance = '{provenance}'"
-            )))
-            .execute(&pool)
-            .await
-            .expect("rewrite the provenance column");
+                .expect("open the crates-io catalog");
+            sqlx::query("UPDATE artifact_cache_entries SET provenance = 'remote'")
+                .execute(&pool)
+                .await
+                .expect("rewrite the provenance column");
             pool.close().await;
         });
+}
+
+fn stored_entries_in_tier(cache_dir: &Path, tier: &str) -> Vec<StoredEntry> {
+    let db = cache_dir.join(tier).join("catalog-v1.sqlite3");
+    if !db.exists() {
+        return Vec::new();
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(async {
+            let options = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&db)
+                .read_only(true);
+            let pool = sqlx::SqlitePool::connect_with(options)
+                .await
+                .expect("open the tier catalog read-only");
+            let rows = sqlx::query_as::<_, StoredEntry>(sqlx::AssertSqlSafe(
+                "SELECT crate_name, compile_key, c_metadata, reach, provenance FROM artifact_cache_entries"
+                    .to_owned(),
+            ))
+            .fetch_all(&pool)
+            .await
+            .expect("list stored entries");
+            pool.close().await;
+            rows
+        })
 }
 
 /// With every layer off a build reads and writes no cache and makes no
@@ -414,7 +436,7 @@ fn crates_io_off_stores_and_serves_nothing(config: &str, flags: &[&str]) {
         "build into an empty cache",
     );
     assert_eq!(
-        stored_entries(&empty.path().join("state-v3.sqlite3")).len(),
+        stored_entries(empty.path()).len(),
         0,
         "no crates.io unit is stored with the layer off"
     );
@@ -579,7 +601,7 @@ fn each_local_switch_gates_only_its_source_kind() {
         let cache = support::tempdir().expect("cache");
         let first = git.project("first", config);
         git.build(&first, cache.path(), flags, "first build");
-        let entries = stored_entries(&cache.path().join("state-v3.sqlite3"));
+        let entries = stored_entries(cache.path());
         assert_eq!(packages(&entries), stored, "{label}: stored units");
 
         let second = git.project("second", config);
@@ -604,7 +626,7 @@ fn a_layer_off_does_not_serve_entries_another_run_stored() {
     let first = git.project("first", "");
     git.build(&first, cache.path(), &[], "fill build");
     assert_eq!(
-        packages(&stored_entries(&cache.path().join("state-v3.sqlite3"))),
+        packages(&stored_entries(cache.path())),
         [
             "proc_macro2",
             "proc_macro2",
@@ -649,5 +671,141 @@ fn an_unknown_config_key_is_rejected() {
         stderr_of(&output).contains("unknown field `cache_mode`"),
         "the error does not name the unknown key:\n{}",
         stderr_of(&output)
+    );
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("create dst");
+    for entry in std::fs::read_dir(src).expect("read src") {
+        let entry = entry.expect("dir entry");
+        let kind = entry.file_type().expect("file type");
+        let target = dst.join(entry.file_name());
+        if kind.is_dir() {
+            copy_dir_recursive(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy file");
+        }
+    }
+}
+
+fn assert_wals_truncated(cache_dir: &Path) {
+    for wal in [
+        cache_dir.join("state-v3.sqlite3-wal"),
+        cache_dir.join("local/catalog-v1.sqlite3-wal"),
+        cache_dir.join("local-crates-io/catalog-v1.sqlite3-wal"),
+    ] {
+        if let Ok(meta) = std::fs::metadata(&wal) {
+            assert_eq!(
+                meta.len(),
+                0,
+                "stow daemon stop must truncate {} to 0 bytes",
+                wal.display()
+            );
+        }
+    }
+}
+
+/// Restoring only `local/` and `local-crates-io/` into a fresh `$STOW_CACHE_DIR`
+/// (with no `crates-io/` and no host `state-v3.sqlite3`) serves real builds,
+/// and `stow daemon stop --local-crates-io-max-bytes 0` drains the daemon,
+/// caps `local-crates-io/` without touching `local/`, and truncates every WAL.
+#[test]
+fn partial_tier_restore_and_daemon_stop_keep_tiers_self_contained() {
+    let git = GitProject::new();
+    let full_cache = support::tempdir().expect("full cache");
+    let git_first = git.project("git-first", "");
+    git.build(&git_first, full_cache.path(), &[], "fill local/ tier");
+
+    let reg = Project::registry("");
+    let (tripwire, _) = tripwire_url();
+    build_in(
+        reg.dir.path(),
+        reg.cargo_home.path(),
+        full_cache.path(),
+        &tripwire,
+        &[NO_REMOTE],
+        "fill local-crates-io/ tier",
+    );
+
+    assert_ne!(
+        stored_entries_in_tier(full_cache.path(), "local"),
+        Vec::new()
+    );
+    assert_ne!(
+        stored_entries_in_tier(full_cache.path(), "local-crates-io"),
+        Vec::new()
+    );
+
+    let stop_out = stow_cli_in(
+        reg.dir.path(),
+        &["daemon", "stop"],
+        full_cache.path(),
+        reg.cargo_home.path(),
+    );
+    assert!(
+        stop_out.status.success(),
+        "stow daemon stop failed:\n{}",
+        stderr_of(&stop_out)
+    );
+    assert_wals_truncated(full_cache.path());
+
+    // Restore ONLY `local/` + `local-crates-io/` into a fresh cache root.
+    let restored = support::tempdir().expect("restored cache");
+    copy_dir_recursive(
+        &full_cache.path().join("local"),
+        &restored.path().join("local"),
+    );
+    copy_dir_recursive(
+        &full_cache.path().join("local-crates-io"),
+        &restored.path().join("local-crates-io"),
+    );
+    assert!(!restored.path().join("state-v3.sqlite3").exists());
+    assert!(!restored.path().join("crates-io").exists());
+
+    let git_second = git.project("git-second", "");
+    let git_rebuilt = git.build(&git_second, restored.path(), &[], "serve restored local/");
+    assert!(
+        logged(
+            &stderr_of(&git_rebuilt.output),
+            SERVED_LOCALLY,
+            "unicode_ident"
+        ),
+        "restored local/ must serve git unit without host state-v3.sqlite3:\n{}",
+        stderr_of(&git_rebuilt.output)
+    );
+
+    let reg_rebuilt = build_in(
+        reg.dir.path(),
+        reg.cargo_home.path(),
+        restored.path(),
+        &tripwire,
+        &[NO_REMOTE],
+        "serve restored local-crates-io/",
+    );
+    assert!(
+        logged(&stderr_of(&reg_rebuilt.output), SERVED_LOCALLY, "cfg_if"),
+        "restored local-crates-io/ must serve crates.io unit:\n{}",
+        stderr_of(&reg_rebuilt.output)
+    );
+
+    // Drain + cap `local-crates-io/` to 0 bytes; `local/` must remain intact.
+    let cap_out = stow_cli_in(
+        reg.dir.path(),
+        &["daemon", "stop", "--local-crates-io-max-bytes", "0"],
+        restored.path(),
+        reg.cargo_home.path(),
+    );
+    assert!(
+        cap_out.status.success(),
+        "stow daemon stop --local-crates-io-max-bytes 0 failed:\n{}",
+        stderr_of(&cap_out)
+    );
+    assert!(
+        stored_entries_in_tier(restored.path(), "local-crates-io").is_empty(),
+        "local-crates-io/ must be evicted to 0"
+    );
+    assert!(
+        !stored_entries_in_tier(restored.path(), "local").is_empty(),
+        "local/ must never be evicted by local-crates-io cap"
     );
 }

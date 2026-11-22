@@ -346,33 +346,38 @@ pub struct StoredEntry {
     pub provenance: String,
 }
 
-/// Every entry the state db at `db` stores; empty when the build stored
-/// nothing and so never created the db.
+/// Every entry the tier catalogs under `cache_dir` store; empty when the
+/// build stored nothing and so never created the catalogs.
 #[allow(dead_code)] // only the local-only fixtures read the store
-pub fn stored_entries(db: &Path) -> Vec<StoredEntry> {
-    if !db.exists() {
-        return Vec::new();
-    }
+pub fn stored_entries(cache_dir: &Path) -> Vec<StoredEntry> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime")
         .block_on(async {
-            let options = sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(db)
-                .read_only(true);
-            let pool = sqlx::SqlitePool::connect_with(options)
+            let mut all = Vec::new();
+            for tier in ["crates-io", "local-crates-io", "local"] {
+                let db = cache_dir.join(tier).join("catalog-v1.sqlite3");
+                if !db.exists() {
+                    continue;
+                }
+                let options = sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&db)
+                    .read_only(true);
+                let pool = sqlx::SqlitePool::connect_with(options)
+                    .await
+                    .expect("open the tier catalog read-only");
+                let rows = sqlx::query_as::<_, StoredEntry>(sqlx::AssertSqlSafe(
+                    "SELECT crate_name, compile_key, c_metadata, reach, provenance FROM artifact_cache_entries"
+                        .to_owned(),
+                ))
+                .fetch_all(&pool)
                 .await
-                .expect("open the state db read-only");
-            let rows = sqlx::query_as::<_, StoredEntry>(sqlx::AssertSqlSafe(
-                "SELECT crate_name, compile_key, c_metadata, reach, provenance FROM artifact_cache_entries"
-                    .to_owned(),
-            ))
-            .fetch_all(&pool)
-            .await
-            .expect("list stored entries");
-            pool.close().await;
-            rows
+                .expect("list stored entries");
+                pool.close().await;
+                all.extend(rows);
+            }
+            all
         })
 }
 

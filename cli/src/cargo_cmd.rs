@@ -5970,7 +5970,10 @@ mod tests {
         )
         .expect("write lockfile");
         let config = test_config(cache.path());
-        let pool = config.state_db_pool().await.expect("state db pool");
+        let pool = config
+            .tier_db_pool(crate::state_db::CacheTier::LocalCratesIo)
+            .await
+            .expect("local-crates-io tier db pool");
         sqlx::query(sqlx::AssertSqlSafe(
             "INSERT INTO artifact_cache_entries \
              (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, \

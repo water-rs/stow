@@ -6,12 +6,72 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use stow_types::error::Context;
-use tokio::sync::OnceCell;
+use stow_types::public_cache::Reach;
 
 const STATE_DB_FILE_NAME: &str = "state-v3.sqlite3";
+pub const TIER_CATALOG_FILE_NAME: &str = "catalog-v1.sqlite3";
+
+/// One of the three self-contained artifact cache directories under
+/// `~/.stow` (`$STOW_CACHE_DIR`), ordered in eviction priority from first
+/// evicted (`CratesIo`) to last evicted (`Local`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CacheTier {
+    /// Downloaded bundles from the signed public cache (`~/.stow/crates-io/`).
+    CratesIo,
+    /// Locally compiled `Reach::Public` `crates.io` misses awaiting public
+    /// publication (`~/.stow/local-crates-io/`).
+    LocalCratesIo,
+    /// Locally compiled `Reach::LocalOnly` units and `cc/` objects that
+    /// never enter the public cache (`~/.stow/local/`).
+    Local,
+}
+
+impl CacheTier {
+    /// Every tier in eviction order (`CratesIo`, `LocalCratesIo`, `Local`).
+    pub const ALL: [Self; 3] = [Self::CratesIo, Self::LocalCratesIo, Self::Local];
+
+    /// Subdirectory name under `$STOW_CACHE_DIR`.
+    #[must_use]
+    pub const fn dir_name(self) -> &'static str {
+        match self {
+            Self::CratesIo => "crates-io",
+            Self::LocalCratesIo => "local-crates-io",
+            Self::Local => "local",
+        }
+    }
+
+    /// Dense array slot (`0..3`) matching [`Self::ALL`].
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::CratesIo => 0,
+            Self::LocalCratesIo => 1,
+            Self::Local => 2,
+        }
+    }
+
+    /// Which local tier a locally compiled rustc unit belongs to.
+    #[must_use]
+    pub const fn for_local_reach(reach: Reach) -> Self {
+        match reach {
+            Reach::Public => Self::LocalCratesIo,
+            Reach::LocalOnly => Self::Local,
+        }
+    }
+}
 
 pub fn state_db_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(STATE_DB_FILE_NAME)
+}
+
+#[must_use]
+pub fn tier_dir(cache_dir: &Path, tier: CacheTier) -> PathBuf {
+    cache_dir.join(tier.dir_name())
+}
+
+#[must_use]
+pub fn tier_db_path(cache_dir: &Path, tier: CacheTier) -> PathBuf {
+    tier_dir(cache_dir, tier).join(TIER_CATALOG_FILE_NAME)
 }
 
 /// Whether a top-level file name in `cache_dir` belongs to the SQLite state
@@ -41,17 +101,16 @@ pub async fn remove_state_db_files(cache_dir: &Path) -> stow_types::error::Resul
     Ok(())
 }
 
-/// Clear every cached-artifact, C/C++ object, build-dir, materialized-output,
-/// negative-cache and lockfile-graph row while keeping `crate_stats`,
-/// `metadata_values`, `circuit_state` and `link_resolution_cache` intact.
+/// Clear every ephemeral host-state row (`build_directories`,
+/// `materialized_outputs`, `negative_cache_entries` and
+/// `lockfile_graph_cache`) while keeping `crate_stats`, `metadata_values`,
+/// `circuit_state` and `link_resolution_cache` intact.
 pub async fn clear_cached_entries(pool: &SqlitePool) -> stow_types::error::Result<()> {
     let mut tx = pool
         .begin()
         .await
         .wrap_err("begin state database clean transaction")?;
     for statement in [
-        "DELETE FROM artifact_cache_entries",
-        "DELETE FROM cc_cache_entries",
         "DELETE FROM build_directories",
         "DELETE FROM materialized_outputs",
         "DELETE FROM negative_cache_entries",
@@ -67,104 +126,304 @@ pub async fn clear_cached_entries(pool: &SqlitePool) -> stow_types::error::Resul
         .wrap_err("commit state database clean transaction")
 }
 
-/// The process's one handle on the state database.
+#[derive(Debug, Default)]
+enum PoolSlot {
+    #[default]
+    Unopened,
+    Open {
+        pool: SqlitePool,
+        identity: Arc<same_file::Handle>,
+    },
+    Closed,
+}
+
+#[derive(Debug, Default)]
+struct StateDbInner {
+    host: tokio::sync::Mutex<PoolSlot>,
+    tiers: [tokio::sync::Mutex<PoolSlot>; 3],
+}
+
+async fn file_identity(path: &Path) -> std::io::Result<Arc<same_file::Handle>> {
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || same_file::Handle::from_path(owned).map(Arc::new))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+/// The process's one handle on the host state database and the three
+/// self-contained tier catalogs (`crates-io/`, `local-crates-io/`, `local/`).
 ///
 /// The command entry point creates it, every config the process loads
 /// carries a clone, and the entry point closes it once the command's
 /// future has finished. One handle, because a process that opened a pool
 /// per loaded config held connections nothing could enumerate, and a
 /// connection still open when the process exits breaks the next one on
-/// Windows: the next opener of a WAL database truncates its `-shm` file
-/// while the dying process still has it mapped, and `SQLite` answers
-/// `SQLITE_IOERR_TRUNCATE` — "disk I/O error" — where a process that
-/// closed its connection first never causes it (stow#682).
-///
-/// The cell holds `Some` once the pool is open and `None` once the handle
-/// is closed. Closing is final: a later [`Self::pool`] fails rather than
-/// reopen a database nothing is left to close.
+/// Windows (stow#682).
 #[derive(Debug, Clone, Default)]
-pub struct StateDb(Arc<OnceCell<Option<SqlitePool>>>);
+pub struct StateDb(Arc<StateDbInner>);
 
 impl StateDb {
     /// A handle closed from the start, for a process that has no state
-    /// database: `stow-build` loads a config through
-    /// [`crate::build_consume`] to read the index and verify bundles,
-    /// never opens the database, and has no entry point here to close
-    /// one. A use fails the way a use after [`Self::close`] does, rather
-    /// than open a connection nothing would close (stow#682).
+    /// database (`stow-build`, stow#682).
     pub fn closed() -> Self {
-        Self(Arc::new(OnceCell::from(None)))
+        Self(Arc::new(StateDbInner {
+            host: tokio::sync::Mutex::new(PoolSlot::Closed),
+            tiers: std::array::from_fn(|_| tokio::sync::Mutex::new(PoolSlot::Closed)),
+        }))
     }
 
-    /// The pool, opened for `cache_dir` on the first call and shared by
-    /// every later one, so the hot path pays the connect and the schema
-    /// pass once per process.
+    /// The host runtime pool (`state-v3.sqlite3`), opened on first call and
+    /// shared by every later one while the underlying file on disk stays the
+    /// same inode/handle.
     ///
     /// # Errors
     ///
     /// Whatever opening the database fails with, and any use after
     /// [`Self::close`].
     pub async fn pool(&self, cache_dir: &Path) -> stow_types::error::Result<SqlitePool> {
-        self.0
-            .get_or_try_init(|| async { connect_pool(cache_dir).await.map(Some) })
-            .await?
-            .clone()
-            .ok_or_else(|| stow_types::stow_error!("the state database was closed before this use"))
+        let mut slot = self.0.host.lock().await;
+        let path = state_db_path(cache_dir);
+        match &*slot {
+            PoolSlot::Closed => {
+                return Err(stow_types::stow_error!(
+                    "the state database was closed before this use"
+                ));
+            }
+            PoolSlot::Open { pool, identity } => {
+                if let Ok(current) = file_identity(&path).await
+                    && current == *identity
+                {
+                    return Ok(pool.clone());
+                }
+                pool.close().await;
+                *slot = PoolSlot::Unopened;
+            }
+            PoolSlot::Unopened => {}
+        }
+        let pool = connect_pool(cache_dir).await?;
+        let identity = file_identity(&path)
+            .await
+            .wrap_err_with(|| format!("identify {}", path.display()))?;
+        *slot = PoolSlot::Open {
+            pool: pool.clone(),
+            identity,
+        };
+        drop(slot);
+        Ok(pool)
     }
 
-    /// Close the pool and refuse every later [`Self::pool`].
+    /// The `SQLite` pool of `tier`'s self-contained catalog
+    /// (`<cache_dir>/<tier>/catalog-v1.sqlite3`), creating it on first write
+    /// and reopening if the file on disk was removed or replaced.
     ///
-    /// Claiming the cell waits for an open that is in flight, so a
-    /// connect racing the close is closed too; a handle that was never
-    /// opened becomes closed without opening anything. Before the pool
-    /// lets go, a WAL grown past [`WAL_RESET_BYTES`] is truncated — the
-    /// close is the one place a database whose processes are each its
-    /// only connection ever sheds it (stow#687).
-    pub async fn close(&self) {
-        if let Some(pool) = self.0.get_or_init(|| async { None }).await {
-            // Logged and not returned: the close runs after the
-            // command's result is decided, that result is the
-            // caller's, and the next close meets the same WAL and
-            // tries again.
-            if let Err(error) = reset_grown_wal(pool).await {
-                tracing::warn!(error = %error, "the state database's WAL was not reset");
+    /// # Errors
+    ///
+    /// Whatever opening the catalog fails with, and any use after
+    /// [`Self::close`].
+    pub async fn tier_pool(
+        &self,
+        cache_dir: &Path,
+        tier: CacheTier,
+    ) -> stow_types::error::Result<SqlitePool> {
+        let mut slot = self.0.tiers[tier.index()].lock().await;
+        let path = tier_db_path(cache_dir, tier);
+        match &*slot {
+            PoolSlot::Closed => {
+                return Err(stow_types::stow_error!(
+                    "the state database was closed before this use"
+                ));
             }
-            pool.close().await;
+            PoolSlot::Open { pool, identity } => {
+                if let Ok(current) = file_identity(&path).await
+                    && current == *identity
+                {
+                    return Ok(pool.clone());
+                }
+                pool.close().await;
+                *slot = PoolSlot::Unopened;
+            }
+            PoolSlot::Unopened => {}
         }
+        let pool = connect_tier_pool(cache_dir, tier).await?;
+        let identity = file_identity(&path)
+            .await
+            .wrap_err_with(|| format!("identify {}", path.display()))?;
+        *slot = PoolSlot::Open {
+            pool: pool.clone(),
+            identity,
+        };
+        drop(slot);
+        Ok(pool)
+    }
+
+    /// Open `tier`'s catalog only when `<cache_dir>/<tier>/catalog-v1.sqlite3`
+    /// already exists on disk, leaving the slot unopened when absent so
+    /// read-only probes never create empty tier directories and a later store
+    /// can still create the catalog.
+    ///
+    /// # Errors
+    ///
+    /// Stat/open failures, schema mismatches, and any use after [`Self::close`].
+    pub async fn existing_tier_pool(
+        &self,
+        cache_dir: &Path,
+        tier: CacheTier,
+    ) -> stow_types::error::Result<Option<SqlitePool>> {
+        let mut slot = self.0.tiers[tier.index()].lock().await;
+        let path = tier_db_path(cache_dir, tier);
+        match &*slot {
+            PoolSlot::Closed => {
+                return Err(stow_types::stow_error!(
+                    "the state database was closed before this use"
+                ));
+            }
+            PoolSlot::Open { pool, identity } => match file_identity(&path).await {
+                Ok(current) if current == *identity => return Ok(Some(pool.clone())),
+                Ok(_) => {
+                    pool.close().await;
+                    *slot = PoolSlot::Unopened;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    pool.close().await;
+                    *slot = PoolSlot::Unopened;
+                    return Ok(None);
+                }
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| format!("stat {}", path.display()));
+                }
+            },
+            PoolSlot::Unopened => match file_identity(&path).await {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| format!("stat {}", path.display()));
+                }
+            },
+        }
+        let pool = connect_tier_pool(cache_dir, tier).await?;
+        let identity = file_identity(&path)
+            .await
+            .wrap_err_with(|| format!("identify {}", path.display()))?;
+        *slot = PoolSlot::Open {
+            pool: pool.clone(),
+            identity,
+        };
+        drop(slot);
+        Ok(Some(pool))
+    }
+
+    /// Close every opened pool and refuse every later open, truncating any
+    /// WAL grown past [`WAL_RESET_BYTES`] (stow#687).
+    pub async fn close(&self) {
+        self.close_inner(false).await;
+    }
+
+    /// Checkpoint and truncate the WAL of every opened pool regardless of
+    /// size, then close every pool — used when draining the daemon before
+    /// archiving tier directories.
+    pub async fn checkpoint_and_close(&self) {
+        self.close_inner(true).await;
+    }
+
+    /// Close only the per-tier pools (`crates-io/`, `local-crates-io/`,
+    /// `local/`) and leave them reopenable so `stow clean` can remove tier
+    /// directories on Windows while leaving the host `state-v3.sqlite3`
+    /// handle usable.
+    pub async fn close_tiers(&self) {
+        let [t0, t1, t2] = &self.0.tiers;
+        tokio::join!(
+            reset_pool_slot(t0),
+            reset_pool_slot(t1),
+            reset_pool_slot(t2),
+        );
+    }
+
+    async fn close_inner(&self, force_truncate: bool) {
+        let [t0, t1, t2] = &self.0.tiers;
+        tokio::join!(
+            close_pool_slot(&self.0.host, force_truncate),
+            close_pool_slot(t0, force_truncate),
+            close_pool_slot(t1, force_truncate),
+            close_pool_slot(t2, force_truncate),
+        );
     }
 }
 
-/// The state database's one schema — the shape every database at
-/// `state_db_path` was created with. A schema change is a new database,
-/// never a repair of the old one.
+async fn reset_pool_slot(mutex: &tokio::sync::Mutex<PoolSlot>) {
+    let mut slot = mutex.lock().await;
+    if let PoolSlot::Open { pool, .. } = std::mem::replace(&mut *slot, PoolSlot::Unopened) {
+        pool.close().await;
+    }
+}
+
+async fn close_pool_slot(mutex: &tokio::sync::Mutex<PoolSlot>, force_truncate: bool) {
+    let mut slot = mutex.lock().await;
+    if let PoolSlot::Open { pool, .. } = std::mem::replace(&mut *slot, PoolSlot::Closed) {
+        let outcome = if force_truncate {
+            truncate_wal(&pool).await
+        } else {
+            reset_grown_wal(&pool).await
+        };
+        if let Err(error) = outcome {
+            tracing::warn!(error = %error, "the state database's WAL was not reset");
+        }
+        pool.close().await;
+    }
+}
+
+/// Checkpoint and truncate every existing catalog in `cache_dir` so on-disk
+/// `catalog-v1.sqlite3` files hold every committed frame with zero-length
+/// `-wal` sidecars before archiving.
+pub async fn checkpoint_existing_databases(cache_dir: &Path) -> stow_types::error::Result<()> {
+    let state_db = StateDb::default();
+    if state_db_path(cache_dir).exists() {
+        let _ = state_db.pool(cache_dir).await?;
+    }
+    for tier in CacheTier::ALL {
+        let _ = state_db.existing_tier_pool(cache_dir, tier).await?;
+    }
+    state_db.checkpoint_and_close().await;
+    Ok(())
+}
+
+/// The host state database's one schema.
 const SCHEMA_SQL: &str = include_str!("state-db-schema.sql");
+/// Each tier catalog's self-contained schema.
+const TIER_SCHEMA_SQL: &str = include_str!("tier-catalog-schema.sql");
 
 /// The schema's identity — the first four bytes of the file's blake3
 /// digest as a nonzero `i32`, stamped into `PRAGMA user_version` when a
 /// database is created and compared on every open. `| 1` keeps the value
 /// off `0`, which is what an unstamped database reads.
-fn schema_identity() -> i32 {
-    let digest = blake3::hash(SCHEMA_SQL.as_bytes());
+fn schema_identity_of(sql: &str) -> i32 {
+    let digest = blake3::hash(sql.as_bytes());
     let mut bytes = [0u8; 4];
     bytes.copy_from_slice(&digest.as_bytes()[..4]);
     i32::from_le_bytes(bytes) | 1
 }
 
-/// Open the state `SQLite` pool. Callers go through [`StateDb::pool`] —
-/// it opens once per process, so the hot path doesn't pay schema
-/// work per invocation, and it is the handle the process closes.
-///
-/// The database carries the schema's identity in `user_version`, stamped
-/// at creation. An open whose stamp differs — including a database an
-/// older stow created before the stamp existed — fails fast and names
-/// the remedy (`stow clean` removes the directory whole): the state is
-/// a cache, so a shape the build does not recognize is discarded
-/// whole, never repaired in place. Only a provably fresh database — no
-/// user tables and an unstamped `user_version` — gets the schema and
-/// the stamp.
+#[cfg(test)]
+fn schema_identity() -> i32 {
+    schema_identity_of(SCHEMA_SQL)
+}
+
 #[tracing::instrument(name = "stow.sqlite.connect", skip_all)]
 async fn connect_pool(cache_dir: &Path) -> stow_types::error::Result<SqlitePool> {
-    let path = state_db_path(cache_dir);
+    connect_db_at(&state_db_path(cache_dir), SCHEMA_SQL).await
+}
+
+#[tracing::instrument(name = "stow.sqlite.connect_tier", skip_all)]
+async fn connect_tier_pool(
+    cache_dir: &Path,
+    tier: CacheTier,
+) -> stow_types::error::Result<SqlitePool> {
+    connect_db_at(&tier_db_path(cache_dir, tier), TIER_SCHEMA_SQL).await
+}
+
+async fn connect_db_at(
+    path: &Path,
+    schema_sql: &'static str,
+) -> stow_types::error::Result<SqlitePool> {
     if let Some(parent) = path.parent() {
         async_fs::create_dir_all(parent)
             .await
@@ -184,7 +443,7 @@ async fn connect_pool(cache_dir: &Path) -> stow_types::error::Result<SqlitePool>
         .connect_with(options)
         .await
         .wrap_err_with(|| format!("open state db {}", path.display()))?;
-    match ensure_schema(&pool, &path).await {
+    match ensure_schema(&pool, path, schema_sql).await {
         Ok(()) => Ok(pool),
         Err(error) => {
             // A dropped pool closes its connection in the background, and
@@ -196,14 +455,19 @@ async fn connect_pool(cache_dir: &Path) -> stow_types::error::Result<SqlitePool>
     }
 }
 
-/// Accepts a database stamped with this build's schema identity, creates
-/// the schema in an empty one, and refuses anything else.
-async fn ensure_schema(pool: &SqlitePool, path: &Path) -> stow_types::error::Result<()> {
+/// Accepts a database stamped with `schema_sql`'s identity, creates the
+/// schema in an empty one, and refuses anything else.
+async fn ensure_schema(
+    pool: &SqlitePool,
+    path: &Path,
+    schema_sql: &'static str,
+) -> stow_types::error::Result<()> {
+    let expected = schema_identity_of(schema_sql);
     let stamped: i32 = sqlx::query_scalar("PRAGMA user_version")
         .fetch_one(pool)
         .await
         .wrap_err_with(|| format!("read schema identity of {}", path.display()))?;
-    if stamped == schema_identity() {
+    if stamped == expected {
         return Ok(());
     }
     // Wrappers of one cold build open a fresh database at once: the
@@ -217,7 +481,7 @@ async fn ensure_schema(pool: &SqlitePool, path: &Path) -> stow_types::error::Res
         .fetch_one(&mut *transaction)
         .await
         .wrap_err_with(|| format!("read schema identity of {}", path.display()))?;
-    if stamped == schema_identity() {
+    if stamped == expected {
         transaction
             .commit()
             .await
@@ -238,13 +502,12 @@ async fn ensure_schema(pool: &SqlitePool, path: &Path) -> stow_types::error::Res
             path.display()
         ));
     }
-    sqlx::raw_sql(SCHEMA_SQL)
+    sqlx::raw_sql(schema_sql)
         .execute(&mut *transaction)
         .await
         .wrap_err_with(|| format!("initialize state db schema {}", path.display()))?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "PRAGMA user_version = {}",
-        schema_identity()
+        "PRAGMA user_version = {expected}"
     )))
     .execute(&mut *transaction)
     .await
@@ -354,6 +617,18 @@ async fn reset_grown_wal(pool: &SqlitePool) -> stow_types::error::Result<()> {
     if metadata.len() < WAL_RESET_BYTES {
         return Ok(());
     }
+    truncate_wal(pool).await
+}
+
+/// Unconditionally run a non-blocking `PRAGMA wal_checkpoint(TRUNCATE)` on
+/// `pool` when its `-wal` file exists.
+async fn truncate_wal(pool: &SqlitePool) -> stow_types::error::Result<()> {
+    let wal = wal_path(pool.connect_options().get_filename());
+    let metadata = match async_fs::metadata(&wal).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).wrap_err_with(|| format!("stat {}", wal.display())),
+    };
 
     let mut connection = pool
         .acquire()
@@ -388,6 +663,15 @@ async fn reset_grown_wal(pool: &SqlitePool) -> stow_types::error::Result<()> {
 #[cfg(test)]
 pub async fn connect(cache_dir: &Path) -> stow_types::error::Result<SqlitePool> {
     connect_pool(cache_dir).await
+}
+
+/// Test-only shim opening `tier`'s catalog directly without a [`StateDb`].
+#[cfg(test)]
+pub async fn connect_tier(
+    cache_dir: &Path,
+    tier: CacheTier,
+) -> stow_types::error::Result<SqlitePool> {
+    connect_tier_pool(cache_dir, tier).await
 }
 
 pub fn now_millis() -> u64 {

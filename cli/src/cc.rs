@@ -7,7 +7,7 @@ use stow_types::error::Context;
 
 use crate::artifact_cache::{LRU_STAMP_INTERVAL_MS, recorded_millis};
 use crate::config::StowConfig;
-use crate::state_db::{db_int, now_millis};
+use crate::state_db::{CacheTier, db_int, now_millis};
 
 /// Which language the compiler shim was invoked for — the two roles resolve
 /// to different POSIX defaults and the same `cl.exe` on Windows.
@@ -460,9 +460,9 @@ pub async fn publish_staged_object(
         .await
         .wrap_err_with(|| format!("stat stored C/C++ object {}", cache_path.display()))?
         .len();
-    let connection = config.state_db_pool().await?;
+    let connection = config.tier_db_pool(CacheTier::Local).await?;
     upsert_cc_cache_entry(&connection, &cache_key, size_bytes, now_millis()).await?;
-    crate::artifact_cache::evict_after_cc_store(config, &connection, &cache_key).await
+    crate::artifact_cache::evict_after_cc_store(config, &cache_key).await
 }
 
 /// The cache path `cache_key` is stored at under `config`.
@@ -858,7 +858,7 @@ async fn record_cc_hit(
     cache_key: &str,
     cache_path: &Path,
 ) -> stow_types::error::Result<()> {
-    let connection = config.state_db_pool().await?;
+    let connection = config.tier_db_pool(CacheTier::Local).await?;
     let stamp: Option<i64> =
         sqlx::query_scalar("SELECT last_accessed_ms FROM cc_cache_entries WHERE cache_key = ?")
             .bind(cache_key)
@@ -1143,6 +1143,8 @@ mod tests {
     use super::{DepfileMode, DepfileTarget, ParsedCcInvocation};
     #[cfg(unix)]
     use crate::config::{StowConfig, VerifyMode};
+    #[cfg(unix)]
+    use crate::state_db::CacheTier;
 
     fn args(values: &[&str]) -> Vec<std::ffi::OsString> {
         values.iter().map(std::ffi::OsString::from).collect()
@@ -1768,9 +1770,9 @@ mod tests {
         )
         .await;
         assert!(object.exists());
-        let pool = crate::state_db::connect(&config.cache_dir)
+        let pool = crate::state_db::connect_tier(&config.cache_dir, CacheTier::Local)
             .await
-            .expect("connect state db");
+            .expect("connect local tier db");
         let row: Option<i64> =
             sqlx::query_scalar("SELECT last_accessed_ms FROM cc_cache_entries WHERE cache_key = ?")
                 .bind(&cache_key)
@@ -1805,9 +1807,9 @@ mod tests {
             store_then_clean(&config, &cc_dir.join(format!("{key}.o")), &output).await;
         }
 
-        let pool = crate::state_db::connect(&config.cache_dir)
+        let pool = crate::state_db::connect_tier(&config.cache_dir, CacheTier::Local)
             .await
-            .expect("connect state db");
+            .expect("connect local tier db");
         let entries = list_cc_cache_keys(&pool).await;
         assert_eq!(
             entries.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -1844,9 +1846,9 @@ mod tests {
         store_then_clean(&config, &first, &output).await;
         store_then_clean(&config, &second, &output).await;
 
-        let pool = crate::state_db::connect(&config.cache_dir)
+        let pool = crate::state_db::connect_tier(&config.cache_dir, CacheTier::Local)
             .await
-            .expect("connect state db");
+            .expect("connect local tier db");
         // `first` starts the pass as the least recently used; the hit
         // must push it behind `second` before `third` is stored. Both
         // stamps are set in the past: a `second` stamped by its store can
