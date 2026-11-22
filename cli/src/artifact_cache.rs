@@ -7181,6 +7181,7 @@ pub mod tests {
         });
     }
 
+    #[cfg(target_os = "macos")]
     async fn resident_logical(pool: &sqlx::SqlitePool) -> u64 {
         list_artifact_cache_entries(pool, "1.91.1")
             .await
