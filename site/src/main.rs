@@ -120,17 +120,21 @@ fn write_page(out: &Path, path: &str, rendered: &str) -> std::io::Result<()> {
 }
 
 fn main() {
-    let out = std::env::args()
-        .nth(1)
-        .map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("dist"), PathBuf::from);
-    let site_key = std::env::var("TURNSTILE_SITE_KEY")
-        .map_or(TURNSTILE_SITE_KEY, |key| Box::leak(key.into_boxed_str()) as &str);
+    let out = std::env::args().nth(1).map_or_else(
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("dist"),
+        PathBuf::from,
+    );
+    let site_key = std::env::var("TURNSTILE_SITE_KEY").map_or(TURNSTILE_SITE_KEY, |key| {
+        Box::leak(key.into_boxed_str()) as &str
+    });
 
     let (repository_url, version, css) = (REPOSITORY_URL, env!("CARGO_PKG_VERSION"), SITE_CSS);
     let pages: &[(&str, String)] = &[
         (
             "index.html",
-            IndexPage::new(site_key).render().expect("index page renders"),
+            IndexPage::new(site_key)
+                .render()
+                .expect("index page renders"),
         ),
         (
             "stats.html",
@@ -156,18 +160,24 @@ fn main() {
         ),
     ];
     for (path, html) in pages {
-        write_page(&out, path, html).unwrap_or_else(|error| {
-            panic!("write {}: {error}", out.join(path).display())
-        });
+        write_page(&out, path, html)
+            .unwrap_or_else(|error| panic!("write {}: {error}", out.join(path).display()));
     }
     for file in STATIC_FILES {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("static").join(file);
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("static")
+            .join(file);
         let target = out.join(file);
         std::fs::copy(&source, &target).unwrap_or_else(|error| {
             panic!("copy {} to {}: {error}", source.display(), target.display())
         });
     }
-    eprintln!("stow-site: rendered {} pages + {} files into {}", pages.len(), STATIC_FILES.len(), out.display());
+    eprintln!(
+        "stow-site: rendered {} pages + {} files into {}",
+        pages.len(),
+        STATIC_FILES.len(),
+        out.display()
+    );
 }
 
 #[cfg(test)]
@@ -178,7 +188,9 @@ mod tests {
     use super::{AUDIT_URL, IndexPage, TURNSTILE_SITE_KEY};
 
     fn render() -> String {
-        IndexPage::new(TURNSTILE_SITE_KEY).render().expect("index page renders")
+        IndexPage::new(TURNSTILE_SITE_KEY)
+            .render()
+            .expect("index page renders")
     }
 
     #[test]
