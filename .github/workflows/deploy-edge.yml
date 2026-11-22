@@ -312,7 +312,7 @@ jobs:
           probes=$((SUITE_REQUESTS / 5))
           probe=0
           for _ in $(seq "$probes"); do
-            for url in "/" \
+            for url in "/api/v1/index/x86_64-unknown-linux-gnu/stable" \
               "/api/v1/crates/serde/versions" \
               "$bundle_probe" \
               "/api/v1/stats" \

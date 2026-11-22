@@ -3,6 +3,7 @@
 node_modules/
 edge/node_modules/
 edge/dist/
+site/dist/
 edge/.skyzen/
 edge/stable-worker*
 .tmp/

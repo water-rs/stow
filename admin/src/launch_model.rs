@@ -132,9 +132,8 @@ enum RouteKind {
     HumanRequest,
     /// `GET /api/v1/requests/{task_id}`.
     RequestStatusRead,
-    /// `/`, `/install.sh`, `/install.ps1`, `/requests/{id}` pages.
-    SiteView,
-    /// `/stats` and `/api/v1/stats`.
+    /// `/api/v1/stats` — the page loads themselves are Pages traffic
+    /// and never reach the Worker.
     StatsView,
     /// `POST /api/v1/admin/index/…` — index slice publishes.
     IndexPublish,
@@ -152,8 +151,7 @@ impl RouteKind {
             Self::EnqueueRedemption => "POST /api/v1/enqueue",
             Self::HumanRequest => "POST /api/v1/requests",
             Self::RequestStatusRead => "GET /api/v1/requests/*",
-            Self::SiteView => "GET /site/*",
-            Self::StatsView => "GET /stats",
+            Self::StatsView => "GET /api/v1/stats",
             Self::IndexPublish => "POST /api/v1/admin/index/*",
             Self::AdminOperation => "* /api/v1/(admin|scheduler)/*",
         }
@@ -176,12 +174,10 @@ fn classify_path(method: &str, path: &str) -> Option<RouteKind> {
         ("POST", "/api/v1/github/workflow-run" | "/api/v1/scheduler/tasks/submit")
         | ("GET", "/api/v1/scheduler/health") => None,
         ("POST", p) if p.starts_with("/api/v1/scheduler/requests/") => None,
-        ("GET", "/" | "/install.sh" | "/install.ps1") => Some(RouteKind::SiteView),
-        ("GET", "/stats" | "/api/v1/stats") => Some(RouteKind::StatsView),
+        ("GET", "/api/v1/stats") => Some(RouteKind::StatsView),
         ("POST", p) if p.starts_with("/api/v1/admin/index/") => Some(RouteKind::IndexPublish),
         ("GET", p) if p.starts_with("/api/v1/requests/") => Some(RouteKind::RequestStatusRead),
         ("GET", p) if p.starts_with("/api/v1/index/") => Some(RouteKind::IndexRequest),
-        ("GET", p) if p.starts_with("/requests/") => Some(RouteKind::SiteView),
         (_, p) if p.starts_with("/api/v1/admin/") || p.starts_with("/api/v1/scheduler/") => {
             Some(RouteKind::AdminOperation)
         }
@@ -599,7 +595,6 @@ pub fn derive_model(snapshot: &WindowSnapshot) -> stow_types::error::Result<Laun
             enqueue_redemption: round4(per_install_day(enqueues)),
             human_request: round4(per_install_day(human_requests)),
             request_status_read: round4(per_install_day(count(RouteKind::RequestStatusRead))),
-            site_view: round4(per_install_day(count(RouteKind::SiteView))),
             stats_view: round4(per_install_day(count(RouteKind::StatsView))),
             miss_node: round4(per_install_day(snapshot.miss_nodes)),
             admin_operations_per_day: round4(per_day(admin_operations)),
@@ -652,7 +647,6 @@ fn render_model(model: &LaunchModel) -> String {
         ("enqueue redemption", EventKind::EnqueueRedemption),
         ("human request", EventKind::HumanRequest),
         ("status read", EventKind::RequestStatusRead),
-        ("site view", EventKind::SiteView),
         ("stats view", EventKind::StatsView),
         ("miss node", EventKind::MissNode),
         ("admin op", EventKind::AdminOperation),

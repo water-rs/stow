@@ -11,7 +11,7 @@ use stow_types::admission;
 
 use crate::api::GhcrConfig;
 use crate::stats::StatsContext;
-use crate::{api, env_binding, ghcr, github_auth, release_hook, runtime_settings, site, webhook};
+use crate::{api, env_binding, ghcr, github_auth, release_hook, runtime_settings, webhook};
 
 const SCHEDULER_BINDING: &str = "SCHEDULER";
 const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
@@ -27,7 +27,6 @@ const STOW_POW_CHALLENGE_SECRET_BINDING: &str = "STOW_POW_CHALLENGE_SECRET";
 const STOW_POW_MIN_BITS_BINDING: &str = "STOW_POW_MIN_BITS";
 const TURNSTILE_SECRET_KEY_BINDING: &str = "TURNSTILE_SECRET_KEY";
 const TURNSTILE_HOSTNAME_BINDING: &str = "TURNSTILE_HOSTNAME";
-const TURNSTILE_SITE_KEY_BINDING: &str = "TURNSTILE_SITE_KEY";
 const STOW_ANALYTICS_BINDING: &str = "STOW_ANALYTICS";
 const CF_ACCOUNT_ID_BINDING: &str = "CF_ACCOUNT_ID";
 const CF_ANALYTICS_TOKEN_BINDING: &str = "CF_ANALYTICS_TOKEN";
@@ -182,10 +181,6 @@ fn worker(
             .unwrap_or(admission::DEFAULT_POW_MIN_BITS),
     };
 
-    let site = site::SiteConfig {
-        turnstile_site_key: env_binding::required_string(env, TURNSTILE_SITE_KEY_BINDING),
-    };
-
     // When the GitHub trust check upstream is rate-limited, this renders
     // the 503 with the `Retry-After` GitHub asked for.
     let trust_gate = github_auth::TrustRateLimitGate;
@@ -209,7 +204,6 @@ fn worker(
         .with(State(ghcr))
         .with(State(resolver_settings))
         .with(State(pow_admission))
-        .with(State(site))
         .with(State(crate::turnstile::CfTurnstileVerifier::new(
             env_binding::required_string(env, TURNSTILE_SECRET_KEY_BINDING),
             env_binding::required_string(env, TURNSTILE_HOSTNAME_BINDING),
@@ -311,7 +305,8 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 2] {
 
 /// Every route an unauthenticated caller can reach — artifact byte reads,
 /// catalog search, miss-admission minting and enqueue redemption, the
-/// human request lane, and the site pages. The anonymous-traffic breaker
+/// human request lane, and the stats and request-status reads the
+/// Pages-served site calls. The anonymous-traffic breaker
 /// is the zone's `stow maintenance: anonymous` WAF rule (`stow-admin
 /// maintenance`), not a gate here — blocked requests never invoke the
 /// Worker. The `scheduler_lanes` mounts share their path constants with
@@ -320,11 +315,6 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 2] {
 fn anonymous_nodes() -> Vec<RouteNode> {
     use stow_types::api::scheduler_lanes as lanes;
     vec![
-        "/".at(site::index),
-        "/install.sh".at(site::install_sh),
-        "/install.ps1".at(site::install_ps1),
-        "/stats".at(site::stats_page),
-        lanes::REQUEST_PAGE.at(site::request_status),
         "/api/v1/bundles/{rustc_version}/{digest}".at(api::get_bundle),
         "/api/v1/crates".route((
             "/search".at(api::search_crates),

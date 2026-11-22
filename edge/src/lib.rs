@@ -45,8 +45,6 @@ mod rust_channel;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod scheduler;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod site;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod stats;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod turnstile;

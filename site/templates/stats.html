@@ -31,33 +31,32 @@
       <section class="numbers" aria-labelledby="numbers-title">
         <div class="frame">
           <h2 id="numbers-title" class="label">Served</h2>
+          <p id="stats-note" class="footnote" role="status">loading the published aggregates…</p>
           <div class="figures">
             <div class="figure">
-              <p class="figure-value">{{ builds_24h }}</p>
+              <p class="figure-value" id="figure-builds">—</p>
               <p class="figure-caption">builds in the last 24 hours, install-reported</p>
             </div>
             <div class="figure">
-              <p class="figure-value">{{ hits_24h }}</p>
+              <p class="figure-value" id="figure-hits">—</p>
               <p class="figure-caption">cache hits in the last 24 hours, install-reported</p>
             </div>
             <div class="figure">
-              <p class="figure-value">{{ misses_24h }}</p>
+              <p class="figure-value" id="figure-misses">—</p>
               <p class="figure-caption">locally compiled artifacts in the last 24 hours, install-reported</p>
             </div>
             <div class="figure">
-              <p class="figure-value">{{ hit_rate_24h }}</p>
+              <p class="figure-value" id="figure-hit-rate">—</p>
               <p class="figure-caption">hit rate over the last 24 hours</p>
             </div>
             <div class="figure">
-              <p class="figure-value">{{ cpu_hours_saved_30d }} h</p>
+              <p class="figure-value" id="figure-cpu-hours">—</p>
               <p class="figure-caption">CPU time saved in the last 30 days (recorded compile time of served artifacts, install-reported)</p>
             </div>
-            {% if let Some(installs) = daily_active_installs_7d %}
-            <div class="figure">
-              <p class="figure-value">{{ installs }}</p>
+            <div class="figure" id="figure-installs" hidden>
+              <p class="figure-value" id="figure-installs-value">—</p>
               <p class="figure-caption">active installs per day, averaged over the last 7 days — suppressed under 20, never an exact identity</p>
             </div>
-            {% endif %}
           </div>
         </div>
       </section>
@@ -68,74 +67,32 @@
           <div class="stats-grid">
             <aside class="window" aria-labelledby="top-digests-title">
               <div class="window-title"><span id="top-digests-title">top bundles (digest)</span></div>
-              <ul class="window-body leader-list">
-                {%- if top_digests.is_empty() %}
-                <li><span>no hits yet</span></li>
-                {%- else %}
-                {%- for entry in top_digests %}
-                <li><span>{{ entry.name }}</span><span class="leader"></span><span>{{ entry.hits }}</span></li>
-                {%- endfor %}
-                {%- endif %}
+              <ul class="window-body leader-list" id="lb-top-digests">
               </ul>
             </aside>
             <aside class="window" aria-labelledby="rustc-versions-title">
               <div class="window-title"><span id="rustc-versions-title">rustc versions</span></div>
-              <ul class="window-body leader-list">
-                {%- if rustc_versions.is_empty() %}
-                <li><span>no hits yet</span></li>
-                {%- else %}
-                {%- for entry in rustc_versions %}
-                <li><span>{{ entry.name }}</span><span class="leader"></span><span>{{ entry.hits }}</span></li>
-                {%- endfor %}
-                {%- endif %}
+              <ul class="window-body leader-list" id="lb-rustc-versions">
               </ul>
             </aside>
             <aside class="window" aria-labelledby="cli-versions-title">
               <div class="window-title"><span id="cli-versions-title">cli versions</span></div>
-              <ul class="window-body leader-list">
-                {%- if cli_versions.is_empty() %}
-                <li><span>no hits yet</span></li>
-                {%- else %}
-                {%- for entry in cli_versions %}
-                <li><span>{{ entry.name }}</span><span class="leader"></span><span>{{ entry.hits }}</span></li>
-                {%- endfor %}
-                {%- endif %}
+              <ul class="window-body leader-list" id="lb-cli-versions">
               </ul>
             </aside>
             <aside class="window" aria-labelledby="operating-systems-title">
               <div class="window-title"><span id="operating-systems-title">operating systems</span></div>
-              <ul class="window-body leader-list">
-                {%- if operating_systems.is_empty() %}
-                <li><span>no reports yet</span></li>
-                {%- else %}
-                {%- for entry in operating_systems %}
-                <li><span>{{ entry.name }}</span><span class="leader"></span><span>{{ entry.hits }}</span></li>
-                {%- endfor %}
-                {%- endif %}
+              <ul class="window-body leader-list" id="lb-operating-systems">
               </ul>
             </aside>
             <aside class="window" aria-labelledby="countries-title">
               <div class="window-title"><span id="countries-title">countries</span></div>
-              <ul class="window-body leader-list">
-                {%- if countries.is_empty() %}
-                <li><span>no reports yet</span></li>
-                {%- else %}
-                {%- for entry in countries %}
-                <li><span>{{ entry.name }}</span><span class="leader"></span><span>{{ entry.hits }}</span></li>
-                {%- endfor %}
-                {%- endif %}
+              <ul class="window-body leader-list" id="lb-countries">
               </ul>
             </aside>
             <aside class="window" aria-labelledby="environments-title">
               <div class="window-title"><span id="environments-title">ci vs local</span></div>
-              <ul class="window-body leader-list">
-                {%- if environments.is_empty() %}
-                <li><span>no reports yet</span></li>
-                {%- else %}
-                {%- for entry in environments %}
-                <li><span>{{ entry.name }}</span><span class="leader"></span><span>{{ entry.hits }}</span></li>
-                {%- endfor %}
-                {%- endif %}
+              <ul class="window-body leader-list" id="lb-environments">
               </ul>
             </aside>
           </div>
@@ -145,8 +102,9 @@
 
     <footer class="site-footer">
       <div class="frame">
-        <p>stow-edge {{ version }} · MIT · <a href="https://github.com/water-rs">water-rs</a> · <a href="{{ repository_url }}">source</a> · <a href="{{ repository_url }}/blob/main/docs/API.md">API</a></p>
+        <p>stow-site {{ version }} · MIT · <a href="https://github.com/water-rs">water-rs</a> · <a href="{{ repository_url }}">source</a> · <a href="{{ repository_url }}/blob/main/docs/API.md">API</a></p>
       </div>
     </footer>
+    <script>{{ js|safe }}</script>
   </body>
 </html>

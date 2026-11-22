@@ -51,11 +51,9 @@ STOW_HUMAN_DAILY_TASK_BUDGET = "2000"
 # expression reads — changing this binding changes nothing until that
 # pass runs. Unset means "0", admit everything.
 # STOW_MIN_DISPATCH_VALUE = "0"
-# Public Turnstile site key (invisible widget) rendered by the request page
-# on stow.waterui.dev; the matching secret is a Worker secret below.
-TURNSTILE_SITE_KEY = "0x4AAAAAAE8LjhnMsqdVhiSp"
 # Hostname the widget is registered for; a token whose siteverify report
-# names any other host is rejected.
+# names any other host is rejected. The public site key renders in the
+# Pages site (site/), not here.
 TURNSTILE_HOSTNAME = "stow.waterui.dev"
 # Audience the trusted CI requests when it mints its GitHub Actions OIDC
 # token; the edge rejects OIDC credentials carrying any other `aud`.
@@ -144,10 +142,12 @@ name = "STOW_STATS_SALT_SECRET"
 [[secret]]
 name = "CF_ANALYTICS_TOKEN"
 
-# Workers Custom Domain — the schema models only `route`/`zone_id`, and this
-# deployment keys the zone by name.
+# Worker route — a path scope, never a Custom Domain: the Pages project
+# owns the `stow.waterui.dev` custom domain and serves every non-API
+# path, and this pattern is more specific so `/api/*` still reaches the
+# Worker (stow#1648).
 [cloudflare.raw]
-routes = [{ pattern = "stow.waterui.dev", custom_domain = true, zone_name = "waterui.dev" }]
+routes = [{ pattern = "stow.waterui.dev/api/*", zone_name = "waterui.dev" }]
 
 # Cache-miss events go to Analytics Engine; the dataset is created
 # implicitly by the first writeDataPoint.

@@ -1004,8 +1004,8 @@ unauthorized POSTs short-circuit before deserialization.
 
 | Method + path | Auth | Body | Response | Purpose |
 |---|---|---|---|---|
-| GET `/` | none | — | HTML | Landing page: numbers from the acceleration audit, how it works, and the crate request form (askama template in `edge/templates/`, Turnstile site key from `TURNSTILE_SITE_KEY`) |
-| GET `/stats` | none | — | HTML | Public usage-statistics page — the `GET /api/v1/stats` numbers rendered in the site's style |
+| GET `/` | none | — | HTML | Landing page (Pages): numbers from the acceleration audit, how it works, and the crate request form — rendered at build time by `stow-site` from `site/templates/` |
+| GET `/stats` | none | — | HTML | Public usage-statistics page (Pages): a static shell whose script renders `GET /api/v1/stats` |
 | GET `/api/v1/stats` | none | — | `UsageStats` | Anonymous usage statistics from the Analytics Engine SQL API, Workers-Cached for one hour |
 | POST `/api/v1/build-report` | none | `BuildReport` | 204 | One install's daily usage counters — at most one report per install per UTC day, one `stow_events` `build` point per accepted report |
 | GET `/api/v1/bundles/{rustc_version}/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Byte fetch — the only artifact-serving route; the `{rustc_version}` segment names the artifact's GHCR package and the `sha256:<64 hex>` segment is the index row's `bundle_digest`, served from GHCR behind Workers Cache |
@@ -1031,7 +1031,7 @@ unauthorized POSTs short-circuit before deserialization.
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestStatus` | Human request: admit and dispatch a `resolve-request.yml` run that enqueues the crate's closure on every CI target in the human lane |
 | GET `/api/v1/requests/{request_id}` | none | — | `CrateRequestStatus` | Live request record: `accepted` → `resolving` → `enqueued`/`failed` plus per-target states |
-| GET `/requests/{request_id}` | none | — | HTML | The same `CrateRequestStatus` rendered as a page, the link the request form returns |
+| GET `/requests/{request_id}` | none | — | HTML | The same `CrateRequestStatus` rendered as a page (Pages `_redirects` rewrite to `request.html`), the link the request form returns |
 | POST `/api/v1/scheduler/requests/{request_id}/outcome` | Bearer: `resolve-request.yml` OIDC on the edge's release tag | `RequestOutcomeReport` | `CrateRequestStatus` | The `resolve-request.yml` job's submission — enqueues the resolved tasks and settles the request record |
 | GET `/api/v1/crates/search?q=&limit=` | none | — | `CrateSearchResponse` | crates.io search, proxied for the request form's completions; query must be ≥2 chars, limit clamps to 1–25 (default 10), response cached 5 min |
 | GET `/api/v1/crates/{crate_name}/versions` | none | — | `CrateVersionsResponse` | Published, non-yanked versions newest-first — the form's version picker; cached 10 min |
@@ -1171,7 +1171,7 @@ is unset or malformed.
 | `STOW_MAX_QUEUE_PENDING` | `2000` | Miss-lane pending depth (other lanes' backlog not counted) at which miss-lane enqueues are refused (429 + `Retry-After: 600`); checked in the edge handler and in the scheduler object. Human-lane and trusted submits are exempt |
 | `STOW_HUMAN_MAX_CLOSURE` | `150` | Largest dependency closure `POST /api/v1/requests` accepts per target; larger closures get 422 |
 | `STOW_HUMAN_DAILY_TASK_BUDGET` | `2000` | Human-lane tasks accepted per UTC day, counted in the scheduler object's `human_daily_task_budget` table; overspending submits get 429 + `Retry-After` to 00:00 UTC |
-| `TURNSTILE_SITE_KEY` | `0x4AAAAAAE8LjhnMsqdVhiSp` | Public site key of the request page's invisible Turnstile widget |
+| `TURNSTILE_SITE_KEY` | `0x4AAAAAAE8LjhnMsqdVhiSp` | Public site key of the request widget — baked into the Pages build in `site/` (env override at render time), not a Worker binding |
 | `TURNSTILE_SECRET_KEY` | required (secret) | Turnstile secret `POST /api/v1/requests` verifies tokens against |
 | `STOW_FREEZE_WINDOW_MINUTES` | `60` | Trailing window the dispatch-freeze trip counts terminal outcomes over; long enough to see the measured failure-wave rate decisively, short enough that a stale burst cannot haunt the next day |
 | `STOW_FREEZE_MIN_OUTCOMES` | `50` | Sample floor for the trip condition: a stream (fleet aggregate or one target) must record this many terminal outcomes in the window before its failure ratio is read — below it nothing trips however bad the ratio |

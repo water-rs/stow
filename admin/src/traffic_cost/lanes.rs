@@ -994,19 +994,9 @@ pub fn build_lanes(
 
     let mut lanes = vec![
         Lane {
-            name: "site",
-            eps: eps(EventKind::SiteView),
-            fire: Fire::PublicGet(vec![
-                "/".to_owned(),
-                "/install.sh".to_owned(),
-                "/install.ps1".to_owned(),
-            ]),
-            expected: ok2xx,
-        },
-        Lane {
             name: "stats",
             eps: eps(EventKind::StatsView),
-            fire: Fire::PublicGet(vec!["/stats".to_owned(), "/api/v1/stats".to_owned()]),
+            fire: Fire::PublicGet(vec!["/api/v1/stats".to_owned()]),
             expected: ok2xx,
         },
         Lane {
@@ -1477,17 +1467,17 @@ mod tests {
             }
         }
         assert_eq!(changed, 2);
-        let site = overridden
+        let stats = overridden
             .iter()
-            .find(|lane| lane.name == "site")
-            .expect("site");
+            .find(|lane| lane.name == "stats")
+            .expect("stats");
         let unscaled = build_lanes(&args, &model, 1.0, None).expect("unscaled");
         assert_eq!(
-            site.eps,
+            stats.eps,
             unscaled
                 .iter()
-                .find(|lane| lane.name == "site")
-                .expect("site")
+                .find(|lane| lane.name == "stats")
+                .expect("stats")
                 .eps
                 * scale
         );
