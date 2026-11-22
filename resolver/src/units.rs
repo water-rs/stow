@@ -107,6 +107,10 @@ pub struct StowUnit {
     pub is_crates_io: bool,
     /// Direct dependency edges of this unit.
     pub deps: Vec<StowDep>,
+    /// Declared features of this package whose activation is non-additive
+    /// (stow#1668), computed from the unpacked crate sources.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub non_additive_features: std::collections::BTreeSet<String>,
 }
 
 /// An edge from one unit to the unit that dep resolves to.

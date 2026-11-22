@@ -110,7 +110,7 @@ pub async fn run(
         return Ok(());
     }
     // The plan renders the substituted ids, so substitute before it.
-    let published = substitute_against_published(&mut trees).await?;
+    let published = substitute_against_published(&mut trees, &resolved.non_additive).await?;
     render::mutation(
         output,
         trees,
@@ -191,13 +191,14 @@ impl SourceProgress {
     fn collect(
         &mut self,
         source: impl std::fmt::Display,
-        result: Result<Vec<EnqueueRequest>, String>,
+        result: Result<(Vec<EnqueueRequest>, crate::projects::NonAdditiveFeatures), String>,
         sources: &mut Vec<Vec<EnqueueRequest>>,
+        non_additive: &mut crate::projects::NonAdditiveFeatures,
         failures: &mut Vec<String>,
     ) {
         self.done += 1;
         match result {
-            Ok(tasks) => {
+            Ok((tasks, source_non_additive)) => {
                 tracing::info!(
                     %source,
                     tasks = tasks.len(),
@@ -206,6 +207,7 @@ impl SourceProgress {
                     elapsed_s = self.started.elapsed().as_secs_f64(),
                     "resolved source"
                 );
+                non_additive.extend(source_non_additive);
                 sources.push(tasks);
             }
             Err(error) => {
@@ -232,6 +234,8 @@ struct ResolvedSources {
     /// One entry per resolved source — each becomes one
     /// [`SubmissionTree`] rooted at that source's own nodes.
     sources: Vec<Vec<EnqueueRequest>>,
+    /// Per-package non-additive features across all resolved sources.
+    non_additive: crate::projects::NonAdditiveFeatures,
     /// `"<repo>: <reason>"`, the string `SourceProgress::collect`
     /// builds — only the `--projects` lane feeds this.
     unresolved_projects: Vec<String>,
@@ -242,6 +246,7 @@ struct ResolvedSources {
 /// the crate lane; a projects file resolves each listed repository's
 /// git tree with the projects lane; `--dirs` resolves each local
 /// directory the same way.
+#[allow(clippy::too_many_lines)]
 async fn resolve_sources(
     args: &ManualArgs,
     targets: &[TargetTriple],
@@ -264,69 +269,90 @@ async fn resolve_sources(
     let projects = args.projects.clone();
     let source_trees = args.source_trees.clone();
     let dirs = args.dirs.clone();
-    let (sources, failures, unresolved_projects) = tokio::task::spawn_blocking(move || {
-        let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
-        let mut sources = Vec::new();
-        let mut unresolved_projects = Vec::new();
-        if !jobs.is_empty() {
-            let mut progress = SourceProgress::new(jobs.len());
-            pool.run(
-                &jobs,
-                |resolver, runtime, (name, version)| {
-                    crate::resolve::resolve_crate(
-                        resolver,
-                        runtime,
-                        name,
-                        version,
-                        &targets,
-                        &rustc_version,
-                        0,
-                    )
-                    .map(|source| {
-                        source
-                            .targets
-                            .into_iter()
-                            .flat_map(|(_target, tasks)| tasks)
-                            .collect::<Vec<EnqueueRequest>>()
-                    })
-                },
-                |_, (name, version), result| {
-                    progress.collect(
-                        format_args!("{name}@{version}"),
-                        result,
-                        &mut sources,
-                        &mut failures,
-                    );
-                },
-            )?;
-        }
-        if let Some(path) = &projects {
-            resolve_projects_lane(
-                &pool,
-                path,
-                source_trees.as_ref(),
-                &targets,
-                &rustc_version,
-                &mut sources,
-                &mut unresolved_projects,
-            )?;
-        }
-        if let Some(dirs) = &dirs {
-            let mut progress = SourceProgress::new(dirs.len());
-            pool.run(
-                dirs,
-                |resolver, _runtime, dir| {
-                    crate::projects::resolve_project_dir(resolver, dir, &targets, &rustc_version)
-                },
-                |_, dir, result| {
-                    progress.collect(dir.display(), result, &mut sources, &mut failures);
-                },
-            )?;
-        }
-        Ok::<_, stow_types::error::Error>((sources, failures, unresolved_projects))
-    })
-    .await
-    .expect("resolve pool panicked")?;
+    let (sources, non_additive, failures, unresolved_projects) =
+        tokio::task::spawn_blocking(move || {
+            let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
+            let mut sources = Vec::new();
+            let mut non_additive = crate::projects::NonAdditiveFeatures::new();
+            let mut unresolved_projects = Vec::new();
+            if !jobs.is_empty() {
+                let mut progress = SourceProgress::new(jobs.len());
+                pool.run(
+                    &jobs,
+                    |resolver, runtime, (name, version)| {
+                        crate::resolve::resolve_crate(
+                            resolver,
+                            runtime,
+                            name,
+                            version,
+                            &targets,
+                            &rustc_version,
+                            0,
+                        )
+                        .map(|source| {
+                            let tasks = source
+                                .targets
+                                .into_iter()
+                                .flat_map(|(_target, tasks)| tasks)
+                                .collect::<Vec<EnqueueRequest>>();
+                            (tasks, source.non_additive_features)
+                        })
+                    },
+                    |_, (name, version), result| {
+                        progress.collect(
+                            format_args!("{name}@{version}"),
+                            result,
+                            &mut sources,
+                            &mut non_additive,
+                            &mut failures,
+                        );
+                    },
+                )?;
+            }
+            if let Some(path) = &projects {
+                resolve_projects_lane(
+                    &pool,
+                    path,
+                    source_trees.as_ref(),
+                    &targets,
+                    &rustc_version,
+                    &mut sources,
+                    &mut non_additive,
+                    &mut unresolved_projects,
+                )?;
+            }
+            if let Some(dirs) = &dirs {
+                let mut progress = SourceProgress::new(dirs.len());
+                pool.run(
+                    dirs,
+                    |resolver, _runtime, dir| {
+                        crate::projects::resolve_project_dir(
+                            resolver,
+                            dir,
+                            &targets,
+                            &rustc_version,
+                        )
+                    },
+                    |_, dir, result| {
+                        progress.collect(
+                            dir.display(),
+                            result,
+                            &mut sources,
+                            &mut non_additive,
+                            &mut failures,
+                        );
+                    },
+                )?;
+            }
+            Ok::<_, stow_types::error::Error>((
+                sources,
+                non_additive,
+                failures,
+                unresolved_projects,
+            ))
+        })
+        .await
+        .expect("resolve pool panicked")?;
     if !failures.is_empty() {
         return Err(stow_error!(
             "resolve failed for {} source(s):\n{}",
@@ -336,6 +362,7 @@ async fn resolve_sources(
     }
     Ok(ResolvedSources {
         sources,
+        non_additive,
         unresolved_projects,
     })
 }
@@ -345,6 +372,7 @@ async fn resolve_sources(
 /// A repository that fails to resolve lands in `unresolved_projects`
 /// — reported after the submit (stow#572) — rather than aborting the
 /// wave like a `--crates` or `--dirs` failure.
+#[allow(clippy::too_many_arguments)]
 fn resolve_projects_lane(
     pool: &crate::resolve::ResolvePool,
     projects: &Path,
@@ -352,6 +380,7 @@ fn resolve_projects_lane(
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
     sources: &mut Vec<Vec<EnqueueRequest>>,
+    non_additive: &mut crate::projects::NonAdditiveFeatures,
     unresolved_projects: &mut Vec<String>,
 ) -> stow_types::error::Result<()> {
     let repos = tokio::runtime::Handle::current()
@@ -370,7 +399,7 @@ fn resolve_projects_lane(
             )
         },
         |_, repo, result| {
-            progress.collect(repo, result, sources, unresolved_projects);
+            progress.collect(repo, result, sources, non_additive, unresolved_projects);
         },
     )?;
     Ok(())
@@ -605,9 +634,10 @@ pub async fn published_slices(
 /// the pairs cover host slices too.
 pub async fn substitute_against_published(
     trees: &mut [SubmissionTree],
+    non_additive: &crate::projects::NonAdditiveFeatures,
 ) -> stow_types::error::Result<PublishedCoverage> {
     let published = slices_for_trees(trees).await?;
-    SubmissionTree::substitute_contained_sets(trees, &published)?;
+    SubmissionTree::substitute_contained_sets_with_non_additive(trees, &published, non_additive)?;
     PublishedCoverage::new(&published)
 }
 

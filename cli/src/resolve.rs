@@ -18,9 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use semver::Version;
 use stow_types::api::{DependencyGraphEntry, ResolvedDependencyGraphEntry, runner_family};
-use stow_types::feature_sets::{
-    ClosureAgreement, ClosureHeld, ClosureKey, closure_members, smallest_containing_set,
-};
+use stow_types::feature_sets::{ClosureAgreement, ClosureHeld, ClosureKey, closure_members};
 use stow_types::glibc::GlibcVersion;
 use stow_types::identity::{
     CMetadata, CrateName, CrateVersion, DependencyIdentity, FeaturesJson, TargetTriple,
@@ -189,6 +187,7 @@ pub const fn host_glibc() -> Option<GlibcVersion> {
 /// (duplicate node, dangling edge, missing root, an unresolvable
 /// dependency subgraph), or when an index row carries a `compile_key`
 /// the canonical-metadata check cannot read.
+#[cfg(test)]
 pub fn analyze_dependency_graph(
     rows: &[ArtifactIndexRow],
     entries: &[DependencyGraphEntry],
@@ -197,6 +196,31 @@ pub fn analyze_dependency_graph(
     rustc_version: &str,
     host_glibc: Option<GlibcVersion>,
     local_programs: &[stow_types::records::LocalProcMacro],
+) -> stow_types::error::Result<GraphAnalysis> {
+    analyze_dependency_graph_with_non_additive(
+        rows,
+        entries,
+        expanded_entries,
+        target,
+        rustc_version,
+        host_glibc,
+        local_programs,
+        &BTreeMap::new(),
+    )
+}
+
+/// [`analyze_dependency_graph`] excluding per-package `non_additive` features
+/// from superset selection (stow#1668).
+#[allow(clippy::too_many_arguments)]
+pub fn analyze_dependency_graph_with_non_additive(
+    rows: &[ArtifactIndexRow],
+    entries: &[DependencyGraphEntry],
+    expanded_entries: &[ResolvedDependencyGraphEntry],
+    target: &str,
+    rustc_version: &str,
+    host_glibc: Option<GlibcVersion>,
+    local_programs: &[stow_types::records::LocalProcMacro],
+    non_additive: &BTreeMap<(CrateName, Version), BTreeSet<String>>,
 ) -> stow_types::error::Result<GraphAnalysis> {
     if entries.is_empty() {
         return Ok(GraphAnalysis {
@@ -257,7 +281,25 @@ pub fn analyze_dependency_graph(
         })
         .collect::<Vec<_>>();
 
-    let plan = expanded_scheduler_plan(&exact_graph, rows, host_glibc, local_programs)?;
+    let non_additive_by_key = non_additive
+        .iter()
+        .map(|((crate_name, version), set)| {
+            (
+                PackageKey {
+                    crate_name: crate_name.clone(),
+                    version: version.clone(),
+                },
+                set.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let plan = expanded_scheduler_plan(
+        &exact_graph,
+        rows,
+        host_glibc,
+        local_programs,
+        &non_additive_by_key,
+    )?;
 
     Ok(GraphAnalysis {
         entries: response_entries,
@@ -278,6 +320,7 @@ fn expanded_scheduler_plan(
     rows: &[ArtifactIndexRow],
     host_glibc: Option<GlibcVersion>,
     local_programs: &[stow_types::records::LocalProcMacro],
+    non_additive: &BTreeMap<PackageKey, BTreeSet<String>>,
 ) -> stow_types::error::Result<ExpandedSchedulerPlan> {
     let cached = cached_artifacts(
         rows,
@@ -286,6 +329,7 @@ fn expanded_scheduler_plan(
         &exact_graph.root_keys,
         host_glibc,
         local_programs,
+        non_additive,
     )?;
     let expanded_total = exact_graph.feature_json_by_key.len();
     let expanded_cached = exact_graph
@@ -520,6 +564,7 @@ fn cached_artifacts(
     root_keys: &BTreeSet<PackageKey>,
     host_glibc: Option<GlibcVersion>,
     local_programs: &[stow_types::records::LocalProcMacro],
+    non_additive: &BTreeMap<PackageKey, BTreeSet<String>>,
 ) -> stow_types::error::Result<CachedArtifacts> {
     let key_pairs = feature_json_by_key
         .iter()
@@ -533,11 +578,12 @@ fn cached_artifacts(
         });
     }
 
-    let reachable = resolve_reachable_cached_rows(
+    let reachable = resolve_reachable_cached_rows_with_non_additive(
         &key_pairs,
         dependency_identity_by_key,
         rows,
         local_programs,
+        non_additive,
     )?;
     let mut semantic_keys = reachable
         .candidates
@@ -579,11 +625,12 @@ fn cached_artifacts(
         .filter(|row| row_servable_on_host(row, host_glibc))
         .cloned()
         .collect::<Vec<_>>();
-    let servable_reachable = resolve_reachable_cached_rows(
+    let servable_reachable = resolve_reachable_cached_rows_with_non_additive(
         &key_pairs,
         dependency_identity_by_key,
         &servable_rows,
         local_programs,
+        non_additive,
     )?;
     let selected_prefetch_rows =
         select_prefetch_candidates(feature_json_by_key, root_keys, &servable_reachable)?;
@@ -598,11 +645,28 @@ fn cached_artifacts(
     })
 }
 
+#[cfg(test)]
 fn resolve_reachable_cached_rows<'a>(
     key_pairs: &BTreeSet<(PackageKey, String)>,
     dependency_identity_by_key: &BTreeMap<PackageKey, DependencyIdentity>,
     rows: &'a [ArtifactIndexRow],
     local_programs: &[stow_types::records::LocalProcMacro],
+) -> stow_types::error::Result<ReachableRows<'a>> {
+    resolve_reachable_cached_rows_with_non_additive(
+        key_pairs,
+        dependency_identity_by_key,
+        rows,
+        local_programs,
+        &BTreeMap::new(),
+    )
+}
+
+fn resolve_reachable_cached_rows_with_non_additive<'a>(
+    key_pairs: &BTreeSet<(PackageKey, String)>,
+    dependency_identity_by_key: &BTreeMap<PackageKey, DependencyIdentity>,
+    rows: &'a [ArtifactIndexRow],
+    local_programs: &[stow_types::records::LocalProcMacro],
+    non_additive: &BTreeMap<PackageKey, BTreeSet<String>>,
 ) -> stow_types::error::Result<ReachableRows<'a>> {
     let IndexedRows {
         mut candidates,
@@ -641,7 +705,7 @@ fn resolve_reachable_cached_rows<'a>(
         .iter()
         .map(|&index| candidates[index].semantic_key.clone())
         .collect::<BTreeSet<_>>();
-    add_superset_candidates(&mut candidates, key_pairs, &covered, rows)?;
+    add_superset_candidates(&mut candidates, key_pairs, &covered, rows, non_additive)?;
 
     let (reachable_candidates, reachable_chain) = reachable_indices(&candidates, &chain_rows);
 
@@ -912,6 +976,7 @@ fn add_superset_candidates<'a>(
     key_pairs: &BTreeSet<(PackageKey, String)>,
     covered: &BTreeSet<SemanticKey>,
     rows: &'a [ArtifactIndexRow],
+    non_additive: &BTreeMap<PackageKey, BTreeSet<String>>,
 ) -> stow_types::error::Result<()> {
     // The chooser's pool: every canonical target-side row is built by
     // definition, grouped by package with its decoded feature set.
@@ -953,11 +1018,14 @@ fn add_superset_candidates<'a>(
         let Ok(requested) = serde_json::from_str::<Vec<String>>(key_pair.1.as_str()) else {
             continue;
         };
-        let Some(serving) = smallest_containing_set(
+        let empty = BTreeSet::new();
+        let forbidden = non_additive.get(&key_pair.0).unwrap_or(&empty);
+        let Some(serving) = stow_types::feature_sets::smallest_containing_set_respecting(
             &requested,
             pkg_rows
                 .iter()
                 .map(|&index| pool[index].features.as_slice()),
+            forbidden,
         ) else {
             continue;
         };
@@ -1511,7 +1579,11 @@ pub fn semantic_identity_match(
     } else if allowed_superset_c_metadatas.is_some_and(|set| set.contains(row.c_metadata.as_str()))
     {
         serde_json::from_str::<Vec<String>>(&request.features_json).is_ok_and(|requested| {
-            stow_types::feature_sets::contains_all(row.features_json.features(), &requested)
+            stow_types::feature_sets::contains_additively(
+                row.features_json.features(),
+                &requested,
+                &request.non_additive_features,
+            )
         })
     } else {
         false
@@ -2346,6 +2418,7 @@ mod tests {
             crate_types: vec![RustCrateType::Rlib],
             consumer: stow_types::upload_plan::ConsumerInputs::stock(),
             build_script: stow_types::upload_plan::BuildScriptInputs::default(),
+            non_additive_features: BTreeSet::new(),
         };
 
         let found = find_semantic_artifact(&rows, &request, None, None)
@@ -2395,6 +2468,7 @@ mod tests {
             crate_types: vec![RustCrateType::Rlib],
             consumer: stow_types::upload_plan::ConsumerInputs::stock(),
             build_script: stow_types::upload_plan::BuildScriptInputs::default(),
+            non_additive_features: BTreeSet::new(),
         };
 
         assert!(
@@ -2410,6 +2484,30 @@ mod tests {
             .expect("seeded lookup")
             .expect("smallest validated superset");
         assert_eq!(found.c_metadata.as_str(), "2222222222222222");
+
+        // stow#1668: non-additive features (`dlopen`) must not serve `[]`
+        // either during graph reachability or during semantic lookup.
+        let fontconfig_rows = vec![row(
+            "yeslogic-fontconfig-sys",
+            "6.0.1",
+            "3333333333333333",
+            &["dlopen"],
+            &[],
+        )];
+        let fc_key = key("yeslogic-fontconfig-sys", "6.0.1");
+        let fc_pairs = BTreeSet::from([(fc_key.clone(), "[]".to_owned())]);
+        let fc_reachable = super::resolve_reachable_cached_rows_with_non_additive(
+            &fc_pairs,
+            &leaf_digests(&fc_pairs),
+            &fontconfig_rows,
+            &[],
+            &BTreeMap::from([(fc_key, BTreeSet::from(["dlopen".to_owned()]))]),
+        )
+        .expect("reachability");
+        assert!(
+            fc_reachable.candidates.is_empty(),
+            "yeslogic-fontconfig-sys [\"dlopen\"] must not serve []"
+        );
     }
 
     /// A row whose floor the host glibc cannot reach is not servable:
@@ -2467,6 +2565,7 @@ mod tests {
             crate_types: vec![RustCrateType::Rlib],
             consumer: stow_types::upload_plan::ConsumerInputs::stock(),
             build_script: stow_types::upload_plan::BuildScriptInputs::default(),
+            non_additive_features: BTreeSet::new(),
         };
         let found = find_semantic_artifact(&rows, &request, None, host)
             .expect("lookup")

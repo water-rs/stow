@@ -118,6 +118,7 @@ pub fn emit_units(
         .packages()
         .map(|pkg| (pkg.package_id(), pkg))
         .collect();
+    let mut non_additive_cache: HashMap<PackageId, BTreeSet<String>> = HashMap::new();
     let pkg_by_id = |id: PackageId| -> CargoResult<&Package> {
         package_map
             .get(&id)
@@ -307,6 +308,16 @@ pub fn emit_units(
 
         let is_crates_io =
             pkg_id.source_id().is_crates_io() || (members_are_crates_io && ws.is_member_id(pkg_id));
+        let non_additive_features = if is_crates_io {
+            non_additive_cache
+                .entry(pkg_id)
+                .or_insert_with(|| {
+                    stow_types::non_additive::non_additive_features_in_package_dir(pkg.root())
+                })
+                .clone()
+        } else {
+            BTreeSet::new()
+        };
         let push_unit = |platform: String,
                          side: StowSide,
                          kind: StowUnitKind,
@@ -325,6 +336,7 @@ pub fn emit_units(
                 features: features.clone(),
                 is_crates_io,
                 deps,
+                non_additive_features: non_additive_features.clone(),
             }
         };
 

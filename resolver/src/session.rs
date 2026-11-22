@@ -79,6 +79,15 @@ pub struct SourceResolve {
     pub has_library: bool,
     /// One task batch per requested target, in request order.
     pub targets: Vec<(String, Vec<EnqueueRequest>)>,
+    /// Per-package non-additive features scanned from unpacked crate sources
+    /// during resolution (stow#1668).
+    pub non_additive_features: std::collections::BTreeMap<
+        (
+            stow_types::identity::CrateName,
+            stow_types::identity::CrateVersion,
+        ),
+        std::collections::BTreeSet<String>,
+    >,
 }
 
 /// A native resolve session: toolchain facts, the isolated cargo home,
@@ -700,11 +709,22 @@ impl Resolver {
         let mut has_binary = false;
         let mut has_library = false;
         let mut batches = Vec::with_capacity(outputs.len());
+        let mut non_additive_features = BTreeMap::new();
         for (target, output) in outputs {
             if output.roots.iter().any(|key| key.kind == StowUnitKind::Lib) {
                 has_library = true;
             }
             has_binary |= output.has_binary;
+            for unit in &output.units {
+                if !unit.non_additive_features.is_empty()
+                    && let (Ok(name), Ok(ver)) = (
+                        stow_types::identity::CrateName::parse(&unit.name),
+                        unit.version.parse::<stow_types::identity::CrateVersion>(),
+                    )
+                {
+                    non_additive_features.insert((name, ver), unit.non_additive_features.clone());
+                }
+            }
             // Every profile's nodes of the one resolved graph: the dev
             // set and the release set a `--release` consumer is served
             // from (stow#1012).
@@ -727,6 +747,7 @@ impl Resolver {
             has_binary,
             has_library,
             targets: batches,
+            non_additive_features,
         })
     }
 }

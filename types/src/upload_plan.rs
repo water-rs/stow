@@ -362,9 +362,24 @@ pub struct BuildScriptInputs {
     pub cfgs: Vec<String>,
     /// Link arguments, in `link-arg=…` spelling and directive order.
     pub link_args: Vec<String>,
+    /// `cargo:rustc-link-lib=…` directives in directive order (stow#1668).
+    pub link_libs: Vec<String>,
 }
 
 impl BuildScriptInputs {
+    /// Whether a feature-superset candidate's build-script outputs (`self`)
+    /// preserve everything the consumer's local build script (`request`)
+    /// required: link arguments and native link libraries must match
+    /// identically, while the superset's build script may emit additional
+    /// additive `rustc-cfg` flags without dropping any of `request.cfgs`
+    /// (`stow#881`, `stow#1668`).
+    #[must_use]
+    pub fn superset_honours(&self, request: &Self) -> bool {
+        self.link_args == request.link_args
+            && self.link_libs == request.link_libs
+            && without_each(&request.cfgs, &self.cfgs).is_empty()
+    }
+
     /// Read the inputs from a build script's captured `cargo:` lines.
     /// `cfg` values go through the argv parser's own reading, so a cfg is
     /// sorted into feature or other exactly as it is on a command line.
@@ -383,6 +398,7 @@ impl BuildScriptInputs {
                     inputs.cfgs.push(cfg.to_owned());
                 }
                 Some(("rustc-link-arg", arg)) => inputs.link_args.push(format!("link-arg={arg}")),
+                Some(("rustc-link-lib", lib)) => inputs.link_libs.push(lib.to_owned()),
                 _ => {}
             }
         }

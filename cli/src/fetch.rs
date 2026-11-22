@@ -79,6 +79,9 @@ pub struct SemanticFetchRequest {
     /// What the requesting invocation's own build script put on its
     /// command line.
     pub build_script: stow_types::upload_plan::BuildScriptInputs,
+    /// Non-additive features of this package detected from its unpacked
+    /// source directory (stow#1668).
+    pub non_additive_features: BTreeSet<String>,
 }
 
 /// The recorded identity of an artifact a semantic match proposes to
@@ -506,16 +509,19 @@ pub fn validate_semantic_bundle_identity(
     let features_json = config.features_json.raw();
     let crate_version = config.crate_version.to_string();
     let dependency_c_metadata_json = config.dependency_c_metadata_json.raw();
-    let build_script = request
-        .build_script_of_same_build(&crate_version, &features_json)
-        .map_or_else(
-            || {
-                std::borrow::Cow::Owned(stow_types::upload_plan::BuildScriptInputs::of(
-                    config.native.as_ref(),
-                ))
-            },
-            std::borrow::Cow::Borrowed,
-        );
+    let build_script =
+        if let Some(own) = request.build_script_of_same_build(&crate_version, &features_json) {
+            std::borrow::Cow::Borrowed(own)
+        } else {
+            let bundle_build_script =
+                stow_types::upload_plan::BuildScriptInputs::of(config.native.as_ref());
+            if !bundle_build_script.superset_honours(&request.build_script) {
+                return Err(stow_types::stow_error!(
+                    "downloaded semantic bundle build-script inputs differ from the request"
+                ));
+            }
+            std::borrow::Cow::Owned(bundle_build_script)
+        };
     if !request.candidate_honours_consumer(
         &SemanticCandidate {
             crate_name: config.crate_name.as_str(),
@@ -553,7 +559,11 @@ fn validate_semantic_bundle_features(
     let features_ok = if allow_superset {
         let requested: Vec<String> = serde_json::from_str(&request.features_json)
             .wrap_err("parse semantic request features_json")?;
-        stow_types::feature_sets::contains_all(candidate.features(), &requested)
+        stow_types::feature_sets::contains_additively(
+            candidate.features(),
+            &requested,
+            &request.non_additive_features,
+        )
     } else {
         candidate.raw() == request.features_json
     };
@@ -917,11 +927,33 @@ pub mod tests {
             crate_types: config.crate_types.clone(),
             consumer,
             build_script,
+            non_additive_features: std::collections::BTreeSet::new(),
         };
         super::validate_semantic_bundle_identity(&bundle, &request, false)
             .expect("same inputs serve");
         request.consumer.cfgs = vec!["custom".to_owned()];
         assert!(super::validate_semantic_bundle_identity(&bundle, &request, false).is_err());
+
+        // stow#1668: a superset bundle (`["dlopen"]`) whose build script
+        // omitted the consumer's `-lfontconfig` or enabled a non-additive
+        // feature must never validate for a `[]` request.
+        request.consumer.cfgs.clear();
+        let mut dlopen_bundle = bundle.clone();
+        dlopen_bundle.manifest.config.features_json =
+            stow_types::identity::FeaturesJson::canonicalize(vec!["dlopen".to_owned()])
+                .expect("canonical features");
+        request.features_json = "[]".to_owned();
+        request.build_script.link_libs = vec!["fontconfig".to_owned()];
+        assert!(
+            super::validate_semantic_bundle_identity(&dlopen_bundle, &request, true).is_err(),
+            "superset bundle with mismatched build-script link libs must be rejected"
+        );
+        request.build_script.link_libs.clear();
+        request.non_additive_features.insert("dlopen".to_owned());
+        assert!(
+            super::validate_semantic_bundle_identity(&dlopen_bundle, &request, true).is_err(),
+            "superset bundle adding a non-additive feature must be rejected"
+        );
     }
 
     /// One canned answer from the stub edge for any request it serves.

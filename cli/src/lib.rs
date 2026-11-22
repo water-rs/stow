@@ -4800,6 +4800,11 @@ async fn build_semantic_fetch_request(
         crate_types = ?crate_types,
         "constructed semantic fetch request"
     );
+    let non_additive_features = parsed
+        .input_path
+        .as_deref()
+        .and_then(stow_types::non_additive::enclosing_package_dir)
+        .map_or_default(|dir| stow_types::non_additive::non_additive_features_in_package_dir(&dir));
     Ok(Some(fetch::SemanticFetchRequest {
         crate_name,
         version,
@@ -4813,6 +4818,7 @@ async fn build_semantic_fetch_request(
         crate_types,
         consumer,
         build_script,
+        non_additive_features,
     }))
 }
 
@@ -6483,6 +6489,7 @@ mod tests {
             crate_types: bundle.manifest.config.crate_types.clone(),
             consumer: stow_types::upload_plan::ConsumerInputs::stock(),
             build_script: stow_types::upload_plan::BuildScriptInputs::default(),
+            non_additive_features: std::collections::BTreeSet::new(),
         };
 
         let mut tally = super::LookupTally::default();
