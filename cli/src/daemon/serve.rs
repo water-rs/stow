@@ -1430,7 +1430,8 @@ fn is_probe(request: &WrapperRequest) -> bool {
         return false;
     };
     plan.args().ok().is_none_or(|args| {
-        crate::classify_invocation(&args).map_or(true, |parsed| !crate::is_compile_unit(&parsed))
+        crate::classify_invocation(&args, plan.env.cargo_bin_name)
+            .map_or(true, |parsed| !crate::is_compile_unit(&parsed))
     })
 }
 

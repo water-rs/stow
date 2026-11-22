@@ -76,6 +76,13 @@ pub struct ParsedRustcArgs {
     /// populating a `ParsedRustcArgs` inside a rustc-wrapper process set
     /// it from `std::env::var_os("OUT_DIR")`.
     pub build_script_out_dir: Option<PathBuf>,
+    /// Whether Cargo exported `CARGO_BIN_NAME` on this rustc invocation —
+    /// set on every `[[bin]]` and `[[example]]` target and never on a
+    /// `custom-build` unit, so a binary whose name begins with
+    /// `build_script_` is never mistaken for a build script. Never parsed
+    /// from argv: callers inside a rustc-wrapper process populate it from
+    /// the invocation's environment.
+    pub cargo_bin_name: bool,
     /// `--extern` pairs, sorted by crate name then path.
     pub extern_crates: Vec<ParsedExternCrate>,
     /// `-Z embed-metadata` value. Nightly cargo passes this flag on every
@@ -145,6 +152,7 @@ impl ParsedRustcArgs {
             strip: None,
             native_search_paths: Vec::new(),
             build_script_out_dir: None,
+            cargo_bin_name: false,
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: true,
@@ -297,11 +305,12 @@ impl ParsedRustcArgs {
         self.crate_types.iter().any(|kind| kind == "bin")
     }
 
-    /// Whether this is the `build_script_build` binary cargo compiles for
-    /// build scripts.
+    /// Whether this is the binary Cargo compiles for a package's
+    /// `custom-build` target (`build_script_<stem>` from `package.build`,
+    /// without `CARGO_BIN_NAME`).
     #[must_use]
     pub fn is_build_script(&self) -> bool {
-        self.is_binary() && self.crate_name == "build_script_build"
+        self.is_binary() && !self.cargo_bin_name && is_build_script_crate_name(&self.crate_name)
     }
 
     /// Whether `--json` includes `artifacts` (cargo's artifact-notification
@@ -1106,6 +1115,15 @@ fn next_str<'a>(
     next_os(iter, flag)?
         .to_str()
         .ok_or_else(|| format!("value after {flag} is not valid UTF-8"))
+}
+
+/// Whether `crate_name` has the `build_script_<stem>` shape Cargo gives a
+/// `custom-build` target (`build-script-<stem>` from `package.build`).
+#[must_use]
+pub(crate) fn is_build_script_crate_name(crate_name: &str) -> bool {
+    crate_name
+        .strip_prefix("build_script_")
+        .is_some_and(|stem| !stem.is_empty())
 }
 
 #[cfg(test)]
@@ -2194,6 +2212,46 @@ mod tests {
                 "/t/debug/build/zstd-sys/fbf81822541b190b/out/build_script_build"
             ))
         );
+
+        let custom = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "build_script_main",
+            "--crate-type",
+            "bin",
+            "--out-dir",
+            "/t/debug/build/xcb/fbf81822541b190b/out",
+            "-C",
+            "metadata=e8a2e5854cc9f44b",
+        ]))
+        .expect("parser should succeed");
+        assert!(custom.is_build_script());
+        assert!(custom.is_restorable_artifact());
+        assert_eq!(
+            custom
+                .output_binary_path("aarch64-apple-darwin")
+                .expect("custom build script output"),
+            Some(PathBuf::from(
+                "/t/debug/build/xcb/fbf81822541b190b/out/build_script_main"
+            ))
+        );
+
+        let mut bin_target = custom;
+        bin_target.cargo_bin_name = true;
+        assert!(!bin_target.is_build_script());
+        assert!(!bin_target.is_restorable_artifact());
+
+        let empty_stem = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "build_script_",
+            "--crate-type",
+            "bin",
+            "--out-dir",
+            "/tmp/out",
+            "-C",
+            "metadata=e8a2e5854cc9f44b",
+        ]))
+        .expect("parser should succeed");
+        assert!(!empty_stem.is_build_script());
     }
 
     /// A build script binary is named for the host the compiling rustc

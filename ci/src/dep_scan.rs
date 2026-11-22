@@ -2290,6 +2290,7 @@ mod tests {
             compile_millis: 0,
             package: None,
             reads_manifest_dir: false,
+            cargo_bin_name: None,
         }
     }
 
@@ -2981,6 +2982,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn custom_named_build_script_selects_under_owning_package() {
+        let mut index = super::PackageIndex::new();
+        index
+            .entry("xcb".to_owned())
+            .or_default()
+            .insert("1.7.1".to_owned(), indexed("xcb", "1.7.1"));
+        let mut script =
+            build_script_capture("xcb", "1.7.1", "/tmp/w/target", UnitInvocation::Native);
+        script.crate_name = "build_script_main".to_owned();
+        script.outputs[0].path =
+            PathBuf::from("/tmp/w/target/debug/build/xcb-0000/build_script_main-aaaaaaaaaaaaaaaa");
+        script.outputs[1].path =
+            PathBuf::from("/tmp/w/target/debug/build/xcb-0000/build_script_main");
+
+        let selected = select_captured_artifacts(&index, &[script], "x86_64-unknown-linux-gnu")
+            .expect("custom-named script selects");
+        assert_eq!(selected.artifacts.len(), 1);
+        assert_eq!(
+            selected.artifacts[0].artifact_kind,
+            ArtifactKind::BuildScript
+        );
+        assert_eq!(selected.artifacts[0].package.name, "xcb");
+    }
+
     /// Relocatable foreign scripts must reach the own-node check too.
     #[test]
     fn relocatable_build_scripts_reach_the_own_node_check() {
@@ -3582,6 +3608,7 @@ mod tests {
             compile_millis: 0,
             package: None,
             reads_manifest_dir: false,
+            cargo_bin_name: None,
         }
     }
 
@@ -3874,6 +3901,7 @@ mod tests {
             compile_millis: 0,
             package: None,
             reads_manifest_dir: false,
+            cargo_bin_name: None,
         }
     }
 
@@ -3920,6 +3948,7 @@ mod tests {
                 compile_millis: 0,
                 package: None,
                 reads_manifest_dir: false,
+                cargo_bin_name: None,
             },
             dependency_aliases: Vec::new(),
             shared_invocations: false,

@@ -60,6 +60,7 @@ pub async fn run_rustc_capture_wrapper(
             // unit; a served bundle's native artifacts must restore into it,
             // never into a `-L native=` path (stow#431).
             parsed.build_script_out_dir = std::env::var_os("OUT_DIR").map(PathBuf::from);
+            parsed.cargo_bin_name = std::env::var_os("CARGO_BIN_NAME").is_some();
             parsed
         }
         Err(error) if error.contains("missing --crate-name") => {
@@ -489,6 +490,7 @@ async fn consumed_capture_record(
         compile_millis: 0,
         package: registry_identity.map(|(package, _)| package),
         reads_manifest_dir: false,
+        cargo_bin_name: cargo_bin_name_env(),
     })
 }
 
@@ -518,7 +520,7 @@ fn is_generated_wrapper_unit(
         return false;
     }
     // The wrapper's own build script is a unit of the wrapper package too,
-    // though its `--crate-name` is always `build_script_build`.
+    // though its `--crate-name` is `build_script_<stem>`, not the package's.
     if parsed.is_build_script() {
         return true;
     }
@@ -589,7 +591,12 @@ fn observed_capture_record(
         compile_millis,
         package: None,
         reads_manifest_dir: false,
+        cargo_bin_name: cargo_bin_name_env(),
     })
+}
+
+fn cargo_bin_name_env() -> Option<String> {
+    std::env::var_os("CARGO_BIN_NAME").map(|name| name.to_string_lossy().into_owned())
 }
 
 async fn replay_rustc_output(output: &async_process::Output) -> stow_types::error::Result<()> {
@@ -730,9 +737,13 @@ async fn prepare_stable_rustc_invocation(
         &identity.extra_filename,
         original_parsed.extra_filename.is_empty(),
     )?;
-    let rewritten_parsed = ParsedRustcArgs::parse(&rewritten_args).map_err(|error| {
+    let mut rewritten_parsed = ParsedRustcArgs::parse(&rewritten_args).map_err(|error| {
         stow_types::stow_error!("parse rewritten rustc wrapper arguments: {error}")
     })?;
+    rewritten_parsed
+        .build_script_out_dir
+        .clone_from(&original_parsed.build_script_out_dir);
+    rewritten_parsed.cargo_bin_name = original_parsed.cargo_bin_name;
     Ok((
         rewritten_args,
         Some(rewritten_parsed),
@@ -1198,6 +1209,7 @@ async fn build_capture_record(
         compile_millis,
         package: registry_identity.map(|(package, _)| package),
         reads_manifest_dir,
+        cargo_bin_name: cargo_bin_name_env(),
     })
 }
 
@@ -1689,6 +1701,7 @@ mod tests {
             strip: None,
             native_search_paths: Vec::new(),
             build_script_out_dir: None,
+            cargo_bin_name: false,
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: false,
@@ -1955,6 +1968,7 @@ mod tests {
             strip: None,
             native_search_paths: Vec::new(),
             build_script_out_dir: None,
+            cargo_bin_name: false,
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: false,
@@ -2135,6 +2149,7 @@ mod tests {
             compile_millis: 0,
             package: None,
             reads_manifest_dir: false,
+            cargo_bin_name: None,
         }
     }
 

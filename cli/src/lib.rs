@@ -779,6 +779,7 @@ fn check_build_script_output(
 /// list stow cannot model still reaches the real compiler — both variants
 /// run a transparent passthrough and differ only in how loudly they are
 /// logged.
+#[derive(Debug)]
 enum UnparseableInvocation {
     /// cargo's `--crate-name`-less probe of the compiler; quiet bypass.
     Probe(String),
@@ -790,9 +791,13 @@ enum UnparseableInvocation {
 
 fn classify_invocation(
     args: &[OsString],
+    cargo_bin_name: bool,
 ) -> Result<rustc_args::ParsedRustcArgs, UnparseableInvocation> {
     match rustc_args::ParsedRustcArgs::parse(args) {
-        Ok(parsed) => Ok(parsed),
+        Ok(mut parsed) => {
+            parsed.cargo_bin_name = cargo_bin_name;
+            Ok(parsed)
+        }
         Err(error) if error.contains("missing --crate-name") => {
             Err(UnparseableInvocation::Probe(error))
         }
@@ -5777,12 +5782,10 @@ mod tests {
     fn unparseable_rustc_invocation_passes_through_instead_of_failing() {
         // A flag stow does not model must never fail the unit: the
         // invocation goes to the real rustc verbatim.
-        let invocation = classify_invocation(&args(&[
-            "--crate-name",
-            "itoa",
-            "-Z",
-            "embed-metadata=banana",
-        ]));
+        let invocation = classify_invocation(
+            &args(&["--crate-name", "itoa", "-Z", "embed-metadata=banana"]),
+            false,
+        );
 
         assert!(
             matches!(invocation, Err(UnparseableInvocation::Passthrough(_))),
@@ -5793,9 +5796,30 @@ mod tests {
     #[test]
     fn crate_name_less_probe_stays_a_quiet_passthrough() {
         assert!(matches!(
-            classify_invocation(&args(&["-vV"])),
+            classify_invocation(&args(&["-vV"]), false),
             Err(UnparseableInvocation::Probe(_))
         ));
+    }
+
+    #[test]
+    fn custom_build_script_and_bin_target_sharing_prefix_classify_apart() {
+        let argv = args(&[
+            "--crate-name",
+            "build_script_main",
+            "--crate-type",
+            "bin",
+            "-C",
+            "metadata=deadbeefdeadbeef",
+            "--out-dir",
+            "/tmp/out",
+        ]);
+        let script = classify_invocation(&argv, false).expect("parse custom build script");
+        assert!(script.is_build_script());
+        assert!(script.is_restorable_artifact());
+
+        let bin = classify_invocation(&argv, true).expect("parse bin target");
+        assert!(!bin.is_build_script());
+        assert!(!bin.is_restorable_artifact());
     }
 
     /// Cargo's probes reach the session as `Plan` frames — `rustc -vV`

@@ -688,7 +688,7 @@ impl<O: Origin> Handler for Session<O> {
     ) -> Decision<Self::Pending> {
         self.origin.planned(&invocation_env);
         let args = invocation.into_args();
-        let classified = classify_invocation(&args);
+        let classified = classify_invocation(&args, invocation_env.cargo_bin_name);
         if !self.resolution_done.has_completed() && describes_compile_unit(&classified) {
             self.resolution_done.complete();
         }

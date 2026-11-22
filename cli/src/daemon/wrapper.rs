@@ -107,6 +107,12 @@ pub struct InvocationEnv {
     /// The invocation's `CARGO_PRIMARY_PACKAGE` fact — set on the units of
     /// the crate cargo is building, which are never cached.
     pub primary_package: bool,
+    /// Whether Cargo set `CARGO_BIN_NAME` on this invocation — set on
+    /// `[[bin]]` and `[[example]]` units and never on `custom-build`
+    /// units, so a binary named `build_script_*` is not mistaken for a
+    /// build script.
+    #[serde(default)]
+    pub cargo_bin_name: bool,
     /// The invocation's `CARGO_MANIFEST_DIR` — cargo sets it on every
     /// rustc call — OS-encoded like the argv. The git-source detection
     /// reads the manifest path inside the checkout from it rather than
@@ -131,6 +137,7 @@ impl InvocationEnv {
     pub fn current() -> Self {
         Self {
             primary_package: std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some(),
+            cargo_bin_name: std::env::var_os("CARGO_BIN_NAME").is_some(),
             manifest_dir: std::env::var_os("CARGO_MANIFEST_DIR")
                 .map(|value| os_bytes::encode(&value)),
             out_dir: std::env::var_os("OUT_DIR").map(|value| os_bytes::encode(&value)),
