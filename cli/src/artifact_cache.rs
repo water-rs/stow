@@ -786,7 +786,7 @@ fn semantic_candidate_honours_consumer(
         let candidate_build_script = stow_types::upload_plan::BuildScriptInputs::of(
             read_entry_native(&loaded.entry_dir)?.as_ref(),
         );
-        if candidate_build_script != request.build_script {
+        if !candidate_build_script.superset_honours(&request.build_script) {
             return Ok(false);
         }
         std::borrow::Cow::Owned(candidate_build_script)

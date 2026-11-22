@@ -515,7 +515,7 @@ pub fn validate_semantic_bundle_identity(
         } else {
             let bundle_build_script =
                 stow_types::upload_plan::BuildScriptInputs::of(config.native.as_ref());
-            if bundle_build_script != request.build_script {
+            if !bundle_build_script.superset_honours(&request.build_script) {
                 return Err(stow_types::stow_error!(
                     "downloaded semantic bundle build-script inputs differ from the request"
                 ));
@@ -943,12 +943,12 @@ pub mod tests {
             stow_types::identity::FeaturesJson::canonicalize(vec!["dlopen".to_owned()])
                 .expect("canonical features");
         request.features_json = "[]".to_owned();
-        request.build_script.link_args = vec!["-lfontconfig".to_owned()];
+        request.build_script.link_libs = vec!["fontconfig".to_owned()];
         assert!(
             super::validate_semantic_bundle_identity(&dlopen_bundle, &request, true).is_err(),
-            "superset bundle with mismatched build-script link args must be rejected"
+            "superset bundle with mismatched build-script link libs must be rejected"
         );
-        request.build_script.link_args.clear();
+        request.build_script.link_libs.clear();
         request.non_additive_features.insert("dlopen".to_owned());
         assert!(
             super::validate_semantic_bundle_identity(&dlopen_bundle, &request, true).is_err(),
