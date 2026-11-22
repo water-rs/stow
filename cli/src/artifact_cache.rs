@@ -7969,6 +7969,7 @@ pub mod tests {
             strip: None,
             native_search_paths: Vec::new(),
             build_script_out_dir: None,
+            cargo_bin_name: false,
             extern_crates,
             embed_metadata: None,
             embed_bitcode: false,
@@ -8076,6 +8077,7 @@ pub mod tests {
             strip: None,
             native_search_paths: Vec::new(),
             build_script_out_dir: None,
+            cargo_bin_name: false,
             extern_crates: vec![ParsedExternCrate {
                 crate_name: "colorchoice".to_owned(),
                 path: dependency_rmeta,

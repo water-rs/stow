@@ -1927,55 +1927,79 @@ echo "[mock-e2e] uncovered graph: 1 admission with PoW challenge (expected)"
 
 echo "[mock-e2e] OK — $TASK_CRATE $TASK_VERSION served from the mock cache via the local index"
 
-# --- stow#1009: remote and local build-script binaries -----------------
+# --- stow#1009, stow#1653: remote and local build-script binaries ------
 script_before="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status")"
-fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
-    "$BIN/stow-admin" submit --crate-name serde_core --version 1.0.229 \
-    --features-json '[]' --target "$HOST_TARGET" --rustc-version "$RUSTC_VERSION" --yes \
-    >"$LOG_DIR/build-script-submit.log" 2>&1 \
-    || die "build-script submit failed — see $LOG_DIR/build-script-submit.log"
+script_target_completed=$(( $(jq -r '.completed' <<<"$script_before") + 2 ))
+for spec in "serde_core 1.0.229" "typenum 1.16.0"; do
+    read -r script_crate script_version <<<"$spec"
+    fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
+        "$BIN/stow-admin" submit --crate-name "$script_crate" --version "$script_version" \
+        --features-json '[]' --target "$HOST_TARGET" --rustc-version "$RUSTC_VERSION" --yes \
+        >>"$LOG_DIR/build-script-submit.log" 2>&1 \
+        || die "build-script submit ($script_crate) failed — see $LOG_DIR/build-script-submit.log"
+done
 deadline=$((SECONDS + TASK_DEADLINE))
 while :; do
     check_children_alive
     status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status")"
     [ "$(jq -r '.failed' <<<"$status_json")" -eq "$(jq -r '.failed' <<<"$script_before")" ] \
         || die "build-script task failed: $status_json"
-    [ "$(jq -r '.completed' <<<"$status_json")" -gt "$(jq -r '.completed' <<<"$script_before")" ] && break
+    [ "$(jq -r '.completed' <<<"$status_json")" -ge "$script_target_completed" ] && break
     [ "$SECONDS" -lt "$deadline" ] || die "build-script task exceeded ${TASK_DEADLINE}s"
     sleep 5
 done
 fg publish_slices build-script
-jq -e '[.[] | select(.crate_name == "serde_core" and .artifact_kind == "BuildScript")] | length > 0' \
-    "$WORK_DIR/catalog.json" >/dev/null || die "serde_core published no build-script artifact"
+for script_crate in serde_core typenum; do
+    jq -e --arg crate "$script_crate" \
+        '[.[] | select(.crate_name == $crate and .artifact_kind == "BuildScript")] | length > 0' \
+        "$WORK_DIR/catalog.json" >/dev/null \
+        || die "$script_crate published no build-script artifact"
+done
 SCRIPT_CONSUMER="$WORK_DIR/build-script-consumer"
 isolated_env cargo new --lib --vcs none "$SCRIPT_CONSUMER" >"$LOG_DIR/build-script-new.log" 2>&1
-printf 'serde_core = { version = "=1.0.229", default-features = false }\n' >>"$SCRIPT_CONSUMER/Cargo.toml"
+cat >>"$SCRIPT_CONSUMER/Cargo.toml" <<'EOF'
+serde_core = { version = "=1.0.229", default-features = false }
+typenum = { version = "=1.16.0", default-features = false }
+EOF
 fg prepare_consumer "$SCRIPT_CONSUMER" build-script
 fg in_dir "$SCRIPT_CONSUMER" stow_cli index refresh >"$LOG_DIR/build-script-refresh.log" 2>&1
 RUST_LOG=stow_cli=info fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-remote.log" 2>&1 \
     || die "remote build-script consumer failed — see $LOG_DIR/build-script-remote.log"
-grep 'served rustc invocation from downloaded stow artifact cache' "$LOG_DIR/build-script-remote.log" \
-    | grep 'crate_name=build_script_build' >/dev/null || die "build script was not served remotely"
+for script_name in build_script_build build_script_main; do
+    grep 'served rustc invocation from downloaded stow artifact cache' "$LOG_DIR/build-script-remote.log" \
+        | grep "crate_name=$script_name" >/dev/null \
+        || die "$script_name was not served remotely"
+done
 fg in_dir "$SCRIPT_CONSUMER" isolated_env cargo clean >"$LOG_DIR/build-script-clean.log" 2>&1
 RUST_LOG=stow_cli=info fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-local.log" 2>&1 \
     || die "local build-script consumer failed — see $LOG_DIR/build-script-local.log"
-grep 'served rustc invocation from local stow artifact cache' "$LOG_DIR/build-script-local.log" \
-    | grep 'crate_name=build_script_build' >/dev/null || die "build script was not served locally"
+for script_name in build_script_build build_script_main; do
+    grep 'served rustc invocation from local stow artifact cache' "$LOG_DIR/build-script-local.log" \
+        | grep "crate_name=$script_name" >/dev/null \
+        || die "$script_name was not served locally"
+done
 RUST_LOG=stow_cli=info fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-fresh.log" 2>&1 \
     || die "fresh build-script consumer failed — see $LOG_DIR/build-script-fresh.log"
-grep 'Fresh serde_core v1.0.229' "$LOG_DIR/build-script-fresh.log" >/dev/null \
-    || die "Cargo did not keep the restored build script fresh"
-# Cargo runs a build script as `build-script-build` in the old layout and
-# as `out/build_script_build` in cargo 1.100's build-unit layout.
-script_run='Running .*(build-script-build|/out/build_script_build)'
-for stage in remote local; do
-    runs="$(grep -cE "$script_run" "$LOG_DIR/build-script-$stage.log" || true)"
-    [ "$runs" -eq 1 ] || die "$stage script restore ran the script $runs times instead of once"
+for fresh_line in 'Fresh serde_core v1.0.229' 'Fresh typenum v1.16.0'; do
+    grep "$fresh_line" "$LOG_DIR/build-script-fresh.log" >/dev/null \
+        || die "Cargo did not keep restored unit fresh ($fresh_line)"
 done
-if grep -qE "$script_run" "$LOG_DIR/build-script-fresh.log"; then
-    die "Cargo reran the fresh build script"
-fi
-echo "[mock-e2e] OK — build script served remotely and locally, then kept fresh by Cargo"
+# Cargo runs a build script as `build-script-<stem>` in the old layout and
+# as `out/build_script_<stem>` in cargo 1.100's build-unit layout; match the
+# closing backtick of Cargo's `Running \`…\`` block because a multi-line
+# `CARGO_PKG_DESCRIPTION` puts `Running` and the executable on different lines.
+for script_run in \
+    '(build-script-build|/out/build_script_build)`$' \
+    '(build-script-main|/out/build_script_main)`$'; do
+    for stage in remote local; do
+        runs="$(grep -cE "$script_run" "$LOG_DIR/build-script-$stage.log" || true)"
+        [ "$runs" -eq 1 ] || die "$stage script restore ($script_run) ran $runs times instead of once"
+    done
+    if grep -qE "$script_run" "$LOG_DIR/build-script-fresh.log"; then
+        die "Cargo reran the fresh build script ($script_run)"
+    fi
+done
+echo "[mock-e2e] OK — default and custom-named build scripts served remotely and locally, then kept fresh by Cargo"
 
 # --- stow#774: host-side nodes ------------------------------------------
 #

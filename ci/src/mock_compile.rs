@@ -196,9 +196,10 @@ pub fn compile(args: &[OsString]) -> stow_types::error::Result<Option<Vec<u8>>> 
     if !enabled() {
         return Ok(None);
     }
-    let Ok(parsed) = ParsedRustcArgs::parse(args) else {
+    let Ok(mut parsed) = ParsedRustcArgs::parse(args) else {
         return Ok(None);
     };
+    parsed.cargo_bin_name = std::env::var_os("CARGO_BIN_NAME").is_some();
     if !replaces(args, &parsed) {
         return Ok(None);
     }
@@ -328,12 +329,7 @@ fn build_script_run_path(
     host: &str,
 ) -> stow_types::error::Result<Option<PlannedOutput>> {
     let built_for_host = parsed.target.is_none();
-    let is_build_script = parsed.crate_name.starts_with("build_script_")
-        && parsed
-            .crate_types
-            .iter()
-            .any(|crate_type| crate_type == "bin")
-        && parsed.emit.contains("link");
+    let is_build_script = parsed.is_build_script() && parsed.emit.contains("link");
     let host_suffix = Naming::of(host).exe_suffix;
     let Some(out_dir) = parsed.out_dir.as_deref() else {
         return Ok(None);

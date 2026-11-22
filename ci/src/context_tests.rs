@@ -133,8 +133,10 @@ fn publish_manifest(reg: &Path, fixture: &Fixture, manifest: &Value) -> String {
 }
 
 fn publish_manifest_source(reg: &Path, fixture: &Fixture, manifest: &Value, lib: &str) -> String {
-    let build_script =
-        !fixture.build_deps.is_empty() && manifest["package"]["build"] != json!(false);
+    let build_script = manifest["package"]["build"].as_str().or_else(|| {
+        (!fixture.build_deps.is_empty() && manifest["package"]["build"] != json!(false))
+            .then_some("build.rs")
+    });
     let cksum = write_crate_tarball(reg, fixture, manifest, lib, build_script);
 
     // The index line's deps are the manifest's own tables, so the two
@@ -222,7 +224,7 @@ fn write_crate_tarball(
     fixture: &Fixture,
     manifest: &Value,
     lib: &str,
-    build_script: bool,
+    build_script: Option<&str>,
 ) -> String {
     let tarball = reg.join(format!("{}-{}.crate", fixture.name, fixture.version));
     let file = std::fs::File::create(&tarball).expect("create crate tarball");
@@ -246,9 +248,9 @@ fn write_crate_tarball(
         format!("{}-{}/src/lib.rs", fixture.name, fixture.version),
         lib.to_owned(),
     );
-    if build_script {
+    if let Some(script_path) = build_script {
         append(
-            format!("{}-{}/build.rs", fixture.name, fixture.version),
+            format!("{}-{}/{script_path}", fixture.name, fixture.version),
             "fn main() {}\n".to_owned(),
         );
     }
@@ -2464,5 +2466,73 @@ fn native_equivalent_library_produces_both_script_shapes_without_recompiling_its
             owed.script_clauses().is_empty(),
             "a crate without a build script owes none"
         );
+    });
+}
+
+#[test]
+fn custom_build_script_path_captures_as_restorable_build_script() {
+    let (cargo_home, reg) = registry_home();
+    let scratch = tempfile::tempdir().unwrap();
+    let fixture = Fixture {
+        name: "xcb_like",
+        version: "1.0.0",
+        deps: vec![],
+        build_deps: vec![],
+        features: &[],
+        proc_macro: false,
+    };
+    let mut manifest = fixture_manifest(&fixture, &[]);
+    manifest["package"]["build"] = json!("build/main.rs");
+    publish_manifest(&reg, &fixture, &manifest);
+
+    let consumer = consumer_project(scratch.path(), &json!({"xcb_like": "1"}), &json!({}));
+    let requests = resolve_requests(cargo_home.path(), &consumer);
+    let task = payload_for(&request_for(&requests, "xcb_like"));
+    let (runtime, capture) = build_binaries();
+    smol::block_on(async {
+        let (_root, workspace) = wrapper_workspace(&reg, &task).await;
+        let graphs =
+            task::phase_unit_graphs(cargo_home.path(), &task, &workspace, CargoSubcommand::Build)
+                .await
+                .expect("xcb_like graphs");
+        let owed = crate::shapes::OwnNodeShapes::from_graphs(&task, &graphs).expect("owed shapes");
+        assert!(
+            !owed.script_clauses().is_empty(),
+            "unit graph owes the custom-named build script"
+        );
+
+        let native = capture_task_units(cargo_home.path(), &reg, &task, &runtime, &capture).await;
+        let explicit = capture_task_invocation(
+            cargo_home.path(),
+            &reg,
+            &task,
+            &runtime,
+            &capture,
+            task::CargoInvocation::ExplicitCompileTime,
+        )
+        .await;
+        let native_script = native
+            .iter()
+            .find(|record| record.crate_name == "build_script_main")
+            .expect("native build_script_main recorded");
+        let explicit_script = explicit
+            .iter()
+            .find(|record| record.crate_name == "build_script_main")
+            .expect("explicit build_script_main recorded");
+        for script in [native_script, explicit_script] {
+            assert!(
+                script.restorable && script.is_build_script() && script.cargo_bin_name.is_none(),
+                "custom-named build script must be captured as restorable BuildScript: {script:?}"
+            );
+            assert_eq!(script.package.as_deref(), Some("xcb_like"));
+        }
+        assert_scripts_follow_their_spellings(
+            cargo_home.path(),
+            &task,
+            &workspace,
+            native_script,
+            explicit_script,
+        )
+        .await;
     });
 }

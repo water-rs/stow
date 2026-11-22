@@ -943,6 +943,7 @@ mod tests {
             strip: None,
             native_search_paths: Vec::new(),
             build_script_out_dir: None,
+            cargo_bin_name: false,
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: false,

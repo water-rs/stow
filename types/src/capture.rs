@@ -111,8 +111,8 @@ pub struct CapturedRustcArtifact {
     #[serde(default)]
     pub compile_millis: u64,
     /// The package name the invocation's registry source path carries.
-    /// A build script's `--crate-name` is always `build_script_build`, so
-    /// the package that owns it can only be read from here.
+    /// A build script's `--crate-name` is `build_script_<stem>`, so the
+    /// package that owns it can only be read from here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package: Option<String>,
     /// Whether the compile read `CARGO_MANIFEST_DIR` through `env!` —
@@ -121,14 +121,19 @@ pub struct CapturedRustcArtifact {
     /// relocatable to another machine.
     #[serde(default)]
     pub reads_manifest_dir: bool,
+    /// `CARGO_BIN_NAME` when Cargo set one (`[[bin]]` and `[[example]]`
+    /// targets, never `custom-build`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_bin_name: Option<String>,
 }
 
 impl CapturedRustcArtifact {
-    /// Whether the record is a package's `build.rs` compile: a binary
-    /// crate cargo always names `build_script_build`.
+    /// Whether the record is a package's `custom-build` compile
+    /// (`build_script_<stem>` without `CARGO_BIN_NAME`).
     #[must_use]
     pub fn is_build_script(&self) -> bool {
-        self.crate_name == "build_script_build"
+        self.cargo_bin_name.is_none()
+            && crate::rustc::is_build_script_crate_name(&self.crate_name)
             && self
                 .crate_types
                 .iter()
