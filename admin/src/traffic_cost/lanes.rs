@@ -46,8 +46,10 @@ use zenwave::Client;
 
 use crate::Edge;
 
-/// Which lanes run and what they name — shared by the peak drive and
-/// the CPU measurement.
+// Which lanes run and what they name — shared by the peak drive and
+// the CPU measurement. Not a doc comment: a doc comment on a flattened
+// `Args` struct becomes the `about` of every command it is flattened
+// into.
 #[derive(Debug, Args)]
 pub struct LaneArgs {
     /// The checked-in launch model.

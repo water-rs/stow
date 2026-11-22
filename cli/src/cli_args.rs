@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+/// A prebuilt cache for Rust dependencies, and a local compilation
+/// cache that replaces sccache.
 #[derive(Debug, Parser)]
 #[command(name = "stow", version, disable_help_subcommand = true)]
 pub struct Cli {
@@ -12,19 +14,38 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Drop-in replacement for `cargo check`: units the caches cover
+    /// are served, the rest compile.
     Check(CargoCommandArgs),
+    /// Drop-in replacement for `cargo build`: units the caches cover
+    /// are served, the rest compile.
     Build(CargoCommandArgs),
+    /// Drop-in replacement for `cargo test`: units the caches cover
+    /// are served, the rest compile.
     Test(CargoCommandArgs),
     /// Report this workspace's cache coverage. Read-only: nothing is
     /// posted and nothing is enqueued.
     Predict(CargoCommandArgs),
+    /// Write stow's wrapper wiring into the global cargo config, so
+    /// every `cargo` invocation routes through the wrappers.
     Setup(SetupArgs),
     /// Update this install to the latest stow-cli release.
     Update,
+    /// Print the wrapper wiring `stow setup` wrote, stale wiring an
+    /// older stow left, and rolling cache-hit stats.
     Status,
+    /// Print this install's own cache statistics — hits, CPU time
+    /// saved, bytes downloaded — kept in `stats.json` next to the
+    /// cache. Local-only: nothing leaves the machine.
     Stats(StatsArgs),
+    /// Remove cached artifacts and build directories, keeping index
+    /// slices and local stats; `--all` removes the whole cache dir.
     Clean(CleanArgs),
+    /// Resolve a `c_metadata` against the verified index slice and
+    /// report the bundle digest it pins.
     CheckArtifact(CheckArtifactArgs),
+    /// Download the artifact bundle a `c_metadata` resolves to,
+    /// digest-checked against the index.
     FetchArtifact(FetchArtifactArgs),
     /// Manage the signed local artifact index this toolchain resolves
     /// against.
@@ -102,6 +123,8 @@ pub struct DrainMissesArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct CargoCommandArgs {
+    /// Apply the index's semver-compatible dependency-upgrade
+    /// suggestions without prompting.
     #[arg(long)]
     pub silent_compatible_upgrades: bool,
     /// Disable the default-on stow resolver. By default stow asks the edge
@@ -126,8 +149,9 @@ pub struct CargoCommandArgs {
     pub cargo_args: Vec<OsString>,
 }
 
-/// The build isolation switch, flattened into the commands that run cargo
-/// (stow#1000).
+// The build isolation switch, flattened into the commands that run cargo
+// (stow#1000). Not a doc comment: a doc comment on a flattened `Args`
+// struct becomes the `about` of every command it is flattened into.
 #[derive(Debug, Clone, Args)]
 pub struct IsolationArgs {
     /// How much of the machine the build's cargo, build scripts and proc
@@ -142,9 +166,11 @@ pub struct IsolationArgs {
     pub isolation: Option<crate::isolation::Level>,
 }
 
-/// The cache layer switches, flattened into the commands that run cargo
-/// (stow#1007). Each flag turns its layer off for this run, over the
-/// `[cache]` table of the stow config.
+// The cache layer switches, flattened into the commands that run cargo
+// (stow#1007). Each flag turns its layer off for this run, over the
+// `[cache]` table of the stow config. Not a doc comment: a doc comment
+// on a flattened `Args` struct becomes the `about` of every command it
+// is flattened into.
 #[derive(Debug, Clone, Copy, Default, Args)]
 pub struct CacheSwitchArgs {
     /// Turn the remote cache off for this run: no edge or registry request,
@@ -224,9 +250,6 @@ pub struct SetupArgs {
     pub skill: SkillSetupArgs,
 }
 
-/// `stow stats`: print this install's own cache statistics — hits,
-/// CPU time saved, bytes downloaded — kept in `stats.json` next to the
-/// cache. Local-only: nothing leaves the machine.
 #[derive(Debug, Clone, Args)]
 pub struct StatsArgs {
     /// Print the counters as JSON instead of a table.
@@ -305,6 +328,36 @@ pub struct IndexRefreshArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every visible command and subcommand describes itself, and no
+    /// description is an internal note: a `///` doc comment on a
+    /// flattened `Args` struct becomes the `about` of every command it
+    /// is flattened into, which is how the `CacheSwitchArgs` note leaked
+    /// onto `check`/`build`/`test` (stow#1659).
+    #[test]
+    fn every_visible_command_describes_itself_without_internal_notes() {
+        fn walk(command: &clap::Command) {
+            for sub in command
+                .get_subcommands()
+                .filter(|sub| !sub.is_hide_set())
+            {
+                let about = sub.get_about().map_or_else(
+                    || panic!("`{}` has no description", sub.get_name()),
+                    ToString::to_string,
+                );
+                let long = sub
+                    .get_long_about()
+                    .map_or_else(String::new, ToString::to_string);
+                assert!(
+                    !about.contains("stow#") && !long.contains("stow#"),
+                    "`{}` leaks an internal reference into help: {about}",
+                    sub.get_name()
+                );
+                walk(sub);
+            }
+        }
+        walk(&<Cli as clap::CommandFactory>::command());
+    }
 
     #[test]
     fn parses_check_command_with_passthrough_cargo_args() {
