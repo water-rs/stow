@@ -1660,3 +1660,220 @@ async fn legacy_records_and_markers_migrate_inline_and_rerun_writes_nothing() {
     ));
     assert_eq!(stack.writes(), writes_rerun, "a rerun writes nothing");
 }
+
+#[tokio::test]
+async fn legacy_standalone_sig_records_and_markers_under_old_identity_resign_in_one_pass() {
+    let stack = Stack::new().await;
+    let session = stack.session(&unbounded());
+    let trust = stow_oci::verify::Trust::GithubCi(stack.sigstore.trust());
+    let rustc = WireRustcVersion::parse(super::RUSTC).expect("rustc");
+    let old_signer = stack.signer_as(OLD_IDENTITY);
+    let old_detached = |reference: String, digest: String| {
+        let signer = &old_signer;
+        async move { signer.sign_detached(&reference, &digest).await }
+    };
+
+    let plans = vec![plan(&stack.root, 0)];
+    let outcome = stow_oci::push_artifacts_with(&session, &plans, &old_detached)
+        .await
+        .expect("old bundle publish");
+    let rows = stow_types::upload_plan::build_artifact_records(
+        &plans,
+        &outcome.published_by_reference,
+        &plans
+            .iter()
+            .map(|plan| (plan.oci_reference.clone(), None))
+            .collect(),
+    )
+    .expect("records");
+
+    let push_legacy = |task_id: &'static str, records: BuildRecords| {
+        let session = &session;
+        let old_signer = &old_signer;
+        let rustc = &rustc;
+        async move {
+            let tag = stow_types::records::records_tag(
+                rustc.as_str(),
+                task_id,
+                BuildRun {
+                    run_id: 1,
+                    run_attempt: 1,
+                },
+            );
+            let marker_tag = stow_types::records::published_tag(rustc.as_str(), task_id);
+            let reference = session.reference(&tag).expect("records ref");
+            let marker_ref = session.reference(&marker_tag).expect("marker ref");
+            let body = serde_json::to_vec(&records).expect("body");
+            let layer_digest = stow_types::registry::sha256_digest(&body);
+            let config = b"{}";
+            let config_digest = stow_types::registry::sha256_digest(config);
+            session
+                .push_blob(&layer_digest, &body)
+                .await
+                .expect("layer");
+            session
+                .push_blob(&config_digest, config)
+                .await
+                .expect("config");
+            let legacy_manifest = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": stow_types::bundle::OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+                "artifactType": stow_types::records::RECORDS_ARTIFACT_TYPE,
+                "config": {
+                    "mediaType": stow_types::records::RECORDS_CONFIG_MEDIA_TYPE,
+                    "digest": config_digest,
+                    "size": config.len(),
+                },
+                "layers": [{
+                    "mediaType": stow_types::records::RECORDS_ARTIFACT_TYPE,
+                    "digest": layer_digest,
+                    "size": body.len(),
+                }],
+                "annotations": {
+                    stow_types::records::RECORDS_TASK_ID_ANNOTATION: task_id,
+                },
+            }))
+            .expect("legacy manifest");
+            let ref_str = reference.to_string();
+            stow_oci::put_signed_manifest(session, &reference, &legacy_manifest, |digest| {
+                let ref_str = ref_str.clone();
+                async move { old_signer.sign(session, &ref_str, &digest).await }
+            })
+            .await
+            .expect("legacy signed push");
+            let marker_str = ref_str.clone();
+            stow_oci::put_signed_manifest(session, &marker_ref, &legacy_manifest, |digest| {
+                let marker_str = marker_str.clone();
+                async move { old_signer.sign(session, &marker_str, &digest).await }
+            })
+            .await
+            .expect("legacy marker push");
+            (tag, marker_tag)
+        }
+    };
+
+    // Task 1: legacy `.sig` + `@refs/heads/main` with live node bundle.
+    let (node_tag, node_marker) = push_legacy(
+        "legacy-node-task",
+        BuildRecords {
+            artifacts: rows.clone(),
+            local_programs: Vec::new(),
+        },
+    )
+    .await;
+    // Task 2: orphan legacy `.sig` `built-*` marker signed under `@refs/heads/main`.
+    let (_, orphan_marker) = push_legacy("legacy-orphan-task", BuildRecords::default()).await;
+
+    let new_signer = stack.signer_as(CERTIFICATE_IDENTITY);
+    let sign_detached = |reference: String, digest: String| {
+        let signer = &new_signer;
+        async move { signer.sign_detached(&reference, &digest).await }
+    };
+    let identities = Identities {
+        old: &old_identity(),
+        new: &reader_identity(),
+    };
+    let resigned = stow_oci::resign::resign_task(
+        &session,
+        &trust,
+        &rustc,
+        &[node_tag.as_str()],
+        identities,
+        BuildRun {
+            run_id: 2,
+            run_attempt: 1,
+        },
+        Signers {
+            records: &sign_detached,
+            node: &sign_detached,
+        },
+    )
+    .await
+    .expect("legacy .sig task re-signs");
+    assert_eq!(
+        (resigned.records_signed, resigned.nodes_republished),
+        (1, 1)
+    );
+    let published = resigned.published.expect("republished task records");
+    assert!(
+        stack
+            .records_tag_verifies(&session, &node_tag, &reader_identity())
+            .await
+    );
+    assert!(
+        stack
+            .records_tag_verifies(&session, &published.tag, &reader_identity())
+            .await
+    );
+    assert_eq!(
+        stow_oci::resign::resign_marker(
+            &session,
+            &trust,
+            &rustc,
+            &node_marker,
+            None,
+            identities,
+            &sign_detached,
+        )
+        .await
+        .expect("task marker already updated by push_records_with"),
+        stow_oci::resign::Resigned::Already
+    );
+    assert_eq!(
+        stow_oci::resign::resign_marker(
+            &session,
+            &trust,
+            &rustc,
+            &orphan_marker,
+            None,
+            identities,
+            &sign_detached,
+        )
+        .await
+        .expect("orphan legacy marker re-signs in place"),
+        stow_oci::resign::Resigned::Signed
+    );
+
+    let writes_before = stack.writes();
+    let rerun = stow_oci::resign::resign_task(
+        &session,
+        &trust,
+        &rustc,
+        &[published.tag.as_str(), node_tag.as_str()],
+        identities,
+        BuildRun {
+            run_id: 3,
+            run_attempt: 1,
+        },
+        Signers {
+            records: &sign_detached,
+            node: &sign_detached,
+        },
+    )
+    .await
+    .expect("rerun succeeds");
+    assert_eq!(
+        (
+            rerun.records_signed,
+            rerun.records_already,
+            rerun.nodes_republished,
+            rerun.nodes_already
+        ),
+        (0, 2, 0, 1)
+    );
+    assert_eq!(
+        stow_oci::resign::resign_marker(
+            &session,
+            &trust,
+            &rustc,
+            &orphan_marker,
+            None,
+            identities,
+            &sign_detached,
+        )
+        .await
+        .expect("rerun orphan marker"),
+        stow_oci::resign::Resigned::Already
+    );
+    assert_eq!(stack.writes(), writes_before, "rerun writes nothing");
+}

@@ -24,14 +24,17 @@
 //! records manifest. A rerun skips what already verifies under the new
 //! identity, so it writes nothing once a run has finished.
 
+use std::collections::BTreeMap;
+
 use futures_util::StreamExt as _;
 use stow_oci::resign::{
-    ExactIdentity, Identities, Signers, TagClass, TaskResigned, classify_tag, resign_task,
+    ExactIdentity, Identities, Signers, TagClass, TaskResigned, classify_tag, resign_marker,
+    resign_task,
 };
 use stow_oci::verify::ReleaseIdentity;
 use stow_oci::{Publisher, RegistryHttp, RegistrySession};
 use stow_types::identity::WireRustcVersion;
-use stow_types::records::BuildRun;
+use stow_types::records::{BuildRun, task_id_hash};
 use stow_types::registry::cache_repository;
 use stow_types::trusted_builder::{CERTIFICATE_ISSUER, TrustedWorkflow};
 
@@ -161,6 +164,7 @@ pub async fn run(
         tasks: tasks.len(),
         ..Sweep::default()
     };
+    let mut newest_by_hash = BTreeMap::new();
     let mut outcomes = futures_util::stream::iter(tasks.iter().map(|tags| resigner.task(tags)))
         .buffer_unordered(concurrency);
     while let Some(outcome) = outcomes.next().await {
@@ -171,6 +175,11 @@ pub async fn run(
                 sweep.nodes_republished += outcome.nodes_republished;
                 sweep.nodes_already += outcome.nodes_already;
                 sweep.tasks_published += usize::from(outcome.published.is_some());
+                if let (Some(task_id), Some(outer_bytes)) =
+                    (outcome.task_id, outcome.newest_outer_bytes)
+                {
+                    newest_by_hash.insert(task_id_hash(&task_id), outer_bytes);
+                }
             }
             Err(error) => {
                 sweep.failed += 1;
@@ -182,8 +191,10 @@ pub async fn run(
 
     // The markers resolve to records manifests the tasks above re-signed,
     // so they are checked once every task has finished.
-    let mut checks = futures_util::stream::iter(markers.iter().map(|tag| resigner.marker(tag)))
-        .buffer_unordered(concurrency);
+    let newest_ref = &newest_by_hash;
+    let mut checks =
+        futures_util::stream::iter(markers.iter().map(|tag| resigner.marker(tag, newest_ref)))
+            .buffer_unordered(concurrency);
     while let Some(outcome) = checks.next().await {
         match outcome {
             Ok(()) => sweep.markers += 1,
@@ -238,24 +249,38 @@ impl Resigner<'_> {
     }
 
     /// Check that the `built-` marker `tag` resolves to a records manifest
-    /// carrying an inline signature under the new identity.
-    async fn marker(&self, tag: &str) -> stow_types::error::Result<()> {
-        let reference = self.session.reference(tag)?;
-        let pulled = stow_oci::pull_listed_records_by_tag(self.session, tag).await?;
-        let repository = format!("{}/{}", reference.registry(), reference.repository());
-        if pulled.verify_marker(
+    /// carrying an inline signature under the new identity, updating legacy
+    /// markers when needed.
+    async fn marker(
+        &self,
+        tag: &str,
+        newest_by_hash: &BTreeMap<String, Vec<u8>>,
+    ) -> stow_types::error::Result<()> {
+        let sign_detached = |reference: String, digest: String| async move {
+            self.publisher
+                .signer()
+                .sign_detached(&reference, &digest)
+                .await
+        };
+        let prefix = format!("built-{}-", self.rustc_version);
+        let newest_outer = tag
+            .strip_prefix(&prefix)
+            .and_then(|hash| newest_by_hash.get(hash))
+            .map(Vec::as_slice);
+        resign_marker(
+            self.session,
             self.trust,
-            &repository,
-            self.rustc_version.as_str(),
-            &self.new,
-        ) {
-            Ok(())
-        } else {
-            Err(stow_types::stow_error!(
-                "marker {reference} carries no inline records signature for {} under the new identity",
-                pulled.signed_digest
-            ))
-        }
+            self.rustc_version,
+            tag,
+            newest_outer,
+            Identities {
+                old: &self.old,
+                new: &self.new,
+            },
+            &sign_detached,
+        )
+        .await
+        .map(|_| ())
     }
 }
 

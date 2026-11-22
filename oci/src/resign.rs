@@ -20,6 +20,7 @@
 use std::collections::BTreeSet;
 
 use oci_client::Reference;
+use oci_client::manifest::OciImageManifest;
 /// The policy accepting one exact certificate subject from one issuer —
 /// what a caller verifies the old identity's signatures with.
 pub use sigstore::bundle::verify::policy::Identity as ExactIdentity;
@@ -30,17 +31,20 @@ use stow_types::bundle::{BundleSignatureMaterial, STOW_BUNDLE_PACK_PATH, STOW_PA
 use stow_types::error::Context as _;
 use stow_types::identity::WireRustcVersion;
 use stow_types::records::{
-    BuildRecords, BuildRun, RecordsSignature, is_records_tag, parse_records_tag, published_tag,
+    BuildRecords, BuildRun, RECORDS_SIGNATURES_ANNOTATION, RecordsSignature,
+    RecordsSignatureEnvelope, is_records_tag, parse_records_tag, published_tag, task_id_hash,
 };
 
-use crate::artifacts::{publish_packed, pull_signature_materials};
+use crate::artifacts::{publish_packed, pull_listed_signature_materials, pull_signature_materials};
 use crate::bundle::pull_bundle;
 use crate::client::RegistrySession;
+use crate::migrate_records::{marker_material_matches, validate_legacy_records_manifest};
 use crate::records::{
-    PulledRecords, RecordsPublishOutcome, pull_listed_records_by_tag, push_records_with,
-    records_manifest_with_envelope,
+    PulledRecords, RecordsPublishOutcome, parse_signed_records_manifest,
+    pull_listed_records_by_tag, push_records_with, records_manifest_with_envelope,
 };
-use crate::verify::{Trust, verify_materials};
+use crate::registry::pull_blob_verified;
+use crate::verify::{Trust, payload_docker_reference, verify_materials};
 
 /// What a tag of a rustc's repository is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +231,75 @@ where
     Ok(Resigned::Signed)
 }
 
+struct FetchedRecords {
+    pulled: PulledRecords,
+    inlined: bool,
+    outer_bytes: Vec<u8>,
+}
+
+async fn pull_records_for_resign(
+    session: &RegistrySession,
+    tag: &str,
+) -> stow_types::error::Result<FetchedRecords> {
+    let reference = session.reference(tag)?;
+    let (raw_bytes, manifest_digest) = session
+        .pull_listed_manifest(&reference)
+        .await
+        .map_err(|error| stow_types::stow_error!("pull records manifest {reference}: {error}"))?;
+    let manifest: OciImageManifest = serde_json::from_slice(&raw_bytes)
+        .wrap_err_with(|| format!("decode records manifest {reference}"))?;
+    if manifest
+        .annotations
+        .as_ref()
+        .is_some_and(|map| map.contains_key(RECORDS_SIGNATURES_ANNOTATION))
+    {
+        let (task_id, signed_digest, envelope, descriptor) =
+            parse_signed_records_manifest(&reference, &manifest)?;
+        let bytes = pull_blob_verified(session, descriptor).await?;
+        let records: BuildRecords = serde_json::from_slice(&bytes).map_err(|error| {
+            stow_types::stow_error!("decode records layer of {reference}: {error}")
+        })?;
+        return Ok(FetchedRecords {
+            pulled: PulledRecords {
+                records,
+                oci_reference: reference.to_string(),
+                manifest_digest,
+                signed_digest,
+                task_id,
+                envelope,
+            },
+            inlined: true,
+            outer_bytes: raw_bytes,
+        });
+    }
+    let task_id = validate_legacy_records_manifest(&reference, &manifest)?;
+    let materials = pull_listed_signature_materials(session, &reference, &manifest_digest).await?;
+    let signatures = materials
+        .iter()
+        .map(RecordsSignature::from_material)
+        .collect::<stow_types::error::Result<Vec<_>>>()?;
+    let bytes = pull_blob_verified(session, &manifest.layers[0]).await?;
+    let records: BuildRecords = serde_json::from_slice(&bytes)
+        .map_err(|error| stow_types::stow_error!("decode records layer of {reference}: {error}"))?;
+    let signed_manifest = String::from_utf8(raw_bytes.clone())
+        .map_err(|error| stow_types::stow_error!("legacy manifest {reference} UTF-8: {error}"))?;
+    Ok(FetchedRecords {
+        pulled: PulledRecords {
+            records,
+            oci_reference: reference.to_string(),
+            manifest_digest: manifest_digest.clone(),
+            signed_digest: manifest_digest,
+            task_id,
+            envelope: RecordsSignatureEnvelope {
+                signed_manifest,
+                signatures,
+            },
+        },
+        inlined: false,
+        outer_bytes: raw_bytes,
+    })
+}
+
 /// Add an inline signature under the new identity to `pulled`'s records manifest.
 ///
 /// Skips signing when the manifest already carries a valid signature under the
@@ -253,9 +326,49 @@ where
     S: Fn(String, String) -> Fut + Send + Sync,
     Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
 {
+    resign_fetched_records(
+        session,
+        trust,
+        reference,
+        identity_reference,
+        pulled,
+        true,
+        identities,
+        sign,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resign_fetched_records<O, N, S, Fut>(
+    session: &RegistrySession,
+    trust: &Trust,
+    reference: &Reference,
+    identity_reference: &str,
+    pulled: &mut PulledRecords,
+    inlined: bool,
+    identities: Identities<'_, O, N>,
+    sign: &S,
+) -> stow_types::error::Result<(Resigned, Option<Vec<u8>>)>
+where
+    O: VerificationPolicy + Sync,
+    N: VerificationPolicy + Sync,
+    S: Fn(String, String) -> Fut + Send + Sync,
+    Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
+{
     let Identities { old, new } = identities;
     if pulled.verify(trust, identity_reference, new).is_ok() {
-        return Ok((Resigned::Already, None));
+        if inlined {
+            return Ok((Resigned::Already, None));
+        }
+        let outer_bytes = records_manifest_with_envelope(&pulled.envelope)?;
+        pulled.manifest_digest = session
+            .put_manifest(reference, &outer_bytes)
+            .await
+            .map_err(|error| {
+                stow_types::stow_error!("write inlined records manifest {reference}: {error}")
+            })?;
+        return Ok((Resigned::Signed, Some(outer_bytes)));
     }
     pulled
         .verify(trust, identity_reference, old)
@@ -402,6 +515,8 @@ pub struct Signers<'a, S, D> {
 /// What [`resign_task`] did.
 #[derive(Debug)]
 pub struct TaskResigned {
+    /// Task id carried by the task's records manifests.
+    pub task_id: Option<String>,
     /// Records tags that gained a signature.
     pub records_signed: usize,
     /// Records tags that already carried one under the new identity.
@@ -412,6 +527,9 @@ pub struct TaskResigned {
     pub nodes_already: usize,
     /// The new records artifact, when any node was republished.
     pub published: Option<RecordsPublishOutcome>,
+    /// Outer inline-signed manifest bytes of the task's newest build when no
+    /// new records artifact was pushed, so a legacy `built-` marker can mirror it.
+    pub newest_outer_bytes: Option<Vec<u8>>,
 }
 
 /// Re-sign one task's records and nodes under the new identity.
@@ -452,23 +570,27 @@ where
         node: sign_node,
     } = signers;
     let mut outcome = TaskResigned {
+        task_id: None,
         records_signed: 0,
         records_already: 0,
         nodes_republished: 0,
         nodes_already: 0,
         published: None,
+        newest_outer_bytes: None,
     };
     let mut pulled = Vec::with_capacity(tags.len());
     let mut newest_rewritten: Option<Vec<u8>> = None;
+    let mut newest_existing_outer: Option<Vec<u8>> = None;
     for (index, tag) in tags.iter().enumerate() {
-        let mut records = pull_listed_records_by_tag(session, tag).await?;
+        let mut fetched = pull_records_for_resign(session, tag).await?;
         let reference = session.reference(tag)?;
-        let (resigned, rewritten) = resign_records(
+        let (resigned, rewritten) = resign_fetched_records(
             session,
             trust,
             &reference,
             &reference.to_string(),
-            &mut records,
+            &mut fetched.pulled,
+            fetched.inlined,
             identities,
             sign,
         )
@@ -480,13 +602,67 @@ where
                     newest_rewritten = rewritten;
                 }
             }
-            Resigned::Already => outcome.records_already += 1,
+            Resigned::Already => {
+                outcome.records_already += 1;
+                if index == 0 {
+                    newest_existing_outer = Some(fetched.outer_bytes);
+                }
+            }
         }
-        pulled.push(records);
+        pulled.push(fetched.pulled);
     }
     let Some(first) = pulled.first() else {
         return Ok(outcome);
     };
+    outcome.task_id = Some(first.task_id.clone());
+    let rows =
+        resign_live_nodes(session, trust, identities, &pulled, sign_node, &mut outcome).await?;
+    if outcome.nodes_republished == 0 {
+        if let Some(outer_bytes) = &newest_rewritten {
+            let marker =
+                session.reference(&published_tag(rustc_version.as_str(), &first.task_id))?;
+            session
+                .put_manifest(&marker, outer_bytes)
+                .await
+                .map_err(|error| {
+                    stow_types::stow_error!("update published marker {marker}: {error}")
+                })?;
+        }
+        outcome.newest_outer_bytes = newest_rewritten.or(newest_existing_outer);
+        return Ok(outcome);
+    }
+    let local_programs = first.records.local_programs.clone();
+    outcome.published = Some(
+        push_records_with(
+            session,
+            rustc_version,
+            &first.task_id,
+            build,
+            &BuildRecords {
+                artifacts: rows,
+                local_programs,
+            },
+            sign,
+        )
+        .await?,
+    );
+    Ok(outcome)
+}
+
+async fn resign_live_nodes<O, N, D, DFut>(
+    session: &RegistrySession,
+    trust: &Trust,
+    identities: Identities<'_, O, N>,
+    pulled: &[PulledRecords],
+    sign_node: &D,
+    outcome: &mut TaskResigned,
+) -> stow_types::error::Result<Vec<ArtifactRecord>>
+where
+    O: VerificationPolicy + Sync,
+    N: VerificationPolicy + Sync,
+    D: Fn(String, String) -> DFut + Send + Sync,
+    DFut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
+{
     let mut seen = BTreeSet::new();
     let live = pulled
         .iter()
@@ -506,35 +682,186 @@ where
             }
         }
     }
-    if outcome.nodes_republished == 0 {
-        if let Some(outer_bytes) = newest_rewritten {
-            let marker =
-                session.reference(&published_tag(rustc_version.as_str(), &first.task_id))?;
-            session
-                .put_manifest(&marker, &outer_bytes)
-                .await
-                .map_err(|error| {
-                    stow_types::stow_error!("update published marker {marker}: {error}")
-                })?;
+    Ok(rows)
+}
+
+/// Ensure a `built-<rustc>-<hash>` marker carries an inline records signature
+/// under `identities.new`, updating legacy `.sig` or old-identity markers when needed.
+///
+/// # Errors
+/// Fails when the marker cannot be pulled, verified under either identity, or updated.
+pub async fn resign_marker<O, N, S, Fut>(
+    session: &RegistrySession,
+    trust: &Trust,
+    rustc_version: &WireRustcVersion,
+    tag: &str,
+    newest_records_outer: Option<&[u8]>,
+    identities: Identities<'_, O, N>,
+    sign: &S,
+) -> stow_types::error::Result<Resigned>
+where
+    O: VerificationPolicy + Sync,
+    N: VerificationPolicy + Sync,
+    S: Fn(String, String) -> Fut + Send + Sync,
+    Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
+{
+    let Identities { old, new } = identities;
+    let reference = session.reference(tag)?;
+    let repository = format!("{}/{}", reference.registry(), reference.repository());
+    let (raw_bytes, manifest_digest) = session
+        .pull_listed_manifest(&reference)
+        .await
+        .map_err(|error| stow_types::stow_error!("pull marker manifest {reference}: {error}"))?;
+    let manifest: OciImageManifest = serde_json::from_slice(&raw_bytes)
+        .wrap_err_with(|| format!("decode marker manifest {reference}"))?;
+    let inlined = manifest
+        .annotations
+        .as_ref()
+        .is_some_and(|map| map.contains_key(RECORDS_SIGNATURES_ANNOTATION));
+    if inlined {
+        let pulled = pull_listed_records_by_tag(session, tag).await?;
+        if pulled.verify_marker(trust, &repository, rustc_version.as_str(), new) {
+            return Ok(Resigned::Already);
         }
-        return Ok(outcome);
     }
-    let local_programs = first.records.local_programs.clone();
-    outcome.published = Some(
-        push_records_with(
-            session,
-            rustc_version,
-            &first.task_id,
-            build,
-            &BuildRecords {
-                artifacts: rows,
-                local_programs,
+    if let Some(outer_bytes) = newest_records_outer {
+        session
+            .put_manifest(&reference, outer_bytes)
+            .await
+            .map_err(|error| stow_types::stow_error!("write marker {reference}: {error}"))?;
+        return verify_updated_marker(session, trust, &reference, &repository, rustc_version, new)
+            .await;
+    }
+    resign_orphan_marker(
+        session,
+        trust,
+        &reference,
+        &repository,
+        rustc_version,
+        &raw_bytes,
+        &manifest_digest,
+        &manifest,
+        inlined,
+        Identities { old, new },
+        sign,
+    )
+    .await
+}
+
+async fn verify_updated_marker<N: VerificationPolicy + Sync>(
+    session: &RegistrySession,
+    trust: &Trust,
+    reference: &Reference,
+    repository: &str,
+    rustc_version: &WireRustcVersion,
+    new: &N,
+) -> stow_types::error::Result<Resigned> {
+    let pulled = pull_listed_records_by_tag(session, reference.tag().unwrap_or_default()).await?;
+    if pulled.verify_marker(trust, repository, rustc_version.as_str(), new) {
+        Ok(Resigned::Signed)
+    } else {
+        Err(stow_types::stow_error!(
+            "marker {reference} carries no inline records signature for {} under the new identity",
+            pulled.signed_digest
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resign_orphan_marker<O, N, S, Fut>(
+    session: &RegistrySession,
+    trust: &Trust,
+    reference: &Reference,
+    repository: &str,
+    rustc_version: &WireRustcVersion,
+    raw_bytes: &[u8],
+    manifest_digest: &str,
+    manifest: &OciImageManifest,
+    inlined: bool,
+    identities: Identities<'_, O, N>,
+    sign: &S,
+) -> stow_types::error::Result<Resigned>
+where
+    O: VerificationPolicy + Sync,
+    N: VerificationPolicy + Sync,
+    S: Fn(String, String) -> Fut + Send + Sync,
+    Fut: Future<Output = stow_types::error::Result<BundleSignatureMaterial>> + Send,
+{
+    let Identities { old, new } = identities;
+    let (task_id, signed_digest, mut envelope, materials) = if inlined {
+        let (task_id, signed_digest, envelope, descriptor) =
+            parse_signed_records_manifest(reference, manifest)?;
+        let bytes = pull_blob_verified(session, descriptor).await?;
+        let _: BuildRecords = serde_json::from_slice(&bytes)
+            .map_err(|error| stow_types::stow_error!("decode marker layer {reference}: {error}"))?;
+        let materials = envelope.materials();
+        (task_id, signed_digest, envelope, materials)
+    } else {
+        let task_id = validate_legacy_records_manifest(reference, manifest)?;
+        let bytes = pull_blob_verified(session, &manifest.layers[0]).await?;
+        let _: BuildRecords = serde_json::from_slice(&bytes)
+            .map_err(|error| stow_types::stow_error!("decode marker layer {reference}: {error}"))?;
+        let materials =
+            pull_listed_signature_materials(session, reference, manifest_digest).await?;
+        let signatures = materials
+            .iter()
+            .map(RecordsSignature::from_material)
+            .collect::<stow_types::error::Result<Vec<_>>>()?;
+        let signed_manifest = String::from_utf8(raw_bytes.to_vec())
+            .map_err(|error| stow_types::stow_error!("legacy marker {reference} UTF-8: {error}"))?;
+        (
+            task_id,
+            manifest_digest.to_owned(),
+            RecordsSignatureEnvelope {
+                signed_manifest,
+                signatures,
             },
-            sign,
+            materials,
         )
-        .await?,
-    );
-    Ok(outcome)
+    };
+    let expected_hash = task_id_hash(&task_id);
+    let already_new = materials.iter().any(|material| {
+        marker_material_matches(
+            trust,
+            repository,
+            rustc_version.as_str(),
+            expected_hash.as_str(),
+            &signed_digest,
+            material,
+            new,
+        )
+    });
+    if !already_new {
+        let bound = materials
+            .iter()
+            .find(|material| {
+                marker_material_matches(
+                    trust,
+                    repository,
+                    rustc_version.as_str(),
+                    expected_hash.as_str(),
+                    &signed_digest,
+                    material,
+                    old,
+                )
+            })
+            .and_then(|material| payload_docker_reference(&material.payload_bytes))
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "marker {reference}@{signed_digest} has no records signature under the old identity"
+                )
+            })?;
+        let material = sign(bound, signed_digest).await?;
+        envelope
+            .signatures
+            .push(RecordsSignature::from_material(&material)?);
+    }
+    let outer_bytes = records_manifest_with_envelope(&envelope)?;
+    session
+        .put_manifest(reference, &outer_bytes)
+        .await
+        .map_err(|error| stow_types::stow_error!("write re-signed marker {reference}: {error}"))?;
+    verify_updated_marker(session, trust, reference, repository, rustc_version, new).await
 }
 
 #[cfg(test)]
