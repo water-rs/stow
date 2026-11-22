@@ -45,6 +45,16 @@ workspace mirror instead of prompting. Recommended for CI.
 stow check --silent-compatible-upgrades --manifest-path Cargo.toml
 ```
 
+## `stow clippy` / `stow nextest`
+
+Drop-in replacements for `cargo clippy` and `cargo nextest`, with the
+same session, cache layers and isolation as `stow check`/`test`.
+`stow clippy` serves dependencies out of `check`'s graph — workspace
+members run through `clippy-driver` and are never cached. `stow
+nextest` serves the units `cargo test` compiles before nextest runs
+them; cargo-nextest is the user's own tool and is not installed by
+stow.
+
 ## Cache layers
 
 The cache has three layers, and each is switched off on its own. The `[cache]`

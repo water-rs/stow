@@ -402,6 +402,12 @@ async fn run_cli(
         CliCommand::Test(command) => {
             return Box::pin(cargo_cmd::run("test", command, state_db)).await;
         }
+        CliCommand::Clippy(command) => {
+            return Box::pin(cargo_cmd::run("clippy", command, state_db)).await;
+        }
+        CliCommand::Nextest(command) => {
+            return Box::pin(cargo_cmd::run("nextest", command, state_db)).await;
+        }
         CliCommand::Daemon(args) => daemon::run(args).await,
         CliCommand::Rustc(command) => return run_rustc_wrapper(command).await,
         CliCommand::Cc(command) => return run_cc_wrapper(command).await,
@@ -428,6 +434,8 @@ const fn subcommand_name(command: &CliCommand) -> &'static str {
         CliCommand::Check(_) => "check",
         CliCommand::Build(_) => "build",
         CliCommand::Test(_) => "test",
+        CliCommand::Clippy(_) => "clippy",
+        CliCommand::Nextest(_) => "nextest",
         CliCommand::Predict(_) => "predict",
         CliCommand::Setup(_) => "setup",
         CliCommand::Update => "update",

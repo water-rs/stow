@@ -36,6 +36,10 @@ pub struct BuildToolchain {
     /// rustc as its first argument for workspace members, and the path it
     /// was found at.
     workspace_wrapper: Option<(PathBuf, Handle)>,
+    /// The toolchain's own clippy-driver, beside rustc — the workspace
+    /// wrapper `cargo clippy` inserts itself, whether or not one is
+    /// configured (stow#1456). `None` when the toolchain ships none.
+    clippy_driver: Option<(PathBuf, Handle)>,
     /// The environment the toolchain was resolved in: its `PATH` and
     /// working directory are what bare and relative spellings resolve
     /// against, and the rustc probes run in it.
@@ -117,6 +121,14 @@ impl BuildToolchain {
             let workspace_wrapper = workspace_wrapper
                 .map(|wrapper| resolve_file(wrapper.as_os_str(), &env, env.cwd()))
                 .transpose()?;
+            let clippy_driver = resolve_file(
+                rustc
+                    .with_file_name(format!("clippy-driver{}", std::env::consts::EXE_SUFFIX))
+                    .as_os_str(),
+                &env,
+                env.cwd(),
+            )
+            .ok();
             Ok::<_, String>((
                 (
                     rustc,
@@ -124,19 +136,21 @@ impl BuildToolchain {
                     launcher,
                     launcher_file,
                     workspace_wrapper,
+                    clippy_driver,
                 ),
                 env,
             ))
         })
         .await
         .map_err(|error| format!("join the rustc resolution task: {error}"))??;
-        let (rustc, rustc_file, launcher, launcher_file, workspace_wrapper) = files;
+        let (rustc, rustc_file, launcher, launcher_file, workspace_wrapper, clippy_driver) = files;
         Ok(Self {
             rustc,
             rustc_file,
             launcher_file,
             launcher,
             workspace_wrapper,
+            clippy_driver,
             env,
             host_target,
             release,
@@ -199,12 +213,18 @@ impl BuildToolchain {
     }
 
     /// Whether `spelling`, written in a process running in `cwd`, names
-    /// the configured workspace wrapper.
+    /// the configured workspace wrapper — or the toolchain's
+    /// clippy-driver, the workspace wrapper `cargo clippy` inserts
+    /// itself (stow#1456).
     #[must_use]
     pub fn is_workspace_wrapper(&self, spelling: &OsStr, cwd: &Path) -> bool {
         self.workspace_wrapper
             .as_ref()
             .is_some_and(|(_, wrapper)| names_file(spelling, &self.env, cwd, wrapper))
+            || self
+                .clippy_driver
+                .as_ref()
+                .is_some_and(|(_, driver)| names_file(spelling, &self.env, cwd, driver))
     }
 
     /// The facts another process needs to rebuild this toolchain: paths
@@ -245,12 +265,19 @@ impl BuildToolchain {
                 .workspace_wrapper
                 .map(|path| identify(&path).map(|file| (path, file)))
                 .transpose()?;
+            let clippy_driver = facts
+                .rustc
+                .with_file_name(format!("clippy-driver{}", std::env::consts::EXE_SUFFIX));
+            let clippy_driver = identify(&clippy_driver)
+                .map(|file| (clippy_driver, file))
+                .ok();
             Ok(Self {
                 rustc: facts.rustc,
                 rustc_file,
                 launcher_file,
                 launcher: facts.launcher,
                 workspace_wrapper,
+                clippy_driver,
                 env,
                 host_target: facts.host_target,
                 release: facts.release,
@@ -455,5 +482,28 @@ mod tests {
         assert_eq!(rebuilt.release(), original.release());
         assert!(rebuilt.is_workspace_wrapper(wrapper.as_os_str(), cwd));
         assert!(!rebuilt.is_workspace_wrapper(other.as_os_str(), cwd));
+    }
+
+    /// `cargo clippy` wraps workspace members in the toolchain's own
+    /// clippy-driver, the `executable` it hands the rustc wrapper —
+    /// accepted as a workspace wrapper, still requiring the build's
+    /// rustc as its first argument (stow#1456).
+    #[tokio::test]
+    async fn clippy_driver_is_a_workspace_wrapper() {
+        let toolchain = super::BuildToolchain::of_the_test_rustc().await;
+        let driver = toolchain
+            .rustc()
+            .with_file_name(format!("clippy-driver{}", std::env::consts::EXE_SUFFIX));
+        assert!(driver.is_file(), "the test toolchain ships no clippy-driver");
+        let cwd = std::env::current_dir().expect("cwd");
+        assert!(toolchain.is_workspace_wrapper(driver.as_os_str(), &cwd));
+        let rebuilt = super::BuildToolchain::from_facts(
+            toolchain.facts(),
+            &crate::session_env::SessionEnv::of_this_process()
+                .expect("the test process's environment"),
+        )
+        .await
+        .expect("rebuild the toolchain");
+        assert!(rebuilt.is_workspace_wrapper(driver.as_os_str(), &cwd));
     }
 }
