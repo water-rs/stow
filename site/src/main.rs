@@ -133,7 +133,7 @@ fn main() {
             IndexPage::new(site_key).render().expect("index page renders"),
         ),
         (
-            "stats/index.html",
+            "stats.html",
             StatsPage {
                 repository_url,
                 version,
