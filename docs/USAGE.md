@@ -406,11 +406,14 @@ against rate limits or a private mirror.
 
 Two composite actions ship in this repository:
 
-- **`water-rs/stow@main` (recommended default — public + local cache):** installs
-  the pinned `stow-cli` release for the runner's target, fetches the verified
-  signed index slice for the active toolchain, and wires the wrapper environment
-  for the whole job so an unchanged `cargo test` streams prebuilt dependencies
-  from the public cache:
+- **`water-rs/stow@main` (recommended default — public + built-in Actions Cache):**
+  installs the pinned `stow-cli` release for the runner's target, restores and
+  post-saves `~/.stow/local` (with `$CARGO_HOME/git/{db,checkouts}`) and
+  `~/.stow/local-crates-io` as separate GitHub Actions Cache entries — never
+  archiving `~/.stow/crates-io` or `~/.stow/index`, and draining `stow-daemon`
+  before upload — and wires the wrapper environment for the whole job so public
+  `crates.io` crates stream from the network while git, C/C++, and uncovered
+  crates reuse Actions Cache across runs:
 
   ```yaml
   - uses: water-rs/stow@main
@@ -420,28 +423,29 @@ Two composite actions ship in this repository:
 - **`water-rs/stow/local@main` (local cache only — `[cache] remote = false`):**
   writes `remote = false` into the runner's stow `config.toml` before running
   `stow setup`, so no request is made to `stow.waterui.dev` or GHCR and nothing
-  about the dependency graph leaves the runner. Cold runs lose public prebuilt
-  acceleration; pair with `actions/cache` on `~/.stow` only when repository
-  policy forbids remote cache access:
+  about the dependency graph leaves the runner, while still restoring and
+  post-saving `~/.stow/local` and `~/.stow/local-crates-io` through GitHub
+  Actions Cache. Use only when repository policy forbids remote cache access:
 
   ```yaml
-  - uses: actions/cache@v4
-    with:
-      path: ~/.stow
-      key: stow-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-      restore-keys: stow-${{ runner.os }}-
   - uses: water-rs/stow/local@main
   - run: cargo test
   ```
 
-Inputs (`water-rs/stow@main` accepts all three; `water-rs/stow/local@main`
-accepts `version` only):
+Inputs (`edge-url` and `verify-mode` apply to `water-rs/stow@main` only; every
+other input applies to both actions):
 
 | Input | Default | Purpose |
 |---|---|---|
 | `version` | `latest` | `stow-cli` release to install — `latest` (the newest stable release that already carries its archives), a bare version (`1.2.3`), or the full `v1.2.3` tag. |
 | `edge-url` | `https://stow.waterui.dev` | Edge worker URL, exported as `STOW_EDGE_URL` (`water-rs/stow@main` only). |
 | `verify-mode` | `github-ci` | Signature verification mode, exported as `STOW_VERIFY_MODE` (`water-rs/stow@main` only). `mock-key` additionally needs `STOW_MOCK_PUBLIC_KEY_PATH` in the job environment. |
+| `cache` | `true` | Enable built-in GitHub Actions Cache restore and post-job save for `local/` and `local-crates-io/`. Set `false` to skip Actions Cache completely. |
+| `shared-key` | `""` | Shared cache namespace across jobs on the same OS and toolchain; defaults to `github.job`. |
+| `key` | `""` | Extra salt appended to the cache key prefix. |
+| `workspaces` | `.` | Newline-separated workspace directories scanned for `Cargo.lock` when computing cache keys. |
+| `save-if` | `true` | Upload updated cache entries on primary-key miss (`false` restores read-only). |
+| `local-crates-io-max-bytes` | `536870912` (`2147483648` on `stow/local`) | Logical byte ceiling enforced on `~/.stow/local-crates-io` via `stow daemon stop --local-crates-io-max-bytes` before upload (`0` skips caching `local-crates-io` and evicts it on drain) so transient `crates.io` fallbacks never crowd out `local/`. |
 
 The action downloads `stow-cli-<target>.tar.xz` (`.zip` on Windows) and
 its `.sha256` from the `v<version>` GitHub Release, verifies

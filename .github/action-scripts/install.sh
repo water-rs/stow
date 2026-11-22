@@ -69,6 +69,9 @@ fi
 mkdir -p "$dest"
 cp -R "$(dirname "$binary")/." "${dest}/"
 echo "$dest" >> "$GITHUB_PATH"
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  echo "stow-bin=${dest}/stow" >> "$GITHUB_OUTPUT"
+fi
 
 "$dest/stow" setup --github-env >> "$GITHUB_ENV"
 # The linker selection cannot ride in the job environment (env
