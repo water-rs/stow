@@ -79,10 +79,9 @@ pub struct LaunchRates {
     /// is a distinct route hitting the scheduler, so it carries its own
     /// measured rate — zone `httpRequestsAdaptiveGroups`.
     pub request_status_read: f64,
-    /// `/`, `/install.sh`, `/install.ps1`, `/requests/{id}` page loads.
-    pub site_view: f64,
-    /// `/stats` and `GET /api/v1/stats` — hourly-cached, so each view
-    /// is cheap but they still bill a worker request.
+    /// `GET /api/v1/stats` — hourly-cached, so each view is cheap but
+    /// it still bills a worker request. The site's page loads are
+    /// Pages traffic and bill nothing.
     pub stats_view: f64,
     /// `dependency_graph_misses` nodes admitted per install-day —
     /// Analytics Engine `stow_cache_misses`, one point per uncovered
@@ -157,8 +156,6 @@ pub enum EventKind {
     HumanRequest,
     /// [`LaunchRates::request_status_read`]
     RequestStatusRead,
-    /// [`LaunchRates::site_view`]
-    SiteView,
     /// [`LaunchRates::stats_view`]
     StatsView,
     /// [`LaunchRates::miss_node`]
@@ -238,7 +235,6 @@ impl LaunchModel {
             EventKind::RequestStatusRead => {
                 self.rates.request_status_read * self.scale.installs as f64
             }
-            EventKind::SiteView => self.rates.site_view * self.scale.installs as f64,
             EventKind::StatsView => self.rates.stats_view * self.scale.installs as f64,
             EventKind::MissNode => self.rates.miss_node * self.scale.installs as f64,
             EventKind::AdminOperation => self.rates.admin_operations_per_day,
@@ -330,7 +326,6 @@ mod tests {
                 enqueue_redemption: 0.0,
                 human_request: 0.0,
                 request_status_read: 0.0,
-                site_view: 0.0,
                 stats_view: 0.0,
                 miss_node: 0.0,
                 admin_operations_per_day: 0.0,

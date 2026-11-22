@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>request — stow</title>
+    <meta name="robots" content="noindex">
+    <style>{{ css|safe }}</style>
+  </head>
+  <body>
+    <header class="masthead">
+      <a class="wordmark" href="/">stow</a>
+      <nav class="masthead-links" aria-label="Site">
+        <a href="{{ repository_url }}#readme">Docs</a>
+        <a href="{{ repository_url }}">Source</a>
+        <a class="masthead-cta" href="/#request">Request a crate</a>
+      </nav>
+    </header>
+
+    <main class="status-page">
+      <div class="frame">
+        <h1 id="request-title">…</h1>
+        <p class="subline">
+          <span class="badge" id="request-badge" data-state="loading">loading</span>
+          <span id="request-summary">reading the request record…</span>
+        </p>
+        <section class="window status-window" aria-label="Crate request" id="request-details" hidden>
+          <div class="window-title"><span>request</span><span id="request-rustc"></span></div>
+          <ul class="window-body leader-list" id="request-details-list">
+          </ul>
+        </section>
+        <section class="window status-window" aria-label="Per-target tasks" id="request-targets" hidden>
+          <div class="window-title"><span>targets</span><span id="request-targets-count"></span></div>
+          <table class="window-body result-table">
+            <thead>
+              <tr><th scope="col">target</th><th scope="col">state</th><th scope="col" class="num">lane</th><th scope="col" class="task-col">task</th></tr>
+            </thead>
+            <tbody id="request-targets-body">
+            </tbody>
+          </table>
+        </section>
+        <p class="status-id" id="request-id-line"></p>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="frame">
+        <p>stow-site {{ version }} · MIT · <a href="https://github.com/water-rs">water-rs</a> · <a href="{{ repository_url }}">source</a> · <a href="{{ repository_url }}/blob/main/docs/API.md">API</a></p>
+      </div>
+    </footer>
+    <script>{{ js|safe }}</script>
+  </body>
+</html>

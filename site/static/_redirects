@@ -1,0 +1,4 @@
+# `/requests/{id}` is one page fed by `GET /api/v1/requests/{id}` — the
+# rewrite keeps the request form's status URLs working.
+/requests /request.html 200
+/requests/* /request.html 200

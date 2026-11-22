@@ -1,0 +1,19 @@
+/
+  Cache-Control: public, max-age=300
+
+/stats
+  Cache-Control: public, max-age=300
+
+/requests/*
+  Cache-Control: no-store
+
+/request.html
+  Cache-Control: no-store
+
+/install.sh
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=3600
+
+/install.ps1
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=3600

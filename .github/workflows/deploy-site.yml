@@ -1,0 +1,46 @@
+name: deploy-site
+
+# The Pages site deploys independently of the edge release pipeline
+# (stow#1648): a push to `main` touching `site/` rebuilds `site/dist`
+# (`cargo run -p stow-site`) and publishes it with `wrangler pages
+# deploy` — a page edit never needs a Worker version. The Worker owns
+# only the `stow.waterui.dev/api/*` route, so a Pages deploy and a Worker
+# deploy cannot interfere. One-time project setup is in
+# docs/DEPLOYMENT.md.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/deploy-site.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency: deploy-site
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: site
+      - run: cargo run --release -p stow-site -- site/dist
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+      - run: bun install -g wrangler@4
+      - run: wrangler pages deploy site/dist --project-name stow-site --branch main
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
