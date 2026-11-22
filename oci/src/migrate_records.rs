@@ -225,7 +225,7 @@ pub async fn migrate_marker_tag(
     Ok(RecordsTagMigration::Migrated { outer_bytes })
 }
 
-fn validate_legacy_records_manifest(
+pub(crate) fn validate_legacy_records_manifest(
     reference: &oci_client::Reference,
     manifest: &OciImageManifest,
 ) -> stow_types::error::Result<String> {
@@ -255,7 +255,7 @@ fn validate_legacy_records_manifest(
     Ok(task_id.clone())
 }
 
-fn marker_material_matches(
+pub(crate) fn marker_material_matches(
     trust: &Trust,
     repository: &str,
     rustc_version: &str,
