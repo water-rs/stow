@@ -513,7 +513,7 @@ fn unit_graph_subcommand(action: &str) -> stow_types::error::Result<&'static str
 /// cargo-selection flags `cargo nextest` forwards to the build it
 /// runs. The lockfile-graph cache key normalizes through the same
 /// function so a key names exactly what the re-run reads.
-pub(crate) fn unit_graph_args(action: &str, cargo_args: &[OsString]) -> Vec<OsString> {
+pub fn unit_graph_args(action: &str, cargo_args: &[OsString]) -> Vec<OsString> {
     match action {
         "clippy" => clippy_unit_graph_args(cargo_args),
         "nextest" => nextest_unit_graph_args(cargo_args),
@@ -640,10 +640,11 @@ fn nextest_unit_graph_args(cargo_args: &[OsString]) -> Vec<OsString> {
             || (name.len() > 2 && ["-p", "-F"].contains(&&name[..2]))
         {
             kept.push(arg.clone());
-            if NEXTEST_CARGO_VALUED.contains(&name) && !text.contains('=') {
-                if let Some(value) = args.next() {
-                    kept.push(value.clone());
-                }
+            if NEXTEST_CARGO_VALUED.contains(&name)
+                && !text.contains('=')
+                && let Some(value) = args.next()
+            {
+                kept.push(value.clone());
             }
         }
     }
