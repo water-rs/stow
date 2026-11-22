@@ -126,13 +126,41 @@ pub async fn clear_cached_entries(pool: &SqlitePool) -> stow_types::error::Resul
         .wrap_err("commit state database clean transaction")
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+async fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = async_fs::metadata(path).await?;
+    Ok(FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+type FileIdentity = Arc<same_file::Handle>;
+
+#[cfg(windows)]
+async fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || same_file::Handle::from_path(owned).map(Arc::new))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 #[derive(Debug, Default)]
 enum PoolSlot {
     #[default]
     Unopened,
     Open {
         pool: SqlitePool,
-        identity: Arc<same_file::Handle>,
+        identity: FileIdentity,
     },
     Closed,
 }
@@ -141,13 +169,6 @@ enum PoolSlot {
 struct StateDbInner {
     host: tokio::sync::Mutex<PoolSlot>,
     tiers: [tokio::sync::Mutex<PoolSlot>; 3],
-}
-
-async fn file_identity(path: &Path) -> std::io::Result<Arc<same_file::Handle>> {
-    let owned = path.to_path_buf();
-    tokio::task::spawn_blocking(move || same_file::Handle::from_path(owned).map(Arc::new))
-        .await
-        .map_err(std::io::Error::other)?
 }
 
 /// The process's one handle on the host state database and the three
@@ -1094,5 +1115,83 @@ mod schema_tests {
             .await
             .expect("after the clean, a fresh database is created");
         assert!(state_db_path(cache_dir.path()).exists());
+    }
+
+    /// Child-process helper for [`reusing_open_pool_preserves_sqlite_locks_across_external_reader_close`]:
+    /// opens and closes `STOW_TEST_EXTERNAL_DB_PATH` in a separate OS process
+    /// without `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` so `SQLite` queries the real
+    /// kernel lock table rather than the parent process's in-memory `inodeList`.
+    #[tokio::test]
+    async fn external_reader_closes_database_in_subprocess() {
+        let Some(path) = std::env::var_os("STOW_TEST_EXTERNAL_DB_PATH") else {
+            return;
+        };
+        let mut reader = raw_connection(std::path::Path::new(&path)).await;
+        let first_hits: i64 =
+            sqlx::query_scalar("SELECT hits FROM crate_stats WHERE crate_name = 'itoa'")
+                .fetch_one(&mut reader)
+                .await
+                .expect("external subprocess read");
+        assert_eq!(first_hits, 1);
+        reader
+            .close()
+            .await
+            .expect("close external subprocess reader");
+    }
+
+    /// Reusing an open `StateDb` pool must never open and close a descriptor
+    /// on the live `SQLite` file: on Unix, closing any descriptor to an inode
+    /// cancels the process's POSIX `fcntl` advisory locks on that file, so an
+    /// external process's close thinks it is the last holder, checkpoints, and
+    /// unlinks `-wal` and `-shm` out from under the still-open pool.
+    #[tokio::test]
+    async fn reusing_open_pool_preserves_sqlite_locks_across_external_reader_close() {
+        let cache_dir = tempfile::tempdir().expect("temp dir");
+        let state_db = super::StateDb::default();
+        let db_path = state_db_path(cache_dir.path());
+
+        let pool = state_db.pool(cache_dir.path()).await.expect("first open");
+        sqlx::query(
+            "INSERT INTO crate_stats (crate_name, hits, misses, errors) VALUES ('itoa', 1, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert first row");
+
+        let reused = state_db.pool(cache_dir.path()).await.expect("second open");
+
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "state_db::schema_tests::external_reader_closes_database_in_subprocess",
+                "--nocapture",
+            ])
+            .env("STOW_TEST_EXTERNAL_DB_PATH", &db_path)
+            .status()
+            .expect("spawn external subprocess reader");
+        assert!(status.success(), "external subprocess reader failed");
+
+        sqlx::query(
+            "INSERT INTO crate_stats (crate_name, hits, misses, errors) \
+             VALUES ('once_cell', 1, 0, 0)",
+        )
+        .execute(&reused)
+        .await
+        .expect("insert second row");
+
+        let mut verify = raw_connection(&db_path).await;
+        let second_hits: Option<i64> =
+            sqlx::query_scalar("SELECT hits FROM crate_stats WHERE crate_name = 'once_cell'")
+                .fetch_optional(&mut verify)
+                .await
+                .expect("verify second row");
+        verify.close().await.expect("close verify reader");
+        state_db.close().await;
+
+        assert_eq!(
+            second_hits,
+            Some(1),
+            "writes on the kept pool must remain visible after an external process closes"
+        );
     }
 }
