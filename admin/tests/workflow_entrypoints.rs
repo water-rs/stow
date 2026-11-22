@@ -1462,6 +1462,44 @@ fn deploy_edge_applies_triggers_after_promotion() {
     );
 }
 
+#[test]
+fn deploy_edge_recovers_when_live_baseline_scheduler_500s() {
+    let wf = load_workflow("deploy-edge.yml");
+    assert_eq!(
+        at(&wf, "jobs.prepare.outputs.baseline_healthy")
+            .map(scalar)
+            .as_deref(),
+        Some("${{ steps.baseline_health.outputs.baseline_healthy }}"),
+    );
+    assert_eq!(
+        at(&wf, "jobs.canary-verdict.if").map(scalar).as_deref(),
+        Some("needs.prepare.outputs.baseline_healthy == 'true'"),
+    );
+    assert_eq!(
+        at(&wf, "jobs.promoted-verdict.if").map(scalar).as_deref(),
+        Some("needs.prepare.outputs.baseline_healthy == 'true'"),
+    );
+    let promote_if = at(&wf, "jobs.promote.if").map(scalar).expect("promote if");
+    assert!(promote_if.contains("needs.prepare.result == 'success'"));
+    assert!(promote_if.contains("needs.canary-verdict.result == 'success'"));
+    assert!(promote_if.contains("needs.prepare.outputs.baseline_healthy == 'false'"));
+    let promote_steps = at(&wf, "jobs.promote.steps")
+        .and_then(serde_yml::Value::as_sequence)
+        .expect("promote steps");
+    let candidate_workload = promote_steps
+        .iter()
+        .find(|s| {
+            field(s, "run")
+                .map(scalar)
+                .is_some_and(|r| r.contains("scripts/deploy-do-workload.sh candidate"))
+        })
+        .expect("promote runs candidate DO workload");
+    assert!(
+        field(candidate_workload, "if").is_none(),
+        "candidate DO workload must verify the promoted Scheduler unconditionally"
+    );
+}
+
 // ===========================================================================
 // operations.yml (stow#955)
 // ===========================================================================

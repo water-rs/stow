@@ -9,11 +9,12 @@
 # schedule of STOW_DO_WORKLOAD_RPS requests a second, each with a query
 # string unique to the run, side and probe so no cache can answer it
 # (stow#749). The measured window opens on the first whole minute at least
-# 60 s after the first request and lasts STOW_DO_WORKLOAD_MINUTES whole
-# minutes: the warm-up absorbs the request that hydrates an object the
-# version change reset, so neither window holds a cold hydration, and the
-# deployment change has propagated before the window opens. Whole minutes
-# because the verdict's periodic dataset may bucket no finer.
+# 60 s after the first request on `baseline` (already warm) and 330 s on
+# `candidate` (past `durableObjectsPeriodicGroups`'s 5-minute periodic
+# flush, so the cold `wake_graph` SQLite hydration after version reset
+# flushes before `do_window_from`, stow#1669) and lasts
+# STOW_DO_WORKLOAD_MINUTES whole minutes. Whole minutes because the
+# verdict's periodic dataset may bucket no finer.
 #
 # The window's end bound is written one second before the minute boundary
 # — the verdict filters with `datetime_leq`, and a periodic row stamped
@@ -54,15 +55,18 @@ rfc3339() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
 if [ "$side" = candidate ]; then
   : "${STOW_DO_WORKLOAD_EXPECT_TAG:?STOW_DO_WORKLOAD_EXPECT_TAG is required on the candidate side}"
   : "${STOW_DO_WORKLOAD_SETTLE_MINUTES:?STOW_DO_WORKLOAD_SETTLE_MINUTES is required on the candidate side}"
+  warmup_s=330
+else
+  warmup_s=60
 fi
 
 interval_ms=$((1000 / STOW_DO_WORKLOAD_RPS))
 start_ms=$(now_ms)
 body=$(mktemp)
 
-# Open the window on the first whole minute at least 60 s after `$1` (ms).
+# Open the window on the first whole minute at least $warmup_s s after `$1` (ms).
 open_window() {
-  from_s=$((($1 / 1000 + 60 + 59) / 60 * 60))
+  from_s=$((($1 / 1000 + warmup_s + 59) / 60 * 60))
   to_s=$((from_s + STOW_DO_WORKLOAD_MINUTES * 60 - 1))
   stop_ms=$((to_s * 1000))
 }

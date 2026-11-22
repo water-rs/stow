@@ -99,6 +99,7 @@ jobs:
     outputs:
       baseline_version: ${{ steps.versions.outputs.baseline_version }}
       candidate_version: ${{ steps.versions.outputs.candidate_version }}
+      baseline_healthy: ${{ steps.baseline_health.outputs.baseline_healthy }}
       deploy_start: ${{ steps.join.outputs.deploy_start }}
       do_baseline_from: ${{ steps.do_workload.outputs.do_window_from }}
       do_baseline_to: ${{ steps.do_workload.outputs.do_window_to }}
@@ -245,12 +246,45 @@ jobs:
           echo "baseline_version=$baseline" >> "$GITHUB_OUTPUT"
           echo "candidate_version=$candidate" >> "$GITHUB_OUTPUT"
 
+      # When the live baseline's Scheduler DO is already broken (e.g. a
+      # wake bug returning HTTP 500 before any candidate is deployed,
+      # stow#1669), a baseline-vs-candidate A/B gate would fail on probe 1
+      # of the broken baseline and block the fix from ever reaching the
+      # object. Probe the live Scheduler 3 times: if any probe answers
+      # 200, the full 4-job canary + promoted comparison runs unchanged;
+      # if all 3 fail, verify the candidate Worker via the synthetic suite
+      # and verify the promoted candidate Scheduler DO directly in
+      # `promote`.
+      - name: Check whether the live baseline Scheduler is healthy
+        id: baseline_health
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+        run: |
+          set -euo pipefail
+          healthy=false
+          last_code=000
+          for attempt in 1 2 3; do
+            last_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+              "$STOW_EDGE_URL/api/v1/scheduler/status?deploy-baseline-probe=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$attempt" || echo 000)
+            if [ "$last_code" = 200 ]; then
+              healthy=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$healthy" != true ]; then
+            echo "::warning::live baseline $BASELINE_VERSION answered $last_code on /api/v1/scheduler/status; skipping baseline-comparison gates and verifying candidate directly on promote"
+          fi
+          echo "BASELINE_HEALTHY=$healthy" >> "$GITHUB_ENV"
+          echo "baseline_healthy=$healthy" >> "$GITHUB_OUTPUT"
+
       # The promoted verdict's baseline DO window. It runs while the
       # deployment is the baseline alone, so every DO request in it runs
       # on the baseline version; `promote` drives the identical workload
       # against the candidate.
       - name: Durable Object workload against the baseline
         id: do_workload
+        if: steps.baseline_health.outputs.baseline_healthy == 'true'
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
         run: scripts/deploy-do-workload.sh baseline
@@ -309,29 +343,54 @@ jobs:
           bundle_probe="/api/v1/bundles/1.99.0/sha256:0000000000000000000000000000000000000000000000000000000000000000"
           cand="stow-edge=\"$CANDIDATE_VERSION\""
           base="stow-edge=\"$BASELINE_VERSION\""
-          probes=$((SUITE_REQUESTS / 5))
           probe=0
-          for _ in $(seq "$probes"); do
-            for url in "/api/v1/index/x86_64-unknown-linux-gnu/stable" \
-              "/api/v1/crates/serde/versions" \
-              "$bundle_probe" \
-              "/api/v1/stats" \
-              "/api/v1/scheduler/status"; do
-              for override in "$cand" "$base"; do
+          if [ "$BASELINE_HEALTHY" = true ]; then
+            probes=$((SUITE_REQUESTS / 5))
+            for _ in $(seq "$probes"); do
+              for url in "/api/v1/index/x86_64-unknown-linux-gnu/stable" \
+                "/api/v1/crates/serde/versions" \
+                "$bundle_probe" \
+                "/api/v1/stats" \
+                "/api/v1/scheduler/status"; do
+                for override in "$cand" "$base"; do
+                  probe=$((probe + 1))
+                  code=$(curl -sS -o /dev/null -w '%{http_code}' --retry 2 --retry-all-errors \
+                    -H "Cloudflare-Workers-Version-Overrides: $override" \
+                    "$STOW_EDGE_URL$url?deploy-suite=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$probe")
+                  case "$code" in
+                    2*|404) ;;
+                    *) echo "::error::suite probe $url answered $code" >&2; exit 1 ;;
+                  esac
+                done
+              done
+            done
+            echo "suite landed $SUITE_REQUESTS requests on each of $CANDIDATE_VERSION and $BASELINE_VERSION"
+          else
+            # Under a split deployment the singleton Scheduler DO remains
+            # bound to the broken baseline until promotion, so probe the 4
+            # stateless Worker routes on the candidate now; `promote`
+            # verifies `/api/v1/scheduler/status` on the candidate DO.
+            probes=$(( (SUITE_REQUESTS + 3) / 4 ))
+            for _ in $(seq "$probes"); do
+              for url in "/api/v1/index/x86_64-unknown-linux-gnu/stable" \
+                "/api/v1/crates/serde/versions" \
+                "$bundle_probe" \
+                "/api/v1/stats"; do
                 probe=$((probe + 1))
                 code=$(curl -sS -o /dev/null -w '%{http_code}' --retry 2 --retry-all-errors \
-                  -H "Cloudflare-Workers-Version-Overrides: $override" \
+                  -H "Cloudflare-Workers-Version-Overrides: $cand" \
                   "$STOW_EDGE_URL$url?deploy-suite=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$probe")
                 case "$code" in
                   2*|404) ;;
-                  *) echo "::error::suite probe $url answered $code" >&2; exit 1 ;;
+                  *) echo "::error::candidate recovery probe $url answered $code" >&2; exit 1 ;;
                 esac
               done
             done
-          done
-          echo "suite landed $SUITE_REQUESTS requests on each of $CANDIDATE_VERSION and $BASELINE_VERSION"
+            echo "recovery suite landed $probe stateless Worker probes on $CANDIDATE_VERSION"
+          fi
 
       - name: Shift $CANARY_SHARE% of traffic onto the candidate
+        if: steps.baseline_health.outputs.baseline_healthy == 'true'
         working-directory: edge
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -354,6 +413,7 @@ jobs:
 
   canary-verdict:
     needs: prepare
+    if: needs.prepare.outputs.baseline_healthy == 'true'
     # The environment's wait timer is the observation window — the job
     # starts after it elapses and no runner is held meanwhile.
     environment: deploy-canary
@@ -407,6 +467,10 @@ jobs:
 
   promote:
     needs: [prepare, canary-verdict]
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      (needs.canary-verdict.result == 'success' || needs.prepare.outputs.baseline_healthy == 'false')
     runs-on: ubuntu-latest
     env:
       BASELINE_VERSION: ${{ needs.prepare.outputs.baseline_version }}
@@ -476,6 +540,7 @@ jobs:
 
   promoted-verdict:
     needs: [prepare, promote]
+    if: needs.prepare.outputs.baseline_healthy == 'true'
     environment: deploy-promoted
     runs-on: ubuntu-latest
     env:
