@@ -435,6 +435,10 @@ Required GitHub Actions secrets:
   `analytics_engine/sql` `overloaded`-event query), Email Sending
   (the `POST …/email/sending/send` alert mail), and `Zone WAF:Edit` on
   `waterui.dev` (the maintenance rules below and the watchdog's trip).
+  `deploy-site.yml` adds `Account Cloudflare Pages:Edit` (the
+  `wrangler pages deploy` step) plus the `User Memberships:Read` and
+  `User User Details:Read` scopes Wrangler needs for its account
+  lookup — the zone-level `Custom Pages` permission is unrelated.
   The zone's id goes in the `CF_ZONE_ID` repository variable — the
   WAF step below and `stow-admin maintenance`/`watchdog` read it,
   `operations.yml` among them.
