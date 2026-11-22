@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.11](https://github.com/water-rs/stow/compare/oci/v0.21.10...oci/v0.21.11) - 2026-11-22
+
+### Fixed
+
+- *(oci,ci)* resign legacy standalone .sig records and markers in one pass (closes #1667)
+
 ## [0.21.10](https://github.com/water-rs/stow/compare/oci/v0.21.9...oci/v0.21.10) - 2026-11-21
 
 ### Other

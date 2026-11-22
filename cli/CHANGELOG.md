@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.11](https://github.com/water-rs/stow/compare/v0.21.10...v0.21.11) - 2026-11-22
+
+### Added
+
+- *(cli)* split artifact cache into crates-io, local-crates-io, and local tiers (stow#1651)
+
+### Fixed
+
+- *(types,cli)* preserve additive build-script cfgs while enforcing link-lib and link-arg equality on supersets
+- *(types,resolver,admin,cli)* exclude non-additive features and mismatched build-script inputs from superset serving (closes #1668)
+- *(cli)* serve graph-validated feature supersets on demand (closes #1665)
+- *(cli)* stat SQLite files on Unix without dropping POSIX fcntl locks
+- *(cli)* require exact crate version in wrapper semantic lookup (stow#1656)
+- *(cli)* gate macOS-only test helper resident_logical
+
+### Other
+
+- *(cli)* extract feature validation helper and group slice lookup args
+- Merge remote-tracking branch 'origin/main' into fix/pinned-mirror-build-dir
+- Merge pull request #1663 from water-rs/fix/semantic-exact-version-1656
+- Merge pull request #1655 from water-rs/feat/three-tier-cache-1651
+- *(cli)* drain daemon before renaming tier directory on Windows
+
 ## [0.21.10](https://github.com/water-rs/stow/compare/v0.21.9...v0.21.10) - 2026-11-21
 
 ### Added
