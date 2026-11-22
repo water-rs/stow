@@ -16,6 +16,14 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
+    inputs:
+      setup:
+        # The one-time stow.waterui.dev cutover (stow#1648): every step is
+        # idempotent, so re-running it repairs rather than breaks.
+        description: "Provision the Pages domain + DNS and drop the Worker Custom Domain"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -44,3 +52,45 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  # One-time domain cutover: the Pages project's custom domain is
+  # `stow.waterui.dev` and the Worker keeps only its `/api/*` route.
+  # Ordering keeps the hostname resolved throughout — the CNAME is
+  # created first (it coexists with the Worker Custom Domain's managed
+  # record only where the API allows it), the Custom Domain is deleted,
+  # and the CNAME step repeats in case the first create conflicted.
+  setup:
+    if: github.event_name == 'workflow_dispatch' && inputs.setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Migrate stow.waterui.dev to Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          api() { curl -fsS -X "$1" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json" ${3:+-d "$3"} "https://api.cloudflare.com/client/v4$2"; }
+          ZONE=$(api GET "/zones?name=waterui.dev" | jq -r '.result[0].id')
+          # The Worker's path-scoped route — API traffic keeps reaching it.
+          api POST "/zones/$ZONE/workers/routes" \
+            '{"pattern":"stow.waterui.dev/api/*","script":"stow-edge"}' || true
+          # The Pages project's claim on the hostname.
+          api POST "/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/stow-site/domains" \
+            '{"name":"stow.waterui.dev"}' || true
+          api POST "/zones/$ZONE/dns_records" \
+            '{"type":"CNAME","name":"stow","content":"stow-site.pages.dev","proxied":true,"ttl":1}' || true
+          CD=$(api GET "/zones/$ZONE/workers/domains" | jq -r '.result[] | select(.hostname == "stow.waterui.dev") | .id')
+          if [ -n "$CD" ]; then
+            api DELETE "/zones/$ZONE/workers/domains/$CD" >/dev/null
+          fi
+          api POST "/zones/$ZONE/dns_records" \
+            '{"type":"CNAME","name":"stow","content":"stow-site.pages.dev","proxied":true,"ttl":1}' || true
+          api PATCH "/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/stow-site/domains/stow.waterui.dev" || true
+          for _ in $(seq 30); do
+            status=$(api GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/stow-site/domains/stow.waterui.dev" | jq -r '.result.status')
+            [ "$status" = "active" ] && break
+            sleep 5
+          done
+          [ "$status" = "active" ] || { echo "Pages domain still $status" >&2; exit 1; }
+          curl -fsS -o /dev/null -w 'GET / -> %{http_code}\n' https://stow.waterui.dev/
+          curl -fsS -o /dev/null -w 'GET /api/v1/stats -> %{http_code}\n' "https://stow.waterui.dev/api/v1/stats?pages-setup"
