@@ -10,6 +10,77 @@ pub struct Cli {
     pub command: Command,
 }
 
+impl Cli {
+    /// Parse `args` while recognizing `CargoCommandArgs` flags anywhere before
+    /// `--` on `check`, `build`, `test`, and `predict`, even after Cargo flags
+    /// such as `-p foo` or `--workspace`.
+    ///
+    /// # Errors
+    ///
+    /// Returns clap's parse error when any `stow` flag or subcommand is
+    /// malformed.
+    pub fn try_parse_normalized<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let raw: Vec<OsString> = args.into_iter().map(Into::into).collect();
+        Self::try_parse_from(hoist_cargo_command_flags(&raw))
+    }
+}
+
+fn hoist_cargo_command_flags(args: &[OsString]) -> Vec<OsString> {
+    let Some(subcommand) = args.get(1).and_then(|s| s.to_str()) else {
+        return args.to_vec();
+    };
+    if !matches!(subcommand, "check" | "build" | "test" | "predict") {
+        return args.to_vec();
+    }
+
+    let mut hoisted = Vec::new();
+    let mut passthrough = Vec::new();
+    let tail = &args[2..];
+    let mut index = 0;
+    while index < tail.len() {
+        let arg = &tail[index];
+        if arg == "--" {
+            passthrough.extend_from_slice(&tail[index..]);
+            break;
+        }
+        match arg.to_str() {
+            Some(
+                "--silent-compatible-upgrades"
+                | "--no-stow-resolver"
+                | "--no-remote-cache"
+                | "--no-local-crates-io-cache"
+                | "--no-local-git-cache",
+            ) => {
+                hoisted.push(arg.clone());
+            }
+            Some(flag) if flag.starts_with("--isolation=") => {
+                hoisted.push(arg.clone());
+            }
+            Some("--isolation") => {
+                hoisted.push(arg.clone());
+                if let Some(next) = tail.get(index + 1)
+                    && next != "--"
+                {
+                    hoisted.push(next.clone());
+                    index += 1;
+                }
+            }
+            _ => passthrough.push(arg.clone()),
+        }
+        index += 1;
+    }
+
+    let mut out = Vec::with_capacity(args.len());
+    out.extend_from_slice(&args[..2]);
+    out.extend(hoisted);
+    out.extend(passthrough);
+    out
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Check(CargoCommandArgs),
@@ -409,7 +480,7 @@ mod tests {
     #[test]
     fn every_cargo_running_command_takes_the_cache_flags() {
         for command in ["check", "build", "test", "predict"] {
-            Cli::try_parse_from([
+            Cli::try_parse_normalized([
                 "stow",
                 command,
                 "--no-remote-cache",
@@ -418,6 +489,74 @@ mod tests {
             ])
             .unwrap_or_else(|error| panic!("{command} rejects a cache flag: {error}"));
         }
+    }
+
+    #[test]
+    fn stow_flags_parse_after_cargo_flags_and_stay_verbatim_after_double_dash() {
+        for command in ["check", "build", "test", "predict"] {
+            let cli = Cli::try_parse_normalized([
+                "stow",
+                command,
+                "-p",
+                "demo",
+                "--release",
+                "--no-remote-cache",
+                "--silent-compatible-upgrades",
+                "--no-stow-resolver",
+                "--isolation",
+                "strict",
+                "--no-local-crates-io-cache",
+                "--no-local-git-cache",
+                "--",
+                "--no-remote-cache",
+                "--isolation",
+                "bogus",
+            ])
+            .unwrap_or_else(|error| panic!("{command} failed to parse interleaved flags: {error}"));
+
+            let args = match cli.command {
+                Command::Check(a) | Command::Build(a) | Command::Test(a) | Command::Predict(a) => a,
+                other => panic!("unexpected command {other:?}"),
+            };
+            assert!(args.silent_compatible_upgrades);
+            assert!(args.no_stow_resolver);
+            assert!(args.cache.no_remote_cache);
+            assert!(args.cache.no_local_crates_io_cache);
+            assert!(args.cache.no_local_git_cache);
+            assert_eq!(
+                args.isolation.isolation,
+                Some(crate::isolation::Level::Strict)
+            );
+            assert_eq!(
+                args.cargo_args,
+                vec![
+                    OsString::from("-p"),
+                    OsString::from("demo"),
+                    OsString::from("--release"),
+                    OsString::from("--"),
+                    OsString::from("--no-remote-cache"),
+                    OsString::from("--isolation"),
+                    OsString::from("bogus"),
+                ]
+            );
+        }
+
+        let eq = Cli::try_parse_normalized(["stow", "check", "--workspace", "--isolation=offline"])
+            .expect("parse --isolation=<LEVEL> after cargo flag");
+        let Command::Check(eq_args) = eq.command else {
+            panic!("expected check command");
+        };
+        assert_eq!(
+            eq_args.isolation.isolation,
+            Some(crate::isolation::Level::Offline)
+        );
+        assert_eq!(eq_args.cargo_args, vec![OsString::from("--workspace")]);
+
+        assert!(
+            Cli::try_parse_normalized(["stow", "check", "-p", "demo", "--isolation", "bogus"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_normalized(["stow", "check", "-p", "demo", "--isolation"]).is_err());
     }
 
     #[test]

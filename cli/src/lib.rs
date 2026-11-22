@@ -105,7 +105,6 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use async_process::Command;
-use clap::Parser;
 use stow_types::error::Context;
 use stow_types::identity::DependencyCompileKeyIdentity;
 use stow_types::public_cache::{
@@ -5180,7 +5179,7 @@ pub(crate) fn log_nonfatal_result(context: &'static str, result: stow_types::err
 }
 
 fn parse_cli_or_exit(args: &[std::ffi::OsString]) -> stow_types::error::Result<Cli> {
-    match Cli::try_parse_from(args.iter().cloned()) {
+    match Cli::try_parse_normalized(args.iter().cloned()) {
         Ok(cli) => Ok(cli),
         Err(error) => {
             let kind = error.kind();
