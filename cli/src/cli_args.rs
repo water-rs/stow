@@ -437,10 +437,7 @@ mod tests {
     #[test]
     fn every_visible_command_describes_itself_without_internal_notes() {
         fn walk(command: &clap::Command) {
-            for sub in command
-                .get_subcommands()
-                .filter(|sub| !sub.is_hide_set())
-            {
+            for sub in command.get_subcommands().filter(|sub| !sub.is_hide_set()) {
                 let about = sub.get_about().map_or_else(
                     || panic!("`{}` has no description", sub.get_name()),
                     ToString::to_string,
