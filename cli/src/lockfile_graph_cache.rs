@@ -55,19 +55,24 @@ const VALUE_FLAGS: &[&[u8]] = &[
 ];
 
 /// The forwarded args as cargo's unit-graph answer sees them:
-/// everything after `--` selects libtest cases, and for `test`/`bench`
-/// a bare positional is the test-name filter — neither changes the
+/// [`crate::workspace_deps::unit_graph_args`] first rewrites each
+/// wrapped action's argument surface into what its `cargo <subcommand>
+/// --unit-graph` re-run reads — clippy's own options and `nextest`'s
+/// subcommand word and run options leave it (stow#1456). Everything
+/// after `--` then selects libtest cases, and for `test`/`bench` a
+/// bare positional is the test-name filter — neither changes the
 /// graph, so neither may split the key.
-fn normalized_args<'a>(action: &str, cargo_args: &'a [OsString]) -> Vec<&'a [u8]> {
-    let args = cargo_args
+fn normalized_args(action: &str, cargo_args: &[OsString]) -> Vec<Vec<u8>> {
+    let translated = crate::workspace_deps::unit_graph_args(action, cargo_args);
+    let args = translated
         .iter()
         .take_while(|arg| arg.as_encoded_bytes() != b"--")
-        .map(|arg| arg.as_encoded_bytes())
+        .map(|arg| arg.as_encoded_bytes().to_vec())
         .collect::<Vec<_>>();
     let mut normalized = Vec::with_capacity(args.len());
     let mut index = 0;
     while index < args.len() {
-        let arg = args[index];
+        let arg = args[index].as_slice();
         index += 1;
         if (action == "test" || action == "bench") && !arg.starts_with(b"-") {
             continue;
@@ -82,9 +87,9 @@ fn normalized_args<'a>(action: &str, cargo_args: &'a [OsString]) -> Vec<&'a [u8]
         if arg.starts_with(b"--target-dir=") {
             continue;
         }
-        normalized.push(arg);
+        normalized.push(arg.to_vec());
         if VALUE_FLAGS.contains(&arg) && index < args.len() {
-            normalized.push(args[index]);
+            normalized.push(args[index].clone());
             index += 1;
         }
     }
@@ -148,7 +153,7 @@ pub fn key_of(project: &KeyInputs<'_>) -> stow_types::error::Result<String> {
     hasher.update(project.action.as_bytes());
     hasher.update(&[0]);
     for arg in normalized_args(project.action, project.cargo_args) {
-        hasher.update(arg);
+        hasher.update(&arg);
         hasher.update(&[0]);
     }
     let cargo_dir = project

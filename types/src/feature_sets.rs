@@ -37,6 +37,39 @@ pub fn contains_all(candidate: &[String], requested: &[String]) -> bool {
     requested.peek().is_none()
 }
 
+/// `true` when `candidate` contains every element of `requested` and adds
+/// no feature listed in `non_additive` (stow#1668). Both slices must be
+/// canonical (strictly sorted, deduplicated).
+#[must_use]
+pub fn contains_additively(
+    candidate: &[String],
+    requested: &[String],
+    non_additive: &BTreeSet<String>,
+) -> bool {
+    let mut requested = requested.iter().peekable();
+    for member in candidate {
+        match requested.peek() {
+            Some(&want) => match want.as_str().cmp(member.as_str()) {
+                std::cmp::Ordering::Less => return false,
+                std::cmp::Ordering::Equal => {
+                    requested.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    if non_additive.contains(member.as_str()) {
+                        return false;
+                    }
+                }
+            },
+            None => {
+                if non_additive.contains(member.as_str()) {
+                    return false;
+                }
+            }
+        }
+    }
+    requested.peek().is_none()
+}
+
 /// The smallest set in `candidates` that contains `requested`.
 ///
 /// Ties break on the sorted feature list; `None` when no candidate
@@ -47,9 +80,20 @@ pub fn smallest_containing_set<'a>(
     requested: &[String],
     candidates: impl IntoIterator<Item = &'a [String]>,
 ) -> Option<&'a [String]> {
+    smallest_containing_set_respecting(requested, candidates, &BTreeSet::new())
+}
+
+/// [`smallest_containing_set`] refusing any candidate whose extra features
+/// over `requested` touch `non_additive` (stow#1668).
+#[must_use]
+pub fn smallest_containing_set_respecting<'a>(
+    requested: &[String],
+    candidates: impl IntoIterator<Item = &'a [String]>,
+    non_additive: &BTreeSet<String>,
+) -> Option<&'a [String]> {
     candidates
         .into_iter()
-        .filter(|candidate| contains_all(candidate, requested))
+        .filter(|candidate| contains_additively(candidate, requested, non_additive))
         .min_by(|left, right| left.len().cmp(&right.len()).then(left.cmp(right)))
 }
 
@@ -66,19 +110,33 @@ pub fn smallest_containing_set<'a>(
 /// always finds a built set.
 #[must_use]
 pub fn serving_map(family: &BTreeSet<Vec<String>>) -> BTreeMap<Vec<String>, Vec<String>> {
+    serving_map_respecting(family, &BTreeSet::new())
+}
+
+/// [`serving_map`] refusing to serve across any feature in `non_additive`
+/// (stow#1668).
+#[must_use]
+pub fn serving_map_respecting(
+    family: &BTreeSet<Vec<String>>,
+    non_additive: &BTreeSet<String>,
+) -> BTreeMap<Vec<String>, Vec<String>> {
     let built: Vec<&Vec<String>> = family
         .iter()
         .filter(|set| {
             !family
                 .iter()
-                .any(|other| *set != other && contains_all(other, set))
+                .any(|other| *set != other && contains_additively(other, set, non_additive))
         })
         .collect();
     family
         .iter()
         .map(|set| {
-            let serving = smallest_containing_set(set, built.iter().map(|set| set.as_slice()))
-                .expect("a set is always contained in at least one built set: itself");
+            let serving = smallest_containing_set_respecting(
+                set,
+                built.iter().map(|set| set.as_slice()),
+                non_additive,
+            )
+            .unwrap_or(set.as_slice());
             (set.clone(), serving.to_vec())
         })
         .collect()
@@ -391,6 +449,25 @@ mod tests {
         );
         assert_eq!(
             smallest_containing_set(&set(&["x"]), published.iter().map(Vec::as_slice)),
+            None
+        );
+    }
+
+    #[test]
+    fn non_additive_features_keep_disjoint_serving_partitions() {
+        let non_additive = BTreeSet::from(["dlopen".to_owned()]);
+        let family = sets(&[&[], &["a"], &["dlopen"], &["a", "dlopen"]]);
+        let map = serving_map_respecting(&family, &non_additive);
+        assert_eq!(map[&set(&[])], set(&["a"]));
+        assert_eq!(map[&set(&["a"])], set(&["a"]));
+        assert_eq!(map[&set(&["dlopen"])], set(&["a", "dlopen"]));
+        assert_eq!(map[&set(&["a", "dlopen"])], set(&["a", "dlopen"]));
+        assert_eq!(
+            smallest_containing_set_respecting(
+                &set(&[]),
+                std::iter::once(set(&["dlopen"]).as_slice()),
+                &non_additive
+            ),
             None
         );
     }

@@ -32,8 +32,10 @@ pub enum QueueCommand {
     Purge(MutationArgs),
 }
 
-/// Shared row selector for `queue list` and every mutation: explicit
-/// `--task-id`s when given, otherwise the filter flags.
+// Shared row selector for `queue list` and every mutation: explicit
+// `--task-id`s when given, otherwise the filter flags. Not a doc
+// comment: a doc comment on a flattened `Args` struct becomes the
+// `about` of every command it is flattened into.
 #[derive(Args)]
 pub struct SelectorArgs {
     /// Act on these task ids exactly; repeatable. When empty the filter

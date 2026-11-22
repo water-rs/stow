@@ -17,7 +17,6 @@ use stow_types::platform::Profile;
 use stow_types::public_cache::{
     StableUnitIdentity, normalized_cache_profile, stable_c_metadata_for_compile_key,
 };
-use stow_types::versioning::is_semver_compatible_upgrade;
 
 use crate::config::StowConfig;
 use crate::fetch::{ArtifactBundle, FetchRequest, SemanticFetchRequest, bundle_file_path};
@@ -702,13 +701,14 @@ pub async fn load_semantic_cached_bundle_in_tiers(
             "SELECT c_metadata, crate_version, emit_json, features_json, crate_name, \
                     compile_key, dependency_c_metadata_json \
              FROM artifact_cache_entries \
-             WHERE rustc_version = ? AND target = ? AND crate_name = ? \
+             WHERE rustc_version = ? AND target = ? AND crate_name = ? AND crate_version = ? \
                AND profile_json = ? AND kind_json = ? AND crate_types_json = ? \
                AND reach = ?",
         )
         .bind(&request.rustc_version)
         .bind(&request.target)
         .bind(&request.crate_name)
+        .bind(&request.version)
         .bind(&profile_json)
         .bind(&kind_json)
         .bind(&crate_types_json)
@@ -722,6 +722,7 @@ pub async fn load_semantic_cached_bundle_in_tiers(
                 &requested_version,
                 &request.emit,
                 &requested_features,
+                &request.non_additive_features,
             )? {
                 candidates.push(candidate);
             }
@@ -777,13 +778,18 @@ fn semantic_candidate_honours_consumer(
     candidate: &SemanticCacheCandidate,
     loaded: &CachedArtifactBundle,
 ) -> stow_types::error::Result<bool> {
-    let build_script = match request
+    let build_script = if let Some(own) = request
         .build_script_of_same_build(&candidate.row.crate_version, &candidate.row.features_json)
     {
-        Some(own) => std::borrow::Cow::Borrowed(own),
-        None => std::borrow::Cow::Owned(stow_types::upload_plan::BuildScriptInputs::of(
+        std::borrow::Cow::Borrowed(own)
+    } else {
+        let candidate_build_script = stow_types::upload_plan::BuildScriptInputs::of(
             read_entry_native(&loaded.entry_dir)?.as_ref(),
-        )),
+        );
+        if !candidate_build_script.superset_honours(&request.build_script) {
+            return Ok(false);
+        }
+        std::borrow::Cow::Owned(candidate_build_script)
     };
     request.candidate_honours_consumer(
         &crate::fetch::SemanticCandidate {
@@ -4194,12 +4200,11 @@ fn semantic_candidate_from_row(
     requested_version: &Version,
     requested_emit: &[String],
     requested_features: &[String],
+    non_additive_features: &std::collections::BTreeSet<String>,
 ) -> stow_types::error::Result<Option<SemanticCacheCandidate>> {
     let candidate_version = Version::parse(&row.crate_version)
         .wrap_err_with(|| format!("parse cached semantic crate version {}", row.crate_version))?;
-    if candidate_version != *requested_version
-        && !is_semver_compatible_upgrade(requested_version, &candidate_version)
-    {
+    if candidate_version != *requested_version {
         return Ok(None);
     }
     let candidate_emit =
@@ -4213,11 +4218,16 @@ fn semantic_candidate_from_row(
     {
         return Ok(None);
     }
-    // A bundle serves the request when its recorded feature set contains
-    // the requested one — superset serving, never unioned (stow#881).
+    // A bundle serves the request when its recorded feature set additively
+    // contains the requested one — superset serving, never unioned (stow#881,
+    // stow#1668).
     let candidate_features = serde_json::from_str::<Vec<String>>(&row.features_json)
         .wrap_err("parse cached features_json")?;
-    if !stow_types::feature_sets::contains_all(&candidate_features, requested_features) {
+    if !stow_types::feature_sets::contains_additively(
+        &candidate_features,
+        requested_features,
+        non_additive_features,
+    ) {
         return Ok(None);
     }
     Ok(Some(SemanticCacheCandidate {
@@ -5408,7 +5418,7 @@ pub mod tests {
         let config = &bundle.manifest.config;
         let request = SemanticFetchRequest {
             crate_name: "ignore".to_owned(),
-            version: "0.4.22".to_owned(),
+            version: "0.4.24".to_owned(),
             features_json: "[\"default\"]".to_owned(),
             dependency_c_metadata_json: "[]".to_owned(),
             target: "aarch64-apple-darwin".to_owned(),
@@ -5419,6 +5429,7 @@ pub mod tests {
             crate_types: config.crate_types.clone(),
             consumer: stow_types::upload_plan::ConsumerInputs::stock(),
             build_script: stow_types::upload_plan::BuildScriptInputs::default(),
+            non_additive_features: std::collections::BTreeSet::new(),
         };
         (bundle, request)
     }
@@ -5440,7 +5451,8 @@ pub mod tests {
     }
 
     #[test]
-    fn load_semantic_cached_bundle_matches_compatible_version_with_different_metadata() {
+    fn load_semantic_cached_bundle_matches_same_version_with_different_metadata_and_rejects_other_patch()
+     {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
         let (bundle, request) = semantic_fixture(
@@ -5451,10 +5463,20 @@ pub mod tests {
         run_async(async {
             let loaded = store_and_load_semantic(&config, &bundle, &request)
                 .await
-                .expect("semantic cache hit");
+                .expect("semantic cache hit on exact version");
             assert_eq!(loaded.crate_name, "ignore");
             assert_eq!(loaded.crate_version, "0.4.24");
             assert_eq!(loaded.c_metadata, "11223344aabbccdd");
+
+            let mut older_request = request;
+            older_request.version = "0.4.22".to_owned();
+            assert!(
+                load_semantic_cached_bundle(&config, &older_request)
+                    .await
+                    .expect("load semantic bundle")
+                    .is_none(),
+                "0.4.24 cached entry must never serve a 0.4.22 request"
+            );
         });
     }
 

@@ -409,8 +409,15 @@ candidate values and exiting non-zero on a breach — which runs
   (`STOW_DO_WORKLOAD_RPS`), once in `prepare` while the deployment is
   still the baseline alone and once in `promote` right after promotion;
   each window is the 3 whole minutes (`STOW_DO_WORKLOAD_MINUTES`) that
-  open at least 60 s after the workload's first request, so the request
-  that hydrates the object the version change reset falls outside it.
+  open at least 60 s after the workload's first request on `baseline`
+  and at least 330 s after the Scheduler object settles onto the new tag
+  on `candidate` (past `durableObjectsPeriodicGroups`'s 5-minute
+  periodic flush), so the cold `wake_graph` SQLite hydration after
+  version reset flushes outside it. If the live baseline's
+  `/api/v1/scheduler/status` already fails before the deploy starts,
+  `prepare` verifies the candidate's stateless Worker routes and
+  `promote` verifies `/api/v1/scheduler/status` directly on the promoted
+  candidate Durable Object instead of deadlocking on the broken baseline.
   Both datasets are summed over the same bounds; alarm and organic DO
   work land in both windows alike. Each window must carry at least
   `MIN_DO_SAMPLE_REQUESTS` (280 of the ~358 scheduled) DO requests:

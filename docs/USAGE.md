@@ -45,6 +45,22 @@ workspace mirror instead of prompting. Recommended for CI.
 stow check --silent-compatible-upgrades --manifest-path Cargo.toml
 ```
 
+## `stow run` / `clippy` / `doc` / `bench` / `nextest`
+
+Drop-in replacements for the rest of the cargo build family, with the
+same session, cache layers and isolation as `stow check`/`build`/`test`.
+
+- `stow run` serves `build`'s graph; argv after `--` passes to the
+  program.
+- `stow clippy` serves `check`'s graph — workspace members run through
+  `clippy-driver` and are never cached.
+- `stow doc` serves the dependency metadata rustdoc reads; the
+  documentation output itself is not cached.
+- `stow bench` serves `test`'s shape under the bench profile.
+- `stow nextest` serves the units `cargo test` compiles before nextest
+  runs them; cargo-nextest is the user's own tool and is not installed
+  by stow.
+
 ## Cache layers
 
 The cache has three layers, and each is switched off on its own. The `[cache]`

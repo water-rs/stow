@@ -1563,7 +1563,8 @@ fn predict_from_inputs(
         .cloned()
         .map(into_api_dependency)
         .collect::<stow_types::error::Result<Vec<_>>>()?;
-    let analysis = resolve::analyze_dependency_graph(
+    let non_additive = expanded.non_additive_features();
+    let analysis = resolve::analyze_dependency_graph_with_non_additive(
         &rows,
         &entries,
         &expanded_in,
@@ -1571,6 +1572,7 @@ fn predict_from_inputs(
         &project.rustc_version,
         resolve::host_glibc(),
         &local_programs,
+        &non_additive,
     )?;
 
     // The wrapper's decision path resolves each compiled unit against

@@ -18,9 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use semver::Version;
 use stow_types::api::{DependencyGraphEntry, ResolvedDependencyGraphEntry, runner_family};
-use stow_types::feature_sets::{
-    ClosureAgreement, ClosureHeld, ClosureKey, closure_members, smallest_containing_set,
-};
+use stow_types::feature_sets::{ClosureAgreement, ClosureHeld, ClosureKey, closure_members};
 use stow_types::glibc::GlibcVersion;
 use stow_types::identity::{
     CMetadata, CrateName, CrateVersion, DependencyIdentity, FeaturesJson, TargetTriple,
@@ -189,6 +187,7 @@ pub const fn host_glibc() -> Option<GlibcVersion> {
 /// (duplicate node, dangling edge, missing root, an unresolvable
 /// dependency subgraph), or when an index row carries a `compile_key`
 /// the canonical-metadata check cannot read.
+#[cfg(test)]
 pub fn analyze_dependency_graph(
     rows: &[ArtifactIndexRow],
     entries: &[DependencyGraphEntry],
@@ -197,6 +196,31 @@ pub fn analyze_dependency_graph(
     rustc_version: &str,
     host_glibc: Option<GlibcVersion>,
     local_programs: &[stow_types::records::LocalProcMacro],
+) -> stow_types::error::Result<GraphAnalysis> {
+    analyze_dependency_graph_with_non_additive(
+        rows,
+        entries,
+        expanded_entries,
+        target,
+        rustc_version,
+        host_glibc,
+        local_programs,
+        &BTreeMap::new(),
+    )
+}
+
+/// [`analyze_dependency_graph`] excluding per-package `non_additive` features
+/// from superset selection (stow#1668).
+#[allow(clippy::too_many_arguments)]
+pub fn analyze_dependency_graph_with_non_additive(
+    rows: &[ArtifactIndexRow],
+    entries: &[DependencyGraphEntry],
+    expanded_entries: &[ResolvedDependencyGraphEntry],
+    target: &str,
+    rustc_version: &str,
+    host_glibc: Option<GlibcVersion>,
+    local_programs: &[stow_types::records::LocalProcMacro],
+    non_additive: &BTreeMap<(CrateName, Version), BTreeSet<String>>,
 ) -> stow_types::error::Result<GraphAnalysis> {
     if entries.is_empty() {
         return Ok(GraphAnalysis {
@@ -257,7 +281,25 @@ pub fn analyze_dependency_graph(
         })
         .collect::<Vec<_>>();
 
-    let plan = expanded_scheduler_plan(&exact_graph, rows, host_glibc, local_programs)?;
+    let non_additive_by_key = non_additive
+        .iter()
+        .map(|((crate_name, version), set)| {
+            (
+                PackageKey {
+                    crate_name: crate_name.clone(),
+                    version: version.clone(),
+                },
+                set.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let plan = expanded_scheduler_plan(
+        &exact_graph,
+        rows,
+        host_glibc,
+        local_programs,
+        &non_additive_by_key,
+    )?;
 
     Ok(GraphAnalysis {
         entries: response_entries,
@@ -278,6 +320,7 @@ fn expanded_scheduler_plan(
     rows: &[ArtifactIndexRow],
     host_glibc: Option<GlibcVersion>,
     local_programs: &[stow_types::records::LocalProcMacro],
+    non_additive: &BTreeMap<PackageKey, BTreeSet<String>>,
 ) -> stow_types::error::Result<ExpandedSchedulerPlan> {
     let cached = cached_artifacts(
         rows,
@@ -286,6 +329,7 @@ fn expanded_scheduler_plan(
         &exact_graph.root_keys,
         host_glibc,
         local_programs,
+        non_additive,
     )?;
     let expanded_total = exact_graph.feature_json_by_key.len();
     let expanded_cached = exact_graph
@@ -520,6 +564,7 @@ fn cached_artifacts(
     root_keys: &BTreeSet<PackageKey>,
     host_glibc: Option<GlibcVersion>,
     local_programs: &[stow_types::records::LocalProcMacro],
+    non_additive: &BTreeMap<PackageKey, BTreeSet<String>>,
 ) -> stow_types::error::Result<CachedArtifacts> {
     let key_pairs = feature_json_by_key
         .iter()
@@ -533,11 +578,12 @@ fn cached_artifacts(
         });
     }
 
-    let reachable = resolve_reachable_cached_rows(
+    let reachable = resolve_reachable_cached_rows_with_non_additive(
         &key_pairs,
         dependency_identity_by_key,
         rows,
         local_programs,
+        non_additive,
     )?;
     let mut semantic_keys = reachable
         .candidates
@@ -579,11 +625,12 @@ fn cached_artifacts(
         .filter(|row| row_servable_on_host(row, host_glibc))
         .cloned()
         .collect::<Vec<_>>();
-    let servable_reachable = resolve_reachable_cached_rows(
+    let servable_reachable = resolve_reachable_cached_rows_with_non_additive(
         &key_pairs,
         dependency_identity_by_key,
         &servable_rows,
         local_programs,
+        non_additive,
     )?;
     let selected_prefetch_rows =
         select_prefetch_candidates(feature_json_by_key, root_keys, &servable_reachable)?;
@@ -598,11 +645,28 @@ fn cached_artifacts(
     })
 }
 
+#[cfg(test)]
 fn resolve_reachable_cached_rows<'a>(
     key_pairs: &BTreeSet<(PackageKey, String)>,
     dependency_identity_by_key: &BTreeMap<PackageKey, DependencyIdentity>,
     rows: &'a [ArtifactIndexRow],
     local_programs: &[stow_types::records::LocalProcMacro],
+) -> stow_types::error::Result<ReachableRows<'a>> {
+    resolve_reachable_cached_rows_with_non_additive(
+        key_pairs,
+        dependency_identity_by_key,
+        rows,
+        local_programs,
+        &BTreeMap::new(),
+    )
+}
+
+fn resolve_reachable_cached_rows_with_non_additive<'a>(
+    key_pairs: &BTreeSet<(PackageKey, String)>,
+    dependency_identity_by_key: &BTreeMap<PackageKey, DependencyIdentity>,
+    rows: &'a [ArtifactIndexRow],
+    local_programs: &[stow_types::records::LocalProcMacro],
+    non_additive: &BTreeMap<PackageKey, BTreeSet<String>>,
 ) -> stow_types::error::Result<ReachableRows<'a>> {
     let IndexedRows {
         mut candidates,
@@ -641,7 +705,7 @@ fn resolve_reachable_cached_rows<'a>(
         .iter()
         .map(|&index| candidates[index].semantic_key.clone())
         .collect::<BTreeSet<_>>();
-    add_superset_candidates(&mut candidates, key_pairs, &covered, rows)?;
+    add_superset_candidates(&mut candidates, key_pairs, &covered, rows, non_additive)?;
 
     let (reachable_candidates, reachable_chain) = reachable_indices(&candidates, &chain_rows);
 
@@ -912,6 +976,7 @@ fn add_superset_candidates<'a>(
     key_pairs: &BTreeSet<(PackageKey, String)>,
     covered: &BTreeSet<SemanticKey>,
     rows: &'a [ArtifactIndexRow],
+    non_additive: &BTreeMap<PackageKey, BTreeSet<String>>,
 ) -> stow_types::error::Result<()> {
     // The chooser's pool: every canonical target-side row is built by
     // definition, grouped by package with its decoded feature set.
@@ -953,11 +1018,14 @@ fn add_superset_candidates<'a>(
         let Ok(requested) = serde_json::from_str::<Vec<String>>(key_pair.1.as_str()) else {
             continue;
         };
-        let Some(serving) = smallest_containing_set(
+        let empty = BTreeSet::new();
+        let forbidden = non_additive.get(&key_pair.0).unwrap_or(&empty);
+        let Some(serving) = stow_types::feature_sets::smallest_containing_set_respecting(
             &requested,
             pkg_rows
                 .iter()
                 .map(|&index| pool[index].features.as_slice()),
+            forbidden,
         ) else {
             continue;
         };
@@ -1498,12 +1566,31 @@ pub fn find_exact_artifact<'a>(
 
 /// The identity half of a semantic request — crate, features, dep chain,
 /// profile, crate types, kind — shared by [`find_semantic_artifact`] and
-/// the serve path's refusal check: the lookup filters and ranks on
-/// this plus version/emit, while refusal detection only needs to know a
-/// matching row exists at all.
-pub fn semantic_identity_match(row: &ArtifactIndexRow, request: &SemanticFetchRequest) -> bool {
+/// the serve path's refusal check, widened to feature supersets only for
+/// `c_metadata`s whose whole downstream chain the build's graph analysis
+/// already proved is published in the slice (`stow#881`).
+pub fn semantic_identity_match(
+    row: &ArtifactIndexRow,
+    request: &SemanticFetchRequest,
+    allowed_superset_c_metadatas: Option<&BTreeSet<String>>,
+) -> bool {
+    let features_match = if row.features_json.raw() == request.features_json {
+        true
+    } else if allowed_superset_c_metadatas.is_some_and(|set| set.contains(row.c_metadata.as_str()))
+    {
+        serde_json::from_str::<Vec<String>>(&request.features_json).is_ok_and(|requested| {
+            stow_types::feature_sets::contains_additively(
+                row.features_json.features(),
+                &requested,
+                &request.non_additive_features,
+            )
+        })
+    } else {
+        false
+    };
     row.crate_name.as_str() == request.crate_name
-        && row.features_json.raw() == request.features_json
+        && Version::parse(&request.version).is_ok_and(|version| row.version.as_semver() == &version)
+        && features_match
         && row.dependency_c_metadata_json.raw() == request.dependency_c_metadata_json
         && row.artifact_kind == request.kind
         && row.crate_types == request.crate_types
@@ -1511,19 +1598,17 @@ pub fn semantic_identity_match(row: &ArtifactIndexRow, request: &SemanticFetchRe
 }
 
 /// The wrapper's semantic lookup, resolved locally: the index row whose
-/// full identity matches `request`, or the newest semver-compatible
-/// upgrade the slice carries.
+/// exact version and identity match `request` (differing only in Cargo's
+/// local `-C metadata` or a wider covering `--emit` set), also admitting
+/// graph-validated feature-superset `c_metadata`s (`allowed_superset_c_metadatas`)
+/// when background prefetch has not landed them locally yet or hit its
+/// `CacheBudget` deadline (`stow#881`, `stow#1631`). Exact feature matches
+/// always outrank supersets; supersets rank by smallest containing feature set,
+/// ties broken by sorted feature list.
 ///
-/// Mirrors the edge's `get_semantic_artifact_reference`: exact-identity
-/// rows (crate, features, dep chain, profile, crate types, kind) first
-/// pass a version/emit filter, then rank by version descending,
-/// canonical metadata, narrowest emit set, and finally `bundle_digest`
-/// descending — the slice's deterministic stand-in for the row's OCI
-/// digest, which the index does not carry.
-///
-/// `host_glibc` ([`host_glibc`]) drops candidates whose `min_glibc` the
-/// host cannot load *before* the version ranking runs, so a servable
-/// older row wins over an unservable newer one.
+/// Semver-compatible upgrades belong strictly in lockfile resolution
+/// (`stow-resolver` / `--silent-compatible-upgrades`), never in substituting
+/// another release's `.rmeta`/`.rlib` behind Cargo's back (stow#1656).
 ///
 /// # Errors
 ///
@@ -1533,6 +1618,7 @@ pub fn semantic_identity_match(row: &ArtifactIndexRow, request: &SemanticFetchRe
 pub fn find_semantic_artifact<'a>(
     rows: &'a [ArtifactIndexRow],
     request: &SemanticFetchRequest,
+    allowed_superset_c_metadatas: Option<&BTreeSet<String>>,
     host_glibc: Option<GlibcVersion>,
 ) -> stow_types::error::Result<Option<&'a ArtifactIndexRow>> {
     validate_emit_sorted(&request.emit)?;
@@ -1546,24 +1632,26 @@ pub fn find_semantic_artifact<'a>(
     let mut candidates = rows
         .iter()
         .filter(|row| {
-            semantic_identity_match(row, request) && row_servable_on_host(row, host_glibc)
-        })
-        .filter(|row| {
-            let candidate_version = row.version.as_semver();
-            (candidate_version == &requested_version
-                || is_semver_compatible_upgrade(&requested_version, candidate_version))
+            semantic_identity_match(row, request, allowed_superset_c_metadatas)
+                && row.version.as_semver() == &requested_version
+                && row_servable_on_host(row, host_glibc)
                 && emit_covers_request(&row.emit, &request.emit)
         })
         .collect::<Vec<_>>();
 
     candidates.sort_by(|left, right| {
-        right
-            .version
-            .as_semver()
-            .cmp(left.version.as_semver())
-            .then(row_has_canonical_metadata(right).cmp(&row_has_canonical_metadata(left)))
-            .then(left.emit.len().cmp(&right.emit.len()))
-            .then(right.bundle_digest.cmp(&left.bundle_digest))
+        left.features_json
+            .features()
+            .len()
+            .cmp(&right.features_json.features().len())
+            .then_with(|| {
+                left.features_json
+                    .features()
+                    .cmp(right.features_json.features())
+            })
+            .then_with(|| row_has_canonical_metadata(right).cmp(&row_has_canonical_metadata(left)))
+            .then_with(|| left.emit.len().cmp(&right.emit.len()))
+            .then_with(|| right.bundle_digest.cmp(&left.bundle_digest))
     });
 
     Ok(candidates.into_iter().next())
@@ -2303,12 +2391,18 @@ mod tests {
         );
     }
 
-    /// Semantic lookup: the newest compatible upgrade wins over an exact
-    /// version match, and emit coverage gates the candidates.
+    /// Semantic lookup matches only the exact requested version — never a
+    /// newer semver-compatible patch release behind Cargo's back (stow#1656).
     #[test]
-    fn semantic_lookup_prefers_newest_compatible_version_and_covering_emit() {
+    fn semantic_lookup_matches_only_exact_version_and_covering_emit() {
         let rows = vec![
-            row("serde", "1.4.9", "aaaaaaaaaaaaaaaa", &["default"], &[]),
+            row(
+                "wasm-bindgen-shared",
+                "0.2.130",
+                "aaaaaaaaaaaaaaaa",
+                &["default"],
+                &[],
+            ),
             row("serde", "1.4.3", "bbbbbbbbbbbbbbbb", &["default"], &[]),
         ];
         let request = SemanticFetchRequest {
@@ -2318,25 +2412,101 @@ mod tests {
             dependency_c_metadata_json: "[]".to_owned(),
             target: TARGET.to_owned(),
             rustc_version: RUSTC.to_owned(),
+            profile: rows[1].profile.clone(),
+            emit: vec!["link".to_owned()],
+            kind: ArtifactKind::Rlib,
+            crate_types: vec![RustCrateType::Rlib],
+            consumer: stow_types::upload_plan::ConsumerInputs::stock(),
+            build_script: stow_types::upload_plan::BuildScriptInputs::default(),
+            non_additive_features: BTreeSet::new(),
+        };
+
+        let found = find_semantic_artifact(&rows, &request, None, None)
+            .expect("lookup")
+            .expect("exact version candidate");
+        assert_eq!(found.version.as_semver(), &Version::parse("1.4.3").unwrap());
+
+        let mut older_pin = request;
+        older_pin.crate_name = "wasm-bindgen-shared".to_owned();
+        older_pin.version = "0.2.120".to_owned();
+        assert!(
+            find_semantic_artifact(&rows, &older_pin, None, None)
+                .expect("lookup")
+                .is_none(),
+            "newer patch release 0.2.130 must never serve a 0.2.120 invocation"
+        );
+    }
+
+    #[test]
+    fn semantic_lookup_admits_only_graph_validated_superset_candidates() {
+        let rows = vec![
+            row(
+                "once_cell",
+                "1.21.4",
+                "1111111111111111",
+                &["alloc", "default", "race", "std"],
+                &[],
+            ),
+            row(
+                "once_cell",
+                "1.21.4",
+                "2222222222222222",
+                &["alloc", "race", "std"],
+                &[],
+            ),
+        ];
+        let request = SemanticFetchRequest {
+            crate_name: "once_cell".to_owned(),
+            version: "1.21.4".to_owned(),
+            features_json: "[\"alloc\",\"race\"]".to_owned(),
+            dependency_c_metadata_json: "[]".to_owned(),
+            target: TARGET.to_owned(),
+            rustc_version: RUSTC.to_owned(),
             profile: rows[0].profile.clone(),
             emit: vec!["link".to_owned()],
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Rlib],
             consumer: stow_types::upload_plan::ConsumerInputs::stock(),
             build_script: stow_types::upload_plan::BuildScriptInputs::default(),
+            non_additive_features: BTreeSet::new(),
         };
 
-        let found = find_semantic_artifact(&rows, &request, None)
-            .expect("lookup")
-            .expect("candidate");
-        assert_eq!(found.version.as_semver(), &Version::parse("1.4.9").unwrap());
-
-        let mut upgrade_only = request.clone();
-        upgrade_only.version = "9.9.9".to_owned();
         assert!(
-            find_semantic_artifact(&rows, &upgrade_only, None)
-                .expect("lookup")
-                .is_none()
+            find_semantic_artifact(&rows, &request, None, None)
+                .expect("unseeded lookup")
+                .is_none(),
+            "unseeded semantic lookup must not pick an unvalidated feature superset"
+        );
+
+        let allowed =
+            BTreeSet::from(["1111111111111111".to_owned(), "2222222222222222".to_owned()]);
+        let found = find_semantic_artifact(&rows, &request, Some(&allowed), None)
+            .expect("seeded lookup")
+            .expect("smallest validated superset");
+        assert_eq!(found.c_metadata.as_str(), "2222222222222222");
+
+        // stow#1668: non-additive features (`dlopen`) must not serve `[]`
+        // either during graph reachability or during semantic lookup.
+        let fontconfig_rows = vec![row(
+            "yeslogic-fontconfig-sys",
+            "6.0.1",
+            "3333333333333333",
+            &["dlopen"],
+            &[],
+        )];
+        let fc_key = key("yeslogic-fontconfig-sys", "6.0.1");
+        let fc_pairs = BTreeSet::from([(fc_key.clone(), "[]".to_owned())]);
+        let fc_reachable = super::resolve_reachable_cached_rows_with_non_additive(
+            &fc_pairs,
+            &leaf_digests(&fc_pairs),
+            &fontconfig_rows,
+            &[],
+            &BTreeMap::from([(fc_key, BTreeSet::from(["dlopen".to_owned()]))]),
+        )
+        .expect("reachability");
+        assert!(
+            fc_reachable.candidates.is_empty(),
+            "yeslogic-fontconfig-sys [\"dlopen\"] must not serve []"
         );
     }
 
@@ -2395,8 +2565,9 @@ mod tests {
             crate_types: vec![RustCrateType::Rlib],
             consumer: stow_types::upload_plan::ConsumerInputs::stock(),
             build_script: stow_types::upload_plan::BuildScriptInputs::default(),
+            non_additive_features: BTreeSet::new(),
         };
-        let found = find_semantic_artifact(&rows, &request, host)
+        let found = find_semantic_artifact(&rows, &request, None, host)
             .expect("lookup")
             .expect("a servable candidate remains");
         assert_eq!(found.version.as_semver(), &Version::parse("1.4.3").unwrap());
@@ -2409,12 +2580,12 @@ mod tests {
             patch: 0,
         });
         assert!(
-            find_semantic_artifact(&rows, &request, strict_host)
+            find_semantic_artifact(&rows, &request, None, strict_host)
                 .expect("lookup")
                 .is_none()
         );
         assert!(rows.iter().any(|row| {
-            semantic_identity_match(row, &request) && !row_servable_on_host(row, strict_host)
+            semantic_identity_match(row, &request, None) && !row_servable_on_host(row, strict_host)
         }));
     }
 

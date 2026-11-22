@@ -62,6 +62,46 @@ pub struct ExpandedDependencyGraph {
 }
 
 impl ExpandedDependencyGraph {
+    /// Per-package non-additive features detected from unpacked registry
+    /// package directories referenced by `raw_unit_graph` (stow#1668).
+    #[must_use]
+    pub fn non_additive_features(
+        &self,
+    ) -> BTreeMap<(stow_types::identity::CrateName, semver::Version), BTreeSet<String>> {
+        let mut out = BTreeMap::new();
+        let Ok(graph) = serde_json::from_slice::<UnitGraph<'_>>(&self.raw_unit_graph) else {
+            return out;
+        };
+        let mut seen = BTreeSet::new();
+        for unit in &graph.units {
+            let (name, version, crates_io) = parse_pkg_id(unit.pkg_id);
+            if !crates_io {
+                continue;
+            }
+            let (Ok(crate_name), Ok(semver_ver)) = (
+                stow_types::identity::CrateName::parse(name),
+                semver::Version::parse(version),
+            ) else {
+                continue;
+            };
+            let key = (crate_name, semver_ver);
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let Some(src_path) = unit.target.src_path.as_deref() else {
+                continue;
+            };
+            let Some(pkg_dir) = stow_types::non_additive::enclosing_package_dir(src_path) else {
+                continue;
+            };
+            let found = stow_types::non_additive::non_additive_features_in_package_dir(&pkg_dir);
+            if !found.is_empty() {
+                out.insert(key, found);
+            }
+        }
+        out
+    }
+
     /// The units cargo's unit graph compiled, in the shared task-unit
     /// model — the identity lens `resolved_task_graph` projects (stow#588).
     ///
@@ -289,6 +329,7 @@ async fn unit_graph_command(
     env: &SessionEnv,
 ) -> stow_types::error::Result<(Command, &'static str)> {
     let subcommand = unit_graph_subcommand(action)?;
+    let translated = unit_graph_args(action, cargo_args);
     let mut unit_graph = env.command("cargo")?;
     unit_graph
         .arg(subcommand)
@@ -313,7 +354,7 @@ async fn unit_graph_command(
     // If a future cargo drops the override, cargo rejects `-Z` and the
     // query fails loudly below — no fallback.
     if env.var_os("RUSTC_BOOTSTRAP").is_none() && cargo_channel_is_stable(current_dir, env).await? {
-        unstable_feature_gate(current_dir, cargo_args, env)?;
+        unstable_feature_gate(current_dir, &translated, env)?;
         for (key, value) in unit_graph_channel_env() {
             unit_graph.env(key, value);
         }
@@ -322,13 +363,13 @@ async fn unit_graph_command(
     // crates.io index on each invocation — a multi-second blocking call
     // that turns small projects (clap ~1s vanilla) into 20-second stow
     // runs and explodes the no-slowdown budget.
-    if !arg_spelled(cargo_args, "--offline") {
+    if !arg_spelled(&translated, "--offline") {
         unit_graph.arg("--offline");
     }
-    if !arg_spelled(cargo_args, "--manifest-path") {
+    if !arg_spelled(&translated, "--manifest-path") {
         unit_graph.arg("--manifest-path").arg(manifest_path);
     }
-    unit_graph.args(cargo_args);
+    unit_graph.args(&translated);
     Ok((unit_graph, subcommand))
 }
 
@@ -485,20 +526,169 @@ pub fn expanded_dependency_graph(
     })
 }
 
-/// The cargo subcommand whose unit graph each wrapped action compiles;
-/// `predict` answers what `check` compiles. Only the actions stow
-/// wraps (`check`, `build`, `test`, `predict`) reach this mapping.
+/// The cargo subcommand whose unit graph each wrapped action compiles:
+/// `predict` answers what `check` compiles, `clippy` lints it, `run`
+/// builds, `nextest` builds the units `test` compiles (stow#1456).
+/// Only the actions stow wraps reach this mapping.
 fn unit_graph_subcommand(action: &str) -> stow_types::error::Result<&'static str> {
     Ok(match action {
-        "check" | "predict" => "check",
-        "build" => "build",
-        "test" => "test",
+        "check" | "predict" | "clippy" => "check",
+        "build" | "run" => "build",
+        "test" | "nextest" => "test",
+        "bench" => "bench",
+        "doc" => "doc",
         other => {
             return Err(stow_types::stow_error!(
                 "stow action `{other}` has no cargo unit-graph subcommand"
             ));
         }
     })
+}
+
+/// The arguments the `cargo <subcommand> --unit-graph` re-run takes for
+/// a wrapped action (stow#1456). `check`/`build`/`test`/`predict`
+/// forward the user's own arguments verbatim; `clippy` drops the
+/// clippy-driver tail and the options only cargo-clippy knows;
+/// `nextest` drops its own subcommand word and keeps only the
+/// cargo-selection flags `cargo nextest` forwards to the build it
+/// runs. The lockfile-graph cache key normalizes through the same
+/// function so a key names exactly what the re-run reads.
+pub fn unit_graph_args(action: &str, cargo_args: &[OsString]) -> Vec<OsString> {
+    match action {
+        "clippy" => clippy_unit_graph_args(cargo_args),
+        "nextest" => nextest_unit_graph_args(cargo_args),
+        // A `--` tail is program argv (`run`) or libtest filters
+        // (`bench`), never cargo's; a positional is `bench`'s optional
+        // filter. Neither shapes the graph, so both stay out of the
+        // re-run — `run`/`doc` spell no positionals at all.
+        "run" | "doc" | "bench" => cargo_args
+            .iter()
+            .take_while(|arg| arg.as_encoded_bytes() != b"--")
+            .filter(|arg| action != "bench" || arg.as_encoded_bytes().starts_with(b"-"))
+            .cloned()
+            .collect(),
+        _ => cargo_args.to_vec(),
+    }
+}
+
+/// Options `cargo clippy` parses itself rather than forwarding to
+/// `cargo check`; `cargo check` would reject them. Everything after
+/// `--` is clippy-driver input and stops the copy.
+const CLIPPY_ONLY_FLAGS: &[&str] = &[
+    "--no-deps",
+    "--fix",
+    "--allow-dirty",
+    "--allow-no-vcs",
+    "--allow-staged",
+    "--broken-code",
+    "--ignore-interpolated",
+];
+
+/// Clippy's own options that take a value, in either spelling.
+const CLIPPY_ONLY_VALUED: &[&str] = &["--explain", "--edition"];
+
+fn clippy_unit_graph_args(cargo_args: &[OsString]) -> Vec<OsString> {
+    let mut kept = Vec::with_capacity(cargo_args.len());
+    let mut args = cargo_args.iter();
+    'args: while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        let Some(text) = arg.to_str() else {
+            kept.push(arg.clone());
+            continue;
+        };
+        if CLIPPY_ONLY_FLAGS.contains(&text) {
+            continue;
+        }
+        for flag in CLIPPY_ONLY_VALUED {
+            if text == *flag {
+                args.next();
+                continue 'args;
+            }
+            if text
+                .strip_prefix(*flag)
+                .is_some_and(|rest| rest.starts_with('='))
+            {
+                continue 'args;
+            }
+        }
+        kept.push(arg.clone());
+    }
+    kept
+}
+
+/// The cargo-selection flags `cargo nextest` forwards to the build it
+/// runs — the only arguments the test unit-graph re-run may see. A
+/// positional names the nextest subcommand or a test-name filter,
+/// which the graph does not read, and an unlisted flag is nextest's
+/// own, which `cargo test` would reject (stow#1456).
+const NEXTEST_CARGO_FLAGS: &[&str] = &[
+    "--lib",
+    "--bins",
+    "--examples",
+    "--tests",
+    "--benches",
+    "--all-targets",
+    "--workspace",
+    "--all-features",
+    "--no-default-features",
+    "--release",
+    "--ignore-rust-version",
+    "--locked",
+    "--offline",
+    "--frozen",
+];
+
+/// Selection flags that take a value, in the `--flag value` and
+/// `--flag=value` spellings; `-p` and `-F` also join `-pfoo`.
+const NEXTEST_CARGO_VALUED: &[&str] = &[
+    "-p",
+    "--package",
+    "--exclude",
+    "--bin",
+    "--example",
+    "--test",
+    "--bench",
+    "-F",
+    "--features",
+    "--profile",
+    "--target",
+    "--manifest-path",
+    "--config",
+];
+
+fn nextest_unit_graph_args(cargo_args: &[OsString]) -> Vec<OsString> {
+    let mut kept = Vec::new();
+    let mut args = cargo_args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        let Some(text) = arg.to_str() else {
+            continue;
+        };
+        if !text.starts_with('-') {
+            continue;
+        }
+        let name = text.split('=').next().unwrap_or(text);
+        if NEXTEST_CARGO_FLAGS.contains(&name) {
+            kept.push(arg.clone());
+            continue;
+        }
+        if NEXTEST_CARGO_VALUED.contains(&name)
+            || (name.len() > 2 && ["-p", "-F"].contains(&&name[..2]))
+        {
+            kept.push(arg.clone());
+            if NEXTEST_CARGO_VALUED.contains(&name)
+                && !text.contains('=')
+                && let Some(value) = args.next()
+            {
+                kept.push(value.clone());
+            }
+        }
+    }
+    kept
 }
 
 /// `cargo -V`'s channel: `cargo X.Y.Z` is stable; `-nightly`/`-dev`
@@ -704,6 +894,8 @@ impl CargoUnitProfile<'_> {
 struct UnitTarget<'a> {
     #[serde(borrow)]
     kind: Vec<&'a str>,
+    #[serde(default)]
+    src_path: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -3149,7 +3341,7 @@ mod unit_graph_tests {
 
     use super::{
         CARGO_CHANNEL_OVERRIDE, SelectedRegistryDependency, UnitGraph, emit_expanded_graph,
-        parse_pkg_id, path_pkg_root, resolve_exact_dependency_graph, rustc_test,
+        parse_pkg_id, path_pkg_root, resolve_exact_dependency_graph, rustc_test, unit_graph_args,
         unit_graph_channel_env, unit_graph_subcommand, unstable_feature_gate,
     };
     use crate::session_env::SessionEnv;
@@ -3710,12 +3902,109 @@ mod unit_graph_tests {
         assert_eq!(unit_graph_subcommand("build").unwrap(), "build");
         assert_eq!(unit_graph_subcommand("test").unwrap(), "test");
         assert_eq!(unit_graph_subcommand("predict").unwrap(), "check");
-        // Only check/build/test/predict reach the query — every other
+        assert_eq!(unit_graph_subcommand("clippy").unwrap(), "check");
+        assert_eq!(unit_graph_subcommand("nextest").unwrap(), "test");
+        assert_eq!(unit_graph_subcommand("run").unwrap(), "build");
+        assert_eq!(unit_graph_subcommand("bench").unwrap(), "bench");
+        assert_eq!(unit_graph_subcommand("doc").unwrap(), "doc");
+        // Only the actions stow wraps reach the query — every other
         // action names itself rather than guessing a graph cargo would
         // not build (stow#551).
-        for action in ["clippy", "run", "bench", "doc", "rustc", "publish"] {
+        for action in ["rustc", "publish", "fetch", "vendor"] {
             assert!(unit_graph_subcommand(action).is_err(), "{action}");
         }
+    }
+
+    /// `run`/`doc`/`bench` forward their cargo arguments, but what
+    /// follows `--` — program argv, libtest filters — and `bench`'s
+    /// positional name filter never reach `cargo` (stow#1456).
+    #[test]
+    fn program_args_stay_out_of_the_unit_graph_args() {
+        let args = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            unit_graph_args("run", &args(&["--bin", "app", "--", "--port", "3000"])),
+            args(&["--bin", "app"])
+        );
+        assert_eq!(
+            unit_graph_args("bench", &args(&["my_filter", "--workspace", "--", "x"])),
+            args(&["--workspace"])
+        );
+        assert_eq!(
+            unit_graph_args("doc", &args(&["--no-deps", "--open"])),
+            args(&["--no-deps", "--open"])
+        );
+    }
+
+    /// `cargo clippy` keeps its own options and everything after `--` to
+    /// itself; the check re-run sees only cargo-check arguments
+    /// (stow#1456).
+    #[test]
+    fn clippy_args_drop_clipys_own_options() {
+        let args = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            unit_graph_args(
+                "clippy",
+                &args(&[
+                    "--workspace",
+                    "--no-deps",
+                    "--fix",
+                    "--explain",
+                    "E0001",
+                    "--edition=2021",
+                    "--",
+                    "-D",
+                    "warnings"
+                ])
+            ),
+            args(&["--workspace"])
+        );
+        assert_eq!(
+            unit_graph_args("clippy", &args(&["--all-targets", "--explain=pedantic"])),
+            args(&["--all-targets"])
+        );
+    }
+
+    /// `cargo nextest`'s subcommand word, its run options and its
+    /// test-name filters stay out of the test re-run — only
+    /// cargo-selection flags cross, in every spelling (stow#1456).
+    #[test]
+    fn nextest_args_keep_only_cargo_selection() {
+        let args = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            unit_graph_args(
+                "nextest",
+                &args(&[
+                    "run",
+                    "--workspace",
+                    "-p",
+                    "foo",
+                    "-E",
+                    "test(name)",
+                    "--no-fail-fast",
+                    "--release",
+                    "my_test"
+                ])
+            ),
+            args(&["--workspace", "-p", "foo", "--release"])
+        );
+        assert_eq!(
+            unit_graph_args(
+                "nextest",
+                &args(&[
+                    "list",
+                    "--features=a,b",
+                    "--manifest-path",
+                    "m.toml",
+                    "--",
+                    "name"
+                ])
+            ),
+            args(&["--features=a,b", "--manifest-path", "m.toml"])
+        );
+        assert_eq!(
+            unit_graph_args("nextest", &args(&["run", "-pfoo"])),
+            args(&["-pfoo"])
+        );
     }
 
     /// Direct registry dependencies are the roots' lib deps in the same

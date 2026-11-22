@@ -466,14 +466,14 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
             )
         },
         |_index, repo, result| match result {
-            Ok(tasks) => {
+            Ok((tasks, non_additive)) => {
                 tracing::info!(%repo, tasks = tasks.len(), "resolved");
                 // `edge` is present exactly when the run submits. One
                 // resolve is one submission tree (stow#878); contained
                 // feature sets are served from their superset (stow#881)
                 // — this lane's pool is the one tree it submits per
                 // repo.
-                let tree = match substituted_tree(&tasks, &published) {
+                let tree = match substituted_tree(&tasks, &published, &non_additive) {
                     Ok(tree) => tree,
                     Err(error) => {
                         substitution_error.get_or_insert(error);
@@ -531,18 +531,28 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
 /// served from the published pool (stow#881). A substitution failure is
 /// the lane's error — the pulled slices are internally inconsistent
 /// (stow#919) — so it propagates, it does not panic.
+pub type NonAdditiveFeatures = std::collections::BTreeMap<
+    (
+        stow_types::identity::CrateName,
+        stow_types::identity::CrateVersion,
+    ),
+    BTreeSet<String>,
+>;
+
 fn substituted_tree(
     tasks: &[stow_types::api::EnqueueRequest],
     published: &[stow_types::api::PublishedIndexSlice],
+    non_additive: &NonAdditiveFeatures,
 ) -> stow_types::error::Result<stow_types::api::SubmissionTree> {
     let mut tree = stow_types::api::SubmissionTree::from_enqueue_requests(
         stow_types::api::SubmissionSource::Preheat,
         tasks,
     )
     .expect("resolved repo converts to a submission tree");
-    stow_types::api::SubmissionTree::substitute_contained_sets(
+    stow_types::api::SubmissionTree::substitute_contained_sets_with_non_additive(
         std::slice::from_mut(&mut tree),
         published,
+        non_additive,
     )?;
     Ok(tree)
 }
@@ -980,7 +990,7 @@ pub fn resolve_repository(
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
     preparation: Option<&stow_resolver::SourcePreparation>,
-) -> Result<Vec<EnqueueRequest>, String> {
+) -> Result<(Vec<EnqueueRequest>, NonAdditiveFeatures), String> {
     let git_ref = stow_resolver::project_fetch_ref(preparation);
     let source = resolver
         .resolve_git(
@@ -992,11 +1002,12 @@ pub fn resolve_repository(
             preparation,
         )
         .map_err(|error| format!("resolve {repo}: {error:#}"))?;
-    Ok(source
+    let tasks = source
         .targets
         .into_iter()
         .flat_map(|(_target, tasks)| tasks)
-        .collect())
+        .collect();
+    Ok((tasks, source.non_additive_features))
 }
 
 /// Resolve one local project directory into its enqueue batch — the
@@ -1009,7 +1020,7 @@ pub fn resolve_project_dir(
     dir: &Path,
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
-) -> Result<Vec<EnqueueRequest>, String> {
+) -> Result<(Vec<EnqueueRequest>, NonAdditiveFeatures), String> {
     let source = resolver
         .resolve_project_dir(
             dir,
@@ -1018,11 +1029,12 @@ pub fn resolve_project_dir(
             0,
         )
         .map_err(|error| format!("resolve {}: {error:#}", dir.display()))?;
-    Ok(source
+    let tasks = source
         .targets
         .into_iter()
         .flat_map(|(_target, tasks)| tasks)
-        .collect())
+        .collect();
+    Ok((tasks, source.non_additive_features))
 }
 
 /// POST the batch in bodies under the edge's request-body bound and sum

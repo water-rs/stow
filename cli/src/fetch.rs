@@ -12,7 +12,6 @@ use stow_types::bundle::{
     STOW_SIGSTORE_PAYLOAD_DIR, SigstoreSignature,
 };
 use stow_types::error::Context;
-use stow_types::versioning::is_semver_compatible_upgrade;
 use tar::Archive;
 use zenwave::Client as _;
 
@@ -80,6 +79,9 @@ pub struct SemanticFetchRequest {
     /// What the requesting invocation's own build script put on its
     /// command line.
     pub build_script: stow_types::upload_plan::BuildScriptInputs,
+    /// Non-additive features of this package detected from its unpacked
+    /// source directory (stow#1668).
+    pub non_additive_features: BTreeSet<String>,
 }
 
 /// The recorded identity of an artifact a semantic match proposes to
@@ -439,6 +441,7 @@ pub fn validate_bundle_identity(
 pub fn validate_semantic_bundle_identity(
     bundle: &ArtifactBundle,
     request: &SemanticFetchRequest,
+    allow_superset: bool,
 ) -> stow_types::error::Result<()> {
     if bundle.manifest.config.target.as_str() != request.target {
         return Err(stow_types::stow_error!(
@@ -458,13 +461,11 @@ pub fn validate_semantic_bundle_identity(
         &request.version,
         &bundle.manifest.config.crate_version.to_string(),
     )?;
-    if bundle.manifest.config.features_json.raw() != request.features_json {
-        return Err(stow_types::stow_error!(
-            "downloaded semantic bundle features mismatch: expected {}, got {}",
-            request.features_json,
-            bundle.manifest.config.features_json
-        ));
-    }
+    validate_semantic_bundle_features(
+        request,
+        &bundle.manifest.config.features_json,
+        allow_superset,
+    )?;
     if bundle.manifest.config.dependency_c_metadata_json.raw() != request.dependency_c_metadata_json
     {
         return Err(stow_types::stow_error!(
@@ -508,16 +509,19 @@ pub fn validate_semantic_bundle_identity(
     let features_json = config.features_json.raw();
     let crate_version = config.crate_version.to_string();
     let dependency_c_metadata_json = config.dependency_c_metadata_json.raw();
-    let build_script = request
-        .build_script_of_same_build(&crate_version, &features_json)
-        .map_or_else(
-            || {
-                std::borrow::Cow::Owned(stow_types::upload_plan::BuildScriptInputs::of(
-                    config.native.as_ref(),
-                ))
-            },
-            std::borrow::Cow::Borrowed,
-        );
+    let build_script =
+        if let Some(own) = request.build_script_of_same_build(&crate_version, &features_json) {
+            std::borrow::Cow::Borrowed(own)
+        } else {
+            let bundle_build_script =
+                stow_types::upload_plan::BuildScriptInputs::of(config.native.as_ref());
+            if !bundle_build_script.superset_honours(&request.build_script) {
+                return Err(stow_types::stow_error!(
+                    "downloaded semantic bundle build-script inputs differ from the request"
+                ));
+            }
+            std::borrow::Cow::Owned(bundle_build_script)
+        };
     if !request.candidate_honours_consumer(
         &SemanticCandidate {
             crate_name: config.crate_name.as_str(),
@@ -547,6 +551,32 @@ fn emit_covers_request(candidate_emit: &[String], requested_emit: &[String]) -> 
         .all(|requested| candidate.contains(requested))
 }
 
+fn validate_semantic_bundle_features(
+    request: &SemanticFetchRequest,
+    candidate: &stow_types::identity::FeaturesJson,
+    allow_superset: bool,
+) -> stow_types::error::Result<()> {
+    let features_ok = if allow_superset {
+        let requested: Vec<String> = serde_json::from_str(&request.features_json)
+            .wrap_err("parse semantic request features_json")?;
+        stow_types::feature_sets::contains_additively(
+            candidate.features(),
+            &requested,
+            &request.non_additive_features,
+        )
+    } else {
+        candidate.raw() == request.features_json
+    };
+    if !features_ok {
+        return Err(stow_types::stow_error!(
+            "downloaded semantic bundle features mismatch: expected {}, got {}",
+            request.features_json,
+            candidate
+        ));
+    }
+    Ok(())
+}
+
 fn validate_semantic_bundle_version(
     requested_version: &str,
     bundle_version: &str,
@@ -555,11 +585,11 @@ fn validate_semantic_bundle_version(
         .wrap_err_with(|| format!("parse requested semantic version {requested_version}"))?;
     let actual = Version::parse(bundle_version)
         .wrap_err_with(|| format!("parse bundle semantic version {bundle_version}"))?;
-    if actual == requested || is_semver_compatible_upgrade(&requested, &actual) {
+    if actual == requested {
         return Ok(());
     }
     Err(stow_types::stow_error!(
-        "downloaded semantic bundle version mismatch: expected {} or semver-compatible upgrade, got {}",
+        "downloaded semantic bundle version mismatch: expected {}, got {}",
         requested_version,
         bundle_version
     ))
@@ -897,10 +927,33 @@ pub mod tests {
             crate_types: config.crate_types.clone(),
             consumer,
             build_script,
+            non_additive_features: std::collections::BTreeSet::new(),
         };
-        super::validate_semantic_bundle_identity(&bundle, &request).expect("same inputs serve");
+        super::validate_semantic_bundle_identity(&bundle, &request, false)
+            .expect("same inputs serve");
         request.consumer.cfgs = vec!["custom".to_owned()];
-        assert!(super::validate_semantic_bundle_identity(&bundle, &request).is_err());
+        assert!(super::validate_semantic_bundle_identity(&bundle, &request, false).is_err());
+
+        // stow#1668: a superset bundle (`["dlopen"]`) whose build script
+        // omitted the consumer's `-lfontconfig` or enabled a non-additive
+        // feature must never validate for a `[]` request.
+        request.consumer.cfgs.clear();
+        let mut dlopen_bundle = bundle.clone();
+        dlopen_bundle.manifest.config.features_json =
+            stow_types::identity::FeaturesJson::canonicalize(vec!["dlopen".to_owned()])
+                .expect("canonical features");
+        request.features_json = "[]".to_owned();
+        request.build_script.link_libs = vec!["fontconfig".to_owned()];
+        assert!(
+            super::validate_semantic_bundle_identity(&dlopen_bundle, &request, true).is_err(),
+            "superset bundle with mismatched build-script link libs must be rejected"
+        );
+        request.build_script.link_libs.clear();
+        request.non_additive_features.insert("dlopen".to_owned());
+        assert!(
+            super::validate_semantic_bundle_identity(&dlopen_bundle, &request, true).is_err(),
+            "superset bundle adding a non-additive feature must be rejected"
+        );
     }
 
     /// One canned answer from the stub edge for any request it serves.
@@ -1147,10 +1200,12 @@ pub mod tests {
     }
 
     #[test]
-    fn semantic_version_accepts_compatible_upgrade() {
-        validate_semantic_bundle_version("1.4.3", "1.4.9").unwrap();
-        validate_semantic_bundle_version("0.9.1", "0.9.7").unwrap();
+    fn semantic_version_requires_exact_release() {
+        validate_semantic_bundle_version("1.4.3", "1.4.3").unwrap();
+        validate_semantic_bundle_version("0.2.120", "0.2.120").unwrap();
         validate_semantic_bundle_version("0.0.5", "0.0.5").unwrap();
+        assert!(validate_semantic_bundle_version("0.2.120", "0.2.130").is_err());
+        assert!(validate_semantic_bundle_version("1.4.3", "1.4.9").is_err());
     }
 
     #[test]

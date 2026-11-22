@@ -4,7 +4,7 @@ description: >
   Install, configure, and drive stow — the signed public prebuilt cache and
   shared CoW local compilation cache for Rust (`cargo` / C / C++). Load whenever
   setting up Rust build acceleration on a user's machine or CI, running `stow`
-  commands (`stow setup`, `stow check|build|test`, `stow predict`, `stow status`,
+  commands (`stow setup`, `stow check|build|test|run|clippy|doc|bench|nextest`, `stow predict`, `stow status`,
   `stow stats`, `stow update`, `stow index`, `stow clean`), diagnosing cache
   misses or `stow-daemon` sandbox errors during `cargo` builds, configuring
   `heel` build-isolation grants, or adding `water-rs/stow@main` to GitHub Actions.
