@@ -3298,8 +3298,8 @@ mod unit_graph_tests {
 
     use super::{
         CARGO_CHANNEL_OVERRIDE, SelectedRegistryDependency, UnitGraph, emit_expanded_graph,
-        parse_pkg_id, path_pkg_root, resolve_exact_dependency_graph, rustc_test,
-        unit_graph_args, unit_graph_channel_env, unit_graph_subcommand, unstable_feature_gate,
+        parse_pkg_id, path_pkg_root, resolve_exact_dependency_graph, rustc_test, unit_graph_args,
+        unit_graph_channel_env, unit_graph_subcommand, unstable_feature_gate,
     };
     use crate::session_env::SessionEnv;
     use stow_types::api::ResolvedDependencyGraphEntry;
@@ -3947,7 +3947,14 @@ mod unit_graph_tests {
         assert_eq!(
             unit_graph_args(
                 "nextest",
-                &args(&["list", "--features=a,b", "--manifest-path", "m.toml", "--", "name"])
+                &args(&[
+                    "list",
+                    "--features=a,b",
+                    "--manifest-path",
+                    "m.toml",
+                    "--",
+                    "name"
+                ])
             ),
             args(&["--features=a,b", "--manifest-path", "m.toml"])
         );

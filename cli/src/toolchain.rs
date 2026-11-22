@@ -494,7 +494,10 @@ mod tests {
         let driver = toolchain
             .rustc()
             .with_file_name(format!("clippy-driver{}", std::env::consts::EXE_SUFFIX));
-        assert!(driver.is_file(), "the test toolchain ships no clippy-driver");
+        assert!(
+            driver.is_file(),
+            "the test toolchain ships no clippy-driver"
+        );
         let cwd = std::env::current_dir().expect("cwd");
         assert!(toolchain.is_workspace_wrapper(driver.as_os_str(), &cwd));
         let rebuilt = super::BuildToolchain::from_facts(
