@@ -1467,17 +1467,17 @@ mod tests {
             }
         }
         assert_eq!(changed, 2);
-        let site = overridden
+        let stats = overridden
             .iter()
-            .find(|lane| lane.name == "site")
-            .expect("site");
+            .find(|lane| lane.name == "stats")
+            .expect("stats");
         let unscaled = build_lanes(&args, &model, 1.0, None).expect("unscaled");
         assert_eq!(
-            site.eps,
+            stats.eps,
             unscaled
                 .iter()
-                .find(|lane| lane.name == "site")
-                .expect("site")
+                .find(|lane| lane.name == "stats")
+                .expect("stats")
                 .eps
                 * scale
         );

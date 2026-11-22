@@ -1056,11 +1056,6 @@ pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
         relative_cpu: 0.35,
     },
     WorkerCpuBudget {
-        // Run 40631853262: 0.027 (0.6 ms of a 22.2 ms reference).
-        lane: "site",
-        relative_cpu: 0.10,
-    },
-    WorkerCpuBudget {
         // Eight Analytics Engine SQL queries per page (stow#896);
         // Workers Cache serves the deployed route for an hour after
         // each. Run 40631853262: 0.149 (3.315 ms of 22.2 ms).
