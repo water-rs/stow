@@ -438,6 +438,7 @@ pub fn validate_bundle_identity(
 pub fn validate_semantic_bundle_identity(
     bundle: &ArtifactBundle,
     request: &SemanticFetchRequest,
+    allow_superset: bool,
 ) -> stow_types::error::Result<()> {
     if bundle.manifest.config.target.as_str() != request.target {
         return Err(stow_types::stow_error!(
@@ -457,7 +458,17 @@ pub fn validate_semantic_bundle_identity(
         &request.version,
         &bundle.manifest.config.crate_version.to_string(),
     )?;
-    if bundle.manifest.config.features_json.raw() != request.features_json {
+    let features_ok = if allow_superset {
+        let requested: Vec<String> = serde_json::from_str(&request.features_json)
+            .wrap_err("parse semantic request features_json")?;
+        stow_types::feature_sets::contains_all(
+            bundle.manifest.config.features_json.features(),
+            &requested,
+        )
+    } else {
+        bundle.manifest.config.features_json.raw() == request.features_json
+    };
+    if !features_ok {
         return Err(stow_types::stow_error!(
             "downloaded semantic bundle features mismatch: expected {}, got {}",
             request.features_json,
@@ -897,9 +908,10 @@ pub mod tests {
             consumer,
             build_script,
         };
-        super::validate_semantic_bundle_identity(&bundle, &request).expect("same inputs serve");
+        super::validate_semantic_bundle_identity(&bundle, &request, false)
+            .expect("same inputs serve");
         request.consumer.cfgs = vec!["custom".to_owned()];
-        assert!(super::validate_semantic_bundle_identity(&bundle, &request).is_err());
+        assert!(super::validate_semantic_bundle_identity(&bundle, &request, false).is_err());
     }
 
     /// One canned answer from the stub edge for any request it serves.

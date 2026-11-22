@@ -429,7 +429,7 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
         c_metadata: unit.c_metadata.parse().expect("c_metadata"),
         extra_filename: format!("-{}", unit.c_metadata),
         target: TargetTriple::parse(&unit.target).expect("target"),
-        rustc_version: wire_rustc,
+        rustc_version: wire_rustc.clone(),
         features_json: wire_string(&unit.features_json),
         dependency_c_metadata_json: wire_string(&unit.dependency_c_metadata_json),
         dependency_identity: DependencyIdentity::leaf().expect("leaf identity"),
@@ -529,7 +529,7 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
         dependency_c_metadata_json: wire_string(&unit.dependency_c_metadata_json),
         dependency_task_ids: Vec::new(),
         c_metadata: unit.c_metadata.parse().expect("c_metadata"),
-        compile_key: unit.compile_key,
+        compile_key: unit.compile_key.clone(),
         bundle_digest: bundle_digest.clone(),
         bundle_size: u64::try_from(bundle_bytes.len()).expect("bundle size"),
         artifact_kind: serde_json::from_str(&unit.kind_json).expect("artifact kind"),
@@ -653,6 +653,347 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
         "setup must leave a verified slice pointer under {}",
         slice_dir.display()
     );
+
+    // First run `stow build` + `stow status` on `dir` (same as `itoa-consumer` in mock-e2e.sh)
+    // so the daemon already holds open `CacheDirHandles` + `StateDb` on `cache`!
+    {
+        let mut first_check = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+        first_check
+            .arg("build")
+            .current_dir(dir.path())
+            .env("CARGO_HOME", cargo_home.path())
+            .env_remove("CARGO_PROFILE_DEV_DEBUG")
+            .env_remove("CARGO_TARGET_DIR");
+        hermetic_stow_env(&mut first_check, &stack.url, cache.path(), &home);
+        let first_out = first_check
+            .env("STOW_VERIFY_MODE", "mock-key")
+            .env("STOW_MOCK_PUBLIC_KEY_PATH", &public_key_path)
+            .output()
+            .expect("first stow build");
+        assert!(
+            String::from_utf8_lossy(&first_out.stdout).contains("served 1 of 1"),
+            "first stow build failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&first_out.stdout),
+            String::from_utf8_lossy(&first_out.stderr),
+        );
+
+        let mut status_cmd = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+        status_cmd
+            .arg("status")
+            .current_dir(dir.path())
+            .env("CARGO_HOME", cargo_home.path());
+        hermetic_stow_env(&mut status_cmd, &stack.url, cache.path(), &home);
+        assert!(
+            status_cmd
+                .env("STOW_VERIFY_MODE", "mock-key")
+                .env("STOW_MOCK_PUBLIC_KEY_PATH", &public_key_path)
+                .output()
+                .expect("stow status")
+                .status
+                .success()
+        );
+    }
+
+    // Also verify stow#881 superset serve through `stow check` on `once_cell`:
+    // publish `once_cell 1.21.4` built with `["default"]` (`["alloc","default","race","std"]`),
+    // then run `stow check` on a `--lib` consumer requesting `default-features = false, features = ["alloc"]`.
+    {
+        let oc_fill_dir = support::tempdir().expect("once_cell fill dir");
+        std::fs::write(
+            oc_fill_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"oc-fill\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"src/lib.rs\"\n[dependencies]\nonce_cell = \"=1.21.4\"\n",
+        )
+        .expect("oc fill manifest");
+        std::fs::create_dir_all(oc_fill_dir.path().join("src")).expect("oc fill src");
+        std::fs::write(oc_fill_dir.path().join("src/lib.rs"), "pub fn f() {}\n").expect("oc lib");
+        let mut fetch_cmd = support::cargo_command(&home);
+        fetch_cmd
+            .arg("fetch")
+            .current_dir(oc_fill_dir.path())
+            .env("CARGO_HOME", cargo_home.path());
+        assert!(
+            fetch_cmd
+                .output()
+                .expect("cargo fetch once_cell")
+                .status
+                .success()
+        );
+
+        let oc_fill_cache = support::tempdir().expect("oc fill cache");
+        let mut oc_check = support::cargo_command(&home);
+        hermetic_stow_env(
+            &mut oc_check,
+            &denied_registry(),
+            oc_fill_cache.path(),
+            &home,
+        );
+        let oc_fill = support::output_after_session(
+            oc_check
+                .arg("check")
+                .current_dir(oc_fill_dir.path())
+                .env("CARGO_HOME", cargo_home.path())
+                .env("RUSTC_WRAPPER", &shim)
+                .env("CARGO_TARGET_DIR", oc_fill_dir.path().join("target"))
+                .env("CARGO_BUILD_BUILD_DIR", oc_fill_dir.path().join("target"))
+                .env("CARGO_NET_OFFLINE", "true")
+                .env("CARGO_INCREMENTAL", "0"),
+            &home,
+        );
+        assert!(
+            oc_fill.status.success(),
+            "oc fill failed: {}",
+            String::from_utf8_lossy(&oc_fill.stderr)
+        );
+        let oc_unit = stored_unit(oc_fill_cache.path(), "once_cell");
+        let oc_entry = entry_dir(oc_fill_cache.path(), &oc_unit.relative_dir);
+        let oc_outputs = stored_outputs(oc_fill_cache.path(), &oc_unit);
+        let oc_raw: Vec<Vec<u8>> = oc_outputs
+            .iter()
+            .map(|f| std::fs::read(oc_entry.join("files").join(&f.file_name)).expect("read oc out"))
+            .collect();
+        let oc_named: Vec<(&str, &[u8])> = oc_outputs
+            .iter()
+            .zip(&oc_raw)
+            .map(|(f, b)| (f.file_name.as_str(), b.as_slice()))
+            .collect();
+        let oc_pack = stow_shim::pack(&oc_named).expect("pack oc");
+        let superset_config = ArtifactBlobConfig {
+            compile_key: oc_unit.compile_key.clone(),
+            crate_name: oc_unit.crate_name.parse().expect("crate name"),
+            crate_version: oc_unit.crate_version.parse().expect("crate version"),
+            c_metadata: oc_unit.c_metadata.parse().expect("c_metadata"),
+            extra_filename: format!("-{}", oc_unit.c_metadata),
+            target: TargetTriple::parse(&oc_unit.target).expect("target"),
+            rustc_version: wire_rustc.clone(),
+            features_json: wire_string(&oc_unit.features_json),
+            dependency_c_metadata_json: wire_string(&oc_unit.dependency_c_metadata_json),
+            dependency_identity: DependencyIdentity::leaf().expect("leaf identity"),
+            dependency_compile_keys_json: oc_unit.dependency_compile_keys_json.clone(),
+            profile: serde_json::from_str(&oc_unit.profile_json).expect("profile"),
+            emit: serde_json::from_str(&oc_unit.emit_json).expect("emit"),
+            artifact_size: 0,
+            compile_millis: 0,
+            kind: serde_json::from_str(&oc_unit.kind_json).expect("artifact kind"),
+            crate_types: serde_json::from_str(&oc_unit.crate_types_json).expect("crate types"),
+            outputs: oc_outputs,
+            native: None,
+            native_archive: None,
+        };
+        let superset_config_bytes =
+            serde_json::to_vec(&superset_config).expect("superset config bytes");
+        let superset_manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": STOW_ARTIFACT_CONFIG_MEDIA_TYPE,
+                "digest": sha256_digest(&superset_config_bytes),
+                "size": superset_config_bytes.len(),
+            },
+            "layers": [{
+                "mediaType": STOW_PACK_MEDIA_TYPE,
+                "digest": sha256_digest(&oc_pack),
+                "size": oc_pack.len(),
+            }],
+        }))
+        .expect("superset oci manifest");
+        let superset_oci_digest = sha256_digest(&superset_manifest_bytes);
+        let superset_sig = sign(&oci_reference, &superset_oci_digest);
+        let superset_sigs = [superset_sig];
+        let superset_bundle_bytes = assemble_bundle(&BundleParts {
+            oci_reference: &oci_reference,
+            oci_digest: &superset_oci_digest,
+            manifest_bytes: &superset_manifest_bytes,
+            config_bytes: &superset_config_bytes,
+            config: &superset_config,
+            signatures: &superset_sigs,
+            pack: &oc_pack,
+        })
+        .expect("assemble superset bundle");
+        let superset_bundle_digest = sha256_digest(&superset_bundle_bytes);
+        let superset_row = ArtifactIndexRow {
+            crate_name: oc_unit.crate_name.parse().expect("crate name"),
+            version: oc_unit.crate_version.parse().expect("crate version"),
+            features_json: wire_string(&oc_unit.features_json),
+            dependency_c_metadata_json: wire_string(&oc_unit.dependency_c_metadata_json),
+            dependency_task_ids: Vec::new(),
+            c_metadata: oc_unit.c_metadata.parse().expect("c_metadata"),
+            compile_key: oc_unit.compile_key.clone(),
+            bundle_digest: superset_bundle_digest.clone(),
+            bundle_size: u64::try_from(superset_bundle_bytes.len()).expect("bundle size"),
+            artifact_kind: serde_json::from_str(&oc_unit.kind_json).expect("artifact kind"),
+            crate_types: serde_json::from_str(&oc_unit.crate_types_json).expect("crate types"),
+            node_profile: stow_types::node_profile::NodeProfile::Dev,
+            profile: serde_json::from_str(&oc_unit.profile_json).expect("profile"),
+            emit: serde_json::from_str(&oc_unit.emit_json).expect("emit"),
+            unit_shape: UnitShape {
+                side: UnitSide::Target,
+                invocation: UnitInvocation::Native,
+                kind: UnitKind::Linked,
+            },
+            min_glibc: None,
+        };
+        let superset_index = ArtifactIndex {
+            header: ArtifactIndexHeader {
+                format_version: ARTIFACT_INDEX_FORMAT_VERSION,
+                target: TargetTriple::parse(&oc_unit.target).expect("target"),
+                rustc_version: WireRustcVersion::parse(&oc_unit.rustc_version)
+                    .expect("rustc version"),
+                generated_at: "2026-10-28T00:00:00Z".to_owned(),
+                generation: 2,
+                row_count: 1,
+            },
+            rows: vec![superset_row],
+            build_scripts: Vec::new(),
+            local_programs: Vec::new(),
+        };
+        let s_blob = stow_shim::encode_index(&superset_index).expect("encode superset index");
+        let s_blob_digest = sha256_digest(&s_blob);
+        let empty = b"{}".to_vec();
+        let empty_digest = sha256_digest(&empty);
+        let s_manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": STOW_INDEX_CONFIG_MEDIA_TYPE,
+                "digest": empty_digest,
+                "size": empty.len(),
+            },
+            "layers": [{
+                "mediaType": STOW_INDEX_MEDIA_TYPE,
+                "digest": s_blob_digest,
+                "size": s_blob.len(),
+            }],
+        }))
+        .expect("s manifest");
+        let s_manifest_digest = sha256_digest(&s_manifest);
+        let s_tag = index_tag(&oc_unit.target, &oc_unit.rustc_version);
+        let s_ref = repository.reference(&s_tag);
+        let s_mat = sign(&s_ref, &s_manifest_digest);
+        let s_payload_digest = sha256_digest(&s_mat.payload_bytes);
+        let s_sig_manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": OCI_CONFIG_MEDIA_TYPE,
+                "digest": empty_digest,
+                "size": empty.len(),
+            },
+            "layers": [{
+                "mediaType": SIGSTORE_OCI_MEDIA_TYPE,
+                "digest": s_payload_digest,
+                "size": s_mat.payload_bytes.len(),
+                "annotations": {
+                    SIGSTORE_CERT_ANNOTATION: MOCK_CERTIFICATE,
+                    SIGSTORE_SIGNATURE_ANNOTATION: s_mat.signature,
+                },
+            }],
+        }))
+        .expect("s sig manifest");
+        let s_stack = MockStack::serve(
+            BTreeMap::from([
+                (s_tag, s_manifest),
+                (sigstore_signature_tag(&s_manifest_digest), s_sig_manifest),
+            ]),
+            BTreeMap::from([
+                (empty_digest, empty),
+                (s_blob_digest, s_blob),
+                (s_payload_digest, s_mat.payload_bytes),
+                (superset_bundle_digest, superset_bundle_bytes),
+            ]),
+        );
+
+        let mut s_refresh = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+        s_refresh
+            .args(["index", "refresh"])
+            .current_dir(dir.path())
+            .env("CARGO_HOME", cargo_home.path());
+        hermetic_stow_env(&mut s_refresh, &s_stack.url, cache.path(), &home);
+        let s_refresh_out = s_refresh
+            .env("STOW_VERIFY_MODE", "mock-key")
+            .env("STOW_MOCK_PUBLIC_KEY_PATH", &public_key_path)
+            .output()
+            .expect("superset index refresh");
+        assert!(s_refresh_out.status.success());
+
+        let subset_dir = support::tempdir().expect("subset consumer");
+        std::fs::write(
+            subset_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"once_cell-subset-consumer\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nonce_cell = { version = \"=1.21.4\", default-features = false, features = [\"alloc\"] }\n",
+        )
+        .expect("subset manifest");
+        std::fs::create_dir_all(subset_dir.path().join("src")).expect("subset src");
+        std::fs::write(
+            subset_dir.path().join("src/lib.rs"),
+            "pub fn add(a: u64, b: u64) -> u64 { a + b }\n",
+        )
+        .expect("subset lib");
+
+        let mut sub_fetch = support::cargo_command(&home);
+        sub_fetch
+            .arg("fetch")
+            .current_dir(subset_dir.path())
+            .env("CARGO_HOME", cargo_home.path());
+        assert!(
+            sub_fetch
+                .output()
+                .expect("subset cargo fetch")
+                .status
+                .success()
+        );
+
+        let mut sub_setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+        sub_setup
+            .arg("setup")
+            .current_dir(subset_dir.path())
+            .env("CARGO_HOME", cargo_home.path());
+        hermetic_stow_env(&mut sub_setup, &s_stack.url, cache.path(), &home);
+        assert!(
+            sub_setup
+                .env("STOW_VERIFY_MODE", "mock-key")
+                .env("STOW_MOCK_PUBLIC_KEY_PATH", &public_key_path)
+                .output()
+                .expect("subset stow setup")
+                .status
+                .success()
+        );
+
+        let mut s_check = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+        s_check
+            .arg("check")
+            .current_dir(subset_dir.path())
+            .env("CARGO_HOME", cargo_home.path())
+            .env_remove("CARGO_PROFILE_DEV_DEBUG")
+            .env_remove("CARGO_TARGET_DIR");
+        hermetic_stow_env(&mut s_check, &s_stack.url, cache.path(), &home);
+        let s_check_out = s_check
+            .env("STOW_VERIFY_MODE", "mock-key")
+            .env("STOW_MOCK_PUBLIC_KEY_PATH", &public_key_path)
+            .output()
+            .expect("superset check");
+        assert!(
+            String::from_utf8_lossy(&s_check_out.stdout).contains("served 1 of 1"),
+            "once_cell subset check failed to serve:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&s_check_out.stdout),
+            String::from_utf8_lossy(&s_check_out.stderr),
+        );
+
+        // Restore original slice on `cache` for the remaining assertions below.
+        let mut restore_refresh = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+        restore_refresh
+            .args(["index", "refresh"])
+            .current_dir(dir.path())
+            .env("CARGO_HOME", cargo_home.path());
+        hermetic_stow_env(&mut restore_refresh, &stack.url, cache.path(), &home);
+        assert!(
+            restore_refresh
+                .env("STOW_VERIFY_MODE", "mock-key")
+                .env("STOW_MOCK_PUBLIC_KEY_PATH", &public_key_path)
+                .output()
+                .expect("restore refresh")
+                .status
+                .success()
+        );
+    }
 
     // A fresh cargo build on a fresh target dir, still pointed at the
     // serving cache: `cfg-if` is the slice's row, so it serves remotely
