@@ -12,7 +12,6 @@ use stow_types::bundle::{
     STOW_SIGSTORE_PAYLOAD_DIR, SigstoreSignature,
 };
 use stow_types::error::Context;
-use stow_types::versioning::is_semver_compatible_upgrade;
 use tar::Archive;
 use zenwave::Client as _;
 
@@ -555,11 +554,11 @@ fn validate_semantic_bundle_version(
         .wrap_err_with(|| format!("parse requested semantic version {requested_version}"))?;
     let actual = Version::parse(bundle_version)
         .wrap_err_with(|| format!("parse bundle semantic version {bundle_version}"))?;
-    if actual == requested || is_semver_compatible_upgrade(&requested, &actual) {
+    if actual == requested {
         return Ok(());
     }
     Err(stow_types::stow_error!(
-        "downloaded semantic bundle version mismatch: expected {} or semver-compatible upgrade, got {}",
+        "downloaded semantic bundle version mismatch: expected {}, got {}",
         requested_version,
         bundle_version
     ))
@@ -1147,10 +1146,12 @@ pub mod tests {
     }
 
     #[test]
-    fn semantic_version_accepts_compatible_upgrade() {
-        validate_semantic_bundle_version("1.4.3", "1.4.9").unwrap();
-        validate_semantic_bundle_version("0.9.1", "0.9.7").unwrap();
+    fn semantic_version_requires_exact_release() {
+        validate_semantic_bundle_version("1.4.3", "1.4.3").unwrap();
+        validate_semantic_bundle_version("0.2.120", "0.2.120").unwrap();
         validate_semantic_bundle_version("0.0.5", "0.0.5").unwrap();
+        assert!(validate_semantic_bundle_version("0.2.120", "0.2.130").is_err());
+        assert!(validate_semantic_bundle_version("1.4.3", "1.4.9").is_err());
     }
 
     #[test]
