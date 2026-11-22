@@ -402,8 +402,17 @@ async fn run_cli(
         CliCommand::Test(command) => {
             return Box::pin(cargo_cmd::run("test", command, state_db)).await;
         }
+        CliCommand::Run(command) => {
+            return Box::pin(cargo_cmd::run("run", command, state_db)).await;
+        }
         CliCommand::Clippy(command) => {
             return Box::pin(cargo_cmd::run("clippy", command, state_db)).await;
+        }
+        CliCommand::Bench(command) => {
+            return Box::pin(cargo_cmd::run("bench", command, state_db)).await;
+        }
+        CliCommand::Doc(command) => {
+            return Box::pin(cargo_cmd::run("doc", command, state_db)).await;
         }
         CliCommand::Nextest(command) => {
             return Box::pin(cargo_cmd::run("nextest", command, state_db)).await;
@@ -434,7 +443,10 @@ const fn subcommand_name(command: &CliCommand) -> &'static str {
         CliCommand::Check(_) => "check",
         CliCommand::Build(_) => "build",
         CliCommand::Test(_) => "test",
+        CliCommand::Run(_) => "run",
         CliCommand::Clippy(_) => "clippy",
+        CliCommand::Bench(_) => "bench",
+        CliCommand::Doc(_) => "doc",
         CliCommand::Nextest(_) => "nextest",
         CliCommand::Predict(_) => "predict",
         CliCommand::Setup(_) => "setup",

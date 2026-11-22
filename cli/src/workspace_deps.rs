@@ -486,15 +486,17 @@ pub fn expanded_dependency_graph(
     })
 }
 
-/// The cargo subcommand whose unit graph each wrapped action compiles;
-/// `predict` answers what `check` compiles, `clippy` lints it, and
-/// `nextest` builds the units `test` compiles (stow#1456). Only the
-/// actions stow wraps reach this mapping.
+/// The cargo subcommand whose unit graph each wrapped action compiles:
+/// `predict` answers what `check` compiles, `clippy` lints it, `run`
+/// builds, `nextest` builds the units `test` compiles (stow#1456).
+/// Only the actions stow wraps reach this mapping.
 fn unit_graph_subcommand(action: &str) -> stow_types::error::Result<&'static str> {
     Ok(match action {
         "check" | "predict" | "clippy" => "check",
-        "build" => "build",
+        "build" | "run" => "build",
         "test" | "nextest" => "test",
+        "bench" => "bench",
+        "doc" => "doc",
         other => {
             return Err(stow_types::stow_error!(
                 "stow action `{other}` has no cargo unit-graph subcommand"
@@ -515,6 +517,16 @@ pub(crate) fn unit_graph_args(action: &str, cargo_args: &[OsString]) -> Vec<OsSt
     match action {
         "clippy" => clippy_unit_graph_args(cargo_args),
         "nextest" => nextest_unit_graph_args(cargo_args),
+        // A `--` tail is program argv (`run`) or libtest filters
+        // (`bench`), never cargo's; a positional is `bench`'s optional
+        // filter. Neither shapes the graph, so both stay out of the
+        // re-run — `run`/`doc` spell no positionals at all.
+        "run" | "doc" | "bench" => cargo_args
+            .iter()
+            .take_while(|arg| arg.as_encoded_bytes() != b"--")
+            .filter(|arg| action != "bench" || arg.as_encoded_bytes().starts_with(b"-"))
+            .cloned()
+            .collect(),
         _ => cargo_args.to_vec(),
     }
 }
@@ -3849,12 +3861,35 @@ mod unit_graph_tests {
         assert_eq!(unit_graph_subcommand("predict").unwrap(), "check");
         assert_eq!(unit_graph_subcommand("clippy").unwrap(), "check");
         assert_eq!(unit_graph_subcommand("nextest").unwrap(), "test");
+        assert_eq!(unit_graph_subcommand("run").unwrap(), "build");
+        assert_eq!(unit_graph_subcommand("bench").unwrap(), "bench");
+        assert_eq!(unit_graph_subcommand("doc").unwrap(), "doc");
         // Only the actions stow wraps reach the query — every other
         // action names itself rather than guessing a graph cargo would
         // not build (stow#551).
-        for action in ["run", "bench", "doc", "rustc", "publish"] {
+        for action in ["rustc", "publish", "fetch", "vendor"] {
             assert!(unit_graph_subcommand(action).is_err(), "{action}");
         }
+    }
+
+    /// `run`/`doc`/`bench` forward their cargo arguments, but what
+    /// follows `--` — program argv, libtest filters — and `bench`'s
+    /// positional name filter never reach `cargo` (stow#1456).
+    #[test]
+    fn program_args_stay_out_of_the_unit_graph_args() {
+        let args = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            unit_graph_args("run", &args(&["--bin", "app", "--", "--port", "3000"])),
+            args(&["--bin", "app"])
+        );
+        assert_eq!(
+            unit_graph_args("bench", &args(&["my_filter", "--workspace", "--", "x"])),
+            args(&["--workspace"])
+        );
+        assert_eq!(
+            unit_graph_args("doc", &args(&["--no-deps", "--open"])),
+            args(&["--no-deps", "--open"])
+        );
     }
 
     /// `cargo clippy` keeps its own options and everything after `--` to
