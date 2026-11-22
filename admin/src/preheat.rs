@@ -215,6 +215,7 @@ async fn submit_plan(
     edge: Option<&Edge>,
     crates_io: &crates_io::CratesIo,
     mut trees: Vec<stow_types::api::SubmissionTree>,
+    non_additive: &crate::projects::NonAdditiveFeatures,
     output: Output,
 ) -> stow_types::error::Result<()> {
     // Contained feature sets are served from their smallest containing
@@ -222,7 +223,7 @@ async fn submit_plan(
     // whole batch before the plan renders and before anything submits —
     // the plan-only output is the production wave count's input, so it
     // must carry the substituted task ids.
-    let published = crate::manual::substitute_against_published(&mut trees).await?;
+    let published = crate::manual::substitute_against_published(&mut trees, non_additive).await?;
     // The fetch phase ended before this call — the count cannot change.
     let api_requests = crates_io.api_requests();
     render::mutation(
@@ -340,8 +341,11 @@ async fn binary(
     })
     .await
     .expect("resolve pool panicked")?;
-    let requests = match resolved.map_err(|error| stow_error!("{error}"))? {
-        BinaryResolve::Tasks { trees } => {
+    let (requests, non_additive) = match resolved.map_err(|error| stow_error!("{error}"))? {
+        BinaryResolve::Tasks {
+            trees,
+            non_additive,
+        } => {
             let node_count: usize = trees.iter().map(|tree| tree.nodes.len()).sum();
             tracing::info!(
                 %crate_name,
@@ -351,7 +355,7 @@ async fn binary(
                 %rustc_version,
                 "planned named-binary preheat tasks"
             );
-            trees
+            (trees, non_additive)
         }
         BinaryResolve::NoBinary => {
             return Err(stow_error!(
@@ -360,7 +364,7 @@ async fn binary(
             ));
         }
     };
-    submit_plan(edge, crates_io, requests, output).await
+    submit_plan(edge, crates_io, requests, &non_additive, output).await
 }
 
 /// The `--targets` option as validated triples — `ci_targets` admits
@@ -383,6 +387,8 @@ enum BinaryResolve {
     Tasks {
         /// The tree the resolve produced (stow#878).
         trees: Vec<stow_types::api::SubmissionTree>,
+        /// Non-additive features detected in resolved crate sources.
+        non_additive: crate::projects::NonAdditiveFeatures,
     },
     /// The crate has no `[[bin]]` — a name source this lane skips.
     NoBinary,
@@ -423,8 +429,10 @@ fn resolve_binary_crate(
     if !source.has_binary {
         return Ok(BinaryResolve::NoBinary);
     }
+    let non_additive = source.non_additive_features.clone();
     Ok(BinaryResolve::Tasks {
         trees: vec![source_tree(source)],
+        non_additive,
     })
 }
 
@@ -611,7 +619,7 @@ fn resolve_binaries(
     };
     for (job, slot) in jobs.iter().zip(slots) {
         match slot.expect("the pool produces one result per job") {
-            Ok(BinaryResolve::Tasks { trees }) => {
+            Ok(BinaryResolve::Tasks { trees, .. }) => {
                 let node_count: usize = trees.iter().map(|tree| tree.nodes.len()).sum();
                 tracing::info!(binary = %job.name, tasks = node_count, "resolved");
                 plan.per_binary.push(BinaryContribution {

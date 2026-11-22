@@ -722,6 +722,7 @@ pub async fn load_semantic_cached_bundle_in_tiers(
                 &requested_version,
                 &request.emit,
                 &requested_features,
+                &request.non_additive_features,
             )? {
                 candidates.push(candidate);
             }
@@ -777,13 +778,18 @@ fn semantic_candidate_honours_consumer(
     candidate: &SemanticCacheCandidate,
     loaded: &CachedArtifactBundle,
 ) -> stow_types::error::Result<bool> {
-    let build_script = match request
+    let build_script = if let Some(own) = request
         .build_script_of_same_build(&candidate.row.crate_version, &candidate.row.features_json)
     {
-        Some(own) => std::borrow::Cow::Borrowed(own),
-        None => std::borrow::Cow::Owned(stow_types::upload_plan::BuildScriptInputs::of(
+        std::borrow::Cow::Borrowed(own)
+    } else {
+        let candidate_build_script = stow_types::upload_plan::BuildScriptInputs::of(
             read_entry_native(&loaded.entry_dir)?.as_ref(),
-        )),
+        );
+        if candidate_build_script != request.build_script {
+            return Ok(false);
+        }
+        std::borrow::Cow::Owned(candidate_build_script)
     };
     request.candidate_honours_consumer(
         &crate::fetch::SemanticCandidate {
@@ -4194,6 +4200,7 @@ fn semantic_candidate_from_row(
     requested_version: &Version,
     requested_emit: &[String],
     requested_features: &[String],
+    non_additive_features: &std::collections::BTreeSet<String>,
 ) -> stow_types::error::Result<Option<SemanticCacheCandidate>> {
     let candidate_version = Version::parse(&row.crate_version)
         .wrap_err_with(|| format!("parse cached semantic crate version {}", row.crate_version))?;
@@ -4211,11 +4218,16 @@ fn semantic_candidate_from_row(
     {
         return Ok(None);
     }
-    // A bundle serves the request when its recorded feature set contains
-    // the requested one — superset serving, never unioned (stow#881).
+    // A bundle serves the request when its recorded feature set additively
+    // contains the requested one — superset serving, never unioned (stow#881,
+    // stow#1668).
     let candidate_features = serde_json::from_str::<Vec<String>>(&row.features_json)
         .wrap_err("parse cached features_json")?;
-    if !stow_types::feature_sets::contains_all(&candidate_features, requested_features) {
+    if !stow_types::feature_sets::contains_additively(
+        &candidate_features,
+        requested_features,
+        non_additive_features,
+    ) {
         return Ok(None);
     }
     Ok(Some(SemanticCacheCandidate {
@@ -5417,6 +5429,7 @@ pub mod tests {
             crate_types: config.crate_types.clone(),
             consumer: stow_types::upload_plan::ConsumerInputs::stock(),
             build_script: stow_types::upload_plan::BuildScriptInputs::default(),
+            non_additive_features: std::collections::BTreeSet::new(),
         };
         (bundle, request)
     }

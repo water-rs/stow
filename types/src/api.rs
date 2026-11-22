@@ -6067,6 +6067,20 @@ impl SubmissionTree {
         trees: &mut [Self],
         published: &[PublishedIndexSlice],
     ) -> crate::error::Result<()> {
+        Self::substitute_contained_sets_with_non_additive(trees, published, &BTreeMap::new())
+    }
+
+    /// [`Self::substitute_contained_sets`] excluding per-package `non_additive`
+    /// features from superset moves (stow#1668).
+    ///
+    /// # Errors
+    /// Same as [`Self::substitute_contained_sets`].
+    #[allow(clippy::too_many_lines)]
+    pub fn substitute_contained_sets_with_non_additive(
+        trees: &mut [Self],
+        published: &[PublishedIndexSlice],
+        non_additive: &BTreeMap<(CrateName, CrateVersion), BTreeSet<String>>,
+    ) -> crate::error::Result<()> {
         // A submitted tree already holding two sets of one group is no
         // resolve's output; moves can only agree with closures that do.
         for tree in trees.iter() {
@@ -6100,9 +6114,18 @@ impl SubmissionTree {
                     .insert(row.features_json.features().to_vec());
             }
         }
+        let empty = BTreeSet::new();
         let mut serving = families
             .iter()
-            .map(|(key, family)| (key.clone(), crate::feature_sets::serving_map(family)))
+            .map(|(key, family)| {
+                let forbidden = non_additive
+                    .get(&(key.0.clone(), key.1.clone()))
+                    .unwrap_or(&empty);
+                (
+                    key.clone(),
+                    crate::feature_sets::serving_map_respecting(family, forbidden),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         // Every pulled row's own minted task id — the join a row's
         // `dependency_task_ids` edges name (stow#919) — is needed here to
@@ -6123,7 +6146,7 @@ impl SubmissionTree {
                     .or_insert((slice_index, row_index));
             }
         }
-        patch_twin_pair_serving(trees, published, &by_task_id, &mut serving);
+        patch_twin_pair_serving(trees, published, &by_task_id, non_additive, &mut serving);
         if serving
             .values()
             .all(|map| map.iter().all(|(set, serve)| set == serve))
@@ -6463,6 +6486,7 @@ fn patch_twin_pair_serving(
     trees: &[SubmissionTree],
     published: &[PublishedNodeSlice],
     by_task_id: &std::collections::HashMap<&str, (usize, usize)>,
+    non_additive: &BTreeMap<(CrateName, CrateVersion), BTreeSet<String>>,
     serving: &mut BTreeMap<SubstitutionGroupKey, BTreeMap<Vec<String>, Vec<String>>>,
 ) {
     type PairKeyAndSet = (TwinPairKey, Vec<String>);
@@ -6590,9 +6614,16 @@ fn patch_twin_pair_serving(
                         .collect()
                 })
         };
+        let empty = BTreeSet::new();
+        let forbidden = non_additive
+            .get(&(key.0.clone(), key.1.clone()))
+            .unwrap_or(&empty);
         let joint = built(true)
             .intersection(&built(false))
-            .filter(|set| **set != features && crate::feature_sets::contains_all(set, &features))
+            .filter(|set| {
+                **set != features
+                    && crate::feature_sets::contains_additively(set, &features, forbidden)
+            })
             .min()
             .cloned()
             .unwrap_or_else(|| features.clone());

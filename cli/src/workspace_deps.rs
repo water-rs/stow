@@ -62,6 +62,46 @@ pub struct ExpandedDependencyGraph {
 }
 
 impl ExpandedDependencyGraph {
+    /// Per-package non-additive features detected from unpacked registry
+    /// package directories referenced by `raw_unit_graph` (stow#1668).
+    #[must_use]
+    pub fn non_additive_features(
+        &self,
+    ) -> BTreeMap<(stow_types::identity::CrateName, semver::Version), BTreeSet<String>> {
+        let mut out = BTreeMap::new();
+        let Ok(graph) = serde_json::from_slice::<UnitGraph<'_>>(&self.raw_unit_graph) else {
+            return out;
+        };
+        let mut seen = BTreeSet::new();
+        for unit in &graph.units {
+            let (name, version, crates_io) = parse_pkg_id(unit.pkg_id);
+            if !crates_io {
+                continue;
+            }
+            let (Ok(crate_name), Ok(semver_ver)) = (
+                stow_types::identity::CrateName::parse(name),
+                semver::Version::parse(version),
+            ) else {
+                continue;
+            };
+            let key = (crate_name, semver_ver);
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let Some(src_path) = unit.target.src_path.as_deref() else {
+                continue;
+            };
+            let Some(pkg_dir) = stow_types::non_additive::enclosing_package_dir(src_path) else {
+                continue;
+            };
+            let found = stow_types::non_additive::non_additive_features_in_package_dir(&pkg_dir);
+            if !found.is_empty() {
+                out.insert(key, found);
+            }
+        }
+        out
+    }
+
     /// The units cargo's unit graph compiled, in the shared task-unit
     /// model — the identity lens `resolved_task_graph` projects (stow#588).
     ///
@@ -854,6 +894,8 @@ impl CargoUnitProfile<'_> {
 struct UnitTarget<'a> {
     #[serde(borrow)]
     kind: Vec<&'a str>,
+    #[serde(default)]
+    src_path: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
