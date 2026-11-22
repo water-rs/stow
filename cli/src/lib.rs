@@ -2462,9 +2462,11 @@ async fn try_remote_serves(
         parsed,
         request,
         ctx,
-        &slice,
-        exact_public_cache_allowed,
-        fetch_pending,
+        SliceLookup {
+            slice: &slice,
+            exact_public_cache_allowed,
+            fetch_pending,
+        },
         tally,
     )
     .await;
@@ -2494,9 +2496,11 @@ async fn try_remote_serves(
                 parsed,
                 request,
                 ctx,
-                &slice,
-                exact_public_cache_allowed,
-                false,
+                SliceLookup {
+                    slice: &slice,
+                    exact_public_cache_allowed,
+                    fetch_pending: false,
+                },
                 tally,
             )
             .await
@@ -2514,6 +2518,12 @@ async fn try_remote_serves(
     }
 }
 
+struct SliceLookup<'a> {
+    slice: &'a SliceIndex,
+    exact_public_cache_allowed: bool,
+    fetch_pending: bool,
+}
+
 /// The two registry serves over one decoded slice: exact first, then
 /// the semantic fallback when it is enabled and the exact path did not
 /// serve or disqualify the cache outright. `fetch_pending` marks the
@@ -2524,9 +2534,7 @@ async fn serves_against_slice(
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     ctx: &BuildContext,
-    slice: &SliceIndex,
-    exact_public_cache_allowed: bool,
-    fetch_pending: bool,
+    lookup: SliceLookup<'_>,
     tally: &mut LookupTally,
 ) -> RemoteServe {
     // A refusal does not end the lookup: the exact row may be unservable
@@ -2534,8 +2542,17 @@ async fn serves_against_slice(
     // way, one refusal anywhere means no build should be enqueued —
     // `Refused` outranks `Miss` in the merge.
     let mut refused = false;
-    if exact_public_cache_allowed {
-        match try_remote_exact_serve(env, parsed, request, slice, fetch_pending, tally).await {
+    if lookup.exact_public_cache_allowed {
+        match try_remote_exact_serve(
+            env,
+            parsed,
+            request,
+            lookup.slice,
+            lookup.fetch_pending,
+            tally,
+        )
+        .await
+        {
             RemoteServe::Miss => {}
             RemoteServe::Refused => refused = true,
             outcome => return outcome,
@@ -2550,7 +2567,7 @@ async fn serves_against_slice(
             parsed,
             semantic_request,
             allowed_supersets,
-            &slice.slice,
+            &lookup.slice.slice,
             tally,
         )
         .await

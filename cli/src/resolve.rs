@@ -2390,7 +2390,7 @@ mod tests {
             target: TARGET.to_owned(),
             rustc_version: RUSTC.to_owned(),
             profile: rows[0].profile.clone(),
-            emit: vec!["dep-info".to_owned(), "link".to_owned()],
+            emit: vec!["link".to_owned()],
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Rlib],
             consumer: stow_types::upload_plan::ConsumerInputs::stock(),

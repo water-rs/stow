@@ -764,7 +764,7 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
             c_metadata: oc_unit.c_metadata.parse().expect("c_metadata"),
             extra_filename: format!("-{}", oc_unit.c_metadata),
             target: TargetTriple::parse(&oc_unit.target).expect("target"),
-            rustc_version: wire_rustc.clone(),
+            rustc_version: wire_rustc,
             features_json: wire_string(&oc_unit.features_json),
             dependency_c_metadata_json: wire_string(&oc_unit.dependency_c_metadata_json),
             dependency_identity: DependencyIdentity::leaf().expect("leaf identity"),
