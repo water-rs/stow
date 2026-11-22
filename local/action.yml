@@ -1,8 +1,9 @@
 name: stow (local cache only)
 description: >-
-  Install the pinned stow-cli release with `[cache] remote = false` and wire
-  the rustc/cc cache wrappers for local-only caching without remote lookups or
-  miss reports. Prefer `water-rs/stow@main` whenever the public cache is allowed.
+  Install the pinned stow-cli release with `[cache] remote = false`, restore
+  and post-save local dependency tiers in GitHub Actions Cache, and wire the
+  rustc/cc cache wrappers without remote lookups or miss reports. Prefer
+  `water-rs/stow@main` whenever the public cache is allowed.
 inputs:
   version:
     description: >-
@@ -10,10 +11,103 @@ inputs:
       `v<version>` release tag (a bare `<version>` also works).
     required: false
     default: latest
+  cache:
+    description: >-
+      Persist `~/.stow/local` (with `$CARGO_HOME/git/{db,checkouts}`) and
+      `~/.stow/local-crates-io` as separate GitHub Actions Cache entries.
+    required: false
+    default: "true"
+  shared-key:
+    description: >-
+      Shared cache namespace across jobs on the same OS and toolchain; defaults
+      to the current job id (`github.job`).
+    required: false
+    default: ""
+  key:
+    description: Additional cache-key salt appended to the job/shared key.
+    required: false
+    default: ""
+  workspaces:
+    description: >-
+      Newline-separated workspace directories scanned for `Cargo.lock` when
+      computing the cache key.
+    required: false
+    default: "."
+  save-if:
+    description: >-
+      Whether to upload updated cache entries in the post step (`true` saves on
+      primary-key miss; `false` restores read-only).
+    required: false
+    default: "true"
+  local-crates-io-max-bytes:
+    description: >-
+      Logical byte ceiling enforced on `~/.stow/local-crates-io` before
+      archiving (default 2 GiB in local-only mode; `0` skips caching
+      `local-crates-io` and evicts it on drain).
+    required: false
+    default: "2147483648"
+outputs:
+  local-cache-hit:
+    description: "`true` when `~/.stow/local` matched its exact primary key."
+    value: ${{ steps.cache-local-rw.outputs.cache-hit || steps.cache-local-ro.outputs.cache-hit || 'false' }}
+  local-crates-io-cache-hit:
+    description: "`true` when `~/.stow/local-crates-io` matched its exact primary key."
+    value: ${{ steps.cache-crates-rw.outputs.cache-hit || steps.cache-crates-ro.outputs.cache-hit || 'false' }}
 runs:
   using: composite
   steps:
+    - name: Compute stow cache keys
+      id: keys
+      if: inputs.cache == 'true'
+      shell: bash
+      env:
+        RUNNER_OS: ${{ runner.os }}
+        RUNNER_ARCH: ${{ runner.arch }}
+        GITHUB_JOB: ${{ github.job }}
+        STOW_SHARED_KEY: ${{ inputs.shared-key }}
+        STOW_EXTRA_KEY: ${{ inputs.key }}
+        STOW_WORKSPACES: ${{ inputs.workspaces }}
+        STOW_ACTION_PATH: ${{ github.action_path }}
+      run: node "${STOW_ACTION_PATH}/../.github/action-scripts/cache-keys.mjs"
+
+    - name: Restore user-local cache
+      id: cache-local-rw
+      if: inputs.cache == 'true' && inputs.save-if == 'true'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.keys.outputs.local-paths }}
+        key: ${{ steps.keys.outputs.local-key }}
+        restore-keys: ${{ steps.keys.outputs.local-restore-keys }}
+
+    - name: Restore user-local cache (read-only)
+      id: cache-local-ro
+      if: inputs.cache == 'true' && inputs.save-if != 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.keys.outputs.local-paths }}
+        key: ${{ steps.keys.outputs.local-key }}
+        restore-keys: ${{ steps.keys.outputs.local-restore-keys }}
+
+    - name: Restore local-crates-io cache
+      id: cache-crates-rw
+      if: inputs.cache == 'true' && inputs.save-if == 'true' && inputs.local-crates-io-max-bytes != '0'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.keys.outputs.local-crates-io-path }}
+        key: ${{ steps.keys.outputs.local-crates-io-key }}
+        restore-keys: ${{ steps.keys.outputs.local-crates-io-restore-keys }}
+
+    - name: Restore local-crates-io cache (read-only)
+      id: cache-crates-ro
+      if: inputs.cache == 'true' && inputs.save-if != 'true' && inputs.local-crates-io-max-bytes != '0'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.keys.outputs.local-crates-io-path }}
+        key: ${{ steps.keys.outputs.local-crates-io-key }}
+        restore-keys: ${{ steps.keys.outputs.local-crates-io-restore-keys }}
+
     - name: Install stow-cli (local cache only)
+      id: install-unix
       if: runner.os != 'Windows'
       shell: bash
       env:
@@ -25,6 +119,7 @@ runs:
       run: bash "${{ github.action_path }}/../.github/action-scripts/install.sh"
 
     - name: Install stow-cli (local cache only)
+      id: install-win
       if: runner.os == 'Windows'
       shell: pwsh
       env:
@@ -34,3 +129,9 @@ runs:
         STOW_VERSION: ${{ inputs.version }}
         STOW_LOCAL_ONLY: "1"
       run: '& "${{ github.action_path }}\..\.github\action-scripts\install.ps1"'
+
+    - name: Register post-job daemon drain
+      uses: water-rs/stow/.github/actions/stow-drain@2e1148a67ee920f8d200b3c83ad527928964bbc4
+      with:
+        stow-bin: ${{ steps.install-unix.outputs.stow-bin || steps.install-win.outputs.stow-bin }}
+        local-crates-io-max-bytes: ${{ inputs.cache == 'true' && inputs.local-crates-io-max-bytes || '' }}

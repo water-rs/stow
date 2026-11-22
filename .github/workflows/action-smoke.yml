@@ -93,14 +93,56 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
-      - if: matrix.mode == 'remote'
+      - name: create deterministic smoke workspace before cache key resolution
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf ../smoke-dep ../smoke-crate
+          mkdir -p ../smoke-dep/src
+          cat > ../smoke-dep/Cargo.toml <<'EOF'
+          [package]
+          name = "smoke-dep"
+          version = "0.1.0"
+          edition = "2024"
+          EOF
+          printf 'pub const ANSWER: u32 = 42;\n' > ../smoke-dep/src/lib.rs
+          (
+            cd ../smoke-dep
+            git init --quiet --initial-branch=main
+            git add --all
+            GIT_AUTHOR_DATE='2026-01-01T00:00:00Z' GIT_COMMITTER_DATE='2026-01-01T00:00:00Z' \
+              git -c user.name=stow-smoke -c user.email=smoke@stow.invalid \
+              commit --quiet --no-gpg-sign -m "initial"
+          )
+          dep_url="$(node -e 'console.log(require("node:url").pathToFileURL(require("node:path").resolve(process.argv[1])).href)' ../smoke-dep)"
+          mkdir -p ../smoke-crate/src ../smoke-crate/tests
+          cat > ../smoke-crate/Cargo.toml <<EOF
+          [package]
+          name = "smoke-crate"
+          version = "0.1.0"
+          edition = "2024"
+
+          [dependencies]
+          smoke-dep = { git = "${dep_url}" }
+          itoa = "1.0.15"
+          EOF
+          printf 'fn main() { assert_eq!(smoke_dep::ANSWER, 42); let mut b = itoa::Buffer::new(); assert_eq!(b.format(42), "42"); }\n' > ../smoke-crate/src/main.rs
+          printf '#[test]\nfn smoke_it() { assert_eq!(smoke_dep::ANSWER, 42); }\n' > ../smoke-crate/tests/smoke_it.rs
+          (cd ../smoke-crate && cargo generate-lockfile)
+      - id: stow-remote
+        if: matrix.mode == 'remote'
         uses: ./
         with:
           version: latest
-      - if: matrix.mode == 'local'
+          shared-key: smoke-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}-${{ matrix.mode }}
+          workspaces: ../smoke-crate
+      - id: stow-local
+        if: matrix.mode == 'local'
         uses: ./local
         with:
           version: latest
+          shared-key: smoke-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}-${{ matrix.mode }}
+          workspaces: ../smoke-crate
       - run: stow --version
       - name: verify local-only mode disables remote requests
         if: matrix.mode == 'local'
@@ -112,18 +154,11 @@ jobs:
             exit 1
           fi
           grep -q "remote cache is off" <<<"$out"
-      - name: cargo check through the wrappers
+      - name: cargo check through the wrappers (cold populate)
         shell: bash
         run: |
           set -euo pipefail
-          # Create the throwaway crate beside the checkout, not inside it:
-          # `cargo new` under the workspace root joins the workspace and
-          # inherits `edition` from a `[workspace.package]` the root does
-          # not define.
-          cargo new ../smoke-crate
           cd ../smoke-crate
-          mkdir -p tests
-          printf '#[test]\nfn smoke_it() {}\n' > tests/smoke_it.rs
           cargo check
           exe="$(cargo test --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "smoke_it") | .executable')"
           [ -f "$exe" ]
@@ -134,4 +169,104 @@ jobs:
               exit 1
               ;;
           esac
+          [ -d "${HOME}/.stow/local" ]
           [ ! -d "${HOME}/.stow/build-dir" ]
+
+  smoke-warm:
+    name: smoke-warm (${{ matrix.os }}, ${{ matrix.mode }})
+    needs: smoke
+    if: always() && needs.smoke.result == 'success'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        mode: [remote, local]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - name: recreate identical smoke workspace on fresh runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf ../smoke-dep ../smoke-crate
+          mkdir -p ../smoke-dep/src
+          cat > ../smoke-dep/Cargo.toml <<'EOF'
+          [package]
+          name = "smoke-dep"
+          version = "0.1.0"
+          edition = "2024"
+          EOF
+          printf 'pub const ANSWER: u32 = 42;\n' > ../smoke-dep/src/lib.rs
+          (
+            cd ../smoke-dep
+            git init --quiet --initial-branch=main
+            git add --all
+            GIT_AUTHOR_DATE='2026-01-01T00:00:00Z' GIT_COMMITTER_DATE='2026-01-01T00:00:00Z' \
+              git -c user.name=stow-smoke -c user.email=smoke@stow.invalid \
+              commit --quiet --no-gpg-sign -m "initial"
+          )
+          dep_url="$(node -e 'console.log(require("node:url").pathToFileURL(require("node:path").resolve(process.argv[1])).href)' ../smoke-dep)"
+          mkdir -p ../smoke-crate/src ../smoke-crate/tests
+          cat > ../smoke-crate/Cargo.toml <<EOF
+          [package]
+          name = "smoke-crate"
+          version = "0.1.0"
+          edition = "2024"
+
+          [dependencies]
+          smoke-dep = { git = "${dep_url}" }
+          itoa = "1.0.15"
+          EOF
+          printf 'fn main() { assert_eq!(smoke_dep::ANSWER, 42); let mut b = itoa::Buffer::new(); assert_eq!(b.format(42), "42"); }\n' > ../smoke-crate/src/main.rs
+          printf '#[test]\nfn smoke_it() { assert_eq!(smoke_dep::ANSWER, 42); }\n' > ../smoke-crate/tests/smoke_it.rs
+          (cd ../smoke-crate && cargo generate-lockfile)
+      - id: stow-remote
+        if: matrix.mode == 'remote'
+        uses: ./
+        with:
+          version: latest
+          shared-key: smoke-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}-${{ matrix.mode }}
+          workspaces: ../smoke-crate
+          save-if: "false"
+      - id: stow-local
+        if: matrix.mode == 'local'
+        uses: ./local
+        with:
+          version: latest
+          shared-key: smoke-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}-${{ matrix.mode }}
+          workspaces: ../smoke-crate
+          save-if: "false"
+      - name: verify warm tier restoration and zero crates-io/index leakage
+        shell: bash
+        env:
+          MODE: ${{ matrix.mode }}
+          HIT_LOCAL: ${{ steps.stow-remote.outputs.local-cache-hit || steps.stow-local.outputs.local-cache-hit }}
+          HIT_CRATES: ${{ steps.stow-remote.outputs.local-crates-io-cache-hit || steps.stow-local.outputs.local-crates-io-cache-hit }}
+        run: |
+          set -euo pipefail
+          if [ "$HIT_LOCAL" != "true" ]; then
+            echo "::error::expected warm local-cache-hit=true, got '$HIT_LOCAL'" >&2
+            exit 1
+          fi
+          [ -d "${HOME}/.stow/local" ]
+          # Public network tiers must never be archived into GitHub Actions Cache.
+          [ ! -d "${HOME}/.stow/crates-io" ]
+          [ ! -d "${HOME}/.stow/index" ]
+          if [ "$MODE" = "local" ]; then
+            if [ "$HIT_CRATES" != "true" ]; then
+              echo "::error::expected warm local-crates-io-cache-hit=true in local mode, got '$HIT_CRATES'" >&2
+              exit 1
+            fi
+            [ -d "${HOME}/.stow/local-crates-io" ]
+          fi
+          cd ../smoke-crate
+          cargo check
+          hits="$(stow stats --json | jq -r '.hits')"
+          if [ "${hits:-0}" -lt 1 ]; then
+            echo "::error::expected restored local cache to serve at least 1 unit, got hits=${hits}" >&2
+            stow stats --json >&2
+            exit 1
+          fi

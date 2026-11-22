@@ -51,6 +51,9 @@ if (-not $binDir) { throw "$archive contains no stow-cli.exe" }
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 Copy-Item -Recurse -Force "$binDir\*" $dest
 Add-Content -Path $env:GITHUB_PATH -Value $dest
+if ($env:GITHUB_OUTPUT) {
+  "stow-bin=$(Join-Path $dest 'stow.exe')" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+}
 
 & (Join-Path $dest 'stow.exe') setup --github-env | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 if ($LASTEXITCODE -ne 0) { throw 'stow setup --github-env failed' }
