@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.11](https://github.com/water-rs/stow/compare/types/v0.21.10...types/v0.21.11) - 2026-11-22
+
+### Added
+
+- *(edge)* serve the site from Cloudflare Pages (stow#1648)
+
+### Fixed
+
+- *(types)* keep paired and private no_std cfg fallbacks additive in non_additive scanner (closes #1673)
+- *(types,cli)* preserve additive build-script cfgs while enforcing link-lib and link-arg equality on supersets
+- *(types,resolver,admin,cli)* exclude non-additive features and mismatched build-script inputs from superset serving (closes #1668)
+- *(cost)* drop the site lane's CPU budget and test references
+
+### Other
+
+- Merge pull request #1649 from water-rs/feat/1648-site-on-pages
+
 ## [0.21.10](https://github.com/water-rs/stow/compare/types/v0.21.9...types/v0.21.10) - 2026-11-21
 
 ### Other
