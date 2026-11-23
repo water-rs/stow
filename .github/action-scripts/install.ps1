@@ -28,6 +28,7 @@ $version = $tag -replace '^v', ''
 
 $target = switch ("$env:RUNNER_OS-$env:RUNNER_ARCH") {
   'Windows-X64' { 'x86_64-pc-windows-msvc' }
+  'Windows-ARM64' { 'aarch64-pc-windows-msvc' }
   default { throw "no stow-cli release target for $env:RUNNER_OS-$env:RUNNER_ARCH" }
 }
 
