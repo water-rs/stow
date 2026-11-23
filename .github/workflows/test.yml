@@ -46,34 +46,25 @@ jobs:
   # requires only the gate, which passes over skipped legs, so a pull request
   # enters the queue at once instead of testing the same change a first time
   # on its own merge ref and then again in the queue.
-  changes:
+  scope:
     if: github.event_name != 'pull_request'
-    name: Changed paths
+    name: Affected scope
     runs-on: ubuntu-latest
     outputs:
-      code: ${{ steps.filter.outputs.code == 'true' && steps.bump.outputs.only != 'true' }}
+      packages: ${{ steps.compute.outputs.packages }}
+      package-args: ${{ steps.compute.outputs.package-args }}
+      doc-package-args: ${{ steps.compute.outputs.doc-package-args }}
+      workspace: ${{ steps.compute.outputs.workspace }}
+      has-scope: ${{ steps.compute.outputs.has-scope }}
+      wasm-edge: ${{ steps.compute.outputs.wasm-edge }}
+      edge-idle: ${{ steps.compute.outputs.edge-idle }}
     steps:
-      # The filter diffs against the previous tip (or the merge group's base)
-      # with git, so it needs the repository checked out.
+      # The determinator and version-only diff both read git history against the
+      # merge-group base, so the checkout needs full history.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
-        id: filter
-        with:
-          # `every` is required: with the default quantifier a negated rule
-          # never excludes anything, because the rules are OR-ed and `**`
-          # already matched. With `every`, a file counts as code only when it
-          # matches every rule, so `code` is true exactly when some changed
-          # file is not documentation.
-          predicate-quantifier: every
-          filters: |
-            code:
-              - '**'
-              - '!**/*.md'
-              - '!LICENSE*'
-              - '!.gitignore'
       # A release-plz bump changes workspace versions and changelogs and
       # nothing else, so it cannot change what a compiler or a test observes
       # beyond the version string. The script reads the diff rather than the
@@ -86,10 +77,41 @@ jobs:
         run: |
           only=$(python3 -I scripts/version-only.py "$BASE" "$GITHUB_SHA")
           echo "only=$only" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        if: steps.bump.outputs.only != 'true'
+        with:
+          toolchain: stable
+      - name: Select affected packages
+        id: affected
+        if: steps.bump.outputs.only != 'true'
+        uses: lexoliu/affected-crates@1a475cb34d6a6f29fb98d65fd4f88471e8749d31 # v0.0.1
+        with:
+          version: v0.0.1
+          base: ${{ github.event.merge_group.base_sha }}
+          rules: .github/affected-rules.toml
+          locked: "true"
+      - name: Compute scope outputs
+        id: compute
+        env:
+          REPORT_JSON: ${{ steps.affected.outputs.report }}
+          BASE: ${{ github.event.merge_group.base_sha }}
+          VERSION_ONLY: ${{ steps.bump.outputs.only || 'false' }}
+        run: |
+          report_file="$RUNNER_TEMP/affected-report.json"
+          if [ "$VERSION_ONLY" = "true" ]; then
+            : > "$report_file"
+          else
+            printf '%s\n' "$REPORT_JSON" > "$report_file"
+          fi
+          python3 .github/scripts/affected-scope.py \
+            --report-file "$report_file" \
+            --base "$BASE" \
+            --head HEAD \
+            --version-only "$VERSION_ONLY"
 
   test:
-    needs: changes
-    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true'
+    needs: scope
+    if: github.event_name == 'workflow_dispatch' || needs.scope.outputs.has-scope == 'true'
     name: Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -115,12 +137,13 @@ jobs:
           # a per-PR copy of every job's cache duplicated the whole set
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo nextest run ${{ env.NO_DEBUGINFO }} --workspace --no-fail-fast
-      - run: cargo test ${{ env.NO_DEBUGINFO }} --doc --workspace
+      - run: cargo nextest run ${{ env.NO_DEBUGINFO }} ${{ (github.event_name == 'workflow_dispatch' || needs.scope.outputs.workspace == 'true') && '--workspace' || needs.scope.outputs.package-args }} --no-fail-fast
+      - if: github.event_name == 'workflow_dispatch' || needs.scope.outputs.workspace == 'true' || needs.scope.outputs.doc-package-args != ''
+        run: cargo test ${{ env.NO_DEBUGINFO }} --doc ${{ (github.event_name == 'workflow_dispatch' || needs.scope.outputs.workspace == 'true') && '--workspace' || needs.scope.outputs.doc-package-args }}
 
   lint:
-    needs: changes
-    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true'
+    needs: scope
+    if: github.event_name == 'workflow_dispatch' || needs.scope.outputs.has-scope == 'true'
     name: Lint
     runs-on: ubuntu-latest
     permissions:
@@ -131,7 +154,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
-          targets: wasm32-unknown-unknown
+          targets: ${{ (github.event_name == 'workflow_dispatch' || needs.scope.outputs.wasm-edge == 'true') && 'wasm32-unknown-unknown' || '' }}
       # Host build scripts compile for x86_64-unknown-linux-gnu, so they
       # link with mold too.
       - uses: ./.github/actions/link-with-mold
@@ -143,16 +166,17 @@ jobs:
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
-      - run: cargo clippy ${{ env.NO_DEBUGINFO }} --workspace --all-targets -- -D warnings
-      - run: cargo clippy ${{ env.NO_DEBUGINFO }} -p stow-edge --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy ${{ env.NO_DEBUGINFO }} ${{ (github.event_name == 'workflow_dispatch' || needs.scope.outputs.workspace == 'true') && '--workspace' || needs.scope.outputs.package-args }} --all-targets -- -D warnings
+      - if: github.event_name == 'workflow_dispatch' || needs.scope.outputs.wasm-edge == 'true'
+        run: cargo clippy ${{ env.NO_DEBUGINFO }} -p stow-edge --target wasm32-unknown-unknown -- -D warnings
 
   # The scheduler idle proof (stow#593): the real workerd build under
   # @cloudflare/vitest-plugin, proving an empty scheduler deletes its
   # alarm instead of re-arming. It lives here rather than release-gate
   # because a regression must block a merge, not a release.
   edge-idle:
-    needs: changes
-    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true'
+    needs: scope
+    if: github.event_name == 'workflow_dispatch' || needs.scope.outputs.edge-idle == 'true'
     name: Edge idle suite
     runs-on: ubuntu-latest
     # The profile release-gate builds the mock-e2e cache under, which
@@ -189,7 +213,7 @@ jobs:
   # contract above reported success, which is what the ruleset sees too.
   gate:
     needs:
-      - changes
+      - scope
       - test
       - lint
       - edge-idle
