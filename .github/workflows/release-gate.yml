@@ -83,19 +83,76 @@ jobs:
           gh workflow run release-gate.yml --ref main -f nightly=true
           gh workflow run test.yml --ref main
 
-  # Every other job needs `tools`, so a skipped `tools` (the trampoline run)
-  # skips the legs; on any other run they run unconditionally: a
-  # certification has no "changed paths" to scope to, and the nightly exists
-  # to catch a drift no change drove.
-  tools:
+  # Computes what changed since the last published `v*` tag (or widens to
+  # the full workspace on nightly / when no prior tag exists) so a release
+  # that touches only the CLI or packaging does not re-run 45-minute edge cost
+  # gates.
+  scope:
     if: github.ref_type != 'tag'
+    name: Affected scope
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    outputs:
+      has-tools: ${{ steps.compute.outputs.has-tools }}
+      tools-variants: ${{ steps.compute.outputs.tools-variants }}
+      mock-e2e: ${{ steps.compute.outputs.release-mock-e2e }}
+      traffic-cost: ${{ steps.compute.outputs.release-traffic-cost }}
+      preheat-cost: ${{ steps.compute.outputs.release-preheat-cost }}
+      release-flow: ${{ steps.compute.outputs.release-flow }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve comparison base
+        id: base
+        env:
+          NIGHTLY: ${{ inputs.nightly }}
+        run: |
+          if [ "$NIGHTLY" = "true" ]; then
+            rev=""
+          else
+            rev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD^ 2>/dev/null || true)
+          fi
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - name: Select affected packages
+        id: affected
+        uses: lexoliu/affected-crates@1a475cb34d6a6f29fb98d65fd4f88471e8749d31 # v0.0.1
+        with:
+          version: v0.0.1
+          base: ${{ steps.base.outputs.rev }}
+          rules: .github/affected-rules.toml
+          locked: "true"
+      - name: Compute release-gate scope
+        id: compute
+        env:
+          REPORT_JSON: ${{ steps.affected.outputs.report }}
+          BASE: ${{ steps.base.outputs.rev }}
+        run: |
+          report_file="$RUNNER_TEMP/affected-report.json"
+          printf '%s\n' "$REPORT_JSON" > "$report_file"
+          python3 .github/scripts/affected-scope.py \
+            --report-file "$report_file" \
+            --base "$BASE" \
+            --head HEAD
+
+  # Every other job needs `scope` (and `tools` when it builds binaries); on the
+  # nightly run (`nightly=true`), `scope` leaves `base` empty so every leg runs
+  # unconditionally to catch drift no change drove.
+  tools:
+    needs: scope
+    if: github.ref_type != 'tag' && needs.scope.outputs.has-tools == 'true'
     name: Gate tools (${{ matrix.variant }})
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        variant: [production, preheat, mock]
+        variant: ${{ fromJson(needs.scope.outputs.tools-variants) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -128,7 +185,8 @@ jobs:
           if-no-files-found: error
 
   mock-e2e:
-    needs: tools
+    needs: [scope, tools]
+    if: needs.scope.outputs.mock-e2e == 'true'
     name: Mock end-to-end
     runs-on: ubuntu-26.04
     permissions:
@@ -195,7 +253,8 @@ jobs:
   # signal or 5xx under the drive. Its reports are what the `Monthly
   # projection` job prices the month from.
   traffic-cost:
-    needs: tools
+    needs: [scope, tools]
+    if: needs.scope.outputs.traffic-cost == 'true'
     name: Traffic cost
     runs-on: ubuntu-26.04
     timeout-minutes: 110
@@ -258,7 +317,8 @@ jobs:
   # production lanes outran this job's timeout beside the wave's builds,
   # so the `Production wave` job counts it.
   preheat-cost:
-    needs: tools
+    needs: [scope, tools]
+    if: needs.scope.outputs.preheat-cost == 'true'
     name: Preheat cost
     runs-on: ubuntu-26.04
     # The full wave keeps the runner's four cores busy for 40 to 45
@@ -321,7 +381,8 @@ jobs:
   # to release-plz, to a script or to the mock that breaks the flow fails
   # the certification rather than the release it would have gated.
   release-flow:
-    needs: tools
+    needs: [scope, tools]
+    if: needs.scope.outputs.release-flow == 'true'
     name: Release flow
     runs-on: ubuntu-26.04
     timeout-minutes: 15
@@ -354,6 +415,7 @@ jobs:
   # `release-pr` and the nightly report read it.
   gate:
     needs:
+      - scope
       - tools
       - mock-e2e
       - release-flow

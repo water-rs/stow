@@ -1,0 +1,77 @@
+# Determinator rules for stow's CI and release-gate scope,
+# read by lexoliu/affected-crates.
+#
+# First matching rule wins (`post-rule = "skip"` is the default). A path inside
+# a workspace package's directory is owned by that package via ancestor
+# matching; an unmatched path outside every package widens the scope to the
+# entire workspace rather than silently narrowing it.
+
+# Toolchain, cargo, lint/test runner settings, and the scope machinery itself
+# affect every crate in the workspace.
+[[path-rule]]
+globs = [
+    "rust-toolchain.toml",
+    ".cargo/**",
+    "clippy.toml",
+    "Clippy.toml",
+    "rustfmt.toml",
+    ".rustfmt.toml",
+    "deny.toml",
+    ".config/**",
+    "release-plz.toml",
+    ".github/affected-rules.toml",
+    ".github/workflows/test.yml",
+    ".github/scripts/**",
+    ".github/actions/link-with-mold/**",
+    "scripts/version-only.py",
+]
+mark-changed = "all"
+
+# The Skyzen CLI installer action drives edge-idle in test.yml and the edge
+# lanes in release-gate.yml without touching any other crate.
+[[path-rule]]
+globs = [".github/actions/install-skyzen-cli/**"]
+mark-changed = ["stow-edge"]
+
+# Files read at compile or test time by stow-admin alone (`workflow_entrypoints`,
+# `periodic_schedule`, `workflow_timeouts`, `launch_model`, `admin/build.rs`).
+# stow-admin has no reverse dependencies, so scoping here leaves every other
+# crate untouched.
+[[path-rule]]
+globs = [
+    ".github/workflows/**",
+    "launch-model.toml",
+    "preheat/**",
+    "scripts/deploy-do-workload.sh",
+    "scripts/signing-ld.sh",
+]
+mark-changed = ["stow-admin"]
+
+# Non-package files that cannot change Rust unit compilation or tests in
+# test.yml. Note that `**/README*` is intentionally NOT suppressed so in-crate
+# Markdown stays owned by its crate; release-gate legs inspect `scripts/**`,
+# `dist-workspace.toml`, and `.github/actions/gate-tools/**` directly.
+[[path-rule]]
+globs = [
+    "docs/**",
+    "*.md",
+    "LICENSE*",
+    "CONTRIBUTING*",
+    "CODE_OF_CONDUCT*",
+    "SECURITY*",
+    "PRIVACY*",
+    ".gitignore",
+    ".gitattributes",
+    ".github/ISSUE_TEMPLATE/**",
+    ".github/dependabot.yml",
+    ".github/actionlint.yaml",
+    ".github/action-scripts/**",
+    ".github/actions/build-environment/**",
+    ".github/actions/gate-tools/**",
+    ".github/actions/stow-toolchain/**",
+    "action.yml",
+    "local/**",
+    "dist-workspace.toml",
+    "scripts/**",
+]
+mark-changed = []

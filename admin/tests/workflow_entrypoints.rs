@@ -2436,14 +2436,29 @@ fn release_gate_nightly_is_a_trampoline_into_main() {
         at(&wf, "jobs.nightly-report.if").map(scalar).as_deref(),
         Some("always() && inputs.nightly")
     );
-    // Every leg needs `tools`, which skips on the trampoline's tag run and
-    // is otherwise unconditional, the nightly's included.
+    // Every leg needs `scope` (and `tools` when it builds binaries); on the
+    // nightly run (`nightly=true`), `scope` leaves its comparison base empty
+    // so every leg runs unconditionally regardless of changed paths.
     assert_eq!(
-        at(&wf, "jobs.tools.if").map(scalar).as_deref(),
+        at(&wf, "jobs.scope.if").map(scalar).as_deref(),
         Some("github.ref_type != 'tag'")
     );
-    for job in ["mock-e2e", "traffic-cost", "preheat-cost"] {
-        assert!(at(&wf, &format!("jobs.{job}.if")).is_none(), "{job}");
+    assert_eq!(
+        at(&wf, "jobs.tools.if").map(scalar).as_deref(),
+        Some("github.ref_type != 'tag' && needs.scope.outputs.has-tools == 'true'")
+    );
+    for (job, output) in [
+        ("mock-e2e", "mock-e2e"),
+        ("traffic-cost", "traffic-cost"),
+        ("preheat-cost", "preheat-cost"),
+        ("release-flow", "release-flow"),
+    ] {
+        let expected = format!("needs.scope.outputs.{output} == 'true'");
+        assert_eq!(
+            at(&wf, &format!("jobs.{job}.if")).map(scalar).as_deref(),
+            Some(expected.as_str()),
+            "{job}"
+        );
     }
     // A passed gate opens the release PR from the certified commit.
     assert_eq!(
