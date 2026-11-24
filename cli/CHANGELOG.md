@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.13](https://github.com/water-rs/stow/compare/v0.21.12...v0.21.13) - 2026-11-24
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.21.12](https://github.com/water-rs/stow/compare/v0.21.11...v0.21.12) - 2026-11-23
 
 ### Other

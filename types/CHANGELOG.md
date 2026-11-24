@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.13](https://github.com/water-rs/stow/compare/types/v0.21.12...types/v0.21.13) - 2026-11-24
+
+### Fixed
+
+- *(oci)* strip legacy non-canonical copies in resign and retry Rekor 429
+
 ## [0.21.11](https://github.com/water-rs/stow/compare/types/v0.21.10...types/v0.21.11) - 2026-11-22
 
 ### Added
