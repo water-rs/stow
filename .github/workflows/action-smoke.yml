@@ -253,9 +253,12 @@ jobs:
           fi
           [ -d "${HOME}/.stow/local" ]
           # Public network tiers must never be archived into GitHub Actions Cache.
+          # In remote mode `stow setup` freshly fetches `~/.stow/index`, so only
+          # `crates-io` is guaranteed absent before `cargo check`; local mode
+          # must have neither.
           [ ! -d "${HOME}/.stow/crates-io" ]
-          [ ! -d "${HOME}/.stow/index" ]
           if [ "$MODE" = "local" ]; then
+            [ ! -d "${HOME}/.stow/index" ]
             if [ "$HIT_CRATES" != "true" ]; then
               echo "::error::expected warm local-crates-io-cache-hit=true in local mode, got '$HIT_CRATES'" >&2
               exit 1
