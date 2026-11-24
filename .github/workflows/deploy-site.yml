@@ -24,6 +24,14 @@ on:
         required: false
         type: boolean
         default: false
+      setup_lookup:
+        # Idempotently ensures the WAF allowlist + Cache Rule on
+        # stow-index.waterui.dev and syncs the current stable rustc's
+        # verified GHCR slices into R2 (stow#1688).
+        description: "Ensure stow-index.waterui.dev edge rules and sync current stable lookup JSONs to R2"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -94,3 +102,35 @@ jobs:
           [ "$status" = "active" ] || { echo "Pages domain still $status" >&2; exit 1; }
           curl -fsS -o /dev/null -w 'GET / -> %{http_code}\n' https://stow.waterui.dev/
           curl -fsS -o /dev/null -w 'GET /api/v1/stats -> %{http_code}\n' "https://stow.waterui.dev/api/v1/stats?pages-setup"
+
+  setup_lookup:
+    if: github.event_name == 'workflow_dispatch' && inputs.setup_lookup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: site-lookup
+      - name: Build stow-admin
+        run: cargo build --release -p stow-admin --bin stow-admin
+      - name: Ensure stow-index.waterui.dev WAF allowlist and Cache Rule
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ZONE_ID: ${{ vars.CF_ZONE_ID }}
+        run: |
+          set -euo pipefail
+          ./target/release/stow-admin index ensure-lookup-rules --yes
+      - name: Sync current stable lookup JSON slices to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          rustc_version="$(curl -fsS https://static.rust-lang.org/dist/channel-rust-stable.toml \
+            | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
+          ./target/release/stow-admin index sync-lookup --rustc-version "$rustc_version"

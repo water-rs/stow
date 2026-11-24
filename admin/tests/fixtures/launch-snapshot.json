@@ -5,7 +5,6 @@
   "cli_fetches": 6069,
   "miss_nodes": 304,
   "requests": {
-    "GET /api/v1/index/*": 4046,
     "GET /api/v1/bundles/*": 6069,
     "POST /api/v1/admissions": 243,
     "POST /api/v1/enqueue": 182,

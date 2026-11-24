@@ -446,6 +446,11 @@ Required GitHub Actions secrets:
   `wrangler pages deploy` step) plus the `User Memberships:Read` and
   `User User Details:Read` scopes Wrangler needs for its account
   lookup — the zone-level `Custom Pages` permission is unrelated.
+  `index-publish.yml` and `deploy-site.yml` (`setup_lookup`) also use
+  `Account Workers R2 Storage:Edit` (uploading `/v1/lookup/<target>.json`
+  to the `stow-lookup` bucket) and `Zone Cache Rules:Edit` on
+  `waterui.dev` (ensuring the query-string-ignoring Cache Rule on
+  `stow-index.waterui.dev` alongside the `Zone WAF:Edit` allowlist).
   The zone's id goes in the `CF_ZONE_ID` repository variable — the
   WAF step below and `stow-admin maintenance`/`watchdog` read it,
   `operations.yml` among them.

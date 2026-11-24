@@ -321,10 +321,6 @@ fn anonymous_nodes() -> Vec<RouteNode> {
             "/{crate_name}/versions".at(api::crate_versions),
             "/{crate_name}/versions/{version}/features".at(api::crate_features),
         )),
-        "/api/v1/index".route((
-            "/{target}/{rustc_version}".at(api::get_index_slice_digest),
-            "/{target}/{rustc_version}/{digest}".at(api::get_index_slice),
-        )),
         lanes::ADMISSIONS.post(api::mint_miss_admissions),
         "/api/v1/build-report".post(api::build_report),
         "/api/v1/stats".at(api::usage_stats),

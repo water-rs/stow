@@ -267,9 +267,10 @@ mod tests {
     }
 
     #[test]
-    fn index_page_talks_to_the_slice_routes() {
+    fn index_page_talks_to_the_lookup_r2_host() {
         let html = render();
-        assert!(html.contains("/api/v1/index/"));
-        assert!(html.contains("/stable"));
+        assert!(html.contains("https://stow-index.waterui.dev"));
+        assert!(html.contains("/v1/lookup/"));
+        assert!(!html.contains("/api/v1/index/"));
     }
 }

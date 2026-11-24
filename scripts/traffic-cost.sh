@@ -343,10 +343,8 @@ echo "[traffic] started mock registry (pid $!), log: $LOG_DIR/mock-registry.log"
 wait_for "mock registry listener" "$READY_DEADLINE" "$!" \
     http_listening "http://$REGISTRY_ADDR/v2/"
 
-# The covered bundle the CPU pass streams, and one signed index slice at
-# the (target, rustc) the index-pull lane requests that names it —
-# without a slice the pointer GET 404s and the lane fires only the first
-# of the two requests the launch model prices per pull.
+# The covered bundle the CPU pass streams, plus one signed index slice
+# at (x86_64-unknown-linux-gnu, RUSTC_VERSION) naming it.
 BUNDLE_DIGEST="$("$BIN/stow-mock-registry" put-blob --size "$BUNDLE_BYTES" \
     --registry-root "$WORK_DIR/mock-registry" | jq -r .digest)"
 jq --arg rustc "$RUSTC_VERSION" --arg digest "$BUNDLE_DIGEST" --argjson size "$BUNDLE_BYTES" '

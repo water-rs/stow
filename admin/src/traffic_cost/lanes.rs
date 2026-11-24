@@ -129,9 +129,6 @@ pub enum Fire {
     HumanLifecycle(super::human::HumanLane),
     /// Round-robin `GET`s over public paths.
     PublicGet(Vec<String>),
-    /// `GET /api/v1/index/{target}/{rustc}` then the digest-addressed
-    /// slice when a pointer answers — the pull's two requests.
-    IndexPull { target: String, rustc: String },
     /// `GET /api/v1/bundles/{rustc}/{digest}` — the stored `digest`
     /// when one is given (the covered fetch), else rotating synthetic
     /// digests under the run's rustc, whose 404 is the miss the launch
@@ -500,57 +497,6 @@ enum Plan {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
     },
-    /// The event resolved to an outcome already — the index pull's
-    /// pointer hop answers the pull when no slice is published.
-    Done(Outcome),
-}
-
-/// A pull is the pointer GET plus the slice GET when one is published —
-/// the second hop reads the pointer's digest. A miss answers 404 and is
-/// the pull's outcome.
-async fn plan_index_pull(
-    base: &str,
-    target: &str,
-    rustc: &str,
-    client: &mut zenwave::DefaultClient,
-) -> Result<Plan, String> {
-    let pointer = client
-        .get(format!("{base}/api/v1/index/{target}/{rustc}"))
-        .map_err(|error| error.to_string())?
-        .await;
-    let pointer = match pointer {
-        Ok(pointer) => pointer,
-        Err(zenwave::Error::Http { status, .. }) => {
-            return Ok(Plan::Done(Outcome::Response {
-                status: status.as_u16(),
-                overloaded: matches!(status.as_u16(), 429 | 503),
-            }));
-        }
-        Err(error) => return Ok(Plan::Done(Outcome::Transport(error.to_string()))),
-    };
-    let pointer_status = pointer.status().as_u16();
-    let digest = if (200..300).contains(&pointer_status) {
-        let body = pointer
-            .into_body()
-            .into_string()
-            .await
-            .map_err(|error| error.to_string())?;
-        serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v.get("digest").and_then(|d| d.as_str()).map(str::to_owned))
-    } else {
-        None
-    };
-    let Some(digest) = digest else {
-        return Ok(Plan::Done(Outcome::Response {
-            status: pointer_status,
-            overloaded: false,
-        }));
-    };
-    Ok(Plan::Get {
-        url: format!("{base}/api/v1/index/{target}/{rustc}/{digest}"),
-        bearer: None,
-    })
 }
 
 /// The crate task a submit lane posts — a real crates.io crate at the
@@ -734,20 +680,13 @@ fn preheat_release_plan(base: &str, secret: &str, rustc: &str) -> Result<Plan, S
     })
 }
 
-/// Resolve one lane event into its request — the index pull's pointer
-/// hop and the bearer fetches happen here.
-async fn plan(
-    fire: &Fire,
-    edge: &Edge,
-    client: &mut zenwave::DefaultClient,
-    counter: u64,
-) -> Result<Plan, String> {
+/// Resolve one lane event into its request — bearer fetches happen here.
+async fn plan(fire: &Fire, edge: &Edge, counter: u64) -> Result<Plan, String> {
     let base = edge.base();
     let bearer = || async { edge.bearer().await.map_err(|error| error.to_string()) };
     match fire {
         Fire::HumanLifecycle(_) => Err("human lifecycle has no single-request plan".to_owned()),
         Fire::PublicGet(paths) => Ok(public_get_plan(base, paths, counter)),
-        Fire::IndexPull { target, rustc } => plan_index_pull(base, target, rustc, client).await,
         Fire::BundleFetch { rustc, digest } => {
             let digest = digest.clone().unwrap_or_else(|| {
                 format!(
@@ -888,10 +827,9 @@ pub async fn fire_once(
         return lane.fire(edge, client).await;
     }
     let started = tokio::time::Instant::now();
-    let planned = plan(fire, edge, client, counter).await;
+    let planned = plan(fire, edge, counter).await;
     timing.planning = Some(started.elapsed().as_secs_f64() * 1000.0);
     let request = match planned? {
-        Plan::Done(outcome) => return Ok(outcome),
         Plan::Get { url, bearer } => {
             let request = client.get(url).map_err(|error| error.to_string())?;
             match bearer {
@@ -1000,15 +938,6 @@ pub fn build_lanes(
             eps: eps(EventKind::StatsView),
             fire: Fire::PublicGet(vec!["/api/v1/stats".to_owned()]),
             expected: ok2xx,
-        },
-        Lane {
-            name: "index-pull",
-            eps: eps(EventKind::IndexPull),
-            fire: Fire::IndexPull {
-                target: "x86_64-unknown-linux-gnu".to_owned(),
-                rustc: args.rustc.clone(),
-            },
-            expected: ok_or_404,
         },
         Lane {
             name: "bundle-fetch",
@@ -1509,10 +1438,9 @@ mod tests {
             .iter()
             .find(|lane| lane.name == "preheat-release")
             .expect("release");
-        let super::Plan::PostBytes { url, headers, body } =
-            super::plan(&release.fire, &edge, &mut zenwave::client(), 0)
-                .await
-                .expect("release request")
+        let super::Plan::PostBytes { url, headers, body } = super::plan(&release.fire, &edge, 0)
+            .await
+            .expect("release request")
         else {
             panic!("signed release")
         };
@@ -1540,10 +1468,9 @@ mod tests {
             .iter()
             .find(|lane| lane.name == "preheat-scheduled")
             .expect("scheduled");
-        let super::Plan::Get { url, .. } =
-            super::plan(&scheduled.fire, &edge, &mut zenwave::client(), 0)
-                .await
-                .expect("scheduled request")
+        let super::Plan::Get { url, .. } = super::plan(&scheduled.fire, &edge, 0)
+            .await
+            .expect("scheduled request")
         else {
             panic!("native scheduled endpoint")
         };
@@ -1572,10 +1499,9 @@ mod tests {
                 lane.eps,
                 cadence / (f64::from(model.scale.days_per_month) * 86_400.0)
             );
-            let super::Plan::PostBytes { headers, body, .. } =
-                super::plan(&lane.fire, &edge, &mut zenwave::client(), 0)
-                    .await
-                    .expect("workflow request")
+            let super::Plan::PostBytes { headers, body, .. } = super::plan(&lane.fire, &edge, 0)
+                .await
+                .expect("workflow request")
             else {
                 panic!("signed workflow")
             };
@@ -1604,7 +1530,7 @@ mod tests {
             model.peak_events_per_second(stow_types::launch_model::EventKind::BuildCallback)
         );
         let edge = crate::Edge::for_test("http://127.0.0.1:8080".to_owned());
-        let request = super::plan(&lanes[0].fire, &edge, &mut zenwave::client(), 41)
+        let request = super::plan(&lanes[0].fire, &edge, 41)
             .await
             .expect("request");
         let super::Plan::PostBytes { url, headers, body } = request else {

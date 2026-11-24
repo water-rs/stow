@@ -1063,12 +1063,6 @@ pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
         relative_cpu: 0.30,
     },
     WorkerCpuBudget {
-        // The pointer GET plus the digest-addressed slice GET.
-        // Run 40631853262: 0.118 (2.625 ms of 22.2 ms).
-        lane: "index-pull",
-        relative_cpu: 0.25,
-    },
-    WorkerCpuBudget {
         // A covered bundle streamed through the byte path — the
         // dominant CPU line at 9e5 events/mo. stow#738 measured 11–24 ms
         // mean on the deployed Worker, far above this local figure.

@@ -209,16 +209,6 @@ const EVENT_COSTS: &[EventCost] = &[
         r2_ops: 0.0,
     },
     EventCost {
-        kind: EventKind::IndexPull,
-        route: "GET /api/v1/index/* (pointer + slice)",
-        forwards: &[],
-        claims: 0.0,
-        worker_requests: 2.0,
-        cpu: CpuPricing::Lanes(&[("index-pull", 1.0)]),
-        subrequests: 2.0,
-        r2_ops: 0.0,
-    },
-    EventCost {
         kind: EventKind::Admission,
         route: "POST /api/v1/admissions",
         // The route mints for the whole candidate tree and calls no

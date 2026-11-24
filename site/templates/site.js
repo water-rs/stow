@@ -586,8 +586,10 @@ const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
 
   // Mirrors `CrateName`'s deserialize rule.
   const CRATE_NAME = /^[A-Za-z0-9_-]{1,128}$/;
-  // Mirrors `ARTIFACT_INDEX_FORMAT_VERSION` in types/src/index.rs.
-  const INDEX_FORMAT_VERSION = 3;
+  // Mirrors `LOOKUP_INDEX_FORMAT_VERSION` in types/src/index.rs.
+  const LOOKUP_FORMAT_VERSION = 1;
+  // R2 public custom domain serving `/v1/lookup/<target>.json` directly.
+  const LOOKUP_BASE_URL = "https://stow-index.waterui.dev";
   const LOOKUP_DEBOUNCE_MS = 180;
 
   // Monotonic ticket: a slower earlier load must not overwrite a faster
@@ -595,10 +597,10 @@ const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
   let lookupTicket = 0;
   let lookupTimer = null;
 
-  // One slice fetch per target, armed lazily on the first query — the
+  // One lookup fetch per target, armed lazily on the first query — the
   // landing page never pays for data nobody asked about. A rejected
-  // fetch retires the request so the next keystroke retries; a slice
-  // that fails to load shows an error, never an empty result.
+  // fetch retires the request so the next keystroke retries; a lookup
+  // index that fails to load shows an error, never an empty result.
   let sliceRequest = null;
 
   const setNote = (element, message, kind) => {
@@ -610,49 +612,28 @@ const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
     }
   };
 
-  const getJson = async (url) => {
-    const response = await fetch(url, { headers: { accept: "application/json" } });
-    const body = await response.json().catch(() => null);
-    if (!response.ok) {
-      throw new Error(
-        body && typeof body.error === "string" ? body.error : `HTTP ${response.status}`,
-      );
-    }
-    return body;
-  };
-
-  // First the short-lived digest pointer (the tag moves at every index
-  // publish), then the immutable digest-addressed blob — which the
-  // browser cache can hold forever, so the second visit loads nothing.
-  // fetch() decodes the negotiated Content-Encoding itself (zstd or
-  // gzip), so `response.json()` always reads the index document.
+  // Single static GET directly from R2 behind Cloudflare CDN — zero
+  // Worker invocations, edge-compressed JSON carrying only the
+  // deduplicated `(crate, version, features) -> bundle_size` map.
   const fetchSlice = async (target) => {
-    const pointer = await getJson(
-      `/api/v1/index/${encodeURIComponent(target)}/stable`,
-    );
-    const url =
-      `/api/v1/index/${encodeURIComponent(target)}` +
-      `/${encodeURIComponent(pointer.rustc_version)}` +
-      `/${encodeURIComponent(pointer.digest)}`;
+    const url = `${LOOKUP_BASE_URL}/v1/lookup/${encodeURIComponent(target)}.json`;
     const response = await fetch(url, { headers: { accept: "application/json" } });
     if (!response.ok) {
-      const body = await response.json().catch(() => null);
-      throw new Error(
-        body && typeof body.error === "string" ? body.error : `HTTP ${response.status}`,
-      );
+      throw new Error(`HTTP ${response.status}`);
     }
     const index = await response.json();
-    // The same two gates `stow_types::index::decode` enforces — a slice
-    // in a format this page does not understand is a load error, never
-    // a "not cached".
     const header = index && index.header;
-    if (!header || header.format_version !== INDEX_FORMAT_VERSION) {
+    if (!header || header.format_version !== LOOKUP_FORMAT_VERSION) {
       throw new Error(
-        `the index slice uses format_version ${header ? header.format_version : "none"} — this page understands ${INDEX_FORMAT_VERSION}`,
+        `the lookup index uses format_version ${header ? header.format_version : "none"} — this page understands ${LOOKUP_FORMAT_VERSION}`,
       );
     }
-    if (header.row_count !== (index.rows ? index.rows.length : undefined)) {
-      throw new Error("the index slice's row count does not match its rows");
+    if (!index.crates || typeof index.crates !== "object" || Array.isArray(index.crates)) {
+      throw new Error("the lookup index is missing its crates map");
+    }
+    const crateNames = Object.keys(index.crates);
+    if (header.crate_count !== crateNames.length) {
+      throw new Error("the lookup index's crate count does not match its crates");
     }
     return index;
   };
@@ -662,23 +643,13 @@ const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
     if (sliceRequest === null || sliceRequest.target !== target) {
       const request = { target, promise: null };
       request.promise = fetchSlice(target).then((index) => {
-        // Only the live request writes the label — a slow slice for a
+        // Only the live request writes the label — a slow fetch for a
         // target the user has already left must not overwrite the new
         // target's label.
         if (sliceRequest === request) {
-          sliceLabel.textContent = `rustc ${index.header.rustc_version} · ${index.rows.length} rows`;
+          sliceLabel.textContent = `rustc ${index.header.rustc_version} · ${index.header.crate_count} crates · ${index.header.row_count} rows`;
         }
-        // Group rows by crate once; every later keystroke is a Map hit.
-        const byCrate = new Map();
-        for (const row of index.rows) {
-          let rows = byCrate.get(row.crate_name);
-          if (rows === undefined) {
-            rows = [];
-            byCrate.set(row.crate_name, rows);
-          }
-          rows.push(row);
-        }
-        return byCrate;
+        return index.crates;
       });
       request.promise.catch(() => {
         if (sliceRequest === request) {
@@ -689,19 +660,6 @@ const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
       sliceRequest = request;
     }
     return sliceRequest.promise;
-  };
-
-  // `features_json` is the canonical JSON-encoded feature list.
-  const parseFeatures = (raw) => {
-    if (Array.isArray(raw)) {
-      return raw;
-    }
-    try {
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
   };
 
   const formatSize = (bytes) =>
@@ -723,9 +681,9 @@ const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
     resultBody.replaceChildren();
     setNote(note, "loading index slice…", null);
 
-    let byCrate;
+    let crates;
     try {
-      byCrate = await ensureSlice();
+      crates = await ensureSlice();
     } catch (error) {
       if (ticket !== lookupTicket) {
         return;
@@ -741,24 +699,15 @@ const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
       return;
     }
 
-    // version -> the distinct feature sets it is cached with.
-    const byVersion = new Map();
-    for (const row of byCrate.get(crateName) ?? []) {
-      const features = parseFeatures(row.features_json);
-      const label = features.length > 0 ? features.join(", ") : "--no-default-features";
-      let sets = byVersion.get(row.version);
-      if (sets === undefined) {
-        sets = new Map();
-        byVersion.set(row.version, sets);
-      }
-      sets.set(label, row.bundle_size);
-    }
+    const crateVersions = Object.prototype.hasOwnProperty.call(crates, crateName)
+      ? crates[crateName]
+      : null;
 
-    if (byVersion.size === 0) {
+    if (!crateVersions) {
       // A prefix is not a lookup: while the text starts cached crates the
       // verdict stays open — "not cached" needs no exact row and no prefix.
       let prefixes = 0;
-      for (const name of byCrate.keys()) {
+      for (const name of Object.keys(crates)) {
         if (name.startsWith(crateName)) {
           prefixes += 1;
         }
@@ -773,14 +722,14 @@ const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
       return;
     }
 
-    const versions = [...byVersion.keys()].sort((a, b) =>
+    const versions = Object.keys(crateVersions).sort((a, b) =>
       b.localeCompare(a, undefined, { numeric: true }),
     );
     for (const version of versions) {
-      for (const [features, size] of byVersion.get(version)) {
+      for (const [features, size] of Object.entries(crateVersions[version])) {
         const row = document.createElement("tr");
         cell(row, version);
-        cell(row, features);
+        cell(row, features.length > 0 ? features : "--no-default-features");
         cell(row, formatSize(size), "num");
         resultBody.appendChild(row);
       }
@@ -799,8 +748,8 @@ const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
   // sort ahead of mid-name ones, and the list is capped: the slice can
   // hold thousands of crates.
   const MAX_LOOKUP_OPTIONS = 12;
-  const latestCachedVersion = (rows) =>
-    [...new Set(rows.map((row) => row.version))].sort((a, b) =>
+  const latestCachedVersion = (crateVersions) =>
+    Object.keys(crateVersions).sort((a, b) =>
       b.localeCompare(a, undefined, { numeric: true }),
     )[0] ?? "";
 
@@ -808,10 +757,10 @@ const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
     input: crateInput,
     list: crateOptions,
     fetchHits: async (query) => {
-      const byCrate = await ensureSlice();
+      const crates = await ensureSlice();
       const prefix = [];
       const rest = [];
-      for (const name of byCrate.keys()) {
+      for (const name of Object.keys(crates)) {
         if (name.startsWith(query)) {
           prefix.push(name);
         } else if (name.includes(query)) {
@@ -823,7 +772,7 @@ const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
       return prefix
         .concat(rest)
         .slice(0, MAX_LOOKUP_OPTIONS)
-        .map((name) => ({ name, version: latestCachedVersion(byCrate.get(name)) }));
+        .map((name) => ({ name, version: latestCachedVersion(crates[name]) }));
     },
     renderItem: (item, hit) => {
       const name = document.createElement("span");
