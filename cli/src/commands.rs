@@ -2259,6 +2259,8 @@ mod tests {
         std::fs::write(slice_dir.join("current.json"), b"{}").expect("pointer");
         std::fs::write(crate::state_db::state_db_path(cache), b"not-a-valid-sqlite")
             .expect("corrupt db");
+        std::fs::write(cache.join("state-v3.sqlite3-wal"), b"wal").expect("wal");
+        std::fs::write(cache.join("state-v3.sqlite3-shm"), b"shm").expect("shm");
 
         let state_db = crate::state_db::StateDb::default();
         super::clean_cache_dir(cache, false, &state_db)
@@ -2266,6 +2268,8 @@ mod tests {
             .expect("clean recovers broken state db");
         assert!(slice_dir.join("current.json").is_file());
         assert!(!crate::state_db::state_db_path(cache).exists());
+        assert!(!cache.join("state-v3.sqlite3-wal").exists());
+        assert!(!cache.join("state-v3.sqlite3-shm").exists());
         state_db.close().await;
     }
 
@@ -2280,9 +2284,23 @@ mod tests {
         std::fs::create_dir_all(cache.join("crates-io/1.100.0/entry")).expect("crates-io");
 
         let state_path = crate::state_db::state_db_path(cache);
-        std::fs::write(&state_path, b"not-a-valid-sqlite").expect("corrupt db");
-        std::fs::write(cache.join("state-v3.sqlite3-wal"), b"wal").expect("wal");
-        std::fs::write(cache.join("state-v3.sqlite3-shm"), b"shm").expect("shm");
+        let mut old_conn = <sqlx::sqlite::SqliteConnectOptions as std::str::FromStr>::from_str(
+            &format!("sqlite://{}", state_path.display()),
+        )
+        .expect("connect options")
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        old_conn = old_conn.synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+        let mut conn = sqlx::ConnectOptions::connect(&old_conn)
+            .await
+            .expect("open legacy state db");
+        sqlx::query("CREATE TABLE old_shape (v TEXT)")
+            .execute(&mut conn)
+            .await
+            .expect("create legacy table");
+        sqlx::Connection::close(conn)
+            .await
+            .expect("close legacy state db");
 
         // Sharded cargo build-dir layout: `<shard>/<hash>/<triple>/<profile>/.cargo-build-lock`
         let active_ws = cache.join("build-dir/b3/dea7bd2fb461ea");

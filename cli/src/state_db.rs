@@ -90,15 +90,49 @@ pub fn is_state_db_file(name: &str) -> bool {
 pub async fn remove_state_db_files(cache_dir: &Path) -> stow_types::error::Result<()> {
     for suffix in ["", "-wal", "-shm"] {
         let path = cache_dir.join(format!("{STATE_DB_FILE_NAME}{suffix}"));
-        match async_fs::remove_file(&path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).wrap_err_with(|| format!("remove {}", path.display()));
+        remove_state_db_file(&path).await?;
+    }
+    Ok(())
+}
+
+async fn remove_state_db_file(path: &Path) -> stow_types::error::Result<()> {
+    #[cfg(windows)]
+    {
+        // `sqlx-sqlite`'s `SqliteConnectOptions::connect` runs connect-time
+        // pragmas with `?` without awaiting `conn.close()`, so when a corrupt
+        // database fails `connect_with`, its background `ConnectionWorker`
+        // thread may still be calling `sqlite3_close()` for a few
+        // milliseconds. Windows rejects `DeleteFile` with
+        // `ERROR_SHARING_VIOLATION` (32) until that handle closes.
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const MAX_RETRIES: usize = 20;
+        const RETRY_DELAY: Duration = Duration::from_millis(25);
+        let mut attempt = 0;
+        loop {
+            match async_fs::remove_file(path).await {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error)
+                    if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
+                        && attempt < MAX_RETRIES =>
+                {
+                    attempt += 1;
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| format!("remove {}", path.display()));
+                }
             }
         }
     }
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        match async_fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).wrap_err_with(|| format!("remove {}", path.display())),
+        }
+    }
 }
 
 /// Clear every ephemeral host-state row (`build_directories`,
