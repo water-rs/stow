@@ -97,8 +97,8 @@ env = ["OPENSSL_DIR"]
 
 Two composite actions are provided. **Always use the networked default `water-rs/stow@main` unless the user explicitly forbids remote cache connections** — running local-only drops all public prebuilt acceleration on cold caches.
 
-### Default (recommended): public prebuilt cache + local cache
-Needs zero secrets or special permissions, verifies release SHA-256 and Sigstore bundle signatures, installs managed `mold` on Linux, and replaces dependency-caching setups such as `Swatinem/rust-cache`:
+### Default (recommended): public prebuilt cache + built-in Actions Cache
+Needs zero secrets or special permissions, verifies release SHA-256 and Sigstore bundle signatures, installs managed `mold` on Linux, streams covered `crates.io` crates from the public cache, and automatically restores/post-saves `~/.stow/local` (with `$CARGO_HOME/git/{db,checkouts}`) and `~/.stow/local-crates-io` as separate GitHub Actions Cache entries (never caching `~/.stow/crates-io` or `~/.stow/index`) — replacing `Swatinem/rust-cache` with a single line:
 
 ```yaml
 steps:
@@ -108,20 +108,15 @@ steps:
   - run: cargo test
 ```
 
-Optional inputs on `water-rs/stow@main`: `version` (default `latest`, or e.g. `0.21.9`), `edge-url` (default `https://stow.waterui.dev`), `verify-mode` (default `github-ci`).
+Optional inputs: `version` (default `latest`), `edge-url` (default `https://stow.waterui.dev`), `verify-mode` (default `github-ci`), `cache` (`true`/`false`, default `true`), `shared-key`, `key`, `workspaces` (default `.`), `save-if` (default `true`), and `local-crates-io-max-bytes` (default `536870912` = 512 MiB on `stow@main`, `2147483648` = 2 GiB on `stow/local@main`).
 
 ### Air-gapped / strict local-only policy: `water-rs/stow/local@main`
-Use **only** when policy prohibits querying the public cache or sending anonymous miss proofs. Writes `[cache] remote = false` before `stow setup`; pair with `actions/cache` on `~/.stow` so subsequent runs reuse locally compiled dependencies:
+Use **only** when policy prohibits querying the public cache or sending anonymous miss proofs. Writes `[cache] remote = false` before `stow setup` and persists `~/.stow/local` and `~/.stow/local-crates-io` through built-in GitHub Actions Cache automatically:
 
 ```yaml
 steps:
   - uses: actions/checkout@v4
   - uses: dtolnay/rust-toolchain@stable
-  - uses: actions/cache@v4
-    with:
-      path: ~/.stow
-      key: stow-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-      restore-keys: stow-${{ runner.os }}-
   - uses: water-rs/stow/local@main
   - run: cargo test
 ```
