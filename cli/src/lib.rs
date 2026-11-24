@@ -6545,6 +6545,7 @@ mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
+            version_leases: crate::artifact_cache::SharedVersionLeases::default(),
         }
     }
 
@@ -7171,6 +7172,7 @@ mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
+            version_leases: crate::artifact_cache::SharedVersionLeases::default(),
         };
         // A scan shaped like a build-script crate's: `default` resolved
         // plus `probe_from_build_script` the script printed itself.
@@ -7348,6 +7350,7 @@ mod tests {
                 trust_material: std::sync::Arc::default(),
                 registry_http: std::sync::Arc::default(),
                 artifact_cache_staging: std::sync::Arc::default(),
+                version_leases: crate::artifact_cache::SharedVersionLeases::default(),
             }
         }
 

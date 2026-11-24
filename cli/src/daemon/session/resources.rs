@@ -14,17 +14,33 @@ use std::sync::Arc;
 
 use tokio::sync::OnceCell;
 
-use crate::config::StowConfig;
+use crate::artifact_cache::{SharedVersionLeases, StagingDir};
+use crate::config::{StowConfig, default_tier_staging};
 use crate::index::{HeldSlices, SliceFetches};
 use crate::state_db::StateDb;
 
 /// The handles of one cache directory.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CacheDirHandles {
     state_db: StateDb,
     trust_material: Arc<OnceCell<Arc<crate::verify::TrustMaterial>>>,
     registry_http: Arc<OnceCell<stow_oci::RegistryHttp>>,
+    artifact_cache_staging: Arc<[OnceCell<Arc<StagingDir>>; 3]>,
+    version_leases: SharedVersionLeases,
     slices: HeldSlices,
+}
+
+impl Default for CacheDirHandles {
+    fn default() -> Self {
+        Self {
+            state_db: StateDb::default(),
+            trust_material: Arc::default(),
+            registry_http: Arc::default(),
+            artifact_cache_staging: default_tier_staging(),
+            version_leases: SharedVersionLeases::default(),
+            slices: HeldSlices::default(),
+        }
+    }
 }
 
 impl CacheDirHandles {
@@ -33,6 +49,8 @@ impl CacheDirHandles {
         config.state_db = self.state_db.clone();
         config.trust_material = Arc::clone(&self.trust_material);
         config.registry_http = Arc::clone(&self.registry_http);
+        config.artifact_cache_staging = Arc::clone(&self.artifact_cache_staging);
+        config.version_leases = self.version_leases.clone();
     }
 
     /// A slice memo for one build, backed by the slices this directory's

@@ -1022,6 +1022,7 @@ mod tests {
             trust_material: Arc::default(),
             registry_http: Arc::default(),
             artifact_cache_staging: Arc::default(),
+            version_leases: crate::artifact_cache::SharedVersionLeases::default(),
         }
     }
 

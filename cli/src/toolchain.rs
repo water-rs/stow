@@ -11,10 +11,41 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+#[cfg(not(unix))]
 use same_file::Handle;
 
 use crate::rustc_args::{self, BuildRustc};
 use crate::session_env::SessionEnv;
+
+/// File identity compared without holding an open file descriptor on Unix
+/// (stow#1690): `(dev, ino)` from `stat` identifies the same file with zero
+/// long-lived FDs across concurrent daemon sessions.
+#[derive(Debug, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    dev_ino: (u64, u64),
+    #[cfg(not(unix))]
+    handle: Handle,
+}
+
+impl FileIdentity {
+    fn from_path(path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let meta = std::fs::metadata(path)?;
+            Ok(Self {
+                dev_ino: (meta.dev(), meta.ino()),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                handle: Handle::from_path(path)?,
+            })
+        }
+    }
+}
 
 /// The build's rustc and the facts probed from it.
 #[derive(Debug)]
@@ -23,23 +54,23 @@ pub struct BuildToolchain {
     rustc: PathBuf,
     /// The rustc's file identity: what a request's executable is compared
     /// with.
-    rustc_file: Handle,
+    rustc_file: FileIdentity,
     /// The file the build's own rustc spelling resolves to — what the
     /// driver itself runs. Under rustup with no `RUSTC` set that is the
     /// `rustc` proxy on `PATH`, a different file from the toolchain's
     /// `<sysroot>/bin/rustc`; cargo hands its wrapper one or the other
     /// depending on whether it took its rustup bypass.
-    launcher_file: Handle,
+    launcher_file: FileIdentity,
     /// The path `launcher_file` was found at.
     launcher: PathBuf,
     /// The configured `RUSTC_WORKSPACE_WRAPPER`, which cargo runs with the
     /// rustc as its first argument for workspace members, and the path it
     /// was found at.
-    workspace_wrapper: Option<(PathBuf, Handle)>,
+    workspace_wrapper: Option<(PathBuf, FileIdentity)>,
     /// The toolchain's own clippy-driver, beside rustc — the workspace
     /// wrapper `cargo clippy` inserts itself, whether or not one is
     /// configured (stow#1456). `None` when the toolchain ships none.
-    clippy_driver: Option<(PathBuf, Handle)>,
+    clippy_driver: Option<(PathBuf, FileIdentity)>,
     /// The environment the toolchain was resolved in: its `PATH` and
     /// working directory are what bare and relative spellings resolve
     /// against, and the rustc probes run in it.
@@ -256,7 +287,7 @@ impl BuildToolchain {
         let env = env.clone();
         tokio::task::spawn_blocking(move || {
             let identify = |path: &Path| {
-                Handle::from_path(path)
+                FileIdentity::from_path(path)
                     .map_err(|error| format!("identify {}: {error}", path.display()))
             };
             let rustc_file = identify(&facts.rustc)?;
@@ -332,7 +363,7 @@ impl BuildToolchain {
         let mut toolchain = Self::of_the_test_rustc().await;
         toolchain.workspace_wrapper = Some((
             wrapper.to_path_buf(),
-            Handle::from_path(wrapper).expect("identify the workspace wrapper"),
+            FileIdentity::from_path(wrapper).expect("identify the workspace wrapper"),
         ));
         std::sync::Arc::new(toolchain)
     }
@@ -366,16 +397,16 @@ fn resolve_file(
     spelling: &OsStr,
     env: &SessionEnv,
     cwd: &Path,
-) -> Result<(PathBuf, Handle), String> {
+) -> Result<(PathBuf, FileIdentity), String> {
     let path = env
         .resolve_program(spelling, cwd)
         .map_err(|error| format!("resolve {}: {error}", Path::new(spelling).display()))?;
-    let file = Handle::from_path(&path)
+    let file = FileIdentity::from_path(&path)
         .map_err(|error| format!("identify {}: {error}", path.display()))?;
     Ok((path, file))
 }
 
-fn names_file(spelling: &OsStr, env: &SessionEnv, cwd: &Path, target: &Handle) -> bool {
+fn names_file(spelling: &OsStr, env: &SessionEnv, cwd: &Path, target: &FileIdentity) -> bool {
     resolve_file(spelling, env, cwd).is_ok_and(|(_, file)| file == *target)
 }
 
