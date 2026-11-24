@@ -134,6 +134,13 @@ const REKOR_READ_BACK_MAX_ATTEMPTS: u32 = 8;
 /// The first wait of the Rekor read-back's retries.
 const REKOR_READ_BACK_INITIAL_DELAY: Duration = Duration::from_millis(500);
 
+/// Rekor `429 Too Many Requests` retries across rate-limit windows when
+/// `oci::client`'s fast inner loop runs out inside the same minute window.
+const REKOR_RATE_LIMIT_MAX_ATTEMPTS: u32 = 4;
+
+/// First wait before re-issuing a Rekor `hashedrekord` submission after `429`.
+const REKOR_RATE_LIMIT_INITIAL_DELAY: Duration = Duration::from_secs(15);
+
 /// The go-containerregistry zero time every layer's history and the
 /// config's `created` carry in a cosign signature image.
 const ZERO_TIME: &str = "0001-01-01T00:00:00Z";
@@ -328,12 +335,30 @@ impl KeylessSigner {
         digest: &str,
     ) -> stow_types::error::Result<SignatureLayer> {
         let payload = simple_signing_payload(reference, digest)?;
-        let identity = self.identity().await?;
-        let signature = identity
-            .signer
-            .sign(&payload)
-            .wrap_err_with(|| format!("sign the payload of {reference}@{digest}"))?;
-        let bundle = self.log(&identity, &payload, &signature).await?;
+        let (identity, bundle, signature) = retry_with_backoff(
+            "log the signature in Rekor",
+            REKOR_RATE_LIMIT_MAX_ATTEMPTS,
+            REKOR_RATE_LIMIT_INITIAL_DELAY,
+            || async {
+                // Re-check certificate expiry on every attempt so rate-limit
+                // waits never let an entry integrate under an expired cert.
+                let identity = self.identity().await.map_err(LogError::Fatal)?;
+                let signature = identity
+                    .signer
+                    .sign(&payload)
+                    .wrap_err_with(|| format!("sign the payload of {reference}@{digest}"))
+                    .map_err(LogError::Fatal)?;
+                match self.log(&identity, &payload, &signature).await {
+                    Ok(bundle) => Ok((identity, bundle, signature)),
+                    Err(error) => Err(error),
+                }
+            },
+            |error| matches!(error, LogError::RateLimited(_)),
+        )
+        .await
+        .map_err(|error| match error {
+            LogError::RateLimited(error) | LogError::Fatal(error) => error,
+        })?;
         let layer = SignatureLayer {
             payload,
             signature: base64::engine::general_purpose::STANDARD.encode(&signature),
@@ -528,7 +553,7 @@ impl KeylessSigner {
         identity: &SigningIdentity,
         payload: &[u8],
         signature: &[u8],
-    ) -> stow_types::error::Result<RekorBundle> {
+    ) -> Result<RekorBundle, LogError> {
         let base64 = base64::engine::general_purpose::STANDARD;
         let entry = serde_json::json!({
             "apiVersion": "0.0.1",
@@ -553,43 +578,65 @@ impl KeylessSigner {
         request
             .headers
             .insert(header::ACCEPT, HeaderValue::from_static("application/json"));
-        request.body = Some(serde_json::to_vec(&entry)?);
-        let response = self.send("log the signature in Rekor", request).await?;
+        request.body = Some(serde_json::to_vec(&entry).map_err(|e| LogError::Fatal(e.into()))?);
+        let response = self
+            .send("log the signature in Rekor", request)
+            .await
+            .map_err(LogError::Fatal)?;
         let response = match response.status {
             reqwest::StatusCode::CREATED => response,
+            reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                return Err(LogError::RateLimited(refused(
+                    "Rekor",
+                    "log the signature",
+                    &url,
+                    &response,
+                )));
+            }
             reqwest::StatusCode::CONFLICT => {
                 let location = response
                     .headers
                     .get(header::LOCATION)
                     .and_then(|value| value.to_str().ok())
                     .ok_or_else(|| {
-                        stow_types::stow_error!(
+                        LogError::Fatal(stow_types::stow_error!(
                             "Rekor answered 409 for {url} without the Location of the existing entry"
-                        )
+                        ))
                     })?;
                 let existing = reqwest::Url::parse(&format!("{rekor}/"))
                     .and_then(|base| base.join(location))
-                    .wrap_err_with(|| format!("resolve Rekor entry Location {location}"))?
+                    .wrap_err_with(|| format!("resolve Rekor entry Location {location}"))
+                    .map_err(LogError::Fatal)?
                     .to_string();
                 self.read_back(&existing)
                     .await
                     .map_err(|error| match error {
-                        EntryRead::NotReadable(response) => stow_types::stow_error!(
+                        EntryRead::NotReadable(response) => LogError::Fatal(stow_types::stow_error!(
                             "Rekor answered 409 for {url} naming the existing entry {existing}, \
                          which was still not readable there after \
                          {REKOR_READ_BACK_MAX_ATTEMPTS} reads: {}: {}",
                             response.status,
                             String::from_utf8_lossy(&response.body)
-                        ),
-                        EntryRead::Refused(response) => {
-                            refused("Rekor", "read back the entry", &existing, &response)
-                        }
-                        EntryRead::Failed(error) => error,
+                        )),
+                        EntryRead::Refused(response) => LogError::Fatal(refused(
+                            "Rekor",
+                            "read back the entry",
+                            &existing,
+                            &response,
+                        )),
+                        EntryRead::Failed(error) => LogError::Fatal(error),
                     })?
             }
-            _ => return Err(refused("Rekor", "log the signature", &url, &response)),
+            _ => {
+                return Err(LogError::Fatal(refused(
+                    "Rekor",
+                    "log the signature",
+                    &url,
+                    &response,
+                )));
+            }
         };
-        rekor_bundle(&response.body)
+        rekor_bundle(&response.body).map_err(LogError::Fatal)
     }
 
     /// Read the logged entry at `url`, retrying the `404` Rekor answers
@@ -642,6 +689,19 @@ enum EntryRead {
     Refused(Box<Response>),
     /// The exchange itself failed.
     Failed(stow_types::error::Error),
+}
+
+enum LogError {
+    RateLimited(stow_types::error::Error),
+    Fatal(stow_types::error::Error),
+}
+
+impl std::fmt::Display for LogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RateLimited(error) | Self::Fatal(error) => write!(f, "{error}"),
+        }
+    }
 }
 
 impl std::fmt::Display for EntryRead {
