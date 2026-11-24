@@ -200,6 +200,8 @@ async fn serve(
         run_dir = %run_dir.path().display(),
         "stow daemon process started"
     );
+    #[cfg(unix)]
+    log_raise_nofile_limit();
     let lock_path = run_dir.daemon_lock();
     let Some(lock) = hold_lock(
         lock_path,
@@ -218,9 +220,11 @@ async fn serve(
     // lost the session's in-flight state and provenance marks, so its
     // wrappers are refused until it exits.
     let sessions = run_dir.sessions();
+    let processes = OsProcesses::default();
     let swept = blocking({
         let sessions = sessions.clone();
-        move || sweep_sessions(&sessions, &OsProcesses)
+        let processes = processes.clone();
+        move || sweep_sessions(&sessions, &processes)
     })
     .await?;
     if swept.removed > 0 {
@@ -242,7 +246,7 @@ async fn serve(
         settings,
         logs,
         table: SessionTable::start(),
-        processes: OsProcesses,
+        processes,
         retirement: Retirement::new(settings.drain),
         busy: Busy::default(),
         installed: Arc::new(Installed::of_current().wrap_err("read this daemon's own executable")?),
@@ -589,6 +593,104 @@ async fn bind(endpoint: &Path) -> Result<Listener> {
     })
 }
 
+/// Target soft open-file limit for the daemon process.
+///
+/// macOS defaults `RLIMIT_NOFILE` to 256 even when the hard limit is
+/// unlimited, which concurrent `cargo` builds exhaust quickly. Raising the
+/// soft limit at startup covers every launch path — launchd, direct spawns,
+/// and inherited execs — and clamps to the kernel per-process ceiling so
+/// `setrlimit` never fails with `EINVAL`.
+#[cfg(unix)]
+const DAEMON_NOFILE_TARGET: libc::rlim_t = 65_536;
+
+/// Backoff after a transient `accept(2)` failure such as `EMFILE` so the
+/// daemon does not spin while existing connections drain.
+#[cfg(unix)]
+const ACCEPT_TRANSIENT_BACKOFF: Duration = Duration::from_millis(25);
+
+#[cfg(unix)]
+fn log_raise_nofile_limit() {
+    match raise_nofile_limit() {
+        Ok((previous, current)) if current > previous => {
+            tracing::info!(
+                previous,
+                current,
+                "raised daemon open-file soft limit (RLIMIT_NOFILE)"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "could not raise daemon open-file soft limit");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn raise_nofile_limit() -> std::io::Result<(libc::rlim_t, libc::rlim_t)> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid out-parameter for `RLIMIT_NOFILE`.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let desired = {
+        let target = DAEMON_NOFILE_TARGET.min(limit.rlim_max);
+        #[cfg(target_os = "macos")]
+        {
+            macos_maxfilesperproc().map_or(target, |kernel_max| target.min(kernel_max))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            target
+        }
+    };
+    if limit.rlim_cur >= desired {
+        return Ok((limit.rlim_cur, limit.rlim_cur));
+    }
+    let previous = limit.rlim_cur;
+    limit.rlim_cur = desired;
+    // SAFETY: `limit` holds a valid soft/hard pair for `RLIMIT_NOFILE`.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((previous, desired))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_maxfilesperproc() -> Option<libc::rlim_t> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_MAXFILESPERPROC];
+    let mut maxfiles: libc::c_int = 0;
+    let mut size = size_of::<libc::c_int>();
+    // SAFETY: `mib` has 2 elements and `maxfiles` has length `size`.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            (&raw mut maxfiles).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && maxfiles > 0 {
+        libc::rlim_t::try_from(maxfiles).ok()
+    } else {
+        None
+    }
+}
+
+/// Errors from `accept(2)` that reflect transient peer or descriptor-table
+/// pressure rather than a broken listener socket.
+#[cfg(unix)]
+fn is_transient_accept_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ECONNABORTED | libc::ECONNRESET | libc::EINTR)
+    )
+}
+
 /// Serve until a retirement has drained, and return it. On Unix the
 /// listener is the caller's, which keeps it open: connections that arrive
 /// from here on wait in its backlog for the successor. On Windows the
@@ -607,11 +709,25 @@ async fn accept_loop(listener: &Listener, daemon: Daemon<OsProcesses>) -> Result
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _) = accepted.wrap_err("accept a daemon connection")?;
-                let request = daemon.busy.request();
-                let peer = peer_of(owner::peer_pid(&stream));
-                connections.spawn(serve_connection(stream, peer, daemon.clone(), request));
-                reap(&mut connections);
+                match accepted {
+                    Ok((stream, _)) => {
+                        let request = daemon.busy.request();
+                        let peer = peer_of(owner::peer_pid(&stream));
+                        connections.spawn(serve_connection(stream, peer, daemon.clone(), request));
+                        reap(&mut connections);
+                    }
+                    Err(error) if is_transient_accept_error(&error) => {
+                        tracing::warn!(%error, "transient error accepting daemon connection; backing off");
+                        reap(&mut connections);
+                        tokio::select! {
+                            () = tokio::time::sleep(ACCEPT_TRANSIENT_BACKOFF) => {}
+                            pending = &mut drained => return Ok(pending),
+                        }
+                    }
+                    Err(error) => {
+                        return Err(error).wrap_err("accept a daemon connection");
+                    }
+                }
             }
             pending = &mut drained => return Ok(pending),
         }
@@ -2900,5 +3016,41 @@ mod tests {
         };
         assert!(reason.contains("no process 99"), "{reason}");
         task.await.expect("join").expect("served");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_accept_errors_are_classified() {
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ECONNABORTED,
+            libc::ECONNRESET,
+            libc::EINTR,
+        ] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            assert!(
+                super::is_transient_accept_error(&error),
+                "errno {errno} should be treated as transient"
+            );
+        }
+        for errno in [libc::EBADF, libc::EINVAL] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            assert!(
+                !super::is_transient_accept_error(&error),
+                "errno {errno} should remain fatal"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raise_nofile_limit_raises_or_preserves_soft_limit() {
+        let (previous, current) = super::raise_nofile_limit().expect("raise RLIMIT_NOFILE");
+        assert!(current >= previous);
+        assert!(
+            current >= 1024 || current == previous,
+            "expected raised soft limit, got previous={previous} current={current}"
+        );
     }
 }

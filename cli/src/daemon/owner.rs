@@ -33,7 +33,7 @@ pub trait Processes: Clone + Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// As [`ExitWatch::arm`].
+    /// As [`ExitWatch`].
     fn watch(&self, owner: CargoOwner) -> Result<BoxFuture<'static, io::Result<()>>, String>;
 
     /// Whether the process `owner` names is still running: its id is in use
@@ -42,8 +42,10 @@ pub trait Processes: Clone + Send + Sync + 'static {
 }
 
 /// The processes of the machine this daemon runs on.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct OsProcesses;
+#[derive(Debug, Clone, Default)]
+pub struct OsProcesses {
+    hub: imp::WatchHub,
+}
 
 impl Processes for OsProcesses {
     fn owner_of(&self, peer: u32, cargo: Option<&Path>) -> Result<CargoOwner, String> {
@@ -51,7 +53,7 @@ impl Processes for OsProcesses {
     }
 
     fn watch(&self, owner: CargoOwner) -> Result<BoxFuture<'static, io::Result<()>>, String> {
-        let watch = ExitWatch::arm(owner, &OsProcessTable)?;
+        let watch = ExitWatch::arm_with(owner, &OsProcessTable, &self.hub)?;
         Ok(Box::pin(watch.exited()))
     }
 
@@ -222,8 +224,17 @@ impl ExitWatch {
     ///
     /// The platform cannot watch a process, or `owner`'s id now names
     /// another process.
+    #[cfg(test)]
     pub fn arm(owner: CargoOwner, table: &impl ProcessTable) -> Result<Self, String> {
-        let watch = imp::arm(owner.pid)
+        Self::arm_with(owner, table, &imp::WatchHub::new())
+    }
+
+    fn arm_with(
+        owner: CargoOwner,
+        table: &impl ProcessTable,
+        hub: &imp::WatchHub,
+    ) -> Result<Self, String> {
+        let watch = imp::arm(owner.pid, hub)
             .map_err(|error| format!("watch process {} for its exit: {error}", owner.pid))?;
         match table.started(owner.pid) {
             Ok(started) if started == owner.started => Ok(Self { watch }),
@@ -327,12 +338,23 @@ mod imp {
         std::fs::read_link(format!("/proc/{pid}/exe"))
     }
 
+    /// Unused on Linux: each watch opens its own pidfd.
+    #[derive(Debug, Clone, Default)]
+    pub(super) struct WatchHub;
+
+    impl WatchHub {
+        #[cfg(test)]
+        pub(super) const fn new() -> Self {
+            Self
+        }
+    }
+
     /// A pidfd, readable once its process has exited.
     #[derive(Debug)]
     pub(super) struct Watch(AsyncFd<OwnedFd>);
 
     /// `None` when `pid` is already gone.
-    pub(super) fn arm(pid: u32) -> io::Result<Option<Watch>> {
+    pub(super) fn arm(pid: u32, _hub: &WatchHub) -> io::Result<Option<Watch>> {
         let pid = libc::pid_t::try_from(pid)
             .map_err(|_| io::Error::other(format!("process id {pid} is out of range")))?;
         // SAFETY: `pidfd_open` takes a process id and a flags word and
@@ -364,14 +386,18 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    //! `proc_pidinfo` for the table and a kqueue for the watch.
+    //! `proc_pidinfo` for the table and a single shared kqueue for every watch.
 
+    use std::collections::HashMap;
     use std::io;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use tokio::io::Interest;
     use tokio::io::unix::AsyncFd;
+    use tokio::sync::oneshot;
 
     fn info(pid: u32) -> io::Result<libc::proc_bsdinfo> {
         let pid = libc::c_int::try_from(pid)
@@ -430,26 +456,182 @@ mod imp {
         Ok(PathBuf::from(std::ffi::OsString::from_vec(path)))
     }
 
-    /// A kqueue holding one `NOTE_EXIT` registration: readable once the
-    /// process has exited.
+    /// One shared `kqueue` descriptor multiplexing every `EVFILT_PROC` watch
+    /// of one [`super::OsProcesses`] instance.
+    #[derive(Debug, Clone, Default)]
+    pub(super) struct WatchHub {
+        hub: Arc<Mutex<Option<Arc<KqueueHub>>>>,
+    }
+
+    type PidWaiters = HashMap<u32, Vec<(u64, oneshot::Sender<()>)>>;
+
+    struct KqueueInner {
+        queue: AsyncFd<OwnedFd>,
+        waiters: Mutex<PidWaiters>,
+        next_id: AtomicU64,
+    }
+
+    struct KqueueHub {
+        inner: Arc<KqueueInner>,
+        driver: tokio::task::JoinHandle<()>,
+    }
+
+    impl std::fmt::Debug for KqueueHub {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("KqueueHub")
+                .field("fd", &self.inner.queue.as_raw_fd())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Drop for KqueueHub {
+        fn drop(&mut self) {
+            self.driver.abort();
+        }
+    }
+
+    impl WatchHub {
+        fn get_or_init(&self) -> io::Result<Arc<KqueueHub>> {
+            let mut guard = self
+                .hub
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(hub) = guard.as_ref() {
+                return Ok(Arc::clone(hub));
+            }
+            // SAFETY: `kqueue` takes nothing and returns a new descriptor or -1.
+            let queue = unsafe { libc::kqueue() };
+            if queue < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `queue` is a descriptor `kqueue` just returned, which
+            // nothing else owns.
+            let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+            // A process the daemon starts must not inherit the watch.
+            // SAFETY: `F_SETFD` on a descriptor this function owns.
+            if unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let inner = Arc::new(KqueueInner {
+                queue: AsyncFd::with_interest(queue, Interest::READABLE)?,
+                waiters: Mutex::new(HashMap::new()),
+                next_id: AtomicU64::new(1),
+            });
+            let driver = tokio::spawn(drain_kqueue(Arc::clone(&inner)));
+            let hub = Arc::new(KqueueHub { inner, driver });
+            *guard = Some(Arc::clone(&hub));
+            drop(guard);
+            Ok(hub)
+        }
+
+        #[cfg(test)]
+        pub(super) fn new() -> Self {
+            Self::default()
+        }
+
+        #[cfg(test)]
+        pub(super) fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            self.hub
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|hub| hub.inner.queue.as_raw_fd())
+        }
+    }
+
+    async fn drain_kqueue(inner: Arc<KqueueInner>) {
+        loop {
+            let mut guard = match inner.queue.readable().await {
+                Ok(guard) => guard,
+                Err(error) => {
+                    tracing::warn!(%error, "shared kqueue readiness wait failed");
+                    return;
+                }
+            };
+            loop {
+                // SAFETY: a zeroed `kevent` is plain integers and a null pointer.
+                let mut events: [libc::kevent; 64] = unsafe { std::mem::zeroed() };
+                let result = guard.try_io(|queue| {
+                    let timeout = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    };
+                    loop {
+                        // SAFETY: zero changes, `events` holds 64 output slots, non-blocking zero timeout.
+                        let count = unsafe {
+                            libc::kevent(
+                                queue.as_raw_fd(),
+                                std::ptr::null(),
+                                0,
+                                events.as_mut_ptr(),
+                                i32::try_from(events.len()).expect("64 fits i32"),
+                                &raw const timeout,
+                            )
+                        };
+                        if count > 0 {
+                            return Ok(usize::try_from(count).expect("positive kevent count"));
+                        }
+                        if count == 0 {
+                            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                        }
+                        let error = io::Error::last_os_error();
+                        if error.kind() != io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
+                });
+                match result {
+                    Ok(Ok(count)) => {
+                        let mut to_notify = Vec::new();
+                        {
+                            let mut waiters = inner
+                                .waiters
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            for event in &events[..count] {
+                                if let Ok(pid) = u32::try_from(event.ident)
+                                    && let Some(entries) = waiters.remove(&pid)
+                                {
+                                    to_notify.extend(entries);
+                                }
+                            }
+                        }
+                        for (_, sender) in to_notify {
+                            let _ = sender.send(());
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "shared kqueue event drain failed");
+                        return;
+                    }
+                    Err(_would_block) => break,
+                }
+            }
+        }
+    }
+
+    /// One `NOTE_EXIT` registration on the shared kqueue.
     #[derive(Debug)]
-    pub(super) struct Watch(AsyncFd<OwnedFd>);
+    pub(super) struct Watch {
+        pid: u32,
+        id: u64,
+        hub: Arc<KqueueHub>,
+        exit: oneshot::Receiver<()>,
+    }
 
     /// `None` when `pid` is already gone.
-    pub(super) fn arm(pid: u32) -> io::Result<Option<Watch>> {
-        // SAFETY: `kqueue` takes nothing and returns a new descriptor or -1.
-        let queue = unsafe { libc::kqueue() };
-        if queue < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `queue` is a descriptor `kqueue` just returned, which
-        // nothing else owns.
-        let queue = unsafe { OwnedFd::from_raw_fd(queue) };
-        // A process the daemon starts must not inherit the watch.
-        // SAFETY: `F_SETFD` on a descriptor this function owns.
-        if unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+    pub(super) fn arm(pid: u32, hub: &WatchHub) -> io::Result<Option<Watch>> {
+        let hub = hub.get_or_init()?;
+        let id = hub.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let (sender, exit) = oneshot::channel();
+        // Hold `waiters` across `kevent(EV_ADD)` and waiter insertion so the
+        // drain loop can never observe `NOTE_EXIT` before the sender is stored.
+        let mut waiters = hub
+            .inner
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let change = libc::kevent {
             ident: pid as libc::uintptr_t,
             filter: libc::EVFILT_PROC,
@@ -465,7 +647,7 @@ mod imp {
         // SAFETY: one change in, one receipt out, both valid for the call.
         let registered = unsafe {
             libc::kevent(
-                queue.as_raw_fd(),
+                hub.inner.queue.as_raw_fd(),
                 &raw const change,
                 1,
                 &raw mut receipt,
@@ -484,15 +666,56 @@ mod imp {
                 Err(io::Error::from_raw_os_error(errno))
             };
         }
-        Ok(Some(Watch(AsyncFd::with_interest(
-            queue,
-            Interest::READABLE,
-        )?)))
+        waiters.entry(pid).or_default().push((id, sender));
+        drop(waiters);
+        Ok(Some(Watch { pid, id, hub, exit }))
     }
 
     impl Watch {
-        pub(super) async fn exited(self) -> io::Result<()> {
-            self.0.readable().await.map(drop)
+        pub(super) async fn exited(mut self) -> io::Result<()> {
+            (&mut self.exit)
+                .await
+                .map_err(|_| io::Error::other("shared kqueue watch driver stopped"))
+        }
+    }
+
+    impl Drop for Watch {
+        #[expect(
+            clippy::significant_drop_tightening,
+            reason = "hold waiters across EV_DELETE so a concurrent arm cannot race"
+        )]
+        fn drop(&mut self) {
+            let mut waiters = self
+                .hub
+                .inner
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entries) = waiters.get_mut(&self.pid) {
+                entries.retain(|(id, _)| *id != self.id);
+                if entries.is_empty() {
+                    waiters.remove(&self.pid);
+                    let delete = libc::kevent {
+                        ident: self.pid as libc::uintptr_t,
+                        filter: libc::EVFILT_PROC,
+                        flags: libc::EV_DELETE,
+                        fflags: 0,
+                        data: 0,
+                        udata: std::ptr::null_mut(),
+                    };
+                    // SAFETY: one change in, zero events out; `queue` is an open kqueue fd.
+                    let _ = unsafe {
+                        libc::kevent(
+                            self.hub.inner.queue.as_raw_fd(),
+                            &raw const delete,
+                            1,
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null(),
+                        )
+                    };
+                }
+            }
         }
     }
 }
@@ -681,8 +904,19 @@ mod imp {
     // `Arc` of `Send` parts.
     unsafe impl Send for Watch {}
 
+    /// Unused on Windows: each watch registers a thread-pool wait on its process handle.
+    #[derive(Debug, Clone, Default)]
+    pub(super) struct WatchHub;
+
+    impl WatchHub {
+        #[cfg(test)]
+        pub(super) const fn new() -> Self {
+            Self
+        }
+    }
+
     /// `None` when `pid` is already gone.
-    pub(super) fn arm(pid: u32) -> io::Result<Option<Watch>> {
+    pub(super) fn arm(pid: u32, _hub: &WatchHub) -> io::Result<Option<Watch>> {
         let process = match open(pid, SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION) {
             Ok(process) => process,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1017,5 +1251,62 @@ mod tests {
             .await
             .expect("fires at once")
             .expect("the wait succeeded");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn shared_kqueue_watches_multiple_processes_on_one_fd() {
+        use super::{OsProcesses, Processes as _};
+
+        let processes = OsProcesses::default();
+        assert_eq!(processes.hub.raw_fd(), None, "kqueue is created lazily");
+
+        let mut first = sleeper();
+        let mut second = sleeper();
+        let first_owner = CargoOwner {
+            pid: first.id(),
+            started: OsProcessTable.started(first.id()).expect("first start"),
+        };
+        let second_owner = CargoOwner {
+            pid: second.id(),
+            started: OsProcessTable.started(second.id()).expect("second start"),
+        };
+
+        let first_watch = processes.watch(first_owner).expect("watch first");
+        let shared_fd = processes
+            .hub
+            .raw_fd()
+            .expect("kqueue initialized after first watch");
+        let second_watch = processes.watch(second_owner).expect("watch second");
+        assert_eq!(
+            processes.hub.raw_fd(),
+            Some(shared_fd),
+            "second watch must reuse the same kqueue descriptor"
+        );
+
+        let first_done = tokio::spawn(first_watch);
+        let second_done = tokio::spawn(second_watch);
+
+        first.kill().expect("kill first");
+        tokio::time::timeout(Duration::from_secs(10), first_done)
+            .await
+            .expect("first watch fires")
+            .expect("join first")
+            .expect("first wait succeeded");
+        first.wait().expect("reap first");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !second_done.is_finished(),
+            "second watch must remain armed after first exits"
+        );
+
+        second.kill().expect("kill second");
+        tokio::time::timeout(Duration::from_secs(10), second_done)
+            .await
+            .expect("second watch fires")
+            .expect("join second")
+            .expect("second wait succeeded");
+        second.wait().expect("reap second");
     }
 }

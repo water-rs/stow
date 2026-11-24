@@ -16,5 +16,10 @@
 		<key>Crashed</key>
 		<true/>
 	</dict>
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>65536</integer>
+	</dict>
 </dict>
 </plist>

@@ -75,9 +75,60 @@ impl ArtifactProvenance {
     }
 }
 
+type VersionLeaseMap = std::collections::HashMap<(CacheTier, String), std::sync::Weak<FileLock>>;
+
+/// Shared handles to live rustc-version lease locks for one cache directory.
+///
+/// Each concurrent build session on the same rustc version needs the shared
+/// version lease held so another process switching rustc versions cannot purge
+/// the active version directory. Holding one `Arc<FileLock>` per
+/// `(CacheTier, rustc_version)` via weak references keeps at most one OS file
+/// descriptor per active tier and rustc version across all sessions in a
+/// daemon, while still releasing the flock as soon as the last session using
+/// that version drops its [`RustcVersionLease`].
+#[derive(Debug, Clone, Default)]
+pub struct SharedVersionLeases {
+    locks: std::sync::Arc<std::sync::Mutex<VersionLeaseMap>>,
+}
+
+impl SharedVersionLeases {
+    fn get(&self, tier: CacheTier, rustc_version: &str) -> Option<std::sync::Arc<FileLock>> {
+        let mut guard = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (tier, rustc_version.to_owned());
+        if let Some(weak) = guard.get(&key) {
+            if let Some(lock) = weak.upgrade() {
+                return Some(lock);
+            }
+            guard.remove(&key);
+        }
+        None
+    }
+
+    fn insert_or_get(
+        &self,
+        tier: CacheTier,
+        rustc_version: &str,
+        lock: std::sync::Arc<FileLock>,
+    ) -> std::sync::Arc<FileLock> {
+        let mut guard = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (tier, rustc_version.to_owned());
+        if let Some(existing) = guard.get(&key).and_then(std::sync::Weak::upgrade) {
+            return existing;
+        }
+        guard.insert(key, std::sync::Arc::downgrade(&lock));
+        lock
+    }
+}
+
 #[derive(Debug)]
 pub struct RustcVersionLease {
-    _locks: Vec<FileLock>,
+    _locks: Vec<std::sync::Arc<FileLock>>,
 }
 
 /// Everything the rustc wrapper resolved about a finished local build that
@@ -309,6 +360,7 @@ pub async fn prepare_local_cache(
             None => None,
         };
         let active_version_matches = tier_active.as_deref() == Some(rustc_version.as_str());
+        let existing_lease = config.version_leases.get(tier, &rustc_version);
         let tier_root_for_prepare = tier_root.clone();
         let purge_root_for_prepare = purge_root.clone();
         let rustc_version_for_prepare = rustc_version.clone();
@@ -319,6 +371,7 @@ pub async fn prepare_local_cache(
                 &purge_root_for_prepare,
                 &rustc_version_for_prepare,
                 active_version_matches,
+                existing_lease,
             )
         })
         .await
@@ -340,7 +393,11 @@ pub async fn prepare_local_cache(
                 .await?;
             }
         }
-        locks.push(prepared.version_lock);
+        let version_lock =
+            config
+                .version_leases
+                .insert_or_get(tier, &rustc_version, prepared.version_lock);
+        locks.push(version_lock);
         stale_dirs.extend(prepared.stale_dirs);
     }
     if !stale_dirs.is_empty() {
@@ -2155,6 +2212,7 @@ fn prepare_tier_cache_blocking(
     purge_root: &Path,
     rustc_version: &str,
     active_version_matches: bool,
+    existing_lease: Option<std::sync::Arc<FileLock>>,
 ) -> stow_types::error::Result<PreparedTierCache> {
     std::fs::create_dir_all(tier_root)
         .wrap_err_with(|| format!("create artifact cache tier {}", tier_root.display()))?;
@@ -2183,7 +2241,10 @@ fn prepare_tier_cache_blocking(
             version_dir.display()
         )
     })?;
-    let version_lock = acquire_version_shared_lock(&leases_root, rustc_version)?;
+    let version_lock = match existing_lease {
+        Some(lease) => lease,
+        None => std::sync::Arc::new(acquire_version_shared_lock(&leases_root, rustc_version)?),
+    };
     sweep_staging_locks(&version_dir.join(STAGING_DIR))?;
 
     if active_version_matches {
@@ -4065,7 +4126,7 @@ struct ArtifactCacheIndexEntry {
 struct PreparedTierCache {
     stale_dirs: Vec<PathBuf>,
     purged_versions: Vec<String>,
-    version_lock: FileLock,
+    version_lock: std::sync::Arc<FileLock>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -4824,6 +4885,7 @@ pub mod tests {
             &purge_root,
             "1.90.0",
             false,
+            None,
         )
         .expect("prepare old rustc cache");
         std::fs::write(artifact_root.join("1.90.0").join("busy.txt"), b"busy")
@@ -4835,6 +4897,7 @@ pub mod tests {
             &purge_root,
             "1.91.1",
             false,
+            None,
         )
         .expect("prepare new rustc cache");
         assert_eq!(switched.stale_dirs, Vec::<PathBuf>::new());
@@ -4842,6 +4905,57 @@ pub mod tests {
         assert!(artifact_root.join("1.91.1").exists());
 
         drop(first.version_lock);
+    }
+
+    #[test]
+    #[expect(
+        clippy::used_underscore_binding,
+        reason = "test inspects held lease Arc identity"
+    )]
+    fn shared_version_leases_reuse_one_lock_and_release_when_last_drops() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let handles = crate::daemon::session::CacheDirHandles::default();
+            let mut first_config = test_config(tempdir.path());
+            let mut second_config = test_config(tempdir.path());
+            handles.install(&mut first_config);
+            handles.install(&mut second_config);
+
+            let first = prepare_local_cache(&first_config, "1.91.1")
+                .await
+                .expect("prepare first lease");
+            let second = prepare_local_cache(&second_config, "1.91.1")
+                .await
+                .expect("prepare second lease");
+            assert_eq!(first._locks.len(), second._locks.len());
+            assert!(!first._locks.is_empty());
+            for (left, right) in first._locks.iter().zip(second._locks.iter()) {
+                assert!(
+                    std::sync::Arc::ptr_eq(left, right),
+                    "concurrent sessions on one rustc version should share the same FileLock"
+                );
+            }
+
+            let leases_root = first_config
+                .tier_dir(CacheTier::CratesIo)
+                .join(super::VERSION_LEASES_DIR);
+            drop(first);
+            assert!(
+                super::try_acquire_version_exclusive_lock(&leases_root, "1.91.1")
+                    .expect("probe exclusive lock while second lease is live")
+                    .is_none(),
+                "exclusive lock must remain blocked while second session holds the shared lease"
+            );
+
+            drop(second);
+            assert!(
+                super::try_acquire_version_exclusive_lock(&leases_root, "1.91.1")
+                    .expect("probe exclusive lock after all leases drop")
+                    .is_some(),
+                "exclusive lock must succeed once the last session drops its lease"
+            );
+        });
     }
 
     const STAGING_HELPER_ENV: &str = "STOW_TEST_STAGING_HELPER";
@@ -4949,6 +5063,7 @@ pub mod tests {
             &config.artifact_cache_purge_root(),
             "1.91.1",
             true,
+            None,
         )
         .expect("prepare cache");
         let staging_root = config
@@ -5021,6 +5136,7 @@ pub mod tests {
             &config.artifact_cache_purge_root(),
             "1.91.1",
             true,
+            None,
         )
         .expect("prepare cache");
         let staging_root = config
@@ -8185,6 +8301,7 @@ pub mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
+            version_leases: crate::artifact_cache::SharedVersionLeases::default(),
         }
     }
 

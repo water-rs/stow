@@ -208,6 +208,11 @@ pub struct StowConfig {
     /// life.
     #[serde(skip, default = "default_tier_staging")]
     pub artifact_cache_staging: Arc<[OnceCell<Arc<crate::artifact_cache::StagingDir>>; 3]>,
+    /// Daemon-shared weak table of active per-`(tier, rustc_version)` shared
+    /// lease locks so concurrent sessions on the same rustc hold one lock FD
+    /// per tier instead of one per session (stow#1690).
+    #[serde(skip, default)]
+    pub version_leases: crate::artifact_cache::SharedVersionLeases,
 }
 
 pub fn default_tier_staging() -> Arc<[OnceCell<Arc<crate::artifact_cache::StagingDir>>; 3]> {
@@ -437,6 +442,7 @@ impl StowConfig {
             trust_material: Arc::default(),
             registry_http: Arc::default(),
             artifact_cache_staging: default_tier_staging(),
+            version_leases: crate::artifact_cache::SharedVersionLeases::default(),
         })
     }
 
