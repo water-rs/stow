@@ -211,7 +211,7 @@ fn strip_rust_comments(source: &str) -> String {
             i += 1;
             while i < bytes.len() {
                 if bytes[i] == b'\\' {
-                    i = (i + 2).min(bytes.len());
+                    i += 1 + source[i + 1..].chars().next().map_or(0, char::len_utf8);
                 } else if bytes[i] == b'"' {
                     i += 1;
                     break;
@@ -367,7 +367,11 @@ fn scan_module_items(
                     } else {
                         negated_pub_items.push((item_name, neg));
                     }
-                    i = (after_attrs + 3).min(bytes.len());
+                    i = after_attrs
+                        + stripped
+                            .get(after_attrs..)
+                            .and_then(|rest| rest.chars().next())
+                            .map_or(0, char::len_utf8);
                     continue;
                 }
                 i = after_attrs.max(i + 2);
@@ -436,8 +440,9 @@ fn cfg_is_pure_feature_formula(pred: &str) -> bool {
             let eq = skip_ws(pred, i + "feature".len());
             if pred.as_bytes().get(eq) == Some(&b'=') {
                 let lit = skip_ws(pred, eq + 1);
-                if let Some(val) = parse_string_literal(&pred[lit..]) {
-                    i = lit + val.len() + 2;
+                if let Some((_, raw_len)) = pred.get(lit..).and_then(parse_string_literal_with_len)
+                {
+                    i = lit + raw_len;
                     continue;
                 }
             }
@@ -492,8 +497,12 @@ fn collect_negated_features_in_cfg(
 }
 
 fn preceded_by_pub(source: &str, mod_pos: usize) -> bool {
-    let before = source[..mod_pos].trim_end();
-    before.len() >= 3 && starts_ident_at(before, before.len() - 3, "pub")
+    let Some(before) = source.get(..mod_pos).map(str::trim_end) else {
+        return false;
+    };
+    before
+        .strip_suffix("pub")
+        .is_some_and(|prefix| prefix.as_bytes().last().is_none_or(|&b| !is_ident_byte(b)))
 }
 
 const fn consume_ident(source: &str, mut pos: usize) -> usize {
@@ -526,8 +535,8 @@ fn public_item_name_at(source: &str, pos: usize, saw_macro_export: bool) -> Opti
         }
         if starts_ident_at(source, cur, "extern") {
             cur = skip_ws(source, cur + "extern".len());
-            if let Some(abi) = parse_string_literal(&source[cur..]) {
-                cur = skip_ws(source, cur + abi.len() + 2);
+            if let Some((_, raw_len)) = source.get(cur..).and_then(parse_string_literal_with_len) {
+                cur = skip_ws(source, cur + raw_len);
             }
         }
         if starts_ident_at(source, cur, "use") {
@@ -606,14 +615,19 @@ fn collect_feature_literals(
 }
 
 fn parse_string_literal(rest: &str) -> Option<String> {
+    parse_string_literal_with_len(rest).map(|(value, _)| value)
+}
+
+fn parse_string_literal_with_len(rest: &str) -> Option<(String, usize)> {
     let body = rest.strip_prefix('"')?;
     let mut out = String::new();
-    let mut chars = body.chars();
-    while let Some(ch) = chars.next() {
+    let mut chars = body.char_indices();
+    while let Some((_, ch)) = chars.next() {
         if ch == '\\' {
-            out.push(chars.next()?);
+            out.push(chars.next()?.1);
         } else if ch == '"' {
-            return Some(out);
+            let consumed = 1 + chars.next().map_or(body.len(), |(next_idx, _)| next_idx);
+            return Some((out, consumed));
         } else {
             out.push(ch);
         }
@@ -631,7 +645,7 @@ const fn preceded_by_ident(bytes: &[u8], pos: usize) -> bool {
 
 fn starts_ident_at(s: &str, pos: usize, ident: &str) -> bool {
     let bytes = s.as_bytes();
-    if preceded_by_ident(bytes, pos) || !s[pos..].starts_with(ident) {
+    if !s.is_char_boundary(pos) || preceded_by_ident(bytes, pos) || !s[pos..].starts_with(ident) {
         return false;
     }
     bytes
@@ -683,7 +697,10 @@ fn balanced_slice(s: &str, open_pos: usize, open: u8, close: u8) -> Option<(&str
             i += 1;
             while i < bytes.len() {
                 if bytes[i] == b'\\' {
-                    i = (i + 2).min(bytes.len());
+                    i += 1 + s
+                        .get(i + 1..)
+                        .and_then(|rest| rest.chars().next())
+                        .map_or(0, char::len_utf8);
                 } else if bytes[i] == b'"' {
                     i += 1;
                     break;
@@ -985,6 +1002,21 @@ macro_rules! helper_macro { () => { 0 }; }
         assert!(
             non_additive_features_in_sources(once_cell_toml, &[], &[paired_pub_lib]).is_empty(),
             "paired positive/negated definitions of the same public symbol remain additive"
+        );
+
+        let utf8_edge_lib = r#"
+const UNITS: &str = "m⁻²";
+mod inner {}
+
+#[cfg(feature = "std")]
+fn helper() -> &'static str { "⁻" }
+
+#[cfg(all(feature = "std", not(feature = "parking_lot")))]
+pub extern "C\"⁻" fn escaped_abi() {}
+"#;
+        assert_eq!(
+            non_additive_features_in_sources(once_cell_toml, &[], &[utf8_edge_lib]),
+            BTreeSet::from(["parking_lot".to_owned()])
         );
     }
 }
