@@ -226,7 +226,7 @@ impl ExitWatch {
     /// another process.
     #[cfg(test)]
     pub fn arm(owner: CargoOwner, table: &impl ProcessTable) -> Result<Self, String> {
-        Self::arm_with(owner, table, &imp::WatchHub::default())
+        Self::arm_with(owner, table, &imp::WatchHub::new())
     }
 
     fn arm_with(
@@ -341,6 +341,13 @@ mod imp {
     /// Unused on Linux: each watch opens its own pidfd.
     #[derive(Debug, Clone, Default)]
     pub(super) struct WatchHub;
+
+    impl WatchHub {
+        #[cfg(test)]
+        pub(super) const fn new() -> Self {
+            Self
+        }
+    }
 
     /// A pidfd, readable once its process has exited.
     #[derive(Debug)]
@@ -516,6 +523,11 @@ mod imp {
             *guard = Some(Arc::clone(&hub));
             drop(guard);
             Ok(hub)
+        }
+
+        #[cfg(test)]
+        pub(super) fn new() -> Self {
+            Self::default()
         }
 
         #[cfg(test)]
@@ -895,6 +907,13 @@ mod imp {
     /// Unused on Windows: each watch registers a thread-pool wait on its process handle.
     #[derive(Debug, Clone, Default)]
     pub(super) struct WatchHub;
+
+    impl WatchHub {
+        #[cfg(test)]
+        pub(super) const fn new() -> Self {
+            Self
+        }
+    }
 
     /// `None` when `pid` is already gone.
     pub(super) fn arm(pid: u32, _hub: &WatchHub) -> io::Result<Option<Watch>> {

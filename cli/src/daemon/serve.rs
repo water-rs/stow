@@ -635,13 +635,17 @@ fn raise_nofile_limit() -> std::io::Result<(libc::rlim_t, libc::rlim_t)> {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let mut desired = DAEMON_NOFILE_TARGET.min(limit.rlim_max);
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(kernel_max) = macos_maxfilesperproc() {
-            desired = desired.min(kernel_max);
+    let desired = {
+        let target = DAEMON_NOFILE_TARGET.min(limit.rlim_max);
+        #[cfg(target_os = "macos")]
+        {
+            macos_maxfilesperproc().map_or(target, |kernel_max| target.min(kernel_max))
         }
-    }
+        #[cfg(not(target_os = "macos"))]
+        {
+            target
+        }
+    };
     if limit.rlim_cur >= desired {
         return Ok((limit.rlim_cur, limit.rlim_cur));
     }
