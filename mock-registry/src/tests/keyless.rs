@@ -1877,3 +1877,220 @@ async fn legacy_standalone_sig_records_and_markers_under_old_identity_resign_in_
     );
     assert_eq!(stack.writes(), writes_before, "rerun writes nothing");
 }
+
+#[tokio::test]
+async fn resign_strips_legacy_noncanonical_outputs_and_updates_records() {
+    use stow_types::bundle::{
+        ArtifactBlobConfig, ArtifactBundleFile, BundleParts, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+        STOW_ARTIFACT_CONFIG_MEDIA_TYPE, STOW_PACK_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE,
+        assemble_bundle,
+    };
+    use stow_types::bundle_schema::validate_bundle_schema;
+    use stow_types::registry::sha256_digest;
+
+    let stack = Stack::new().await;
+    let session = stack.session(&unbounded());
+    let trust = stow_oci::verify::Trust::GithubCi(stack.sigstore.trust());
+    let rustc = WireRustcVersion::parse(super::RUSTC).expect("rustc");
+    let base_plan = plan(&stack.root, 0);
+    let canonical_bytes = std::fs::read(&base_plan.outputs[0].path).expect("canonical output");
+    let alias_bytes = canonical_bytes.clone();
+    let alias_file = ArtifactBundleFile {
+        file_name: "libserde-0000000000000000.rlib".to_owned(),
+        media_type: STOW_RLIB_MEDIA_TYPE.to_owned(),
+        sha256: hex::encode(sha2::Sha256::digest(&alias_bytes)),
+    };
+    let canonical_file = base_plan.outputs[0].bundle_file.clone();
+
+    let legacy_config = ArtifactBlobConfig {
+        compile_key: base_plan.compile_key.clone(),
+        crate_name: base_plan.crate_name.clone(),
+        crate_version: base_plan.crate_version.clone(),
+        c_metadata: base_plan.c_metadata.clone(),
+        extra_filename: base_plan.extra_filename.clone(),
+        target: base_plan.target.clone(),
+        rustc_version: base_plan.rustc_version.clone(),
+        features_json: base_plan.features_json.clone(),
+        dependency_c_metadata_json: base_plan.dependency_c_metadata_json.clone(),
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf"),
+        dependency_compile_keys_json: base_plan.dependency_compile_keys_json.clone(),
+        profile: base_plan.profile.clone(),
+        emit: base_plan.emit.clone(),
+        artifact_size: (alias_bytes.len() + canonical_bytes.len()) as u64,
+        compile_millis: base_plan.compile_millis,
+        kind: base_plan.kind.clone(),
+        crate_types: base_plan.crate_types.clone(),
+        outputs: vec![alias_file.clone(), canonical_file.clone()],
+        native: None,
+        native_archive: None,
+    };
+    let legacy_config_bytes = serde_json::to_vec(&legacy_config).expect("config json");
+    let legacy_pack = stow_shim::pack(&[
+        (alias_file.file_name.as_str(), alias_bytes.as_slice()),
+        (
+            canonical_file.file_name.as_str(),
+            canonical_bytes.as_slice(),
+        ),
+    ])
+    .expect("legacy pack");
+    let legacy_manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+        "config": {
+            "mediaType": STOW_ARTIFACT_CONFIG_MEDIA_TYPE,
+            "digest": sha256_digest(&legacy_config_bytes),
+            "size": legacy_config_bytes.len(),
+        },
+        "layers": [{
+            "mediaType": STOW_PACK_MEDIA_TYPE,
+            "digest": sha256_digest(&legacy_pack),
+            "size": legacy_pack.len(),
+        }],
+    });
+    let legacy_manifest_bytes =
+        serde_json::to_vec(&legacy_manifest).expect("legacy oci manifest json");
+    let legacy_oci_digest = sha256_digest(&legacy_manifest_bytes);
+
+    let old_signer = stack.signer_as(OLD_IDENTITY);
+    let legacy_sig = old_signer
+        .sign_detached(&base_plan.oci_reference, &legacy_oci_digest)
+        .await
+        .expect("old node sign");
+    let legacy_bundle_bytes = assemble_bundle(&BundleParts {
+        oci_reference: &base_plan.oci_reference,
+        oci_digest: &legacy_oci_digest,
+        manifest_bytes: &legacy_manifest_bytes,
+        config_bytes: &legacy_config_bytes,
+        config: &legacy_config,
+        signatures: &[legacy_sig],
+        pack: &legacy_pack,
+    })
+    .expect("assemble legacy bundle");
+    assert!(
+        validate_bundle_schema(&legacy_bundle_bytes).is_err(),
+        "legacy bundle carrying builder alias fails current schema"
+    );
+
+    let legacy_bundle_digest = sha256_digest(&legacy_bundle_bytes);
+    let legacy_bundle_size = legacy_bundle_bytes.len() as u64;
+    session
+        .push_blob(&legacy_bundle_digest, &legacy_bundle_bytes)
+        .await
+        .expect("push legacy bundle blob");
+
+    let mut published = BTreeMap::new();
+    published.insert(
+        base_plan.oci_reference.clone(),
+        stow_types::upload_plan::PublishedArtifact {
+            oci_digest: legacy_oci_digest.clone(),
+            bundle_digest: legacy_bundle_digest,
+            bundle_size: legacy_bundle_size,
+        },
+    );
+    let old_rows = stow_types::upload_plan::build_artifact_records(
+        std::slice::from_ref(&base_plan),
+        &published,
+        &[(base_plan.oci_reference.clone(), None)]
+            .into_iter()
+            .collect(),
+    )
+    .expect("records");
+    assert_eq!(old_rows[0].artifact_size, canonical_bytes.len() as u64);
+    let old_records = stow_oci::push_records_with(
+        &session,
+        &rustc,
+        "legacy-alias-task",
+        BuildRun {
+            run_id: 1,
+            run_attempt: 1,
+        },
+        &BuildRecords {
+            artifacts: old_rows.clone(),
+            local_programs: Vec::new(),
+        },
+        |reference, digest| {
+            let signer = &old_signer;
+            async move { signer.sign_detached(&reference, &digest).await }
+        },
+    )
+    .await
+    .expect("push old records");
+
+    let new_signer = stack.signer_as(CERTIFICATE_IDENTITY);
+    let sign_detached = |reference: String, digest: String| {
+        let signer = &new_signer;
+        async move { signer.sign_detached(&reference, &digest).await }
+    };
+    let identities = Identities {
+        old: &old_identity(),
+        new: &reader_identity(),
+    };
+    let resigned = stow_oci::resign::resign_task(
+        &session,
+        &trust,
+        &rustc,
+        &[old_records.tag.as_str()],
+        identities,
+        BuildRun {
+            run_id: 2,
+            run_attempt: 1,
+        },
+        Signers {
+            records: &sign_detached,
+            node: &sign_detached,
+        },
+    )
+    .await
+    .expect("resign strips legacy alias and succeeds");
+    assert_eq!(resigned.nodes_republished, 1);
+
+    let new_tag = resigned.published.expect("new records").tag;
+    let new_rows = stow_oci::pull_records_by_tag(&session, &new_tag)
+        .await
+        .expect("new records")
+        .records
+        .artifacts;
+    assert_eq!(new_rows.len(), 1);
+    let new_row = &new_rows[0];
+    assert_ne!(new_row.oci_digest, legacy_oci_digest);
+    assert_eq!(new_row.artifact_size, canonical_bytes.len() as u64);
+
+    let new_bundle_bytes = session
+        .pull_blob(&new_row.bundle_digest)
+        .await
+        .expect("pull cleaned bundle");
+    validate_bundle_schema(&new_bundle_bytes).expect("cleaned bundle passes schema validation");
+    stack
+        .verify(&session, new_row)
+        .await
+        .expect("cleaned node verifies under release-tag identity");
+
+    let writes_before = stack.writes();
+    let rerun = stow_oci::resign::resign_task(
+        &session,
+        &trust,
+        &rustc,
+        &[new_tag.as_str(), old_records.tag.as_str()],
+        identities,
+        BuildRun {
+            run_id: 3,
+            run_attempt: 1,
+        },
+        Signers {
+            records: &sign_detached,
+            node: &sign_detached,
+        },
+    )
+    .await
+    .expect("rerun succeeds");
+    assert_eq!(
+        (
+            rerun.records_signed,
+            rerun.records_already,
+            rerun.nodes_republished,
+            rerun.nodes_already,
+        ),
+        (0, 2, 0, 1)
+    );
+    assert_eq!(stack.writes(), writes_before);
+}

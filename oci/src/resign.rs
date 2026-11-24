@@ -28,6 +28,7 @@ pub use sigstore::bundle::verify::policy::Identity as ExactIdentity;
 pub use sigstore::bundle::verify::policy::VerificationPolicy;
 use stow_types::api::{ArtifactRecord, CI_TARGET_TRIPLES};
 use stow_types::bundle::{BundleSignatureMaterial, STOW_BUNDLE_PACK_PATH, STOW_PACK_MEDIA_TYPE};
+use stow_types::bundle_schema::canonical_output_indices;
 use stow_types::error::Context as _;
 use stow_types::identity::WireRustcVersion;
 use stow_types::records::{
@@ -453,23 +454,71 @@ where
 
     let pack = bundle.layer(STOW_BUNDLE_PACK_PATH, layer)?.to_vec();
     let files = bundle.config.packed_files().cloned().collect::<Vec<_>>();
-    let pack = smol::unblock(move || {
-        let expected = files.iter().collect::<Vec<_>>();
-        stow_shim::unpack(&pack, &expected).map(|_| pack)
-    })
-    .await
-    .wrap_err_with(|| format!("check the pack of {oci_reference}"))?;
+    let canonical_indices = canonical_output_indices(&bundle.config)
+        .wrap_err_with(|| format!("validate canonical outputs of {oci_reference}"))?;
+    let mut cleaned = bundle.config.clone();
+    let (cleaned_config_bytes, cleaned_pack, stripped_legacy) =
+        if canonical_indices.len() == bundle.config.outputs.len() {
+            let pack = smol::unblock(move || {
+                let expected = files.iter().collect::<Vec<_>>();
+                stow_shim::unpack(&pack, &expected).map(|_| pack)
+            })
+            .await
+            .wrap_err_with(|| format!("check the pack of {oci_reference}"))?;
+            (bundle.config_bytes.clone(), pack, false)
+        } else {
+            // Pre-`stow#1495` bundles included cargo's per-invocation alias copy
+            // alongside the stable-named outputs; strip the alias copy after
+            // verifying every file's hash against the old signed config.
+            let has_native_archive = bundle.config.native_archive.is_some();
+            let orig_outputs_len = bundle.config.outputs.len();
+            let unpacked = smol::unblock(move || {
+                let expected = files.iter().collect::<Vec<_>>();
+                stow_shim::unpack(&pack, &expected)
+            })
+            .await
+            .wrap_err_with(|| format!("check the pack of {oci_reference}"))?;
+            let mut retained_outputs = Vec::with_capacity(canonical_indices.len());
+            let mut retained_bytes: Vec<(&str, &[u8])> =
+                Vec::with_capacity(canonical_indices.len() + usize::from(has_native_archive));
+            let mut artifact_size = 0u64;
+            for &index in &canonical_indices {
+                let output = bundle.config.outputs[index].clone();
+                let bytes = &unpacked[index];
+                artifact_size =
+                    artifact_size.saturating_add(u64::try_from(bytes.len()).map_err(|_| {
+                        stow_types::stow_error!("output of {oci_reference} exceeds u64 bytes")
+                    })?);
+                retained_outputs.push(output);
+                retained_bytes.push((
+                    bundle.config.outputs[index].file_name.as_str(),
+                    bytes.as_slice(),
+                ));
+            }
+            if let Some(native) = &bundle.config.native_archive {
+                retained_bytes.push((
+                    native.file_name.as_str(),
+                    unpacked[orig_outputs_len].as_slice(),
+                ));
+            }
+            let cleaned_pack = stow_shim::pack(&retained_bytes)
+                .wrap_err_with(|| format!("re-pack canonical outputs of {oci_reference}"))?;
+            cleaned.outputs = retained_outputs;
+            cleaned.artifact_size = artifact_size;
+            let cleaned_config_bytes = serde_json::to_vec(&cleaned)?;
+            (cleaned_config_bytes, cleaned_pack, true)
+        };
 
     let published = publish_packed(
         session,
         oci_reference,
-        &bundle.config,
-        &bundle.config_bytes,
-        &pack,
+        &cleaned,
+        &cleaned_config_bytes,
+        &cleaned_pack,
         sign,
     )
     .await?;
-    if published.oci_digest != record.oci_digest {
+    if !stripped_legacy && published.oci_digest != record.oci_digest {
         return Err(stow_types::stow_error!(
             "republishing {oci_reference} produced {}, not the recorded {}",
             published.oci_digest,
@@ -477,6 +526,8 @@ where
         ));
     }
     Ok(NodeResigned::Republished(Box::new(ArtifactRecord {
+        oci_digest: published.oci_digest,
+        artifact_size: cleaned.artifact_size,
         bundle_digest: published.bundle_digest,
         bundle_size: published.bundle_size,
         ..record.clone()

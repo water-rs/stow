@@ -106,26 +106,7 @@ fn validate_bundle_config_identity(config: &ArtifactBlobConfig) -> Result<(), Bu
             Some(_) => {}
             None => lib_name = Some(stem.clone()),
         }
-        let canonical_stem = format!("lib{stem}{extra}", extra = config.extra_filename);
-        let canonical = match kind {
-            BundleOutputKind::Executable => {
-                output.file_name == canonical_executable_name(config, &stem)
-            }
-            BundleOutputKind::Rlib => output.file_name == format!("{canonical_stem}.rlib"),
-            BundleOutputKind::Rmeta => output.file_name == format!("{canonical_stem}.rmeta"),
-            BundleOutputKind::Dynamic => {
-                // Dynamic output names are platform-shaped: unix takes
-                // `lib<crate><extra>.{so,dylib}`, Windows takes
-                // `<crate><extra>.dll` with no `lib` prefix.
-                let prefix = if config.target.is_windows() {
-                    format!("{stem}{extra}.dll", extra = config.extra_filename)
-                } else {
-                    format!("{canonical_stem}.")
-                };
-                output.file_name.starts_with(&prefix)
-            }
-        };
-        if !canonical {
+        if !is_canonical_output(config, output, &stem, kind) {
             return Err(BundleSchemaError(format!(
                 "bundle output {} is not named for stable metadata {}",
                 output.file_name, config.c_metadata
@@ -136,7 +117,83 @@ fn validate_bundle_config_identity(config: &ArtifactBlobConfig) -> Result<(), Bu
     Ok(())
 }
 
+/// Return the indices in `config.outputs` naming canonical outputs.
+///
+/// Legacy pre-`stow#1495` bundles also carry cargo's per-invocation alias copy
+/// (builder-hash outputs or bare `build_script_build`); this drops those copies
+/// and validates the retained subset against the current bundle schema.
+///
+/// # Errors
+/// Returns [`BundleSchemaError`] when `config`'s identity is invalid, no
+/// canonical output exists in `config.outputs`, or the retained outputs still
+/// violate the bundle schema.
+pub fn canonical_output_indices(
+    config: &ArtifactBlobConfig,
+) -> Result<Vec<usize>, BundleSchemaError> {
+    let stable_c_metadata =
+        stable_c_metadata_for_compile_key(&config.compile_key).map_err(|error| {
+            BundleSchemaError(format!(
+                "bundle compile_key {} is not a valid stable public-cache identity: {error}",
+                config.compile_key
+            ))
+        })?;
+    if stable_c_metadata != config.c_metadata.as_str() {
+        return Err(BundleSchemaError(format!(
+            "bundle c_metadata {} does not match stable compile_key prefix {}",
+            config.c_metadata, stable_c_metadata
+        )));
+    }
+    let indices: Vec<usize> = config
+        .outputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, output)| {
+            let (stem, kind) = classify_bundle_output(config, output).ok()?;
+            is_canonical_output(config, output, &stem, kind).then_some(index)
+        })
+        .collect();
+    if indices.is_empty() {
+        return Err(BundleSchemaError(format!(
+            "bundle carries no canonical outputs for stable metadata {}",
+            config.c_metadata
+        )));
+    }
+    let mut cleaned = config.clone();
+    cleaned.outputs = indices
+        .iter()
+        .map(|&index| config.outputs[index].clone())
+        .collect();
+    validate_bundle_config_identity(&cleaned)?;
+    Ok(indices)
+}
+
+fn is_canonical_output(
+    config: &ArtifactBlobConfig,
+    output: &ArtifactBundleFile,
+    stem: &str,
+    kind: BundleOutputKind,
+) -> bool {
+    let canonical_stem = format!("lib{stem}{extra}", extra = config.extra_filename);
+    match kind {
+        BundleOutputKind::Executable => output.file_name == canonical_executable_name(config, stem),
+        BundleOutputKind::Rlib => output.file_name == format!("{canonical_stem}.rlib"),
+        BundleOutputKind::Rmeta => output.file_name == format!("{canonical_stem}.rmeta"),
+        BundleOutputKind::Dynamic => {
+            // Dynamic output names are platform-shaped: unix takes
+            // `lib<crate><extra>.{so,dylib}`, Windows takes
+            // `<crate><extra>.dll` with no `lib` prefix.
+            let prefix = if config.target.is_windows() {
+                format!("{stem}{extra}.dll", extra = config.extra_filename)
+            } else {
+                format!("{canonical_stem}.")
+            };
+            output.file_name.starts_with(&prefix)
+        }
+    }
+}
+
 /// Which canonical check a bundle output participates in.
+#[derive(Clone, Copy)]
 enum BundleOutputKind {
     Rlib,
     Rmeta,
@@ -576,5 +633,44 @@ mod tests {
         config.kind = ArtifactKind::BuildScript;
         config.crate_types = vec![RustCrateType::Bin];
         validate_bundle_schema(&bundle_bytes(config)).unwrap();
+    }
+
+    #[test]
+    fn canonical_output_indices_strips_legacy_builder_copies_and_rejects_empty() {
+        use super::canonical_output_indices;
+
+        let shared = stable_config(vec![
+            bundle_file("libproc_macro2-68afcc2f66100859.rlib", STOW_RLIB_MEDIA_TYPE),
+            bundle_file("libproc_macro2-df1c5df8d44a9ede.rlib", STOW_RLIB_MEDIA_TYPE),
+            bundle_file(
+                "libproc_macro2-68afcc2f66100859.rmeta",
+                STOW_RMETA_MEDIA_TYPE,
+            ),
+            bundle_file(
+                "libproc_macro2-df1c5df8d44a9ede.rmeta",
+                STOW_RMETA_MEDIA_TYPE,
+            ),
+        ]);
+        assert_eq!(canonical_output_indices(&shared).unwrap(), vec![1, 3]);
+
+        let mut build_unit = stable_config(vec![
+            bundle_file(
+                "build_script_build",
+                crate::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE,
+            ),
+            bundle_file(
+                "build_script_build-df1c5df8d44a9ede",
+                crate::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE,
+            ),
+        ]);
+        build_unit.kind = ArtifactKind::BuildScript;
+        build_unit.crate_types = vec![RustCrateType::Bin];
+        assert_eq!(canonical_output_indices(&build_unit).unwrap(), vec![1]);
+
+        let no_canonical = stable_config(vec![bundle_file(
+            "libproc_macro2-68afcc2f66100859.rlib",
+            STOW_RLIB_MEDIA_TYPE,
+        )]);
+        assert!(canonical_output_indices(&no_canonical).is_err());
     }
 }
