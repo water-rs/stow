@@ -746,23 +746,50 @@ pub async fn clean_project(
         crate::daemon::stop_if_running(&exe, settings)
     })
     .await;
-    clean_cache_dir(&cache_dir, args.all, state_db).await?;
-    write_stdout(&format!("removed {}\n", cache_dir.display()))
+    let skipped_build_dirs = clean_cache_dir(&cache_dir, args.all, state_db).await?;
+    if skipped_build_dirs > 0 {
+        let noun = if skipped_build_dirs == 1 {
+            "directory"
+        } else {
+            "directories"
+        };
+        write_stdout(&format!(
+            "removed {} (skipped {skipped_build_dirs} active build {noun} under {BUILD_DIR_PARENT})\n",
+            cache_dir.display()
+        ))
+    } else {
+        write_stdout(&format!("removed {}\n", cache_dir.display()))
+    }
 }
 
 async fn clean_cache_dir(
     cache_dir: &Path,
     all: bool,
     state_db: &StateDb,
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<usize> {
+    // Handle `state-v3.sqlite3` before removing subdirectories so a concurrent
+    // build holding a lock under `build-dir` can never leave an incompatible
+    // state database behind blocking subsequent commands.
     if all {
         state_db.close().await;
-        return async_fs::remove_dir_all(cache_dir)
-            .await
-            .wrap_err_with(|| format!("remove cache dir {}", cache_dir.display()));
+        crate::state_db::remove_state_db_files(cache_dir).await?;
+    } else {
+        state_db.close_tiers().await;
+        if crate::state_db::state_db_path(cache_dir).exists() {
+            match state_db.pool(cache_dir).await {
+                Ok(pool) => crate::state_db::clear_cached_entries(&pool).await?,
+                Err(error) => {
+                    tracing::info!(
+                        %error,
+                        "state database could not be opened under current schema; removing it"
+                    );
+                    crate::state_db::remove_state_db_files(cache_dir).await?;
+                }
+            }
+        }
     }
-    state_db.close_tiers().await;
 
+    let mut skipped_build_dirs = 0usize;
     let mut entries = async_fs::read_dir(cache_dir)
         .await
         .wrap_err_with(|| format!("read cache dir {}", cache_dir.display()))?;
@@ -772,40 +799,79 @@ async fn clean_cache_dir(
     {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if matches!(name_str.as_ref(), "index" | "stats.json")
-            || crate::state_db::is_state_db_file(&name_str)
+        if !all
+            && (matches!(name_str.as_ref(), "index" | "stats.json")
+                || crate::state_db::is_state_db_file(&name_str))
         {
             continue;
         }
         let path = entry.path();
-        let kind = entry
-            .file_type()
-            .await
-            .wrap_err_with(|| format!("stat {}", path.display()))?;
-        if kind.is_dir() {
-            async_fs::remove_dir_all(&path)
-                .await
-                .wrap_err_with(|| format!("remove {}", path.display()))?;
+        let kind = match entry.file_type().await {
+            Ok(kind) => kind,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).wrap_err_with(|| format!("stat {}", path.display())),
+        };
+        if kind.is_dir() && name_str.as_ref() == BUILD_DIR_PARENT {
+            skipped_build_dirs +=
+                tokio::task::spawn_blocking(move || crate::build_dirs::clean_all(&path))
+                    .await
+                    .wrap_err("join build-dir clean task")??;
+        } else if kind.is_dir() {
+            remove_cache_subdir(&path).await?;
         } else {
-            async_fs::remove_file(&path)
-                .await
-                .wrap_err_with(|| format!("remove {}", path.display()))?;
-        }
-    }
-
-    if crate::state_db::state_db_path(cache_dir).exists() {
-        match state_db.pool(cache_dir).await {
-            Ok(pool) => crate::state_db::clear_cached_entries(&pool).await?,
-            Err(error) => {
-                tracing::info!(
-                    %error,
-                    "state database could not be opened under current schema; removing it"
-                );
-                crate::state_db::remove_state_db_files(cache_dir).await?;
+            match async_fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| format!("remove {}", path.display()));
+                }
             }
         }
     }
-    Ok(())
+
+    if all {
+        match async_fs::remove_dir(cache_dir).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    && skipped_build_dirs > 0 => {}
+            Err(error) => {
+                return Err(error)
+                    .wrap_err_with(|| format!("remove cache dir {}", cache_dir.display()));
+            }
+        }
+    }
+    Ok(skipped_build_dirs)
+}
+
+/// Remove a cache subdirectory without racing against processes that recreate
+/// entries under the original path: on Unix, atomically rename it aside first.
+async fn remove_cache_subdir(path: &Path) -> stow_types::error::Result<()> {
+    #[cfg(unix)]
+    let target = {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if name.starts_with(".clean-") {
+            path.to_path_buf()
+        } else {
+            let aside = path.with_file_name(format!(".clean-{}-{name}", std::process::id()));
+            match async_fs::rename(path, &aside).await {
+                Ok(()) => aside,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| format!("move {} aside", path.display()));
+                }
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let target = path.to_path_buf();
+
+    match async_fs::remove_dir_all(&target).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).wrap_err_with(|| format!("remove {}", target.display())),
+    }
 }
 
 /// `stow check-artifact`: resolve `c_metadata` against the verified index
@@ -2201,6 +2267,75 @@ mod tests {
         assert!(slice_dir.join("current.json").is_file());
         assert!(!crate::state_db::state_db_path(cache).exists());
         state_db.close().await;
+    }
+
+    #[tokio::test]
+    async fn clean_skips_active_build_dir_and_still_removes_schema_mismatched_state_db() {
+        let dir = tempfile::tempdir().expect("temp cache dir");
+        let cache = dir.path();
+        let slice_dir = cache.join("index/aarch64-apple-darwin/1.100.0");
+        std::fs::create_dir_all(&slice_dir).expect("slice dir");
+        std::fs::write(slice_dir.join("current.json"), b"{}").expect("pointer");
+        std::fs::write(cache.join("stats.json"), b"{}").expect("stats");
+        std::fs::create_dir_all(cache.join("crates-io/1.100.0/entry")).expect("crates-io");
+
+        let state_path = crate::state_db::state_db_path(cache);
+        std::fs::write(&state_path, b"not-a-valid-sqlite").expect("corrupt db");
+        std::fs::write(cache.join("state-v3.sqlite3-wal"), b"wal").expect("wal");
+        std::fs::write(cache.join("state-v3.sqlite3-shm"), b"shm").expect("shm");
+
+        // Sharded cargo build-dir layout: `<shard>/<hash>/<triple>/<profile>/.cargo-build-lock`
+        let active_ws = cache.join("build-dir/b3/dea7bd2fb461ea");
+        let active_profile = active_ws.join("aarch64-apple-darwin/debug");
+        std::fs::create_dir_all(&active_profile).expect("active profile");
+        let active_lock_path = active_profile.join(".cargo-build-lock");
+        let active_lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&active_lock_path)
+            .expect("open active lock");
+        let active_lock =
+            crate::file_lock::FileLock::exclusive(active_lock_file).expect("hold cargo build lock");
+
+        let idle_ws = cache.join("build-dir/b3/11111111111111");
+        std::fs::create_dir_all(idle_ws.join("debug")).expect("idle profile");
+        std::fs::write(idle_ws.join("debug/.cargo-build-lock"), b"").expect("idle lock");
+
+        let state_db = crate::state_db::StateDb::default();
+        let skipped = super::clean_cache_dir(cache, false, &state_db)
+            .await
+            .expect("default clean succeeds despite active build");
+        assert_eq!(skipped, 1);
+        assert!(!state_path.exists());
+        assert!(!cache.join("state-v3.sqlite3-wal").exists());
+        assert!(!cache.join("state-v3.sqlite3-shm").exists());
+        assert!(!cache.join("crates-io").exists());
+        assert!(!idle_ws.exists(), "idle sibling workspace must be cleaned");
+        assert!(
+            active_ws.exists(),
+            "active locked workspace must be preserved"
+        );
+        assert!(slice_dir.join("current.json").is_file());
+        state_db.close().await;
+
+        let all_db = crate::state_db::StateDb::default();
+        let skipped_all = super::clean_cache_dir(cache, true, &all_db)
+            .await
+            .expect("clean --all succeeds despite active build");
+        assert_eq!(skipped_all, 1);
+        assert!(!cache.join("index").exists());
+        assert!(!cache.join("stats.json").exists());
+        assert!(active_ws.exists());
+
+        drop(active_lock);
+        let final_db = crate::state_db::StateDb::default();
+        let skipped_after = super::clean_cache_dir(cache, true, &final_db)
+            .await
+            .expect("clean --all removes root once lock is released");
+        assert_eq!(skipped_after, 0);
+        assert!(!cache.exists());
     }
 
     #[test]

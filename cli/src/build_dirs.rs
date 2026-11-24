@@ -346,12 +346,134 @@ fn newest_modification_ms(dir: &Path) -> Result<u64> {
     Ok(newest)
 }
 
+/// Remove every idle workspace build directory under `root`, skipping any
+/// whose `.cargo-build-lock` is held by a running `cargo` build. Returns
+/// the number of active build directories skipped.
+///
+/// Cargo's `{workspace-path-hash}` template shards workspaces into two-hex
+/// subdirectories (`<root>/<2-hex>/<14-hex>/...`), while direct workspace
+/// directories (`<root>/<name>/...`) can also exist. Shards are descended
+/// into so an active build in one workspace does not block cleaning idle
+/// siblings under the same shard.
+///
+/// # Errors
+///
+/// Listing `root` or removing an unlocked entry failed.
+pub fn clean_all(root: &Path) -> Result<usize> {
+    let listing = match std::fs::read_dir(root) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error).wrap_err_with(|| format!("list {}", root.display())),
+    };
+    let mut skipped = 0usize;
+    for entry in listing {
+        let entry = entry.wrap_err_with(|| format!("list {}", root.display()))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(COLLECTING_PREFIX) {
+            remove_path(&path)?;
+            continue;
+        }
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).wrap_err_with(|| format!("stat {}", path.display())),
+        };
+        if !kind.is_dir() {
+            remove_path(&path)?;
+            continue;
+        }
+        if is_hash_shard_name(&name_str) {
+            skipped += clean_shard(&path)?;
+            remove_empty_dir(&path)?;
+        } else if !remove_unlocked(&path)? {
+            tracing::info!(
+                build_dir = %path.display(),
+                "skipping active build directory held by a running cargo build"
+            );
+            skipped += 1;
+        }
+    }
+    remove_empty_dir(root)?;
+    Ok(skipped)
+}
+
+fn clean_shard(shard: &Path) -> Result<usize> {
+    let listing = match std::fs::read_dir(shard) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error).wrap_err_with(|| format!("list {}", shard.display())),
+    };
+    let mut skipped = 0usize;
+    for entry in listing {
+        let entry = entry.wrap_err_with(|| format!("list {}", shard.display()))?;
+        let path = entry.path();
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(COLLECTING_PREFIX)
+        {
+            remove_path(&path)?;
+            continue;
+        }
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).wrap_err_with(|| format!("stat {}", path.display())),
+        };
+        if !kind.is_dir() {
+            remove_path(&path)?;
+            continue;
+        }
+        if !remove_unlocked(&path)? {
+            tracing::info!(
+                build_dir = %path.display(),
+                "skipping active build directory held by a running cargo build"
+            );
+            skipped += 1;
+        }
+    }
+    Ok(skipped)
+}
+
+fn is_hash_shard_name(name: &str) -> bool {
+    name.len() == 2 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn remove_empty_dir(dir: &Path) -> Result<()> {
+    match std::fs::remove_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).wrap_err_with(|| format!("remove {}", dir.display())),
+    }
+}
+
 /// Remove `dir` with every cargo build lock inside it held; `false`, with
 /// nothing removed, when a lock is held by a build.
 fn remove_unlocked(dir: &Path) -> Result<bool> {
     let mut locks = Vec::new();
-    for entry in walkdir::WalkDir::new(dir).max_depth(3) {
-        let entry = entry.wrap_err_with(|| format!("walk {}", dir.display()))?;
+    // Depth 4 covers both `<ws>/<triple>/<profile>/.cargo-build-lock` and a
+    // two-level `<shard>/<hash>/<triple>/<profile>/.cargo-build-lock` tree.
+    for entry in walkdir::WalkDir::new(dir).max_depth(4) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error)
+                if error
+                    .io_error()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error).wrap_err_with(|| format!("walk {}", dir.display())),
+        };
         if entry.file_name() != OsStr::new(CARGO_BUILD_LOCK) || !entry.file_type().is_file() {
             continue;
         }
@@ -376,7 +498,13 @@ fn remove_unlocked(dir: &Path) -> Result<bool> {
     #[cfg(unix)]
     {
         let hidden = hidden_sibling(dir);
-        std::fs::rename(dir, &hidden).wrap_err_with(|| format!("move {} aside", dir.display()))?;
+        match std::fs::rename(dir, &hidden) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => {
+                return Err(error).wrap_err_with(|| format!("move {} aside", dir.display()));
+            }
+        }
         drop(locks);
         remove_path(&hidden)?;
         Ok(true)
