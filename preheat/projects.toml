@@ -687,3 +687,6 @@ repo = "https://github.com/xerj-org/xerj"
 [[project]]
 repo = "https://github.com/storytold/lightcraft"
 
+[[project]]
+repo = "https://github.com/May-Agent/may"
+
