@@ -23,6 +23,7 @@ mod index_migrate_records;
 mod index_resign;
 mod launch_model;
 mod login;
+mod lookup_r2;
 mod maintenance;
 mod manual;
 mod operations;

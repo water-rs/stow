@@ -112,13 +112,19 @@ jobs:
           INPUT_RUSTC: ${{ inputs.rustc_version }}
         run: |
           set -euo pipefail
+          stable_rustc="$(curl -fsS https://static.rust-lang.org/dist/channel-rust-stable.toml \
+            | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
           if [ -n "$INPUT_RUSTC" ]; then
             rustc_version="$INPUT_RUSTC"
           else
-            rustc_version="$(curl -fsS https://static.rust-lang.org/dist/channel-rust-stable.toml \
-              | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
+            rustc_version="$stable_rustc"
           fi
           echo "RUSTC_VERSION=$rustc_version" >> "$GITHUB_ENV"
+          if [ "$rustc_version" = "$stable_rustc" ]; then
+            echo "IS_STABLE_RUSTC=true" >> "$GITHUB_ENV"
+          else
+            echo "IS_STABLE_RUSTC=false" >> "$GITHUB_ENV"
+          fi
       # The one-time re-sign of the slices signed before the release-tag
       # switch (stow#1515): the export below verifies each previous slice
       # under the release-tag identity, so the slices gain it first.
@@ -207,6 +213,8 @@ jobs:
           STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           # When the export ran `--full` the report does too: its slices
           # carry no `.prev` base.
           INPUT_FULL: ${{ inputs.full }}
@@ -221,10 +229,12 @@ jobs:
           slices = json.load(open(os.path.join(out, "slices.json")))
           failed = []
           report = []
+          lookup = []
           for s in slices:
               print(f"::group::{s['tag']}", flush=True)
               file = os.path.join(out, s["index_file"])
               folded = os.path.join(out, s["folded_file"])
+              lookup_file = os.path.join(out, s["lookup_file"])
               ok = subprocess.run(["stow-admin", "index", "publish",
                                    "--file", file, "--folded", folded]).returncode == 0
               # The report gathers every slice the run published into
@@ -234,6 +244,8 @@ jobs:
               # into it.
               if ok and os.environ["REPORT"] == "true":
                   report += ["--file", file]
+              if ok and os.environ.get("IS_STABLE_RUSTC") == "true" and os.environ.get("CLOUDFLARE_API_TOKEN"):
+                  lookup += ["--file", lookup_file]
               print("::endgroup::", flush=True)
               if not ok:
                   print(f"::error::index publish failed for {s['tag']}", flush=True)
@@ -252,6 +264,13 @@ jobs:
               if not ok:
                   print("::error::index report failed", flush=True)
                   failed.append("report")
+          if lookup:
+              print("::group::publish-lookup", flush=True)
+              ok = subprocess.run(["stow-admin", "index", "publish-lookup"] + lookup).returncode == 0
+              print("::endgroup::", flush=True)
+              if not ok:
+                  print("::error::lookup index publish to R2 failed", flush=True)
+                  failed.append("lookup")
           if failed:
               print(f"::error::index publish incomplete: {' '.join(failed)}", flush=True)
               sys.exit(1)

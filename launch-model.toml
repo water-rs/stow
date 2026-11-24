@@ -24,7 +24,6 @@ period_days = 365
 
 [rates]
 cli_byte_path_fetch = 3.0
-index_pull = 1.0
 admission = 0.1201
 enqueue_redemption = 0.09
 human_request = 0.0148

@@ -34,7 +34,7 @@ use stow_types::api::{CI_TARGET_TRIPLES, PublishedSliceRow};
 use stow_types::identity::{DependencyIdentity, TargetTriple, WireRustcVersion};
 use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
-    IndexDecodeError, content_sha256, folded_tag, folded_tag_parts, index_tag,
+    IndexDecodeError, LookupIndex, content_sha256, folded_tag, folded_tag_parts, index_tag,
 };
 use stow_types::public_cache::UnitShape;
 use stow_types::records::{parse_records_tag, record_to_index_row};
@@ -130,6 +130,15 @@ pub enum IndexCommand {
     /// identities through the signed index slices (stow#889) — the
     /// edge keeps no identity store, so the offline join lives here.
     Join(IndexJoinArgs),
+    /// Upload exported per-target lookup JSON files to R2 for
+    /// `stow.waterui.dev`'s cache lookup widget (stow#1688).
+    PublishLookup(crate::lookup_r2::IndexPublishLookupArgs),
+    /// Pull live verified index slices for one rustc from GHCR and
+    /// upload their deduplicated lookup JSON files to R2 (stow#1688).
+    SyncLookup(crate::lookup_r2::IndexSyncLookupArgs),
+    /// Ensure the Cloudflare WAF allowlist and Cache Rule (ignore query
+    /// strings) fronting the R2 lookup custom domain (stow#1688).
+    EnsureLookupRules(crate::lookup_r2::IndexEnsureLookupRulesArgs),
 }
 
 #[derive(Args)]
@@ -174,6 +183,7 @@ struct IndexExportSummary {
     folded_tag: String,
     index_file: String,
     folded_file: String,
+    lookup_file: String,
     rows: u64,
     bytes: usize,
     sha256: String,
@@ -287,6 +297,11 @@ pub async fn run(
         IndexCommand::Resign(args) => crate::index_resign::run(args).await,
         IndexCommand::MigrateRecords(args) => crate::index_migrate_records::run(args).await,
         IndexCommand::Join(args) => index_join(args).await,
+        IndexCommand::PublishLookup(args) => crate::lookup_r2::publish_lookup_files(args).await,
+        IndexCommand::SyncLookup(args) => index_sync_lookup(args).await,
+        IndexCommand::EnsureLookupRules(args) => {
+            crate::lookup_r2::ensure_lookup_rules_cmd(args).await
+        }
     }
 }
 
@@ -1082,40 +1097,7 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
         .map_err(|error| stow_error!("create {}: {error}", args.out_dir.display()))?;
     let mut summaries = Vec::new();
     for slice in &pass.slices {
-        let bytes = stow_shim::encode_index(&slice.index)
-            .map_err(|error| stow_error!("encode index: {error}"))?;
-        let index_name = index_tag(slice.target.as_str(), slice.rustc_version.as_str());
-        let folded_name = folded_tag(slice.target.as_str(), slice.rustc_version.as_str());
-        let index_file = args.out_dir.join(&index_name);
-        let folded_file = args.out_dir.join(&folded_name);
-        tokio::fs::write(&index_file, &bytes)
-            .await
-            .map_err(|error| stow_error!("write index {}: {error}", index_file.display()))?;
-        tokio::fs::write(&folded_file, serde_json::to_vec(&slice.folded)?)
-            .await
-            .map_err(|error| stow_error!("write folded {}: {error}", folded_file.display()))?;
-        // The `.prev` sidecar is the report's delta base — the index
-        // this pass extended, captured while the tag still named it.
-        if let Some(prev) = &slice.prev {
-            let prev_bytes = stow_shim::encode_index(prev)
-                .map_err(|error| stow_error!("encode previous index: {error}"))?;
-            tokio::fs::write(prev_path(&index_file), &prev_bytes)
-                .await
-                .map_err(|error| stow_error!("write previous-index sidecar: {error}"))?;
-        }
-        let summary = IndexExportSummary {
-            target: slice.target.as_str().to_owned(),
-            rustc_version: slice.rustc_version.as_str().to_owned(),
-            tag: index_name.clone(),
-            folded_tag: folded_name.clone(),
-            index_file: index_name,
-            folded_file: folded_name,
-            rows: slice.index.header.row_count,
-            bytes: bytes.len(),
-            sha256: sha256_digest(&bytes),
-            content_sha256: content_sha256(&slice.index)
-                .map_err(|error| stow_error!("digest index content: {error}"))?,
-        };
+        let summary = write_exported_slice(&args.out_dir, slice).await?;
         let line = serde_json::to_string(&summary)
             .map_err(|error| stow_error!("serialize index summary: {error}"))?;
         render::emit_line(&line);
@@ -1134,6 +1116,53 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
     .await
     .map_err(|error| stow_error!("write new-records.json: {error}"))?;
     Ok(())
+}
+
+async fn write_exported_slice(
+    out_dir: &std::path::Path,
+    slice: &SliceExport,
+) -> stow_types::error::Result<IndexExportSummary> {
+    let bytes = stow_shim::encode_index(&slice.index)
+        .map_err(|error| stow_error!("encode index: {error}"))?;
+    let index_name = index_tag(slice.target.as_str(), slice.rustc_version.as_str());
+    let folded_name = folded_tag(slice.target.as_str(), slice.rustc_version.as_str());
+    let lookup_name = format!("{index_name}.lookup.json");
+    let index_file = out_dir.join(&index_name);
+    let folded_file = out_dir.join(&folded_name);
+    let lookup_file = out_dir.join(&lookup_name);
+    tokio::fs::write(&index_file, &bytes)
+        .await
+        .map_err(|error| stow_error!("write index {}: {error}", index_file.display()))?;
+    tokio::fs::write(&folded_file, serde_json::to_vec(&slice.folded)?)
+        .await
+        .map_err(|error| stow_error!("write folded {}: {error}", folded_file.display()))?;
+    let lookup = LookupIndex::from_artifact_index(&slice.index);
+    tokio::fs::write(&lookup_file, serde_json::to_vec(&lookup)?)
+        .await
+        .map_err(|error| stow_error!("write lookup {}: {error}", lookup_file.display()))?;
+    // The `.prev` sidecar is the report's delta base — the index
+    // this pass extended, captured while the tag still named it.
+    if let Some(prev) = &slice.prev {
+        let prev_bytes = stow_shim::encode_index(prev)
+            .map_err(|error| stow_error!("encode previous index: {error}"))?;
+        tokio::fs::write(prev_path(&index_file), &prev_bytes)
+            .await
+            .map_err(|error| stow_error!("write previous-index sidecar: {error}"))?;
+    }
+    Ok(IndexExportSummary {
+        target: slice.target.as_str().to_owned(),
+        rustc_version: slice.rustc_version.as_str().to_owned(),
+        tag: index_name.clone(),
+        folded_tag: folded_name.clone(),
+        index_file: index_name,
+        folded_file: folded_name,
+        lookup_file: lookup_name,
+        rows: slice.index.header.row_count,
+        bytes: bytes.len(),
+        sha256: sha256_digest(&bytes),
+        content_sha256: content_sha256(&slice.index)
+            .map_err(|error| stow_error!("digest index content: {error}"))?,
+    })
 }
 
 /// The sidecar `index export` leaves beside each emitted slice file:
@@ -1712,6 +1741,26 @@ async fn published_slices(
     .try_collect::<Vec<_>>()
     .await?;
     Ok(live.into_iter().flatten().collect())
+}
+
+/// `stow-admin index sync-lookup`: pull every live verified
+/// `index.<target>.<rustc>` slice from GHCR and upload its deduplicated
+/// lookup JSON to R2.
+async fn index_sync_lookup(
+    args: crate::lookup_r2::IndexSyncLookupArgs,
+) -> stow_types::error::Result<()> {
+    let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
+        .map_err(|error| stow_error!("--rustc-version: {error}"))?;
+    let history = PullContext::connect(&rustc_version).await?;
+    let published = published_slices(&history, &rustc_version).await?;
+    for slice in &published {
+        let lookup = LookupIndex::from_artifact_index(&slice.index);
+        let summary = crate::lookup_r2::upload_lookup_index(&lookup, &args.bucket).await?;
+        let line = serde_json::to_string(&summary)
+            .map_err(|error| stow_error!("serialize lookup upload summary: {error}"))?;
+        render::emit_line(&line);
+    }
+    Ok(())
 }
 
 /// `stow-admin index reconcile`: the published slices of one rustc the

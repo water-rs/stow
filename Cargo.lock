@@ -7305,15 +7305,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
-name = "ruzstd"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8847,7 +8838,6 @@ dependencies = [
 name = "stow-edge"
 version = "0.21.13"
 dependencies = [
- "anyhow",
  "askama 0.14.0",
  "async-lock",
  "base64 0.23.1",
@@ -8864,7 +8854,6 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rmp-serde",
- "ruzstd",
  "semver",
  "serde",
  "serde-wasm-bindgen",
@@ -8876,7 +8865,6 @@ dependencies = [
  "skyzen-core 0.3.0",
  "skyzen-services 0.4.0",
  "sqlx",
- "stow-shim",
  "stow-types",
  "tar",
  "thiserror 2.0.21",

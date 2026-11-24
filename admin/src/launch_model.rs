@@ -122,8 +122,6 @@ const PATH_COUNTS_QUERY: &str = include_str!("../queries/launch-model.graphql");
 /// family suffix keeps the raw-path detail the classifier discarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum RouteKind {
-    /// `GET /api/v1/index/…` — pointer and slice fetches (a pull is two).
-    IndexRequest,
     /// `POST /api/v1/admissions`.
     Admission,
     /// `POST /api/v1/enqueue`.
@@ -146,7 +144,6 @@ impl RouteKind {
     /// The snapshot's stable key prefix for the kind.
     const fn key(self) -> &'static str {
         match self {
-            Self::IndexRequest => "GET /api/v1/index/*",
             Self::Admission => "POST /api/v1/admissions",
             Self::EnqueueRedemption => "POST /api/v1/enqueue",
             Self::HumanRequest => "POST /api/v1/requests",
@@ -177,7 +174,6 @@ fn classify_path(method: &str, path: &str) -> Option<RouteKind> {
         ("GET", "/api/v1/stats") => Some(RouteKind::StatsView),
         ("POST", p) if p.starts_with("/api/v1/admin/index/") => Some(RouteKind::IndexPublish),
         ("GET", p) if p.starts_with("/api/v1/requests/") => Some(RouteKind::RequestStatusRead),
-        ("GET", p) if p.starts_with("/api/v1/index/") => Some(RouteKind::IndexRequest),
         (_, p) if p.starts_with("/api/v1/admin/") || p.starts_with("/api/v1/scheduler/") => {
             Some(RouteKind::AdminOperation)
         }
@@ -564,7 +560,6 @@ pub fn derive_model(snapshot: &WindowSnapshot) -> stow_types::error::Result<Laun
     let requests = &snapshot.requests;
     let count = |kind: RouteKind| requests.get(kind.key()).copied().unwrap_or(0);
 
-    let index_requests = count(RouteKind::IndexRequest);
     let enqueues = count(RouteKind::EnqueueRedemption);
     let human_requests = count(RouteKind::HumanRequest);
     let admin_operations = count(RouteKind::AdminOperation);
@@ -588,9 +583,6 @@ pub fn derive_model(snapshot: &WindowSnapshot) -> stow_types::error::Result<Laun
         },
         rates: LaunchRates {
             cli_byte_path_fetch: round4(per_install_day(snapshot.cli_fetches)),
-            // One pull is the pointer GET plus the slice GET — two
-            // requests per pull.
-            index_pull: round4(per_install_day(index_requests.div_ceil(2))),
             admission: round4(per_install_day(count(RouteKind::Admission))),
             enqueue_redemption: round4(per_install_day(enqueues)),
             human_request: round4(per_install_day(human_requests)),
@@ -642,7 +634,6 @@ fn render_model(model: &LaunchModel) -> String {
     let mut table = crate::render::Table::new(&["kind", "events/month"]);
     for (label, kind) in [
         ("cli byte-path fetch", EventKind::CliBytePathFetch),
-        ("index pull", EventKind::IndexPull),
         ("admission", EventKind::Admission),
         ("enqueue redemption", EventKind::EnqueueRedemption),
         ("human request", EventKind::HumanRequest),

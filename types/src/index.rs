@@ -59,6 +59,87 @@ pub const STOW_FOLDED_MEDIA_TYPE: &str = "application/vnd.stow.folded.v1+json";
 /// Media type of the OCI config the folded artifact carries.
 pub const STOW_FOLDED_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.folded.config.v1+json";
 
+/// Format version of [`LookupIndex`], the slim per-target JSON published
+/// to R2 for `stow.waterui.dev`'s cache lookup widget.
+pub const LOOKUP_INDEX_FORMAT_VERSION: u32 = 1;
+
+/// R2 object key (no leading slash) for `target`'s slim lookup JSON.
+#[must_use]
+pub fn lookup_object_key(target: &str) -> String {
+    format!("v1/lookup/{target}.json")
+}
+
+/// Header of a [`LookupIndex`] document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LookupIndexHeader {
+    /// Format version — [`LOOKUP_INDEX_FORMAT_VERSION`].
+    pub format_version: u32,
+    /// The slice's compilation target triple.
+    pub target: TargetTriple,
+    /// The stable rustc version the slice was built for.
+    pub rustc_version: WireRustcVersion,
+    /// RFC 3339 UTC timestamp from the source [`ArtifactIndexHeader`].
+    pub generated_at: String,
+    /// Publish generation from the source [`ArtifactIndexHeader`].
+    pub generation: i64,
+    /// Number of distinct crates in [`LookupIndex::crates`].
+    pub crate_count: u64,
+    /// Total servable rows in the source [`ArtifactIndex::rows`].
+    pub row_count: u64,
+}
+
+/// Slim per-target lookup index published directly to R2 for
+/// `stow.waterui.dev`'s "IS IT CACHED?" widget (stow#1688).
+///
+/// Deduplicates [`ArtifactIndex::rows`] to the exact projection the
+/// browser renders: `crates[crate_name][version][features_label] =
+/// bundle_size`, where `features_label` is the comma-separated feature
+/// list (or `""` for `--no-default-features`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LookupIndex {
+    /// Self-describing slice metadata.
+    pub header: LookupIndexHeader,
+    /// `crate_name -> version -> features_label -> bundle_size`.
+    pub crates: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
+    >,
+}
+
+impl LookupIndex {
+    /// Project a full [`ArtifactIndex`] down to the deduplicated map the
+    /// site renders.
+    #[must_use]
+    pub fn from_artifact_index(index: &ArtifactIndex) -> Self {
+        let mut crates: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
+        > = std::collections::BTreeMap::new();
+        for row in &index.rows {
+            let label = row.features_json.features().join(", ");
+            crates
+                .entry(row.crate_name.as_str().to_owned())
+                .or_default()
+                .entry(row.version.to_string())
+                .or_default()
+                .insert(label, row.bundle_size);
+        }
+        let crate_count = crates.len() as u64;
+        Self {
+            header: LookupIndexHeader {
+                format_version: LOOKUP_INDEX_FORMAT_VERSION,
+                target: index.header.target.clone(),
+                rustc_version: index.header.rustc_version.clone(),
+                generated_at: index.header.generated_at.clone(),
+                generation: index.header.generation,
+                crate_count,
+                row_count: index.header.row_count,
+            },
+            crates,
+        }
+    }
+}
+
 /// The published artifact index: a versioned header plus the slice's rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactIndex {
@@ -768,6 +849,39 @@ mod tests {
         assert_eq!(
             index_tag("wasm32-unknown-unknown", "1.92.0+dist"),
             "index.wasm32-unknown-unknown.1.92.0_dist"
+        );
+    }
+
+    #[test]
+    fn lookup_index_deduplicates_rows_by_crate_version_and_features() {
+        let mut first = row("aaaa");
+        first.features_json =
+            FeaturesJson::from_sorted(vec!["default".to_owned(), "std".to_owned()])
+                .expect("features");
+        first.bundle_size = 100;
+        let mut duplicate = row("bbbb");
+        duplicate.features_json =
+            FeaturesJson::from_sorted(vec!["default".to_owned(), "std".to_owned()])
+                .expect("features");
+        duplicate.bundle_size = 200;
+        let mut no_features = row("cccc");
+        no_features.features_json = FeaturesJson::from_sorted(Vec::new()).expect("empty features");
+        no_features.bundle_size = 50;
+
+        let idx = index(vec![first, duplicate, no_features]);
+        let lookup = LookupIndex::from_artifact_index(&idx);
+
+        assert_eq!(lookup.header.format_version, LOOKUP_INDEX_FORMAT_VERSION);
+        assert_eq!(lookup.header.crate_count, 1);
+        assert_eq!(lookup.header.row_count, 3);
+        let versions = lookup.crates.get("serde").expect("serde present");
+        let features = versions.get("1.0.219").expect("version present");
+        assert_eq!(features.len(), 2);
+        assert_eq!(features.get("default, std"), Some(&200));
+        assert_eq!(features.get(""), Some(&50));
+        assert_eq!(
+            lookup_object_key("x86_64-unknown-linux-gnu"),
+            "v1/lookup/x86_64-unknown-linux-gnu.json"
         );
     }
 }

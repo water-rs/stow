@@ -20,9 +20,7 @@ skyzen-core = { git = "https://github.com/zen-rs/skyzen", branch = "main" }
 skyzen-cloudflare = { git = "https://github.com/zen-rs/skyzen", branch = "main" }
 skyzen-services = { git = "https://github.com/zen-rs/skyzen", branch = "main", default-features = false }
 stow-types = { workspace = true, features = ["ci"] }
-stow-shim.workspace = true
 http = "1"
-anyhow = "1"
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -63,11 +61,7 @@ orx-split-vec = { version = "4.1.1", default-features = false }
 # hand-rolled waker queue cannot promise on the single-threaded
 # js_sys::futures executor (see fetch_guard::OutboundPool).
 async-lock = "3.4"
-# The index-slice transcode: the `zstd` crate does not build for wasm32,
-# so the worker decodes zstd with `ruzstd` (pure Rust) and re-encodes as
-# gzip with `flate2` for clients without `Accept-Encoding: zstd`; the
-# resolver also reads `.crate`/codeload tarballs through it.
-ruzstd = "0.8"
+# `.crate`/codeload tarballs are gzip-decoded by the resolver.
 flate2.workspace = true
 hmac = "0.13"
 sha2 = "0.11"
@@ -88,7 +82,5 @@ tar.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio"] }
 skyzen-services = { git = "https://github.com/zen-rs/skyzen", branch = "main", default-features = false, features = ["sqlite"] }
-# The real index producer, so the transcode test decodes what a publish writes.
-stow-shim = { workspace = true, features = ["zstd"] }
 [lints]
 workspace = true

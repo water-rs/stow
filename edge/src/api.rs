@@ -4,7 +4,6 @@ use skyzen::routing::Params;
 use skyzen::runtime::wasm::passthrough_js_response;
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Request, Response, StatusCode};
-use skyzen_cloudflare::worker::send::IntoSendFuture as _;
 use skyzen_cloudflare::worker::{self, AnalyticsEngineDataset};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use stow_types::admission;
@@ -12,7 +11,7 @@ use stow_types::api::{
     AdmissionRequest, CI_TARGET_TRIPLES, CrateRequest, EnqueueAdmission, EnqueueTicket,
 };
 use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
-use stow_types::identity::{CrateName, CrateVersion, TargetTriple, WireRustcVersion};
+use stow_types::identity::{CrateName, CrateVersion, WireRustcVersion};
 
 use crate::errors::GetArtifactError;
 use crate::fetch_guard::OutboundPool;
@@ -20,8 +19,8 @@ use crate::github_auth::{self, OPERATIONS_WORKFLOW};
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
-    catalog, crates_io, dependency_resolver, ghcr, index_slice, miss_logger, rust_channel,
-    scheduler, scheduler_client, stats,
+    catalog, crates_io, dependency_resolver, ghcr, miss_logger, rust_channel, scheduler,
+    scheduler_client, stats,
 };
 
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
@@ -1252,82 +1251,12 @@ pub async fn get_bundle(
     Ok(response)
 }
 
-/* ---- index slices ---- */
+/* ---- registry byte helpers ---- */
 
-/// `Cache-Control` on the digest-resolution answer: the
-/// `index.<target>.<rustc>` tag moves at every index publish, so the
-/// pointer stays short-lived while the blob it names is immutable.
-const INDEX_DIGEST_MAX_AGE: &str = "public, max-age=60";
-
-/// `Cache-Control` on every digest-addressed answer — index slice bytes
-/// and bundles: the digest pins the content, so the answer is immutable
-/// and no cache in front of it ever revalidates.
+/// `Cache-Control` on every digest-addressed bundle answer: the digest
+/// pins the content, so the answer is immutable and no cache in front
+/// of it ever revalidates.
 const DIGEST_ADDRESSED_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
-
-/// The request's `Accept-Encoding` header value (empty when absent) —
-/// the slice route negotiates its `Content-Encoding` on it.
-#[derive(Debug)]
-pub struct AcceptEncoding(pub String);
-
-impl Extractor for AcceptEncoding {
-    type Error = std::convert::Infallible;
-
-    fn extract(
-        request: &mut Request,
-    ) -> impl std::future::Future<Output = Result<Self, Self::Error>> + Send {
-        let value = request
-            .headers()
-            .get(skyzen::header::ACCEPT_ENCODING)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned();
-        std::future::ready(Ok(Self(value)))
-    }
-}
-
-/// Response of `GET /api/v1/index/{target}/{rustc_version}` — the layer
-/// digest the slice's OCI tag currently points at, so a client can then
-/// fetch the bytes from the immutable digest-addressed route.
-#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
-pub struct IndexSlicePointer {
-    /// The requested compilation target triple.
-    pub target: String,
-    /// The rustc version the slice is built for — the resolved version
-    /// when the path named `stable`.
-    pub rustc_version: String,
-    /// `sha256:…` digest of the index layer blob.
-    pub digest: String,
-    /// Compressed layer size in bytes.
-    pub size: u64,
-}
-
-/// The validated `{target}` path segment — parsed into a
-/// [`TargetTriple`] so only the triple alphabet can reach a registry URL.
-fn path_target(params: &Params) -> Result<TargetTriple, GetArtifactError> {
-    params
-        .get("target")
-        .map_err(|_| GetArtifactError::BadRequest)?
-        .parse::<TargetTriple>()
-        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))
-}
-
-/// Resolve the `{rustc_version}` path segment for the index routes:
-/// `stable` resolves in the Worker from the Cache-API-cached channel
-/// answer (`rust_channel`), so an index view never wakes the scheduler
-/// Durable Object; any other value must already be a wire rustc
-/// version.
-async fn index_rustc_version(
-    cache: &CfCache,
-    raw: &str,
-) -> Result<WireRustcVersion, GetArtifactError> {
-    if raw == "stable" {
-        return rust_channel::stable_rustc_version(cache, &rust_channel::CfRustChannel)
-            .await
-            .map_err(GetArtifactError::from);
-    }
-    raw.parse::<WireRustcVersion>()
-        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))
-}
 
 /// Map a registry failure on the byte paths onto the public error
 /// surface: a missing blob is a 404, a rate-limited or 5xx registry is
@@ -1338,150 +1267,14 @@ fn registry_fetch_error(error: ghcr::FetchError) -> GetArtifactError {
         ghcr::FetchError::NotFound => GetArtifactError::NotFound,
         ghcr::FetchError::Unavailable => GetArtifactError::GhcrUnavailable,
         other => {
-            tracing::error!(error = %other, "index fetch from registry failed");
+            tracing::error!(error = %other, "registry fetch failed");
             GetArtifactError::InternalWithMessage(other.to_string())
         }
     }
 }
 
-/// Fetch the `index.<target>.<rustc>` manifest and return its single
-/// index layer — the digest the published slice currently points at,
-/// and the size that bounds the buffered read.
-async fn index_slice_layer(
-    ghcr: &GhcrConfig,
-    target: &TargetTriple,
-    rustc_version: &WireRustcVersion,
-    pool: &OutboundPool,
-) -> Result<stow_types::api::OciDescriptor, GetArtifactError> {
-    let tag = stow_types::index::index_tag(target.as_str(), rustc_version.as_str());
-    let repository = stow_types::registry::cache_repository(rustc_version);
-    let mut response =
-        ghcr::open_manifest(&ghcr.base_url, repository.path(), &tag, &ghcr.tokens, pool)
-            .await
-            .map_err(registry_fetch_error)?;
-    let body = response
-        .text()
-        .into_send()
-        .await
-        .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
-    let manifest: stow_types::api::OciManifest = serde_json::from_str(&body).map_err(|error| {
-        GetArtifactError::InternalWithMessage(format!("decode index manifest: {error}"))
-    })?;
-    index_slice::index_layer(&manifest)
-        .cloned()
-        .map_err(|error| GetArtifactError::InternalWithMessage(format!("{tag}: {error}")))
-}
-
-/// `GET /api/v1/index/{target}/{rustc_version}` — which blob digest the
-/// `index.<target>.<rustc>` OCI tag currently names. The page asks this
-/// first, then fetches the digest-addressed route for the bytes.
-pub async fn get_index_slice_digest(
-    params: Params,
-    State(ghcr): State<GhcrConfig>,
-    State(cache): State<CfCache>,
-) -> Result<Response, GetArtifactError> {
-    let target = path_target(&params)?;
-    let rustc_version = index_rustc_version(
-        &cache,
-        params
-            .get("rustc_version")
-            .map_err(|_| GetArtifactError::BadRequest)?,
-    )
-    .await?;
-    let layer = index_slice_layer(&ghcr, &target, &rustc_version, &OutboundPool::new()).await?;
-    cacheable_json(
-        &IndexSlicePointer {
-            target: target.into_inner(),
-            rustc_version: rustc_version.into_inner(),
-            digest: layer.digest.clone(),
-            size: layer.size,
-        },
-        INDEX_DIGEST_MAX_AGE,
-    )
-}
-
-/// Fetch a digest-addressed index slice after proving the digest is
-/// still this pair's index layer — returns the layer the manifest
-/// declared and the streaming blob response.
-async fn fetch_index_slice_upstream(
-    ghcr: &GhcrConfig,
-    target: &TargetTriple,
-    rustc_version: &WireRustcVersion,
-    digest: &str,
-    pool: &OutboundPool,
-) -> Result<(stow_types::api::OciDescriptor, worker::Response), GetArtifactError> {
-    // A miss must still be this pair's index layer — without the check,
-    // any `sha256:` digest the repository holds (a several-hundred-MB
-    // bundle included) would make the worker fetch it, and the gzip
-    // transcode would buffer the whole blob inside one isolate.
-    let layer = index_slice_layer(ghcr, target, rustc_version, pool).await?;
-    if layer.digest != digest {
-        return Err(GetArtifactError::NotFound);
-    }
-    let repository = stow_types::registry::cache_repository(rustc_version);
-    let upstream = ghcr::open_blob(
-        &ghcr.base_url,
-        repository.path(),
-        digest,
-        &ghcr.tokens,
-        pool,
-    )
-    .await
-    .map_err(registry_fetch_error)?;
-    if let Some(length) = worker_content_length(&upstream).filter(|length| *length > layer.size) {
-        return Err(GetArtifactError::InternalWithMessage(format!(
-            "slice blob reports {length} bytes, over the {} its manifest declares",
-            layer.size
-        )));
-    }
-    Ok((layer, upstream))
-}
-
-/// Read a registry blob response into memory, stopping the moment it
-/// outgrows the size its manifest declared — the gzip transcode's
-/// buffered path, bounded so a wrong blob cannot eat one isolate's heap.
-async fn bounded_blob_bytes(
-    response: &mut worker::Response,
-    size: u64,
-) -> Result<Vec<u8>, GetArtifactError> {
-    // `ByteStream` is a !Send JsValue stream — the whole read is wrapped
-    // in `into_send` rather than each `next`, so the stream state may
-    // cross the loop's awaits inside one isolate-local future.
-    let read = async {
-        use futures_util::StreamExt as _;
-
-        let too_big = |bytes: &[u8]| {
-            (bytes.len() as u64 > size).then(|| {
-                GetArtifactError::InternalWithMessage(format!(
-                    "slice blob exceeds the {size} bytes its manifest declares"
-                ))
-            })
-        };
-        if let Ok(stream) = response.stream() {
-            futures_util::pin_mut!(stream);
-            let mut bytes = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk
-                    .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
-                bytes.extend_from_slice(&chunk);
-                if let Some(error) = too_big(&bytes) {
-                    return Err(error);
-                }
-            }
-            Ok(bytes)
-        } else {
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
-            too_big(&bytes).map_or(Ok(bytes), Err)
-        }
-    };
-    read.into_send().await
-}
-
 /// The registry/cache response's `Content-Length`, when it carries one —
-/// forwarded onto the slice answer so the client can size the download.
+/// forwarded onto the bundle answer so the client can size the download.
 fn worker_content_length(response: &worker::Response) -> Option<u64> {
     response
         .headers()
@@ -1489,106 +1282,6 @@ fn worker_content_length(response: &worker::Response) -> Option<u64> {
         .ok()
         .flatten()
         .and_then(|value| value.parse().ok())
-}
-
-/// Decorate the slice answer with its headers. `Content-Type` is
-/// `application/json` because `Content-Encoding` describes the transfer
-/// encoding: the bytes the client ends up reading are always the index
-/// JSON document.
-fn slice_response(
-    mut response: Response,
-    encoding: index_slice::SliceEncoding,
-    content_length: Option<u64>,
-) -> Response {
-    let headers = response.headers_mut();
-    headers.insert(
-        skyzen::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    headers.insert(
-        skyzen::header::CONTENT_ENCODING,
-        HeaderValue::from_static(encoding.content_encoding()),
-    );
-    headers.insert(
-        skyzen::header::CACHE_CONTROL,
-        HeaderValue::from_static(DIGEST_ADDRESSED_CACHE_CONTROL),
-    );
-    // One URL serves both encodings — every cache between the worker and
-    // the client must key on the request's Accept-Encoding.
-    headers.insert(
-        skyzen::header::VARY,
-        HeaderValue::from_static("accept-encoding"),
-    );
-    if let Some(length) = content_length {
-        headers.insert(skyzen::header::CONTENT_LENGTH, HeaderValue::from(length));
-    }
-    response
-}
-
-/// `GET /api/v1/index/{target}/{rustc_version}/{digest}` — the index
-/// slice itself: the same blob the CLI's index refresh pulls, served
-/// from this origin so a browser never has to run GHCR's anonymous
-/// bearer exchange, and cached by Workers Cache on the response's own
-/// immutable `Cache-Control`. `Accept-Encoding` picks the
-/// `Content-Encoding`: `zstd` hands workerd the upstream stream itself,
-/// so the published blob passes through byte-for-byte without entering
-/// wasm; anything else gets a gzip transcode, cached per encoding by the
-/// `Vary` the answer carries.
-pub async fn get_index_slice(
-    params: Params,
-    accept: AcceptEncoding,
-    State(ghcr): State<GhcrConfig>,
-    State(cache): State<CfCache>,
-) -> Result<Response, GetArtifactError> {
-    let target = path_target(&params)?;
-    let rustc_version = index_rustc_version(
-        &cache,
-        params
-            .get("rustc_version")
-            .map_err(|_| GetArtifactError::BadRequest)?,
-    )
-    .await?;
-    let digest = index_slice::parse_layer_digest(
-        params
-            .get("digest")
-            .map_err(|_| GetArtifactError::BadRequest)?,
-    )
-    .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?
-    .to_owned();
-
-    let encoding = index_slice::negotiate_encoding(&accept.0);
-
-    // One bound for the whole request: the manifest read and the blob
-    // stream draw from the same invocation's budget.
-    let pool = OutboundPool::new();
-    let (layer, mut upstream) =
-        fetch_index_slice_upstream(&ghcr, &target, &rustc_version, &digest, &pool).await?;
-
-    match encoding {
-        index_slice::SliceEncoding::Zstd => {
-            let content_length = worker_content_length(&upstream);
-            Ok(slice_response(
-                passthrough_upstream(upstream).map_err(registry_fetch_error)?,
-                encoding,
-                content_length,
-            ))
-        }
-        index_slice::SliceEncoding::Gzip => {
-            // Buffer and transcode on a Workers Cache miss; the response's
-            // `Vary: accept-encoding` caches the gzip copy under its own
-            // variant. The manifest's declared size bounds the read — a
-            // blob that grows past it is an error, not a bigger buffer.
-            let zstd = bounded_blob_bytes(&mut upstream, layer.size).await?;
-            let gzip = index_slice::zstd_to_gzip(&zstd)
-                .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
-            let content_length = gzip.len() as u64;
-            Ok(slice_response(
-                Response::new(Body::from(gzip)),
-                encoding,
-                Some(content_length),
-            ))
-        }
-    }
 }
 
 /// POST /api/v1/admissions

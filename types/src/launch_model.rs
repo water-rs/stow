@@ -63,11 +63,6 @@ pub struct LaunchRates {
     /// where `blob1 = 'hit'` (the 1/10 sample's weight restores the true
     /// count).
     pub cli_byte_path_fetch: f64,
-    /// Index pulls: one pull is the pointer GET plus the folded-slice
-    /// GET, so each pull is two worker requests. Zone
-    /// `httpRequestsAdaptiveGroups` on `/api/v1/index/*` — Analytics
-    /// Engine has no event for the index path.
-    pub index_pull: f64,
     /// `POST /api/v1/admissions` — miss admissions minted.
     pub admission: f64,
     /// `POST /api/v1/enqueue` — admission tickets redeemed.
@@ -145,9 +140,6 @@ pub struct LaunchModel {
 pub enum EventKind {
     /// [`LaunchRates::cli_byte_path_fetch`]
     CliBytePathFetch,
-    /// [`LaunchRates::index_pull`] — one pull; routes billed per pull's
-    /// two requests multiply it themselves.
-    IndexPull,
     /// [`LaunchRates::admission`]
     Admission,
     /// [`LaunchRates::enqueue_redemption`]
@@ -226,7 +218,6 @@ impl LaunchModel {
             EventKind::CliBytePathFetch => {
                 self.rates.cli_byte_path_fetch * self.scale.installs as f64
             }
-            EventKind::IndexPull => self.rates.index_pull * self.scale.installs as f64,
             EventKind::Admission => self.rates.admission * self.scale.installs as f64,
             EventKind::EnqueueRedemption => {
                 self.rates.enqueue_redemption * self.scale.installs as f64
@@ -321,7 +312,6 @@ mod tests {
             },
             rates: LaunchRates {
                 cli_byte_path_fetch: 0.0,
-                index_pull: 0.0,
                 admission: 0.0,
                 enqueue_redemption: 0.0,
                 human_request: 0.0,

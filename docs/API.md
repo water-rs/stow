@@ -217,57 +217,38 @@ cargo derives the enabled closure when it builds.
 `400` when `{crate_name}` is not a legal crate name or `{version}` is
 not semver; `404` when crates.io does not publish the crate.
 
-## Index slices
+## Site lookup index (R2)
 
-The landing page's "is this crate cached?" lookup reads the same signed
-index slice the CLI's resolver uses — the zstd JSON `ArtifactIndex`
-published per `(target, rustc_version)` as the OCI tag
-`index.<target>.<rustc>` on `ghcr.io/water-rs/stow-cache-v2-<rustc>`. A browser
-cannot run GHCR's anonymous bearer exchange or reach ghcr.io
-cross-origin, so the worker serves the slice from its own origin in two
-steps: a short-lived tag→digest pointer, then the immutable
-digest-addressed bytes.
-
-### `GET /api/v1/index/{target}/{rustc_version}`
-
-Resolves the `index.<target>.<rustc_version>` tag to the digest the
-layer blob currently has. `{rustc_version}` may be the literal `stable`,
-which resolves through the scheduler's cached channel manifest.
-
-Response `200`: `IndexSlicePointer`, `Cache-Control: public, max-age=60`
-— the tag moves at every index publish, so the pointer is short-lived.
+The landing page's "is this crate cached?" lookup does not go through the
+Worker. `index-publish.yml` projects each stable rustc's published
+`ArtifactIndex` down to a deduplicated `LookupIndex` JSON document
+(`(crate_name, version, features) -> bundle_size`) and uploads it to the
+`stow-lookup` R2 bucket at `/v1/lookup/{target}.json`, served directly
+from `https://stow-index.waterui.dev/v1/lookup/{target}.json` behind
+Cloudflare CDN (`Cache-Control: public, max-age=300`, Cache Rule
+ignoring query strings, and a zone WAF allowlist restricting paths to
+`CI_TARGET_TRIPLES`).
 
 ```json
 {
-  "target": "x86_64-unknown-linux-gnu",
-  "rustc_version": "1.98.1",
-  "digest": "sha256:0123…",
-  "size": 143872
+  "header": {
+    "format_version": 1,
+    "target": "x86_64-unknown-linux-gnu",
+    "rustc_version": "1.100.0",
+    "generated_at": "2026-11-24T00:00:00Z",
+    "generation": 324,
+    "crate_count": 5252,
+    "row_count": 181094
+  },
+  "crates": {
+    "serde": {
+      "1.0.219": {
+        "default, std": 143872
+      }
+    }
+  }
 }
 ```
-
-`400` for a malformed target or rustc version; `404` when no index slice
-is published for the pair; `502` when GHCR is rate-limiting or down.
-
-### `GET /api/v1/index/{target}/{rustc_version}/{digest}`
-
-The slice blob itself, fetched from GHCR and cached at the edge by
-Workers Cache on the digest-addressed URL. `{digest}` must be `sha256:`
-plus 64 lowercase hex digits — anything else is `400`. On a cache miss
-the digest must also name the layer the pair's index tag currently
-points at, or the route answers `404`; an already-cached older digest
-is still served.
-
-Response `200`: the slice bytes with `Content-Type: application/json`,
-`Cache-Control: public, max-age=31536000, immutable` (the digest
-content-addresses the body) and `Vary: Accept-Encoding`; a hit may
-answer from Workers Cache with the Worker never running — billed as a
-request, but spending no CPU or subrequests. The
-`Content-Encoding` negotiates on the request's `Accept-Encoding`:
-clients naming `zstd` get the published blob byte-for-byte
-(`Content-Encoding: zstd`); anything else — an absent token, a `q=0`
-refusal — gets a gzip transcode the platform caches under its own
-`Vary` variant (`Content-Encoding: gzip`).
 
 ## `GET /requests/{task_id}`
 
