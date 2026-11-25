@@ -150,6 +150,7 @@ fn a_setup_free_build_keys_like_the_setup_path() {
     let mut setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     setup
         .arg("setup")
+        .arg("--yes")
         .current_dir(&project)
         .env("CARGO_HOME", &setup_home);
     // Setup fetches the host index slice since stow#1032 — its

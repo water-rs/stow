@@ -61,6 +61,7 @@ mod sandbox;
 mod session_env;
 mod state_db;
 mod stats;
+mod term_style;
 #[cfg(test)]
 mod test_edge;
 mod toolchain;

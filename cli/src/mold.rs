@@ -301,29 +301,36 @@ fn compiler_path_value(bin_dir: &Path) -> stow_types::error::Result<&str> {
     Ok(bin)
 }
 
-/// `stow setup`'s half of the contract: what the user's global cargo
+/// Read-only plan for `stow setup`'s Linux mold linker provisioning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GlobalMoldPlan {
+    /// Not a Linux host; no linker configuration is needed.
+    NotNeeded,
+    /// Global Cargo configuration already selects a reachable mold binary.
+    AlreadyConfigured,
+    /// Needs stow's managed mold installation at `bin_dir`.
+    Managed {
+        /// Managed mold `bin` directory (`<tools_dir>/mold/bin`).
+        bin_dir: PathBuf,
+        /// Whether the managed mold archive must be downloaded first.
+        needs_download: bool,
+    },
+}
+
+/// `stow setup`'s read-only linker plan: what the user's global cargo
 /// configuration needs so every build links with mold — read the way a
 /// global setup must read it, from `$CARGO_HOME/config.toml` plus the
 /// environment, so the answer never depends on the directory setup ran
-/// in. The project-level walk belongs to `stow` builds, which run inside
-/// a project and resolve through [`resolve_link_from`] instead.
-///
-/// `None` means the config needs no linker selection written — not a
-/// Linux host, or the configuration already selects mold *and can reach a
-/// mold binary*, in which case nothing is installed and nothing written.
-/// Every other Linux machine gets the managed install's `bin` dir back,
-/// which the caller passes to [`write_linker_selection`]. A configuration
-/// whose own selection exists but cannot resolve — the selection without
-/// the binary — is provisioned too: the config gains the `COMPILER_PATH`
-/// env entry that makes the managed install findable.
+/// in. Performs no downloads or writes.
 ///
 /// # Errors
 ///
-/// Fails when the rustc host target cannot be detected or the mold install
-/// fails — the error says which.
-pub async fn prepare_global() -> stow_types::error::Result<Option<PathBuf>> {
+/// Fails when the global cargo configuration cannot be loaded, the rustc
+/// host target cannot be detected, or the per-user tools directory cannot
+/// be resolved.
+pub async fn plan_global() -> stow_types::error::Result<GlobalMoldPlan> {
     if !cfg!(target_os = "linux") {
-        return Ok(None);
+        return Ok(GlobalMoldPlan::NotNeeded);
     }
     let cargo_home = crate::config::cargo_home();
     let loaded = cargo_config(
@@ -344,11 +351,32 @@ pub async fn prepare_global() -> stow_types::error::Result<Option<PathBuf>> {
     let config = link_eval_config(&loaded, &build_rustc);
     let link = resolve_link_from(&config, &host, &process_env);
     if link.selects_mold && link.unavailable_reason(&process_env).await.is_none() {
-        return Ok(None);
+        return Ok(GlobalMoldPlan::AlreadyConfigured);
     }
-    Ok(Some(
-        ensure_mold_install(&crate::config::tools_dir()?).await?,
-    ))
+    let bin_dir = crate::config::tools_dir()?.join("mold").join("bin");
+    let needs_download =
+        !(is_executable(&bin_dir.join("mold")) && is_executable(&bin_dir.join("ld.mold")));
+    Ok(GlobalMoldPlan::Managed {
+        bin_dir,
+        needs_download,
+    })
+}
+
+/// Apply a [`GlobalMoldPlan`]: download/verify managed mold when planned,
+/// returning the managed `bin` directory for [`write_linker_selection`].
+///
+/// # Errors
+///
+/// Fails when downloading, verifying, extracting, or running mold fails.
+pub async fn apply_global_plan(
+    plan: &GlobalMoldPlan,
+) -> stow_types::error::Result<Option<PathBuf>> {
+    match plan {
+        GlobalMoldPlan::NotNeeded | GlobalMoldPlan::AlreadyConfigured => Ok(None),
+        GlobalMoldPlan::Managed { .. } => Ok(Some(
+            ensure_mold_install(&crate::config::tools_dir()?).await?,
+        )),
+    }
 }
 
 /// The link resolution a build from a directory with no config of its

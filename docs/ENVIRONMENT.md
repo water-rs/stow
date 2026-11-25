@@ -50,7 +50,10 @@ default, and the purpose.
 | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (any case) | unset | Under every sandboxed level these are filtered out: heel publishes its own in-process proxy as `HTTP_PROXY`/`HTTPS_PROXY` inside the sandbox so every outbound connection goes through the declared network policy. |
 | `STOW_CLI_GITHUB_TOKEN` | falls back to `GITHUB_TOKEN`, then `GH_TOKEN` | GitHub token `stow update` sends with its release lookups — only useful against rate limits or a private mirror. |
 | `STOW_NO_ANALYTICS` | unset | When `1`, every edge request carries `x-stow-no-analytics: 1` and the edge writes no usage-statistics point and computes no install hash for it. The CLI also sends no daily build report at all. See [`PRIVACY.md`](../PRIVACY.md). |
-| `CI` | unset (set by CI providers) | When present (any value), every edge request carries `x-stow-ci: 1` so the usage statistics can split CI from local builds. Standard convention — GitHub Actions, GitLab CI and friends set it. See [`PRIVACY.md`](../PRIVACY.md). |
+| `CI` | unset (set by CI providers) | When present (any value), every edge request carries `x-stow-ci: 1` so the usage statistics can split CI from local builds, and `stow setup` skips interactive confirmation prompts. Standard convention — GitHub Actions, GitLab CI and friends set it. See [`PRIVACY.md`](../PRIVACY.md). |
+| `NO_COLOR` | unset | When present and non-empty, disables ANSI color styling in `stow setup` and `stow status` output (takes precedence over `CLICOLOR_FORCE`). |
+| `CLICOLOR_FORCE` | unset | When present, non-empty, and not `0` (and `NO_COLOR` is unset or empty), forces ANSI color styling in `stow setup` and `stow status` output even when stdout is not a TTY. |
+| `TERM` | inherited | When `dumb` (and `CLICOLOR_FORCE` is not forcing color), disables ANSI color styling in `stow setup` and `stow status` output. |
 | `RUST_LOG` | unset (defaults to `warn`) | Standard tracing-env-filter directive (e.g., `stow_cli=debug,info`). Without it, only `warn`/`error` events print — one per condition per build; per-unit lookup detail and per-attempt retries sit at `debug`. A rustc / cc wrapper reads it only under `STOW_TRACE_WRAPPED_COMPILERS`. |
 
 `stow stats` prints this install's own cache counters (`--json` for

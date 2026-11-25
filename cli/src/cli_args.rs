@@ -120,8 +120,8 @@ pub enum Command {
     Setup(SetupArgs),
     /// Update this install to the latest stow-cli release.
     Update,
-    /// Print the wrapper wiring `stow setup` wrote, stale wiring an
-    /// older stow left, and rolling cache-hit stats.
+    /// Print Cargo wrapper wiring, remote and daemon state, stale per-project
+    /// wiring, and cache performance counters.
     Status,
     /// Print this install's own cache statistics — hits, CPU time
     /// saved, bytes downloaded — kept in `stats.json` next to the
@@ -346,6 +346,10 @@ pub struct SetupArgs {
     /// runners.
     #[arg(long)]
     pub no_build_dir: bool,
+    /// Apply the setup plan without prompting for confirmation on an
+    /// interactive terminal.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
     #[command(flatten)]
     pub skill: SkillSetupArgs,
 }
@@ -672,6 +676,19 @@ mod tests {
             panic!("expected setup command");
         };
         assert!(args.github_env);
+        assert!(!args.yes);
+    }
+
+    #[test]
+    fn parses_setup_command_with_yes_flags() {
+        for flag in ["-y", "--yes"] {
+            let cli = Cli::try_parse_from(["stow", "setup", flag])
+                .unwrap_or_else(|error| panic!("parse `stow setup {flag}`: {error}"));
+            let Command::Setup(args) = cli.command else {
+                panic!("expected setup command");
+            };
+            assert!(args.yes, "{flag} must set args.yes");
+        }
     }
 
     #[test]

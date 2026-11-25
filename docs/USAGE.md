@@ -240,6 +240,17 @@ invocation on the machine transparently routes through stow's `rustc`
 and `cc` wrappers. Run it once per machine; it's idempotent and
 preserves unrelated keys.
 
+Before writing any files in normal mode, `stow setup` computes and prints a
+plan listing every exact path and setting it will create, update, or clean
+(`$CARGO_HOME/config.toml` keys, shim directory, Linux `mold` linker if
+needed, daemon login service, stale per-project configs, and detected agent
+skill targets). On an interactive terminal (TTY stdin and stdout, without
+`CI` set), it asks for confirmation before modifying anything and aborts
+cleanly with zero writes if declined. Pass `-y` / `--yes` to apply without
+prompting; non-TTY invocations, `CI`, and `--github-env` always skip
+prompting. ANSI styling is enabled on TTY stdout unless `NO_COLOR` is set
+(or forced with `CLICOLOR_FORCE`).
+
 The wrapper shims live inside the cargo home itself —
 `$CARGO_HOME/stow/shims/<key>/`, where `<key>` is derived from the
 stow binary's path — so the paths written into `config.toml` survive
@@ -485,21 +496,34 @@ from the shared cache rather than the per-repo Actions cache,
 
 ## `stow status`
 
-Prints the wrapper configuration `stow setup` wrote into the global
-cargo config, any stale per-project wiring an older stow left in an
-ancestor `.cargo/config.toml` (`stow setup` removes it), plus rolling
-cache-hit counters from the local SQLite
-stats DB.
+Prints a grouped summary of the wrapper configuration `stow setup` wrote
+into the global cargo config (including `build-dir`), remote cache and
+non-spawning daemon state, rolling cache performance counters (hits,
+misses, hit rate, errors, CPU time saved, bytes served and downloaded), and
+any stale per-project wiring an older stow left in an ancestor
+`.cargo/config.toml` (`stow setup` removes it). Color is enabled on TTY
+stdout unless `NO_COLOR` is set (or forced with `CLICOLOR_FORCE`).
 
 ```
-config: ~/.cargo/config.toml
-rustc-wrapper: ~/.cargo/stow/shims/<key>/stow-rustc-wrapper
-cc: ~/.cargo/stow/shims/<key>/stow-cc
-cxx: ~/.cargo/stow/shims/<key>/stow-cxx
-cc-launcher: ~/.cargo/stow/shims/<key>/stow-cc-launcher
-edge-url: https://stow.waterui.dev
-rust-cache: hits=412 misses=87 errors=2
-cc-cache: hits=11 misses=3 errors=0
+Cargo wiring
+            config: ~/.cargo/config.toml
+     rustc-wrapper: ~/.cargo/stow/shims/<key>/stow-rustc-wrapper
+                cc: ~/.cargo/stow/shims/<key>/stow-cc
+               cxx: ~/.cargo/stow/shims/<key>/stow-cxx
+       cc-launcher: ~/.cargo/stow/shims/<key>/stow-cc-launcher
+         build-dir: ~/.stow/build-dir/{workspace-path-hash}
+
+Remote & daemon
+          edge-url: https://stow.waterui.dev
+      remote-cache: on
+            daemon: running (stow 0.21.13, protocol 5)
+
+Cache performance
+        rust-cache: 412 hits, 87 misses (82.6% hit rate), 2 errors
+          cc-cache: 11 hits, 3 misses (78.6% hit rate), 0 errors
+         cpu-saved: 14.2 min
+      bytes-served: 128.4 MiB
+  bytes-downloaded: 42.1 MiB
 ```
 
 ## `stow stats`
