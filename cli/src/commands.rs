@@ -54,7 +54,7 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
     // directory it runs in must not change the result.
     let mold_bin_dir = mold::prepare_global().await?;
     let wrappers = detect_wrapper_commands()?;
-    let cleaned = clean_stale_project_configs(&current_dir, &cargo_home.join("config.toml"))?;
+    let cleaned = clean_stale_project_configs(&current_dir, &cargo_home)?;
     // Where a workspace's intermediates go: under stow's cache root, so a
     // store or a serve is a same-volume clone — unless the user already
     // placed the build directory (stow#1538).
@@ -491,7 +491,7 @@ pub async fn status_project(state_db: &StateDb) -> stow_types::error::Result<()>
     ))?;
 
     if let Ok(current_dir) = std::env::current_dir() {
-        for path in stale_project_configs(&current_dir, &config_path) {
+        for path in stale_project_configs(&current_dir, &cargo_home) {
             write_stdout(&format!(
                 "stale stow wiring: {} — left by an older stow; `stow setup` removes it\n",
                 path.display()
@@ -1193,12 +1193,15 @@ pub fn configured_cxx_compiler(target: &str) -> Option<String> {
 }
 
 /// `.cargo/config.toml` files in `dir`'s ancestors that still carry stow's
-/// old per-project wiring — they shadow the global config. `exclude` is the
-/// global config path itself (it belongs to the write target, not this
-/// walk). Returns every file holding a stow-owned value.
-fn stale_project_configs(dir: &Path, exclude: &Path) -> Vec<PathBuf> {
+/// old per-project wiring — they shadow the global config. `cargo_home` is
+/// passed explicitly so `cargo-config2` never falls back to the process
+/// `CARGO_HOME` during tests, and `$CARGO_HOME/config.toml` itself is
+/// excluded as the global write target. Returns every file holding a
+/// stow-owned value.
+fn stale_project_configs(dir: &Path, cargo_home: &Path) -> Vec<PathBuf> {
+    let exclude = cargo_home.join("config.toml");
     let mut stale = Vec::new();
-    for path in cargo_config2::Walk::new(dir) {
+    for path in cargo_config2::Walk::with_cargo_home(dir, Some(cargo_home.to_path_buf())) {
         if path == exclude {
             continue;
         }
@@ -1221,10 +1224,10 @@ fn stale_project_configs(dir: &Path, exclude: &Path) -> Vec<PathBuf> {
 /// so a user's own `CC`, `COMPILER_PATH` or `rustc-wrapper` survives.
 fn clean_stale_project_configs(
     dir: &Path,
-    exclude: &Path,
+    cargo_home: &Path,
 ) -> stow_types::error::Result<Vec<PathBuf>> {
     let mut cleaned = Vec::new();
-    for path in stale_project_configs(dir, exclude) {
+    for path in stale_project_configs(dir, cargo_home) {
         let contents =
             std::fs::read_to_string(&path).wrap_err_with(|| format!("read {}", path.display()))?;
         let mut document = contents
@@ -1969,12 +1972,18 @@ mod tests {
         let untouched = untouched_dir.join("config.toml");
         std::fs::write(&untouched, "[env]\nCC = \"/usr/bin/clang\"\n").expect("seed user config");
 
-        let cleaned = super::clean_stale_project_configs(
-            &project,
-            &tempdir.path().join("elsewhere/config.toml"),
-        )
-        .expect("clean");
+        let global_home = tempdir.path().join("elsewhere");
+        std::fs::create_dir_all(&global_home).expect("create elsewhere cargo home");
+        let global_config = global_home.join("config.toml");
+        let global_contents = "[build]\nrustc-wrapper = \"/tmp/stow-tools/stow-rustc-wrapper\"\n";
+        std::fs::write(&global_config, global_contents).expect("seed global config");
+
+        let cleaned = super::clean_stale_project_configs(&project, &global_home).expect("clean");
         assert_eq!(cleaned, vec![stale.clone()]);
+        assert_eq!(
+            std::fs::read_to_string(&global_config).expect("read global config"),
+            global_contents
+        );
         let text = std::fs::read_to_string(&stale).expect("read cleaned");
         assert!(!text.contains("stow-cc"), "stow entry survived:\n{text}");
         assert!(text.contains("OBJC"), "user entry dropped:\n{text}");
@@ -2074,7 +2083,7 @@ mod tests {
 
         let cleaned = super::clean_stale_project_configs(
             &tempdir.path().join("proj"),
-            &tempdir.path().join("elsewhere/config.toml"),
+            &tempdir.path().join("elsewhere"),
         )
         .expect("clean");
         assert_eq!(cleaned, vec![stale.clone()]);
