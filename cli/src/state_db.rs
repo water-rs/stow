@@ -475,6 +475,11 @@ async fn connect_tier_pool(
     connect_db_at(&tier_db_path(cache_dir, tier), TIER_SCHEMA_SQL).await
 }
 
+/// Wait out concurrent writers when multiple daemons share one `cache_dir`
+/// (e.g. containerized sessions sharing a host cache mount); sqlx's 5 s
+/// default is too short under heavy parallel cold-cache writes.
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn connect_db_at(
     path: &Path,
     schema_sql: &'static str,
@@ -490,6 +495,7 @@ async fn connect_db_at(
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(SQLITE_BUSY_TIMEOUT)
         .foreign_keys(true);
 
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
