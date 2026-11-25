@@ -557,6 +557,10 @@ async fn apply_setup(
 }
 
 /// Compute the daemon login service target for this platform without writing.
+#[cfg_attr(
+    not(any(target_os = "macos", windows)),
+    allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)
+)]
 fn planned_daemon_service() -> stow_types::error::Result<Option<DaemonServicePlan>> {
     #[cfg(target_os = "macos")]
     {
@@ -3295,6 +3299,12 @@ mod tests {
             !uncolored.contains('\x1b'),
             "plain setup plan must not emit ANSI escapes:\n{uncolored}"
         );
+        let expected_linker = format!(
+            "linker: mold ({}) (will download)",
+            PathBuf::from("/Users/u/.local/share/stow/tools/mold/bin")
+                .join("mold")
+                .display()
+        );
         for expected in [
             "stow setup plan",
             "config: /Users/u/.cargo/config.toml (update)",
@@ -3304,7 +3314,7 @@ mod tests {
             "cc-launcher: /Users/u/.cargo/stow/shims/0123456789abcdef/stow-cc-launcher",
             "STOW_REAL_CC: clang",
             "build-dir: /Users/u/.stow/build-dir/{workspace-path-hash}",
-            "linker: mold (/Users/u/.local/share/stow/tools/mold/bin/mold) (will download)",
+            expected_linker.as_str(),
             "shims: /Users/u/.cargo/stow/shims/0123456789abcdef",
             "launch agent: /Users/u/Library/LaunchAgents/dev.waterui.stow.plist (dev.waterui.stow)",
             "agent skill: /Users/u/.agents/skills/stow/SKILL.md (install)",
