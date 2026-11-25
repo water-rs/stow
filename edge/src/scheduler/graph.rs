@@ -462,6 +462,20 @@ pub struct RequestRecord {
 /// is runs per minute.
 const DISPATCH_RATE_WINDOW_MS: i64 = 60_000;
 
+/// Ephemeral state for one live external enterprise GitHub-hosted job
+/// (stow#1697). Kept in memory with a TTL so missed `completed` deliveries
+/// never permanently hold back scheduler capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnterpriseJob {
+    family: RunnerFamily,
+    queued: bool,
+    updated_at: i64,
+}
+
+/// Drop an uncompleted enterprise job entry after 60 minutes (matching
+/// `DEFAULT_STALE_DISPATCH_MINUTES`) so a lost webhook cannot wedge dispatch.
+const ENTERPRISE_JOB_TTL_MS: i64 = 60 * 60 * 1_000;
+
 /// The whole in-memory graph. Nothing here serializes whole: the
 /// snapshot (`snapshot.rs`) walks it one byte-bounded chunk at a time,
 /// and a wake decodes it one chunk at a time — neither side ever holds
@@ -560,6 +574,9 @@ pub struct Graph {
     pending_ages: BTreeMap<i64, u32>,
     /// External `build-crate.yml` runs (stow#877): run id → family bit.
     external_runs: HashMap<u64, u8>,
+    /// Live non-`stow` GitHub-hosted jobs across the shared enterprise
+    /// (stow#1697): job id → ephemeral occupancy & queued state.
+    enterprise_jobs: HashMap<u64, EnterpriseJob>,
     /// The CI API recovery deadline in epoch milliseconds.
     ci_not_before: i64,
     /// The dispatch freeze record while engaged.
@@ -2660,16 +2677,8 @@ impl Graph {
     }
 
     /// [`Self::claim_nodes`], adding the ready entries the pass examined
-    /// to `scans` — the pass's cost, which tests bound.
-    fn claim_scanned(
-        &mut self,
-        settings: &queue::SchedulerSettings,
-        now: i64,
-        bound: u32,
-        scans: &mut u64,
-    ) -> Result<ClaimPass, QueueError> {
-        // Stale-lease recovery first: in-flight nodes whose claim
-        // outlived the lease return to pending.
+    /// Return in-flight nodes whose claim outlived the lease to pending.
+    fn recover_stale_leases(&mut self, settings: &queue::SchedulerSettings, now: i64) {
         let stale_ms = i64::from(settings.stale_dispatch_minutes) * 60_000;
         let stale: Vec<u32> = self
             .inflight
@@ -2688,9 +2697,22 @@ impl Graph {
             });
             self.refresh_ready(ix);
         }
+    }
+
+    /// to `scans` — the pass's cost, which tests bound.
+    fn claim_scanned(
+        &mut self,
+        settings: &queue::SchedulerSettings,
+        now: i64,
+        bound: u32,
+        scans: &mut u64,
+    ) -> Result<ClaimPass, QueueError> {
+        self.recover_stale_leases(settings, now);
         if self.freeze.is_some() || self.ci_not_before > now {
             return Ok(ClaimPass::default());
         }
+        self.prune_enterprise_jobs(now);
+        let yielding_bulk = self.has_queued_enterprise_job();
         let (total_free, macos_free) = self.free_slots(settings);
         let total_free = total_free.min(bound);
         let macos_free = macos_free.min(bound);
@@ -2721,6 +2743,9 @@ impl Graph {
                     continue;
                 }
                 for (&(operand, profile), class) in ready {
+                    if yielding_bulk && operand < queue::MISS_PRIORITY {
+                        continue;
+                    }
                     let cursor = cursors
                         .entry((macos, (operand, profile)))
                         .or_insert(Some((i64::MIN, 0)));
@@ -3763,23 +3788,80 @@ impl Graph {
         live.nth(over).map(|at| at + DISPATCH_RATE_WINDOW_MS)
     }
 
-    /// Dispatch slots free under `settings`: the cap minus in-flight and
-    /// external occupancy, in total and for the macOS family. A cap
-    /// below the in-flight count saturates at zero — nothing in flight
-    /// is moved.
+    /// Dispatch slots free under `settings`: the cap minus in-flight,
+    /// external `stow` occupancy, and live enterprise dev-CI occupancy, in
+    /// total and for the macOS family. A cap below occupancy saturates at
+    /// zero — nothing in flight is moved.
     pub fn free_slots(&self, settings: &queue::SchedulerSettings) -> (u32, u32) {
         let (inflight, macos_inflight) = self.inflight();
+        let (enterprise_total, enterprise_macos) = self.enterprise_occupancy();
         let total = match settings.dispatch {
             queue::Dispatch::Limited(limit) => limit.get(),
             queue::Dispatch::Paused => 0,
         }
         .saturating_sub(inflight)
-        .saturating_sub(self.external_total());
+        .saturating_sub(self.external_total())
+        .saturating_sub(enterprise_total);
         let macos = settings
             .max_concurrent_macos_jobs
             .saturating_sub(macos_inflight)
-            .saturating_sub(self.external_family(RunnerFamily::MacOs));
+            .saturating_sub(self.external_family(RunnerFamily::MacOs))
+            .saturating_sub(enterprise_macos);
         (total, macos)
+    }
+
+    /// Record or clear one external enterprise GitHub-hosted job (stow#1697).
+    /// Returns `true` when the update freed capacity or cleared a queued
+    /// yield so the caller can re-arm the scheduler alarm.
+    pub fn apply_enterprise_job_update(
+        &mut self,
+        update: &stow_types::api::EnterpriseJobUpdate,
+        now: i64,
+    ) -> bool {
+        let had_queued = self.has_queued_enterprise_job();
+        let before = self.enterprise_jobs.len();
+        self.prune_enterprise_jobs(now);
+        if update.active {
+            self.enterprise_jobs.insert(
+                update.job_id,
+                EnterpriseJob {
+                    family: update.family,
+                    queued: update.queued,
+                    updated_at: now,
+                },
+            );
+        } else {
+            self.enterprise_jobs.remove(&update.job_id);
+        }
+        let freed_slots = self.enterprise_jobs.len() < before;
+        let cleared_yield = had_queued && !self.has_queued_enterprise_job();
+        freed_slots || cleared_yield
+    }
+
+    /// Drop stale enterprise job entries whose `completed` webhook never arrived.
+    pub fn prune_enterprise_jobs(&mut self, now: i64) {
+        self.enterprise_jobs
+            .retain(|_, job| now.saturating_sub(job.updated_at) < ENTERPRISE_JOB_TTL_MS);
+    }
+
+    /// Live external enterprise job occupancy: `(total, macos)`.
+    #[must_use]
+    pub fn enterprise_occupancy(&self) -> (u32, u32) {
+        let total = u32::try_from(self.enterprise_jobs.len()).unwrap_or(u32::MAX);
+        let macos = u32::try_from(
+            self.enterprise_jobs
+                .values()
+                .filter(|job| job.family == RunnerFamily::MacOs)
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        (total, macos)
+    }
+
+    /// Whether any live external enterprise job is currently `queued`.
+    #[must_use]
+    pub fn has_queued_enterprise_job(&self) -> bool {
+        self.enterprise_jobs.values().any(|job| job.queued)
     }
 
     /// Return a completed, unpublished node to the queue as never
@@ -9484,5 +9566,75 @@ mod tests {
         let health = graph.health(1_000 + Graph::DELIVERY_STALE_MS * 10);
         assert_eq!(health.scheduler, HealthState::Ok);
         assert_eq!(health.last_run_update_age_seconds, None);
+    }
+
+    #[test]
+    fn enterprise_jobs_reduce_free_slots_yield_preheat_when_queued_and_expire() {
+        use stow_types::api::EnterpriseJobUpdate;
+
+        let mut graph = Graph::default();
+        let settings = queue::SchedulerSettings {
+            dispatch: queue::Dispatch::from_max_concurrent_jobs(10),
+            max_concurrent_macos_jobs: 4,
+            ..queue::SchedulerSettings::default()
+        };
+        assert_eq!(graph.free_slots(&settings), (10, 4));
+
+        // Queued enterprise macOS job reduces both total and macOS slots and
+        // marks bulk yielding active.
+        let freed = graph.apply_enterprise_job_update(
+            &EnterpriseJobUpdate {
+                job_id: 1,
+                family: RunnerFamily::MacOs,
+                active: true,
+                queued: true,
+            },
+            1_000,
+        );
+        assert!(!freed);
+        assert_eq!(graph.free_slots(&settings), (9, 3));
+        assert!(graph.has_queued_enterprise_job());
+
+        // Transitioning queued -> in_progress clears bulk yield and signals re-arm.
+        let freed = graph.apply_enterprise_job_update(
+            &EnterpriseJobUpdate {
+                job_id: 1,
+                family: RunnerFamily::MacOs,
+                active: true,
+                queued: false,
+            },
+            2_000,
+        );
+        assert!(freed);
+        assert_eq!(graph.free_slots(&settings), (9, 3));
+        assert!(!graph.has_queued_enterprise_job());
+
+        // Completing the job frees the slot and signals re-arm.
+        let freed = graph.apply_enterprise_job_update(
+            &EnterpriseJobUpdate {
+                job_id: 1,
+                family: RunnerFamily::MacOs,
+                active: false,
+                queued: false,
+            },
+            3_000,
+        );
+        assert!(freed);
+        assert_eq!(graph.free_slots(&settings), (10, 4));
+
+        // A dropped `completed` delivery expires after ENTERPRISE_JOB_TTL_MS.
+        graph.apply_enterprise_job_update(
+            &EnterpriseJobUpdate {
+                job_id: 2,
+                family: RunnerFamily::Linux,
+                active: true,
+                queued: true,
+            },
+            10_000,
+        );
+        assert_eq!(graph.free_slots(&settings), (9, 4));
+        graph.prune_enterprise_jobs(10_000 + ENTERPRISE_JOB_TTL_MS);
+        assert_eq!(graph.free_slots(&settings), (10, 4));
+        assert!(!graph.has_queued_enterprise_job());
     }
 }

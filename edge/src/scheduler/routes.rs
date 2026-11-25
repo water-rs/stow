@@ -902,6 +902,17 @@ pub(super) async fn task_run_update(
     Ok(outcome)
 }
 
+/// `POST /enterprise/job-update`: in-memory dynamic yielding for non-`stow`
+/// GitHub-hosted jobs across the shared enterprise (stow#1697). Costs zero
+/// SQLite reads and zero SQLite writes.
+pub(super) fn enterprise_job_update(
+    graph: LoadedGraph<'_>,
+    update: &stow_types::api::EnterpriseJobUpdate,
+    now: i64,
+) -> bool {
+    graph.with(|graph| graph.apply_enterprise_job_update(update, now))
+}
+
 /// The wake the graph plans — see [`Graph::wake_plan`].
 pub(super) fn wake_plan(
     graph: LoadedGraph<'_>,

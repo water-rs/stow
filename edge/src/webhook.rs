@@ -190,6 +190,80 @@ struct ActionOnly {
     action: String,
 }
 
+/// The `workflow_job` payload fields read for enterprise dynamic yielding
+/// (stow#1697).
+#[derive(serde::Deserialize)]
+struct WorkflowJobEvent {
+    action: String,
+    repository: RepoRef,
+    workflow_job: WorkflowJobFields,
+}
+
+#[derive(serde::Deserialize)]
+struct WorkflowJobFields {
+    id: u64,
+    #[serde(default)]
+    labels: Vec<String>,
+}
+
+/// Infer the GitHub-hosted runner family from a `workflow_job`'s `labels`,
+/// returning `None` for self-hosted jobs (which do not consume the shared
+/// GitHub-hosted 500-runner pool).
+fn hosted_runner_family(labels: &[String]) -> Option<stow_types::api::RunnerFamily> {
+    if labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case("self-hosted"))
+    {
+        return None;
+    }
+    if labels
+        .iter()
+        .any(|label| label.to_ascii_lowercase().starts_with("macos"))
+    {
+        return Some(stow_types::api::RunnerFamily::MacOs);
+    }
+    if labels
+        .iter()
+        .any(|label| label.to_ascii_lowercase().starts_with("windows"))
+    {
+        return Some(stow_types::api::RunnerFamily::Windows);
+    }
+    Some(stow_types::api::RunnerFamily::Linux)
+}
+
+/// Decode a signed `workflow_job` delivery for an external repository on a
+/// GitHub-hosted runner into an [`stow_types::api::EnterpriseJobUpdate`].
+///
+/// Returns `Ok(None)` without touching the scheduler DO when:
+/// - `repository.full_name` is `water-rs/stow` (already tracked via `workflow_run`),
+/// - `action` is not `queued`, `in_progress`, or `completed`, or
+/// - `labels` include `self-hosted`.
+fn decode_enterprise_job_update(
+    delivery: &VerifiedDelivery,
+) -> Result<Option<stow_types::api::EnterpriseJobUpdate>, GetArtifactError> {
+    let event: WorkflowJobEvent = serde_json::from_slice(&delivery.body).map_err(|error| {
+        GetArtifactError::BadRequestWithMessage(format!("malformed workflow_job payload: {error}"))
+    })?;
+    if event.repository.full_name == stow_types::trusted_builder::REPOSITORY {
+        return Ok(None);
+    }
+    let (active, queued) = match event.action.as_str() {
+        "queued" => (true, true),
+        "in_progress" => (true, false),
+        "completed" => (false, false),
+        _ => return Ok(None),
+    };
+    let Some(family) = hosted_runner_family(&event.workflow_job.labels) else {
+        return Ok(None);
+    };
+    Ok(Some(stow_types::api::EnterpriseJobUpdate {
+        job_id: event.workflow_job.id,
+        family,
+        active,
+        queued,
+    }))
+}
+
 /// Decode a signed delivery into the `workflow_run` event plus its
 /// action. `None` covers everything this hook does not consume —
 /// non-`workflow_run` events (`ping`) answer 200 so GitHub's delivery
@@ -349,9 +423,21 @@ pub async fn github_workflow_run(
 async fn consume_delivery(
     delivery: &VerifiedDelivery,
     records: &impl RecordsCheck,
-    forward: &(impl TaskRunForward + RequestRunForward),
+    forward: &(impl TaskRunForward + RequestRunForward + EnterpriseJobForward),
     app_bot_login: &str,
 ) -> Result<(), GetArtifactError> {
+    if delivery.event == "workflow_job" {
+        if let Some(update) = decode_enterprise_job_update(delivery)?
+            && let Err(error) = forward.send_enterprise_job_update(&update).await
+        {
+            tracing::warn!(
+                job_id = update.job_id,
+                %error,
+                "forward enterprise workflow_job update"
+            );
+        }
+        return Ok(());
+    }
     let Some((action, event)) = decode_delivery(delivery)? else {
         tracing::debug!(event = %delivery.event, "ignoring non-workflow_run delivery");
         return Ok(());
@@ -495,6 +581,26 @@ impl RequestRunForward for CfDurableNamespace {
         update: &'a stow_types::api::RequestRunUpdate,
     ) -> impl Future<Output = Result<(), SchedulerClientError>> + Send + 'a {
         scheduler_client::send_request_run_update(self, request_id, update).into_send()
+    }
+}
+
+/// The outbound channel an enterprise `workflow_job` delivery uses:
+/// `POST /enterprise/job-update` (stow#1697).
+trait EnterpriseJobForward: Sync {
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn send_enterprise_job_update<'a>(
+        &'a self,
+        update: &'a stow_types::api::EnterpriseJobUpdate,
+    ) -> impl Future<Output = Result<(), SchedulerClientError>> + Send + 'a;
+}
+
+#[cfg(target_arch = "wasm32")]
+impl EnterpriseJobForward for CfDurableNamespace {
+    fn send_enterprise_job_update<'a>(
+        &'a self,
+        update: &'a stow_types::api::EnterpriseJobUpdate,
+    ) -> impl Future<Output = Result<(), SchedulerClientError>> + Send + 'a {
+        scheduler_client::send_enterprise_job_update(self, update).into_send()
     }
 }
 
@@ -1215,9 +1321,23 @@ mod tests {
         updates: std::sync::Mutex<Vec<TaskRunUpdate>>,
         completions: std::sync::Mutex<Vec<WorkflowRunComplete>>,
         request_updates: std::sync::Mutex<Vec<stow_types::api::RequestRunUpdate>>,
+        enterprise_updates: std::sync::Mutex<Vec<stow_types::api::EnterpriseJobUpdate>>,
         /// Scripted status — when `Some`, the stub answers
         /// `SchedulerClientError::Http` with it.
         status: Option<u16>,
+    }
+
+    impl EnterpriseJobForward for CountingForward {
+        fn send_enterprise_job_update<'a>(
+            &'a self,
+            update: &'a stow_types::api::EnterpriseJobUpdate,
+        ) -> impl Future<Output = Result<(), SchedulerClientError>> + Send + 'a {
+            self.enterprise_updates
+                .lock()
+                .expect("enterprise updates")
+                .push(*update);
+            std::future::ready(Ok(()))
+        }
     }
 
     impl RequestRunForward for CountingForward {
@@ -1611,5 +1731,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn enterprise_workflow_job_filters_self_hosted_and_stow_and_forwards_hosted() {
+        let records = RecordsPresent;
+        let forward = CountingForward::default();
+
+        // 1. External repo on ubuntu-latest (queued) -> forwarded as Linux, active, queued.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "queued",
+            "repository": { "full_name": "May-Agent/may" },
+            "workflow_job": { "id": 101, "labels": ["ubuntu-latest"] }
+        }))
+        .expect("serialize");
+        let delivery = verified("workflow_job", &body).await.expect("sign");
+        consume_delivery(&delivery, &records, &forward, APP_BOT_LOGIN)
+            .await
+            .expect("consume");
+
+        // 2. External repo on macos-15 (in_progress) -> forwarded as MacOs, active, !queued.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "in_progress",
+            "repository": { "full_name": "lexoliu/helios" },
+            "workflow_job": { "id": 102, "labels": ["macos-15"] }
+        }))
+        .expect("serialize");
+        let delivery = verified("workflow_job", &body).await.expect("sign");
+        consume_delivery(&delivery, &records, &forward, APP_BOT_LOGIN)
+            .await
+            .expect("consume");
+
+        // 3. Self-hosted job -> ignored (0 forwards).
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "queued",
+            "repository": { "full_name": "May-Agent/may" },
+            "workflow_job": { "id": 103, "labels": ["self-hosted", "linux", "gcp-spot"] }
+        }))
+        .expect("serialize");
+        let delivery = verified("workflow_job", &body).await.expect("sign");
+        consume_delivery(&delivery, &records, &forward, APP_BOT_LOGIN)
+            .await
+            .expect("consume");
+
+        // 4. water-rs/stow's own workflow_job -> ignored (0 forwards).
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "queued",
+            "repository": { "full_name": stow_types::trusted_builder::REPOSITORY },
+            "workflow_job": { "id": 104, "labels": ["ubuntu-latest"] }
+        }))
+        .expect("serialize");
+        let delivery = verified("workflow_job", &body).await.expect("sign");
+        consume_delivery(&delivery, &records, &forward, APP_BOT_LOGIN)
+            .await
+            .expect("consume");
+
+        // 5. Completed external job -> forwarded with active=false.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "completed",
+            "repository": { "full_name": "May-Agent/may" },
+            "workflow_job": { "id": 101, "labels": ["ubuntu-latest"] }
+        }))
+        .expect("serialize");
+        let delivery = verified("workflow_job", &body).await.expect("sign");
+        consume_delivery(&delivery, &records, &forward, APP_BOT_LOGIN)
+            .await
+            .expect("consume");
+
+        let sent = forward.enterprise_updates.lock().expect("lock").clone();
+        assert_eq!(
+            sent,
+            vec![
+                stow_types::api::EnterpriseJobUpdate {
+                    job_id: 101,
+                    family: stow_types::api::RunnerFamily::Linux,
+                    active: true,
+                    queued: true,
+                },
+                stow_types::api::EnterpriseJobUpdate {
+                    job_id: 102,
+                    family: stow_types::api::RunnerFamily::MacOs,
+                    active: true,
+                    queued: false,
+                },
+                stow_types::api::EnterpriseJobUpdate {
+                    job_id: 101,
+                    family: stow_types::api::RunnerFamily::Linux,
+                    active: false,
+                    queued: false,
+                },
+            ]
+        );
     }
 }

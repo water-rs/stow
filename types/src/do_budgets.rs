@@ -672,6 +672,14 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 150,
     },
     DriveBudget {
+        // stow#1697: in-memory enterprise yield map with 60m TTL — zero SQLite I/O.
+        name: "POST /enterprise/job-update",
+        statements: 0,
+        rows_read: 0,
+        rows_written: 0,
+        wall_ms: 50,
+    },
+    DriveBudget {
         // stow#1378: the re-claim mints its ids from digest rows, one
         // read each in one statement; the stale claims are in flight,
         // so at most the dispatch cap (45); two rows read per digest
