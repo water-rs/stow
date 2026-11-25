@@ -46,6 +46,13 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Debug, Clone)]
 pub struct WebhookSecret(pub String);
 
+/// The `WORKFLOW_WEBHOOK_SECRET` binding, stored via `State` — verifies
+/// enterprise/org `workflow_job` deliveries separately from
+/// `STOW_GITHUB_WEBHOOK_SECRET` so occupancy webhooks cannot forge
+/// trusted `workflow_run` build completions.
+#[derive(Debug, Clone)]
+pub struct WorkflowWebhookSecret(pub String);
+
 /// The `GITHUB_APP_SLUG` binding rendered into the
 /// `triggering_actor.login` a scheduler-dispatched run carries —
 /// `<slug>[bot]`. A `build-crate.yml` `in_progress` delivery whose run
@@ -121,14 +128,30 @@ impl Extractor for VerifiedDelivery {
 
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         let delivery = SignedDelivery::extract(request).await?;
-        let State(secret) = State::<WebhookSecret>::extract(request)
+        let State(run_secret) =
+            State::<WebhookSecret>::extract(request)
+                .await
+                .map_err(|error| {
+                    GetArtifactError::InternalWithMessage(format!(
+                        "webhook secret binding missing: {error}"
+                    ))
+                })?;
+        let State(job_secret) = State::<WorkflowWebhookSecret>::extract(request)
             .await
             .map_err(|error| {
                 GetArtifactError::InternalWithMessage(format!(
-                    "webhook secret binding missing: {error}"
+                    "workflow webhook secret binding missing: {error}"
                 ))
             })?;
-        verify_signature(&secret.0, &delivery.signature, &delivery.body)?;
+        match delivery.event.as_str() {
+            "workflow_job" => verify_signature(&job_secret.0, &delivery.signature, &delivery.body)?,
+            "ping" => {
+                if verify_signature(&run_secret.0, &delivery.signature, &delivery.body).is_err() {
+                    verify_signature(&job_secret.0, &delivery.signature, &delivery.body)?;
+                }
+            }
+            _ => verify_signature(&run_secret.0, &delivery.signature, &delivery.body)?,
+        }
         Ok(Self {
             event: delivery.event,
             body: delivery.body,
@@ -837,6 +860,7 @@ mod tests {
     use super::*;
 
     const SECRET: &str = "webhook-secret";
+    const WORKFLOW_SECRET: &str = "workflow-webhook-secret";
 
     fn signed_body(secret: &str, body: &[u8]) -> String {
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("hmac accepts any key");
@@ -845,8 +869,8 @@ mod tests {
     }
 
     /// A request the way GitHub sends it: event + signature headers over
-    /// the raw body, the `STOW_GITHUB_WEBHOOK_SECRET` binding layered in
-    /// as `State`.
+    /// the raw body, the `STOW_GITHUB_WEBHOOK_SECRET` and
+    /// `WORKFLOW_WEBHOOK_SECRET` bindings layered in as `State`.
     fn delivery_request(event: &str, body: &[u8], signature: &str) -> Request {
         let mut request = Request::new(skyzen::Body::from(body.to_vec()));
         request
@@ -860,10 +884,18 @@ mod tests {
             .extensions_mut()
             .insert(State(WebhookSecret(SECRET.to_owned())));
         request
+            .extensions_mut()
+            .insert(State(WorkflowWebhookSecret(WORKFLOW_SECRET.to_owned())));
+        request
     }
 
     async fn verified(event: &str, body: &[u8]) -> Result<VerifiedDelivery, GetArtifactError> {
-        let signature = signed_body(SECRET, body);
+        let secret = if event == "workflow_job" {
+            WORKFLOW_SECRET
+        } else {
+            SECRET
+        };
+        let signature = signed_body(secret, body);
         let mut request = delivery_request(event, body, &signature);
         VerifiedDelivery::extract(&mut request).await
     }
@@ -1822,5 +1854,33 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn workflow_webhook_secret_isolated_from_workflow_run() {
+        let body = b"{}";
+
+        // `workflow_job` accepts WORKFLOW_SECRET and rejects SECRET.
+        let mut ok_job =
+            delivery_request("workflow_job", body, &signed_body(WORKFLOW_SECRET, body));
+        assert!(VerifiedDelivery::extract(&mut ok_job).await.is_ok());
+
+        let mut bad_job = delivery_request("workflow_job", body, &signed_body(SECRET, body));
+        assert!(VerifiedDelivery::extract(&mut bad_job).await.is_err());
+
+        // `workflow_run` accepts SECRET and rejects WORKFLOW_SECRET.
+        let mut ok_run = delivery_request("workflow_run", body, &signed_body(SECRET, body));
+        assert!(VerifiedDelivery::extract(&mut ok_run).await.is_ok());
+
+        let mut bad_run =
+            delivery_request("workflow_run", body, &signed_body(WORKFLOW_SECRET, body));
+        assert!(VerifiedDelivery::extract(&mut bad_run).await.is_err());
+
+        // `ping` accepts either secret so both webhook registrations verify.
+        let mut ping_run = delivery_request("ping", body, &signed_body(SECRET, body));
+        assert!(VerifiedDelivery::extract(&mut ping_run).await.is_ok());
+
+        let mut ping_job = delivery_request("ping", body, &signed_body(WORKFLOW_SECRET, body));
+        assert!(VerifiedDelivery::extract(&mut ping_job).await.is_ok());
     }
 }
