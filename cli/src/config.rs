@@ -28,6 +28,23 @@ const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
 const STOW_REGISTRY_BASE_URL_ENV: &str = "STOW_REGISTRY_BASE_URL";
 const STOW_INDEX_REFRESH_SECS_ENV: &str = "STOW_INDEX_REFRESH_SECS";
 const STOW_ARTIFACT_CACHE_MAX_BYTES_ENV: &str = "STOW_ARTIFACT_CACHE_MAX_BYTES";
+const STOW_BUCKET_ENV: &str = "STOW_BUCKET";
+const STOW_BUCKET_ENDPOINT_ENV: &str = "STOW_BUCKET_ENDPOINT";
+const STOW_BUCKET_REGION_ENV: &str = "STOW_BUCKET_REGION";
+const STOW_BUCKET_PREFIX_ENV: &str = "STOW_BUCKET_PREFIX";
+const STOW_BUCKET_READ_ONLY_ENV: &str = "STOW_BUCKET_READ_ONLY";
+const STOW_BUCKET_LOCAL_CRATES_IO_ENV: &str = "STOW_BUCKET_LOCAL_CRATES_IO";
+const STOW_BUCKET_FORCE_PATH_STYLE_ENV: &str = "STOW_BUCKET_FORCE_PATH_STYLE";
+const AWS_ACCESS_KEY_ID_ENV: &str = "AWS_ACCESS_KEY_ID";
+const AWS_SECRET_ACCESS_KEY_ENV: &str = "AWS_SECRET_ACCESS_KEY";
+const AWS_SESSION_TOKEN_ENV: &str = "AWS_SESSION_TOKEN";
+pub const DEFAULT_BUCKET_REGION: &str = "auto";
+pub const DEFAULT_BUCKET_PREFIX: &str = "stow/";
+/// Short default timeouts for optional L2 bucket operations so an unreachable
+/// or stalled S3-compatible endpoint degrades quickly to local compilation.
+pub const DEFAULT_BUCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+pub const DEFAULT_BUCKET_READ_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_BUCKET_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_NEGATIVE_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_CIRCUIT_RESET_SECS: u64 = 60;
@@ -114,6 +131,110 @@ impl CacheLayers {
     }
 }
 
+/// Static S3 credentials resolved from a build's [`SessionEnv`]
+/// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`).
+///
+/// Never read from or serialized into `config.toml`; [`std::fmt::Debug`]
+/// redacts every field so credentials never appear in logs or diagnostics.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct BucketCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+}
+
+impl BucketCredentials {
+    /// Convert into [`skyzen_s3::S3Credentials`] for explicit per-session auth.
+    #[must_use]
+    pub fn into_s3_credentials(self) -> skyzen_s3::S3Credentials {
+        let credentials = skyzen_s3::S3Credentials::new(self.access_key_id, self.secret_access_key);
+        match self.session_token {
+            Some(token) => credentials.with_session_token(token),
+            None => credentials,
+        }
+    }
+}
+
+impl std::fmt::Debug for BucketCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BucketCredentials")
+            .field("access_key_id", &"<redacted>")
+            .field("secret_access_key", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Optional S3-compatible remote bucket backing stow's local cache tiers
+/// (`local/`, including `local/cc/`, and optionally `local-crates-io/`).
+///
+/// Configured via `[cache.bucket]` in `config.toml` and/or `STOW_BUCKET*`
+/// variables in [`SessionEnv`]; works independently of `[cache] remote`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BucketCacheConfig {
+    pub bucket: String,
+    pub endpoint: Option<String>,
+    pub region: String,
+    pub prefix: String,
+    pub read_only: bool,
+    pub local_crates_io: bool,
+    pub force_path_style: Option<bool>,
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
+    pub operation_timeout: Duration,
+    #[serde(skip)]
+    pub credentials: Option<BucketCredentials>,
+}
+
+impl BucketCacheConfig {
+    /// Build a configuration for `bucket` with default region, prefix, flags,
+    /// and timeouts.
+    #[must_use]
+    pub fn for_bucket(bucket: impl Into<String>) -> Self {
+        Self {
+            bucket: bucket.into(),
+            endpoint: None,
+            region: DEFAULT_BUCKET_REGION.to_owned(),
+            prefix: DEFAULT_BUCKET_PREFIX.to_owned(),
+            read_only: false,
+            local_crates_io: true,
+            force_path_style: None,
+            connect_timeout: DEFAULT_BUCKET_CONNECT_TIMEOUT,
+            read_timeout: DEFAULT_BUCKET_READ_TIMEOUT,
+            operation_timeout: DEFAULT_BUCKET_OPERATION_TIMEOUT,
+            credentials: None,
+        }
+    }
+
+    /// Timeout configuration passed to [`skyzen_s3::S3StorageBuilder::timeouts`].
+    #[must_use]
+    pub const fn s3_timeouts(&self) -> skyzen_s3::S3Timeouts {
+        skyzen_s3::S3Timeouts {
+            connect: Some(self.connect_timeout),
+            read: Some(self.read_timeout),
+            operation_attempt: None,
+            operation: Some(self.operation_timeout),
+        }
+    }
+}
+
+/// Normalize a bucket key prefix: strip leading slashes and ensure a trailing
+/// slash when non-empty.
+#[must_use]
+pub fn normalize_bucket_prefix(raw: &str) -> String {
+    let trimmed = raw.trim_start_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else if trimmed.ends_with('/') {
+        trimmed.to_owned()
+    } else {
+        format!("{trimmed}/")
+    }
+}
+
 /// The environment switches that shape what a command sends and writes
 /// rather than what it builds: resolved once with the config, so the
 /// process answering for a build reads them from the build's environment.
@@ -159,6 +280,10 @@ pub struct StowConfig {
     /// refuse a config whose remote layer is off.
     #[serde(default)]
     pub cache: CacheLayers,
+    /// Optional S3-compatible remote bucket backing local cache tiers
+    /// (`[cache.bucket]` / `STOW_BUCKET*`). Independent of `cache.remote`.
+    #[serde(default)]
+    pub bucket: Option<Box<BucketCacheConfig>>,
     pub edge_url: String,
     /// OCI registry root every index/artifact pull hits, in
     /// `scheme://host[:port]` form — the pull appends `/v2/<repository>`
@@ -213,6 +338,10 @@ pub struct StowConfig {
     /// per tier instead of one per session (stow#1690).
     #[serde(skip, default)]
     pub version_leases: crate::artifact_cache::SharedVersionLeases,
+    /// Daemon-shared remote bucket clients, circuit breakers, and bounded
+    /// write-behind uploader for this cache directory (stow#1700).
+    #[serde(skip, default)]
+    pub bucket_handles: crate::bucket_cache::BucketCacheHandles,
 }
 
 pub fn default_tier_staging() -> Arc<[OnceCell<Arc<crate::artifact_cache::StagingDir>>; 3]> {
@@ -400,12 +529,15 @@ impl StowConfig {
     pub fn load_in(env: &SessionEnv, state_db: StateDb) -> stow_types::error::Result<Self> {
         let file_config = load_user_config(env)?;
         let verify_mode = load_verify_mode(env, file_config.as_ref())?;
+        let cache = file_config
+            .as_ref()
+            .and_then(|config| config.cache.as_ref())
+            .map_or_default(CacheUserConfig::layers);
+        let bucket = resolve_bucket_config(env, file_config.as_ref())?.map(Box::new);
         Ok(Self {
             switches: Switches::of_environ(env.environ()),
-            cache: file_config
-                .as_ref()
-                .and_then(|config| config.cache)
-                .unwrap_or_default(),
+            cache,
+            bucket,
             edge_url: resolve_edge_url(env, file_config.as_ref()),
             registry_base_url: resolve_registry_base_url(env, file_config.as_ref()),
             cache_dir: resolve_cache_dir(env, file_config.as_ref())?,
@@ -443,7 +575,30 @@ impl StowConfig {
             registry_http: Arc::default(),
             artifact_cache_staging: default_tier_staging(),
             version_leases: crate::artifact_cache::SharedVersionLeases::default(),
+            bucket_handles: crate::bucket_cache::BucketCacheHandles::default(),
         })
+    }
+
+    /// Whether the configured remote bucket backs `tier`.
+    ///
+    /// Never true for [`CacheTier::CratesIo`], which belongs to the signed
+    /// public cache alone.
+    #[must_use]
+    pub fn bucket_syncs_tier(&self, tier: CacheTier) -> bool {
+        let Some(bucket) = self.bucket.as_deref() else {
+            return false;
+        };
+        match tier {
+            CacheTier::CratesIo => false,
+            CacheTier::LocalCratesIo => self.cache.local_crates_io && bucket.local_crates_io,
+            CacheTier::Local => self.cache.local_crates_io || self.cache.local_git,
+        }
+    }
+
+    /// Whether the configured remote bucket syncs `local-crates-io/`.
+    #[must_use]
+    pub fn bucket_syncs_local_crates_io(&self) -> bool {
+        self.bucket_syncs_tier(CacheTier::LocalCratesIo)
     }
 
     pub async fn ensure_dirs(&self) -> stow_types::error::Result<()> {
@@ -700,9 +855,55 @@ fn load_user_config(env: &SessionEnv) -> stow_types::error::Result<Option<StowUs
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CacheUserConfig {
+    remote: bool,
+    local_crates_io: bool,
+    local_git: bool,
+    bucket: Option<BucketCacheFileConfig>,
+}
+
+impl Default for CacheUserConfig {
+    fn default() -> Self {
+        let defaults = CacheLayers::default();
+        Self {
+            remote: defaults.remote,
+            local_crates_io: defaults.local_crates_io,
+            local_git: defaults.local_git,
+            bucket: None,
+        }
+    }
+}
+
+impl CacheUserConfig {
+    const fn layers(&self) -> CacheLayers {
+        CacheLayers {
+            remote: self.remote,
+            local_crates_io: self.local_crates_io,
+            local_git: self.local_git,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct BucketCacheFileConfig {
+    bucket: Option<String>,
+    endpoint: Option<String>,
+    region: Option<String>,
+    prefix: Option<String>,
+    read_only: Option<bool>,
+    local_crates_io: Option<bool>,
+    force_path_style: Option<bool>,
+    connect_timeout_secs: Option<u64>,
+    read_timeout_secs: Option<u64>,
+    operation_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StowUserConfig {
-    cache: Option<CacheLayers>,
+    cache: Option<CacheUserConfig>,
     edge_url: Option<String>,
     registry_base_url: Option<String>,
     cache_dir: Option<String>,
@@ -717,6 +918,146 @@ struct StowUserConfig {
     isolation: Option<crate::isolation::IsolationConfig>,
     #[cfg(feature = "mock-verify")]
     mock_public_key_path: Option<String>,
+}
+
+fn parse_bool_env(env: &SessionEnv, key: &str) -> stow_types::error::Result<Option<bool>> {
+    let Some(raw) = text_var(env, key) else {
+        return Ok(None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(Some(true)),
+        "0" | "false" | "no" => Ok(Some(false)),
+        other => Err(stow_types::stow_error!(
+            "parse {key} as boolean (`true`/`false`/`1`/`0`): got `{other}`"
+        )),
+    }
+}
+
+fn positive_timeout_secs(
+    value: Option<u64>,
+    field: &str,
+    default: Duration,
+) -> stow_types::error::Result<Duration> {
+    match value {
+        Some(0) => Err(stow_types::stow_error!(
+            "[cache.bucket] {field} must be greater than zero"
+        )),
+        Some(secs) => Ok(Duration::from_secs(secs)),
+        None => Ok(default),
+    }
+}
+
+fn resolve_bucket_credentials(
+    env: &SessionEnv,
+) -> stow_types::error::Result<Option<BucketCredentials>> {
+    let access_key = text_var(env, AWS_ACCESS_KEY_ID_ENV).filter(|value| !value.is_empty());
+    let secret_key = text_var(env, AWS_SECRET_ACCESS_KEY_ENV).filter(|value| !value.is_empty());
+    let session_token = text_var(env, AWS_SESSION_TOKEN_ENV).filter(|value| !value.is_empty());
+    match (access_key, secret_key) {
+        (Some(access_key_id), Some(secret_access_key)) => Ok(Some(BucketCredentials {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        })),
+        (Some(_), None) => Err(stow_types::stow_error!(
+            "{AWS_ACCESS_KEY_ID_ENV} is set without {AWS_SECRET_ACCESS_KEY_ENV}"
+        )),
+        (None, Some(_)) => Err(stow_types::stow_error!(
+            "{AWS_SECRET_ACCESS_KEY_ENV} is set without {AWS_ACCESS_KEY_ID_ENV}"
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
+fn resolve_bucket_config(
+    env: &SessionEnv,
+    file_config: Option<&StowUserConfig>,
+) -> stow_types::error::Result<Option<BucketCacheConfig>> {
+    let file_bucket = file_config
+        .and_then(|config| config.cache.as_ref())
+        .and_then(|cache| cache.bucket.as_ref());
+
+    let bucket = match text_var(env, STOW_BUCKET_ENV) {
+        Some(raw) if raw.trim().is_empty() => return Ok(None),
+        Some(raw) => raw.trim().to_owned(),
+        None => match file_bucket {
+            None => return Ok(None),
+            Some(file) => match file.bucket.as_deref().map(str::trim) {
+                Some(name) if !name.is_empty() => name.to_owned(),
+                _ => {
+                    return Err(stow_types::stow_error!(
+                        "[cache.bucket] requires a non-empty `bucket` name (or {STOW_BUCKET_ENV})"
+                    ));
+                }
+            },
+        },
+    };
+
+    let endpoint = match text_var(env, STOW_BUCKET_ENDPOINT_ENV) {
+        Some(raw) if raw.trim().is_empty() => None,
+        Some(raw) => Some(raw.trim().to_owned()),
+        None => file_bucket
+            .and_then(|file| file.endpoint.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+    };
+
+    let region = text_var(env, STOW_BUCKET_REGION_ENV)
+        .or_else(|| file_bucket.and_then(|file| file.region.clone()))
+        .unwrap_or_else(|| DEFAULT_BUCKET_REGION.to_owned());
+    let region = region.trim().to_owned();
+    if region.is_empty() {
+        return Err(stow_types::stow_error!(
+            "bucket region ({STOW_BUCKET_REGION_ENV} or [cache.bucket] region) must not be empty"
+        ));
+    }
+
+    let raw_prefix = text_var(env, STOW_BUCKET_PREFIX_ENV)
+        .or_else(|| file_bucket.and_then(|file| file.prefix.clone()))
+        .unwrap_or_else(|| DEFAULT_BUCKET_PREFIX.to_owned());
+    let prefix = normalize_bucket_prefix(&raw_prefix);
+
+    let read_only = parse_bool_env(env, STOW_BUCKET_READ_ONLY_ENV)?
+        .or_else(|| file_bucket.and_then(|file| file.read_only))
+        .unwrap_or(false);
+    let local_crates_io = parse_bool_env(env, STOW_BUCKET_LOCAL_CRATES_IO_ENV)?
+        .or_else(|| file_bucket.and_then(|file| file.local_crates_io))
+        .unwrap_or(true);
+    let force_path_style = parse_bool_env(env, STOW_BUCKET_FORCE_PATH_STYLE_ENV)?
+        .or_else(|| file_bucket.and_then(|file| file.force_path_style));
+
+    let connect_timeout = positive_timeout_secs(
+        file_bucket.and_then(|file| file.connect_timeout_secs),
+        "connect_timeout_secs",
+        DEFAULT_BUCKET_CONNECT_TIMEOUT,
+    )?;
+    let read_timeout = positive_timeout_secs(
+        file_bucket.and_then(|file| file.read_timeout_secs),
+        "read_timeout_secs",
+        DEFAULT_BUCKET_READ_TIMEOUT,
+    )?;
+    let operation_timeout = positive_timeout_secs(
+        file_bucket.and_then(|file| file.operation_timeout_secs),
+        "operation_timeout_secs",
+        DEFAULT_BUCKET_OPERATION_TIMEOUT,
+    )?;
+
+    let credentials = resolve_bucket_credentials(env)?;
+
+    Ok(Some(BucketCacheConfig {
+        bucket,
+        endpoint,
+        region,
+        prefix,
+        read_only,
+        local_crates_io,
+        force_path_style,
+        connect_timeout,
+        read_timeout,
+        operation_timeout,
+        credentials,
+    }))
 }
 
 fn load_verify_mode(
@@ -935,5 +1276,170 @@ mod tests {
                 .and_then(std::ffi::OsStr::to_str),
             Some("stow")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bucket_config_parses_toml_file_with_remote_off() {
+        use std::time::Duration;
+
+        use crate::session_env::SessionEnv;
+        use crate::state_db::{CacheTier, StateDb};
+
+        let home = tempfile::tempdir().expect("home");
+        let bare = SessionEnv::for_tests([("HOME", home.path().as_os_str())]);
+        let file = super::config_file_path(&bare).expect("config path");
+        std::fs::create_dir_all(file.parent().expect("config parent")).expect("mkdir");
+        std::fs::write(
+            &file,
+            r#"
+[cache]
+remote = false
+
+[cache.bucket]
+bucket = "team-cache"
+endpoint = "https://r2.example.invalid"
+region = "wnam"
+prefix = "/ci/stow"
+read_only = true
+local_crates_io = false
+force_path_style = true
+connect_timeout_secs = 4
+read_timeout_secs = 12
+operation_timeout_secs = 45
+"#,
+        )
+        .expect("write config");
+
+        let from_file =
+            super::StowConfig::load_in(&bare, StateDb::closed()).expect("load file config");
+        assert!(!from_file.cache.remote);
+        assert!(!from_file.cache.reaches_network());
+        let bucket = from_file.bucket.as_deref().expect("bucket enabled");
+        assert_eq!(bucket.bucket, "team-cache");
+        assert_eq!(
+            bucket.endpoint.as_deref(),
+            Some("https://r2.example.invalid")
+        );
+        assert_eq!(bucket.region, "wnam");
+        assert_eq!(bucket.prefix, "ci/stow/");
+        assert!(bucket.read_only);
+        assert!(!bucket.local_crates_io);
+        assert_eq!(bucket.force_path_style, Some(true));
+        assert_eq!(bucket.connect_timeout, Duration::from_secs(4));
+        assert_eq!(bucket.read_timeout, Duration::from_secs(12));
+        assert_eq!(bucket.operation_timeout, Duration::from_secs(45));
+        assert!(bucket.credentials.is_none());
+        assert!(from_file.bucket_syncs_tier(CacheTier::Local));
+        assert!(!from_file.bucket_syncs_local_crates_io());
+        assert!(!from_file.bucket_syncs_tier(CacheTier::CratesIo));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bucket_config_applies_session_env_overrides_and_redacts_credentials() {
+        use std::ffi::OsStr;
+
+        use crate::session_env::SessionEnv;
+        use crate::state_db::StateDb;
+
+        let home = tempfile::tempdir().expect("home");
+        let bare = SessionEnv::for_tests([("HOME", home.path().as_os_str())]);
+        let file = super::config_file_path(&bare).expect("config path");
+        std::fs::create_dir_all(file.parent().expect("config parent")).expect("mkdir");
+        std::fs::write(&file, "[cache.bucket]\nbucket = \"team-cache\"\n").expect("write config");
+
+        let env = SessionEnv::for_tests([
+            ("HOME", home.path().as_os_str()),
+            ("STOW_BUCKET", OsStr::new("override-bucket")),
+            (
+                "STOW_BUCKET_ENDPOINT",
+                OsStr::new("https://override.example.invalid"),
+            ),
+            ("STOW_BUCKET_REGION", OsStr::new("us-east-1")),
+            ("STOW_BUCKET_PREFIX", OsStr::new("dev")),
+            ("STOW_BUCKET_READ_ONLY", OsStr::new("false")),
+            ("STOW_BUCKET_LOCAL_CRATES_IO", OsStr::new("1")),
+            ("STOW_BUCKET_FORCE_PATH_STYLE", OsStr::new("0")),
+            ("AWS_ACCESS_KEY_ID", OsStr::new("AKIAEXAMPLE123")),
+            ("AWS_SECRET_ACCESS_KEY", OsStr::new("super-secret-value")),
+            ("AWS_SESSION_TOKEN", OsStr::new("temp-session-token")),
+        ]);
+        let overridden =
+            super::StowConfig::load_in(&env, StateDb::closed()).expect("load overridden config");
+        let bucket = overridden.bucket.as_deref().expect("bucket enabled");
+        assert_eq!(bucket.bucket, "override-bucket");
+        assert_eq!(
+            bucket.endpoint.as_deref(),
+            Some("https://override.example.invalid")
+        );
+        assert_eq!(bucket.region, "us-east-1");
+        assert_eq!(bucket.prefix, "dev/");
+        assert!(!bucket.read_only);
+        assert!(bucket.local_crates_io);
+        assert_eq!(bucket.force_path_style, Some(false));
+        assert!(overridden.bucket_syncs_local_crates_io());
+        let creds = bucket.credentials.as_ref().expect("session credentials");
+        assert_eq!(creds.access_key_id, "AKIAEXAMPLE123");
+        assert_eq!(creds.secret_access_key, "super-secret-value");
+        assert_eq!(creds.session_token.as_deref(), Some("temp-session-token"));
+        let debug = format!("{bucket:?}");
+        assert!(
+            !debug.contains("AKIAEXAMPLE123"),
+            "debug leaked key id: {debug}"
+        );
+        assert!(
+            !debug.contains("super-secret-value"),
+            "debug leaked secret: {debug}"
+        );
+        assert!(
+            !debug.contains("temp-session-token"),
+            "debug leaked session token: {debug}"
+        );
+
+        let disabled_env = SessionEnv::for_tests([
+            ("HOME", home.path().as_os_str()),
+            ("STOW_BUCKET", OsStr::new("")),
+        ]);
+        let disabled = super::StowConfig::load_in(&disabled_env, StateDb::closed())
+            .expect("load disabled config");
+        assert!(disabled.bucket.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bucket_config_rejects_partial_credentials_and_toml_secrets() {
+        use std::ffi::OsStr;
+
+        use crate::session_env::SessionEnv;
+        use crate::state_db::StateDb;
+
+        let home = tempfile::tempdir().expect("home");
+        let partial = SessionEnv::for_tests([
+            ("HOME", home.path().as_os_str()),
+            ("STOW_BUCKET", OsStr::new("my-bucket")),
+            ("AWS_ACCESS_KEY_ID", OsStr::new("AKIAONLY")),
+        ]);
+        let err = super::StowConfig::load_in(&partial, StateDb::closed())
+            .expect_err("partial credentials must fail");
+        assert!(err.to_string().contains("AWS_SECRET_ACCESS_KEY"), "{err}");
+
+        let invalid_bool = SessionEnv::for_tests([
+            ("HOME", home.path().as_os_str()),
+            ("STOW_BUCKET", OsStr::new("my-bucket")),
+            ("STOW_BUCKET_READ_ONLY", OsStr::new("maybe")),
+        ]);
+        assert!(super::StowConfig::load_in(&invalid_bool, StateDb::closed()).is_err());
+
+        // Credentials are never accepted in config.toml (`deny_unknown_fields`).
+        let bare = SessionEnv::for_tests([("HOME", home.path().as_os_str())]);
+        let file = super::config_file_path(&bare).expect("config path");
+        std::fs::create_dir_all(file.parent().expect("config parent")).expect("mkdir");
+        std::fs::write(
+            &file,
+            "[cache.bucket]\nbucket = \"b\"\naccess_key_id = \"nope\"\n",
+        )
+        .expect("write config");
+        assert!(super::StowConfig::load_in(&bare, StateDb::closed()).is_err());
     }
 }

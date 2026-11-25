@@ -437,7 +437,7 @@ pub async fn load_cached_bundle_in_tiers(
     Ok(None)
 }
 
-async fn load_cached_bundle_in_tier(
+pub async fn load_cached_bundle_in_tier(
     config: &StowConfig,
     tier: CacheTier,
     request: &FetchRequest<'_>,
@@ -1385,13 +1385,19 @@ async fn merge_artifact_cache_outputs(
 /// directory, and is never published. The entry's recorded `c_metadata`
 /// column stays the stable one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalEntryKey(String);
+pub struct LocalEntryKey {
+    key: String,
+    manifest_scoped: bool,
+}
 
 impl LocalEntryKey {
     /// The key of a unit that embeds no path of this machine.
     #[must_use]
     pub fn plain(c_metadata: &str) -> Self {
-        Self(c_metadata.to_owned())
+        Self {
+            key: c_metadata.to_owned(),
+            manifest_scoped: false,
+        }
     }
 
     /// The key of a unit that read `CARGO_MANIFEST_DIR`, scoped to the
@@ -1400,13 +1406,23 @@ impl LocalEntryKey {
     pub fn manifest_scoped(c_metadata: &str, manifest_dir: &[u8]) -> Self {
         use sha2::Digest as _;
         let digest = hex::encode(sha2::Sha256::digest(manifest_dir));
-        Self(format!("{c_metadata}-m{}", &digest[..16]))
+        Self {
+            key: format!("{c_metadata}-m{}", &digest[..16]),
+            manifest_scoped: true,
+        }
     }
 
     /// The path segment and cache-key component.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.key
+    }
+
+    /// Whether this entry is tied to one machine's `CARGO_MANIFEST_DIR` and
+    /// therefore must never leave the machine.
+    #[must_use]
+    pub const fn is_manifest_scoped(&self) -> bool {
+        self.manifest_scoped
     }
 }
 
@@ -1532,6 +1548,157 @@ pub async fn store_local_build_outputs(
     )
     .await?;
     Ok(true)
+}
+
+/// Verified metadata for a remote-bucket artifact archive ready to be installed
+/// atomically into a local L1 cache tier.
+pub struct BucketInstallInput<'a> {
+    pub tier: CacheTier,
+    pub rustc_version: &'a str,
+    pub target: &'a str,
+    pub entry_key: &'a str,
+    pub compile_key: &'a str,
+    pub crate_name: &'a str,
+    pub crate_version: String,
+    pub c_metadata: &'a str,
+    pub features_json: String,
+    pub dependency_c_metadata_json: String,
+    pub dependency_compile_keys_json: &'a str,
+    pub dependency_instances_json: &'a str,
+    pub reach: stow_types::public_cache::Reach,
+    pub compile_millis: u64,
+    pub profile: &'a Profile,
+    pub emit: &'a [String],
+    pub kind: &'a ArtifactKind,
+    pub crate_types: &'a [RustCrateType],
+    pub outputs: &'a [ArtifactBundleFile],
+    pub size_bytes: u64,
+}
+
+async fn record_bucket_entry_metadata(
+    connection: &sqlx::SqlitePool,
+    cache_key: &str,
+    entry_relative_dir: &Path,
+    input: &BucketInstallInput<'_>,
+) -> stow_types::error::Result<()> {
+    replace_artifact_cache_metadata(
+        connection,
+        input.rustc_version,
+        cache_key,
+        &path_to_string(entry_relative_dir)?,
+        input.size_bytes,
+        now_millis(),
+        &CacheEntryMetadata {
+            oci_reference: LOCAL_ENTRY_SENTINEL,
+            oci_digest: LOCAL_ENTRY_SENTINEL,
+            provenance: ArtifactProvenance::Local,
+            compile_key: input.compile_key,
+            crate_name: input.crate_name,
+            crate_version: input.crate_version.clone(),
+            c_metadata: input.c_metadata,
+            features_json: input.features_json.clone(),
+            dependency_c_metadata_json: input.dependency_c_metadata_json.clone(),
+            dependency_compile_keys_json: input.dependency_compile_keys_json,
+            dependency_instances_json: input.dependency_instances_json,
+            reach: input.reach,
+            compile_millis: input.compile_millis,
+            target: input.target,
+            profile: input.profile,
+            emit: input.emit,
+            kind: input.kind,
+            crate_types: input.crate_types,
+            outputs: input.outputs,
+            sigstore_signatures: &[],
+        },
+    )
+    .await
+}
+
+/// Atomically install a verified staged directory downloaded from a remote
+/// bucket into `input.tier`'s L1 directory and SQLite catalog, then load and
+/// return the installed [`CachedArtifactBundle`] holding its shared lease lock.
+///
+/// Never installs into [`CacheTier::CratesIo`].
+pub async fn install_staged_bucket_entry(
+    config: &StowConfig,
+    staged: tempfile::TempDir,
+    input: &BucketInstallInput<'_>,
+) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
+    if input.tier == CacheTier::CratesIo {
+        return Err(stow_types::stow_error!(
+            "remote bucket entries may never be installed into the public crates-io tier"
+        ));
+    }
+    let version_dir = config.tier_version_dir(input.tier, input.rustc_version);
+    let entry_relative_dir = PathBuf::from(BUNDLES_DIR)
+        .join(ARTIFACT_CACHE_LAYOUT_VERSION)
+        .join(input.target)
+        .join(input.entry_key);
+    let cache_key = artifact_cache_key(input.target, input.entry_key);
+    let entry_dir = version_dir.join(&entry_relative_dir);
+    let entry_parent = entry_dir.parent().ok_or_else(|| {
+        stow_types::stow_error!(
+            "bucket artifact cache entry dir {} has no parent",
+            entry_dir.display()
+        )
+    })?;
+    async_fs::create_dir_all(entry_parent)
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "create bucket artifact cache parent {}",
+                entry_parent.display()
+            )
+        })?;
+    let connection = config.tier_db_pool(input.tier).await?;
+    let write_lease = acquire_entry_exclusive_lock_async(&version_dir, &cache_key).await?;
+
+    let existing = load_artifact_cache_entry(&connection, input.rustc_version, &cache_key).await?;
+    let installed_now = if existing.is_some() && entry_dir.exists() {
+        drop(staged);
+        false
+    } else {
+        if existing.is_none() && entry_dir.exists() {
+            remove_orphaned_entry_dir(entry_dir.clone()).await?;
+        }
+        let target_dir = entry_dir.clone();
+        tokio::task::spawn_blocking(move || -> stow_types::error::Result<()> {
+            std::fs::rename(staged.path(), &target_dir).wrap_err_with(|| {
+                format!(
+                    "move staged bucket artifact {} into place at {}",
+                    staged.path().display(),
+                    target_dir.display()
+                )
+            })?;
+            let _ = staged.keep();
+            Ok(())
+        })
+        .await
+        .wrap_err("join bucket artifact install task")??;
+        record_bucket_entry_metadata(&connection, &cache_key, &entry_relative_dir, input).await?;
+        true
+    };
+    drop(write_lease);
+
+    if installed_now {
+        evict_entries(
+            config,
+            input.rustc_version,
+            &ProtectedEntry::Rustc(input.tier, &cache_key),
+        )
+        .await?;
+    }
+
+    load_cached_bundle_in_tier(
+        config,
+        input.tier,
+        &FetchRequest {
+            target: input.target,
+            rustc_version: input.rustc_version,
+            c_metadata: input.entry_key,
+        },
+    )
+    .await
 }
 
 /// The dependency binding a stored local entry records — the compile keys
@@ -8302,6 +8469,8 @@ pub mod tests {
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
             version_leases: crate::artifact_cache::SharedVersionLeases::default(),
+            bucket: None,
+            bucket_handles: crate::bucket_cache::BucketCacheHandles::default(),
         }
     }
 

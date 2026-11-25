@@ -59,6 +59,7 @@ blake3.workspace = true
 hex.workspace = true
 tar = "0.4"
 flate2.workspace = true
+zstd = { version = "0.14", default-features = false }
 stow-types.workspace = true
 stow-shim = { workspace = true, features = ["zstd"] }
 stow-oci.workspace = true
@@ -90,6 +91,8 @@ time = { version = "0.3.55", default-features = false, features = [
     "std",
     "formatting",
 ] }
+skyzen-services = { git = "https://github.com/zen-rs/skyzen", branch = "main", default-features = false }
+skyzen-s3 = { git = "https://github.com/zen-rs/skyzen", branch = "main", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -135,6 +138,7 @@ tokio = { version = "1", features = ["test-util"] }
 # the whole process tree has to go with it.
 process-wrap = { version = "10.0.1", default-features = false, features = ["std", "process-group", "job-object"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+skyzen-test = { git = "https://github.com/zen-rs/skyzen", branch = "main", default-features = false }
 stow-types.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
