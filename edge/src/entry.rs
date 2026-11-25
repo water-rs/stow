@@ -34,6 +34,7 @@ const STOW_STATS_SQL_URL_BINDING: &str = "STOW_STATS_SQL_URL";
 const STOW_STATS_BINDING: &str = "STOW_STATS";
 const STOW_STATS_SALT_SECRET_BINDING: &str = "STOW_STATS_SALT_SECRET";
 const STOW_GITHUB_WEBHOOK_SECRET_BINDING: &str = "STOW_GITHUB_WEBHOOK_SECRET";
+const WORKFLOW_WEBHOOK_SECRET_BINDING: &str = "WORKFLOW_WEBHOOK_SECRET";
 const STOW_NEWRELEASES_WEBHOOK_SECRET_BINDING: &str = "STOW_NEWRELEASES_WEBHOOK_SECRET";
 
 /// `WinterCG` `fetch` export the generated Worker shim calls.
@@ -219,6 +220,9 @@ fn worker(
             env,
             STOW_GITHUB_WEBHOOK_SECRET_BINDING,
         ))))
+        .with(State(webhook::WorkflowWebhookSecret(
+            env_binding::required_string(env, WORKFLOW_WEBHOOK_SECRET_BINDING),
+        )))
         .with(State(webhook::AppBotLogin(app_bot_login)))
         .with(State(release_hook::NewreleasesSecret(
             env_binding::required_string(env, STOW_NEWRELEASES_WEBHOOK_SECRET_BINDING),
