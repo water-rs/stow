@@ -63,7 +63,7 @@ pub fn is_ci_target(target: &str) -> bool {
 /// for the rest. The scheduler caps dispatches per family because the
 /// pools are sized very differently — the org's macOS pool is the
 /// smallest — and starts the slow Windows legs of a wave first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 pub enum RunnerFamily {
     /// `ubuntu-latest` — also hosts the Android and wasm builds.
     Linux,
@@ -1064,6 +1064,24 @@ pub struct TaskRunUpdate {
     pub task_id: String,
     /// The Actions run id the row's generation is bound to.
     pub github_run_id: String,
+}
+
+/// An enterprise `workflow_job` lifecycle transition for a non-`stow`
+/// repository running on a standard GitHub-hosted runner (stow#1697).
+///
+/// Forwarded to the scheduler DO's `POST /enterprise/job-update` so the
+/// scheduler dynamically yields shared GitHub-hosted runner slots while
+/// developer CI is active or queued, with zero Durable Object SQLite I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct EnterpriseJobUpdate {
+    /// GitHub Actions job id.
+    pub job_id: u64,
+    /// Runner family inferred from the job's labels.
+    pub family: RunnerFamily,
+    /// `true` for `queued`/`in_progress`, `false` for `completed`.
+    pub active: bool,
+    /// `true` while the job is waiting in the GitHub-hosted queue (`queued`).
+    pub queued: bool,
 }
 
 /// A normalized dependency entry from a resolved Cargo dependency graph.

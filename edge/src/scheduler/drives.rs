@@ -3352,6 +3352,41 @@ pub const DRIVES: &[Drive] = &[
         }),
     },
     Drive {
+        // stow#1697: in-memory enterprise yield map — zero SQLite reads or writes.
+        name: "POST /enterprise/job-update",
+        setup: None,
+        run: |_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let _ = routes::enterprise_job_update(
+                    ctx.loaded(),
+                    &stow_types::api::EnterpriseJobUpdate {
+                        job_id: 99_999_001,
+                        family: RunnerFamily::Linux,
+                        active: true,
+                        queued: true,
+                    },
+                    now_ms(),
+                );
+                Ok(())
+            })
+        },
+        cleanup: Some(|_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let _ = routes::enterprise_job_update(
+                    ctx.loaded(),
+                    &stow_types::api::EnterpriseJobUpdate {
+                        job_id: 99_999_001,
+                        family: RunnerFamily::Linux,
+                        active: false,
+                        queued: false,
+                    },
+                    now_ms(),
+                );
+                Ok(())
+            })
+        }),
+    },
+    Drive {
         // The alarm's clock-based recovery of one in-flight node whose
         // claim ran past `STOW_STALE_DISPATCH_MINUTES`: the claim pass's
         // stale sweep requeues it, bounded by the expired nodes the pass

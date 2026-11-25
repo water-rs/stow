@@ -406,6 +406,9 @@ impl Scheduler {
                 // scheduled handler names one due periodic workflow,
                 // and the object dispatches it on `main`.
                 "/periodic/dispatch".post(periodic_dispatch),
+                // External enterprise `workflow_job` lifecycle updates
+                // (stow#1697) for dynamic runner-slot yielding.
+                "/enterprise/job-update".post(apply_enterprise_job_update),
             )),
         ))
         // The alarm endpoint runs without the router's middleware, so it
@@ -1038,6 +1041,32 @@ async fn apply_task_run_update(
         graph::StartOutcome::Applied
         | graph::StartOutcome::Stale
         | graph::StartOutcome::External => {}
+    }
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// `POST /enterprise/job-update` — in-memory dynamic yielding for external
+/// enterprise GitHub-hosted jobs (stow#1697). Re-arms the alarm when a job
+/// finishes or leaves the `queued` state so `stow` immediately reclaims the
+/// shared pool once developer CI finishes.
+async fn apply_enterprise_job_update(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(update): Json<stow_types::api::EnterpriseJobUpdate>,
+) -> Result<Json<OkResponse>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let now = now_ms();
+    let freed = routes::enterprise_job_update(graph, &update, now);
+    if freed {
+        let settings = scheduler_settings(&env, graph)?;
+        let plan = routes::wake_plan(graph, &settings, now);
+        queue::arm_alarm(&alarm, plan).await.map_err(|error| {
+            skyzen::Error::msg(format!(
+                "arm scheduler alarm after enterprise yield: {error}"
+            ))
+        })?;
     }
     Ok(Json(OkResponse { ok: true }))
 }

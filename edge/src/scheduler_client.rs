@@ -10,6 +10,8 @@ const SCHEDULER_SUBMIT_TRUSTED_URL: &str = "https://scheduler.internal/tasks/sub
 const SCHEDULER_SUBMIT_IDS_URL: &str = "https://scheduler.internal/tasks/submit/ids";
 const SCHEDULER_COMPLETE_RUN_URL: &str = "https://scheduler.internal/tasks/complete-run";
 const SCHEDULER_RUN_UPDATE_URL: &str = "https://scheduler.internal/tasks/run-update";
+const SCHEDULER_ENTERPRISE_JOB_UPDATE_URL: &str =
+    "https://scheduler.internal/enterprise/job-update";
 const SCHEDULER_REQUESTS_URL: &str = "https://scheduler.internal/requests";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
 const SCHEDULER_HEALTH_URL: &str = "https://scheduler.internal/health";
@@ -140,6 +142,17 @@ pub async fn send_task_run_update(
     update: &stow_types::api::TaskRunUpdate,
 ) -> Result<(), SchedulerClientError> {
     send_json(namespace, SCHEDULER_RUN_UPDATE_URL, update).await
+}
+
+/// The enterprise `workflow_job` dynamic-yield channel (stow#1697):
+/// `POST /enterprise/job-update` tracks live non-`stow` GitHub-hosted jobs
+/// in memory so `stow` yields runner slots while developer CI is running
+/// or queued.
+pub async fn send_enterprise_job_update(
+    namespace: &CfDurableNamespace,
+    update: &stow_types::api::EnterpriseJobUpdate,
+) -> Result<(), SchedulerClientError> {
+    send_json(namespace, SCHEDULER_ENTERPRISE_JOB_UPDATE_URL, update).await
 }
 
 pub async fn get_status(
