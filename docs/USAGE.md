@@ -89,6 +89,18 @@ in every configuration. Commands that exist to talk to the remote cache
 `stow fetch-artifact`) fail with a message saying the remote cache is off;
 `stow setup` skips the index fetch.
 
+### Remote bucket L2 for local tiers
+
+Local cache tiers (`local/`, including `local/cc/`, and optionally
+`local-crates-io/`) can be backed by an S3-compatible bucket (Cloudflare R2,
+AWS S3, MinIO, Tigris, etc.) via `[cache.bucket]` in [`CONFIG.md`](CONFIG.md) or
+`STOW_BUCKET*` variables in [`ENVIRONMENT.md`](ENVIRONMENT.md). It operates
+independently of `[cache] remote = false` (public cache off, private bucket on),
+never uploads `crates-io/` or `CARGO_MANIFEST_DIR`-scoped entries, hydrates L1
+on miss with SHA-256 verification and `dependency_instances` SVH checks, uploads
+new local builds asynchronously in the background, and drains in-flight uploads
+on `stow daemon stop`.
+
 ## Build isolation
 
 Every cargo-running command confines the build — cargo, rustc, every build

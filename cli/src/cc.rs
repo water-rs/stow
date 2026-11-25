@@ -526,6 +526,7 @@ pub async fn write_record(config: &StowConfig, record: CcRecord) {
                 );
                 return;
             }
+            crate::bucket_cache::enqueue_cc_upload(config, &cache_key);
             crate::log_nonfatal_result(
                 "failed to record C/C++ cache miss stats",
                 crate::stats::record_miss(config, &format!("cc:{cache_key}")).await,
@@ -1224,6 +1225,8 @@ mod tests {
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
             version_leases: crate::artifact_cache::SharedVersionLeases::default(),
+            bucket: None,
+            bucket_handles: crate::bucket_cache::BucketCacheHandles::default(),
         }
     }
 

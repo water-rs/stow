@@ -64,6 +64,8 @@ fn config(cache_dir: &Path, cache: CacheLayers, tripwire: &Tripwire) -> StowConf
         registry_http: Arc::default(),
         artifact_cache_staging: Arc::default(),
         version_leases: crate::artifact_cache::SharedVersionLeases::default(),
+        bucket: None,
+        bucket_handles: crate::bucket_cache::BucketCacheHandles::default(),
     }
 }
 

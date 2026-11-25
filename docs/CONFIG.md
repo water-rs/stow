@@ -84,6 +84,25 @@ verify_mode = "github-ci"
 remote = true
 local_crates_io = true
 local_git = true
+
+# Optional S3-compatible remote bucket backing stow's local cache tiers
+# (`local/`, including `local/cc/`, and optionally `local-crates-io/`) as an L2
+# behind local disk L1. Works independently of `[cache] remote = false` (public
+# cache off, private bucket on). Credentials are never stored in this file;
+# they come from the build's environment (`AWS_ACCESS_KEY_ID`,
+# `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`) or the ambient AWS
+# credential chain (IMDS / OIDC / `~/.aws`).
+# [cache.bucket]
+# bucket = "my-stow-cache"             # Required (or $STOW_BUCKET)
+# endpoint = "https://<acct>.r2.cloudflarestorage.com"  # Optional ($STOW_BUCKET_ENDPOINT)
+# region = "auto"                      # Default "auto" ($STOW_BUCKET_REGION)
+# prefix = "stow/"                     # Default "stow/" ($STOW_BUCKET_PREFIX)
+# read_only = false                    # Default false ($STOW_BUCKET_READ_ONLY)
+# local_crates_io = true               # Sync `local-crates-io/` too; default true ($STOW_BUCKET_LOCAL_CRATES_IO)
+# force_path_style = true              # Optional; defaults to true when `endpoint` is set ($STOW_BUCKET_FORCE_PATH_STYLE)
+# connect_timeout_secs = 3             # Default 3
+# read_timeout_secs = 10               # Default 10
+# operation_timeout_secs = 30          # Default 30
 ```
 
 ## Resolution order

@@ -638,6 +638,8 @@ mod tests {
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
             version_leases: crate::artifact_cache::SharedVersionLeases::default(),
+            bucket: None,
+            bucket_handles: crate::bucket_cache::BucketCacheHandles::default(),
         }
     }
 

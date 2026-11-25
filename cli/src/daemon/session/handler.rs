@@ -544,7 +544,27 @@ async fn answer_cc_lookup<H: Handler>(handler: &Arc<H>, lookup: CcLookup) -> Rep
     if !crate::cc::is_cache_key(&lookup.cache_key) {
         return Reply::failed("malformed C/C++ cache key");
     }
-    match crate::cc::locate_cached_object(config, &lookup.cache_key).await {
+    let located = match crate::cc::locate_cached_object(config, &lookup.cache_key).await {
+        Ok(Some(object)) => Ok(Some(object)),
+        Ok(None) => match Box::pin(crate::bucket_cache::pull_cc_object(
+            config,
+            &lookup.cache_key,
+        ))
+        .await
+        {
+            Ok(found) => Ok(found),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    cache_key = %lookup.cache_key,
+                    "remote bucket C/C++ cache pull failed; falling back to local compile"
+                );
+                Ok(None)
+            }
+        },
+        Err(error) => Err(error),
+    };
+    match located {
         Ok(Some(object)) => Reply {
             answer: Answer::CcHit {
                 object: super::os_bytes::encode(object.as_os_str()),

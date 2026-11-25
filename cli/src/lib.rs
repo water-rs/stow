@@ -16,6 +16,7 @@
 
 mod admission;
 mod artifact_cache;
+mod bucket_cache;
 mod budget;
 /// The verified cache-consumption chain `stow-build` reuses (stow#299).
 ///
@@ -732,9 +733,19 @@ async fn store_local_build(
     } else {
         artifact_cache::LocalEntryKey::plain(c_metadata)
     };
-    artifact_cache::store_local_build_outputs(config, parsed, build, host, &entry_key)
-        .await
-        .map(|_| ())
+    let stored =
+        artifact_cache::store_local_build_outputs(config, parsed, build, host, &entry_key).await?;
+    if stored && !entry_key.is_manifest_scoped() {
+        let tier = state_db::CacheTier::for_local_reach(build.reach);
+        bucket_cache::enqueue_rust_upload(
+            config,
+            tier,
+            &build.rustc_version,
+            &build.target,
+            entry_key.as_str(),
+        );
+    }
+    Ok(())
 }
 
 /// The invocation's `CARGO_MANIFEST_DIR`, which cargo sets on every rustc
@@ -1755,20 +1766,14 @@ async fn lookup_chain(
 
     // When the remote cache now publishes this unit, download into
     // `crates-io/` first so transitional `local-crates-io/` entries are
-    // superseded; otherwise serve `local-crates-io/` immediately.
+    // superseded; otherwise serve `local-crates-io/` immediately (L1, then
+    // optional remote bucket L2).
     let remote_publishes_unit =
         remote_slice_covers_unit(env, ctx, &request, exact_public_cache_allowed).await;
     if !remote_publishes_unit
         && env.env_base.config.cache.local_crates_io
-        && let Some(notifications) = try_serve_tier_exact_or_semantic(
-            parsed,
-            env,
-            &request,
-            invocation_env,
-            state_db::CacheTier::LocalCratesIo,
-            tally,
-        )
-        .await
+        && let Some(notifications) =
+            try_serve_local_crates_io(parsed, env, &request, invocation_env, tally).await
     {
         return RemoteServe::Served(notifications);
     }
@@ -1791,20 +1796,44 @@ async fn lookup_chain(
 
     // Remote index listed the unit, but remote serve missed/refused (e.g.
     // host glibc below the remote artifact's floor, or transient network
-    // error): fall back to `local-crates-io/` if this host already built it.
+    // error): fall back to `local-crates-io/` (L1, then optional remote
+    // bucket L2).
+    if let Some(notifications) =
+        try_serve_local_crates_io(parsed, env, &request, invocation_env, tally).await
+    {
+        return RemoteServe::Served(notifications);
+    }
+    remote_outcome
+}
+
+async fn try_serve_local_crates_io(
+    parsed: &rustc_args::ParsedRustcArgs,
+    env: &WrapperEnvironment<'_>,
+    request: &FetchRequest<'_>,
+    invocation_env: &daemon::wrapper::InvocationEnv,
+    tally: &mut LookupTally,
+) -> Option<daemon::wrapper::ArtifactNotifications> {
     if let Some(notifications) = try_serve_tier_exact_or_semantic(
         parsed,
         env,
-        &request,
+        request,
         invocation_env,
         state_db::CacheTier::LocalCratesIo,
         tally,
     )
     .await
     {
-        return RemoteServe::Served(notifications);
+        return Some(notifications);
     }
-    remote_outcome
+    try_serve_bucket_rust_artifact(
+        &env.env_base.config,
+        parsed,
+        &env.source,
+        request,
+        state_db::CacheTier::LocalCratesIo,
+        tally,
+    )
+    .await
 }
 
 /// Everything the cache path needs once every bypass-capable preparation
@@ -2998,14 +3027,14 @@ async fn decide_local_only(
         )
         .await;
     }
-    if let Some((identity, _reach)) = prep.identity {
+    if let Some((identity, reach)) = prep.identity {
         let request = FetchRequest {
             target: &target,
             rustc_version: prep.env_base.rustc_version(),
             c_metadata: identity.c_metadata.as_str(),
         };
         let mut tally = LookupTally::default();
-        let served = try_serve_local_invocation(
+        let mut served = try_serve_local_invocation(
             &prep.env_base.config,
             parsed,
             source,
@@ -3014,6 +3043,18 @@ async fn decide_local_only(
             &mut tally,
         )
         .await;
+        if served.is_none() {
+            let tier = state_db::CacheTier::for_local_reach(reach);
+            served = try_serve_bucket_rust_artifact(
+                &prep.env_base.config,
+                parsed,
+                source,
+                &request,
+                tier,
+                &mut tally,
+            )
+            .await;
+        }
         // A miss is never counted here: this path serves units the
         // public cache does not carry, so an unmet local lookup means
         // nothing was promised. A serve and a failed lookup are the
@@ -3276,6 +3317,49 @@ async fn try_serve_local_cached_bundle_in_tiers(
             }
         };
     let cached_bundle = cached_bundle?;
+    try_serve_loaded_local_cached_bundle(
+        config,
+        parsed,
+        source,
+        request,
+        EntryOrigin::ExactKey,
+        cached_bundle,
+        tally,
+    )
+    .await
+}
+
+/// Read-through a local-tier Rust artifact from the optional remote bucket
+/// into L1, then serve it through [`try_serve_loaded_local_cached_bundle`] so
+/// semantic, closure, and `dependency_instances` SVH checks apply identically
+/// to any locally stored entry.
+async fn try_serve_bucket_rust_artifact(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    source: &UnitSource,
+    request: &FetchRequest<'_>,
+    tier: state_db::CacheTier,
+    tally: &mut LookupTally,
+) -> Option<ArtifactNotifications> {
+    let cached_bundle = match Box::pin(bucket_cache::pull_rust_artifact(
+        config, tier, source, request,
+    ))
+    .await
+    {
+        Ok(Some(bundle)) => bundle,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                crate_name = %parsed.crate_name,
+                target = %request.target,
+                rustc_version = %request.rustc_version,
+                tier = tier.dir_name(),
+                "failed to pull Rust artifact from remote bucket; degrading to local compilation"
+            );
+            return None;
+        }
+    };
     try_serve_loaded_local_cached_bundle(
         config,
         parsed,
@@ -6546,6 +6630,8 @@ mod tests {
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
             version_leases: crate::artifact_cache::SharedVersionLeases::default(),
+            bucket: None,
+            bucket_handles: crate::bucket_cache::BucketCacheHandles::default(),
         }
     }
 
@@ -7173,6 +7259,8 @@ mod tests {
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
             version_leases: crate::artifact_cache::SharedVersionLeases::default(),
+            bucket: None,
+            bucket_handles: crate::bucket_cache::BucketCacheHandles::default(),
         };
         // A scan shaped like a build-script crate's: `default` resolved
         // plus `probe_from_build_script` the script printed itself.
@@ -7351,6 +7439,8 @@ mod tests {
                 registry_http: std::sync::Arc::default(),
                 artifact_cache_staging: std::sync::Arc::default(),
                 version_leases: crate::artifact_cache::SharedVersionLeases::default(),
+                bucket: None,
+                bucket_handles: crate::bucket_cache::BucketCacheHandles::default(),
             }
         }
 

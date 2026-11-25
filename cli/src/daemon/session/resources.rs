@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 
 use crate::artifact_cache::{SharedVersionLeases, StagingDir};
+use crate::bucket_cache::BucketCacheHandles;
 use crate::config::{StowConfig, default_tier_staging};
 use crate::index::{HeldSlices, SliceFetches};
 use crate::state_db::StateDb;
@@ -28,6 +29,7 @@ pub struct CacheDirHandles {
     artifact_cache_staging: Arc<[OnceCell<Arc<StagingDir>>; 3]>,
     version_leases: SharedVersionLeases,
     slices: HeldSlices,
+    bucket_handles: BucketCacheHandles,
 }
 
 impl Default for CacheDirHandles {
@@ -39,6 +41,7 @@ impl Default for CacheDirHandles {
             artifact_cache_staging: default_tier_staging(),
             version_leases: SharedVersionLeases::default(),
             slices: HeldSlices::default(),
+            bucket_handles: BucketCacheHandles::default(),
         }
     }
 }
@@ -51,6 +54,7 @@ impl CacheDirHandles {
         config.registry_http = Arc::clone(&self.registry_http);
         config.artifact_cache_staging = Arc::clone(&self.artifact_cache_staging);
         config.version_leases = self.version_leases.clone();
+        config.bucket_handles = self.bucket_handles.clone();
     }
 
     /// A slice memo for one build, backed by the slices this directory's
@@ -78,9 +82,12 @@ impl Resources {
             .clone()
     }
 
-    /// Checkpoint, truncate WALs, and close every opened state/tier database.
+    /// Drain pending remote bucket uploads, then checkpoint, truncate WALs,
+    /// and close every opened state/tier database.
     pub async fn checkpoint_and_close_all(&mut self) {
         let handles: Vec<CacheDirHandles> = self.by_cache_dir.drain().map(|(_, h)| h).collect();
+        futures_util::future::join_all(handles.iter().map(|handle| handle.bucket_handles.drain()))
+            .await;
         futures_util::future::join_all(
             handles
                 .iter()

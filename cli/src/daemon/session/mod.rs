@@ -546,10 +546,9 @@ impl<O: Origin> Session<O> {
     /// the full decision's probes — never rule a unit out.
     async fn serve_map_rules_out(&self, parsed: &rustc_args::ParsedRustcArgs) -> bool {
         if self.ctx.cache.is_off()
-            || self
-                .env_cache
-                .config()
-                .is_some_and(|config| config.switches.identity_trace.is_some())
+            || self.env_cache.config().is_some_and(|config| {
+                config.switches.identity_trace.is_some() || config.bucket_syncs_local_crates_io()
+            })
         {
             return false;
         }
@@ -1023,6 +1022,8 @@ mod tests {
             registry_http: Arc::default(),
             artifact_cache_staging: Arc::default(),
             version_leases: crate::artifact_cache::SharedVersionLeases::default(),
+            bucket: None,
+            bucket_handles: crate::bucket_cache::BucketCacheHandles::default(),
         }
     }
 
@@ -1309,5 +1310,58 @@ mod tests {
         for session in opened {
             session.end().await.expect("end the session");
         }
+    }
+
+    /// When a remote bucket syncs `local-crates-io/`, the serve map must not
+    /// rule out uncovered crates.io units before the lookup chain checks the
+    /// bucket (stow#1700).
+    #[tokio::test]
+    async fn serve_map_does_not_rule_out_crates_io_units_when_bucket_syncs_local_crates_io() {
+        let sessions = tempfile::tempdir().expect("sessions directory");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let target = tempfile::tempdir().expect("target directory");
+        let handles = CacheDirHandles::default();
+
+        let mut bucket_on = config_in(cache.path());
+        bucket_on.bucket = Some(Box::new(crate::config::BucketCacheConfig::for_bucket(
+            "team-bucket",
+        )));
+        let session_on = Session::open(
+            SessionId::mint(),
+            facts(target.path(), Some(bucket_on)).await,
+            &handles,
+            sessions.path(),
+        )
+        .await
+        .expect("open session with bucket local_crates_io=true");
+
+        let mut bucket_local_only = config_in(cache.path());
+        let mut bucket_cfg = crate::config::BucketCacheConfig::for_bucket("team-bucket");
+        bucket_cfg.local_crates_io = false;
+        bucket_local_only.bucket = Some(Box::new(bucket_cfg));
+        let session_off = Session::open(
+            SessionId::mint(),
+            facts(target.path(), Some(bucket_local_only)).await,
+            &handles,
+            sessions.path(),
+        )
+        .await
+        .expect("open session with bucket local_crates_io=false");
+
+        let out_dir = target.path().join("deps");
+        let unit = rustc_args::ParsedRustcArgs::parse(&uncovered_unit(&out_dir))
+            .expect("parse uncovered crates.io unit");
+
+        assert!(
+            !session_on.serve_map_rules_out(&unit).await,
+            "serve_map must not rule out crates.io units when bucket syncs local-crates-io"
+        );
+        assert!(
+            session_off.serve_map_rules_out(&unit).await,
+            "serve_map still rules out uncovered crates.io units when bucket.local_crates_io is false"
+        );
+
+        session_on.end().await.expect("end session_on");
+        session_off.end().await.expect("end session_off");
     }
 }
