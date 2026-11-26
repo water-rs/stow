@@ -176,11 +176,14 @@ pub async fn collect(
     for (build_dir, manifests_json, last_built_ms) in rows {
         let manifests: Vec<PathBuf> =
             serde_json::from_str(&manifests_json).wrap_err("parse the recorded manifests")?;
+        // Keyed by path, which compares by component: a key written with
+        // `/` on Windows matches the directory the listing names with `\`.
         let record = Record {
+            key: build_dir,
             manifests,
             last_built_ms: db_int(last_built_ms, "build directory last built")?,
         };
-        records.insert(build_dir, record);
+        records.insert(PathBuf::from(&record.key), record);
     }
     let root = cache_dir.join(BUILD_DIR_PARENT);
     let cache_dir_owned = cache_dir.to_path_buf();
@@ -207,6 +210,8 @@ pub async fn collect(
 
 /// What stow recorded of one build directory.
 struct Record {
+    /// The row's key, as `record` wrote it.
+    key: String,
     /// The member manifests builds of the directory were seen compiling;
     /// empty when none was seen.
     manifests: Vec<PathBuf>,
@@ -223,7 +228,7 @@ struct Swept {
 
 fn sweep(
     root: &Path,
-    records: &HashMap<String, Record>,
+    records: &HashMap<PathBuf, Record>,
     idle_ms: u64,
     now_ms: u64,
 ) -> Result<Swept> {
@@ -236,56 +241,122 @@ fn sweep(
     let listing = match std::fs::read_dir(root) {
         Ok(listing) => listing,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            swept.forgotten.extend(records.keys().cloned());
+            swept
+                .forgotten
+                .extend(records.values().map(|record| record.key.clone()));
             return Ok(swept);
         }
         Err(error) => return Err(error).wrap_err_with(|| format!("list {}", root.display())),
     };
+    let ctx = Sweep {
+        records,
+        idle_ms,
+        now_ms,
+    };
     for entry in listing {
         let entry = entry.wrap_err_with(|| format!("list {}", root.display()))?;
-        let dir = entry.path();
+        let path = entry.path();
+        let name = entry.file_name();
         // Left by a sweep a crash ended between its rename and its
         // removal: no build can be in it, since no lock was free to be
         // taken for it after the rename.
+        if name.to_string_lossy().starts_with(COLLECTING_PREFIX) {
+            remove_path(&path)?;
+            continue;
+        }
+        if !entry
+            .file_type()
+            .wrap_err_with(|| format!("stat {}", path.display()))?
+            .is_dir()
+        {
+            continue;
+        }
+        // Cargo's `{workspace-path-hash}` shards workspaces into
+        // `<2-hex>/<14-hex>`, and that is the directory `record` keys.
+        if is_hash_shard_name(&name.to_string_lossy()) {
+            sweep_shard(&path, &ctx, &mut swept, &mut present)?;
+        } else {
+            sweep_dir(path, &ctx, &mut swept, &mut present)?;
+        }
+    }
+    swept.forgotten.extend(
+        records
+            .iter()
+            .filter(|(path, _)| !present.contains(*path))
+            .map(|(_, record)| record.key.clone()),
+    );
+    Ok(swept)
+}
+
+/// What a sweep judges a build directory by.
+struct Sweep<'a> {
+    records: &'a HashMap<PathBuf, Record>,
+    idle_ms: u64,
+    now_ms: u64,
+}
+
+/// Sweep the workspace directories of one hash shard. The shard itself is
+/// left in place, empty or not: a build creating a directory in it must
+/// not find it removed.
+fn sweep_shard(
+    shard: &Path,
+    ctx: &Sweep<'_>,
+    swept: &mut Swept,
+    present: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    let listing = match std::fs::read_dir(shard) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).wrap_err_with(|| format!("list {}", shard.display())),
+    };
+    for entry in listing {
+        let entry = entry.wrap_err_with(|| format!("list {}", shard.display()))?;
+        let path = entry.path();
         if entry
             .file_name()
             .to_string_lossy()
             .starts_with(COLLECTING_PREFIX)
         {
-            remove_path(&dir)?;
+            remove_path(&path)?;
             continue;
         }
-        if !entry
-            .file_type()
-            .wrap_err_with(|| format!("stat {}", dir.display()))?
-            .is_dir()
-        {
-            continue;
-        }
-        let key = dir.to_str().map(str::to_owned);
-        present.extend(key.clone());
-        let record = key.as_ref().and_then(|key| records.get(key));
-        let Some(reason) = verdict(&dir, record, idle_ms, now_ms)? else {
-            continue;
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).wrap_err_with(|| format!("stat {}", path.display())),
         };
-        if remove_unlocked(&dir)? {
-            swept.collected.removed.push((dir, reason));
-            swept.removed_keys.extend(key);
-        } else {
-            tracing::debug!(
-                build_dir = %dir.display(),
-                "a build holds the build directory's cargo lock; not collecting it"
-            );
-            swept.collected.locked.push(dir);
+        if kind.is_dir() {
+            sweep_dir(path, ctx, swept, present)?;
         }
     }
-    swept.forgotten.extend(
-        records
-            .keys()
-            .filter(|key| !present.contains(*key))
-            .cloned(),
-    );
-    Ok(swept)
+    Ok(())
+}
+
+/// Judge one workspace build directory and remove it when it is due.
+fn sweep_dir(
+    dir: PathBuf,
+    ctx: &Sweep<'_>,
+    swept: &mut Swept,
+    present: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    present.insert(dir.clone());
+    let record = ctx.records.get(&dir);
+    let Some(reason) = verdict(&dir, record, ctx.idle_ms, ctx.now_ms)? else {
+        return Ok(());
+    };
+    if remove_unlocked(&dir)? {
+        swept
+            .removed_keys
+            .extend(record.map(|record| record.key.clone()));
+        swept.collected.removed.push((dir, reason));
+    } else {
+        tracing::debug!(
+            build_dir = %dir.display(),
+            "a build holds the build directory's cargo lock; not collecting it"
+        );
+        swept.collected.locked.push(dir);
+    }
+    Ok(())
 }
 
 /// Whether `dir` is due for collection, and why.
@@ -602,17 +673,69 @@ fn remove_all_but_locks(locks: &[(PathBuf, FileLock)]) -> Result<()> {
 }
 
 fn remove_path(path: &Path) -> Result<()> {
-    let removed = if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
-        std::fs::remove_dir_all(path)
-    } else {
-        std::fs::remove_file(path)
-    };
+    let is_dir = std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir());
+    let mut removed = remove_once(path, is_dir);
+    // A build script or test fixture can leave a read-only directory,
+    // whose entries cannot be unlinked until it is writable again.
+    if is_dir
+        && removed
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    {
+        make_writable(path)?;
+        removed = remove_once(path, is_dir);
+    }
     match removed {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
             Err(error).wrap_err_with(|| format!("remove {}", path.display()))
         }
         _ => Ok(()),
     }
+}
+
+fn remove_once(path: &Path, is_dir: bool) -> std::io::Result<()> {
+    if is_dir {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+/// Give every directory under `root`, `root` included, its owner's write
+/// and search permission, so its entries can be removed. Only Unix has
+/// directories whose permissions keep their entries from being removed.
+#[cfg(unix)]
+fn make_writable(root: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error)
+                if error
+                    .io_error()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error).wrap_err_with(|| format!("walk {}", root.display())),
+        };
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        let mut permissions = entry
+            .metadata()
+            .wrap_err_with(|| format!("stat {}", entry.path().display()))?
+            .permissions();
+        permissions.set_mode(permissions.mode() | 0o700);
+        std::fs::set_permissions(entry.path(), permissions)
+            .wrap_err_with(|| format!("make {} writable", entry.path().display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_writable(_root: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn utf8(path: &Path) -> Result<&str> {
@@ -700,6 +823,62 @@ mod tests {
         assert_eq!(collected.removed, [(dir.clone(), Reason::WorkspaceGone)]);
         assert!(!dir.exists());
         assert_eq!(remaining_rows(&pool).await, 0, "its record goes with it");
+    }
+
+    #[tokio::test]
+    async fn a_deleted_workspaces_sharded_build_directory_is_collected() {
+        let fixture = Fixture::new();
+        let pool = connect(fixture.cache.path()).await.expect("state db");
+        let gone = fixture.build_dir("79/201e3c3f383709");
+        let kept = fixture.build_dir("79/aaaaaaaaaaaaaa");
+        let gone_manifest = fixture.workspace("gone");
+        let kept_manifest = fixture.workspace("kept");
+        let now = now_millis();
+        record(&pool, &gone, std::slice::from_ref(&gone_manifest), now)
+            .await
+            .expect("record gone");
+        record(&pool, &kept, std::slice::from_ref(&kept_manifest), now)
+            .await
+            .expect("record kept");
+        std::fs::remove_file(&gone_manifest).expect("delete the workspace");
+
+        let collected = collect(&pool, fixture.cache.path(), IDLE, now)
+            .await
+            .expect("collect");
+        assert_eq!(collected.removed, [(gone.clone(), Reason::WorkspaceGone)]);
+        assert!(!gone.exists());
+        assert!(kept.join("debug/deps/libdemo.rlib").exists());
+        assert_eq!(
+            remaining_rows(&pool).await,
+            1,
+            "the live workspace keeps its record"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_only_directory_inside_a_build_directory_does_not_stop_its_removal() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = Fixture::new();
+        let pool = connect(fixture.cache.path()).await.expect("state db");
+        let dir = fixture.build_dir("79/201e3c3f383709");
+        let manifest = fixture.workspace("gone");
+        record(&pool, &dir, std::slice::from_ref(&manifest), now_millis())
+            .await
+            .expect("record");
+        let readonly = dir.join("debug/deps/fixture");
+        std::fs::create_dir_all(&readonly).expect("fixture dir");
+        std::fs::write(readonly.join("data"), b"x").expect("fixture file");
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555))
+            .expect("make read-only");
+        std::fs::remove_file(&manifest).expect("delete the workspace");
+
+        let collected = collect(&pool, fixture.cache.path(), IDLE, now_millis())
+            .await
+            .expect("collect");
+        assert_eq!(collected.removed, [(dir.clone(), Reason::WorkspaceGone)]);
+        assert!(!dir.exists());
     }
 
     #[tokio::test]
