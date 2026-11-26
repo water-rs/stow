@@ -156,27 +156,28 @@ impl RecordsSignatureEnvelope {
 /// The `run-name` `build-crate.yml` stamps on its run —
 /// `<rustc>-<task_id>`, unhashed.
 ///
-/// `WireRustcVersion` is numeric (`1.99.0`) and never contains `-`, so
-/// the title splits at the first `-`: the rustc version selects which
-/// records an export pass considers, the task id identifies the run.
-/// `index-publish-cron.yml`'s `${RUN_TITLE%%-*}` still yields the
-/// rustc.
+/// The public cache builds only stable Rust releases (`1.99.0`), which
+/// never contain `-`, so the title splits at the first `-`: the rustc
+/// version selects which records an export pass considers, the task id
+/// identifies the run. `index-publish-cron.yml`'s `${RUN_TITLE%%-*}`
+/// still yields the rustc.
 #[must_use]
 pub fn run_title(rustc_version: &str, task_id: &str) -> String {
     debug_assert!(
-        !rustc_version.is_empty() && !rustc_version.contains('-'),
+        crate::identity::is_stable_rustc_version(rustc_version),
         "rustc version {rustc_version:?} cannot lead a run title"
     );
     format!("{rustc_version}-{task_id}")
 }
 
 /// The `(rustc_version, task_id)` a run title names — the inverse of
-/// [`run_title`]. `None` when the title is not `<rustc>-<task_id>`: the
-/// run is not one ours could have made, or its name was hand-edited.
+/// [`run_title`]. `None` when the title is not `<stable-rustc>-<task_id>`:
+/// the run is not one ours could have made, or its name was hand-edited.
 #[must_use]
 pub fn parse_run_title(title: &str) -> Option<(&str, &str)> {
     let (rustc_version, task_id) = title.split_once('-')?;
-    (!rustc_version.is_empty() && !task_id.is_empty()).then_some((rustc_version, task_id))
+    (crate::identity::is_stable_rustc_version(rustc_version) && !task_id.is_empty())
+        .then_some((rustc_version, task_id))
 }
 
 /// The `run-name` `resolve-request.yml` stamps on its run —
@@ -332,7 +333,7 @@ pub fn parse_records_tag(tag: &str) -> Option<RecordsTag<'_>> {
         }
         None => (rest, None),
     };
-    (!rustc_version.is_empty()
+    (crate::identity::is_stable_rustc_version(rustc_version)
         && task_hash.len() == 64
         && task_hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
     .then_some(RecordsTag {
@@ -398,11 +399,19 @@ mod tests {
         );
     }
 
-    /// A run title parses only as `<rustc>-<task_id>` — no dash, an
-    /// empty half, or a trailing-only split are all refused.
+    /// A run title parses only as `<stable-rustc>-<task_id>` — no dash,
+    /// an empty half, a non-stable rustc prefix, or a trailing-only split
+    /// are all refused.
     #[test]
     fn parse_run_title_refuses_malformed_titles() {
-        for title in ["nodash", "1.99.0-", "-some-task-id"] {
+        for title in [
+            "nodash",
+            "1.99.0-",
+            "-some-task-id",
+            "nightly-serde-1.0.0",
+            "resolve-a1-req-serde",
+            "1.99-serde-1.0.0",
+        ] {
             assert_eq!(parse_run_title(title), None, "{title}");
         }
     }

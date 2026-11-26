@@ -444,6 +444,9 @@ pub struct JournalConsumer<'a> {
 /// superset-hit report — the direct-dep entries above every superset-served
 /// node — journaled as one `inexact` line so the report's admission rides
 /// the same detached drain a miss does (stow#882).
+///
+/// Returns `true` when entries were written; skips empty builds and
+/// non-stable rustc releases, which the public cache does not build.
 pub fn journal_session(
     session: SessionId,
     rustc: &OsStr,
@@ -452,9 +455,16 @@ pub fn journal_session(
     target_dir: &Path,
     expanded_cache_key: &str,
     inexact_entries: &[stow_types::api::DependencyGraphEntry],
-) {
+) -> bool {
     if observations.is_empty() && inexact_entries.is_empty() {
-        return;
+        return false;
+    }
+    if !stow_types::identity::is_stable_rustc_version(consumer.rustc_version) {
+        tracing::debug!(
+            rustc_version = %consumer.rustc_version,
+            "non-stable rustc release; not journaling misses"
+        );
+        return false;
     }
     // The consumer's flag plus any observed explicit `--target` — the
     // flag covers a build where every observed unit is host-side and
@@ -489,6 +499,7 @@ pub fn journal_session(
     let journal = journal_path(target_dir, &session_journal_id(session));
     if let Err(error) = append_lines(&journal, &entries) {
         tracing::warn!(error = %error, journal = %journal.display(), "could not journal the build's compile observations");
+        return false;
     }
     // The expanded graph's store lands only when the in-build analysis
     // reaches it — a build aborts that analysis when cargo exits, and a
@@ -497,6 +508,7 @@ pub fn journal_session(
     if let Some(manifest_dir) = consumer.manifest_dir {
         write_consumer_context(&journal, manifest_dir, consumer.key);
     }
+    true
 }
 
 /// `stow __drain-misses <target_dir>`: move each finished journal aside,
@@ -1091,6 +1103,15 @@ async fn prepare_group(
     group: Vec<JournalEntry>,
     gate: &mut crate::derive_gate::DerivationGate,
 ) -> Option<PreparedGroup> {
+    if !stow_types::identity::is_stable_rustc_version(&key.rustc_version) {
+        tracing::info!(
+            journal = %journal.display(),
+            rustc_version = %key.rustc_version,
+            entries = group.len(),
+            "miss journal group names a non-stable rustc release; dropping it"
+        );
+        return None;
+    }
     let mut expanded = if key.expanded_cache_key.is_empty() {
         None
     } else {
@@ -1991,6 +2012,51 @@ mod tests {
         assert!(
             !journal.exists(),
             "the redeemed report left nothing journaled"
+        );
+        assert_eq!(finished_journals(dir.path()), [] as [std::path::PathBuf; 0]);
+    }
+
+    #[test]
+    fn journal_session_skips_non_stable_rustc_versions() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let obs = unit("memchr", None);
+        for rustc_version in ["1.101.0-nightly", "1.100.0-beta.2", "1.101.0-dev"] {
+            let consumer = JournalConsumer {
+                manifest_dir: None,
+                rustc_version,
+                target: "aarch64-apple-darwin",
+                target_given: false,
+                key: None,
+            };
+            assert!(
+                !journal_session(
+                    SessionId::mint(),
+                    OsStr::new("rustc"),
+                    &consumer,
+                    std::slice::from_ref(&obs),
+                    dir.path(),
+                    "",
+                    &[],
+                ),
+                "{rustc_version} must not write a miss journal"
+            );
+        }
+        assert_eq!(finished_journals(dir.path()), [] as [std::path::PathBuf; 0]);
+    }
+
+    #[tokio::test]
+    async fn drain_drops_preexisting_non_stable_rustc_journal_without_hitting_edge() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = test_config(dir.path());
+        let journal = journal_path(dir.path(), "stow-nightly-legacy");
+        append_lines(&journal, &[entry("memchr", "1.101.0-nightly")]).expect("write journal");
+
+        let mut gate = crate::derive_gate::DerivationGate::unopened(dir.path().join("gate"));
+        drain_journal(&config, &journal, &mut gate).await;
+
+        assert!(
+            !journal.exists(),
+            "non-stable rustc journal must be dropped rather than retried forever"
         );
         assert_eq!(finished_journals(dir.path()), [] as [std::path::PathBuf; 0]);
     }

@@ -95,7 +95,12 @@ async fn ensure_graph<'a>(
     // The admission floor is a deploy binding, never persisted: every
     // wake plan and claim reads the one stamped here.
     loaded.with(|graph| graph.set_floor(settings.min_dispatch_value));
-    if !loaded.with(|graph| graph.ci_waiting(now_ms())) && cell.take_reconcile() {
+    if loaded.with(|graph| graph.freeze().is_some() && graph.inflight().0 == 0) {
+        // Frozen with nothing in flight: nothing to bind or renew; leave
+        // `reconcile_attempted_at = 0` so the first pass after unfreeze
+        // reconciles live occupancy without spending a CI call on wake.
+        let _ = cell.take_reconcile();
+    } else if !loaded.with(|graph| graph.ci_waiting(now_ms())) && cell.take_reconcile() {
         // The CI `status` listing is the truth for runs a snapshot's
         // eviction could have orphaned (claims whose bindings never
         // landed). A failure leaves the replayed state: the delivery
@@ -115,6 +120,17 @@ async fn ensure_graph<'a>(
                 loaded.with(|graph| graph.reconcile_failed(now_ms()));
                 tracing::warn!(%error, "post-wake CI status reconcile failed — keeping replayed state");
             }
+        }
+        // Living runs just renewed their leases above; reclaim any
+        // already-expired leases in memory so a cold wake while frozen or
+        // paused neither displays dead runs nor re-arms spurious alarms.
+        let live_settings = scheduler_settings(env, loaded)?;
+        let recovered = loaded.with(|graph| graph.recover_stale_leases(&live_settings, now_ms()));
+        if recovered > 0 {
+            tracing::info!(
+                recovered,
+                "post-wake stale recovery reclaimed expired in-flight leases"
+            );
         }
     }
     Ok(loaded)
@@ -986,6 +1002,17 @@ pub(super) async fn complete_run_pass(
     // A completion may have freed room under the memory lines: admit
     // what waits in the backlog before claiming.
     admit_backlog(graph, db, &settings).await;
+    if graph.with(|graph| graph.freeze().is_some()) {
+        let recovered = graph.with(|graph| graph.recover_stale_leases(&settings, now_ms()));
+        if recovered > 0 {
+            tracing::info!(
+                recovered,
+                "dispatch frozen — reclaimed expired in-flight leases on completion"
+            );
+        }
+        schedule_alarm(env, db, alarm, graph.cell()).await?;
+        return Ok(Vec::new());
+    }
     // The completion freed a slot, so this request claims one
     // concurrent round inline — never the status reconcile: its
     // listing calls plus a POST round could carry the webhook past
@@ -1580,8 +1607,9 @@ async fn write_dispatch_freeze(
         .map_err(to_error)?;
     match transition {
         freeze::FreezeTransition::Engaged(record) => {
-            // While frozen the wake plan is a delete — a live alarm
-            // would only spin dispatch passes the gate would eat.
+            // While frozen the wake plan deletes the alarm once nothing
+            // is in flight, or tracks the earliest in-flight lease expiry
+            // so expired leases still reap and release residency.
             schedule_alarm(&env, &db, &alarm, graph.cell())
                 .await
                 .map_err(|error| {
@@ -1998,7 +2026,7 @@ pub(super) async fn settle_meter(
         Err(error) => tracing::error!(%error, "do meter settle failed"),
     }
     let needed = match scheduler_settings(env, graph) {
-        Ok(settings) => graph.with(|graph| graph.needs_residency(&settings)),
+        Ok(settings) => graph.with(|graph| graph.needs_residency(&settings, now_ms())),
         Err(error) => {
             // Every route fails on the same settings, so nothing will
             // claim work until they are fixed: hold nothing.
@@ -2058,6 +2086,13 @@ pub(super) async fn preheat_release_pass(
     db: &DurableDb,
     request: &stow_types::api::PreheatReleaseRequest,
 ) -> Result<()> {
+    if !request.rustc_version.is_stable() {
+        return Err(Error::msg(format!(
+            "preheat rustc version `{}` is not a stable release",
+            request.rustc_version
+        ))
+        .set_status(StatusCode::BAD_REQUEST));
+    }
     let graph = ensure_graph(env, db, graph).await?;
     routes::require_ci_ready(graph, now_ms()).map_err(route_error)?;
     let interface = ci_interface(env, graph).await?;
@@ -2165,10 +2200,11 @@ pub(super) async fn published_index_pass(
     Ok(claimed)
 }
 
-/// The dispatch freeze stops the scheduler as well as the work-submitting
-/// routes: a frozen graph claims nothing and plans no wake, so the
-/// alarm does not re-arm — nothing runs until `dispatch-freeze clear`
-/// lifts it.
+/// The dispatch freeze stops claiming new work as well as the trusted
+/// work-submitting routes: a frozen graph claims nothing, reclaims any
+/// expired in-flight leases without touching CI, and deletes the alarm
+/// once nothing remains in flight — idle cost stays zero until
+/// `dispatch-freeze clear` lifts it.
 ///
 /// The alarm handler's `DurableDb` is extracted fresh (alarms bypass
 /// the router middleware), so it wraps the handle in the metering
@@ -2263,7 +2299,15 @@ async fn dispatch_pending(
     // precedes binding resolution on purpose: while frozen there is no
     // dispatch pass at all, not even its failures.
     if graph.with(|graph| graph.freeze().is_some()) {
-        tracing::info!("dispatch frozen — skipping dispatch pass");
+        let recovered = graph.with(|graph| graph.recover_stale_leases(&settings, now_ms()));
+        if recovered > 0 {
+            tracing::info!(
+                recovered,
+                "dispatch frozen — reclaimed expired in-flight leases"
+            );
+        } else {
+            tracing::info!("dispatch frozen — skipping dispatch pass");
+        }
         return Ok(Vec::new());
     }
     dispatch_pass(graph.cell(), env, db, &settings, bound, PassReconcile::Due).await

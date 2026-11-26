@@ -1985,6 +1985,13 @@ pub async fn admit_observed_misses(
     if observations.is_empty() {
         return Ok(());
     }
+    if !stow_types::identity::is_stable_rustc_version(rustc_version) {
+        tracing::info!(
+            rustc_version = %rustc_version,
+            "rustc version is not a stable release; not minting misses"
+        );
+        return Ok(());
+    }
     let Some(family) = stow_types::api::runner_family(consumer_target) else {
         tracing::info!(
             target = %consumer_target,
@@ -2118,6 +2125,13 @@ pub async fn admit_inexact_report(
     expanded: &ExpandedDependencyGraph,
 ) -> stow_types::error::Result<()> {
     if entries.is_empty() {
+        return Ok(());
+    }
+    if !stow_types::identity::is_stable_rustc_version(rustc_version) {
+        tracing::info!(
+            rustc_version = %rustc_version,
+            "rustc version is not a stable release; not posting the inexact report"
+        );
         return Ok(());
     }
     let Some(_family) = stow_types::api::runner_family(consumer_target) else {
@@ -5338,6 +5352,9 @@ impl PublicCacheMode {
 }
 
 fn unsupported_public_cache_reason(rustc_version: &str) -> Option<&'static str> {
+    if stow_types::identity::is_stable_rustc_version(rustc_version) {
+        return None;
+    }
     if rustc_version.contains("-nightly") {
         Some("nightly")
     } else if rustc_version.contains("-beta") {
@@ -5345,7 +5362,7 @@ fn unsupported_public_cache_reason(rustc_version: &str) -> Option<&'static str> 
     } else if rustc_version.contains("-dev") {
         Some("dev")
     } else {
-        None
+        Some("non-stable")
     }
 }
 

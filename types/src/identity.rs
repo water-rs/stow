@@ -336,6 +336,27 @@ string_newtype!(
     InvalidRustcVersion
 );
 
+/// Whether `value` names a stable Rust release (`<major>.<minor>.<patch>`,
+/// with no prerelease or build suffix).
+///
+/// The public cache builds only stable Rust releases: `dtolnay/rust-toolchain`
+/// refuses prerelease strings like `1.101.0-nightly`, and `<rustc>-<task_id>`
+/// run titles split on the first `-` (`crate::records::parse_run_title`).
+#[must_use]
+pub fn is_stable_rustc_version(value: &str) -> bool {
+    semver::Version::parse(value)
+        .is_ok_and(|version| version.pre.is_empty() && version.build.is_empty())
+}
+
+impl WireRustcVersion {
+    /// Whether this version names a stable Rust release
+    /// (`<major>.<minor>.<patch>`, with no prerelease or build suffix).
+    #[must_use]
+    pub fn is_stable(&self) -> bool {
+        is_stable_rustc_version(self.as_str())
+    }
+}
+
 /// Parse `[pkg.rustc].version` out of `channel-rust-stable.toml`, reducing
 /// the decorated string (`"1.98.1 (hash date)"`) to the semantic numeric
 /// portion.
@@ -345,7 +366,7 @@ string_newtype!(
 ///
 /// # Errors
 /// Returns an [`crate::error::Error`] when the manifest is not TOML, lacks
-/// `pkg.rustc.version`, or the version is not valid semver.
+/// `pkg.rustc.version`, or the version is not a stable semver release.
 pub fn parse_channel_rustc_version(manifest: &str) -> crate::error::Result<WireRustcVersion> {
     use crate::error::Context as _;
 
@@ -365,6 +386,11 @@ pub fn parse_channel_rustc_version(manifest: &str) -> crate::error::Result<WireR
         .ok_or_else(|| crate::error::Error::msg("channel manifest rustc version is empty"))?;
     let version = semver::Version::parse(numeric)
         .wrap_err_with(|| format!("channel manifest rustc version `{numeric}`"))?;
+    if !version.pre.is_empty() || !version.build.is_empty() {
+        return Err(crate::stow_error!(
+            "channel manifest rustc version `{numeric}` is not a stable release"
+        ));
+    }
     WireRustcVersion::parse(version.to_string())
         .wrap_err_with(|| format!("channel manifest rustc version `{numeric}`"))
 }
@@ -695,6 +721,8 @@ mod tests {
             "not toml = [",
             "[pkg.rustc]\nversion = \"bad version!!\"\n",
             "[pkg.rustc]\nversion = \"\"\n",
+            "[pkg.rustc]\nversion = \"1.101.0-nightly (04b871bb4 2026-01-01)\"\n",
+            "[pkg.rustc]\nversion = \"1.100.0-beta.2 (04b871bb4 2026-01-01)\"\n",
         ] {
             assert!(
                 super::parse_channel_rustc_version(manifest).is_err(),
@@ -724,9 +752,34 @@ mod tests {
 
     #[test]
     fn rustc_version_shape() {
-        WireRustcVersion::parse("1.83.0").unwrap();
-        WireRustcVersion::parse("1.91.0-nightly").unwrap();
+        let stable = WireRustcVersion::parse("1.83.0").unwrap();
+        let nightly = WireRustcVersion::parse("1.91.0-nightly").unwrap();
+        assert!(stable.is_stable());
+        assert!(!nightly.is_stable());
         assert!(WireRustcVersion::parse("").is_err());
+    }
+
+    #[test]
+    fn stable_rustc_version_accepts_only_numeric_releases() {
+        for version in ["1.83.0", "1.99.1", "1.101.0"] {
+            assert!(is_stable_rustc_version(version), "{version} must be stable");
+        }
+        for version in [
+            "",
+            "1.99",
+            "stable",
+            "nightly",
+            "1.101.0-nightly",
+            "1.100.0-beta.2",
+            "1.101.0-dev",
+            "1.100.0-rc.1",
+            "1.99.0+build.1",
+        ] {
+            assert!(
+                !is_stable_rustc_version(version),
+                "{version} must not be stable"
+            );
+        }
     }
 
     #[test]

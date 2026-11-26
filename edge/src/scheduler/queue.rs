@@ -390,6 +390,12 @@ pub fn admit_request(
     ),
     QueueError,
 > {
+    if !admission.rustc_version.is_stable() {
+        return Err(QueueError::Invariant(format!(
+            "request rustc version `{}` is not a stable release",
+            admission.rustc_version
+        )));
+    }
     let record = load_request(graph, &admission.request_id);
     if let Some(record) = record
         && record.state != "failed"
@@ -1174,6 +1180,15 @@ mod tests {
         let (step, event) = super::admit_request(&graph, &admission, 1, &settings, 1001).unwrap();
         assert!(matches!(step, super::RequestAdmissionStep::Existing));
         assert!(event.is_none());
+
+        let nightly = RequestAdmission {
+            rustc_version: "1.101.0-nightly".parse().unwrap(),
+            ..admission
+        };
+        assert!(matches!(
+            super::admit_request(&graph, &nightly, 1, &settings, 1001),
+            Err(crate::errors::QueueError::Invariant(_))
+        ));
     }
 
     #[test]

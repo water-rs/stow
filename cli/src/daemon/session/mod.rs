@@ -158,8 +158,7 @@ impl Origin for DriverFacts {
             target_dir,
             &expanded_cache_key,
             &self.seed.inexact_entries,
-        );
-        !(observations.is_empty() && self.seed.inexact_entries.is_empty())
+        )
     }
 }
 
@@ -509,12 +508,12 @@ impl<O: Origin> Session<O> {
     /// The build's compile observations are its miss list (stow#317) — a
     /// failed build's units are real misses too, whatever its last unit
     /// did. They land in the same journal a plain-cargo wrapper writes;
-    /// only a build that reaches the network has anything to admit.
+    /// only a build whose public cache is active has anything to admit.
     fn write_journal(&self) -> bool {
         let Some(config) = &self.build.config else {
             return false;
         };
-        if !config.cache.reaches_network() {
+        if !config.cache.reaches_network() || self.build.public_cache_disabled {
             return false;
         }
         self.origin
@@ -544,6 +543,7 @@ impl<O: Origin> Session<O> {
     ) {
         if let Ok(Some(build)) =
             finish_rustc_compile(post, success, local_base, &self.env_cache, &self.ctx).await
+            && !self.build.public_cache_disabled
             && let Some(parsed) = post.parsed.as_ref()
             && let Some(unit) = miss_journal::observed_unit(parsed, &build)
         {
@@ -1385,5 +1385,62 @@ mod tests {
 
         session_on.end().await.expect("end session_on");
         session_off.end().await.expect("end session_off");
+    }
+
+    #[tokio::test]
+    async fn public_cache_disabled_session_writes_no_miss_journal() {
+        let sessions = tempfile::tempdir().expect("sessions directory");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let target = tempfile::tempdir().expect("target directory");
+        let handles = CacheDirHandles::default();
+
+        let mut config = config_in(cache.path());
+        config.cache.remote = true;
+        let mut session_facts = facts(target.path(), Some(config)).await;
+        session_facts.build.public_cache_disabled = true;
+        session_facts.driver.project.rustc_version = "1.101.0-nightly".to_owned();
+        let session = Session::open(SessionId::mint(), session_facts, &handles, sessions.path())
+            .await
+            .expect("open session");
+        session
+            .observations
+            .lock()
+            .expect("observations mutex")
+            .push(artifact_cache::ObservedUnit {
+                crate_name: "memchr".to_owned(),
+                crate_version: "2.7.4".to_owned(),
+                features: Vec::new(),
+                target: HOST_TARGET.to_owned(),
+                explicit_target: None,
+                profile: stow_types::platform::Profile {
+                    opt_level: "0".to_owned(),
+                    debuginfo: 2,
+                    debug_assertions: true,
+                    overflow_checks: true,
+                    panic: stow_types::platform::PanicStrategy::Unwind,
+                    strip: stow_types::platform::StripLevel::None,
+                },
+                externs: Vec::new(),
+            });
+
+        let end = session.end().await.expect("end session");
+        assert!(
+            !end.journal_written,
+            "a build with public cache disabled must not write a miss journal"
+        );
+        let journals: Vec<_> = std::fs::read_dir(target.path())
+            .expect("read target dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("stow-misses.")
+            })
+            .collect();
+        assert!(
+            journals.is_empty(),
+            "no miss journal file should be created"
+        );
     }
 }
