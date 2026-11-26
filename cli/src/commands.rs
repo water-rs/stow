@@ -1565,11 +1565,11 @@ async fn remove_cache_subdir(path: &Path) -> stow_types::error::Result<()> {
     #[cfg(not(unix))]
     let target = path.to_path_buf();
 
-    match async_fs::remove_dir_all(&target).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).wrap_err_with(|| format!("remove {}", target.display())),
-    }
+    let display_target = target.clone();
+    tokio::task::spawn_blocking(move || stow_types::fs::remove_dir_all(&target))
+        .await
+        .wrap_err("join cache subdir removal task")?
+        .wrap_err_with(|| format!("remove {}", display_target.display()))
 }
 
 /// `stow check-artifact`: resolve `c_metadata` against the verified index
@@ -1723,7 +1723,7 @@ pub async fn purge_cache_dirs(args: PurgeCacheDirArgs) -> stow_types::error::Res
             if !path.exists() {
                 continue;
             }
-            std::fs::remove_dir_all(&path)
+            stow_types::fs::remove_dir_all(&path)
                 .wrap_err_with(|| format!("purge stale cache directory {}", path.display()))?;
         }
         Ok(())

@@ -462,7 +462,7 @@ fn sweep_sessions(sessions: &Path, processes: &impl Processes) -> Result<Swept> 
                 swept.outlived.push(Outlived { owner, dir: path });
             }
             _ => {
-                std::fs::remove_dir_all(&path)
+                stow_types::fs::remove_dir_all(&path)
                     .wrap_err_with(|| format!("remove the dead session {}", path.display()))?;
                 swept.removed += 1;
             }
@@ -481,7 +481,7 @@ fn refuse_until_exit<P: Processes>(daemon: &Daemon<P>, outlived: Outlived) {
             // Gone or replaced by another process between the sweep and the
             // watch: there is nothing left to refuse.
             tracing::warn!(%owner, %reason, "a cargo that outlived the previous daemon cannot be watched");
-            if let Err(error) = std::fs::remove_dir_all(&dir) {
+            if let Err(error) = stow_types::fs::remove_dir_all(&dir) {
                 tracing::warn!(%error, dir = %dir.display(), "remove the record of a cargo");
             }
             return;
@@ -495,8 +495,15 @@ fn refuse_until_exit<P: Processes>(daemon: &Daemon<P>, outlived: Outlived) {
             tracing::warn!(%owner, %error, "watching a cargo for its exit failed; no longer refusing it");
         }
         table.remove_cargo(owner);
-        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
-            tracing::warn!(%error, dir = %dir.display(), "remove the record of a cargo");
+        let display_dir = dir.display().to_string();
+        match tokio::task::spawn_blocking(move || stow_types::fs::remove_dir_all(&dir)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, dir = %display_dir, "remove the record of a cargo");
+            }
+            Err(error) => {
+                tracing::warn!(%error, dir = %display_dir, "join the cargo record removal task");
+            }
         }
         tracing::info!(%owner, "a cargo that outlived the previous daemon has exited");
     });

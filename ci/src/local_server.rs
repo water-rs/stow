@@ -1372,7 +1372,10 @@ async fn drive_task(state: LocalServerState, task: BuildTaskPayload, workflow_ru
                 // The runner a dispatch stands in for is ephemeral: a
                 // landed run leaves nothing behind. A failed run keeps
                 // its tree.
-                if let Err(error) = async_fs::remove_dir_all(&root).await {
+                let root_dir = root.clone();
+                if let Err(error) =
+                    smol::unblock(move || stow_types::fs::remove_dir_all(&root_dir)).await
+                {
                     tracing::error!(%error, root = %root.display(), "remove the landed run's directory");
                 }
             }
@@ -1869,7 +1872,8 @@ async fn publish_stage(run: &TaskRun, layout: &TaskLayout) -> stow_types::error:
     )
     .await?;
     // The runner a task stands in for is ephemeral.
-    async_fs::remove_dir_all(&layout.root).await?;
+    let root = layout.root.clone();
+    smol::unblock(move || stow_types::fs::remove_dir_all(&root)).await?;
     Ok(())
 }
 

@@ -163,7 +163,7 @@ pub fn keep_only_owner(dir: &Path) -> Result<()> {
             .wrap_err_with(|| format!("stat {}", path.display()))?
             .is_dir()
         {
-            std::fs::remove_dir_all(&path)
+            stow_types::fs::remove_dir_all(&path)
         } else {
             std::fs::remove_file(&path)
         };

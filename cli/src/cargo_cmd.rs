@@ -3739,7 +3739,7 @@ fn remove_mirror_entry(path: &Path) -> stow_types::error::Result<()> {
     } else if meta.is_file() {
         std::fs::remove_file(path).wrap_err_with(|| format!("remove {}", path.display()))
     } else {
-        std::fs::remove_dir_all(path).wrap_err_with(|| format!("remove {}", path.display()))
+        stow_types::fs::remove_dir_all(path).wrap_err_with(|| format!("remove {}", path.display()))
     }
 }
 

@@ -2868,7 +2868,8 @@ async fn stabilize_workspace(
     remove_existing_phase_target_dirs(&stable_root).await?;
     let capture_dir = stable_root.join(".stow-rustc-capture");
     if capture_dir.exists() {
-        async_fs::remove_dir_all(&capture_dir)
+        let dir = capture_dir.clone();
+        smol::unblock(move || stow_types::fs::remove_dir_all(&dir))
             .await
             .map_err(|error| {
                 stow_types::stow_error!(
@@ -2894,7 +2895,8 @@ async fn remove_existing_phase_target_dirs(workspace_root: &Path) -> stow_types:
         if !target_dir.exists() {
             continue;
         }
-        async_fs::remove_dir_all(&target_dir)
+        let dir = target_dir.clone();
+        smol::unblock(move || stow_types::fs::remove_dir_all(&dir))
             .await
             .map_err(|error| {
                 stow_types::stow_error!(

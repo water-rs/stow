@@ -363,7 +363,7 @@ mod linux {
             std::fs::remove_dir(src)?;
         } else {
             if dst.is_dir() {
-                std::fs::remove_dir_all(dst)?;
+                stow_types::fs::remove_dir_all(dst)?;
             } else if dst.exists() {
                 std::fs::remove_file(dst)?;
             }
@@ -1384,7 +1384,7 @@ mod linux {
 
     impl Drop for StowCowFs {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.unlinked_dir);
+            let _ = stow_types::fs::remove_dir_all(&self.unlinked_dir);
         }
     }
 
@@ -1408,7 +1408,7 @@ mod linux {
             let blobs_dir = backing_root.join(COW_BLOBS_DIR);
             std::fs::create_dir_all(&blobs_dir)?;
             let unlinked_dir = backing_root.join(COW_UNLINKED_DIR);
-            let _ = std::fs::remove_dir_all(&unlinked_dir);
+            let _ = stow_types::fs::remove_dir_all(&unlinked_dir);
             std::fs::create_dir_all(&unlinked_dir)?;
             Ok(Self {
                 cache_dir,
