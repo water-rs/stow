@@ -57,6 +57,13 @@ verify_mode = "github-ci"
 # (30 days).
 # build_dir_idle_secs = 2592000
 
+# Linux FUSE virtual CoW layer over `<cache_dir>/build-dir/` on non-CoW
+# filesystems such as ext4. Defaults to true on Linux (false elsewhere);
+# set `fuse = false` or `STOW_FUSE=0` to disable. On Linux CoW filesystems
+# (btrfs, XFS) or non-Linux platforms this setting is a no-op; if `/dev/fuse`
+# or `fusermount3` is unavailable, stow falls back to regular byte copies.
+# fuse = true
+
 # Per-request HTTP timeout (seconds) for the edge worker. Default 300.
 # request_timeout_secs = 300
 

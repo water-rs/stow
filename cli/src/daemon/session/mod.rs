@@ -190,6 +190,9 @@ pub struct Session<O = DriverFacts> {
     refusals: std::sync::Mutex<Vec<Refusal>>,
     /// The background analysis, stopped when the build's cargo exits.
     enrichment: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Shared handles of this session's cache directory (retains any FUSE
+    /// mount and allows deferred mounting once cargo releases its lock).
+    handles: CacheDirHandles,
 }
 
 impl Session {
@@ -289,6 +292,11 @@ impl<O: Origin> Session<O> {
             .wrap_err("reopen the build's toolchain")?;
         let dir = SessionDir::create(sessions, id)?;
         let config = session_config(&build, handles, id);
+        if let Some(config) = config.as_ref() {
+            handles
+                .ensure_fuse_mounted(&config.cache_dir, config.fuse)
+                .await;
+        }
         let has_policy = seed.cache_policy_entries.is_some();
         let (allow_writer, allowed) = seed.cache_policy_entries.as_ref().map_or_else(
             || (None, None),
@@ -365,6 +373,7 @@ impl<O: Origin> Session<O> {
             observations: std::sync::Mutex::default(),
             refusals: std::sync::Mutex::default(),
             enrichment: std::sync::Mutex::new(enrichment),
+            handles: handles.clone(),
         });
         // The probes and the cache lease overlap the build's start instead
         // of waiting for its first unit (stow#608).
@@ -434,10 +443,19 @@ impl<O: Origin> Session<O> {
             .map(ToString::to_string)
             .collect();
         self.remove_dir().await?;
+        self.ensure_fuse_mounted().await;
         Ok(SessionEnd {
             refusals,
             journal_written,
         })
+    }
+
+    async fn ensure_fuse_mounted(&self) {
+        if let Some(config) = self.env_cache.config() {
+            self.handles
+                .ensure_fuse_mounted(&config.cache_dir, config.fuse)
+                .await;
+        }
     }
 
     /// Attribute the build directory to the workspace members the build
@@ -483,7 +501,9 @@ impl<O: Origin> Session<O> {
     pub(crate) async fn abort(&self) -> Result<()> {
         self.stop_enrichment().await;
         self.reports.drain(CONNECTION_DRAIN_BUDGET).await;
-        self.remove_dir().await
+        let removed = self.remove_dir().await;
+        self.ensure_fuse_mounted().await;
+        removed
     }
 
     /// The build's compile observations are its miss list (stow#317) — a
@@ -971,6 +991,7 @@ impl Session {
             observations: std::sync::Mutex::default(),
             refusals: std::sync::Mutex::default(),
             enrichment: std::sync::Mutex::new(None),
+            handles: CacheDirHandles::default(),
         })
     }
 }
@@ -1015,6 +1036,7 @@ mod tests {
             artifact_cache_max_bytes: u64::MAX,
             index_refresh_interval: Duration::ZERO,
             build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
+            fuse: false,
             verify_mode: crate::config::VerifyMode::GithubCi,
             switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),

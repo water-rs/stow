@@ -45,6 +45,7 @@ pub const DEFAULT_BUCKET_PREFIX: &str = "stow/";
 pub const DEFAULT_BUCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DEFAULT_BUCKET_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_BUCKET_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const STOW_FUSE_ENV: &str = "STOW_FUSE";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_NEGATIVE_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_CIRCUIT_RESET_SECS: u64 = 60;
@@ -305,6 +306,14 @@ pub struct StowConfig {
     /// Age past which a build directory under `<cache_dir>/build-dir/`
     /// that has not been built is collected. `build_dir_idle_secs`.
     pub build_dir_idle: Duration,
+    /// Linux FUSE virtual copy-on-write layer over `<cache_dir>/build-dir/`
+    /// for non-copy-on-write filesystems such as ext4 (stow#1704). Defaults to
+    /// `true` on Linux (opt out via `fuse = false` or `STOW_FUSE=0`), `false`
+    /// elsewhere; automatically skipped on native `CoW` filesystems (`btrfs`,
+    /// `xfs`) and falls back to byte copies when `/dev/fuse` or `fusermount` is
+    /// unavailable.
+    #[serde(default = "default_fuse")]
+    pub fuse: bool,
     pub verify_mode: VerifyMode,
     /// The process's handle on the state database, shared by every config
     /// the process loads: the command entry point creates it, hands it to
@@ -342,6 +351,10 @@ pub struct StowConfig {
     /// write-behind uploader for this cache directory (stow#1700).
     #[serde(skip, default)]
     pub bucket_handles: crate::bucket_cache::BucketCacheHandles,
+}
+
+pub const fn default_fuse() -> bool {
+    cfg!(target_os = "linux")
 }
 
 pub fn default_tier_staging() -> Arc<[OnceCell<Arc<crate::artifact_cache::StagingDir>>; 3]> {
@@ -569,6 +582,7 @@ impl StowConfig {
                 .as_ref()
                 .and_then(|config| config.build_dir_idle_secs)
                 .map_or(DEFAULT_BUILD_DIR_IDLE, Duration::from_secs),
+            fuse: load_fuse(env, file_config.as_ref())?,
             verify_mode,
             state_db,
             trust_material: Arc::default(),
@@ -914,6 +928,7 @@ struct StowUserConfig {
     artifact_cache_max_bytes: Option<u64>,
     index_refresh_secs: Option<u64>,
     build_dir_idle_secs: Option<u64>,
+    fuse: Option<bool>,
     verify_mode: Option<String>,
     isolation: Option<crate::isolation::IsolationConfig>,
     #[cfg(feature = "mock-verify")]
@@ -1130,6 +1145,24 @@ fn load_artifact_cache_max_bytes(
     Ok(value)
 }
 
+fn load_fuse(
+    env: &SessionEnv,
+    file_config: Option<&StowUserConfig>,
+) -> stow_types::error::Result<bool> {
+    if let Some(raw) = text_var(env, STOW_FUSE_ENV) {
+        return match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" => Ok(true),
+            "0" | "false" => Ok(false),
+            other => Err(stow_types::stow_error!(
+                "parse {STOW_FUSE_ENV} as boolean (`1`/`true`/`0`/`false`), got `{other}`"
+            )),
+        };
+    }
+    Ok(file_config
+        .and_then(|config| config.fuse)
+        .unwrap_or_else(default_fuse))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1213,6 +1246,58 @@ mod tests {
             super::cache_dir(&bare).expect("the default cache directory"),
             home.path().join(".stow")
         );
+        assert_eq!(
+            config.fuse,
+            cfg!(target_os = "linux"),
+            "fuse defaults on for Linux and off elsewhere"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fuse_config_defaults_on_linux_and_honors_file_and_env() {
+        use std::ffi::OsStr;
+
+        use crate::session_env::SessionEnv;
+        use crate::state_db::StateDb;
+
+        let home = tempfile::tempdir().expect("home");
+        let bare = SessionEnv::for_tests([("HOME", home.path().as_os_str())]);
+        let default_cfg =
+            super::StowConfig::load_in(&bare, StateDb::closed()).expect("default config");
+        assert_eq!(default_cfg.fuse, cfg!(target_os = "linux"));
+
+        let file = super::config_file_path(&bare).expect("config path");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, "fuse = false\n").expect("write config false");
+        let from_file_off =
+            super::StowConfig::load_in(&bare, StateDb::closed()).expect("file config off");
+        assert!(!from_file_off.fuse);
+
+        let env_on = SessionEnv::for_tests([
+            ("HOME", home.path().as_os_str()),
+            ("STOW_FUSE", OsStr::new("1")),
+        ]);
+        let overridden_on = super::StowConfig::load_in(&env_on, StateDb::closed()).expect("env on");
+        assert!(overridden_on.fuse);
+
+        std::fs::write(&file, "fuse = true\n").expect("write config true");
+        let from_file = super::StowConfig::load_in(&bare, StateDb::closed()).expect("file config");
+        assert!(from_file.fuse);
+
+        let env_off = SessionEnv::for_tests([
+            ("HOME", home.path().as_os_str()),
+            ("STOW_FUSE", OsStr::new("0")),
+        ]);
+        let overridden_off =
+            super::StowConfig::load_in(&env_off, StateDb::closed()).expect("env off");
+        assert!(!overridden_off.fuse);
+
+        let env_bad = SessionEnv::for_tests([
+            ("HOME", home.path().as_os_str()),
+            ("STOW_FUSE", OsStr::new("maybe")),
+        ]);
+        assert!(super::StowConfig::load_in(&env_bad, StateDb::closed()).is_err());
     }
 
     #[test]

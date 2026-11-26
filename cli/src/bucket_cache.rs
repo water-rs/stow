@@ -1336,6 +1336,7 @@ mod tests {
             artifact_cache_max_bytes: 512 * 1024 * 1024,
             index_refresh_interval: Duration::from_secs(60),
             build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
+            fuse: false,
             verify_mode: VerifyMode::GithubCi,
             state_db: StateDb::default(),
             trust_material: Arc::default(),

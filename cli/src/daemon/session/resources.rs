@@ -17,6 +17,7 @@ use tokio::sync::OnceCell;
 use crate::artifact_cache::{SharedVersionLeases, StagingDir};
 use crate::bucket_cache::BucketCacheHandles;
 use crate::config::{StowConfig, default_tier_staging};
+use crate::fuse_cow::FuseMount;
 use crate::index::{HeldSlices, SliceFetches};
 use crate::state_db::StateDb;
 
@@ -30,6 +31,7 @@ pub struct CacheDirHandles {
     version_leases: SharedVersionLeases,
     slices: HeldSlices,
     bucket_handles: BucketCacheHandles,
+    fuse_mount: Arc<std::sync::Mutex<Option<Arc<FuseMount>>>>,
 }
 
 impl Default for CacheDirHandles {
@@ -42,6 +44,7 @@ impl Default for CacheDirHandles {
             version_leases: SharedVersionLeases::default(),
             slices: HeldSlices::default(),
             bucket_handles: BucketCacheHandles::default(),
+            fuse_mount: Arc::default(),
         }
     }
 }
@@ -55,6 +58,51 @@ impl CacheDirHandles {
         config.artifact_cache_staging = Arc::clone(&self.artifact_cache_staging);
         config.version_leases = self.version_leases.clone();
         config.bucket_handles = self.bucket_handles.clone();
+    }
+
+    /// Mount the Linux FUSE virtual copy-on-write layer over
+    /// `<cache_dir>/build-dir/` when enabled and not yet mounted.
+    pub async fn ensure_fuse_mounted(&self, cache_dir: &Path, enabled: bool) {
+        if !enabled {
+            return;
+        }
+        {
+            let guard = self
+                .fuse_mount
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.is_some() {
+                return;
+            }
+        }
+        let cache_dir = cache_dir.to_path_buf();
+        let mount = tokio::task::spawn_blocking(move || {
+            crate::fuse_cow::ensure_mounted(&cache_dir, enabled)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(mount) = mount {
+            let mut guard = self
+                .fuse_mount
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.is_none() {
+                *guard = Some(mount);
+            }
+        }
+    }
+
+    /// Unmount any FUSE virtual copy-on-write layer held for this cache directory.
+    async fn unmount_fuse(&self) {
+        let mount = self
+            .fuse_mount
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mount) = mount {
+            let _ = tokio::task::spawn_blocking(move || drop(mount)).await;
+        }
     }
 
     /// A slice memo for one build, backed by the slices this directory's
@@ -82,17 +130,17 @@ impl Resources {
             .clone()
     }
 
-    /// Drain pending remote bucket uploads, then checkpoint, truncate WALs,
-    /// and close every opened state/tier database.
+    /// Drain pending remote bucket uploads, unmount any active FUSE
+    /// copy-on-write layers, then checkpoint, truncate WALs, and close every
+    /// opened state/tier database.
     pub async fn checkpoint_and_close_all(&mut self) {
         let handles: Vec<CacheDirHandles> = self.by_cache_dir.drain().map(|(_, h)| h).collect();
         futures_util::future::join_all(handles.iter().map(|handle| handle.bucket_handles.drain()))
             .await;
-        futures_util::future::join_all(
-            handles
-                .iter()
-                .map(|handle| handle.state_db.checkpoint_and_close()),
-        )
+        futures_util::future::join_all(handles.iter().map(|handle| async {
+            handle.unmount_fuse().await;
+            handle.state_db.checkpoint_and_close().await;
+        }))
         .await;
     }
 }

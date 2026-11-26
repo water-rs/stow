@@ -1479,6 +1479,7 @@ async fn clean_cache_dir(
         }
     }
 
+    let fuse_mounted = crate::fuse_cow::is_fuse_mount(&cache_dir.join(BUILD_DIR_PARENT));
     let mut skipped_build_dirs = 0usize;
     let mut entries = async_fs::read_dir(cache_dir)
         .await
@@ -1495,6 +1496,9 @@ async fn clean_cache_dir(
         {
             continue;
         }
+        if fuse_mounted && name_str.as_ref() == crate::fuse_cow::BUILD_DIR_BACKING {
+            continue;
+        }
         let path = entry.path();
         let kind = match entry.file_type().await {
             Ok(kind) => kind,
@@ -1502,10 +1506,14 @@ async fn clean_cache_dir(
             Err(error) => return Err(error).wrap_err_with(|| format!("stat {}", path.display())),
         };
         if kind.is_dir() && name_str.as_ref() == BUILD_DIR_PARENT {
-            skipped_build_dirs +=
-                tokio::task::spawn_blocking(move || crate::build_dirs::clean_all(&path))
-                    .await
-                    .wrap_err("join build-dir clean task")??;
+            let cache_dir_owned = cache_dir.to_path_buf();
+            skipped_build_dirs += tokio::task::spawn_blocking(move || {
+                let skipped = crate::build_dirs::clean_all(&path)?;
+                let _ = crate::fuse_cow::gc_unreferenced_blobs(&cache_dir_owned);
+                Ok::<_, stow_types::error::Error>(skipped)
+            })
+            .await
+            .wrap_err("join build-dir clean task")??;
         } else if kind.is_dir() {
             remove_cache_subdir(&path).await?;
         } else {
@@ -1525,7 +1533,7 @@ async fn clean_cache_dir(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error)
                 if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
-                    && skipped_build_dirs > 0 => {}
+                    && (skipped_build_dirs > 0 || fuse_mounted) => {}
             Err(error) => {
                 return Err(error)
                     .wrap_err_with(|| format!("remove cache dir {}", cache_dir.display()));
@@ -2480,6 +2488,7 @@ mod tests {
             artifact_cache_max_bytes: 1024,
             index_refresh_interval: Duration::from_mins(5),
             build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
+            fuse: false,
             verify_mode,
             switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),

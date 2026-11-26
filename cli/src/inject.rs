@@ -640,10 +640,10 @@ fn replace_output<F>(
     Ok(file)
 }
 
-/// Clone `source` (APFS `clonefile`, Linux `FICLONE`, else a byte copy) to a
-/// uniquely named file beside `destination`, not yet visible at it, for
-/// [`serve_output`] to place. The staged file is removed on drop if it is
-/// never placed.
+/// Clone `source` (APFS `clonefile`, Linux `FICLONE`, optional Linux FUSE
+/// virtual copy-on-write, else a byte copy) to a uniquely named file beside
+/// `destination`, not yet visible at it, for [`serve_output`] to place. The
+/// staged file is removed on drop if it is never placed.
 pub fn stage_clone(
     source: &std::path::Path,
     destination: &std::path::Path,
@@ -655,7 +655,13 @@ pub fn stage_clone(
     tempfile::Builder::new()
         .prefix(".stow-stage-")
         .make_in(parent, |staged| {
-            reflink_copy::reflink_or_copy(source, staged)
+            if crate::fuse_cow::try_virtual_clone(source, staged)? {
+                return Ok(None);
+            }
+            if reflink_copy::reflink(source, staged).is_ok() {
+                return Ok(None);
+            }
+            std::fs::copy(source, staged).map(Some)
         })
 }
 

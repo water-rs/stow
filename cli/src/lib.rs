@@ -38,6 +38,7 @@ mod edge_client;
 mod facade;
 mod fetch;
 mod file_lock;
+mod fuse_cow;
 mod index;
 mod inject;
 mod isolation;
@@ -6624,6 +6625,7 @@ mod tests {
             artifact_cache_max_bytes: 1,
             index_refresh_interval: std::time::Duration::from_mins(10),
             build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
+            fuse: false,
             verify_mode: crate::config::VerifyMode::GithubCi,
             switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
@@ -7253,6 +7255,7 @@ mod tests {
             artifact_cache_max_bytes: 0,
             index_refresh_interval: std::time::Duration::ZERO,
             build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
+            fuse: false,
             verify_mode: crate::config::VerifyMode::GithubCi,
             switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
@@ -7433,6 +7436,7 @@ mod tests {
                 artifact_cache_max_bytes: u64::MAX,
                 index_refresh_interval: Duration::ZERO,
                 build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
+                fuse: false,
                 verify_mode: crate::config::VerifyMode::GithubCi,
                 switches: crate::config::Switches::default(),
                 state_db: crate::state_db::StateDb::default(),

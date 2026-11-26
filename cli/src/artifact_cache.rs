@@ -8462,6 +8462,7 @@ pub mod tests {
             artifact_cache_max_bytes: u64::MAX,
             index_refresh_interval: Duration::from_mins(1),
             build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
+            fuse: false,
             verify_mode: VerifyMode::GithubCi,
             switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
