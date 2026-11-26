@@ -674,6 +674,29 @@ async fn answer_plan<H: Handler>(
             return Answer::Failed { message: error };
         }
     };
+    // The search paths of served closures are part of the request: without
+    // them rustc cannot load what a served dependency needs (stow#1711).
+    let args = match handler.output_roots().cloned() {
+        Some(roots) => {
+            let searched = smol::unblock(move || {
+                let extra = crate::inject::closure_search_args(&args, roots.dirs());
+                (args, extra)
+            })
+            .await;
+            match searched {
+                (mut args, Ok(extra)) => {
+                    args.extend(extra);
+                    args
+                }
+                (_, Err(error)) => {
+                    return Answer::Failed {
+                        message: format!("find the search paths of served closures: {error}"),
+                    };
+                }
+            }
+        }
+        None => args,
+    };
     // A refused request compiles as cargo asked, with nothing the build
     // adds to the arguments.
     let as_requested = CompileCommand::new(&executable, &args);

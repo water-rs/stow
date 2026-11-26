@@ -904,6 +904,113 @@ fn sha256_open_file(
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
+/// The `-L dependency=` arguments a rustc invocation needs to load the
+/// dependencies of crates stow served together with their closure
+/// (stow#1711).
+///
+/// A served closure puts the served unit's dependency outputs in the
+/// unit's own out dir ([`materialize_original_outputs`]). Under cargo's
+/// per-unit build-dir layout that directory is on a dependent's search
+/// path only when the unit is also some other unit's dependency; a direct
+/// dependency arrives as `--extern` alone, and a crate its closure added
+/// outside cargo's graph is then nowhere rustc looks. Each `--extern`
+/// whose directory lies under one of `roots`, is not searched already and
+/// holds another crate's library is returned as a search path.
+///
+/// # Errors
+///
+/// Listing such a directory failed for a reason other than its absence.
+pub fn closure_search_args(
+    args: &[std::ffi::OsString],
+    roots: &[std::path::PathBuf],
+) -> stow_types::error::Result<Vec<std::ffi::OsString>> {
+    let mut searched = BTreeSet::new();
+    let mut externs = Vec::new();
+    let mut iter = args.iter().map(|arg| arg.to_str());
+    while let Some(arg) = iter.next() {
+        let Some(arg) = arg else { continue };
+        if arg == "-L" {
+            if let Some(Some(value)) = iter.next() {
+                note_crate_search_path(value, &mut searched);
+            }
+        } else if let Some(value) = arg.strip_prefix("-L") {
+            note_crate_search_path(value, &mut searched);
+        } else if arg == "--extern" {
+            if let Some(Some(value)) = iter.next() {
+                externs.extend(extern_path(value));
+            }
+        } else if let Some(value) = arg.strip_prefix("--extern=") {
+            externs.extend(extern_path(value));
+        }
+    }
+    let mut extra = Vec::new();
+    for path in externs {
+        let Some(dir) = path.parent() else { continue };
+        if searched.contains(dir) || !roots.iter().any(|root| dir.starts_with(root)) {
+            continue;
+        }
+        let own = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(library_crate);
+        let listing = match std::fs::read_dir(dir) {
+            Ok(listing) => listing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).wrap_err_with(|| format!("list {}", dir.display())),
+        };
+        for entry in listing {
+            let entry = entry.wrap_err_with(|| format!("list {}", dir.display()))?;
+            let name = entry.file_name();
+            if name
+                .to_str()
+                .and_then(library_crate)
+                .is_some_and(|crate_name| Some(crate_name) != own)
+            {
+                let mut search = std::ffi::OsString::from("dependency=");
+                search.push(dir);
+                extra.push(std::ffi::OsString::from("-L"));
+                extra.push(search);
+                break;
+            }
+        }
+        searched.insert(dir.to_path_buf());
+    }
+    Ok(extra)
+}
+
+/// Record `value`, one `-L [KIND=]PATH`, when rustc searches it for
+/// crates: the `dependency`, `crate` and `all` kinds, or no kind.
+fn note_crate_search_path(value: &str, searched: &mut BTreeSet<std::path::PathBuf>) {
+    let path = match value.split_once('=') {
+        Some(("dependency" | "crate" | "all", path)) => path,
+        Some(("native" | "framework", _)) => return,
+        _ => value,
+    };
+    searched.insert(std::path::PathBuf::from(path));
+}
+
+/// The path of one `--extern [OPTIONS:]NAME=PATH`; `None` for a bare name.
+fn extern_path(value: &str) -> Option<std::path::PathBuf> {
+    value
+        .split_once('=')
+        .map(|(_, path)| std::path::PathBuf::from(path))
+}
+
+/// The crate a library file holds: `lib<crate>[-<hash>]` with `.rlib`,
+/// `.rmeta` or a proc-macro's `.dylib`/`.so`, or `<crate>[-<hash>].dll`.
+fn library_crate(file_name: &str) -> Option<&str> {
+    let (stem, extension) = file_name.rsplit_once('.')?;
+    let stem = match extension {
+        "rlib" | "rmeta" | "dylib" | "so" => stem.strip_prefix("lib")?,
+        "dll" => stem,
+        _ => return None,
+    };
+    Some(
+        stem.split_once('-')
+            .map_or(stem, |(crate_name, _)| crate_name),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -1055,6 +1162,95 @@ mod tests {
     /// rustc to write, runnable by the cargo that spawns it, whichever
     /// invocation spelling and output directory asked: one bundle serves
     /// the native and the `--target` builds alike.
+
+    #[test]
+    fn a_direct_extern_holding_a_served_closure_is_searched() {
+        let root = tempfile::tempdir().expect("build dir");
+        let unit = |name: &str, files: &[&str]| {
+            let dir = root
+                .path()
+                .join("debug/build")
+                .join(name)
+                .join("0123456789abcdef/out");
+            std::fs::create_dir_all(&dir).expect("unit out dir");
+            for file in files {
+                std::fs::write(dir.join(file), b"").expect("output");
+            }
+            dir
+        };
+        let served = unit(
+            "semver",
+            &[
+                "libsemver-0123456789abcdef.rmeta",
+                "libserde_core-fedcba9876543210.rlib",
+            ],
+        );
+        // A closure that is one proc-macro library still needs the search.
+        let derive = unit(
+            "bytemuck",
+            &[
+                "libbytemuck-0123456789abcdef.rmeta",
+                "libbytemuck_derive-fedcba9876543210.dylib",
+            ],
+        );
+        let plain = unit("itoa", &["libitoa-0123456789abcdef.rmeta"]);
+        let searched = unit(
+            "memchr",
+            &[
+                "libmemchr-0123456789abcdef.rmeta",
+                "libcfg_if-fedcba9876543210.rlib",
+            ],
+        );
+        let outside = tempfile::tempdir().expect("outside dir");
+        std::fs::write(outside.path().join("libother-0123456789abcdef.rlib"), b"").expect("output");
+        std::fs::write(outside.path().join("libfar-0123456789abcdef.rmeta"), b"").expect("output");
+        let args: Vec<std::ffi::OsString> = [
+            "--extern".to_owned(),
+            format!(
+                "semver={}",
+                served.join("libsemver-0123456789abcdef.rmeta").display()
+            ),
+            format!(
+                "--extern=itoa={}",
+                plain.join("libitoa-0123456789abcdef.rmeta").display()
+            ),
+            "--extern".to_owned(),
+            format!(
+                "bytemuck={}",
+                derive.join("libbytemuck-0123456789abcdef.rmeta").display()
+            ),
+            "--extern".to_owned(),
+            format!(
+                "memchr={}",
+                searched.join("libmemchr-0123456789abcdef.rmeta").display()
+            ),
+            format!("-Ldependency={}", searched.display()),
+            "--extern".to_owned(),
+            format!(
+                "far={}",
+                outside
+                    .path()
+                    .join("libfar-0123456789abcdef.rmeta")
+                    .display()
+            ),
+        ]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+
+        let extra =
+            super::closure_search_args(&args, &[root.path().to_path_buf()]).expect("search args");
+        assert_eq!(
+            extra,
+            [
+                std::ffi::OsString::from("-L"),
+                std::ffi::OsString::from(format!("dependency={}", served.display())),
+                std::ffi::OsString::from("-L"),
+                std::ffi::OsString::from(format!("dependency={}", derive.display())),
+            ]
+        );
+    }
+
     #[test]
     fn a_build_script_is_served_as_an_executable_file_for_every_spelling() {
         smol::block_on(async {
