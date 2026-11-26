@@ -134,7 +134,7 @@ fn executable_file_name(base: &str) -> String {
 /// `CMAKE_*_COMPILER_LAUNCHER` are *launchers*: the program to run arrives as
 /// the first argument. `CC` and `CXX` are not — they are invoked with compiler
 /// arguments only, so a launcher-shaped shim tries to execute the first flag.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrapperShimPaths {
     /// Path to the rustc wrapper.
     pub rustc_wrapper: PathBuf,
@@ -144,6 +144,18 @@ pub struct WrapperShimPaths {
     pub cc_compiler: PathBuf,
     /// Compiler-shaped c++ shim, for `CXX`.
     pub cxx_compiler: PathBuf,
+}
+
+/// Compute the wrapper paths [`materialize_wrapper_shims`] will place under
+/// `tools_dir` without creating directories or writing files.
+#[must_use]
+pub fn planned_wrapper_shims(tools_dir: &Path) -> WrapperShimPaths {
+    WrapperShimPaths {
+        rustc_wrapper: tools_dir.join(executable_file_name(RUSTC_WRAPPER_PATH)),
+        cc_launcher: tools_dir.join(executable_file_name(CC_LAUNCHER_PATH)),
+        cc_compiler: tools_dir.join(executable_file_name(CC_COMPILER_PATH)),
+        cxx_compiler: tools_dir.join(executable_file_name(CXX_COMPILER_PATH)),
+    }
 }
 
 /// The durable per-user directory stow's tools — the managed mold

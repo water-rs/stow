@@ -48,7 +48,9 @@ pub mod scheduled_task;
 mod serve;
 pub mod session;
 mod start;
-pub use start::stop_if_running;
+#[cfg(test)]
+pub use start::StatusReply;
+pub use start::{DaemonProbe, probe_if_running, stop_if_running};
 mod table;
 #[cfg(windows)]
 mod windows;

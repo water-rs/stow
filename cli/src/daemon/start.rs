@@ -57,6 +57,58 @@ pub struct StatusReply {
     pub floor: u16,
 }
 
+/// Outcome of a quick, non-spawning daemon status probe (`stow status`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonProbe {
+    /// A running daemon answered a status request.
+    Running(StatusReply),
+    /// A running daemon is retiring onto a successor.
+    Retiring {
+        /// The retiring daemon's stow version.
+        stow_version: String,
+    },
+    /// No daemon is listening at the runtime endpoint.
+    NotRunning,
+    /// Probing failed (e.g., timeout, permission issue, or older protocol).
+    Unavailable(String),
+}
+
+/// Timeout for [`probe_if_running`]: a live daemon responds in milliseconds,
+/// so half a second separates a healthy daemon from a wedged one without
+/// stalling `stow status`.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Probe a running daemon without creating directories or starting one.
+#[must_use]
+pub fn probe_if_running(exe: &Path) -> DaemonProbe {
+    let dir = match RunDir::locate() {
+        Ok(dir) if dir.exists() => dir,
+        Ok(_) => return DaemonProbe::NotRunning,
+        Err(error) => return DaemonProbe::Unavailable(error.to_string()),
+    };
+    let endpoint = RunDir(dir).endpoint();
+    let stream = match try_connect(&endpoint, PROBE_TIMEOUT) {
+        Ok(Attempt::Connected(stream)) => stream,
+        Ok(Attempt::Down) => return DaemonProbe::NotRunning,
+        Err(error) => return DaemonProbe::Unavailable(error.to_string()),
+    };
+    #[cfg(unix)]
+    let reply = exchange(&stream, exe);
+    #[cfg(windows)]
+    let reply = {
+        let exe = exe.to_owned();
+        with_deadline(PROBE_TIMEOUT, move || exchange(stream, &exe))
+    };
+    match reply {
+        Ok(Reply::Status(status)) => DaemonProbe::Running(status),
+        Ok(Reply::Retiring { stow_version, .. }) => DaemonProbe::Retiring { stow_version },
+        Ok(Reply::TooOld { protocol, .. }) => {
+            DaemonProbe::Unavailable(format!("older protocol {protocol}"))
+        }
+        Err(error) => DaemonProbe::Unavailable(error.to_string()),
+    }
+}
+
 /// A connection to the daemon that has not yet said hello.
 #[derive(Debug)]
 pub struct Connection {

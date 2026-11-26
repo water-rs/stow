@@ -31,7 +31,7 @@ irm https://stow.waterui.dev/install.ps1 | iex
 ```
 
 - **Updating:** run `stow update` (reads the cargo-dist receipt, updates the binary, refreshes wrapper shims, and drains/restarts the running daemon). Never overwrite an installer-managed `stow` with `cargo install`, which lacks an install receipt.
-- **Global Cargo wiring only — never pollute project repos:** `stow setup` is idempotent and writes only into `$CARGO_HOME/config.toml` (`~/.cargo/config.toml` by default): `build.rustc-wrapper`, host-scoped `CC_<triple>` / `CXX_<triple>`, `CMAKE_C_COMPILER_LAUNCHER` / `CMAKE_CXX_COMPILER_LAUNCHER`, `build.build-dir` (unless the user already configured one or `--no-build-dir` was passed), and on Linux a managed `mold` install (`-fuse-ld=mold` + `COMPILER_PATH`). On interactive terminals where `~/.claude` or `~/.agents` exists, `stow setup` also offers to install/update this `stow` skill (`--install-skill` / `--no-install-skill` for non-interactive control). **Never write `stow` wrapper paths into a project's `.cargo/config.toml`.**
+- **Global Cargo wiring only — never pollute project repos:** `stow setup` is idempotent, previews a plan of every path and setting it will change (asking for confirmation on interactive TTYs unless `-y`/`--yes` or `CI` is set), and writes only into `$CARGO_HOME/config.toml` (`~/.cargo/config.toml` by default): `build.rustc-wrapper`, host-scoped `CC_<triple>` / `CXX_<triple>`, `CMAKE_C_COMPILER_LAUNCHER` / `CMAKE_CXX_COMPILER_LAUNCHER`, `build.build-dir` (unless the user already configured one or `--no-build-dir` was passed), and on Linux a managed `mold` install (`-fuse-ld=mold` + `COMPILER_PATH`). On interactive terminals where `~/.claude` or `~/.agents` exists, `stow setup` also offers to install/update this `stow` skill (`--install-skill` / `--no-install-skill` for non-interactive control). **Never write `stow` wrapper paths into a project's `.cargo/config.toml`.**
 - **`build.build-dir` & integration test binaries:** on developer machines where `stow setup` sets `build.build-dir = "<cache_dir>/build-dir/{workspace-path-hash}"` (so idle/deleted worktrees can be swept), Cargo still copies final `[[bin]]` / `cdylib` / `staticlib` outputs to `target/<profile>/`, while `deps/` intermediates (including integration test executables) live under `<build-dir>/<profile>/deps/`. Discover test executable paths from `cargo test --no-run --message-format=json` (`executable` field), or pass `CARGO_BUILD_BUILD_DIR=target` (or `stow setup --no-build-dir` on ephemeral CI runners) when a script requires `target/<profile>/deps/`.
 
 ## 2. Running Builds and Maximizing Hit Rate
@@ -123,7 +123,7 @@ steps:
 
 ## 6. Diagnostics & Maintenance Commands
 
-- `stow status` — active Cargo wrapper paths, stale per-project configs detected, and rolling `rust-cache` / `cc-cache` hit/miss/error counts.
+- `stow status` — grouped summary of active Cargo wrapper wiring (`build-dir` included), remote cache and non-spawning daemon state, cache hit rates / CPU saved / bytes served & downloaded, and any stale per-project configs detected.
 - `stow stats` (`--json`) — local hits, misses, bytes downloaded, and compile CPU time saved.
 - `stow index status` / `stow index refresh` — inspect or force-revalidate cached `(target, rustc)` signed index slices (`~/.stow/index/`).
 - `STOW_IDENTITY_TRACE=/tmp/stow-trace cargo check` — writes per-invocation JSON identity records to diagnose why a specific unit missed an index row.

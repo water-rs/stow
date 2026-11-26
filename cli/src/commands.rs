@@ -6,6 +6,7 @@
 //! module is the dev/maintenance surface.
 
 use std::fmt::Write as _;
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
 use stow_types::error::Context;
@@ -16,6 +17,7 @@ use crate::cli_args::{
     CheckArtifactArgs, FetchArtifactArgs, IndexRefreshArgs, PurgeCacheDirArgs, SetupArgs, StatsArgs,
 };
 use crate::config::{self, StowConfig};
+use crate::daemon::DaemonProbe;
 use crate::daemon::client::Restarted;
 use crate::fetch;
 use crate::index;
@@ -25,8 +27,416 @@ use crate::rustc_args::{detect_rustc_host_target, detect_rustc_version};
 use crate::session_env::SessionEnv;
 use crate::state_db::StateDb;
 use crate::stats;
+use crate::term_style::Palette;
 use crate::wrapper_shim;
 use crate::write_stdout;
+
+/// Right-aligned label width shared by `stow setup` and `stow status`.
+const LABEL_WIDTH: usize = 16;
+
+/// Platform daemon login service managed by `stow setup`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DaemonServicePlan {
+    /// macOS `LaunchAgent` plist and launchd label.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    LaunchAgent { plist: PathBuf, label: String },
+    /// Windows Task Scheduler task name.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    ScheduledTask { name: String },
+}
+
+/// How an agent skill target appears in the setup plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillPlanMode {
+    /// Unconditionally installed (`--install-skill`).
+    Install,
+    /// Detected agent home needing update; user will be asked on an interactive terminal.
+    Prompt,
+}
+
+/// One coding-agent skill file targeted by `stow setup`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillTargetPlan {
+    path: PathBuf,
+    mode: SkillPlanMode,
+}
+
+/// Read-only plan of every path and setting `stow setup` will create, update,
+/// or clean before anything touches disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupPlan {
+    cargo_config_path: PathBuf,
+    cargo_config_exists: bool,
+    shims_dir: PathBuf,
+    host_target: String,
+    rustc_version: String,
+    rustc_wrapper: String,
+    cc_key: String,
+    cc_compiler: String,
+    cxx_key: String,
+    cxx_compiler: String,
+    cc_launcher: String,
+    real_cc: Option<String>,
+    real_cxx: Option<String>,
+    build_dir: BuildDirPlacement,
+    mold: mold::GlobalMoldPlan,
+    stale_project_configs: Vec<PathBuf>,
+    daemon_service: Option<DaemonServicePlan>,
+    skill_targets: Vec<SkillTargetPlan>,
+    fetch_index_slice: bool,
+}
+
+/// Applied outcomes reported after `stow setup` finishes writing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupOutcome {
+    config_path: PathBuf,
+    build_dir: BuildDirPlacement,
+    mold_bin_dir: Option<PathBuf>,
+    selects_mold: bool,
+    cleaned_stale_configs: Vec<PathBuf>,
+    daemon_service: Option<DaemonServicePlan>,
+    installed_skills: Vec<PathBuf>,
+}
+
+/// Whether stdin and stdout are both interactive terminals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalMode {
+    Interactive,
+    NonInteractive,
+}
+
+impl TerminalMode {
+    const fn from_stdio(stdin_tty: bool, stdout_tty: bool) -> Self {
+        if stdin_tty && stdout_tty {
+            Self::Interactive
+        } else {
+            Self::NonInteractive
+        }
+    }
+}
+
+/// Terminal and flag inputs that decide whether `stow setup` prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetupPromptContext {
+    yes: bool,
+    ci_env: bool,
+    terminal: TerminalMode,
+}
+
+impl SetupPromptContext {
+    /// Whether `stow setup` should ask for interactive confirmation before writing.
+    const fn should_prompt(self) -> bool {
+        !self.yes && !self.ci_env && matches!(self.terminal, TerminalMode::Interactive)
+    }
+}
+
+/// Parse a `[Y/n]` confirmation line: empty (Enter), `y`, or `yes` approves.
+fn parse_confirm_answer(answer: &str) -> bool {
+    let trimmed = answer.trim();
+    trimmed.is_empty() || trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes")
+}
+
+/// Prompt the user to confirm applying the rendered setup plan.
+fn confirm_setup_with(
+    reader: &mut impl std::io::BufRead,
+    writer: &mut impl std::io::Write,
+    palette: Palette,
+) -> stow_types::error::Result<bool> {
+    write!(writer, "{} ", palette.bold("Apply these changes? [Y/n]:"))
+        .wrap_err("write setup confirmation prompt")?;
+    writer.flush().wrap_err("flush setup confirmation prompt")?;
+    let mut answer = String::new();
+    let bytes = reader
+        .read_line(&mut answer)
+        .wrap_err("read setup confirmation answer")?;
+    if bytes == 0 {
+        // EOF (e.g. Ctrl-D) declines rather than silently writing files.
+        return Ok(false);
+    }
+    Ok(parse_confirm_answer(&answer))
+}
+
+fn push_kv(out: &mut String, palette: Palette, key: &str, value: impl std::fmt::Display) {
+    let label = format!("{key:>LABEL_WIDTH$}:");
+    let _ = writeln!(out, "  {} {value}", palette.key(label));
+}
+
+/// Render the pre-write `stow setup` plan.
+fn render_setup_plan(plan: &SetupPlan, palette: Palette) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", palette.heading("stow setup plan"));
+    let config_action = if plan.cargo_config_exists {
+        palette.dim("(update)")
+    } else {
+        palette.ok("(create)")
+    };
+    push_kv(
+        &mut out,
+        palette,
+        "config",
+        format!("{} {config_action}", plan.cargo_config_path.display()),
+    );
+    push_kv(&mut out, palette, "rustc-wrapper", &plan.rustc_wrapper);
+    push_kv(
+        &mut out,
+        palette,
+        "cc",
+        format!(
+            "{} {}",
+            plan.cc_compiler,
+            palette.dim(format!("({})", plan.cc_key))
+        ),
+    );
+    push_kv(
+        &mut out,
+        palette,
+        "cxx",
+        format!(
+            "{} {}",
+            plan.cxx_compiler,
+            palette.dim(format!("({})", plan.cxx_key))
+        ),
+    );
+    push_kv(
+        &mut out,
+        palette,
+        "cc-launcher",
+        format!(
+            "{} {}",
+            plan.cc_launcher,
+            palette.dim("(CMAKE_{C,CXX}_COMPILER_LAUNCHER)")
+        ),
+    );
+    if let Some(real_cc) = &plan.real_cc {
+        push_kv(&mut out, palette, "STOW_REAL_CC", real_cc);
+    }
+    if let Some(real_cxx) = &plan.real_cxx {
+        push_kv(&mut out, palette, "STOW_REAL_CXX", real_cxx);
+    }
+    push_kv(&mut out, palette, "build-dir", plan.build_dir.value_text());
+    render_setup_plan_extras(&mut out, plan, palette);
+    out
+}
+
+fn render_setup_plan_extras(out: &mut String, plan: &SetupPlan, palette: Palette) {
+    match &plan.mold {
+        mold::GlobalMoldPlan::NotNeeded => {}
+        mold::GlobalMoldPlan::AlreadyConfigured => {
+            push_kv(
+                out,
+                palette,
+                "linker",
+                format!("mold {}", palette.dim("(already configured)")),
+            );
+        }
+        mold::GlobalMoldPlan::Managed {
+            bin_dir,
+            needs_download,
+        } => {
+            let note = if *needs_download {
+                format!(" {}", palette.warn("(will download)"))
+            } else {
+                String::new()
+            };
+            push_kv(
+                out,
+                palette,
+                "linker",
+                format!("mold ({}){note}", bin_dir.join("mold").display()),
+            );
+        }
+    }
+    push_kv(out, palette, "shims", plan.shims_dir.display());
+    if let Some(service) = &plan.daemon_service {
+        match service {
+            DaemonServicePlan::LaunchAgent { plist, label } => {
+                push_kv(
+                    out,
+                    palette,
+                    "launch agent",
+                    format!("{} {}", plist.display(), palette.dim(format!("({label})"))),
+                );
+            }
+            DaemonServicePlan::ScheduledTask { name } => {
+                push_kv(
+                    out,
+                    palette,
+                    "scheduled task",
+                    format!("{name} {}", palette.dim("(Windows Task Scheduler)")),
+                );
+            }
+        }
+    }
+    for skill in &plan.skill_targets {
+        let note = match skill.mode {
+            SkillPlanMode::Install => palette.ok("(install)"),
+            SkillPlanMode::Prompt => palette.dim("(detected; will ask)"),
+        };
+        push_kv(
+            out,
+            palette,
+            "agent skill",
+            format!("{} {note}", skill.path.display()),
+        );
+    }
+    for stale in &plan.stale_project_configs {
+        push_kv(
+            out,
+            palette,
+            "stale cleanup",
+            format!("{} {}", stale.display(), palette.warn("(strip stow keys)")),
+        );
+    }
+    if plan.fetch_index_slice {
+        push_kv(
+            out,
+            palette,
+            "index slice",
+            format!("{} / rustc {}", plan.host_target, plan.rustc_version),
+        );
+    }
+}
+
+/// Render the completion summary after `stow setup` applies changes.
+fn render_setup_complete(outcome: &SetupOutcome, palette: Palette) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", palette.ok_bold("stow setup complete"));
+    push_kv(
+        &mut out,
+        palette,
+        "configured",
+        outcome.config_path.display(),
+    );
+    match (&outcome.mold_bin_dir, outcome.selects_mold) {
+        (Some(dir), _) => {
+            push_kv(
+                &mut out,
+                palette,
+                "linker",
+                format!("mold ({})", dir.join("mold").display()),
+            );
+        }
+        (None, true) if cfg!(target_os = "linux") => {
+            push_kv(
+                &mut out,
+                palette,
+                "linker",
+                format!("mold {}", palette.dim("(already configured)")),
+            );
+        }
+        _ => {}
+    }
+    push_kv(
+        &mut out,
+        palette,
+        "build-dir",
+        outcome.build_dir.value_text(),
+    );
+    for path in &outcome.cleaned_stale_configs {
+        push_kv(
+            &mut out,
+            palette,
+            "cleaned",
+            format!("stale stow wiring from {}", path.display()),
+        );
+    }
+    if let Some(service) = &outcome.daemon_service {
+        match service {
+            DaemonServicePlan::LaunchAgent { plist, .. } => {
+                push_kv(&mut out, palette, "launch agent", plist.display());
+            }
+            DaemonServicePlan::ScheduledTask { name } => {
+                push_kv(&mut out, palette, "scheduled task", name);
+            }
+        }
+    }
+    for path in &outcome.installed_skills {
+        push_kv(&mut out, palette, "stow skill", path.display());
+    }
+    out
+}
+
+struct PreparedSetup {
+    current_dir: PathBuf,
+    cargo_home: PathBuf,
+    resolved_wrappers: ResolvedWrapperPlan,
+    stow_config: StowConfig,
+    interactive: bool,
+    plan: SetupPlan,
+}
+
+async fn prepare_setup(
+    args: &SetupArgs,
+    state_db: &StateDb,
+) -> stow_types::error::Result<PreparedSetup> {
+    let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
+    let cargo_home = config::require_cargo_home()?;
+    let config_path = cargo_home.join("config.toml");
+    let env = SessionEnv::of_this_process()?;
+    let (host_target, rustc_version, mold_plan) = tokio::join!(
+        detect_rustc_host_target(std::ffi::OsStr::new("rustc"), &env),
+        detect_rustc_version(std::ffi::OsStr::new("rustc"), &env),
+        mold::plan_global(),
+    );
+    let host_target = host_target
+        .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
+    let rustc_version =
+        rustc_version.map_err(|error| stow_types::stow_error!("detect rustc version: {error}"))?;
+    let mold_plan = mold_plan?;
+    let resolved_wrappers = resolve_wrapper_executables(&cargo_home)?;
+    let planned_shims = wrapper_shim::planned_wrapper_shims(&resolved_wrappers.shims_dir);
+    let cargo_config_exists = async_fs::metadata(&config_path).await.is_ok();
+    let stale_configs = stale_project_configs(&current_dir, &cargo_home);
+    let build_dir = match user_build_dir(&cargo_home, &env)? {
+        Some(user) => BuildDirPlacement::User(user),
+        None if args.no_build_dir => BuildDirPlacement::Disabled,
+        None => BuildDirPlacement::Stow(stow_build_dir_template(&config::cache_dir(&env)?)?),
+    };
+    let stow_config = StowConfig::load(state_db.clone())?;
+    let interactive = SetupPromptContext {
+        yes: args.yes,
+        ci_env: std::env::var_os("CI").is_some(),
+        terminal: TerminalMode::from_stdio(
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        ),
+    }
+    .should_prompt();
+    let scoped = host_target.replace(['-', '.'], "_");
+    let real_cc = configured_c_compiler(&host_target)
+        .or_else(|| read_recorded_env(&config_path, "STOW_REAL_CC"));
+    let real_cxx = configured_cxx_compiler(&host_target)
+        .or_else(|| read_recorded_env(&config_path, "STOW_REAL_CXX"));
+    let plan = SetupPlan {
+        cargo_config_path: config_path,
+        cargo_config_exists,
+        shims_dir: resolved_wrappers.shims_dir.clone(),
+        host_target,
+        rustc_version,
+        rustc_wrapper: shim_path(&planned_shims.rustc_wrapper, "rustc wrapper")?,
+        cc_key: format!("CC_{scoped}"),
+        cc_compiler: shim_path(&planned_shims.cc_compiler, "cc compiler")?,
+        cxx_key: format!("CXX_{scoped}"),
+        cxx_compiler: shim_path(&planned_shims.cxx_compiler, "cxx compiler")?,
+        cc_launcher: shim_path(&planned_shims.cc_launcher, "cc launcher")?,
+        real_cc,
+        real_cxx,
+        build_dir,
+        mold: mold_plan,
+        stale_project_configs: stale_configs,
+        daemon_service: planned_daemon_service()?,
+        skill_targets: planned_skill_targets(args, interactive)?,
+        fetch_index_slice: stow_config.cache.reaches_network(),
+    };
+    Ok(PreparedSetup {
+        current_dir,
+        cargo_home,
+        resolved_wrappers,
+        stow_config,
+        interactive,
+        plan,
+    })
+}
 
 /// `stow setup`: write the stow wiring into the user's global cargo
 /// configuration — `$CARGO_HOME/config.toml` — so every cargo invocation
@@ -37,61 +447,53 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
     if args.github_env {
         return print_setup_env(state_db).await;
     }
-    let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
-    let cargo_home = config::require_cargo_home()?;
-    // The host triple and the version probe are independent answers
-    // from the same toolchain — await them together (stow#1032).
-    let env = SessionEnv::of_this_process()?;
-    let (host_target, rustc_version) = tokio::join!(
-        detect_rustc_host_target(std::ffi::OsStr::new("rustc"), &env),
-        detect_rustc_version(std::ffi::OsStr::new("rustc"), &env),
-    );
-    let host_target = host_target
-        .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
-    let rustc_version =
-        rustc_version.map_err(|error| stow_types::stow_error!("detect rustc version: {error}"))?;
-    // A global setup answers only from the global configuration — the
-    // directory it runs in must not change the result.
-    let mold_bin_dir = mold::prepare_global().await?;
-    let wrappers = detect_wrapper_commands()?;
-    let cleaned = clean_stale_project_configs(&current_dir, &cargo_home)?;
-    // Where a workspace's intermediates go: under stow's cache root, so a
-    // store or a serve is a same-volume clone — unless the user already
-    // placed the build directory (stow#1538).
-    let build_dir = match user_build_dir(&cargo_home, &env)? {
-        Some(user) => BuildDirPlacement::User(user),
-        None if args.no_build_dir => BuildDirPlacement::Disabled,
-        None => BuildDirPlacement::Stow(stow_build_dir_template(&config::cache_dir(&env)?)?),
-    };
-    let (config_path, selects_mold) = write_cargo_config(
-        &cargo_home,
-        &wrappers,
-        &host_target,
-        configured_c_compiler(&host_target).as_deref(),
-        configured_cxx_compiler(&host_target).as_deref(),
-        mold_bin_dir.as_deref(),
-        build_dir.stow_template(),
-    )
-    .await?;
-    // The config the link-cache record below and the index-slice fetch
-    // at the end both read — loaded once, so setup fails on the same
-    // error either would have hit (stow#1032).
-    let stow_config = StowConfig::load(state_db.clone())?;
-    // The link resolution a first build would run, recorded now under
-    // the per-machine key — a project with no config of its own builds
-    // warm (stow#608). The record must come after the write: the key
-    // digests the global file's content. Linux only;
-    // `warm_global_link_cache` is a no-op elsewhere.
-    if cfg!(target_os = "linux") {
-        mold::warm_global_link_cache(&cargo_home, &stow_config).await?;
+    let prepared = prepare_setup(&args, state_db).await?;
+    let palette = Palette::for_stdout();
+    write_stdout(&render_setup_plan(&prepared.plan, palette))?;
+
+    if prepared.interactive {
+        let confirmed = smol::unblock(move || {
+            let stdin = std::io::stdin();
+            let mut reader = stdin.lock();
+            let mut stdout = std::io::stdout();
+            confirm_setup_with(&mut reader, &mut stdout, palette)
+        })
+        .await?;
+        if !confirmed {
+            write_stdout(&format!(
+                "{}\n",
+                palette.warn("setup cancelled — no files were modified")
+            ))?;
+            return Ok(());
+        }
     }
 
-    // The stable sandbox identity's persistent toolchain grants
-    // (stow#815): written once here instead of per build — on Windows
-    // that is the AppContainer profile's ACL work, which blocks, so it
-    // runs off the executor. A build that never saw setup reconciles
-    // whatever is missing on its own. A failure is the command's error,
-    // not a warning.
+    let outcome = apply_setup(&args, &prepared).await?;
+    write_stdout(&render_setup_complete(&outcome, palette))?;
+    Ok(())
+}
+
+async fn apply_setup(
+    args: &SetupArgs,
+    prepared: &PreparedSetup,
+) -> stow_types::error::Result<SetupOutcome> {
+    let mold_bin_dir = mold::apply_global_plan(&prepared.plan.mold).await?;
+    let wrappers = materialize_wrappers(&prepared.resolved_wrappers)?;
+    let cleaned = clean_stale_project_configs(&prepared.current_dir, &prepared.cargo_home)?;
+    let (config_path, selects_mold) = write_cargo_config(
+        &prepared.cargo_home,
+        &wrappers,
+        &prepared.plan.host_target,
+        configured_c_compiler(&prepared.plan.host_target).as_deref(),
+        configured_cxx_compiler(&prepared.plan.host_target).as_deref(),
+        mold_bin_dir.as_deref(),
+        prepared.plan.build_dir.stow_template(),
+    )
+    .await?;
+    if cfg!(target_os = "linux") {
+        mold::warm_global_link_cache(&prepared.cargo_home, &prepared.stow_config).await?;
+    }
+
     let identity = crate::sandbox::stow_identity()?;
     let identity_name = identity.name().to_owned();
     smol::unblock(move || identity.prepare())
@@ -100,22 +502,20 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
             stow_types::stow_error!("prepare the {identity_name} sandbox identity: {error}")
         })?;
 
-    // The index slice every wrapper lookup on this toolchain reads:
-    // the wrapper's `cached_slice` is read-only by design
-    // (docs/wrapper-hot-path.md), so without the fetch a fresh install's
-    // first plain `cargo build` serves nothing (stow#1032). Setup ends
-    // by leaving it verified in the local cache through the same
-    // `ensure_slice` `stow build` uses — a failed fetch is the
-    // command's error, never a fallback. The local-only and off cache modes
-    // reach no registry, so setup fetches nothing under them.
-    if stow_config.cache.reaches_network() {
-        index::ensure_slice(&stow_config, &host_target, &rustc_version)
-            .await
-            .map_err(|error| {
-                stow_types::stow_error!(
-                    "fetch the {host_target} index slice for rustc {rustc_version}: {error}"
-                )
-            })?;
+    if prepared.stow_config.cache.reaches_network() {
+        index::ensure_slice(
+            &prepared.stow_config,
+            &prepared.plan.host_target,
+            &prepared.plan.rustc_version,
+        )
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!(
+                "fetch the {} index slice for rustc {}: {error}",
+                prepared.plan.host_target,
+                prepared.plan.rustc_version
+            )
+        })?;
     }
 
     tracing::info!(
@@ -127,46 +527,79 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
         mold_bin_dir = ?mold_bin_dir,
         "configured cargo for stow"
     );
-    let linker_line = match (&mold_bin_dir, selects_mold) {
-        (Some(dir), _) => format!("\nlinker: mold ({})", dir.join("mold").display()),
-        (None, true) if cfg!(target_os = "linux") => {
-            "\nlinker: mold (already configured)".to_owned()
-        }
-        _ => String::new(),
+
+    #[cfg(target_os = "macos")]
+    let installed_service = {
+        let installed = install_launch_agent(&wrappers.runtime_executable).await?;
+        Some(DaemonServicePlan::LaunchAgent {
+            plist: installed.plist,
+            label: crate::daemon::launch_agent::LABEL.to_owned(),
+        })
     };
-    write_stdout(&format!(
-        "configured {}\nrustc-wrapper: {}\ncc: {}\ncxx: {}\ncc-launcher: {}{}\n{}\n",
-        config_path.display(),
-        wrappers.rustc,
-        wrappers.cc_compiler,
-        wrappers.cxx_compiler,
-        wrappers.cc_launcher,
-        linker_line,
-        build_dir.report(),
-    ))?;
-    for path in cleaned {
-        write_stdout(&format!(
-            "cleaned stale stow wiring from {}\n",
-            path.display()
-        ))?;
-    }
-    // The login trigger of the per-user daemon; `setup` is the only thing
-    // that installs it (stow#1435).
+    #[cfg(windows)]
+    let installed_service = {
+        let task = register_daemon_task(&wrappers.runtime_executable).await?;
+        Some(DaemonServicePlan::ScheduledTask { name: task })
+    };
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let installed_service = None;
+
+    let installed_skills = maybe_setup_stow_skill(args, prepared.interactive).await?;
+    Ok(SetupOutcome {
+        config_path,
+        build_dir: prepared.plan.build_dir.clone(),
+        mold_bin_dir,
+        selects_mold,
+        cleaned_stale_configs: cleaned,
+        daemon_service: installed_service,
+        installed_skills,
+    })
+}
+
+/// Compute the daemon login service target for this platform without writing.
+#[cfg_attr(
+    not(any(target_os = "macos", windows)),
+    allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)
+)]
+fn planned_daemon_service() -> stow_types::error::Result<Option<DaemonServicePlan>> {
     #[cfg(target_os = "macos")]
     {
-        let installed = install_launch_agent(&wrappers.runtime_executable).await?;
-        write_stdout(&format!("launch agent: {}\n", installed.plist.display()))?;
+        let plist = dirs::home_dir()
+            .ok_or_else(|| stow_types::stow_error!("resolve home directory"))?
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{}.plist", crate::daemon::launch_agent::LABEL));
+        Ok(Some(DaemonServicePlan::LaunchAgent {
+            plist,
+            label: crate::daemon::launch_agent::LABEL.to_owned(),
+        }))
     }
-    // The Windows counterpart: the task that is both the login trigger and
-    // the only way a build starts the daemon (stow#1454).
     #[cfg(windows)]
     {
-        let task = register_daemon_task(&wrappers.runtime_executable).await?;
-        write_stdout(&format!("scheduled task: {task}\n"))?;
+        let run_dir = crate::daemon::RunDir::locate()?;
+        Ok(Some(DaemonServicePlan::ScheduledTask {
+            name: crate::daemon::scheduled_task::task_name(&run_dir),
+        }))
     }
-    maybe_setup_stow_skill(&args).await?;
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        Ok(None)
+    }
+}
 
-    Ok(())
+/// Read an existing non-stow `[env]` entry from `config_path` without modifying it.
+fn read_recorded_env(config_path: &Path, key: &str) -> Option<String> {
+    let document = std::fs::read_to_string(config_path)
+        .ok()?
+        .parse::<DocumentMut>()
+        .ok()?;
+    document
+        .get("env")
+        .and_then(Item::as_table)
+        .and_then(|env| env.get(key))
+        .and_then(env_item_value)
+        .map(str::to_owned)
+        .filter(|value| !is_stow_owned_value(value))
 }
 
 /// Register the Task Scheduler task that starts the daemon for the run
@@ -415,89 +848,346 @@ fn setup_env_output(
         })
 }
 
-/// `stow status`: print the wrapper configuration `stow setup` wrote into
-/// the global cargo config, any stale per-project wiring an older stow
-/// left in the ancestor `.cargo/config.toml` files, plus rolling
-/// cache-hit stats.
+/// Cargo wiring section of [`StatusReport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CargoWiringStatus {
+    /// `$CARGO_HOME/config.toml` does not exist yet.
+    NotConfigured { config_path: PathBuf },
+    /// `$CARGO_HOME/config.toml` was parsed.
+    Configured {
+        config_path: PathBuf,
+        rustc_wrapper: Option<String>,
+        cc_compiler: Option<String>,
+        cxx_compiler: Option<String>,
+        cc_launcher: Option<String>,
+        build_dir: String,
+        linker_mold: bool,
+    },
+}
+
+/// Remote cache and daemon state section of [`StatusReport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteDaemonStatus {
+    edge_url: Option<String>,
+    remote_cache: Option<bool>,
+    daemon: DaemonProbe,
+}
+
+/// Structured data rendered by `stow status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusReport {
+    cargo: CargoWiringStatus,
+    remote: RemoteDaemonStatus,
+    summary: stats::StatsSummary,
+    local: stats::LocalStats,
+    stale_project_configs: Vec<PathBuf>,
+}
+
+/// Format a `hits / (hits + misses)` percentage, or `None` with zero lookups.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "lookup counters are far below 2^53"
+)]
+fn format_hit_rate(hits: u64, misses: u64) -> Option<String> {
+    let total = hits.saturating_add(misses);
+    if total == 0 {
+        return None;
+    }
+    Some(format!("{:.1}%", (hits as f64 / total as f64) * 100.0))
+}
+
+fn format_cache_line(hits: u64, misses: u64, errors: u64, palette: Palette) -> String {
+    let hits_text = if hits > 0 {
+        palette.ok(format!("{} hits", grouped_count(hits)))
+    } else {
+        palette.dim(format!("{} hits", grouped_count(hits)))
+    };
+    let misses_text = if misses > 0 {
+        palette.warn(format!("{} misses", grouped_count(misses)))
+    } else {
+        palette.dim(format!("{} misses", grouped_count(misses)))
+    };
+    let rate_text = format_hit_rate(hits, misses).map_or_else(
+        || palette.dim("(—)".to_owned()),
+        |rate| palette.bold(format!("({rate} hit rate)")),
+    );
+    let errors_text = if errors > 0 {
+        palette.err(format!("{} errors", grouped_count(errors)))
+    } else {
+        palette.dim(format!("{} errors", grouped_count(errors)))
+    };
+    format!("{hits_text}, {misses_text} {rate_text}, {errors_text}")
+}
+
+fn render_optional_wiring(value: Option<&str>, palette: Palette) -> String {
+    value.map_or_else(|| palette.warn("<missing>").to_string(), ToOwned::to_owned)
+}
+
+/// Render [`StatusReport`] as a grouped, human-friendly summary.
+fn render_status_report(report: &StatusReport, palette: Palette) -> String {
+    let mut out = String::new();
+    render_cargo_wiring_section(&mut out, &report.cargo, palette);
+    let _ = writeln!(out);
+    render_remote_daemon_section(&mut out, &report.remote, palette);
+    let _ = writeln!(out);
+    render_cache_perf_section(&mut out, report.summary, report.local, palette);
+    if !report.stale_project_configs.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{}", palette.warn("Warnings"));
+        for path in &report.stale_project_configs {
+            let _ = writeln!(
+                out,
+                "  {} {} — left by an older stow; `stow setup` removes it",
+                palette.warn("stale stow wiring:"),
+                path.display()
+            );
+        }
+    }
+    out
+}
+
+fn render_cargo_wiring_section(out: &mut String, cargo: &CargoWiringStatus, palette: Palette) {
+    let _ = writeln!(out, "{}", palette.heading("Cargo wiring"));
+    match cargo {
+        CargoWiringStatus::NotConfigured { config_path } => {
+            let _ = writeln!(
+                out,
+                "  {} {} is missing — run `stow setup`",
+                palette.warn("not configured:"),
+                config_path.display()
+            );
+        }
+        CargoWiringStatus::Configured {
+            config_path,
+            rustc_wrapper,
+            cc_compiler,
+            cxx_compiler,
+            cc_launcher,
+            build_dir,
+            linker_mold,
+        } => {
+            push_kv(out, palette, "config", config_path.display());
+            push_kv(
+                out,
+                palette,
+                "rustc-wrapper",
+                render_optional_wiring(rustc_wrapper.as_deref(), palette),
+            );
+            push_kv(
+                out,
+                palette,
+                "cc",
+                render_optional_wiring(cc_compiler.as_deref(), palette),
+            );
+            push_kv(
+                out,
+                palette,
+                "cxx",
+                render_optional_wiring(cxx_compiler.as_deref(), palette),
+            );
+            push_kv(
+                out,
+                palette,
+                "cc-launcher",
+                render_optional_wiring(cc_launcher.as_deref(), palette),
+            );
+            push_kv(out, palette, "build-dir", build_dir);
+            if *linker_mold {
+                push_kv(out, palette, "linker", "mold");
+            }
+        }
+    }
+}
+
+fn render_remote_daemon_section(out: &mut String, remote: &RemoteDaemonStatus, palette: Palette) {
+    let _ = writeln!(out, "{}", palette.heading("Remote & daemon"));
+    push_kv(
+        out,
+        palette,
+        "edge-url",
+        render_optional_wiring(remote.edge_url.as_deref(), palette),
+    );
+    let remote_state = match remote.remote_cache {
+        Some(true) => palette.ok("on").to_string(),
+        Some(false) => palette.warn("off (local-only)").to_string(),
+        None => palette.warn("<unavailable>").to_string(),
+    };
+    push_kv(out, palette, "remote-cache", remote_state);
+    let daemon_state = match &remote.daemon {
+        DaemonProbe::Running(status) => palette
+            .ok(format!(
+                "running (stow {}, protocol {})",
+                status.stow_version, status.protocol
+            ))
+            .to_string(),
+        DaemonProbe::Retiring { stow_version } => palette
+            .warn(format!("retiring (stow {stow_version})"))
+            .to_string(),
+        DaemonProbe::NotRunning => palette.dim("not running").to_string(),
+        DaemonProbe::Unavailable(reason) => {
+            palette.err(format!("unavailable ({reason})")).to_string()
+        }
+    };
+    push_kv(out, palette, "daemon", daemon_state);
+}
+
+fn render_cache_perf_section(
+    out: &mut String,
+    summary: stats::StatsSummary,
+    local: stats::LocalStats,
+    palette: Palette,
+) {
+    let _ = writeln!(out, "{}", palette.heading("Cache performance"));
+    push_kv(
+        out,
+        palette,
+        "rust-cache",
+        format_cache_line(
+            summary.rust_hits,
+            summary.rust_misses,
+            summary.rust_errors,
+            palette,
+        ),
+    );
+    push_kv(
+        out,
+        palette,
+        "cc-cache",
+        format_cache_line(
+            summary.cc_hits,
+            summary.cc_misses,
+            summary.cc_errors,
+            palette,
+        ),
+    );
+    push_kv(
+        out,
+        palette,
+        "cpu-saved",
+        format_cpu_millis(local.cpu_millis_saved),
+    );
+    push_kv(
+        out,
+        palette,
+        "bytes-served",
+        format_bytes(local.bytes_served),
+    );
+    push_kv(
+        out,
+        palette,
+        "bytes-downloaded",
+        format_bytes(local.bytes_downloaded),
+    );
+}
+
+/// `stow status`: print Cargo wrapper wiring, remote and daemon state,
+/// cache performance counters, and any stale per-project wiring.
 pub async fn status_project(state_db: &StateDb) -> stow_types::error::Result<()> {
     let cargo_home = config::require_cargo_home()?;
     let config_path = cargo_home.join("config.toml");
 
-    if async_fs::metadata(&config_path).await.is_err() {
-        write_stdout(&format!(
-            "not configured: {} is missing — run `stow setup`\n",
-            config_path.display()
-        ))?;
-        return Ok(());
-    }
+    let cargo = if async_fs::metadata(&config_path).await.is_ok() {
+        let document = async_fs::read_to_string(&config_path)
+            .await
+            .wrap_err_with(|| format!("read {}", config_path.display()))?
+            .parse::<DocumentMut>()
+            .wrap_err_with(|| format!("parse {}", config_path.display()))?;
 
-    let document = async_fs::read_to_string(&config_path)
-        .await
-        .wrap_err_with(|| format!("read {}", config_path.display()))?
-        .parse::<DocumentMut>()
-        .wrap_err_with(|| format!("parse {}", config_path.display()))?;
-
-    let rustc_wrapper = document
-        .get("build")
-        .and_then(Item::as_table)
-        .and_then(|table| table.get("rustc-wrapper"))
-        .and_then(Item::as_str)
-        .unwrap_or("<missing>");
-
-    // The shims are wired under the `cc` crate's target-scoped keys for the
-    // host triple; an unrecognized answer still reports whatever scoped
-    // keys are present rather than pretending nothing is wired.
-    let scoped = |base: &str| -> Option<String> {
-        document
-            .get("env")
+        let rustc_wrapper = document
+            .get("build")
             .and_then(Item::as_table)
-            .map(|env| {
-                env.iter()
-                    .filter(|(key, _)| key.starts_with(&format!("{base}_")) || *key == base)
-                    .filter_map(|(_, item)| env_item_value(item).map(str::to_owned))
-                    .collect::<Vec<_>>()
-            })
-            .filter(|values| !values.is_empty())
-            .map(|values| values.join(", "))
-    };
-    let cc_compiler = scoped("CC").unwrap_or_else(|| "<missing>".to_owned());
-    let cxx_compiler = scoped("CXX").unwrap_or_else(|| "<missing>".to_owned());
-    let cc_launcher = env_value(&document, "CMAKE_C_COMPILER_LAUNCHER").unwrap_or("<missing>");
-    let (edge_url, stats_summary) = match StowConfig::load(state_db.clone()) {
-        Ok(config) => {
-            let edge_url = config.edge_url.clone();
-            (
-                edge_url,
-                stats::read_summary(&config).await.unwrap_or_default(),
-            )
+            .and_then(|table| table.get("rustc-wrapper"))
+            .and_then(Item::as_str)
+            .map(str::to_owned);
+
+        // The shims are wired under the `cc` crate's target-scoped keys for the
+        // host triple; an unrecognized answer still reports whatever scoped
+        // keys are present rather than pretending nothing is wired.
+        let scoped = |base: &str| -> Option<String> {
+            document
+                .get("env")
+                .and_then(Item::as_table)
+                .map(|env| {
+                    env.iter()
+                        .filter(|(key, _)| key.starts_with(&format!("{base}_")) || *key == base)
+                        .filter_map(|(_, item)| env_item_value(item).map(str::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|values| !values.is_empty())
+                .map(|values| values.join(", "))
+        };
+        let cc_compiler = scoped("CC");
+        let cxx_compiler = scoped("CXX");
+        let cc_launcher = env_value(&document, "CMAKE_C_COMPILER_LAUNCHER").map(str::to_owned);
+        let build_dir = std::env::var_os("CARGO_BUILD_BUILD_DIR").map_or_else(
+            || {
+                document
+                    .get("build")
+                    .and_then(Item::as_table_like)
+                    .and_then(|table| table.get("build-dir"))
+                    .and_then(Item::as_str)
+                    .map_or_else(|| "target/ (default)".to_owned(), str::to_owned)
+            },
+            |env_val| format!("{} (CARGO_BUILD_BUILD_DIR)", env_val.to_string_lossy()),
+        );
+        let linker_mold = cfg!(target_os = "linux") && document_selects_mold(&document);
+        CargoWiringStatus::Configured {
+            config_path: config_path.clone(),
+            rustc_wrapper,
+            cc_compiler,
+            cxx_compiler,
+            cc_launcher,
+            build_dir,
+            linker_mold,
         }
-        Err(_) => ("<missing>".to_owned(), stats::StatsSummary::default()),
+    } else {
+        CargoWiringStatus::NotConfigured {
+            config_path: config_path.clone(),
+        }
     };
 
-    write_stdout(&format!(
-        "config: {}\nrustc-wrapper: {}\ncc: {}\ncxx: {}\ncc-launcher: {}\nedge-url: {}\nrust-cache: hits={} misses={} errors={}\ncc-cache: hits={} misses={} errors={}\n",
-        config_path.display(),
-        rustc_wrapper,
-        cc_compiler,
-        cxx_compiler,
-        cc_launcher,
-        edge_url,
-        stats_summary.rust_hits,
-        stats_summary.rust_misses,
-        stats_summary.rust_errors,
-        stats_summary.cc_hits,
-        stats_summary.cc_misses,
-        stats_summary.cc_errors,
-    ))?;
+    let daemon_fut = tokio::task::spawn_blocking(|| {
+        std::env::current_exe().map_or_else(
+            |error| DaemonProbe::Unavailable(error.to_string()),
+            |exe| crate::daemon::probe_if_running(&exe),
+        )
+    });
 
-    if let Ok(current_dir) = std::env::current_dir() {
-        for path in stale_project_configs(&current_dir, &cargo_home) {
-            write_stdout(&format!(
-                "stale stow wiring: {} — left by an older stow; `stow setup` removes it\n",
-                path.display()
-            ))?;
-        }
-    }
+    let loaded_config = StowConfig::load(state_db.clone()).ok();
+    let stats_fut = async {
+        let Some(cfg) = loaded_config.as_ref() else {
+            return (stats::StatsSummary::default(), stats::LocalStats::default());
+        };
+        let summary_fut = async {
+            if crate::state_db::state_db_path(&cfg.cache_dir).exists() {
+                stats::read_summary(cfg).await.unwrap_or_default()
+            } else {
+                stats::StatsSummary::default()
+            }
+        };
+        let local_fut = async { stats::read_local_stats(cfg).await.unwrap_or_default() };
+        tokio::join!(summary_fut, local_fut)
+    };
+
+    let (daemon_res, (summary, local)) = tokio::join!(daemon_fut, stats_fut);
+    let daemon = daemon_res.unwrap_or_else(|error| DaemonProbe::Unavailable(error.to_string()));
+    let remote = RemoteDaemonStatus {
+        edge_url: loaded_config.as_ref().map(|cfg| cfg.edge_url.clone()),
+        remote_cache: loaded_config.as_ref().map(|cfg| cfg.cache.remote),
+        daemon,
+    };
+
+    let stale_project_configs = std::env::current_dir()
+        .map_or_default(|current_dir| stale_project_configs(&current_dir, &cargo_home));
+
+    let report = StatusReport {
+        cargo,
+        remote,
+        summary,
+        local,
+        stale_project_configs,
+    };
+    write_stdout(&render_status_report(&report, Palette::for_stdout()))?;
 
     Ok(())
 }
@@ -1081,7 +1771,16 @@ pub struct WrapperCommands {
     pub(crate) runtime_executable: PathBuf,
 }
 
-pub fn detect_wrapper_commands() -> stow_types::error::Result<WrapperCommands> {
+/// Resolved runtime/capture executables and shim directory prior to writing.
+struct ResolvedWrapperPlan {
+    shims_dir: PathBuf,
+    runtime_executable: PathBuf,
+    capture_executable: PathBuf,
+}
+
+fn resolve_wrapper_executables(
+    cargo_home: &Path,
+) -> stow_types::error::Result<ResolvedWrapperPlan> {
     let current_exe = std::env::current_exe().wrap_err("resolve current executable")?;
     let runtime_executable =
         std::env::var_os("STOW_WRAPPER_PATH").map_or_else(|| current_exe.clone(), PathBuf::from);
@@ -1122,19 +1821,32 @@ pub fn detect_wrapper_commands() -> stow_types::error::Result<WrapperCommands> {
     // install never re-points this binary's shims (stow#645). The old
     // per-user shim files under `stow/tools` are deliberately left alone:
     // another cargo home's `config.toml` may still name them.
-    let shims_dir = config::shims_dir(&config::require_cargo_home()?, &runtime_executable);
+    let shims_dir = config::shims_dir(cargo_home, &runtime_executable);
+    Ok(ResolvedWrapperPlan {
+        shims_dir,
+        runtime_executable,
+        capture_executable,
+    })
+}
+
+fn materialize_wrappers(plan: &ResolvedWrapperPlan) -> stow_types::error::Result<WrapperCommands> {
     let shims = wrapper_shim::materialize_wrapper_shims(
-        &shims_dir,
-        &runtime_executable,
-        &capture_executable,
+        &plan.shims_dir,
+        &plan.runtime_executable,
+        &plan.capture_executable,
     )?;
     Ok(WrapperCommands {
         rustc: shim_path(&shims.rustc_wrapper, "rustc wrapper")?,
         cc_launcher: shim_path(&shims.cc_launcher, "cc launcher")?,
         cc_compiler: shim_path(&shims.cc_compiler, "cc compiler")?,
         cxx_compiler: shim_path(&shims.cxx_compiler, "cxx compiler")?,
-        runtime_executable,
+        runtime_executable: plan.runtime_executable.clone(),
     })
+}
+
+pub fn detect_wrapper_commands() -> stow_types::error::Result<WrapperCommands> {
+    let plan = resolve_wrapper_executables(&config::require_cargo_home()?)?;
+    materialize_wrappers(&plan)
 }
 
 fn shim_path(path: &std::path::Path, what: &str) -> stow_types::error::Result<String> {
@@ -1169,14 +1881,17 @@ fn configured_compiler(
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Option<String> {
     let scoped = target.replace(['-', '.'], "_");
-    let lookup = |key: &str| env(key).and_then(|value| value.into_string().ok());
+    let lookup = |key: &str| {
+        env(key)
+            .and_then(|value| value.into_string().ok())
+            .filter(|value| !value.trim().is_empty() && !is_stow_owned_value(value))
+    };
     lookup(real_env)
         .or_else(|| lookup(&format!("{base_env}_{target}")))
         .or_else(|| lookup(&format!("{base_env}_{scoped}")))
         .or_else(|| lookup(&format!("TARGET_{base_env}")))
         .or_else(|| lookup(&format!("HOST_{base_env}")))
         .or_else(|| lookup(base_env))
-        .filter(|value| !value.trim().is_empty())
 }
 
 /// The C compiler the caller configured for `target`, or `None` when none
@@ -1330,12 +2045,36 @@ fn document_build_dir_is_stow(document: &DocumentMut) -> bool {
 const BUNDLED_STOW_SKILL: &str = include_str!("../skills/stow/SKILL.md");
 const DETECTED_AGENT_DIR_NAMES: [&str; 2] = [".agents", ".claude"];
 
-async fn maybe_setup_stow_skill(args: &SetupArgs) -> stow_types::error::Result<()> {
+/// Deduplicate skill file paths across detected agent homes without creating
+/// directories, respecting symlinks that already point at the same target.
+fn deduplicated_skill_paths(agent_homes: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut paths = Vec::new();
+    for agent_home in agent_homes {
+        let skill_dir = agent_home.join("skills").join("stow");
+        let key = std::fs::canonicalize(&skill_dir).unwrap_or_else(|_| {
+            std::fs::canonicalize(agent_home)
+                .unwrap_or_else(|_| agent_home.clone())
+                .join("skills")
+                .join("stow")
+        });
+        if seen.insert(key) {
+            paths.push(skill_dir.join("SKILL.md"));
+        }
+    }
+    paths
+}
+
+/// Compute the coding-agent skill targets `stow setup` plans to install or offer.
+fn planned_skill_targets(
+    args: &SetupArgs,
+    interactive: bool,
+) -> stow_types::error::Result<Vec<SkillTargetPlan>> {
     use crate::cli_args::SkillInstallPolicy;
 
     let policy = args.skill.policy();
     if policy == SkillInstallPolicy::Skip {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let Some(home) = dirs::home_dir() else {
         if policy == SkillInstallPolicy::Install {
@@ -1343,7 +2082,7 @@ async fn maybe_setup_stow_skill(args: &SetupArgs) -> stow_types::error::Result<(
                 "resolve home directory for --install-skill"
             ));
         }
-        return Ok(());
+        return Ok(Vec::new());
     };
     let detected = detected_agent_homes(&home);
     if policy == SkillInstallPolicy::Install {
@@ -1352,19 +2091,62 @@ async fn maybe_setup_stow_skill(args: &SetupArgs) -> stow_types::error::Result<(
         } else {
             detected
         };
-        let written = install_bundled_stow_skill(&targets)?;
-        for path in written {
-            write_stdout(&format!("stow skill: {}\n", path.display()))?;
-        }
-        return Ok(());
+        return Ok(deduplicated_skill_paths(&targets)
+            .into_iter()
+            .map(|path| SkillTargetPlan {
+                path,
+                mode: SkillPlanMode::Install,
+            })
+            .collect());
     }
-    if detected.is_empty() || !agent_homes_need_skill_update(&detected, BUNDLED_STOW_SKILL) {
-        return Ok(());
-    }
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin())
-        || !std::io::IsTerminal::is_terminal(&std::io::stderr())
+    if !interactive
+        || detected.is_empty()
+        || !agent_homes_need_skill_update(&detected, BUNDLED_STOW_SKILL)
     {
-        return Ok(());
+        return Ok(Vec::new());
+    }
+    Ok(deduplicated_skill_paths(&detected)
+        .into_iter()
+        .map(|path| SkillTargetPlan {
+            path,
+            mode: SkillPlanMode::Prompt,
+        })
+        .collect())
+}
+
+async fn maybe_setup_stow_skill(
+    args: &SetupArgs,
+    interactive: bool,
+) -> stow_types::error::Result<Vec<PathBuf>> {
+    use crate::cli_args::SkillInstallPolicy;
+
+    let policy = args.skill.policy();
+    if policy == SkillInstallPolicy::Skip {
+        return Ok(Vec::new());
+    }
+    let Some(home) = dirs::home_dir() else {
+        if policy == SkillInstallPolicy::Install {
+            return Err(stow_types::stow_error!(
+                "resolve home directory for --install-skill"
+            ));
+        }
+        return Ok(Vec::new());
+    };
+    let detected = detected_agent_homes(&home);
+    if policy == SkillInstallPolicy::Install {
+        let targets = if detected.is_empty() {
+            vec![home.join(".agents")]
+        } else {
+            detected
+        };
+        return install_bundled_stow_skill(&targets);
+    }
+    if !interactive
+        || detected.is_empty()
+        || !agent_homes_need_skill_update(&detected, BUNDLED_STOW_SKILL)
+        || !std::io::stderr().is_terminal()
+    {
+        return Ok(Vec::new());
     }
     let labels = detected
         .iter()
@@ -1376,12 +2158,10 @@ async fn maybe_setup_stow_skill(args: &SetupArgs) -> stow_types::error::Result<(
         .join(", ");
     let approved = smol::unblock(move || prompt_skill_install(&labels)).await?;
     if approved {
-        let written = install_bundled_stow_skill(&detected)?;
-        for path in written {
-            write_stdout(&format!("stow skill: {}\n", path.display()))?;
-        }
+        install_bundled_stow_skill(&detected)
+    } else {
+        Ok(Vec::new())
     }
-    Ok(())
 }
 
 fn detected_agent_homes(home: &Path) -> Vec<PathBuf> {
@@ -1440,6 +2220,7 @@ fn install_bundled_stow_skill(agent_homes: &[PathBuf]) -> stow_types::error::Res
 }
 
 /// Where setup left this machine's build directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum BuildDirPlacement {
     /// Stow's own template, written by this setup.
     Stow(String),
@@ -1461,11 +2242,11 @@ impl BuildDirPlacement {
         }
     }
 
-    fn report(&self) -> String {
+    fn value_text(&self) -> String {
         match self {
-            Self::Stow(template) => format!("build-dir: {template}"),
-            Self::User(user) => format!("build-dir: {user} (already configured, left alone)"),
-            Self::Disabled => "build-dir: target/ (--no-build-dir)".to_owned(),
+            Self::Stow(template) => template.clone(),
+            Self::User(user) => format!("{user} (already configured, left alone)"),
+            Self::Disabled => "target/ (--no-build-dir)".to_owned(),
         }
     }
 }
@@ -1833,6 +2614,34 @@ mod tests {
             super::configured_compiler("STOW_REAL_CC", "CC", "riscv64gc-unknown-linux-gnu", |_| {
                 None
             },),
+            None
+        );
+    }
+
+    /// Stow's own shims exported by an already-wired Cargo config must never
+    /// be recorded as `STOW_REAL_CC` (which would cause `stow-cc` to exec
+    /// itself recursively).
+    #[test]
+    fn configured_compiler_skips_stow_owned_shim_values() {
+        let env = |key: &str| match key {
+            "CC_aarch64_apple_darwin" => Some(std::ffi::OsString::from(
+                "/Users/example/.cargo/stow/shims/abc123/stow-cc",
+            )),
+            "CC" => Some(std::ffi::OsString::from("/usr/bin/clang")),
+            _ => None,
+        };
+        let resolved =
+            super::configured_compiler("STOW_REAL_CC", "CC", "aarch64-apple-darwin", env);
+        assert_eq!(resolved.as_deref(), Some("/usr/bin/clang"));
+
+        let shim_only = |key: &str| match key {
+            "CC_aarch64_apple_darwin" => Some(std::ffi::OsString::from(
+                "/Users/example/.cargo/stow/shims/abc123/stow-cc",
+            )),
+            _ => None,
+        };
+        assert_eq!(
+            super::configured_compiler("STOW_REAL_CC", "CC", "aarch64-apple-darwin", shim_only),
             None
         );
     }
@@ -2446,5 +3255,269 @@ mod tests {
                 .to_string()
                 .contains("build-dir = \"/custom/build\"")
         );
+    }
+
+    fn sample_setup_plan() -> super::SetupPlan {
+        super::SetupPlan {
+            cargo_config_path: PathBuf::from("/Users/u/.cargo/config.toml"),
+            cargo_config_exists: true,
+            shims_dir: PathBuf::from("/Users/u/.cargo/stow/shims/0123456789abcdef"),
+            host_target: "x86_64-unknown-linux-gnu".to_owned(),
+            rustc_version: "1.91.1".to_owned(),
+            rustc_wrapper: "/Users/u/.cargo/stow/shims/0123456789abcdef/stow-rustc-wrapper"
+                .to_owned(),
+            cc_key: "CC_x86_64_unknown_linux_gnu".to_owned(),
+            cc_compiler: "/Users/u/.cargo/stow/shims/0123456789abcdef/stow-cc".to_owned(),
+            cxx_key: "CXX_x86_64_unknown_linux_gnu".to_owned(),
+            cxx_compiler: "/Users/u/.cargo/stow/shims/0123456789abcdef/stow-cxx".to_owned(),
+            cc_launcher: "/Users/u/.cargo/stow/shims/0123456789abcdef/stow-cc-launcher".to_owned(),
+            real_cc: Some("clang".to_owned()),
+            real_cxx: None,
+            build_dir: super::BuildDirPlacement::Stow(
+                "/Users/u/.stow/build-dir/{workspace-path-hash}".to_owned(),
+            ),
+            mold: crate::mold::GlobalMoldPlan::Managed {
+                bin_dir: PathBuf::from("/Users/u/.local/share/stow/tools/mold/bin"),
+                needs_download: true,
+            },
+            stale_project_configs: vec![PathBuf::from("/work/proj/.cargo/config.toml")],
+            daemon_service: Some(super::DaemonServicePlan::LaunchAgent {
+                plist: PathBuf::from("/Users/u/Library/LaunchAgents/dev.waterui.stow.plist"),
+                label: "dev.waterui.stow".to_owned(),
+            }),
+            skill_targets: vec![super::SkillTargetPlan {
+                path: PathBuf::from("/Users/u/.agents/skills/stow/SKILL.md"),
+                mode: super::SkillPlanMode::Install,
+            }],
+            fetch_index_slice: true,
+        }
+    }
+
+    #[test]
+    fn setup_plan_renders_every_target_plain_and_colored() {
+        let plan = sample_setup_plan();
+        let uncolored = super::render_setup_plan(&plan, crate::term_style::Palette::plain());
+        assert!(
+            !uncolored.contains('\x1b'),
+            "plain setup plan must not emit ANSI escapes:\n{uncolored}"
+        );
+        let expected_linker = format!(
+            "linker: mold ({}) (will download)",
+            PathBuf::from("/Users/u/.local/share/stow/tools/mold/bin")
+                .join("mold")
+                .display()
+        );
+        for expected in [
+            "stow setup plan",
+            "config: /Users/u/.cargo/config.toml (update)",
+            "rustc-wrapper: /Users/u/.cargo/stow/shims/0123456789abcdef/stow-rustc-wrapper",
+            "cc: /Users/u/.cargo/stow/shims/0123456789abcdef/stow-cc (CC_x86_64_unknown_linux_gnu)",
+            "cxx: /Users/u/.cargo/stow/shims/0123456789abcdef/stow-cxx (CXX_x86_64_unknown_linux_gnu)",
+            "cc-launcher: /Users/u/.cargo/stow/shims/0123456789abcdef/stow-cc-launcher",
+            "STOW_REAL_CC: clang",
+            "build-dir: /Users/u/.stow/build-dir/{workspace-path-hash}",
+            expected_linker.as_str(),
+            "shims: /Users/u/.cargo/stow/shims/0123456789abcdef",
+            "launch agent: /Users/u/Library/LaunchAgents/dev.waterui.stow.plist (dev.waterui.stow)",
+            "agent skill: /Users/u/.agents/skills/stow/SKILL.md (install)",
+            "stale cleanup: /work/proj/.cargo/config.toml (strip stow keys)",
+            "index slice: x86_64-unknown-linux-gnu / rustc 1.91.1",
+        ] {
+            assert!(
+                uncolored.contains(expected),
+                "missing `{expected}` in plain setup plan:\n{uncolored}"
+            );
+        }
+
+        let colored = super::render_setup_plan(&plan, crate::term_style::Palette::colored());
+        assert!(
+            colored.contains("\x1b[1;36mstow setup plan\x1b[0m"),
+            "colored setup plan must style heading:\n{colored}"
+        );
+        assert!(
+            colored.contains("/Users/u/.cargo/config.toml"),
+            "colored setup plan must preserve target paths:\n{colored}"
+        );
+
+        let mut win_plan = plan;
+        win_plan.daemon_service = Some(super::DaemonServicePlan::ScheduledTask {
+            name: "stow-daemon-0123456789abcdef".to_owned(),
+        });
+        let win_output = super::render_setup_plan(&win_plan, crate::term_style::Palette::plain());
+        assert!(
+            win_output.contains("scheduled task: stow-daemon-0123456789abcdef"),
+            "missing scheduled task in Windows plan:\n{win_output}"
+        );
+    }
+
+    #[test]
+    fn setup_confirmation_skips_prompt_for_yes_ci_or_non_tty() {
+        let prompt = |yes, stdin_tty, stdout_tty, ci_env| {
+            super::SetupPromptContext {
+                yes,
+                ci_env,
+                terminal: super::TerminalMode::from_stdio(stdin_tty, stdout_tty),
+            }
+            .should_prompt()
+        };
+        assert!(prompt(false, true, true, false));
+        assert!(!prompt(true, true, true, false));
+        assert!(!prompt(false, true, true, true));
+        assert!(!prompt(false, false, true, false));
+        assert!(!prompt(false, true, false, false));
+        assert!(!prompt(false, false, false, false));
+    }
+
+    #[test]
+    fn setup_confirmation_prompt_handles_accept_decline_and_eof() {
+        let palette = crate::term_style::Palette::plain();
+        for (input, expected) in [
+            ("\n", true),
+            ("y\n", true),
+            ("Y\n", true),
+            ("yes\n", true),
+            ("YES\n", true),
+            ("n\n", false),
+            ("no\n", false),
+            ("anything\n", false),
+            ("", false),
+        ] {
+            let mut reader = std::io::Cursor::new(input.as_bytes());
+            let mut writer = Vec::new();
+            let confirmed = super::confirm_setup_with(&mut reader, &mut writer, palette)
+                .expect("confirm prompt");
+            assert_eq!(confirmed, expected, "unexpected result for input {input:?}");
+            let prompt = String::from_utf8(writer).expect("utf-8 prompt");
+            assert!(
+                prompt.contains("Apply these changes? [Y/n]:"),
+                "prompt text missing: {prompt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_plan_computes_shim_paths_without_creating_any_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cargo_home = dir.path().join("cargo-home");
+        let resolved = super::resolve_wrapper_executables(&cargo_home).expect("resolve wrappers");
+        let shims = crate::wrapper_shim::planned_wrapper_shims(&resolved.shims_dir);
+        assert!(shims.rustc_wrapper.starts_with(&resolved.shims_dir));
+        assert!(
+            !cargo_home.exists(),
+            "planning must not create CARGO_HOME or shims directory before confirmation"
+        );
+        assert!(!resolved.shims_dir.exists());
+    }
+
+    #[test]
+    fn status_report_renders_grouped_summary_plain_and_colored() {
+        let report = super::StatusReport {
+            cargo: super::CargoWiringStatus::Configured {
+                config_path: PathBuf::from("/Users/u/.cargo/config.toml"),
+                rustc_wrapper: Some("/Users/u/.cargo/stow/shims/abc/stow-rustc-wrapper".to_owned()),
+                cc_compiler: Some("/Users/u/.cargo/stow/shims/abc/stow-cc".to_owned()),
+                cxx_compiler: Some("/Users/u/.cargo/stow/shims/abc/stow-cxx".to_owned()),
+                cc_launcher: Some("/Users/u/.cargo/stow/shims/abc/stow-cc-launcher".to_owned()),
+                build_dir: "/Users/u/.stow/build-dir/{workspace-path-hash}".to_owned(),
+                linker_mold: true,
+            },
+            remote: super::RemoteDaemonStatus {
+                edge_url: Some("https://stow.waterui.dev".to_owned()),
+                remote_cache: Some(true),
+                daemon: crate::daemon::DaemonProbe::Running(crate::daemon::StatusReply {
+                    stow_version: "0.21.13".to_owned(),
+                    protocol: 5,
+                    floor: 4,
+                }),
+            },
+            summary: crate::stats::StatsSummary {
+                rust_hits: 412,
+                rust_misses: 87,
+                rust_errors: 2,
+                rust_glibc_refusals: 0,
+                rust_local_dependency_builds: 0,
+                cc_hits: 11,
+                cc_misses: 3,
+                cc_errors: 0,
+            },
+            local: crate::stats::LocalStats {
+                hits: 423,
+                cpu_millis_saved: 852_000,
+                bytes_served: 134_637_158,
+                bytes_downloaded: 44_145_049,
+            },
+            stale_project_configs: vec![PathBuf::from("/work/old/.cargo/config.toml")],
+        };
+
+        let plain = super::render_status_report(&report, crate::term_style::Palette::plain());
+        assert!(
+            !plain.contains('\x1b'),
+            "plain status must not emit ANSI escapes:\n{plain}"
+        );
+        for expected in [
+            "Cargo wiring",
+            "config: /Users/u/.cargo/config.toml",
+            "rustc-wrapper: /Users/u/.cargo/stow/shims/abc/stow-rustc-wrapper",
+            "cc: /Users/u/.cargo/stow/shims/abc/stow-cc",
+            "cxx: /Users/u/.cargo/stow/shims/abc/stow-cxx",
+            "cc-launcher: /Users/u/.cargo/stow/shims/abc/stow-cc-launcher",
+            "build-dir: /Users/u/.stow/build-dir/{workspace-path-hash}",
+            "linker: mold",
+            "Remote & daemon",
+            "edge-url: https://stow.waterui.dev",
+            "remote-cache: on",
+            "daemon: running (stow 0.21.13, protocol 5)",
+            "Cache performance",
+            "rust-cache: 412 hits, 87 misses (82.6% hit rate), 2 errors",
+            "cc-cache: 11 hits, 3 misses (78.6% hit rate), 0 errors",
+            "cpu-saved: 14.2 min",
+            "bytes-served: 128.4 MiB",
+            "bytes-downloaded: 42.1 MiB",
+            "Warnings",
+            "stale stow wiring: /work/old/.cargo/config.toml",
+        ] {
+            assert!(
+                plain.contains(expected),
+                "missing `{expected}` in plain status output:\n{plain}"
+            );
+        }
+
+        let colored = super::render_status_report(&report, crate::term_style::Palette::colored());
+        assert!(
+            colored.contains("\x1b[1;36mCargo wiring\x1b[0m"),
+            "colored status must style section headings:\n{colored}"
+        );
+        assert!(
+            colored.contains("\x1b[32mon\x1b[0m"),
+            "colored status must highlight remote-cache on:\n{colored}"
+        );
+        assert!(
+            colored.contains("\x1b[31m2 errors\x1b[0m"),
+            "colored status must highlight non-zero errors:\n{colored}"
+        );
+    }
+
+    #[test]
+    fn status_report_renders_unconfigured_and_zero_stats() {
+        let unconfigured = super::StatusReport {
+            cargo: super::CargoWiringStatus::NotConfigured {
+                config_path: PathBuf::from("/Users/u/.cargo/config.toml"),
+            },
+            remote: super::RemoteDaemonStatus {
+                edge_url: Some("https://stow.waterui.dev".to_owned()),
+                remote_cache: Some(false),
+                daemon: crate::daemon::DaemonProbe::NotRunning,
+            },
+            summary: crate::stats::StatsSummary::default(),
+            local: crate::stats::LocalStats::default(),
+            stale_project_configs: Vec::new(),
+        };
+        let unconf_plain =
+            super::render_status_report(&unconfigured, crate::term_style::Palette::plain());
+        assert!(unconf_plain.contains("not configured: /Users/u/.cargo/config.toml is missing"));
+        assert!(unconf_plain.contains("remote-cache: off (local-only)"));
+        assert!(unconf_plain.contains("daemon: not running"));
+        assert!(unconf_plain.contains("rust-cache: 0 hits, 0 misses (—), 0 errors"));
+        assert!(!unconf_plain.contains("Warnings"));
     }
 }

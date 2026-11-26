@@ -25,6 +25,7 @@ fn setup_in(dir: &Path) -> toml::Value {
     let mut setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     setup
         .arg("setup")
+        .arg("--yes")
         .current_dir(dir)
         .env("CARGO_HOME", &cargo_home);
     // Setup loads `StowConfig::load` and installs tools under the
@@ -227,6 +228,7 @@ fn an_explicit_toolchain_survives_setup() {
     let mut setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     setup
         .arg("setup")
+        .arg("--yes")
         .current_dir(dir.path())
         .env("CARGO_HOME", &cargo_home);
     let home = dir.path().join("stow-home");
