@@ -563,6 +563,12 @@ under the current schema, `stow clean` removes and resets it automatically.
 Pass `--all` (`stow clean --all`) to delete the entire `$STOW_CACHE_DIR`,
 including cached index slices and local stats.
 
+Routine disk reclamation never needs it: the artifact tiers evict least
+recently used entries at their size cap, and the daemon sweeps `build-dir/`
+hourly, removing the build directory of a workspace whose manifest is gone and
+any directory not built for 30 days. `stow clean` empties the caches every
+worktree shares, so the next builds compile cold.
+
 ## `stow daemon status` / `stow daemon stop`
 
 `stow daemon status` prints the running daemon's stow version and protocol,
