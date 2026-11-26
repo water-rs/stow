@@ -176,11 +176,14 @@ pub async fn collect(
     for (build_dir, manifests_json, last_built_ms) in rows {
         let manifests: Vec<PathBuf> =
             serde_json::from_str(&manifests_json).wrap_err("parse the recorded manifests")?;
+        // Keyed by path, which compares by component: a key written with
+        // `/` on Windows matches the directory the listing names with `\`.
         let record = Record {
+            key: build_dir,
             manifests,
             last_built_ms: db_int(last_built_ms, "build directory last built")?,
         };
-        records.insert(build_dir, record);
+        records.insert(PathBuf::from(&record.key), record);
     }
     let root = cache_dir.join(BUILD_DIR_PARENT);
     let cache_dir_owned = cache_dir.to_path_buf();
@@ -207,6 +210,8 @@ pub async fn collect(
 
 /// What stow recorded of one build directory.
 struct Record {
+    /// The row's key, as `record` wrote it.
+    key: String,
     /// The member manifests builds of the directory were seen compiling;
     /// empty when none was seen.
     manifests: Vec<PathBuf>,
@@ -223,7 +228,7 @@ struct Swept {
 
 fn sweep(
     root: &Path,
-    records: &HashMap<String, Record>,
+    records: &HashMap<PathBuf, Record>,
     idle_ms: u64,
     now_ms: u64,
 ) -> Result<Swept> {
@@ -236,7 +241,9 @@ fn sweep(
     let listing = match std::fs::read_dir(root) {
         Ok(listing) => listing,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            swept.forgotten.extend(records.keys().cloned());
+            swept
+                .forgotten
+                .extend(records.values().map(|record| record.key.clone()));
             return Ok(swept);
         }
         Err(error) => return Err(error).wrap_err_with(|| format!("list {}", root.display())),
@@ -274,16 +281,16 @@ fn sweep(
     }
     swept.forgotten.extend(
         records
-            .keys()
-            .filter(|key| !present.contains(*key))
-            .cloned(),
+            .iter()
+            .filter(|(path, _)| !present.contains(*path))
+            .map(|(_, record)| record.key.clone()),
     );
     Ok(swept)
 }
 
 /// What a sweep judges a build directory by.
 struct Sweep<'a> {
-    records: &'a HashMap<String, Record>,
+    records: &'a HashMap<PathBuf, Record>,
     idle_ms: u64,
     now_ms: u64,
 }
@@ -295,7 +302,7 @@ fn sweep_shard(
     shard: &Path,
     ctx: &Sweep<'_>,
     swept: &mut Swept,
-    present: &mut std::collections::HashSet<String>,
+    present: &mut std::collections::HashSet<PathBuf>,
 ) -> Result<()> {
     let listing = match std::fs::read_dir(shard) {
         Ok(listing) => listing,
@@ -330,17 +337,18 @@ fn sweep_dir(
     dir: PathBuf,
     ctx: &Sweep<'_>,
     swept: &mut Swept,
-    present: &mut std::collections::HashSet<String>,
+    present: &mut std::collections::HashSet<PathBuf>,
 ) -> Result<()> {
-    let key = dir.to_str().map(str::to_owned);
-    present.extend(key.clone());
-    let record = key.as_ref().and_then(|key| ctx.records.get(key));
+    present.insert(dir.clone());
+    let record = ctx.records.get(&dir);
     let Some(reason) = verdict(&dir, record, ctx.idle_ms, ctx.now_ms)? else {
         return Ok(());
     };
     if remove_unlocked(&dir)? {
+        swept
+            .removed_keys
+            .extend(record.map(|record| record.key.clone()));
         swept.collected.removed.push((dir, reason));
-        swept.removed_keys.extend(key);
     } else {
         tracing::debug!(
             build_dir = %dir.display(),
