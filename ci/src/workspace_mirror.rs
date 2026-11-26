@@ -58,7 +58,7 @@ pub fn materialize_workspace(
             return Ok(mirror_root.clone());
         }
         if mirror_root.exists() {
-            std::fs::remove_dir_all(&mirror_root).wrap_err_with(|| {
+            stow_types::fs::remove_dir_all(&mirror_root).wrap_err_with(|| {
                 format!(
                     "remove incomplete stable workspace {}",
                     mirror_root.display()
@@ -73,7 +73,7 @@ pub fn materialize_workspace(
             now_nanos()?
         ));
         if temp_root.exists() {
-            std::fs::remove_dir_all(&temp_root).wrap_err_with(|| {
+            stow_types::fs::remove_dir_all(&temp_root).wrap_err_with(|| {
                 format!("remove stale temp stable workspace {}", temp_root.display())
             })?;
         }
@@ -82,7 +82,7 @@ pub fn materialize_workspace(
 
         let copy_result = populate_workspace(&source_root, &temp_root);
         if let Err(error) = copy_result {
-            let _ = std::fs::remove_dir_all(&temp_root);
+            let _ = stow_types::fs::remove_dir_all(&temp_root);
             return Err(error);
         }
         write_ready_marker(&temp_root)?;
@@ -98,7 +98,7 @@ pub fn materialize_workspace(
                         mirror = %mirror_root.display(),
                         "workspace mirror already exists (concurrent create) — discarding temp copy"
                     );
-                    std::fs::remove_dir_all(&temp_root).ok();
+                    stow_types::fs::remove_dir_all(&temp_root).ok();
                     Ok(())
                 } else {
                     Err(rename_error)

@@ -485,7 +485,7 @@ impl<O: Origin> Session<O> {
     async fn remove_dir(&self) -> Result<()> {
         let dir = self.dir.path().to_owned();
         smol::unblock(move || {
-            std::fs::remove_dir_all(&dir)
+            stow_types::fs::remove_dir_all(&dir)
                 .wrap_err_with(|| format!("remove the session directory {}", dir.display()))
         })
         .await

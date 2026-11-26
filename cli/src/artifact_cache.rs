@@ -2368,7 +2368,7 @@ impl StagingDir {
 
 impl Drop for StagingDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = stow_types::fs::remove_dir_all(&self.dir);
         let _ = std::fs::remove_file(&self.lock_path);
     }
 }
@@ -2868,7 +2868,7 @@ async fn remove_cached_bundle_locked(
         tokio::task::spawn_blocking({
             let entry_dir = entry_dir.clone();
             move || {
-                std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
+                stow_types::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
                     format!("remove cached artifact entry {}", entry_dir.display())
                 })
             }
@@ -3892,7 +3892,7 @@ async fn remove_entry_group(
             tokio::task::spawn_blocking({
                 let entry_dir = entry_dir.clone();
                 move || {
-                    std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
+                    stow_types::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
                         format!("evict artifact cache entry {}", entry_dir.display())
                     })
                 }
@@ -4112,7 +4112,7 @@ fn sweep_staging_locks(staging_root: &Path) -> stow_types::error::Result<()> {
         };
         let staged_dir = lock_path.with_extension("");
         if staged_dir.exists() {
-            std::fs::remove_dir_all(&staged_dir).wrap_err_with(|| {
+            stow_types::fs::remove_dir_all(&staged_dir).wrap_err_with(|| {
                 format!("remove abandoned staging dir {}", staged_dir.display())
             })?;
         }
@@ -4207,7 +4207,7 @@ async fn acquire_entry_exclusive_lock_async(
 /// an entry, and never silently adopted by the row about to be written.
 async fn remove_orphaned_entry_dir(entry_dir: PathBuf) -> stow_types::error::Result<()> {
     tokio::task::spawn_blocking(move || {
-        std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
+        stow_types::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
             format!(
                 "remove orphaned artifact cache entry dir {}",
                 entry_dir.display()

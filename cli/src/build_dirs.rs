@@ -244,39 +244,28 @@ fn sweep(
     for entry in listing {
         let entry = entry.wrap_err_with(|| format!("list {}", root.display()))?;
         let dir = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
         // Left by a sweep a crash ended between its rename and its
         // removal: no build can be in it, since no lock was free to be
         // taken for it after the rename.
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(COLLECTING_PREFIX)
-        {
+        if name_str.starts_with(COLLECTING_PREFIX) {
             remove_path(&dir)?;
             continue;
         }
-        if !entry
-            .file_type()
-            .wrap_err_with(|| format!("stat {}", dir.display()))?
-            .is_dir()
-        {
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).wrap_err_with(|| format!("stat {}", dir.display())),
+        };
+        if !kind.is_dir() {
             continue;
         }
-        let key = dir.to_str().map(str::to_owned);
-        present.extend(key.clone());
-        let record = key.as_ref().and_then(|key| records.get(key));
-        let Some(reason) = verdict(&dir, record, idle_ms, now_ms)? else {
-            continue;
-        };
-        if remove_unlocked(&dir)? {
-            swept.collected.removed.push((dir, reason));
-            swept.removed_keys.extend(key);
+        if is_hash_shard_name(&name_str) {
+            sweep_shard(&dir, records, idle_ms, now_ms, &mut present, &mut swept)?;
+            remove_empty_dir(&dir)?;
         } else {
-            tracing::debug!(
-                build_dir = %dir.display(),
-                "a build holds the build directory's cargo lock; not collecting it"
-            );
-            swept.collected.locked.push(dir);
+            sweep_leaf(&dir, records, idle_ms, now_ms, &mut present, &mut swept)?;
         }
     }
     swept.forgotten.extend(
@@ -286,6 +275,70 @@ fn sweep(
             .cloned(),
     );
     Ok(swept)
+}
+
+fn sweep_shard(
+    shard: &Path,
+    records: &HashMap<String, Record>,
+    idle_ms: u64,
+    now_ms: u64,
+    present: &mut std::collections::HashSet<String>,
+    swept: &mut Swept,
+) -> Result<()> {
+    let listing = match std::fs::read_dir(shard) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).wrap_err_with(|| format!("list {}", shard.display())),
+    };
+    for entry in listing {
+        let entry = entry.wrap_err_with(|| format!("list {}", shard.display()))?;
+        let dir = entry.path();
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(COLLECTING_PREFIX)
+        {
+            remove_path(&dir)?;
+            continue;
+        }
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).wrap_err_with(|| format!("stat {}", dir.display())),
+        };
+        if !kind.is_dir() {
+            continue;
+        }
+        sweep_leaf(&dir, records, idle_ms, now_ms, present, swept)?;
+    }
+    Ok(())
+}
+
+fn sweep_leaf(
+    dir: &Path,
+    records: &HashMap<String, Record>,
+    idle_ms: u64,
+    now_ms: u64,
+    present: &mut std::collections::HashSet<String>,
+    swept: &mut Swept,
+) -> Result<()> {
+    let key = dir.to_str().map(str::to_owned);
+    present.extend(key.clone());
+    let record = key.as_ref().and_then(|key| records.get(key));
+    let Some(reason) = verdict(dir, record, idle_ms, now_ms)? else {
+        return Ok(());
+    };
+    if remove_unlocked(dir)? {
+        swept.collected.removed.push((dir.to_path_buf(), reason));
+        swept.removed_keys.extend(key);
+    } else {
+        tracing::debug!(
+            build_dir = %dir.display(),
+            "a build holds the build directory's cargo lock; not collecting it"
+        );
+        swept.collected.locked.push(dir.to_path_buf());
+    }
+    Ok(())
 }
 
 /// Whether `dir` is due for collection, and why.
@@ -512,9 +565,10 @@ pub fn has_active_cargo_lock(root: &Path) -> Result<bool> {
 /// nothing removed, when a lock is held by a build.
 fn remove_unlocked(dir: &Path) -> Result<bool> {
     let mut locks = Vec::new();
-    // Depth 4 covers both `<ws>/<triple>/<profile>/.cargo-build-lock` and a
-    // two-level `<shard>/<hash>/<triple>/<profile>/.cargo-build-lock` tree.
-    for entry in walkdir::WalkDir::new(dir).max_depth(4) {
+    // Depth 3 covers both `<ws>/<profile>/.cargo-build-lock` and
+    // `<ws>/<triple>/<profile>/.cargo-build-lock` on the leaf workspace
+    // build directory passed here.
+    for entry in walkdir::WalkDir::new(dir).max_depth(3) {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error)
@@ -603,7 +657,7 @@ fn remove_all_but_locks(locks: &[(PathBuf, FileLock)]) -> Result<()> {
 
 fn remove_path(path: &Path) -> Result<()> {
     let removed = if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
-        std::fs::remove_dir_all(path)
+        stow_types::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
     };
@@ -626,7 +680,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
-    use super::{CARGO_BUILD_LOCK, Reason, collect, collect_if_due, record};
+    use super::{CARGO_BUILD_LOCK, Reason, clean_all, collect, collect_if_due, record};
     use crate::state_db::{connect, now_millis};
 
     const IDLE: Duration = Duration::from_hours(24 * 30);
@@ -941,5 +995,171 @@ mod tests {
             0,
             "deleting the entry now frees all of it"
         );
+    }
+
+    #[tokio::test]
+    async fn a_sharded_deleted_workspace_is_collected_while_its_shard_sibling_stays() {
+        let fixture = Fixture::new();
+        let pool = connect(fixture.cache.path()).await.expect("state db");
+        let gone_dir = fixture.build_dir("e5/31c0aabbccddeeff");
+        let gone_manifest = fixture.workspace("gone-sharded");
+        let live_dir = fixture.build_dir("e5/4444555566667777");
+        let live_manifest = fixture.workspace("live-sharded");
+        let now = now_millis();
+        record(&pool, &gone_dir, std::slice::from_ref(&gone_manifest), now)
+            .await
+            .expect("record gone");
+        record(&pool, &live_dir, std::slice::from_ref(&live_manifest), now)
+            .await
+            .expect("record live");
+        std::fs::remove_file(&gone_manifest).expect("delete gone workspace");
+
+        let collected = collect(&pool, fixture.cache.path(), IDLE, now)
+            .await
+            .expect("collect");
+        assert_eq!(
+            collected.removed,
+            [(gone_dir.clone(), Reason::WorkspaceGone)]
+        );
+        assert!(!gone_dir.exists());
+        assert!(live_dir.join("debug/deps/libdemo.rlib").exists());
+        assert_eq!(remaining_rows(&pool).await, 1);
+
+        // Removing the remaining sibling collects it and removes the empty shard.
+        std::fs::remove_file(&live_manifest).expect("delete live workspace");
+        let collected = collect(&pool, fixture.cache.path(), IDLE, now)
+            .await
+            .expect("collect second");
+        assert_eq!(
+            collected.removed,
+            [(live_dir.clone(), Reason::WorkspaceGone)]
+        );
+        assert!(!live_dir.exists());
+        assert!(
+            !fixture
+                .cache
+                .path()
+                .join(super::BUILD_DIR_PARENT)
+                .join("e5")
+                .exists(),
+            "empty shard directory is removed"
+        );
+        assert_eq!(remaining_rows(&pool).await, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sweeps_leftover_hidden_directory_inside_a_shard_is_removed() {
+        let fixture = Fixture::new();
+        let pool = connect(fixture.cache.path()).await.expect("state db");
+        let shard = fixture
+            .cache
+            .path()
+            .join(super::BUILD_DIR_PARENT)
+            .join("a1");
+        let leftover = shard.join(".collecting-1-bbbbbbbbbbbbbb");
+        std::fs::create_dir_all(leftover.join("debug")).expect("leftover");
+
+        collect(&pool, fixture.cache.path(), IDLE, now_millis())
+            .await
+            .expect("collect");
+        assert!(!leftover.exists());
+        assert!(!shard.exists(), "empty shard directory is removed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_only_subdirectory_inside_a_build_dir_is_removed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = Fixture::new();
+        let pool = connect(fixture.cache.path()).await.expect("state db");
+        let collect_dir = fixture.build_dir("f1/11111111111111");
+        let collect_ro = collect_dir.join("debug/build/pkg/out/ro");
+        std::fs::create_dir_all(&collect_ro).expect("create ro dir");
+        std::fs::write(collect_ro.join("generated.rs"), b"// ro").expect("write ro file");
+        std::fs::set_permissions(&collect_ro, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod 0555");
+        let manifest = fixture.workspace("ro-collect");
+        record(
+            &pool,
+            &collect_dir,
+            std::slice::from_ref(&manifest),
+            now_millis(),
+        )
+        .await
+        .expect("record");
+        std::fs::remove_file(&manifest).expect("delete workspace");
+
+        let collected = collect(&pool, fixture.cache.path(), IDLE, now_millis())
+            .await
+            .expect("collect with read-only subdir");
+        assert_eq!(
+            collected.removed,
+            [(collect_dir.clone(), Reason::WorkspaceGone)]
+        );
+        assert!(!collect_dir.exists());
+
+        let clean_dir = fixture.build_dir("f2/22222222222222");
+        let clean_ro = clean_dir.join("debug/build/pkg/out/ro_0444");
+        std::fs::create_dir_all(&clean_ro).expect("create 0444 dir");
+        std::fs::write(clean_ro.join("generated.rs"), b"// ro").expect("write ro file");
+        std::fs::set_permissions(&clean_ro, std::fs::Permissions::from_mode(0o444))
+            .expect("chmod 0444");
+
+        let skipped =
+            clean_all(&fixture.cache.path().join(super::BUILD_DIR_PARENT)).expect("clean_all");
+        assert_eq!(skipped, 0);
+        assert!(!clean_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn a_sharded_idle_build_directory_is_collected_without_touching_active_sibling() {
+        let fixture = Fixture::new();
+        let pool = connect(fixture.cache.path()).await.expect("state db");
+        let now = now_millis();
+
+        let idle_recorded = fixture.build_dir("c3/11111111111111");
+        let idle_manifest = fixture.workspace("idle-sharded");
+        record(
+            &pool,
+            &idle_recorded,
+            std::slice::from_ref(&idle_manifest),
+            now - 31 * DAY_MS,
+        )
+        .await
+        .expect("record idle");
+
+        let idle_unrecorded = fixture.build_dir("c3/22222222222222");
+        age(&idle_unrecorded, 31);
+
+        let active_recorded = fixture.build_dir("c3/33333333333333");
+        let active_manifest = fixture.workspace("active-sharded");
+        record(
+            &pool,
+            &active_recorded,
+            std::slice::from_ref(&active_manifest),
+            now - 2 * DAY_MS,
+        )
+        .await
+        .expect("record active");
+
+        let mut collected = collect(&pool, fixture.cache.path(), IDLE, now)
+            .await
+            .expect("collect");
+        collected
+            .removed
+            .sort_by(|(left, _), (right, _)| left.cmp(right));
+        assert_eq!(
+            collected.removed,
+            [
+                (idle_recorded.clone(), Reason::Idle),
+                (idle_unrecorded.clone(), Reason::Idle),
+            ]
+        );
+        assert!(!idle_recorded.exists());
+        assert!(!idle_unrecorded.exists());
+        assert!(active_recorded.join("debug/deps/libdemo.rlib").exists());
+        assert_eq!(remaining_rows(&pool).await, 1);
     }
 }

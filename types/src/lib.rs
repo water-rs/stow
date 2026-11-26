@@ -24,6 +24,8 @@ pub mod error;
 pub mod feature_sets;
 pub mod fixture;
 pub mod forwards;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod fs;
 pub mod glibc;
 pub mod hash;
 pub mod identity;
