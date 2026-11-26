@@ -129,16 +129,26 @@ mod platform {
 }
 
 /// btrfs and XFS: `FS_IOC_FIEMAP` flags each extent another file shares.
-/// Every other Linux filesystem has no reflinks.
+/// On non-CoW Linux filesystems (such as ext4), a cache file linked into
+/// `.stow-cow-blobs/` by the optional FUSE `CoW` layer (`stow#1704`) holds
+/// `nlink > 1`, so its bytes remain allocated when the cache entry is
+/// removed.
 #[cfg(target_os = "linux")]
 mod platform {
     use std::ffi::CString;
     use std::io;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
-    pub(super) fn tracks_sharing(root: &Path) -> io::Result<bool> {
-        let path = CString::new(root.as_os_str().as_bytes())
+    #[allow(clippy::unnecessary_wraps)]
+    pub(super) const fn tracks_sharing(root: &Path) -> io::Result<bool> {
+        let _ = root;
+        Ok(true)
+    }
+
+    fn is_reflink_fs(path: &Path) -> io::Result<bool> {
+        let path = CString::new(path.as_os_str().as_bytes())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
         // SAFETY: `path` is NUL-terminated and `stat` is a writable
@@ -146,7 +156,6 @@ mod platform {
         let status = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
         if status != 0 {
             let error = io::Error::last_os_error();
-            // A root another process removed holds nothing shared.
             if error.kind() == io::ErrorKind::NotFound {
                 return Ok(false);
             }
@@ -158,6 +167,13 @@ mod platform {
     }
 
     pub(super) fn file_shared_bytes(path: &Path, len: u64) -> io::Result<u64> {
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.nlink() > 1 {
+            return Ok(len);
+        }
+        if !is_reflink_fs(path)? {
+            return Ok(0);
+        }
         let file = std::fs::File::open(path)?;
         let mut shared = 0u64;
         for extent in fiemap::Fiemap::new(&file) {

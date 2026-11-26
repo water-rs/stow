@@ -81,19 +81,20 @@ impl Machine {
     }
 
     /// A plain `cargo build`: the wiring is only what setup wrote into
-    /// the cargo home.
-    fn cargo_build(&self) {
+    /// the cargo home. Returns the running daemon guard so any FUSE mount over
+    /// `<cache_dir>/build-dir/` stays mounted while the caller inspects it.
+    fn cargo_build(&self) -> PrivateDaemon {
         let daemon = PrivateDaemon::in_home(&self.home);
         let mut build = support::cargo_command(&self.home);
         self.hermetic(&mut build);
         build.arg("build").env("CARGO_INCREMENTAL", "0");
         let output = support::output_after_session(&mut build, &self.home);
-        drop(daemon);
         assert!(
             output.status.success(),
             "cargo build failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        daemon
     }
 
     /// The build directory cargo reports for the workspace in `dir`, its
@@ -168,7 +169,7 @@ fn setup_places_intermediates_under_stows_cache_and_artifacts_in_target() {
         String::from_utf8_lossy(&output.stdout)
     );
 
-    machine.cargo_build();
+    let _daemon = machine.cargo_build();
 
     let intermediates = files_under(&machine.cache.join("build-dir"));
     assert!(
@@ -233,7 +234,7 @@ fn a_project_build_directory_wins_for_that_project_and_not_for_setup() {
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("left alone"));
 
-    machine.cargo_build();
+    let _daemon = machine.cargo_build();
     assert!(
         !files_under(&mine).is_empty(),
         "the project's build directory was not used"
@@ -271,7 +272,7 @@ fn a_build_directory_in_the_global_config_is_kept_and_reported() {
         "setup did not report the user's build directory:\n{stdout}"
     );
 
-    machine.cargo_build();
+    let _daemon = machine.cargo_build();
     assert_ne!(files_under(&mine), [] as [std::path::PathBuf; 0]);
     assert_eq!(
         files_under(&machine.cache.join("build-dir")),

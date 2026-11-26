@@ -183,10 +183,17 @@ pub async fn collect(
         records.insert(build_dir, record);
     }
     let root = cache_dir.join(BUILD_DIR_PARENT);
+    let cache_dir_owned = cache_dir.to_path_buf();
     let idle_ms = duration_millis(idle);
-    let swept = tokio::task::spawn_blocking(move || sweep(&root, &records, idle_ms, now_ms))
-        .await
-        .wrap_err("join the build directory sweep")??;
+    let swept = tokio::task::spawn_blocking(move || {
+        let swept = sweep(&root, &records, idle_ms, now_ms)?;
+        if let Err(error) = crate::fuse_cow::gc_unreferenced_blobs(&cache_dir_owned) {
+            tracing::debug!(%error, "failed to GC unreferenced FUSE CoW blobs");
+        }
+        Ok::<_, stow_types::error::Error>(swept)
+    })
+    .await
+    .wrap_err("join the build directory sweep")??;
     let mut transaction = pool.begin().await?;
     for forgotten in swept.forgotten.iter().chain(&swept.removed_keys) {
         sqlx::query("DELETE FROM build_directories WHERE build_dir = ?")
@@ -447,13 +454,58 @@ fn remove_empty_dir(dir: &Path) -> Result<()> {
         Err(error)
             if matches!(
                 error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::DirectoryNotEmpty
+                    | std::io::ErrorKind::ResourceBusy
             ) =>
         {
             Ok(())
         }
         Err(error) => Err(error).wrap_err_with(|| format!("remove {}", dir.display())),
     }
+}
+
+/// Whether any build directory under `root` currently has its
+/// `.cargo-build-lock` held by a running `cargo` build.
+///
+/// # Errors
+///
+/// Walking `root` or opening a lock file failed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn has_active_cargo_lock(root: &Path) -> Result<bool> {
+    if !root.exists() {
+        return Ok(false);
+    }
+    for entry in walkdir::WalkDir::new(root).max_depth(5) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error)
+                if error
+                    .io_error()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error).wrap_err_with(|| format!("walk {}", root.display())),
+        };
+        if entry.file_name() != OsStr::new(CARGO_BUILD_LOCK) || !entry.file_type().is_file() {
+            continue;
+        }
+        let file = match std::fs::File::open(entry.path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).wrap_err_with(|| format!("open {}", entry.path().display()));
+            }
+        };
+        if FileLock::try_exclusive(file)
+            .wrap_err_with(|| format!("lock {}", entry.path().display()))?
+            .is_none()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Remove `dir` with every cargo build lock inside it held; `false`, with

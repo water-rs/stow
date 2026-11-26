@@ -254,6 +254,7 @@ async fn serve(
     for outlived in swept.outlived {
         refuse_until_exit(&daemon, outlived);
     }
+    mount_default_fuse(&daemon).await;
     tracing::info!(
         pid = std::process::id(),
         endpoint = %endpoint.display(),
@@ -402,6 +403,25 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(work)
         .await
         .wrap_err("run the daemon's blocking work")?
+}
+
+/// If the user's default config enables the Linux FUSE copy-on-write layer
+/// (default on Linux non-CoW filesystems; opt out via `fuse = false` /
+/// `STOW_FUSE=0`), mount `<cache_dir>/build-dir/` before clients start plain
+/// `cargo` builds so cargo opens the mounted tree from the start.
+async fn mount_default_fuse<P: Processes>(daemon: &Daemon<P>) {
+    if let Ok(default_config) =
+        blocking(|| crate::config::StowConfig::load(crate::state_db::StateDb::closed())).await
+        && default_config.fuse
+    {
+        let handles = daemon
+            .table
+            .handles_for(default_config.cache_dir.clone())
+            .await;
+        handles
+            .ensure_fuse_mounted(&default_config.cache_dir, true)
+            .await;
+    }
 }
 
 /// What a start of the daemon found under the sessions directory.

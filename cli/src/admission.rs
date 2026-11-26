@@ -631,6 +631,7 @@ mod tests {
             artifact_cache_max_bytes: 1,
             index_refresh_interval: Duration::from_secs(1),
             build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
+            fuse: false,
             verify_mode: VerifyMode::GithubCi,
             switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),

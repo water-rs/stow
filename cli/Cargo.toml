@@ -101,6 +101,10 @@ libc = "0.2"
 # `FS_IOC_FIEMAP` extents with their `SHARED` flag: the bytes of a cache
 # entry a btrfs or XFS reflink still holds (stow#1539).
 fiemap = { version = "0.2.1", default-features = false }
+# Optional Linux FUSE virtual CoW layer for `build-dir` on non-CoW filesystems
+# (`fuse = true` / `STOW_FUSE=1`, stow#1704). Pure-Rust `/dev/fuse` without a
+# C `libfuse` build dependency.
+fuser = { version = "0.19.0", default-features = false }
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 # The launch agent plist (`cli/templates/launch_agent.xml`) and the

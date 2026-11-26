@@ -1313,6 +1313,7 @@ mod tests {
             artifact_cache_max_bytes: 0,
             index_refresh_interval: std::time::Duration::ZERO,
             build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
+            fuse: false,
             verify_mode: crate::config::VerifyMode::GithubCi,
             switches: crate::config::Switches::default(),
             state_db: crate::state_db::StateDb::default(),
