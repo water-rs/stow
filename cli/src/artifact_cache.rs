@@ -2364,6 +2364,14 @@ impl StagingDir {
     pub fn rustc_version(&self) -> &str {
         &self.rustc_version
     }
+
+    /// Whether both `<name>/` and `<name>.lock` still exist at their expected
+    /// paths (`false` when an idle version sweep moved `<rustc_version>/` into
+    /// `.purge/` or `stow clean` removed the tier).
+    #[must_use]
+    pub fn is_live_on_disk(&self) -> bool {
+        self.dir.is_dir() && self.lock_path.is_file()
+    }
 }
 
 impl Drop for StagingDir {
@@ -5285,6 +5293,47 @@ pub mod tests {
                 .count(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn artifact_cache_staging_dir_supports_multiple_rustcs_and_reacquires_after_purge() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+
+        let s100 = config
+            .artifact_cache_staging_dir(CacheTier::CratesIo, "1.100.0")
+            .await
+            .expect("stage 1.100.0");
+        let s99 = config
+            .artifact_cache_staging_dir(CacheTier::CratesIo, "1.99.1")
+            .await
+            .expect("stage 1.99.1 alongside 1.100.0");
+        assert!(s100.is_live_on_disk());
+        assert!(s99.is_live_on_disk());
+        assert_ne!(s100.path(), s99.path());
+
+        // Simulate an idle version purge moving `crates-io/1.100.0` aside to `.purge/`.
+        let purged_dest = config.artifact_cache_purge_root().join("crates-io-1.100.0");
+        std::fs::create_dir_all(config.artifact_cache_purge_root()).expect("create purge root");
+        std::fs::rename(
+            config.tier_version_dir(CacheTier::CratesIo, "1.100.0"),
+            &purged_dest,
+        )
+        .expect("move 1.100.0 aside");
+        assert!(
+            !s100.is_live_on_disk(),
+            "purged version dir invalidates the old staging dir"
+        );
+
+        let reacquired = config
+            .artifact_cache_staging_dir(CacheTier::CratesIo, "1.100.0")
+            .await
+            .expect("reacquire 1.100.0 staging dir");
+        assert!(reacquired.is_live_on_disk());
+        tempfile::Builder::new()
+            .prefix("probe-")
+            .tempdir_in(reacquired.path())
+            .expect("create temp entry inside reacquired staging dir");
     }
 
     /// A live process's staging dir survives the sweep: its `<name>.lock`

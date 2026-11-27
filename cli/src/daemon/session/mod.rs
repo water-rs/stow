@@ -306,7 +306,9 @@ impl<O: Origin> Session<O> {
             .wrap_err("reopen the build's toolchain")?;
         let dir = SessionDir::create(sessions, id)?;
         let config = session_config(&build, handles, id);
-        if let Some(config) = config.as_ref() {
+        if let Some(config) = config.as_ref()
+            && stow_build_dir(config, &build.roots).is_some()
+        {
             handles
                 .ensure_fuse_mounted(&config.cache_dir, config.fuse)
                 .await;
@@ -466,7 +468,9 @@ impl<O: Origin> Session<O> {
     }
 
     async fn ensure_fuse_mounted(&self) {
-        if let Some(config) = self.env_cache.config() {
+        if let Some(config) = self.env_cache.config()
+            && stow_build_dir(config, &self.build.roots).is_some()
+        {
             self.handles
                 .ensure_fuse_mounted(&config.cache_dir, config.fuse)
                 .await;
@@ -1504,6 +1508,41 @@ mod tests {
         assert!(
             journals.is_empty(),
             "no miss journal file should be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_outside_stow_build_dir_leaves_build_dir_uncreated_even_with_fuse_enabled() {
+        let sessions = tempfile::tempdir().expect("sessions directory");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let target = tempfile::tempdir().expect("target directory");
+        let handles = CacheDirHandles::default();
+
+        let mut config = config_in(cache.path());
+        config.fuse = true;
+        let session = Session::open(
+            SessionId::mint(),
+            facts(target.path(), Some(config)).await,
+            &handles,
+            sessions.path(),
+        )
+        .await
+        .expect("open session with target outside <cache_dir>/build-dir");
+        session.end().await.expect("end session");
+
+        assert!(
+            !cache
+                .path()
+                .join(crate::build_dirs::BUILD_DIR_PARENT)
+                .exists(),
+            "a build targeting ./target/ (--no-build-dir) must never create <cache_dir>/build-dir"
+        );
+        assert!(
+            !cache
+                .path()
+                .join(crate::fuse_cow::BUILD_DIR_BACKING)
+                .exists(),
+            "a build targeting ./target/ (--no-build-dir) must never create <cache_dir>/build-dir-backing"
         );
     }
 }
