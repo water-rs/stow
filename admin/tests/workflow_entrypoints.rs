@@ -1943,6 +1943,39 @@ fn index_publish_reconciles_after_the_publish_under_full() {
     }
 }
 
+#[test]
+fn index_publish_scopes_concurrency_per_rustc() {
+    let wf = load_workflow("index-publish.yml");
+    assert!(
+        at(&wf, "concurrency").is_none(),
+        "top-level concurrency would starve secondary rustc waves"
+    );
+    assert_eq!(
+        at(&wf, "jobs.resolve-rustc.if").map(scalar).as_deref(),
+        Some("inputs.rustc_version == ''")
+    );
+    assert_eq!(
+        at(&wf, "jobs.publish.if").map(scalar).as_deref(),
+        Some(
+            "always() && (needs.resolve-rustc.result == 'success' || needs.resolve-rustc.result == 'skipped')"
+        )
+    );
+    assert_eq!(
+        at(&wf, "jobs.publish.concurrency.group")
+            .map(scalar)
+            .as_deref(),
+        Some(
+            "index-publish-${{ inputs.rustc_version || needs.resolve-rustc.outputs.rustc_version }}"
+        )
+    );
+    assert_eq!(
+        at(&wf, "jobs.publish.concurrency.cancel-in-progress")
+            .map(scalar)
+            .as_deref(),
+        Some("false")
+    );
+}
+
 // ===========================================================================
 // repack-followup.yml
 // ===========================================================================

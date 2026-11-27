@@ -19,36 +19,66 @@ publish = false
 git_only = true
 git_release_enable = false
 git_tag_name = "v{{ version }}"
+version_group = "stow"
 
 [[package]]
 name = "stow-oci"
 git_tag_name = "oci/v{{ version }}"
+version_group = "stow"
 
 [[package]]
 name = "stow-shim"
 git_tag_name = "shim/v{{ version }}"
+version_group = "stow"
 
 [[package]]
 name = "stow-types"
 git_tag_name = "types/v{{ version }}"
+version_group = "stow"
 
-# Internal tooling: never released or published.
+# Internal binaries shipped or deployed from `v<version>`: never published to
+# crates.io or tagged separately, but grouped with `stow` so changes confined
+# to the builder, edge, or admin CLI still bump `[workspace.package].version`
+# in lockstep with `v<version>`.
 [[package]]
 name = "stow-build"
-release = false
 publish = false
+git_only = true
+git_tag_enable = false
+git_tag_name = "v{{ version }}"
+changelog_update = false
+version_group = "stow"
 
 [[package]]
 name = "stow-edge"
-release = false
 publish = false
+git_only = true
+git_tag_enable = false
+git_tag_name = "v{{ version }}"
+changelog_update = false
+version_group = "stow"
 
 [[package]]
 name = "stow-admin"
+publish = false
+git_only = true
+git_tag_enable = false
+git_tag_name = "v{{ version }}"
+changelog_update = false
+version_group = "stow"
+
+# Non-release workspace crates.
+[[package]]
+name = "stow-mock-registry"
 release = false
 publish = false
 
 [[package]]
-name = "stow-mock-registry"
+name = "stow-site"
+release = false
+publish = false
+
+[[package]]
+name = "stow-resolver"
 release = false
 publish = false
