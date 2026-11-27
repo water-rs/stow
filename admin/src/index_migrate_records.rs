@@ -23,9 +23,14 @@ use stow_types::trusted_builder::TrustedWorkflow;
 use crate::index_cmd::registry_base;
 use crate::render;
 
-/// Default tasks migrated concurrently; registry writes are bounded by
-/// [`stow_oci::WriteBudget`].
-const DEFAULT_MIGRATE_CONCURRENCY: usize = 16;
+/// Default tasks migrated concurrently — matches `RECORDS_PULL_CONCURRENCY`
+/// in `index_cmd.rs` (GHCR reads are uncapped; registry writes stay bounded
+/// by [`stow_oci::WriteBudget`]).
+const DEFAULT_MIGRATE_CONCURRENCY: usize = 64;
+
+/// Log migration progress every N completed tasks or markers so long sweeps
+/// report pace instead of running silent.
+const PROGRESS_LOG_INTERVAL: usize = 1000;
 
 #[derive(Args)]
 pub struct IndexMigrateRecordsArgs {
@@ -131,6 +136,8 @@ async fn migrate_task_builds(
     by_task: TaskBuilds,
     summary: &mut Summary,
 ) -> BTreeMap<String, Vec<u8>> {
+    let total = by_task.len();
+    let mut processed = 0usize;
     let mut newest_by_hash: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut task_outcomes =
         futures_util::stream::iter(by_task.into_iter().map(|(task_hash, mut builds)| {
@@ -171,6 +178,7 @@ async fn migrate_task_builds(
         .buffer_unordered(ctx.concurrency);
 
     while let Some(outcome) = task_outcomes.next().await {
+        processed += 1;
         match outcome {
             Ok((task_hash, migrated, already, newest_outer)) => {
                 summary.records_migrated += migrated;
@@ -184,6 +192,16 @@ async fn migrate_task_builds(
                 tracing::error!(%error, "migrating task records failed");
             }
         }
+        if processed.is_multiple_of(PROGRESS_LOG_INTERVAL) || processed == total {
+            tracing::info!(
+                processed,
+                total,
+                records_migrated = summary.records_migrated,
+                records_already = summary.records_already,
+                failed = summary.failed,
+                "records migration progress"
+            );
+        }
     }
     newest_by_hash
 }
@@ -195,6 +213,8 @@ async fn migrate_markers(
     newest_by_hash: &BTreeMap<String, Vec<u8>>,
     summary: &mut Summary,
 ) {
+    let total = markers.len();
+    let mut processed = 0usize;
     let canonical_repo = format!("ghcr.io/{}", ctx.repository.path());
     let mut marker_outcomes =
         futures_util::stream::iter(markers.into_iter().map(|(task_hash, tag)| {
@@ -215,6 +235,7 @@ async fn migrate_markers(
         .buffer_unordered(ctx.concurrency);
 
     while let Some(outcome) = marker_outcomes.next().await {
+        processed += 1;
         match outcome {
             Ok(RecordsTagMigration::Migrated { .. }) => summary.markers_migrated += 1,
             Ok(RecordsTagMigration::Already { .. }) => summary.markers_already += 1,
@@ -222,6 +243,16 @@ async fn migrate_markers(
                 summary.failed += 1;
                 tracing::error!(%error, "migrating built- marker failed");
             }
+        }
+        if processed.is_multiple_of(PROGRESS_LOG_INTERVAL) || processed == total {
+            tracing::info!(
+                processed,
+                total,
+                markers_migrated = summary.markers_migrated,
+                markers_already = summary.markers_already,
+                failed = summary.failed,
+                "marker migration progress"
+            );
         }
     }
 }

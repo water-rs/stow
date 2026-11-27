@@ -75,7 +75,10 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Incremental runs finish in minutes; full exports and one-time sweeps
+    # (`migrate_records`, `resign`) scan the whole rustc repository and need
+    # the 350-minute sweep ceiling (`build-crate.yml`'s `resign` / `repack`).
+    timeout-minutes: ${{ fromJSON((inputs.migrate_records || inputs.full || inputs.resign) && '350' || '30') }}
     steps:
       - name: Refuse to sign under any identity but a release tag
         env:
