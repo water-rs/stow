@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.14](https://github.com/water-rs/stow/compare/types/v0.21.13...types/v0.21.14) - 2026-11-27
+
+### Added
+
+- *(scheduler)* dynamically yield runner slots to enterprise workflow_job webhooks ([#1697](https://github.com/water-rs/stow/pull/1697))
+- *(lookup)* serve slim site lookup index from R2 and drop edge index proxy
+
+### Fixed
+
+- *(edge,cli,types)* reject non-stable rustc admissions and reap frozen in-flight leases
+
+### Other
+
+- Merge pull request #1715 from water-rs/fix/reject-nightly-enqueue-and-frozen-inflight
+- Merge pull request #1684 from water-rs/release-plz-2026-11-23T08-01-57Z
+
 ## [0.21.13](https://github.com/water-rs/stow/compare/types/v0.21.12...types/v0.21.13) - 2026-11-24
 
 ### Fixed
