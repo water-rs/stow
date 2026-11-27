@@ -205,12 +205,42 @@ fn log_line_body(line: &str) -> String {
 /// `unknown` while every one of them named a plan-validation refusal on a
 /// line this test had skipped.
 fn is_error_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
     line.contains("##[error]")
-        || line.contains("::error::")
-        || line
-            .trim_start()
+        || trimmed.starts_with("::error::")
+        || trimmed.starts_with("::error ")
+        || trimmed
             .get(..5)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("error"))
+}
+
+/// Strip ANSI escapes and timestamps from each line of `log`, skipping
+/// GitHub Actions' `##[group]Run … ##[endgroup]` command-echo blocks so
+/// echoed shell source (such as `echo "::error::…"`) never masquerades
+/// as step output. Any runner annotation (`##[…`) also ends the echo
+/// block in case a synthetic log fixture omits `##[endgroup]`.
+fn executed_log_lines(log: &str) -> impl Iterator<Item = String> + '_ {
+    let mut in_run_echo = false;
+    log.lines().filter_map(move |raw| {
+        let body = log_line_body(raw);
+        let trimmed = body.trim_start();
+        if trimmed.starts_with("##[group]Run ") {
+            in_run_echo = true;
+            return None;
+        }
+        if in_run_echo {
+            if trimmed.starts_with("##[endgroup]") {
+                in_run_echo = false;
+                return None;
+            }
+            if trimmed.starts_with("##[") {
+                in_run_echo = false;
+            } else {
+                return None;
+            }
+        }
+        Some(body)
+    })
 }
 
 /// Classify one job log. Scans error lines top-down for a known class;
@@ -219,8 +249,7 @@ fn is_error_line(line: &str) -> bool {
 /// executed — the runner-loss and setup-failure bucket. `watchdog`
 /// reuses it for the incident's failure-class breakdown.
 pub fn classify_log(log: &str) -> (FailureClass, Option<String>) {
-    for line in log.lines() {
-        let line = log_line_body(line);
+    for line in executed_log_lines(log) {
         let line = line.as_str();
         if !is_error_line(line) {
             continue;
@@ -255,8 +284,7 @@ pub fn classify_log(log: &str) -> (FailureClass, Option<String>) {
 /// The first line [`is_error_line`] accepts, reduced by
 /// [`log_line_body`] — the digest's per-failure evidence line.
 pub fn first_error_line(log: &str) -> Option<String> {
-    log.lines()
-        .map(log_line_body)
+    executed_log_lines(log)
         .find(|line| is_error_line(line))
         .map(|line| line.trim().to_owned())
 }
@@ -964,6 +992,24 @@ mod tests {
     fn first_error_line_wins() {
         let log = "##[error]error: toolchain '1.91.1' does not support target 'x'\nerror: failed to download `y`\n";
         assert_eq!(classify_log(log).0, FailureClass::ToolchainTargetMissing);
+    }
+
+    #[test]
+    fn ignores_echoed_error_commands_inside_run_group_headers() {
+        let log = concat!(
+            "2026-11-27T12:48:44.428Z ##[group]Run set -euo pipefail\n",
+            "2026-11-27T12:48:44.428Z \x1b[36;1m[ -x \"$exe\" ] || { echo \"::error::missing NDK tool $exe\"; exit 1; }\x1b[0m\n",
+            "2026-11-27T12:48:44.428Z \x1b[36;1mecho \"::error::no stow toolchain is published for ${RUNNER_OS}/${RUNNER_ARCH}\"\x1b[0m\n",
+            "2026-11-27T12:48:44.431Z ##[endgroup]\n",
+            "2026-11-27T12:48:44.659Z Login Succeeded\n",
+            "2026-11-27T12:48:45.886Z Error: no signatures found\n",
+            "2026-11-27T12:48:45.889Z ##[error]Process completed with exit code 1.\n",
+        );
+        assert_eq!(
+            super::first_error_line(log).as_deref(),
+            Some("Error: no signatures found")
+        );
+        assert_eq!(classify_log(log).0, FailureClass::WrapperNeverExecuted);
     }
 
     // ----- Run classification (stow#833) -----

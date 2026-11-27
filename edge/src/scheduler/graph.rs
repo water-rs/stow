@@ -3986,6 +3986,23 @@ impl Graph {
         self.freeze.as_ref()
     }
 
+    /// Epoch milliseconds of the most recent `Cleared` freeze transition,
+    /// if any — outcomes finishing before an operator clear were already
+    /// acknowledged and do not re-trip the freshly lifted breaker.
+    pub(super) fn last_freeze_cleared_ms(&self) -> Option<i64> {
+        let cleared = self
+            .freeze_history
+            .iter()
+            .rev()
+            .find(|t| t.event == stow_types::api::FreezeTransitionEvent::Cleared)?;
+        let parsed = time::OffsetDateTime::parse(
+            &cleared.at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .ok()?;
+        i64::try_from(parsed.unix_timestamp_nanos().div_euclid(1_000_000)).ok()
+    }
+
     /// Stamp the admission floor (`min_dispatch_value`, a deploy
     /// binding — never persisted) and re-evaluate eligibility when it
     /// moved.
