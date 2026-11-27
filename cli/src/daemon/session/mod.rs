@@ -233,7 +233,22 @@ impl Session<Cargo> {
         let cargo_home = SessionEnv::new(build.environ.clone(), build.cwd.clone())
             .cargo_home()
             .map(Path::to_path_buf);
-        let session = Self::assemble(id, build, Cargo::new(cargo_home), handles, sessions).await?;
+        let mut initial_dirs = Vec::with_capacity(3);
+        if let Some(owner_cwd) = crate::daemon::owner::process_cwd(owner.pid) {
+            initial_dirs.push(owner_cwd);
+        }
+        initial_dirs.push(build.cwd.clone());
+        if let Some(target_parent) = build.roots.dirs().first().and_then(|dir| dir.parent()) {
+            initial_dirs.push(target_parent.to_path_buf());
+        }
+        let session = Self::assemble(
+            id,
+            build,
+            Cargo::with_initial_dirs(cargo_home, initial_dirs),
+            handles,
+            sessions,
+        )
+        .await?;
         session.dir.record_owner(owner)?;
         Ok(session)
     }
@@ -434,6 +449,7 @@ impl<O: Origin> Session<O> {
         self.reports.drain(CONNECTION_DRAIN_BUDGET).await;
         let journal_written = self.write_journal();
         self.record_manifests().await;
+        self.spawn_post_session_gc();
         let refusals = self
             .refusals
             .lock()
@@ -500,9 +516,45 @@ impl<O: Origin> Session<O> {
     pub(crate) async fn abort(&self) -> Result<()> {
         self.stop_enrichment().await;
         self.reports.drain(CONNECTION_DRAIN_BUDGET).await;
+        self.record_manifests().await;
+        self.spawn_post_session_gc();
         let removed = self.remove_dir().await;
         self.ensure_fuse_mounted().await;
         removed
+    }
+
+    fn spawn_post_session_gc(&self) {
+        let Some(config) = self.env_cache.config() else {
+            return;
+        };
+        let cache_dir = config.cache_dir.clone();
+        let policy = build_dir_policy(config);
+        let state_db = config.state_db.clone();
+        let span = self.span.clone();
+        tokio::spawn(
+            async move {
+                let result = async {
+                    let pool = state_db.pool(&cache_dir).await?;
+                    crate::build_dirs::collect_after_session(&pool, &cache_dir, policy).await
+                }
+                .await;
+                match result {
+                    Ok(Some(collected)) if !collected.removed.is_empty() => {
+                        tracing::info!(
+                            removed = collected.removed.len(),
+                            reclaimed_bytes = collected.reclaimed_bytes,
+                            locked = collected.locked.len(),
+                            "collected build directories after session"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(error = %error, "post-session build directory collection failed");
+                    }
+                }
+            }
+            .instrument(span),
+        );
     }
 
     /// The build's compile observations are its miss list (stow#317) — a
@@ -913,6 +965,14 @@ fn stow_build_dir(config: &StowConfig, roots: &OutputRoots) -> Option<PathBuf> {
 /// per session, never per compile; the sweep itself is paced inside
 /// [`crate::build_dirs::collect_if_due`]. The session's end records the
 /// manifests the build went on to compile ([`Session::record_manifests`]).
+const fn build_dir_policy(config: &StowConfig) -> crate::build_dirs::Policy {
+    crate::build_dirs::Policy {
+        idle: config.build_dir_idle,
+        max_bytes: config.build_dir_max_bytes,
+        min_free_bytes: config.build_dir_min_free_bytes,
+    }
+}
+
 fn spawn_build_dir_bookkeeping(
     span: &tracing::Span,
     config: Option<&StowConfig>,
@@ -923,7 +983,7 @@ fn spawn_build_dir_bookkeeping(
         return;
     };
     let cache_dir = config.cache_dir.clone();
-    let idle = config.build_dir_idle;
+    let policy = build_dir_policy(config);
     let state_db = config.state_db.clone();
     let build_dir = stow_build_dir(config, roots);
     tokio::spawn(
@@ -933,13 +993,14 @@ fn spawn_build_dir_bookkeeping(
                 if let Some(build_dir) = build_dir {
                     crate::build_dirs::record(&pool, &build_dir, &manifests, now_millis()).await?;
                 }
-                crate::build_dirs::collect_if_due(&pool, &cache_dir, idle).await
+                crate::build_dirs::collect_if_due(&pool, &cache_dir, policy).await
             }
             .await;
             match swept {
                 Ok(Some(collected)) if !collected.removed.is_empty() => {
                     tracing::info!(
                         removed = collected.removed.len(),
+                        reclaimed_bytes = collected.reclaimed_bytes,
                         locked = collected.locked.len(),
                         "collected build directories"
                     );
@@ -1036,6 +1097,8 @@ mod tests {
             artifact_cache_max_bytes: u64::MAX,
             index_refresh_interval: Duration::ZERO,
             build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
+            build_dir_max_bytes: crate::config::DEFAULT_BUILD_DIR_MAX_BYTES,
+            build_dir_min_free_bytes: crate::config::DEFAULT_BUILD_DIR_MIN_FREE_BYTES,
             fuse: false,
             verify_mode: crate::config::VerifyMode::GithubCi,
             switches: crate::config::Switches::default(),

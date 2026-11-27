@@ -1420,6 +1420,55 @@ fn local_stats_table(report: &StatsReport) -> String {
     )
 }
 
+/// `stow gc`: reclaim unlocked build directories under `$STOW_CACHE_DIR/build-dir/`
+/// without touching any artifact cache tier (`crates-io/`, `local-crates-io/`, `local/`).
+pub async fn gc_project(
+    args: crate::cli_args::GcArgs,
+    state_db: &StateDb,
+) -> stow_types::error::Result<()> {
+    let config = StowConfig::load(state_db.clone())?;
+    if !config.cache_dir.exists() {
+        write_stdout("removed 0 build directories (0 B reclaimed)\n")?;
+        return Ok(());
+    }
+    let pool = config.state_db_pool().await?;
+    let collected = if args.worktrees.is_empty() {
+        let policy = crate::build_dirs::Policy {
+            idle: config.build_dir_idle,
+            max_bytes: args.max_bytes.unwrap_or(config.build_dir_max_bytes),
+            min_free_bytes: args
+                .min_free_bytes
+                .unwrap_or(config.build_dir_min_free_bytes),
+        };
+        crate::build_dirs::collect_with_policy(
+            &pool,
+            &config.cache_dir,
+            policy,
+            crate::state_db::now_millis(),
+        )
+        .await?
+    } else {
+        crate::build_dirs::gc_worktrees(&pool, &config.cache_dir, &args.worktrees).await?
+    };
+    let removed = collected.removed.len();
+    let noun = if removed == 1 {
+        "directory"
+    } else {
+        "directories"
+    };
+    let reclaimed = format_bytes(collected.reclaimed_bytes);
+    if collected.locked.is_empty() {
+        write_stdout(&format!(
+            "removed {removed} build {noun} ({reclaimed} reclaimed)\n"
+        ))
+    } else {
+        write_stdout(&format!(
+            "removed {removed} build {noun} ({reclaimed} reclaimed), skipped {} active\n",
+            collected.locked.len()
+        ))
+    }
+}
+
 /// `stow clean`: remove cached artifacts and build directories while
 /// preserving verified index slices and local stats (`--all` removes the
 /// entire `$STOW_CACHE_DIR`).
@@ -2490,6 +2539,8 @@ mod tests {
             artifact_cache_max_bytes: 1024,
             index_refresh_interval: Duration::from_mins(5),
             build_dir_idle: crate::config::DEFAULT_BUILD_DIR_IDLE,
+            build_dir_max_bytes: crate::config::DEFAULT_BUILD_DIR_MAX_BYTES,
+            build_dir_min_free_bytes: crate::config::DEFAULT_BUILD_DIR_MIN_FREE_BYTES,
             fuse: false,
             verify_mode,
             switches: crate::config::Switches::default(),
