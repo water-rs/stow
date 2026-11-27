@@ -263,6 +263,15 @@ impl ExitWatch {
     }
 }
 
+/// The current working directory of process `pid`, when the operating system
+/// exposes it to the current user. Used to attribute a plain `cargo` session's
+/// build directory at session open even when the first compiler wrapper runs
+/// inside `$CARGO_HOME/registry`.
+#[must_use]
+pub fn process_cwd(pid: u32) -> Option<PathBuf> {
+    imp::cwd(pid).ok()
+}
+
 /// The process on the other end of `stream`, as the kernel knows it.
 ///
 /// # Errors
@@ -336,6 +345,10 @@ mod imp {
 
     pub(super) fn image(pid: u32) -> io::Result<PathBuf> {
         std::fs::read_link(format!("/proc/{pid}/exe"))
+    }
+
+    pub(super) fn cwd(pid: u32) -> io::Result<PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/cwd"))
     }
 
     /// Unused on Linux: each watch opens its own pidfd.
@@ -454,6 +467,39 @@ mod imp {
             .ok_or_else(io::Error::last_os_error)?;
         path.truncate(length);
         Ok(PathBuf::from(std::ffi::OsString::from_vec(path)))
+    }
+
+    pub(super) fn cwd(pid: u32) -> io::Result<PathBuf> {
+        use std::ffi::CStr;
+        use std::os::unix::ffi::OsStrExt as _;
+        let pid = libc::c_int::try_from(pid)
+            .map_err(|_| io::Error::other(format!("process id {pid} is out of range")))?;
+        let size = libc::c_int::try_from(size_of::<libc::proc_vnodepathinfo>())
+            .expect("vnodepathinfo fits in c_int");
+        // SAFETY: `proc_vnodepathinfo` is plain C integers and fixed byte arrays.
+        let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` points to `size` writable bytes for `PROC_PIDVNODEPATHINFO`.
+        let filled = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        if filled != size {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `vip_path` is a NUL-terminated 1024-byte `[[c_char; 32]; 32]` buffer written by the kernel.
+        let cstr = unsafe { CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
+        if cstr.to_bytes().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process reports an empty working directory",
+            ));
+        }
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(cstr.to_bytes())))
     }
 
     /// One shared `kqueue` descriptor multiplexing every `EVFILT_PROC` watch
@@ -760,6 +806,10 @@ mod imp {
 
     // SAFETY: a process handle is usable from any thread.
     unsafe impl Send for Process {}
+
+    pub(super) fn cwd(_pid: u32) -> io::Result<PathBuf> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 
     fn open(pid: u32, access: u32) -> io::Result<Process> {
         // SAFETY: `OpenProcess` takes three integers and returns a handle

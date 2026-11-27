@@ -127,6 +127,10 @@ pub enum Command {
     /// saved, bytes downloaded — kept in `stats.json` next to the
     /// cache. Local-only: nothing leaves the machine.
     Stats(StatsArgs),
+    /// Reclaim unlocked build directories (deleted workspaces, idle age, or
+    /// least-recently-used under size and free-space bounds) without touching
+    /// cached artifacts.
+    Gc(GcArgs),
     /// Remove cached artifacts and build directories, keeping index
     /// slices and local stats; `--all` removes the whole cache dir.
     Clean(CleanArgs),
@@ -359,6 +363,21 @@ pub struct StatsArgs {
     /// Print the counters as JSON instead of a table.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Clone, Args, Default)]
+pub struct GcArgs {
+    /// Reclaim only the build directories belonging to these workspace or
+    /// git worktree paths (before or after the directory is deleted).
+    #[arg(long = "worktree", value_name = "PATH")]
+    pub worktrees: Vec<PathBuf>,
+    /// Override `build_dir_max_bytes` for this run (`0` evicts every unlocked
+    /// idle build directory).
+    #[arg(long, value_name = "BYTES")]
+    pub max_bytes: Option<u64>,
+    /// Override `build_dir_min_free_bytes` for this run.
+    #[arg(long, value_name = "BYTES")]
+    pub min_free_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Args, Default)]

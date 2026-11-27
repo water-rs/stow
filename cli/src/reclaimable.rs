@@ -52,6 +52,54 @@ pub fn shared_bytes(root: &Path) -> io::Result<u64> {
     Ok(shared)
 }
 
+/// The bytes of the regular files at `root` that deleting `root` actually
+/// returns to the filesystem: total file length minus [`shared_bytes`],
+/// computed in a single walk. Missing roots return `0`.
+pub fn reclaimable_bytes(root: &Path) -> io::Result<u64> {
+    let tracks = match platform::tracks_sharing(root) {
+        Ok(tracks) => tracks,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut reclaimable = 0u64;
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => match error.into_io_error() {
+                Some(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Some(error) => return Err(error),
+                None => {
+                    return Err(io::Error::other(format!(
+                        "walk {} hit a symlink loop",
+                        root.display()
+                    )));
+                }
+            },
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let len = match entry.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => match error.into_io_error() {
+                Some(io_err) if io_err.kind() == io::ErrorKind::NotFound => continue,
+                Some(io_err) => return Err(io_err),
+                None => continue,
+            },
+        };
+        if !tracks {
+            reclaimable = reclaimable.saturating_add(len);
+            continue;
+        }
+        match platform::file_shared_bytes(entry.path(), len) {
+            Ok(shared) => reclaimable = reclaimable.saturating_add(len.saturating_sub(shared)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(reclaimable)
+}
+
 /// APFS: `getattrlist` with `ATTR_CMNEXT_PRIVATESIZE` returns the bytes
 /// of a file no clone shares. A volume that does not track clones omits
 /// the attribute from the returned set, and then the whole file is
@@ -247,6 +295,11 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         assert_eq!(
             shared_bytes(&tempdir.path().join("gone")).expect("measure missing root"),
+            0
+        );
+        assert_eq!(
+            super::reclaimable_bytes(&tempdir.path().join("gone"))
+                .expect("measure missing reclaimable"),
             0
         );
     }

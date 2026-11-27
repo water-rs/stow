@@ -13,6 +13,9 @@ default-run = "stow-cli"
 # while `skyzen-s3` / `skyzen-services` come from git.
 publish = false
 
+[package.metadata.dist]
+dist = true
+
 [[bin]]
 name = "stow-cli"
 path = "src/bin/stow-cli.rs"

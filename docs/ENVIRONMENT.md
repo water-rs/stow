@@ -18,6 +18,9 @@ default, and the purpose.
 | `STOW_MOCK_PUBLIC_KEY_PATH` | _required when `STOW_VERIFY_MODE=mock-key`_ | PEM path the wrapper trusts when verifying mock OCI bundles. |
 | `STOW_CACHE_DIR` | `~/.stow` | Where the local artifact cache + state SQLite live. |
 | `STOW_ARTIFACT_CACHE_MAX_BYTES` | `21474836480` (20 GiB) | Soft cap on the local artifact cache before stow purges old entries. |
+| `STOW_BUILD_DIR_MAX_BYTES` | `68719476736` (64 GiB) | Soft cap on private reclaimable bytes across `<STOW_CACHE_DIR>/build-dir/` before unlocked idle build directories are evicted least-recently-used (`build_dir_max_bytes` in `config.toml`; `0` evicts every unlocked idle build directory). |
+| `STOW_BUILD_DIR_MIN_FREE_BYTES` | `21474836480` (20 GiB) | Minimum free bytes on `<STOW_CACHE_DIR>`'s filesystem below which unlocked idle build directories under `build-dir/` are evicted least-recently-used (`build_dir_min_free_bytes` in `config.toml`; `0` disables the floor). |
+| `STOW_BUILD_DIR_IDLE_SECS` | `2592000` (30 days) | Seconds an unlocked build directory under `<STOW_CACHE_DIR>/build-dir/` may go unbuilt before collection (`build_dir_idle_secs` in `config.toml`). |
 | `STOW_BUCKET` | unset | S3-compatible bucket name backing stow's local cache tiers (`local/`, `local/cc/`, and optionally `local-crates-io/`) as an L2 cache. Overrides `[cache.bucket] bucket` in `config.toml`; set to an empty string (`""`) to disable a file-configured bucket for one run. Works independently of `[cache] remote = false`. |
 | `STOW_BUCKET_ENDPOINT` | unset | Custom S3-compatible endpoint URL (Cloudflare R2, MinIO, Tigris, OSS, etc.). Overrides `[cache.bucket] endpoint`; set to `""` to clear a file-configured endpoint. |
 | `STOW_BUCKET_REGION` | `auto` | Signing region for `[cache.bucket]` requests (e.g. `auto` for R2, `us-east-1` for AWS S3). Overrides `[cache.bucket] region`. |

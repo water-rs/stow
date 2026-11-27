@@ -54,8 +54,20 @@ verify_mode = "github-ci"
 # longer exists is removed regardless of age; one a running build holds
 # (cargo's `.cargo-build-lock`) is never touched. A directory stow has no
 # record of is judged by its files' modification times. Default 2592000
-# (30 days).
+# (30 days). May also be set via $STOW_BUILD_DIR_IDLE_SECS.
 # build_dir_idle_secs = 2592000
+
+# Soft cap on private (non-CoW-shared) bytes across `<cache_dir>/build-dir/`.
+# When exceeded, unlocked idle build directories are evicted oldest-first
+# (LRU) without touching cached artifact tiers (`0` evicts every unlocked
+# idle build directory). Default 68719476736 (64 GiB).
+# May also be set via $STOW_BUILD_DIR_MAX_BYTES.
+# build_dir_max_bytes = 68719476736
+
+# Minimum free bytes on `<cache_dir>`'s filesystem below which unlocked idle
+# build directories are evicted oldest-first (LRU). `0` disables the floor.
+# Default 21474836480 (20 GiB). May also be set via $STOW_BUILD_DIR_MIN_FREE_BYTES.
+# build_dir_min_free_bytes = 21474836480
 
 # Linux FUSE virtual CoW layer over `<cache_dir>/build-dir/` on non-CoW
 # filesystems such as ext4. Defaults to true on Linux (false elsewhere);

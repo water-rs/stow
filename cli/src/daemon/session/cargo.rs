@@ -109,6 +109,45 @@ impl Cargo {
         }
     }
 
+    /// The origin of a cargo seeded with candidate directories from the
+    /// opening process (`cargo`'s own working directory, the opener's `cwd`,
+    /// or the parent of a local `target/` directory) so `build_directories`
+    /// records the workspace manifest as soon as the session opens, even if
+    /// the build aborts before compiling a workspace member.
+    #[must_use]
+    pub fn with_initial_dirs(
+        cargo_home: Option<PathBuf>,
+        candidates: impl IntoIterator<Item = PathBuf>,
+    ) -> Self {
+        let cargo = Self::new(cargo_home);
+        {
+            let mut dirs = cargo
+                .local_manifest_dirs
+                .lock()
+                .expect("local manifest dirs mutex");
+            for candidate in candidates {
+                if let Some(dir) = cargo.nearest_local_manifest_dir(&candidate) {
+                    dirs.insert(dir);
+                }
+            }
+        }
+        cargo
+    }
+
+    /// Walk `start` and its ancestors for the nearest local package/workspace
+    /// directory holding `Cargo.toml` outside `$CARGO_HOME/{registry,git}`.
+    fn nearest_local_manifest_dir(&self, start: &Path) -> Option<PathBuf> {
+        for dir in start.ancestors() {
+            if !self.is_local(dir) {
+                return None;
+            }
+            if dir.join("Cargo.toml").is_file() {
+                return Some(dir.to_path_buf());
+            }
+        }
+        None
+    }
+
     /// Whether a package at `manifest_dir` is local: not a checkout of a
     /// registry or git source under the cargo home.
     fn is_local(&self, manifest_dir: &Path) -> bool {
@@ -526,5 +565,28 @@ mod tests {
                 .map(OsString::from)
                 .to_vec()
         );
+    }
+
+    #[test]
+    fn cargo_with_initial_dirs_attributes_local_workspace_while_ignoring_registry() {
+        use super::{Cargo, Origin as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cargo_home = temp.path().join(".cargo");
+        let registry_pkg = cargo_home.join("registry/src/index.crates.io-1/serde-1.0.0");
+        std::fs::create_dir_all(&registry_pkg).expect("registry dir");
+        std::fs::write(
+            registry_pkg.join("Cargo.toml"),
+            b"[package]\nname=\"serde\"\n",
+        )
+        .expect("registry manifest");
+
+        let ws = temp.path().join("worktree");
+        let nested = ws.join("crates/member/src");
+        std::fs::create_dir_all(&nested).expect("nested");
+        std::fs::write(ws.join("Cargo.toml"), b"[workspace]\n").expect("ws manifest");
+
+        let origin = Cargo::with_initial_dirs(Some(cargo_home), [registry_pkg, nested]);
+        assert_eq!(origin.manifests(), vec![ws.join("Cargo.toml")]);
     }
 }

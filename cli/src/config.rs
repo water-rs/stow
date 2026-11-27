@@ -28,6 +28,9 @@ const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
 const STOW_REGISTRY_BASE_URL_ENV: &str = "STOW_REGISTRY_BASE_URL";
 const STOW_INDEX_REFRESH_SECS_ENV: &str = "STOW_INDEX_REFRESH_SECS";
 const STOW_ARTIFACT_CACHE_MAX_BYTES_ENV: &str = "STOW_ARTIFACT_CACHE_MAX_BYTES";
+const STOW_BUILD_DIR_MAX_BYTES_ENV: &str = "STOW_BUILD_DIR_MAX_BYTES";
+const STOW_BUILD_DIR_MIN_FREE_BYTES_ENV: &str = "STOW_BUILD_DIR_MIN_FREE_BYTES";
+const STOW_BUILD_DIR_IDLE_SECS_ENV: &str = "STOW_BUILD_DIR_IDLE_SECS";
 const STOW_BUCKET_ENV: &str = "STOW_BUCKET";
 const STOW_BUCKET_ENDPOINT_ENV: &str = "STOW_BUCKET_ENDPOINT";
 const STOW_BUCKET_REGION_ENV: &str = "STOW_BUCKET_REGION";
@@ -56,10 +59,24 @@ pub const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 /// `index_refresh_secs`, default ten minutes.
 const DEFAULT_INDEX_REFRESH_SECS: u64 = 600;
 /// How long a build directory stow placed may go unbuilt before the
-/// daemon collects it — config `build_dir_idle_secs`, default 30 days
-/// (stow#1540). A workspace left alone for a month is rebuilt from the
-/// cache in one serve.
+/// daemon collects it — config `build_dir_idle_secs` or
+/// `STOW_BUILD_DIR_IDLE_SECS`, default 30 days (stow#1540). A workspace left
+/// alone for a month is rebuilt from the cache in one serve.
 pub const DEFAULT_BUILD_DIR_IDLE: Duration = Duration::from_hours(24 * 30);
+/// Default cap on private (non-CoW-shared) bytes across `<cache_dir>/build-dir/`
+/// before unlocked idle build directories are evicted LRU: 64 GiB.
+pub const DEFAULT_BUILD_DIR_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Default free-space floor on `<cache_dir>`'s filesystem below which unlocked
+/// idle build directories are evicted LRU: 20 GiB.
+pub const DEFAULT_BUILD_DIR_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+const fn default_build_dir_max_bytes() -> u64 {
+    DEFAULT_BUILD_DIR_MAX_BYTES
+}
+
+const fn default_build_dir_min_free_bytes() -> u64 {
+    DEFAULT_BUILD_DIR_MIN_FREE_BYTES
+}
 /// The consumer's registry connect bound: an unreachable registry
 /// answers in seconds, and its connect/DNS failure never joins the
 /// retry sweep — the build's circuit carries the outage instead of
@@ -304,8 +321,19 @@ pub struct StowConfig {
     /// change. `STOW_INDEX_REFRESH_SECS` or `index_refresh_secs`.
     pub index_refresh_interval: Duration,
     /// Age past which a build directory under `<cache_dir>/build-dir/`
-    /// that has not been built is collected. `build_dir_idle_secs`.
+    /// that has not been built is collected. `build_dir_idle_secs` or
+    /// `STOW_BUILD_DIR_IDLE_SECS`.
     pub build_dir_idle: Duration,
+    /// Soft cap on private reclaimable bytes across `<cache_dir>/build-dir/`
+    /// before unlocked idle build directories are evicted LRU.
+    /// `build_dir_max_bytes` or `STOW_BUILD_DIR_MAX_BYTES`.
+    #[serde(default = "default_build_dir_max_bytes")]
+    pub build_dir_max_bytes: u64,
+    /// Minimum free bytes on `<cache_dir>`'s filesystem below which unlocked
+    /// idle build directories are evicted LRU. `build_dir_min_free_bytes` or
+    /// `STOW_BUILD_DIR_MIN_FREE_BYTES`.
+    #[serde(default = "default_build_dir_min_free_bytes")]
+    pub build_dir_min_free_bytes: u64,
     /// Linux FUSE virtual copy-on-write layer over `<cache_dir>/build-dir/`
     /// for non-copy-on-write filesystems such as ext4 (stow#1704). Defaults to
     /// `true` on Linux (opt out via `fuse = false` or `STOW_FUSE=0`), `false`
@@ -578,10 +606,23 @@ impl StowConfig {
                 .unwrap_or(DEFAULT_CIRCUIT_TRIP_THRESHOLD),
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(env, file_config.as_ref())?,
             index_refresh_interval: load_index_refresh_interval(env, file_config.as_ref())?,
-            build_dir_idle: file_config
-                .as_ref()
-                .and_then(|config| config.build_dir_idle_secs)
-                .map_or(DEFAULT_BUILD_DIR_IDLE, Duration::from_secs),
+            build_dir_idle: load_build_dir_idle(env, file_config.as_ref())?,
+            build_dir_max_bytes: load_u64_setting(
+                env,
+                STOW_BUILD_DIR_MAX_BYTES_ENV,
+                file_config
+                    .as_ref()
+                    .and_then(|config| config.build_dir_max_bytes),
+                DEFAULT_BUILD_DIR_MAX_BYTES,
+            )?,
+            build_dir_min_free_bytes: load_u64_setting(
+                env,
+                STOW_BUILD_DIR_MIN_FREE_BYTES_ENV,
+                file_config
+                    .as_ref()
+                    .and_then(|config| config.build_dir_min_free_bytes),
+                DEFAULT_BUILD_DIR_MIN_FREE_BYTES,
+            )?,
             fuse: load_fuse(env, file_config.as_ref())?,
             verify_mode,
             state_db,
@@ -928,6 +969,8 @@ struct StowUserConfig {
     artifact_cache_max_bytes: Option<u64>,
     index_refresh_secs: Option<u64>,
     build_dir_idle_secs: Option<u64>,
+    build_dir_max_bytes: Option<u64>,
+    build_dir_min_free_bytes: Option<u64>,
     fuse: Option<bool>,
     verify_mode: Option<String>,
     isolation: Option<crate::isolation::IsolationConfig>,
@@ -1143,6 +1186,43 @@ fn load_artifact_cache_max_bytes(
         ));
     }
     Ok(value)
+}
+
+fn load_u64_setting(
+    env: &SessionEnv,
+    env_key: &str,
+    file_value: Option<u64>,
+    default: u64,
+) -> stow_types::error::Result<u64> {
+    text_var(env, env_key).map_or_else(
+        || Ok(file_value.unwrap_or(default)),
+        |raw| {
+            raw.parse::<u64>()
+                .map_err(|error| stow_types::stow_error!("parse {env_key} as u64: {error}"))
+        },
+    )
+}
+
+fn load_build_dir_idle(
+    env: &SessionEnv,
+    file_config: Option<&StowUserConfig>,
+) -> stow_types::error::Result<Duration> {
+    text_var(env, STOW_BUILD_DIR_IDLE_SECS_ENV).map_or_else(
+        || {
+            Ok(file_config
+                .and_then(|config| config.build_dir_idle_secs)
+                .map_or(DEFAULT_BUILD_DIR_IDLE, Duration::from_secs))
+        },
+        |raw| {
+            raw.parse::<u64>()
+                .map(Duration::from_secs)
+                .map_err(|error| {
+                    stow_types::stow_error!(
+                        "parse {STOW_BUILD_DIR_IDLE_SECS_ENV} as u64 seconds: {error}"
+                    )
+                })
+        },
+    )
 }
 
 fn load_fuse(

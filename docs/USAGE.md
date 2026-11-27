@@ -2,7 +2,7 @@
 
 The user-facing binary is `stow`. It ships three personalities in one
 executable: a `cargo` driver (`stow check|build|test|predict`), a
-maintenance/setup CLI (`stow setup|update|status|stats|index|clean|check-artifact|fetch-artifact`),
+maintenance/setup CLI (`stow setup|update|status|stats|index|gc|clean|check-artifact|fetch-artifact`),
 and a hidden `rustc`/`cc` wrapper invoked by Cargo through `RUSTC_WRAPPER`.
 
 ## Configuration
@@ -547,6 +547,29 @@ local state DB. `--json` prints the same counters as JSON.
 
 Nothing leaves the machine: the command reads local counters only. See
 [`PRIVACY.md`](../PRIVACY.md) for what the edge records about requests.
+
+## `stow gc`
+
+Reclaims unlocked per-workspace build directories under `$STOW_CACHE_DIR/build-dir/`
+without touching any cached artifact tier (`crates-io/`, `local-crates-io/`,
+`local/`), verified index slices (`index/`), or local stats (`stats.json`):
+
+```sh
+stow gc
+stow gc --worktree /path/to/removed-or-idle-worktree
+stow gc --max-bytes 0
+```
+
+Without `--worktree`, `stow gc` removes every unlocked build directory whose
+recorded workspace manifests no longer exist or that exceeded `build_dir_idle_secs`,
+then evicts remaining unlocked idle build directories oldest-first (LRU) until
+private reclaimable bytes are within `--max-bytes` (`build_dir_max_bytes`) and
+filesystem free space meets `--min-free-bytes` (`build_dir_min_free_bytes`).
+With one or more `--worktree <PATH>` flags, `stow gc` removes only the unlocked
+build directories attributed to those workspaces or git worktrees (resolving
+both `build_directories` records and, when `Cargo.toml` is still on disk,
+Cargo's offline `build_directory`). Any build directory whose `.cargo-build-lock`
+is currently held by a running `cargo` build is skipped.
 
 ## `stow clean`
 
