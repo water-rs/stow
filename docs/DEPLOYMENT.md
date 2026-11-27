@@ -1028,11 +1028,13 @@ ships. The flow:
    unless the merge's second parent is H, H has exactly one parent X, and X
    carries a `Certified` success status created by `github-actions[bot]`;
    a push that merges no release PR releases nothing. The job then checks
-   out H and runs `release-plz release`: every crate whose version is not
-   yet on crates.io is published over OIDC trusted publishing and tagged at
-   H with the release App's token. The `stow-cli` tag is `v<version>`; the
-   other crates' are `oci/v<version>`, `shim/v<version>` and
-   `types/v<version>`, which no workflow triggers on. The crates.io trusted
+   out H and runs `release-plz release`: every publishable library crate
+   (`stow-types`, `stow-shim`, `stow-oci`) whose version is not yet on
+   crates.io is published over OIDC trusted publishing and tagged
+   (`oci/v<version>`, `shim/v<version>` and `types/v<version>`, which no
+   workflow triggers on), while `stow-cli` (`publish = false`,
+   `git_only = true`) skips crates.io and is tagged `v<version>` at H with
+   the release App's token. The crates.io trusted
    publisher entry of each published crate names `release-plz.yml`; leave
    its environment empty or `release`.
 4. **Everything else runs from the tag `v<version>`.** Its push triggers

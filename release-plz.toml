@@ -15,6 +15,8 @@ git_release_enable = false
 # `<directory>/v<version>`, which no workflow triggers on.
 [[package]]
 name = "stow-cli"
+publish = false
+git_only = true
 git_release_enable = false
 git_tag_name = "v{{ version }}"
 
