@@ -1191,7 +1191,7 @@ fn build_crate_run_name_concurrency_and_jobs() {
     assert_eq!(
         at(&wf, "jobs.publish.if").map(scalar).as_deref(),
         Some(
-            "inputs.repack_rustc == '' && inputs.resign_rustc == '' && needs.build.result == 'success'"
+            "always() && inputs.repack_rustc == '' && inputs.resign_rustc == '' && needs.build.result == 'success'"
         )
     );
 }
@@ -2463,6 +2463,6 @@ fn release_gate_nightly_is_a_trampoline_into_main() {
     // A passed gate opens the release PR from the certified commit.
     assert_eq!(
         at(&wf, "jobs.release-pr.if").map(scalar).as_deref(),
-        Some("needs.gate.result == 'success'")
+        Some("always() && needs.gate.result == 'success'")
     );
 }

@@ -457,7 +457,7 @@ jobs:
   # identity the release job accepts it from.
   release-pr:
     needs: gate
-    if: needs.gate.result == 'success'
+    if: always() && needs.gate.result == 'success'
     name: Release PR
     runs-on: ubuntu-latest
     timeout-minutes: 20
