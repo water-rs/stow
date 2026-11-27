@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.15](https://github.com/water-rs/stow/compare/v0.21.14...v0.21.15) - 2026-11-27
+
+### Fixed
+
+- *(cli)* release idle staging locks before version purge on Windows
+- *(cli)* skip unused FUSE build-dir mount and reacquire purged staging dirs
+
 ## [0.21.14](https://github.com/water-rs/stow/compare/v0.21.13...v0.21.14) - 2026-11-27
 
 ### Added
