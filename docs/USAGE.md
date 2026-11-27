@@ -482,7 +482,7 @@ other input applies to both actions):
 | `cache` | `true` | Enable built-in GitHub Actions Cache restore and post-job save for `local/` and `local-crates-io/`. Set `false` to skip Actions Cache completely. |
 | `shared-key` | `""` | Shared cache namespace across jobs on the same OS and toolchain; defaults to `github.job`. |
 | `key` | `""` | Extra salt appended to the cache key prefix. |
-| `workspaces` | `.` | Newline-separated workspace directories scanned for `Cargo.lock` when computing cache keys. |
+| `workspaces` | `.` | Newline-separated workspace directories scanned for `Cargo.lock`, `[profile.*]` tables in sibling `Cargo.toml`, and `.cargo/config(.toml)` when computing cache keys. |
 | `save-if` | `true` | Upload updated cache entries on primary-key miss (`false` restores read-only). |
 | `local-crates-io-max-bytes` | `536870912` (`2147483648` on `stow/local`) | Logical byte ceiling enforced on `~/.stow/local-crates-io` via `stow daemon stop --local-crates-io-max-bytes` before upload (`0` skips caching `local-crates-io` and evicts it on drain) so transient `crates.io` fallbacks never crowd out `local/`. |
 
