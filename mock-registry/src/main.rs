@@ -81,6 +81,7 @@ async fn async_main() -> stow_types::error::Result<()> {
         }
         Command::Populate(request) => populate_registry(request).await,
         Command::PublishIndex(request) => publish_index(request).await,
+        Command::PublishFolded(request) => publish_folded(request).await,
         Command::IndexFromRecords(request) => index_from_records(request).await,
         Command::PushRecords(request) => push_records(request).await,
         Command::RetagRecords(request) => retag_records(request).await,
@@ -153,13 +154,16 @@ async fn publish_index(request: PublishIndexArgs) -> stow_types::error::Result<(
         &index,
         &index_bytes,
     )
-    .await?;
+    .await
+}
+
+async fn publish_folded(request: PublishFoldedArgs) -> stow_types::error::Result<()> {
     write_signed_folded(
         &request.registry_root,
         &request.private_key_path,
-        index.header.target.as_str(),
-        index.header.rustc_version.as_str(),
-        &request.folded,
+        &request.target,
+        &request.rustc_version,
+        &request.file,
     )
     .await
 }
@@ -1372,9 +1376,12 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Populate(PopulateArgs),
-    /// Write a signed index artifact into the registry root — what
-    /// `stow-admin index publish` shells out to under `mock-key` mode.
+    /// Write a signed index artifact into the registry root — phase 1 of
+    /// `stow-admin index publish` under `mock-key` mode.
     PublishIndex(PublishIndexArgs),
+    /// Write a signed folded-tag companion artifact into the registry root
+    /// — phase 2 of `stow-admin index publish` under `mock-key` mode.
+    PublishFolded(PublishFoldedArgs),
     /// Build + sign + publish the index slice for `(target, rustc_version)`
     /// straight from a `populate --records-out` file — the bench pipeline
     /// has no edge to `stow-admin index export` from.
@@ -1459,10 +1466,23 @@ struct PublishIndexArgs {
     /// The encoded (`zstd` JSON) index file `stow-admin index export` wrote.
     #[arg(long)]
     file: PathBuf,
-    /// The slice's folded-tag list JSON, written under
-    /// `folded.<target>.<rustc>` beside the index manifest.
     #[arg(long)]
-    folded: PathBuf,
+    registry_root: PathBuf,
+    #[arg(long = "private-key")]
+    private_key_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+struct PublishFoldedArgs {
+    /// Compilation target triple of the slice (`folded.<target>.<rustc>`).
+    #[arg(long)]
+    target: String,
+    /// Rustc version of the slice (`folded.<target>.<rustc>`).
+    #[arg(long = "rustc-version")]
+    rustc_version: String,
+    /// The slice's folded-tag list JSON written under `folded.<target>.<rustc>`.
+    #[arg(long)]
+    file: PathBuf,
     #[arg(long)]
     registry_root: PathBuf,
     #[arg(long = "private-key")]

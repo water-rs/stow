@@ -172,13 +172,16 @@ jobs:
       # published `index`/`folded` pairs for R's slices, and verifies
       # only the records tags no folded set covers — the pass is
       # O(new work), not O(store). It writes `index.<t>.<r>` +
-      # `folded.<t>.<r>` per changed slice, `slices.json` describing them,
-      # and `new-records.json` (the folded delta). The publish loop then
-      # pushes each pair (`index publish` signs both under this
-      # workflow's identity) and `index report` tells the edge what the
-      # live slice serves — the scheduler's dependency gate learns
-      # servability from the publish path itself, not from task
-      # completions.
+      # `folded.<t>.<r>` per changed slice, `slices.json` (ordered host
+      # slices before cross slices), `shared-tags.json` (multi-slice
+      # records tags), and `new-records.json` (the folded delta). `index
+      # publish --dir` then pushes all `index.*` tags first (host slices
+      # before cross slices, skipping cross slices whose runner host
+      # failed) and only afterwards pushes each succeeded slice's
+      # `folded.*` tag excluding any shared tag that named a failed
+      # slice; `index report` tells the edge what went live — the
+      # scheduler's dependency gate learns servability from the publish
+      # path itself, not from task completions.
       - name: Export every index slice in one pass
         env:
           GHCR_USERNAME: ${{ github.actor }}
@@ -218,47 +221,59 @@ jobs:
           # When the export ran `--full` the report does too: its slices
           # carry no `.prev` base.
           INPUT_FULL: ${{ inputs.full }}
-        # A slice whose publish fails must not cost every later slice its
-        # update: slices are independent, and a stale slice is what every
-        # CLI on that target resolves against until the next run.
-        # Failures are collected and reported at the end.
+        # Independent runner families must not block one another on a
+        # transient failure, while cross-target slices depend on their
+        # runner host slice (which holds their dependencies' build scripts)
+        # and multi-slice records tags must not enter any `folded.*` set
+        # until every slice they named has published its `index.*`.
+        # `stow-admin index publish --dir` enforces both invariants in two
+        # phases and records per-slice outcomes in `published.json`.
         run: |
           python3 - "$export_dir" <<'EOF'
           import json, os, subprocess, sys
           out = sys.argv[1]
-          slices = json.load(open(os.path.join(out, "slices.json")))
           failed = []
           report = []
           lookup = []
-          for s in slices:
-              print(f"::group::{s['tag']}", flush=True)
-              file = os.path.join(out, s["index_file"])
-              folded = os.path.join(out, s["folded_file"])
-              lookup_file = os.path.join(out, s["lookup_file"])
-              ok = subprocess.run(["stow-admin", "index", "publish",
-                                   "--file", file, "--folded", folded]).returncode == 0
-              # The report gathers every slice the run published into
-              # ONE `index report` call — one edge post, one scheduler
-              # append, one dispatch pass (stow#940). A slice whose
-              # publish failed is left out of the report, not failed
-              # into it.
-              if ok and os.environ["REPORT"] == "true":
-                  report += ["--file", file]
-              if ok and os.environ.get("IS_STABLE_RUSTC") == "true" and os.environ.get("CLOUDFLARE_API_TOKEN"):
-                  lookup += ["--file", lookup_file]
-              print("::endgroup::", flush=True)
-              if not ok:
-                  print(f"::error::index publish failed for {s['tag']}", flush=True)
+          print("::group::index publish", flush=True)
+          publish_ok = subprocess.run(["stow-admin", "index", "publish", "--dir", out]).returncode == 0
+          print("::endgroup::", flush=True)
+          published_path = os.path.join(out, "published.json")
+          published = json.load(open(published_path)) if os.path.exists(published_path) else []
+          if not publish_ok and not published:
+              print("::error::index publish failed before writing published.json", flush=True)
+              failed.append("publish")
+          for s in published:
+              if not s["index_published"]:
+                  detail = s.get("error") or s["outcome"]
+                  print(f"::error::index publish failed for {s['tag']}: {detail}", flush=True)
                   failed.append(s["tag"])
-          # Slices are independent: publish failures are reported, but
-          # every slice that did go live is still reported. A failed
-          # report fails the run like a failed publish: the next run's
-          # reconcile step reports whatever the scheduler still lacks.
+                  continue
+              if not s["folded_published"]:
+                  detail = s.get("error") or "folded publish failed"
+                  print(f"::error::folded publish failed for {s['folded_tag']}: {detail}", flush=True)
+                  failed.append(s["folded_tag"])
+              # The report gathers every slice whose index went live in
+              # phase 1 into ONE `index report` call — one edge post, one
+              # scheduler append, one dispatch pass (stow#940). Cross
+              # slices whose runner host failed were skipped in phase 1
+              # and are left out of the report.
+              if os.environ["REPORT"] == "true":
+                  report += ["--file", os.path.join(out, s["index_file"])]
+              if os.environ.get("IS_STABLE_RUSTC") == "true" and os.environ.get("CLOUDFLARE_API_TOKEN"):
+                  lookup += ["--file", os.path.join(out, s["lookup_file"])]
+          if not publish_ok and not failed:
+              failed.append("publish")
+          # Every slice whose index went live (never a cross slice whose
+          # runner host failed) is still reported. A failed report fails
+          # the run like a failed publish: the next run's reconcile step
+          # reports whatever the scheduler still lacks.
           if report:
               step = ["stow-admin", "index", "report"] + report
               if os.environ.get("INPUT_FULL") == "true":
                   step.append("--full")
-              print(f"::group::report {' '.join(s['tag'] for s in slices)}", flush=True)
+              reported_tags = [s["tag"] for s in published if s["index_published"]]
+              print(f"::group::report {' '.join(reported_tags)}", flush=True)
               ok = subprocess.run(step).returncode == 0
               print("::endgroup::", flush=True)
               if not ok:

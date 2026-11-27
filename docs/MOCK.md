@@ -418,8 +418,8 @@ CPU.
 
 The populated records feed the signed index the CLI resolves against —
 export the slice out of the registry's records artifacts and publish it
-back into the mock registry (mock-key mode delegates the signed push to
-`stow-mock-registry publish-index`):
+back into the mock registry (mock-key mode delegates the signed pushes to
+`stow-mock-registry publish-index` and `publish-folded`):
 
 ```sh
 target/release/stow-admin index export \
@@ -427,8 +427,7 @@ target/release/stow-admin index export \
 STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
 STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
 target/release/stow-admin index publish \
-  --file /tmp/stow-bench/index-export/index.aarch64-apple-darwin.1.91.1 \
-  --folded /tmp/stow-bench/index-export/folded.aarch64-apple-darwin.1.91.1
+  --dir /tmp/stow-bench/index-export
 STOW_EDGE_URL=http://127.0.0.1:8788 \
 GH_TOKEN="$(target/release/stow-mock-registry oidc-token --workflow index-publish.yml)" \
 target/release/stow-admin index report \

@@ -178,15 +178,19 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   refused there — submit the same crates with `--crates` or
   `--projects`.
 - `stow-admin index export --out-dir <dir>` /
-  `index publish --file <index> --folded <folded>` /
+  `index publish --dir <dir>` /
   `index report --file <index>` / `index reconcile --rustc-version <r>` /
   `index targets` — export
   every changed index slice in one pass from the registry's verified
   records artifacts (each `index.<t>.<r>` plus its `folded.<t>.<r>`
-  companion; only the records tags no folded set covers are pulled),
-  push both to GHCR signed under the index workflow (mock deploys
-  delegate to `stow-mock-registry publish-index`), and report each
-  slice's membership to the scheduler. `index-publish.yml`
+  companion, ordered host slices before cross slices, plus
+  `shared-tags.json` for multi-slice records; only the records tags no
+  folded set covers are pulled), push and sign all `index.*` tags first
+  (skipping cross slices whose runner host failed) and then each
+  succeeded slice's `folded.*` tag excluding any shared tag that named a
+  failed slice (mock deploys delegate to `stow-mock-registry
+  publish-index` and `publish-folded`), and report each live slice's
+  membership to the scheduler. `index-publish.yml`
   runs this loop after every `build-crate` run, preceded by `index
   reconcile`, which replays every published slice whose generation
   the scheduler does not hold from the generation it does hold, one

@@ -30,7 +30,7 @@ use futures_util::{StreamExt as _, TryStreamExt as _};
 use keyring_core::api::CredentialStoreApi;
 #[cfg(test)]
 use stow_types::api::ArtifactRecord;
-use stow_types::api::{CI_TARGET_TRIPLES, PublishedSliceRow};
+use stow_types::api::{CI_TARGET_TRIPLES, PublishedSliceRow, runner_family};
 use stow_types::identity::{DependencyIdentity, TargetTriple, WireRustcVersion};
 use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
@@ -81,14 +81,18 @@ pub enum IndexCommand {
     /// per slice, plus only the `records-*` artifacts no folded set
     /// covers. Writes each changed slice as `index.<target>.<rustc>` and
     /// its folded set as `folded.<target>.<rustc>` under `--out-dir`,
-    /// plus `slices.json` (the publish/report loop's input) and
-    /// `new-records.json` (the delta the pass folded). A
+    /// plus `slices.json` (ordered host slices before cross slices),
+    /// `shared-tags.json` (multi-slice records tags and the slice tags
+    /// they named) and `new-records.json` (the delta the pass folded). A
     /// `CI_TARGET_TRIPLES` member with no new rows and no published
     /// pair is still written — an empty first-publish slice, so
     /// `--target` consumers of a deps-less lane always find the tag.
     Export(IndexExportArgs),
-    /// Push an exported index file and its folded companion to the
-    /// registry and sign both.
+    /// Publish an exported pass directory to the registry in two phases:
+    /// every slice's `index.<target>.<rustc>` first (host slices before
+    /// cross slices, skipping cross slices whose runner host failed),
+    /// then each succeeded slice's `folded.<target>.<rustc>` excluding
+    /// newly-folded multi-slice tags that also named any failed slice.
     Publish(IndexPublishArgs),
     /// Report a just-published slice's semantic membership to the edge
     /// — what the scheduler's dependency gate checks before releasing
@@ -175,7 +179,7 @@ pub struct IndexJoinArgs {
 /// `content_sha256` (a digest of everything but the wall-clock
 /// `generated_at`) to decide whether the published artifact is stale, and
 /// `tag` for the GHCR reference.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct IndexExportSummary {
     target: String,
     rustc_version: String,
@@ -190,33 +194,50 @@ struct IndexExportSummary {
     content_sha256: String,
 }
 
-/// Publish an index file `index export` wrote to the slice's OCI tag and
-/// sign it, then do the same for its folded companion.
+/// Publish every changed slice `index export --out-dir` wrote in two phases:
+///
+/// 1. Push and sign each slice's `index.<target>.<rustc>` tag, host slices
+///    before cross-target slices. If a runner host slice fails, every cross
+///    slice built on that host is skipped so downstream cross tasks are never
+///    released before their dependencies' host-side build scripts are live.
+/// 2. Push and sign each succeeded slice's `folded.<target>.<rustc>` tag,
+///    excluding any newly-folded multi-slice `records-*` tag that also named a
+///    slice whose phase-1 publish did not succeed. That guarantees the next
+///    export's `folded_union` never skips a multi-slice record before every
+///    slice it belongs to has published its rows.
 ///
 /// Two modes, selected by environment: with `STOW_MOCK_PRIVATE_KEY_PATH`
-/// set the command delegates to `stow-mock-registry publish-index` —
-/// writing the signed artifacts into `STOW_MOCK_REGISTRY_ROOT` exactly as
-/// `stow-build` mock-populate does for bundles; without it the command
-/// pushes to GHCR through `stow-oci` (`GHCR_USERNAME`/`GHCR_TOKEN`) and
-/// signs keyless in process under the job's OIDC identity, the production
-/// path `index-publish.yml` runs.
+/// set the command delegates to `stow-mock-registry publish-index` /
+/// `publish-folded` — writing the signed artifacts into
+/// `STOW_MOCK_REGISTRY_ROOT`; without it the command pushes to GHCR through
+/// `stow-oci` (`GHCR_USERNAME`/`GHCR_TOKEN`) and signs keyless in process
+/// under the job's OIDC identity, the production path `index-publish.yml`
+/// runs.
 #[derive(Args)]
 pub struct IndexPublishArgs {
-    /// The encoded index file (`index export --out-dir` wrote).
+    /// The export directory `index export --out-dir` wrote (`slices.json`,
+    /// `shared-tags.json`, and the slice files).
     #[arg(long)]
-    file: std::path::PathBuf,
-    /// The folded set file the same export wrote for the slice.
-    #[arg(long)]
-    folded: std::path::PathBuf,
+    dir: std::path::PathBuf,
 }
 
-/// The JSON line `index publish` prints on stdout.
-#[derive(Debug, serde::Serialize)]
+/// The per-slice JSON summary `index publish --dir` prints on stdout and
+/// writes to `<dir>/published.json`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct IndexPublishSummary {
+    target: String,
+    rustc_version: String,
     tag: String,
     folded_tag: String,
-    manifest_digest: String,
-    outcome: &'static str,
+    index_file: String,
+    lookup_file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_digest: Option<String>,
+    outcome: String,
+    index_published: bool,
+    folded_published: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// Report the slice an exported index file carries to the edge, so the
@@ -641,12 +662,31 @@ struct SliceExport {
 
 /// What one export pass produced.
 struct ExportPass {
-    /// Slices that changed — the only ones publish needs to touch.
+    /// Slices that changed — ordered host slices before cross slices.
     slices: Vec<SliceExport>,
+    /// Newly-folded `records-*` tags that contributed rows or local programs
+    /// to more than one slice, mapped to the sorted `index.<target>.<rustc>`
+    /// tags they named. Phase 2 of `index publish` excludes a shared tag from
+    /// every slice's `folded.*` set unless every slice it named succeeded in
+    /// phase 1.
+    shared_tags: BTreeMap<String, Vec<String>>,
     /// Every record this pass pulled — the folded delta.
     new_records: BuildRecords,
     /// Records artifacts pulled — the O(change) meter the gate counts.
     pulled: usize,
+}
+
+/// The runner host triple `target` cross-compiles on, or `None` when `target`
+/// builds on its own host (or is not a `CI_TARGET_TRIPLES` member).
+fn cross_host_triple(target: &str) -> Option<&'static str> {
+    let host = runner_family(target)?.host_triple();
+    (host != target).then_some(host)
+}
+
+/// Ordering key placing every host slice before every cross-target slice, and
+/// lexicographically by target then rustc within each group.
+fn slice_order_key<'a>(target: &'a str, rustc: &'a str) -> (bool, &'a str, &'a str) {
+    (cross_host_triple(target).is_some(), target, rustc)
 }
 
 /// A boxed pull future — the injected halves' shared return shape, so a
@@ -843,6 +883,7 @@ where
     let mut new_rows: BTreeMap<(TargetTriple, WireRustcVersion), RowsByIdentity> = BTreeMap::new();
     let mut new_folded: BTreeMap<(TargetTriple, WireRustcVersion), BTreeSet<String>> =
         BTreeMap::new();
+    let mut shared_tags: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut new_records = BuildRecords::default();
     let mut new_programs: BTreeMap<(TargetTriple, WireRustcVersion), Vec<LocalProcMacro>> =
         BTreeMap::new();
@@ -853,7 +894,9 @@ where
     for ((_, _, tag), records) in missing.iter().zip(per_tag) {
         // The tag joins the folded set of every slice its records name;
         // a records artifact is immutable per build, so the tag is never
-        // pulled again once marked.
+        // pulled again once marked. Multi-slice tags are recorded in
+        // `shared_tags` so phase 2 of `index publish` only marks them once
+        // every named slice's index went live in phase 1.
         let mut named = BTreeSet::new();
         for record in &records.artifacts {
             let key = (record.target.clone(), record.rustc_version.clone());
@@ -869,6 +912,15 @@ where
             named.insert(key.clone());
             new_programs.entry(key).or_default().push(program.clone());
         }
+        if named.len() > 1 {
+            shared_tags.insert(
+                (*tag).to_owned(),
+                named
+                    .iter()
+                    .map(|(target, rustc)| index_tag(target.as_str(), rustc.as_str()))
+                    .collect(),
+            );
+        }
         for key in named {
             new_folded.entry(key).or_default().insert((*tag).to_owned());
         }
@@ -881,6 +933,7 @@ where
     // but must still be marked so they are never re-pulled).
     Ok(ExportPass {
         slices: merge_exports(prev, &new_rows, &new_programs, &new_folded, rustc)?,
+        shared_tags,
         new_records,
         pulled: pulled_count,
     })
@@ -962,7 +1015,9 @@ fn merge_exports(
             push_slice(&key)?;
         }
     }
-    slices.sort_by(|(a, _, _, _), (b, _, _, _)| a.cmp(b));
+    slices.sort_by(|((ta, ra), _, _, _), ((tb, rb), _, _, _)| {
+        slice_order_key(ta.as_str(), ra.as_str()).cmp(&slice_order_key(tb.as_str(), rb.as_str()))
+    });
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|error| stow_error!("format generated_at: {error}"))?;
@@ -1110,11 +1165,23 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
     .await
     .map_err(|error| stow_error!("write slices.json: {error}"))?;
     tokio::fs::write(
+        args.out_dir.join("shared-tags.json"),
+        serde_json::to_vec(&pass.shared_tags)?,
+    )
+    .await
+    .map_err(|error| stow_error!("write shared-tags.json: {error}"))?;
+    tokio::fs::write(
         args.out_dir.join("new-records.json"),
         serde_json::to_vec(&pass.new_records)?,
     )
     .await
     .map_err(|error| stow_error!("write new-records.json: {error}"))?;
+    // Remove any stale `published.json` from an earlier wave sharing `--out-dir`.
+    match tokio::fs::remove_file(args.out_dir.join("published.json")).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(stow_error!("remove stale published.json: {error}")),
+    }
     Ok(())
 }
 
@@ -1278,78 +1345,433 @@ fn row_key(
     )
 }
 
-/// `stow-admin index publish` — the second half of the index pipeline.
-/// The file's own header is authoritative for the slice key, and the
-/// `--folded` companion is pushed under `folded.<target>.<rustc>` in the
-/// same step so the pair can never skew: the next export's folded set is
-/// always the one this slice was built from.
-async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> {
-    let bytes = tokio::fs::read(&args.file)
-        .await
-        .map_err(|error| stow_error!("read index file {}: {error}", args.file.display()))?;
-    let index = ArtifactIndex::decode(&bytes)
-        .map_err(|error| stow_error!("decode index file {}: {error}", args.file.display()))?;
-    let folded_bytes = tokio::fs::read(&args.folded)
-        .await
-        .map_err(|error| stow_error!("read folded file {}: {error}", args.folded.display()))?;
-    let folded: Vec<String> = serde_json::from_slice(&folded_bytes)
-        .map_err(|error| stow_error!("decode folded file {}: {error}", args.folded.display()))?;
-    let target = index.header.target.as_str().to_owned();
-    let rustc_version = index.header.rustc_version.as_str().to_owned();
-    let sha256 =
-        content_sha256(&index).map_err(|error| stow_error!("digest index content: {error}"))?;
-    let tag = index_tag(&target, &rustc_version);
-    let ftag = folded_tag(&target, &rustc_version);
+/// One slice loaded and validated from `index export --out-dir` ahead of
+/// phase 1.
+struct PreparedSlice {
+    summary: IndexExportSummary,
+    rustc_version: WireRustcVersion,
+    index_path: std::path::PathBuf,
+    folded_path: std::path::PathBuf,
+    index_bytes: Vec<u8>,
+    folded: Vec<String>,
+}
 
-    let (manifest_digest, outcome) =
-        if let Ok(private_key_path) = std::env::var(STOW_MOCK_PRIVATE_KEY_PATH_ENV) {
-            publish_index_mock(&args.file, &args.folded, &private_key_path).await?
-        } else {
-            let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
-            // The keyless signer checks every signature it makes against
-            // the trust readers verify with.
-            let trust = stow_oci::verify::records_trust().await?;
-            let publisher = stow_oci::Publisher::from_env(http, &trust, TrustedWorkflow::INDEX)?;
-            let outcome = stow_oci::publish_index(
-                &publisher,
-                &bytes,
-                &target,
-                &index.header.rustc_version,
-                &sha256,
-            )
-            .await?;
-            // The folded set publishes under the same identity in the
-            // same step — the export that follows only ever sees pairs
-            // this command pushed.
-            stow_oci::publish_folded(
-                &publisher,
-                &serde_json::to_vec(&folded)?,
-                &target,
-                &index.header.rustc_version,
-            )
-            .await?;
-            match outcome {
-                stow_oci::IndexPublishOutcome::Published { manifest_digest } => {
-                    (manifest_digest, "published")
-                }
-                stow_oci::IndexPublishOutcome::Unchanged { manifest_digest } => {
-                    (manifest_digest, "unchanged")
-                }
-                stow_oci::IndexPublishOutcome::Resigned { manifest_digest } => {
-                    (manifest_digest, "resigned")
-                }
-            }
-        };
-    tracing::info!(%tag, %ftag, %manifest_digest, outcome, "published artifact index slice");
-    let line = serde_json::to_string(&IndexPublishSummary {
-        tag,
-        folded_tag: ftag,
+/// Phase-1 outcome for one slice inside [`publish_pass`].
+enum Phase1Outcome {
+    Published {
+        manifest_digest: String,
+        outcome: &'static str,
+    },
+    Failed(String),
+    SkippedHostFailed(String),
+}
+
+/// Load and validate every slice listed in `slices.json` from `dir` before
+/// pushing anything, so local corruption or export skew fails fast before any
+/// tag moves.
+async fn load_prepared_slices(
+    dir: &std::path::Path,
+    summaries: Vec<IndexExportSummary>,
+) -> stow_types::error::Result<Vec<PreparedSlice>> {
+    let mut prepared = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let index_path = dir.join(&summary.index_file);
+        let folded_path = dir.join(&summary.folded_file);
+        let index_bytes = tokio::fs::read(&index_path)
+            .await
+            .map_err(|error| stow_error!("read index file {}: {error}", index_path.display()))?;
+        let index = ArtifactIndex::decode(&index_bytes)
+            .map_err(|error| stow_error!("decode index file {}: {error}", index_path.display()))?;
+        if index.header.target.as_str() != summary.target
+            || index.header.rustc_version.as_str() != summary.rustc_version
+        {
+            return Err(stow_error!(
+                "index file {} carries header {}/{}, expected {}/{}",
+                index_path.display(),
+                index.header.target,
+                index.header.rustc_version,
+                summary.target,
+                summary.rustc_version,
+            ));
+        }
+        let actual_content_sha256 = content_sha256(&index).map_err(|error| {
+            stow_error!("digest index content {}: {error}", index_path.display())
+        })?;
+        if actual_content_sha256 != summary.content_sha256 {
+            return Err(stow_error!(
+                "index file {} content_sha256 {actual_content_sha256} disagrees with slices.json {}",
+                index_path.display(),
+                summary.content_sha256,
+            ));
+        }
+        let folded_bytes = tokio::fs::read(&folded_path)
+            .await
+            .map_err(|error| stow_error!("read folded file {}: {error}", folded_path.display()))?;
+        let folded: Vec<String> = serde_json::from_slice(&folded_bytes).map_err(|error| {
+            stow_error!("decode folded file {}: {error}", folded_path.display())
+        })?;
+        prepared.push(PreparedSlice {
+            rustc_version: index.header.rustc_version,
+            summary,
+            index_path,
+            folded_path,
+            index_bytes,
+            folded,
+        });
+    }
+    Ok(prepared)
+}
+
+fn build_publish_summary(
+    slice: &PreparedSlice,
+    manifest_digest: Option<String>,
+    outcome: &str,
+    index_published: bool,
+    folded_published: bool,
+    error: Option<String>,
+) -> IndexPublishSummary {
+    IndexPublishSummary {
+        target: slice.summary.target.clone(),
+        rustc_version: slice.summary.rustc_version.clone(),
+        tag: slice.summary.tag.clone(),
+        folded_tag: slice.summary.folded_tag.clone(),
+        index_file: slice.summary.index_file.clone(),
+        lookup_file: slice.summary.lookup_file.clone(),
         manifest_digest,
-        outcome,
-    })
-    .map_err(|error| stow_error!("serialize index publish summary: {error}"))?;
-    render::emit_line(&line);
+        outcome: outcome.to_owned(),
+        index_published,
+        folded_published,
+        error,
+    }
+}
+
+async fn publish_phase1_indexes<'a, I>(
+    ordered: &[&'a PreparedSlice],
+    publish_index: &I,
+) -> (Vec<Phase1Outcome>, BTreeSet<&'a str>)
+where
+    I: Fn(&'a PreparedSlice) -> PullFut<'a, (String, &'static str)> + Send + Sync,
+{
+    let mut failed_hosts: BTreeSet<(&str, &str)> = BTreeSet::new();
+    let mut succeeded_tags: BTreeSet<&'a str> = BTreeSet::new();
+    let mut outcomes: Vec<Phase1Outcome> = Vec::with_capacity(ordered.len());
+
+    for &slice in ordered {
+        if let Some(host) = cross_host_triple(&slice.summary.target)
+            && failed_hosts.contains(&(host, slice.summary.rustc_version.as_str()))
+        {
+            let message = format!(
+                "skipped {} because runner host slice {host} failed in phase 1",
+                slice.summary.tag
+            );
+            tracing::error!(tag = %slice.summary.tag, host, "{message}");
+            outcomes.push(Phase1Outcome::SkippedHostFailed(message));
+            continue;
+        }
+        match publish_index(slice).await {
+            Ok((manifest_digest, outcome)) => {
+                tracing::info!(
+                    tag = %slice.summary.tag,
+                    %manifest_digest,
+                    outcome,
+                    "published artifact index slice"
+                );
+                succeeded_tags.insert(slice.summary.tag.as_str());
+                outcomes.push(Phase1Outcome::Published {
+                    manifest_digest,
+                    outcome,
+                });
+            }
+            Err(error) => {
+                let message = error.to_string();
+                tracing::error!(tag = %slice.summary.tag, error = %message, "index publish failed");
+                failed_hosts.insert((
+                    slice.summary.target.as_str(),
+                    slice.summary.rustc_version.as_str(),
+                ));
+                outcomes.push(Phase1Outcome::Failed(message));
+            }
+        }
+    }
+    (outcomes, succeeded_tags)
+}
+
+async fn publish_phase2_folded<'a, F>(
+    ordered: Vec<&'a PreparedSlice>,
+    phase1: Vec<Phase1Outcome>,
+    excluded_tags: &BTreeSet<&str>,
+    publish_folded: &F,
+) -> Vec<IndexPublishSummary>
+where
+    F: Fn(&'a PreparedSlice, Vec<String>) -> PullFut<'a, ()> + Send + Sync,
+{
+    let mut results = Vec::with_capacity(ordered.len());
+    for (slice, p1) in ordered.into_iter().zip(phase1) {
+        let summary = match p1 {
+            Phase1Outcome::Published {
+                manifest_digest,
+                outcome,
+            } => {
+                let filtered: Vec<String> = slice
+                    .folded
+                    .iter()
+                    .filter(|tag| !excluded_tags.contains(tag.as_str()))
+                    .cloned()
+                    .collect();
+                let (folded_published, error) = match publish_folded(slice, filtered).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            folded_tag = %slice.summary.folded_tag,
+                            "published artifact index folded set"
+                        );
+                        (true, None)
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        tracing::error!(
+                            folded_tag = %slice.summary.folded_tag,
+                            error = %message,
+                            "folded set publish failed"
+                        );
+                        (false, Some(message))
+                    }
+                };
+                build_publish_summary(
+                    slice,
+                    Some(manifest_digest),
+                    outcome,
+                    true,
+                    folded_published,
+                    error,
+                )
+            }
+            Phase1Outcome::Failed(message) => {
+                build_publish_summary(slice, None, "failed", false, false, Some(message))
+            }
+            Phase1Outcome::SkippedHostFailed(message) => build_publish_summary(
+                slice,
+                None,
+                "skipped-host-failed",
+                false,
+                false,
+                Some(message),
+            ),
+        };
+        results.push(summary);
+    }
+    results
+}
+
+/// Two-phase publish of an export pass:
+///
+/// - **Phase 1**: publish `index.<target>.<rustc>` only, host slices before
+///   cross slices. If a runner host slice fails, every cross slice built on
+///   that host is skipped (`skipped-host-failed`) so downstream cross tasks
+///   cannot be released without their host-side build scripts.
+/// - **Phase 2**: publish `folded.<target>.<rustc>` only for slices that
+///   succeeded in phase 1, filtering out any newly-folded multi-slice tag in
+///   `shared_tags` unless **every** slice it named succeeded in phase 1.
+async fn publish_pass<'a, I, F>(
+    slices: &'a [PreparedSlice],
+    shared_tags: &BTreeMap<String, Vec<String>>,
+    publish_index: I,
+    publish_folded: F,
+) -> Vec<IndexPublishSummary>
+where
+    I: Fn(&'a PreparedSlice) -> PullFut<'a, (String, &'static str)> + Send + Sync,
+    F: Fn(&'a PreparedSlice, Vec<String>) -> PullFut<'a, ()> + Send + Sync,
+{
+    let mut ordered: Vec<&'a PreparedSlice> = slices.iter().collect();
+    ordered.sort_by(|a, b| {
+        slice_order_key(&a.summary.target, &a.summary.rustc_version).cmp(&slice_order_key(
+            &b.summary.target,
+            &b.summary.rustc_version,
+        ))
+    });
+    let (phase1, succeeded_tags) = publish_phase1_indexes(&ordered, &publish_index).await;
+    // Exclude any multi-slice tag from every slice's `folded.*` set unless
+    // EVERY slice that tag named went live in phase 1; otherwise the next
+    // export's `folded_union` would skip pulling that tag and permanently lose
+    // its rows for the slice(s) that failed.
+    let excluded_tags: BTreeSet<&str> = shared_tags
+        .iter()
+        .filter(|(_, slice_tags)| {
+            !slice_tags
+                .iter()
+                .all(|tag| succeeded_tags.contains(tag.as_str()))
+        })
+        .map(|(records_tag, _)| records_tag.as_str())
+        .collect();
+    publish_phase2_folded(ordered, phase1, &excluded_tags, &publish_folded).await
+}
+
+/// `stow-admin index publish --dir <out-dir>` — the second half of the index
+/// pipeline. Publishes every changed slice in two phases (`index.*` host-first,
+/// then filtered `folded.*`), prints one JSON summary line per slice, writes
+/// `<dir>/published.json`, and exits non-zero if any slice failed in either
+/// phase.
+async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> {
+    let published_path = args.dir.join("published.json");
+    match tokio::fs::remove_file(&published_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(stow_error!(
+                "remove stale {}: {error}",
+                published_path.display()
+            ));
+        }
+    }
+    let slices_path = args.dir.join("slices.json");
+    let slices_bytes = tokio::fs::read(&slices_path)
+        .await
+        .map_err(|error| stow_error!("read {}: {error}", slices_path.display()))?;
+    let summaries: Vec<IndexExportSummary> = serde_json::from_slice(&slices_bytes)
+        .map_err(|error| stow_error!("decode {}: {error}", slices_path.display()))?;
+    let shared_path = args.dir.join("shared-tags.json");
+    let shared_bytes = tokio::fs::read(&shared_path)
+        .await
+        .map_err(|error| stow_error!("read {}: {error}", shared_path.display()))?;
+    let shared_tags: BTreeMap<String, Vec<String>> = serde_json::from_slice(&shared_bytes)
+        .map_err(|error| stow_error!("decode {}: {error}", shared_path.display()))?;
+
+    if summaries.is_empty() {
+        tokio::fs::write(&published_path, b"[]")
+            .await
+            .map_err(|error| stow_error!("write {}: {error}", published_path.display()))?;
+        return Ok(());
+    }
+
+    let prepared = load_prepared_slices(&args.dir, summaries).await?;
+    let results = if let Ok(private_key_path) = std::env::var(STOW_MOCK_PRIVATE_KEY_PATH_ENV) {
+        publish_pass_mock(&args.dir, &prepared, &shared_tags, &private_key_path).await?
+    } else {
+        publish_pass_production(&prepared, &shared_tags).await?
+    };
+
+    for summary in &results {
+        let line = serde_json::to_string(summary)
+            .map_err(|error| stow_error!("serialize index publish summary: {error}"))?;
+        render::emit_line(&line);
+    }
+    tokio::fs::write(&published_path, serde_json::to_vec(&results)?)
+        .await
+        .map_err(|error| stow_error!("write {}: {error}", published_path.display()))?;
+
+    let failed: Vec<&str> = results
+        .iter()
+        .filter_map(|summary| {
+            if !summary.index_published {
+                Some(summary.tag.as_str())
+            } else if !summary.folded_published {
+                Some(summary.folded_tag.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !failed.is_empty() {
+        return Err(stow_error!(
+            "index publish incomplete: {}",
+            failed.join(", ")
+        ));
+    }
     Ok(())
+}
+
+async fn publish_pass_production(
+    prepared: &[PreparedSlice],
+    shared_tags: &BTreeMap<String, Vec<String>>,
+) -> stow_types::error::Result<Vec<IndexPublishSummary>> {
+    let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
+    // The keyless signer checks every signature it makes against the trust
+    // readers verify with.
+    let trust = stow_oci::verify::records_trust().await?;
+    let publisher = stow_oci::Publisher::from_env(http, &trust, TrustedWorkflow::INDEX)?;
+    let pub_ref = &publisher;
+    Ok(publish_pass(
+        prepared,
+        shared_tags,
+        |slice| {
+            Box::pin(async move {
+                let outcome = stow_oci::publish_index(
+                    pub_ref,
+                    &slice.index_bytes,
+                    &slice.summary.target,
+                    &slice.rustc_version,
+                    &slice.summary.content_sha256,
+                )
+                .await?;
+                Ok(match outcome {
+                    stow_oci::IndexPublishOutcome::Published { manifest_digest } => {
+                        (manifest_digest, "published")
+                    }
+                    stow_oci::IndexPublishOutcome::Unchanged { manifest_digest } => {
+                        (manifest_digest, "unchanged")
+                    }
+                    stow_oci::IndexPublishOutcome::Resigned { manifest_digest } => {
+                        (manifest_digest, "resigned")
+                    }
+                })
+            })
+        },
+        |slice, filtered| {
+            Box::pin(async move {
+                let bytes = serde_json::to_vec(&filtered)?;
+                stow_oci::publish_folded(
+                    pub_ref,
+                    &bytes,
+                    &slice.summary.target,
+                    &slice.rustc_version,
+                )
+                .await?;
+                Ok(())
+            })
+        },
+    )
+    .await)
+}
+
+async fn publish_pass_mock(
+    out_dir: &std::path::Path,
+    prepared: &[PreparedSlice],
+    shared_tags: &BTreeMap<String, Vec<String>>,
+    private_key_path: &str,
+) -> stow_types::error::Result<Vec<IndexPublishSummary>> {
+    let registry_root = std::env::var(STOW_MOCK_REGISTRY_ROOT_ENV)
+        .map_err(|_| stow_error!("missing {STOW_MOCK_REGISTRY_ROOT_ENV}"))?;
+    let mock_registry_exe = mock_registry_binary()?;
+    let registry_root_ref = registry_root.as_str();
+    let mock_exe_ref = mock_registry_exe.as_path();
+    Ok(publish_pass(
+        prepared,
+        shared_tags,
+        |slice| {
+            Box::pin(async move {
+                publish_index_mock(
+                    mock_exe_ref,
+                    &slice.index_path,
+                    registry_root_ref,
+                    private_key_path,
+                )
+                .await
+            })
+        },
+        |slice, filtered| {
+            Box::pin(async move {
+                publish_folded_mock(
+                    mock_exe_ref,
+                    out_dir,
+                    slice,
+                    &filtered,
+                    registry_root_ref,
+                    private_key_path,
+                )
+                .await
+            })
+        },
+    )
+    .await)
 }
 
 /// The edge route a publish run's slices are reported to.
@@ -1427,6 +1849,14 @@ async fn index_report<H: SliceHistory>(
     for file in &args.file {
         slices.extend(slice_report_for(file, args.full).await?);
     }
+    // Report host slices before cross-target slices so a multi-body report
+    // never releases cross-target dependents before their runner host slice.
+    slices.sort_by(|a, b| {
+        slice_order_key(a.target.as_str(), a.rustc_version.as_str()).cmp(&slice_order_key(
+            b.target.as_str(),
+            b.rustc_version.as_str(),
+        ))
+    });
     let has_delta = slices.iter().any(|slice| slice.base_generation.is_some());
     let reported: Vec<(TargetTriple, WireRustcVersion, i64)> = slices
         .iter()
@@ -1782,13 +2212,23 @@ async fn index_reconcile(edge: &Edge, args: IndexReconcileArgs) -> stow_types::e
 }
 
 /// Replay every `live` slice the scheduler does not hold as published
-/// and post the reports, in order.
+/// and post the reports, host slices before cross-target slices.
 async fn reconcile(
     edge: &Edge,
     history: &impl SliceHistory,
-    live: Vec<SliceManifest>,
+    mut live: Vec<SliceManifest>,
     held: &BTreeMap<(TargetTriple, WireRustcVersion), HeldSlice>,
 ) -> stow_types::error::Result<IndexReconcileSummary> {
+    live.sort_by(|a, b| {
+        slice_order_key(
+            a.index.header.target.as_str(),
+            a.index.header.rustc_version.as_str(),
+        )
+        .cmp(&slice_order_key(
+            b.index.header.target.as_str(),
+            b.index.header.rustc_version.as_str(),
+        ))
+    });
     let replays = futures_util::stream::iter(live.into_iter().map(|manifest| {
         let key = (
             manifest.index.header.target.clone(),
@@ -1905,18 +2345,7 @@ struct MockIndexPublishReport {
     outcome: String,
 }
 
-/// Mock-key mode: delegate the registry write and the mock signature to
-/// the sibling `stow-mock-registry` binary, the same way `stow-build
-/// serve` delegates bundle publication to `stow-mock-registry populate`.
-/// The child reports the manifest digest and outcome on its last stdout
-/// line.
-async fn publish_index_mock(
-    file: &std::path::Path,
-    folded: &std::path::Path,
-    private_key_path: &str,
-) -> stow_types::error::Result<(String, &'static str)> {
-    let registry_root = std::env::var(STOW_MOCK_REGISTRY_ROOT_ENV)
-        .map_err(|_| stow_error!("missing {STOW_MOCK_REGISTRY_ROOT_ENV}"))?;
+fn mock_registry_binary() -> stow_types::error::Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
     let mock_registry_exe = exe
         .parent()
@@ -1931,12 +2360,22 @@ async fn publish_index_mock(
             mock_registry_exe.display()
         ));
     }
-    let output = tokio::process::Command::new(&mock_registry_exe)
+    Ok(mock_registry_exe)
+}
+
+/// Mock-key phase 1: delegate the signed index write to the sibling
+/// `stow-mock-registry publish-index` binary. The child reports the manifest
+/// digest and outcome on its last stdout line.
+async fn publish_index_mock(
+    mock_registry_exe: &std::path::Path,
+    file: &std::path::Path,
+    registry_root: &str,
+    private_key_path: &str,
+) -> stow_types::error::Result<(String, &'static str)> {
+    let output = tokio::process::Command::new(mock_registry_exe)
         .arg("publish-index")
         .arg("--file")
         .arg(file)
-        .arg("--folded")
-        .arg(folded)
         .arg("--registry-root")
         .arg(registry_root)
         .arg("--private-key")
@@ -1969,6 +2408,74 @@ async fn publish_index_mock(
         }
     };
     Ok((report.manifest_digest, outcome))
+}
+
+/// Mock-key phase 2: delegate the signed folded-set write to the sibling
+/// `stow-mock-registry publish-folded` binary. When multi-slice tags were
+/// filtered out, write the filtered list to a temporary file beside the export
+/// so the exported file stays intact.
+async fn publish_folded_mock(
+    mock_registry_exe: &std::path::Path,
+    out_dir: &std::path::Path,
+    slice: &PreparedSlice,
+    filtered: &[String],
+    registry_root: &str,
+    private_key_path: &str,
+) -> stow_types::error::Result<()> {
+    if filtered == slice.folded.as_slice() {
+        return run_mock_publish_folded(
+            mock_registry_exe,
+            slice,
+            &slice.folded_path,
+            registry_root,
+            private_key_path,
+        )
+        .await;
+    }
+    let mut temp = tempfile::NamedTempFile::new_in(out_dir)
+        .map_err(|error| stow_error!("create filtered folded temp file: {error}"))?;
+    let bytes = serde_json::to_vec(filtered)?;
+    std::io::Write::write_all(&mut temp, &bytes)
+        .map_err(|error| stow_error!("write filtered folded temp file: {error}"))?;
+    run_mock_publish_folded(
+        mock_registry_exe,
+        slice,
+        temp.path(),
+        registry_root,
+        private_key_path,
+    )
+    .await
+}
+
+async fn run_mock_publish_folded(
+    mock_registry_exe: &std::path::Path,
+    slice: &PreparedSlice,
+    folded_path: &std::path::Path,
+    registry_root: &str,
+    private_key_path: &str,
+) -> stow_types::error::Result<()> {
+    let output = tokio::process::Command::new(mock_registry_exe)
+        .arg("publish-folded")
+        .arg("--target")
+        .arg(&slice.summary.target)
+        .arg("--rustc-version")
+        .arg(&slice.summary.rustc_version)
+        .arg("--file")
+        .arg(folded_path)
+        .arg("--registry-root")
+        .arg(registry_root)
+        .arg("--private-key")
+        .arg(private_key_path)
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(stow_error!(
+            "mock registry publish-folded failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
 }
 
 /// `CF_ACCOUNT_ID` — the account the digest leaderboard's Analytics
@@ -3992,5 +4499,492 @@ mod tests {
                 "{paths:?}"
             );
         });
+    }
+
+    fn record_for_target(
+        target: &str,
+        task_id: &str,
+        kind: ArtifactKind,
+        crate_name: &str,
+    ) -> ArtifactRecord {
+        let mut r = record(task_id);
+        let is_script = kind == ArtifactKind::BuildScript;
+        r.target = TargetTriple::parse(target).expect("target");
+        r.crate_name = CrateName::parse(crate_name).expect("crate name");
+        r.artifact_kind = kind;
+        if is_script {
+            r.crate_types = vec![RustCrateType::Bin];
+            r.unit_shape.side = stow_types::public_cache::UnitSide::Host;
+        }
+        r
+    }
+
+    fn run_recovery_export(
+        stored_indexes: &BTreeMap<String, ArtifactIndex>,
+        stored_folded: &BTreeMap<String, Vec<String>>,
+        by_tag: &BTreeMap<String, Vec<ArtifactRecord>>,
+        tags: &[String],
+        rustc: &WireRustcVersion,
+    ) -> (ExportPass, Vec<String>) {
+        let pulled = Mutex::new(Vec::<String>::new());
+        let pass = block_on(export_pass(
+            tags,
+            |ftag| {
+                let got = stored_folded.get(ftag).map(|folded| {
+                    let (target, rustc_str) = folded_tag_parts(ftag).expect("folded tag");
+                    let itag = index_tag(target, rustc_str);
+                    (
+                        (
+                            TargetTriple::parse(target).expect("target"),
+                            WireRustcVersion::parse(rustc_str).expect("rustc"),
+                        ),
+                        PrevSlice {
+                            index: stored_indexes[&itag].clone(),
+                            folded: folded.iter().cloned().collect(),
+                        },
+                    )
+                });
+                Box::pin(async move { Ok(got) })
+            },
+            |tag| {
+                pulled.lock().unwrap().push(tag.to_owned());
+                let records = by_tag[tag].clone();
+                Box::pin(async move {
+                    Ok(BuildRecords {
+                        artifacts: records,
+                        local_programs: Vec::new(),
+                    })
+                })
+            },
+            false,
+            rustc,
+        ))
+        .expect("recovery export pass");
+        (pass, pulled.into_inner().unwrap())
+    }
+
+    fn prepared_from_slice(slice: &SliceExport) -> PreparedSlice {
+        let index_bytes = stow_shim::encode_index(&slice.index).expect("encode index");
+        let index_name = index_tag(slice.target.as_str(), slice.rustc_version.as_str());
+        let folded_name = folded_tag(slice.target.as_str(), slice.rustc_version.as_str());
+        let lookup_name = format!("{index_name}.lookup.json");
+        let summary = IndexExportSummary {
+            target: slice.target.as_str().to_owned(),
+            rustc_version: slice.rustc_version.as_str().to_owned(),
+            tag: index_name.clone(),
+            folded_tag: folded_name.clone(),
+            index_file: index_name.clone(),
+            folded_file: folded_name.clone(),
+            lookup_file: lookup_name,
+            rows: slice.index.header.row_count,
+            bytes: index_bytes.len(),
+            sha256: sha256_digest(&index_bytes),
+            content_sha256: content_sha256(&slice.index).expect("content sha"),
+        };
+        PreparedSlice {
+            summary,
+            rustc_version: slice.rustc_version.clone(),
+            index_path: std::path::PathBuf::from(index_name),
+            folded_path: std::path::PathBuf::from(folded_name),
+            index_bytes,
+            folded: slice.folded.clone(),
+        }
+    }
+
+    #[test]
+    fn merge_exports_orders_host_slices_before_cross_slices() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let slices = merge_exports(
+            BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &rustc,
+        )
+        .expect("merge exports");
+        let targets: Vec<&str> = slices.iter().map(|s| s.target.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec![
+                "aarch64-apple-darwin",
+                "x86_64-pc-windows-msvc",
+                "x86_64-unknown-linux-gnu",
+                "aarch64-apple-ios",
+                "aarch64-apple-ios-sim",
+                "aarch64-linux-android",
+                "aarch64-pc-windows-msvc",
+                "aarch64-unknown-linux-gnu",
+                "wasm32-unknown-unknown",
+            ]
+        );
+    }
+
+    struct SimulatedPublish {
+        summaries: Vec<IndexPublishSummary>,
+        events: Vec<String>,
+        indexes: BTreeMap<String, ArtifactIndex>,
+        folded: BTreeMap<String, Vec<String>>,
+    }
+
+    fn simulate_publish(
+        pass: &ExportPass,
+        include_targets: &[&str],
+        fail_target: &str,
+    ) -> SimulatedPublish {
+        let prepared: Vec<PreparedSlice> = pass
+            .slices
+            .iter()
+            .filter(|s| include_targets.contains(&s.target.as_str()))
+            .map(prepared_from_slice)
+            .collect();
+        let events = Mutex::new(Vec::<String>::new());
+        let indexes = Mutex::new(BTreeMap::<String, ArtifactIndex>::new());
+        let folded = Mutex::new(BTreeMap::<String, Vec<String>>::new());
+        let summaries = block_on(publish_pass(
+            &prepared,
+            &pass.shared_tags,
+            |slice| {
+                let (target, tag) = (slice.summary.target.clone(), slice.summary.tag.clone());
+                let index = ArtifactIndex::decode(&slice.index_bytes).expect("decode");
+                events.lock().unwrap().push(format!("index:{target}"));
+                let result = if target == fail_target {
+                    Err(stow_error!("simulated failure for {fail_target}"))
+                } else {
+                    indexes.lock().unwrap().insert(tag, index);
+                    Ok(("sha256:00".to_owned(), "published"))
+                };
+                Box::pin(async move { result })
+            },
+            |slice, filtered| {
+                events
+                    .lock()
+                    .unwrap()
+                    .push(format!("folded:{}", slice.summary.target));
+                folded
+                    .lock()
+                    .unwrap()
+                    .insert(slice.summary.folded_tag.clone(), filtered);
+                Box::pin(async { Ok(()) })
+            },
+        ));
+        SimulatedPublish {
+            summaries,
+            events: events.into_inner().unwrap(),
+            indexes: indexes.into_inner().unwrap(),
+            folded: folded.into_inner().unwrap(),
+        }
+    }
+
+    /// Regression for the cross-target build-script loss incident: a
+    /// cross-target crate with a `build.rs` publishes one `records-*` artifact
+    /// carrying target-side `Rlib`s (`aarch64-unknown-linux-gnu`) and a
+    /// host-side `BuildScript` (`x86_64-unknown-linux-gnu`). When the runner
+    /// host slice fails in phase 1:
+    /// 1. Every cross slice on that host is skipped (`skipped-host-failed`),
+    ///    never published or reported without its host slice.
+    /// 2. Unrelated runner families (`aarch64-apple-darwin` + `aarch64-apple-ios`)
+    ///    still publish both `index.*` and `folded.*`.
+    /// 3. Neither `folded.x86_64-unknown-linux-gnu` nor
+    ///    `folded.aarch64-unknown-linux-gnu` is written, so the next export
+    ///    re-pulls the shared `records-*` tag and publishes both the `Rlib`
+    ///    and the `BuildScript`.
+    #[test]
+    fn publish_pass_gates_cross_slices_when_host_fails_and_preserves_recovery() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let (linux_host, linux_cross) = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu");
+        let (mac_host, ios_cross) = ("aarch64-apple-darwin", "aarch64-apple-ios");
+        let crc_tag = records_tag(RUSTC, "aaaa1111", BUILD);
+        let ios_tag = records_tag(RUSTC, "bbbb2222", BUILD);
+        let crc_rlib = record_for_target(linux_cross, "aaaa1111", ArtifactKind::Rlib, "crc32fast");
+        let crc_script = record_for_target(
+            linux_host,
+            "aaaa1112",
+            ArtifactKind::BuildScript,
+            "crc32fast",
+        );
+        let by_tag = BTreeMap::from([
+            (crc_tag.clone(), vec![crc_rlib.clone(), crc_script.clone()]),
+            (
+                ios_tag.clone(),
+                vec![
+                    record_for_target(ios_cross, "bbbb2222", ArtifactKind::Rlib, "crc32fast"),
+                    record_for_target(mac_host, "bbbb2223", ArtifactKind::BuildScript, "crc32fast"),
+                ],
+            ),
+        ]);
+        let tags = vec![crc_tag.clone(), ios_tag.clone()];
+        let pass1 = block_on(export_pass(
+            &tags,
+            pull_no_prev(),
+            pull_records_by_tag(by_tag.clone()),
+            false,
+            &rustc,
+        ))
+        .expect("export pass 1");
+        assert_eq!(
+            pass1.shared_tags.get(&crc_tag),
+            Some(&vec![
+                index_tag(linux_cross, RUSTC),
+                index_tag(linux_host, RUSTC),
+            ])
+        );
+        let sim = simulate_publish(
+            &pass1,
+            &[linux_host, linux_cross, mac_host, ios_cross],
+            linux_host,
+        );
+        assert_eq!(
+            sim.events,
+            vec![
+                format!("index:{mac_host}"),
+                format!("index:{linux_host}"),
+                format!("index:{ios_cross}"),
+                format!("folded:{mac_host}"),
+                format!("folded:{ios_cross}"),
+            ]
+        );
+        let by_target: BTreeMap<&str, &IndexPublishSummary> = sim
+            .summaries
+            .iter()
+            .map(|s| (s.target.as_str(), s))
+            .collect();
+        assert!(by_target[mac_host].index_published && by_target[mac_host].folded_published);
+        assert!(by_target[ios_cross].index_published && by_target[ios_cross].folded_published);
+        assert_eq!(by_target[linux_host].outcome, "failed");
+        assert_eq!(by_target[linux_cross].outcome, "skipped-host-failed");
+
+        let mut next_tags: Vec<String> = sim.folded.keys().cloned().collect();
+        next_tags.extend([crc_tag.clone(), ios_tag]);
+        let (pass2, pulled) =
+            run_recovery_export(&sim.indexes, &sim.folded, &by_tag, &next_tags, &rustc);
+        assert_eq!(pulled, vec![crc_tag]);
+        let host_slice = pass2
+            .slices
+            .iter()
+            .find(|s| s.target.as_str() == linux_host)
+            .expect("host slice recovered");
+        let cross_slice = pass2
+            .slices
+            .iter()
+            .find(|s| s.target.as_str() == linux_cross)
+            .expect("cross slice recovered");
+        assert_eq!(
+            host_slice.index.build_scripts,
+            vec![record_to_index_row(&crc_script)]
+        );
+        assert_eq!(cross_slice.index.rows, vec![record_to_index_row(&crc_rlib)]);
+    }
+
+    /// Converse failure mode: the runner host slice succeeds in phase 1, then
+    /// the cross-target slice fails in phase 1. Phase 2 MUST exclude the shared
+    /// cross-build `records-*` tag from `folded.<host>` while still recording
+    /// host-only tags, so the next export re-pulls ONLY the shared tag, keeps
+    /// the host slice's generation unchanged (`content_sha256` equal), and
+    /// publishes the missing cross slice `Rlib`s.
+    #[test]
+    fn publish_pass_excludes_shared_tags_from_host_folded_when_cross_fails_and_recovers() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let (linux_host, linux_cross) = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu");
+        let host_only_tag = records_tag(RUSTC, "cccc3333", BUILD);
+        let shared_tag = records_tag(RUSTC, "dddd4444", BUILD);
+        let cross_rlib = record_for_target(linux_cross, "dddd4444", ArtifactKind::Rlib, "rustix");
+        let by_tag = BTreeMap::from([
+            (
+                host_only_tag.clone(),
+                vec![record_for_target(
+                    linux_host,
+                    "cccc3333",
+                    ArtifactKind::Rlib,
+                    "serde",
+                )],
+            ),
+            (
+                shared_tag.clone(),
+                vec![
+                    cross_rlib.clone(),
+                    record_for_target(linux_host, "dddd4445", ArtifactKind::BuildScript, "rustix"),
+                ],
+            ),
+        ]);
+        let tags = vec![host_only_tag.clone(), shared_tag.clone()];
+        let pass1 = block_on(export_pass(
+            &tags,
+            pull_no_prev(),
+            pull_records_by_tag(by_tag.clone()),
+            false,
+            &rustc,
+        ))
+        .expect("export pass 1");
+        let sim = simulate_publish(&pass1, &[linux_host, linux_cross], linux_cross);
+        let by_target: BTreeMap<&str, &IndexPublishSummary> = sim
+            .summaries
+            .iter()
+            .map(|s| (s.target.as_str(), s))
+            .collect();
+        assert!(by_target[linux_host].index_published && by_target[linux_host].folded_published);
+        assert!(
+            !by_target[linux_cross].index_published && !by_target[linux_cross].folded_published
+        );
+
+        let host_ftag = folded_tag(linux_host, RUSTC);
+        assert_eq!(
+            sim.folded.get(&host_ftag),
+            Some(&vec![host_only_tag.clone()]),
+            "host folded keeps host-only tag and excludes shared tag whose cross slice failed"
+        );
+        assert!(
+            !sim.folded.contains_key(&folded_tag(linux_cross, RUSTC)),
+            "failed cross slice writes no folded tag"
+        );
+
+        let next_tags = vec![host_ftag, host_only_tag, shared_tag.clone()];
+        let (pass2, pulled) =
+            run_recovery_export(&sim.indexes, &sim.folded, &by_tag, &next_tags, &rustc);
+        assert_eq!(pulled, vec![shared_tag.clone()]);
+        let host_slice = pass2
+            .slices
+            .iter()
+            .find(|s| s.target.as_str() == linux_host)
+            .expect("host slice");
+        let cross_slice = pass2
+            .slices
+            .iter()
+            .find(|s| s.target.as_str() == linux_cross)
+            .expect("cross slice");
+        assert_eq!(host_slice.index.header.generation, 1);
+        assert!(host_slice.folded.contains(&shared_tag));
+        assert_eq!(
+            cross_slice.index.rows,
+            vec![record_to_index_row(&cross_rlib)]
+        );
+        assert_eq!(cross_slice.folded, vec![shared_tag]);
+    }
+
+    #[test]
+    fn publish_pass_allows_cross_only_slice_when_host_was_not_in_pass() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let linux_cross = "aarch64-unknown-linux-gnu";
+        let tag = records_tag(RUSTC, "eeee5555", BUILD);
+        let rlib = record_for_target(linux_cross, "eeee5555", ArtifactKind::Rlib, "byteorder");
+        let pass = block_on(export_pass(
+            std::slice::from_ref(&tag),
+            pull_no_prev(),
+            pull_records_by_tag(BTreeMap::from([(tag.clone(), vec![rlib])])),
+            false,
+            &rustc,
+        ))
+        .expect("export pass");
+        let prepared: Vec<PreparedSlice> = pass
+            .slices
+            .iter()
+            .filter(|s| s.target.as_str() == linux_cross)
+            .map(prepared_from_slice)
+            .collect();
+        let summaries = block_on(publish_pass(
+            &prepared,
+            &pass.shared_tags,
+            |_slice| Box::pin(async { Ok(("sha256:22".to_owned(), "published")) }),
+            |_slice, _filtered| Box::pin(async { Ok(()) }),
+        ));
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].index_published && summaries[0].folded_published);
+    }
+
+    #[tokio::test]
+    async fn index_report_and_reconcile_post_host_slices_before_cross_slices() {
+        let dir = tempfile::tempdir().expect("report dir");
+        let make_index = |target: &str| ArtifactIndex {
+            header: ArtifactIndexHeader {
+                format_version: ARTIFACT_INDEX_FORMAT_VERSION,
+                target: TargetTriple::parse(target).expect("target"),
+                rustc_version: WireRustcVersion::parse(RUSTC).expect("rustc"),
+                generated_at: "2026-01-01T00:00:00Z".to_owned(),
+                generation: 1,
+                row_count: 1,
+            },
+            rows: vec![record_to_index_row(&record_for_target(
+                target,
+                "aaaa1111",
+                ArtifactKind::Rlib,
+                "serde",
+            ))],
+            build_scripts: Vec::new(),
+            local_programs: Vec::new(),
+        };
+        let android = "aarch64-linux-android";
+        let linux_cross = "aarch64-unknown-linux-gnu";
+        let linux_host = "x86_64-unknown-linux-gnu";
+
+        let android_file = dir.path().join(index_tag(android, RUSTC));
+        let host_file = dir.path().join(index_tag(linux_host, RUSTC));
+        std::fs::write(
+            &android_file,
+            stow_shim::encode_index(&make_index(android)).expect("encode android"),
+        )
+        .expect("write android");
+        std::fs::write(
+            &host_file,
+            stow_shim::encode_index(&make_index(linux_host)).expect("encode host"),
+        )
+        .expect("write host");
+
+        let server = crate::test_server::Loopback::start(Vec::new()).await;
+        // Pass cross file BEFORE host file; `index_report` must sort host first.
+        index_report(
+            &Edge::for_test(server.url.clone()),
+            IndexReportArgs {
+                file: vec![android_file, host_file],
+                full: true,
+            },
+            &no_history,
+        )
+        .await
+        .expect("index report");
+        let requests = server.join().await;
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("report JSON");
+        let reported_targets: Vec<&str> = body["slices"]
+            .as_array()
+            .expect("slices array")
+            .iter()
+            .map(|s| s["target"].as_str().expect("target"))
+            .collect();
+        assert_eq!(reported_targets, vec![linux_host, android]);
+
+        // Reconcile given cross slices ahead of host slice must also post host first.
+        let server = crate::test_server::Loopback::start(Vec::new()).await;
+        let live = vec![
+            SliceManifest {
+                index: make_index(android),
+                previous: None,
+            },
+            SliceManifest {
+                index: make_index(linux_cross),
+                previous: None,
+            },
+            SliceManifest {
+                index: make_index(linux_host),
+                previous: None,
+            },
+        ];
+        let dummy_history = FakeHistory::chain(Vec::new());
+        reconcile(
+            &Edge::for_test(server.url.clone()),
+            &dummy_history,
+            live,
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("reconcile");
+        let requests = server.join().await;
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("reconcile JSON");
+        let reconciled_targets: Vec<&str> = body["slices"]
+            .as_array()
+            .expect("slices array")
+            .iter()
+            .map(|s| s["target"].as_str().expect("target"))
+            .collect();
+        assert_eq!(reconciled_targets, vec![linux_host, android, linux_cross]);
     }
 }

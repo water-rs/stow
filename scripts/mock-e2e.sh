@@ -325,28 +325,25 @@ publish_slices() {
         --rustc-version "$RUSTC_VERSION" \
         >"$LOG_DIR/index-export-$tag.log" 2>&1 \
         || die "stow-admin index export failed — see $LOG_DIR/index-export-$tag.log"
-    local pairs
-    pairs="$(python3 -c 'import json,sys
+    # Publish the pass in two phases (`index.*` host-first, then `folded.*`)
+    # and report all live slices in ONE call (stow#940).
+    isolated_env \
+        STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
+        STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
+        "$BIN/stow-admin" index publish \
+        --dir "$WORK_DIR/index-export" \
+        >>"$LOG_DIR/index-publish-$tag.log" 2>&1 \
+        || die "stow-admin index publish failed — see $LOG_DIR/index-publish-$tag.log"
+    local index_files
+    index_files="$(python3 -c 'import json,sys
 for s in json.load(open(sys.argv[1])):
-    print(s["index_file"], s["folded_file"])' "$WORK_DIR/index-export/slices.json")" \
-        || die "reading $WORK_DIR/index-export/slices.json failed"
-    # Every slice publishes and signs on its own; the scheduler report
-    # is ONE call per run carrying the run's slices (stow#940).
+    if s["index_published"]:
+        print(s["index_file"])' "$WORK_DIR/index-export/published.json")" \
+        || die "reading $WORK_DIR/index-export/published.json failed"
     local report_files=()
-    echo "$pairs" | while read -r index_file folded_file; do
-        [ -n "$index_file" ] || continue
-        isolated_env \
-            STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
-            STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
-            "$BIN/stow-admin" index publish \
-            --file "$WORK_DIR/index-export/$index_file" \
-            --folded "$WORK_DIR/index-export/$folded_file" \
-            >>"$LOG_DIR/index-publish-$tag.log" 2>&1 \
-            || die "stow-admin index publish failed for $index_file — see $LOG_DIR/index-publish-$tag.log"
-    done
-    while read -r index_file _; do
+    while read -r index_file; do
         [ -n "$index_file" ] && report_files+=(--file "$WORK_DIR/index-export/$index_file")
-    done <<<"$pairs"
+    done <<<"$index_files"
     isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc index-publish.yml)" \
         "$BIN/stow-admin" index report "${report_files[@]}" \
         >>"$LOG_DIR/index-report-$tag.log" 2>&1 \
