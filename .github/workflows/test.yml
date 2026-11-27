@@ -166,6 +166,11 @@ jobs:
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
+      - name: Verify publishable crate manifests
+        run: |
+          for pkg in $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish == null or (.publish | length) > 0) | .name'); do
+            cargo package --list --locked -p "$pkg" > /dev/null
+          done
       - run: cargo clippy ${{ env.NO_DEBUGINFO }} ${{ (github.event_name == 'workflow_dispatch' || needs.scope.outputs.workspace == 'true') && '--workspace' || needs.scope.outputs.package-args }} --all-targets -- -D warnings
       - if: github.event_name == 'workflow_dispatch' || needs.scope.outputs.wasm-edge == 'true'
         run: cargo clippy ${{ env.NO_DEBUGINFO }} -p stow-edge --target wasm32-unknown-unknown -- -D warnings
