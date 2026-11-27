@@ -486,6 +486,7 @@ async fn fetch_slice(
         &tag,
         target,
         rustc_version,
+        pointer.is_some(),
     )
     .await?
     else {
@@ -498,10 +499,11 @@ async fn fetch_slice(
     })
 }
 
-/// The slice a missing `stow-cache-v2-<rustc>` package resolves to: no
-/// published manifest, zero rows — every lookup misses, which is exactly
-/// what a rustc nothing has published for means. `stow-cache-v2-<rustc>`
-/// deleted and rebuilt reads the same until the first publish lands.
+/// The slice an unindexed `(target, rustc)` resolves to when nothing has been
+/// published for it yet: no published manifest, zero rows — every lookup
+/// misses. Both a missing `stow-cache-v2-<rustc>` package and a newly created
+/// package whose `index.<target>.<rustc>` tag has not landed yet read the same
+/// until the first slice publish lands.
 fn empty_slice(target: &str, rustc_version: &str) -> stow_types::error::Result<IndexSlice> {
     Ok(IndexSlice {
         manifest_digest: None,
@@ -533,6 +535,7 @@ fn empty_slice(target: &str, rustc_version: &str) -> stow_types::error::Result<I
 /// cold sigstore cache) starts before the manifest pull, and the blob and
 /// the signature materials fetch together once the manifest names them
 /// (stow#347).
+#[expect(clippy::too_many_arguments, reason = "internal slice pull parameters")]
 async fn download_verified_slice(
     config: &StowConfig,
     session: &stow_oci::RegistrySession,
@@ -541,14 +544,25 @@ async fn download_verified_slice(
     tag: &str,
     target: &str,
     rustc_version: &str,
+    has_cached_pointer: bool,
 ) -> Result<Option<(Vec<u8>, String, ArtifactIndex)>, SliceFetchError> {
     let trust = verify::spawn_trust(config);
-    // A package that does not exist is the registry's answer of "empty
-    // index", not a pull failure — the same `None` every other index
-    // reader gives; a missing tag on an existing package stays an error.
+    // A package that does not exist is always the registry's answer of "empty
+    // index". When no verified slice has ever been cached locally
+    // (`!has_cached_pointer`), an absent `index.<target>.<rustc>` tag on an
+    // existing `stow-cache-v2-<rustc>` package (after the first `build-crate`
+    // run pushed `records-<rustc>-*`, before `index-publish` has published
+    // this target's slice) means the same thing; once a pointer is cached, a
+    // missing tag on an existing package stays an error so a deleted tag never
+    // downgrades a known generation to empty.
     let (bytes, manifest_digest) = match session.pull_manifest(reference).await {
         Ok(pulled) => pulled,
-        Err(error) if error.is_package_missing() => return Ok(None),
+        Err(error)
+            if error.is_package_missing()
+                || (!has_cached_pointer && error.is_manifest_unknown()) =>
+        {
+            return Ok(None);
+        }
         Err(error) => {
             return Err(SliceFetchError::registry(
                 format!("pull manifest {reference}"),
@@ -1535,6 +1549,90 @@ mod tests {
             .await
             .expect("the build path takes the registry's empty answer");
         assert_eq!(slice.index.rows.len(), 0);
+    }
+
+    /// stow#1736: once the first `build-crate` run for a new stable `rustc`
+    /// pushes `records-<rustc>-*`, `stow-cache-v2-<rustc>` exists (token
+    /// exchange returns `200`), while targets whose `index.<target>.<rustc>`
+    /// tag has not been published yet answer `404 MANIFEST_UNKNOWN`. Before
+    /// any generation is cached locally, that `404` resolves to the empty
+    /// index; once a verified pointer is cached, `404` on an existing package
+    /// stays an error on `confirmed_slice` and serves the cached slice on
+    /// `refresh_slice`.
+    #[tokio::test]
+    async fn an_unindexed_target_on_an_existing_package_serves_empty_only_when_cold() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let registry = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = registry.local_addr().expect("local addr");
+        let realm = format!("http://{address}/token");
+        std::thread::spawn(move || {
+            for stream in registry.incoming() {
+                let mut stream = stream.expect("accept");
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.ends_with(b"\r\n\r\n") {
+                    let read = std::io::Read::read(&mut stream, &mut buffer).expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let path = request
+                    .split(|byte| *byte == b' ')
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_vec();
+                let response = if path == b"/v2/" {
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"{realm}\",service=\"mock\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else if path.starts_with(b"/token") {
+                    let body = r#"{"token":"anon-ok"}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    let body =
+                        r#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown"}]}"#;
+                    format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                stream.write_all(response.as_bytes()).expect("respond");
+            }
+        });
+        let config = StowConfig {
+            cache: crate::config::CacheLayers::default(),
+            registry_base_url: format!("http://{address}"),
+            ..test_config(tempdir.path())
+        };
+
+        let cold = ensure_slice(&config, TARGET, RUSTC)
+            .await
+            .expect("cold missing tag serves empty index");
+        assert_eq!(cold.index.rows.len(), 0);
+        assert_eq!(cold.manifest_digest, None);
+        let cold_confirmed = confirmed_slice(&config, TARGET, RUSTC)
+            .await
+            .expect("cold build prefetch serves empty index");
+        assert_eq!(cold_confirmed.index.rows.len(), 0);
+
+        let dir = slice_dir(&config, TARGET, RUSTC);
+        let blob = stow_shim::encode_index(&test_index(vec![test_row("aaaa")])).expect("encode");
+        commit_slice(&dir, "sha256:aaaa", blob, 1)
+            .await
+            .expect("seed verified generation");
+
+        let refreshed = refresh_slice(&config, TARGET, RUSTC)
+            .await
+            .expect("warm refresh keeps cached slice on 404");
+        assert_eq!(refreshed.manifest_digest.as_deref(), Some("sha256:aaaa"));
+        confirmed_slice(&config, TARGET, RUSTC)
+            .await
+            .expect_err("warm confirmed_slice refuses missing tag on existing package");
     }
 
     fn generation_digest(generation: usize) -> String {

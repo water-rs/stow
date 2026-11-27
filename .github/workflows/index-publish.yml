@@ -65,15 +65,37 @@ permissions:
   # under.
   id-token: write
 
-concurrency:
-  group: index-publish
-  cancel-in-progress: false
-
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Cron and manual dispatches leave `inputs.rustc_version` empty (`workflow_run`
+  # ticks always populate it), so resolve the live stable channel only when
+  # needed without spending a runner on every build completion.
+  resolve-rustc:
+    if: inputs.rustc_version == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rustc_version: ${{ steps.resolve.outputs.rustc_version }}
+    steps:
+      - name: Resolve current stable rustc
+        id: resolve
+        run: |
+          set -euo pipefail
+          stable_rustc="$(curl -fsS https://static.rust-lang.org/dist/channel-rust-stable.toml \
+            | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
+          echo "rustc_version=$stable_rustc" >> "$GITHUB_OUTPUT"
+
   publish:
+    needs: [resolve-rustc]
+    if: always() && (needs.resolve-rustc.result == 'success' || needs.resolve-rustc.result == 'skipped')
+    # Each rustc writes exclusively to `stow-cache-v2-<rustc>`, so scoping the
+    # single-writer queue per rustc keeps rapid completions of one toolchain
+    # from superseding pending index publishes of another (stow#1736).
+    concurrency:
+      group: index-publish-${{ inputs.rustc_version || needs.resolve-rustc.outputs.rustc_version }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     # Incremental runs finish in minutes; full exports and one-time sweeps
     # (`migrate_records`, `resign`) scan the whole rustc repository and need
