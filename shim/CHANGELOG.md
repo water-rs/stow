@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.14](https://github.com/water-rs/stow/compare/shim/v0.21.13...shim/v0.21.14) - 2026-11-27
+
+### Added
+
+- *(cli)* interactive setup plan/confirmation and grouped status output
+
 ## [0.17.0](https://github.com/water-rs/stow/compare/stow-shim-v0.16.0...stow-shim-v0.17.0) - 2026-11-12
 
 ### Added

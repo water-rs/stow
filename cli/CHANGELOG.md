@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.14](https://github.com/water-rs/stow/compare/v0.21.13...v0.21.14) - 2026-11-27
+
+### Added
+
+- *(cli)* add Linux FUSE virtual CoW layer for non-CoW build-dir
+- *(cli)* interactive setup plan/confirmation and grouped status output
+- *(action)* persist local and local-crates-io tiers in GitHub Actions Cache (stow#1652)
+
+### Fixed
+
+- *(edge,cli,types)* reject non-stable rustc admissions and reap frozen in-flight leases
+- *(cli)* match build-dir records by path, not string ([#1708](https://github.com/water-rs/stow/pull/1708))
+- *(cli)* sweep build directories through hash shards ([#1708](https://github.com/water-rs/stow/pull/1708))
+- *(cli)* allow non-macos/windows lint on planned_daemon_service and use native path separator in setup plan test
+- *(cli)* isolate cargo_home in stale_project_configs walk
+- *(cli)* set 30s SQLite busy_timeout on state and tier catalog DBs
+- *(cli)* retry Windows sharing violation when removing state-v3.sqlite3
+- *(cli)* make stow clean recover state db first and skip locked build-dirs
+- *(cli)* satisfy Linux clippy lints in owner and serve
+- *(cli)* prevent daemon EMFILE crashes and reduce per-session FDs
+
+### Other
+
+- Merge pull request #1715 from water-rs/fix/reject-nightly-enqueue-and-frozen-inflight
+- *(cli)* keep daemon alive across build-dir assertions in workspace_build_dir
+- Merge pull request #1705 from water-rs/feat/setup-status-ux
+
 ## [0.21.13](https://github.com/water-rs/stow/compare/v0.21.12...v0.21.13) - 2026-11-24
 
 ### Other
