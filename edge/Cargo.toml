@@ -28,9 +28,9 @@ serde_json.workspace = true
 # the same crate skyzen's `query` feature parses with.
 serde_html_form = "0.4"
 tracing.workspace = true
-# `LegOutcome` timestamps — the same `time` stow-types exposes through
-# its runs API (OffsetDateTime construction + duration reads only).
-time = { version = "0.3", default-features = false, features = ["std"] }
+# `LegOutcome` and freeze-transition timestamps — the same `time`
+# stow-types exposes through its runs API.
+time = { version = "0.3", default-features = false, features = ["std", "parsing"] }
 semver.workspace = true
 blake3.workspace = true
 # The scheduler snapshot's bulk sections: MessagePack, carried as base64

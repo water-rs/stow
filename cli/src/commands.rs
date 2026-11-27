@@ -2101,6 +2101,39 @@ fn document_build_dir_is_stow(document: &DocumentMut) -> bool {
         .is_some_and(is_stow_build_dir)
 }
 
+/// Whether `$CARGO_HOME/config.toml` configures `build.build-dir` inside
+/// `<cache_dir>/build-dir/`.
+#[must_use]
+pub fn cargo_home_uses_stow_build_dir(cache_dir: &Path) -> bool {
+    let Ok(cargo_home) = config::require_cargo_home() else {
+        return false;
+    };
+    cargo_home_uses_stow_build_dir_in(&cargo_home, cache_dir)
+}
+
+fn cargo_home_uses_stow_build_dir_in(cargo_home: &Path, cache_dir: &Path) -> bool {
+    let Ok(root) = std::path::absolute(cache_dir) else {
+        return false;
+    };
+    let expected_parent = root.join(BUILD_DIR_PARENT);
+    let Ok(contents) = std::fs::read_to_string(cargo_home.join("config.toml")) else {
+        return false;
+    };
+    let Ok(document) = contents.parse::<DocumentMut>() else {
+        return false;
+    };
+    document
+        .get("build")
+        .and_then(Item::as_table_like)
+        .and_then(|build| build.get("build-dir"))
+        .and_then(Item::as_str)
+        .is_some_and(|dir| {
+            let candidate = Path::new(dir.trim());
+            candidate.starts_with(&expected_parent)
+                || candidate.starts_with(cache_dir.join(BUILD_DIR_PARENT))
+        })
+}
+
 const BUNDLED_STOW_SKILL: &str = include_str!("../skills/stow/SKILL.md");
 const DETECTED_AGENT_DIR_NAMES: [&str; 2] = [".agents", ".claude"];
 
@@ -3581,5 +3614,54 @@ mod tests {
         assert!(unconf_plain.contains("daemon: not running"));
         assert!(unconf_plain.contains("rust-cache: 0 hits, 0 misses (—), 0 errors"));
         assert!(!unconf_plain.contains("Warnings"));
+    }
+
+    #[test]
+    fn cargo_home_uses_stow_build_dir_tracks_configured_build_dir_for_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cargo_home = dir.path().join("cargo-home");
+        let cache_dir = dir.path().join("stow-cache");
+        let other_cache_dir = dir.path().join("other-stow-cache");
+        std::fs::create_dir_all(&cargo_home).expect("create cargo_home");
+
+        assert!(
+            !super::cargo_home_uses_stow_build_dir_in(&cargo_home, &cache_dir),
+            "missing config.toml does not enable stow build-dir"
+        );
+
+        std::fs::write(
+            cargo_home.join("config.toml"),
+            "[build]\nrustc-wrapper = \"/tmp/stow-rustc-wrapper\"\n",
+        )
+        .expect("write --no-build-dir config");
+        assert!(
+            !super::cargo_home_uses_stow_build_dir_in(&cargo_home, &cache_dir),
+            "stow setup --no-build-dir must not report stow build-dir enabled"
+        );
+
+        std::fs::write(
+            cargo_home.join("config.toml"),
+            "[build]\nbuild-dir = \"/custom/build-dir/{workspace-path-hash}\"\n",
+        )
+        .expect("write custom build-dir config");
+        assert!(
+            !super::cargo_home_uses_stow_build_dir_in(&cargo_home, &cache_dir),
+            "a custom build-dir outside <cache_dir>/build-dir must not match"
+        );
+
+        let template = super::stow_build_dir_template(&cache_dir).expect("template");
+        std::fs::write(
+            cargo_home.join("config.toml"),
+            format!("[build]\nbuild-dir = {template:?}\n"),
+        )
+        .expect("write stow build-dir config");
+        assert!(super::cargo_home_uses_stow_build_dir_in(
+            &cargo_home,
+            &cache_dir
+        ));
+        assert!(
+            !super::cargo_home_uses_stow_build_dir_in(&cargo_home, &other_cache_dir),
+            "another cache_dir must not match"
+        );
     }
 }

@@ -2,7 +2,9 @@
 //! non-copy-on-write filesystems such as ext4 (stow#1704).
 //!
 //! Enabled by default on Linux (`fuse = true`; opt out via `fuse = false` in
-//! `config.toml` or `STOW_FUSE=0`). Automatically skipped on native `CoW`
+//! `config.toml` or `STOW_FUSE=0`) whenever `<cache_dir>/build-dir/` is
+//! configured or used (skipped under `stow setup --no-build-dir` when no build
+//! targets `<cache_dir>/build-dir/`). Automatically skipped on native `CoW`
 //! filesystems (`btrfs` / `xfs`) and cleanly falls back to regular byte copies
 //! when `/dev/fuse` or `fusermount3`/`fusermount` is unavailable.
 //!

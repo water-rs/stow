@@ -65,6 +65,12 @@ runs:
         repo="ghcr.io/water-rs/stow-toolchain"
         ref="${repo}:${TOOLCHAIN_SHA}-${key}"
         with_ghcr_retry() {
+          local extra_pattern="${1:-}"
+          shift
+          local pattern='toomanyrequests|429|502|503|504|i/o timeout|connection reset'
+          if [ -n "$extra_pattern" ]; then
+            pattern="${pattern}|${extra_pattern}"
+          fi
           local attempt=1 delay=1 err_file
           err_file="$(mktemp)"
           while true; do
@@ -74,7 +80,9 @@ runs:
               return 0
             fi
             cat "$err_file" >&2
-            if [ "$attempt" -ge 6 ] || ! grep -Eiq 'toomanyrequests|429|502|503|504|i/o timeout|connection reset' "$err_file"; then
+            # 7 attempts sleep 1+2+4+8+16+32 = 63s (+ jitter), spanning GHCR's
+            # 60-second 44,000/minute sliding window.
+            if [ "$attempt" -ge 7 ] || ! grep -Eiq "$pattern" "$err_file"; then
               rm -f "$err_file"
               return 1
             fi
@@ -85,12 +93,15 @@ runs:
         }
         echo "$GHCR_TOKEN" | oras login ghcr.io \
           --username "$GITHUB_ACTOR" --password-stdin
-        digest="$(with_ghcr_retry oras manifest fetch --descriptor "$ref" | jq -r .digest)"
-        with_ghcr_retry cosign verify "${repo}@${digest}" \
+        digest="$(with_ghcr_retry '' oras manifest fetch --descriptor "$ref" | jq -r .digest)"
+        # Cosign v4 swallows HTTP 429 on `.sig` manifest lookups and exits with
+        # `Error: no signatures found` even after `oras manifest fetch` just
+        # resolved the tag's digest; retry it across the 1-minute window.
+        with_ghcr_retry 'no signatures found' cosign verify "${repo}@${digest}" \
           --certificate-identity-regexp '^https://github\.com/water-rs/stow/\.github/workflows/toolchain-publish\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
           --certificate-github-workflow-sha "$TOOLCHAIN_SHA" \
           --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
-        with_ghcr_retry oras pull "${repo}@${digest}" --output "$RUNNER_TEMP/stow-toolchain"
+        with_ghcr_retry '' oras pull "${repo}@${digest}" --output "$RUNNER_TEMP/stow-toolchain"
         bin_dir="$RUNNER_TEMP/stow-toolchain/bin"
         mkdir -p "$bin_dir"
         members=()

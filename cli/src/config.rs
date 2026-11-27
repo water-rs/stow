@@ -365,11 +365,11 @@ pub struct StowConfig {
     /// session made each index fetch pay that scan again (stow#624).
     #[serde(skip, default = "Arc::default")]
     pub registry_http: Arc<OnceCell<stow_oci::RegistryHttp>>,
-    /// This process's per-tier artifact cache staging directories, created
-    /// lazily on the first store into each tier and held for the process's
-    /// life.
+    /// Per-tier, per-rustc artifact cache staging directories shared across a
+    /// daemon's sessions, created lazily and re-acquired automatically if an
+    /// idle version directory was purged or cleaned.
     #[serde(skip, default = "default_tier_staging")]
-    pub artifact_cache_staging: Arc<[OnceCell<Arc<crate::artifact_cache::StagingDir>>; 3]>,
+    pub artifact_cache_staging: TierStaging,
     /// Daemon-shared weak table of active per-`(tier, rustc_version)` shared
     /// lease locks so concurrent sessions on the same rustc hold one lock FD
     /// per tier instead of one per session (stow#1690).
@@ -381,12 +381,17 @@ pub struct StowConfig {
     pub bucket_handles: crate::bucket_cache::BucketCacheHandles,
 }
 
+pub type TierStaging = Arc<
+    [tokio::sync::Mutex<std::collections::BTreeMap<String, Arc<crate::artifact_cache::StagingDir>>>;
+        3],
+>;
+
 pub const fn default_fuse() -> bool {
     cfg!(target_os = "linux")
 }
 
-pub fn default_tier_staging() -> Arc<[OnceCell<Arc<crate::artifact_cache::StagingDir>>; 3]> {
-    Arc::new(std::array::from_fn(|_| OnceCell::new()))
+pub fn default_tier_staging() -> TierStaging {
+    Arc::default()
 }
 
 impl StowConfig {
@@ -485,39 +490,52 @@ impl StowConfig {
     ///
     /// # Errors
     ///
-    /// Whatever creating or locking the staging directory fails with, and
-    /// a request to stage a second rustc version after the directory was
-    /// created for a different one.
+    /// Whatever creating or locking the staging directory fails with.
     pub async fn artifact_cache_staging_dir(
         &self,
         tier: CacheTier,
         rustc_version: &str,
     ) -> stow_types::error::Result<Arc<crate::artifact_cache::StagingDir>> {
+        let mut by_version = self.artifact_cache_staging[tier.index()].lock().await;
+        if let Some(existing) = by_version.get(rustc_version)
+            && existing.rustc_version() == rustc_version
+            && existing.is_live_on_disk()
+        {
+            return Ok(Arc::clone(existing));
+        }
         let staging_root = self
             .tier_version_dir(tier, rustc_version)
             .join(crate::artifact_cache::STAGING_DIR);
-        let staging = self.artifact_cache_staging[tier.index()]
-            .get_or_try_init(|| {
-                let staging_root = staging_root.clone();
-                let rustc_version = rustc_version.to_owned();
-                async move {
-                    let staging = tokio::task::spawn_blocking(move || {
-                        crate::artifact_cache::StagingDir::acquire(&staging_root, &rustc_version)
-                    })
-                    .await
-                    .wrap_err("join artifact cache staging task")??;
-                    stow_types::error::Result::Ok(Arc::new(staging))
-                }
+        let version = rustc_version.to_owned();
+        let staging = tokio::task::spawn_blocking(move || {
+            crate::artifact_cache::StagingDir::acquire(&staging_root, &version)
+        })
+        .await
+        .wrap_err("join artifact cache staging task")??;
+        let staging = Arc::new(staging);
+        by_version.insert(rustc_version.to_owned(), Arc::clone(&staging));
+        drop(by_version);
+        Ok(staging)
+    }
+
+    /// Release cached [`crate::artifact_cache::StagingDir`] handles in `tier`
+    /// for every rustc version other than `keep_version` that holds no active
+    /// version lease and has no in-flight store reference, so Windows can
+    /// rename idle `<tier>/<stale_version>` directories into `.purge/`.
+    pub async fn release_idle_artifact_cache_staging(&self, tier: CacheTier, keep_version: &str) {
+        let mut by_version = self.artifact_cache_staging[tier.index()].lock().await;
+        let evicted: Vec<Arc<crate::artifact_cache::StagingDir>> = by_version
+            .extract_if(.., |version, staging| {
+                version != keep_version
+                    && !self.version_leases.is_held(tier, version)
+                    && Arc::strong_count(staging) == 1
             })
-            .await?;
-        if staging.rustc_version() != rustc_version {
-            return Err(stow_types::stow_error!(
-                "artifact cache staging in {} is bound to rustc {}, cannot stage {rustc_version}",
-                tier.dir_name(),
-                staging.rustc_version()
-            ));
+            .map(|(_, staging)| staging)
+            .collect();
+        drop(by_version);
+        if !evicted.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || drop(evicted)).await;
         }
-        Ok(Arc::clone(staging))
     }
 }
 

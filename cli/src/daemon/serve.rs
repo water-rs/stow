@@ -407,12 +407,20 @@ async fn blocking<T: Send + 'static>(
 
 /// If the user's default config enables the Linux FUSE copy-on-write layer
 /// (default on Linux non-CoW filesystems; opt out via `fuse = false` /
-/// `STOW_FUSE=0`), mount `<cache_dir>/build-dir/` before clients start plain
-/// `cargo` builds so cargo opens the mounted tree from the start.
+/// `STOW_FUSE=0`) and `<cache_dir>/build-dir/` is configured in `$CARGO_HOME`
+/// or already present on disk, mount `<cache_dir>/build-dir/` before clients
+/// start plain `cargo` builds so cargo opens the mounted tree from the start.
+/// Skipped under `stow setup --no-build-dir` so `<cache_dir>/build-dir/` is
+/// never created when unused.
 async fn mount_default_fuse<P: Processes>(daemon: &Daemon<P>) {
-    if let Ok(default_config) =
-        blocking(|| crate::config::StowConfig::load(crate::state_db::StateDb::closed())).await
+    if let Ok((default_config, uses_build_dir)) = blocking(|| {
+        let config = crate::config::StowConfig::load(crate::state_db::StateDb::closed())?;
+        let uses_build_dir = default_uses_stow_build_dir(&config.cache_dir);
+        Ok((config, uses_build_dir))
+    })
+    .await
         && default_config.fuse
+        && uses_build_dir
     {
         let handles = daemon
             .table
@@ -422,6 +430,20 @@ async fn mount_default_fuse<P: Processes>(daemon: &Daemon<P>) {
             .ensure_fuse_mounted(&default_config.cache_dir, true)
             .await;
     }
+}
+
+fn default_uses_stow_build_dir(cache_dir: &Path) -> bool {
+    let mountpoint = cache_dir.join(crate::build_dirs::BUILD_DIR_PARENT);
+    if !matches!(
+        std::fs::symlink_metadata(&mountpoint),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return true;
+    }
+    if cache_dir.join(crate::fuse_cow::BUILD_DIR_BACKING).exists() {
+        return true;
+    }
+    crate::commands::cargo_home_uses_stow_build_dir(cache_dir)
 }
 
 /// What a start of the daemon found under the sessions directory.

@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use tokio::sync::OnceCell;
 
-use crate::artifact_cache::{SharedVersionLeases, StagingDir};
+use crate::artifact_cache::SharedVersionLeases;
 use crate::bucket_cache::BucketCacheHandles;
-use crate::config::{StowConfig, default_tier_staging};
+use crate::config::{StowConfig, TierStaging, default_tier_staging};
 use crate::fuse_cow::FuseMount;
 use crate::index::{HeldSlices, SliceFetches};
 use crate::state_db::StateDb;
@@ -27,7 +27,7 @@ pub struct CacheDirHandles {
     state_db: StateDb,
     trust_material: Arc<OnceCell<Arc<crate::verify::TrustMaterial>>>,
     registry_http: Arc<OnceCell<stow_oci::RegistryHttp>>,
-    artifact_cache_staging: Arc<[OnceCell<Arc<StagingDir>>; 3]>,
+    artifact_cache_staging: TierStaging,
     version_leases: SharedVersionLeases,
     slices: HeldSlices,
     bucket_handles: BucketCacheHandles,

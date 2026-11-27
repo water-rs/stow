@@ -70,10 +70,12 @@ verify_mode = "github-ci"
 # build_dir_min_free_bytes = 21474836480
 
 # Linux FUSE virtual CoW layer over `<cache_dir>/build-dir/` on non-CoW
-# filesystems such as ext4. Defaults to true on Linux (false elsewhere);
-# set `fuse = false` or `STOW_FUSE=0` to disable. On Linux CoW filesystems
-# (btrfs, XFS) or non-Linux platforms this setting is a no-op; if `/dev/fuse`
-# or `fusermount3` is unavailable, stow falls back to regular byte copies.
+# filesystems such as ext4 when `<cache_dir>/build-dir/` is configured or used.
+# Defaults to true on Linux (false elsewhere); set `fuse = false` or
+# `STOW_FUSE=0` to disable. Skipped when `--no-build-dir` leaves `build-dir/`
+# unused, on Linux CoW filesystems (btrfs, XFS), or on non-Linux platforms; if
+# `/dev/fuse` or `fusermount3` is unavailable, stow falls back to regular byte
+# copies.
 # fuse = true
 
 # Per-request HTTP timeout (seconds) for the edge worker. Default 300.

@@ -103,7 +103,9 @@ jobs:
                 return 0
               fi
               cat "$err_file" >&2
-              if [ "$attempt" -ge 6 ] || ! grep -Eiq 'toomanyrequests|429|502|503|504|i/o timeout|connection reset' "$err_file"; then
+              # 7 attempts sleep 1+2+4+8+16+32 = 63s (+ jitter), spanning GHCR's
+              # 60-second 44,000/minute sliding window.
+              if [ "$attempt" -ge 7 ] || ! grep -Eiq 'toomanyrequests|429|502|503|504|i/o timeout|connection reset' "$err_file"; then
                 rm -f "$err_file"
                 return 1
               fi

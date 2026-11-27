@@ -975,7 +975,10 @@ pub fn evaluate_freeze_trip(
     // The bucket table's `(target, bucket)` rollup is the ring's
     // read-time fold: only rows inside the window count, the same
     // bound the `bucket >= unixepoch - window` predicate gave.
-    let cutoff = now_ms - i64::from(settings.window_minutes) * 60_000;
+    let window_cutoff = now_ms - i64::from(settings.window_minutes) * 60_000;
+    let cutoff = graph
+        .last_freeze_cleared_ms()
+        .map_or(window_cutoff, |cleared_ms| window_cutoff.max(cleared_ms));
     let by_target = graph.attempt_tallies_since(cutoff);
     let mut tallies = Vec::with_capacity(by_target.len());
     for (target, (outcomes, failures)) in by_target {
@@ -1230,6 +1233,100 @@ mod tests {
         assert!(
             super::evaluate_freeze_trip(&unverified, &settings, 1000)
                 .expect("evaluate")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn clearing_freeze_excludes_pre_clear_failures_from_window() {
+        use crate::scheduler::graph::{AttemptOutcome, Graph};
+        use stow_types::api::{
+            ChannelOutcome, DispatchFreezeRecord, DispatchFreezeTrigger, SchedulerEvent,
+        };
+
+        let mut graph = Graph::default();
+        let settings = crate::freeze::FreezeSettings {
+            window_minutes: 60,
+            min_outcomes: 2,
+            fail_percent: 50,
+        };
+        for run in 1..=2_u64 {
+            graph.record_attempt_outcome(AttemptOutcome {
+                task_id: format!("pre-{run}"),
+                generation_id: "1".to_owned(),
+                attempt: 1,
+                target: "aarch64-unknown-linux-gnu".to_owned(),
+                failure_class: Some("infrastructure".to_owned()),
+                source_failure: None,
+                run_id: run.to_string(),
+                finished_at_ms: 1_000_000,
+            });
+        }
+        assert!(
+            super::evaluate_freeze_trip(&graph, &settings, 1_000_000)
+                .expect("evaluate")
+                .is_some()
+        );
+
+        let trigger = DispatchFreezeTrigger::Manual {
+            actor: "operator".to_owned(),
+        };
+        graph.apply(
+            &SchedulerEvent::Freeze {
+                at: "1970-01-01T00:16:40Z".to_owned(),
+                trigger: trigger.clone(),
+                record: Some(Box::new(DispatchFreezeRecord {
+                    frozen_at: "1970-01-01T00:16:40Z".to_owned(),
+                    trigger: trigger.clone(),
+                    notify: ChannelOutcome::Disabled {
+                        reason: "test".to_owned(),
+                    },
+                })),
+            },
+            1_000_000,
+        );
+        // Clear at t = 1_060_000 ms (1970-01-01T00:17:40Z).
+        graph.apply(
+            &SchedulerEvent::Freeze {
+                at: "1970-01-01T00:17:40Z".to_owned(),
+                trigger,
+                record: None,
+            },
+            1_060_000,
+        );
+
+        graph.record_attempt_outcome(AttemptOutcome {
+            task_id: "post-1".to_owned(),
+            generation_id: "1".to_owned(),
+            attempt: 1,
+            target: "aarch64-unknown-linux-gnu".to_owned(),
+            failure_class: None,
+            source_failure: None,
+            run_id: "3".to_owned(),
+            finished_at_ms: 1_120_000,
+        });
+        assert!(
+            super::evaluate_freeze_trip(&graph, &settings, 1_120_000)
+                .expect("post-clear single outcome does not re-trip on pre-clear burst")
+                .is_none()
+        );
+
+        // Two fresh post-clear failures still trip normally.
+        for run in 4..=5_u64 {
+            graph.record_attempt_outcome(AttemptOutcome {
+                task_id: format!("post-{run}"),
+                generation_id: "1".to_owned(),
+                attempt: 1,
+                target: "aarch64-unknown-linux-gnu".to_owned(),
+                failure_class: Some("infrastructure".to_owned()),
+                source_failure: None,
+                run_id: run.to_string(),
+                finished_at_ms: 1_180_000,
+            });
+        }
+        assert!(
+            super::evaluate_freeze_trip(&graph, &settings, 1_180_000)
+                .expect("fresh post-clear failures trip")
                 .is_some()
         );
     }
