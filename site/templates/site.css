@@ -104,6 +104,7 @@ code { font-family: var(--mono); }
 }
 
 .window {
+  min-width: 0;
   border: 2px solid var(--ink);
   background: var(--panel);
   color: var(--ink);
@@ -173,18 +174,22 @@ code { font-family: var(--mono); }
 .numbers .frame { border-top: 2px solid var(--ink); }
 .figures {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: 24px;
   margin-bottom: 20px;
 }
 .figure {
+  min-width: 0;
+  container-type: inline-size;
   padding: 16px 0 0;
   border-top: 2px solid var(--ink);
 }
 .figure-value {
   margin: 0;
-  font: 800 clamp(56px, 8vw, 104px)/1 var(--grotesque);
+  font: 800 clamp(44px, 18cqi, 68px)/1 var(--grotesque);
+  font-variant-numeric: tabular-nums;
   letter-spacing: -0.05em;
+  overflow-wrap: anywhere;
 }
 .figure-caption { margin: 8px 0 0; font-size: 14px; }
 .footnote { max-width: 72ch; margin: 0; font-size: 14px; }
@@ -306,19 +311,32 @@ code { font-family: var(--mono); }
 /* Invisible until Turnstile needs an interaction; then it sits beside the button. */
 #turnstile-widget:empty { display: none; }
 
-.leader-list { list-style: none; display: grid; gap: 10px; }
-.leader-list li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-size: 14px; }
-/* The value may carry a long unbroken token (an error string); it
-   shrinks and wraps rather than pushing the row past the panel. */
+.leader-list { list-style: none; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.leader-list li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; min-width: 0; font-size: 14px; }
+/* Either end of a leader row may carry a long unbroken token (a digest
+   or target triple on the left, an error string on the right); both
+   shrink inside the panel rather than pushing the row past its border. */
+.leader-list li > :first-child,
 .leader-list li > :last-child { min-width: 0; overflow-wrap: anywhere; }
-.leader { flex: 1; border-bottom: 2px dotted var(--ink); transform: translateY(-4px); }
+.leader { flex: 1 0 24px; border-bottom: 2px dotted var(--ink); transform: translateY(-4px); }
 
 /* ---- stats page ---- */
 .stats-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: 24px;
   align-items: start;
+}
+.stats-grid .leader-list li { flex-wrap: nowrap; }
+.stats-grid .leader-list li > :first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stats-grid .leader + * {
+  flex: none;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 .result { overflow-x: auto; }
@@ -360,7 +378,6 @@ code { font-family: var(--mono); }
 @media (max-width: 720px) {
   .frame { padding-top: 40px; padding-bottom: 40px; }
   .hero h1 { font-size: clamp(34px, 11vw, 48px); }
-  .figure-value { font-size: clamp(48px, 15vw, 64px); }
   .request-grid { grid-template-columns: minmax(0, 1fr); }
   .lookup-grid { grid-template-columns: minmax(0, 1fr); }
   .stats-grid { grid-template-columns: minmax(0, 1fr); }
