@@ -197,13 +197,7 @@ async fn stage_candidates(
         &http,
     );
 
-    let mut seen_compile_keys = BTreeSet::new();
-    let mut distinct = Vec::new();
-    for (slice, row) in candidates {
-        if seen_compile_keys.insert(row.compile_key.clone()) {
-            distinct.push((slice, row));
-        }
-    }
+    let distinct = dedup_candidates(candidates);
     let candidate_count = distinct.len();
 
     let started = Instant::now();
@@ -224,6 +218,22 @@ async fn stage_candidates(
         store_dir: store_dir.to_path_buf(),
         artifacts: staged,
     })
+}
+
+/// Deduplicate staging candidates by `(slice target, compile_key)` so a
+/// row in one slice never shadows the row staged under another slice's
+/// target namespace (`store_dir/<target>/<compile_key>`).
+fn dedup_candidates<'a>(
+    candidates: Vec<(&'a IndexSlice, &'a ArtifactIndexRow)>,
+) -> Vec<(&'a IndexSlice, &'a ArtifactIndexRow)> {
+    let mut seen = BTreeSet::new();
+    let mut distinct = Vec::new();
+    for (slice, row) in candidates {
+        if seen.insert((slice.index.header.target.as_str(), row.compile_key.as_str())) {
+            distinct.push((slice, row));
+        }
+    }
+    distinct
 }
 
 /// Stage every candidate, `PREFETCH_CONCURRENCY` at a time, and count
@@ -847,5 +857,46 @@ mod tests {
             assert!(text.contains("2.3.4"), "the row's version: {text}");
             assert!(text.contains("did not verify"), "the verdict: {text}");
         });
+    }
+
+    #[test]
+    fn dedup_candidates_keys_by_slice_target_and_compile_key() {
+        let mut target_slice = index_slice(vec![index_row(
+            "crc32fast",
+            "1.5.5",
+            "0000000000000001",
+            &[],
+            UnitSide::Target,
+        )]);
+        target_slice.index.header.target =
+            stow_types::identity::TargetTriple::parse("aarch64-unknown-linux-gnu").unwrap();
+        let mut host_slice = index_slice(vec![index_row(
+            "crc32fast",
+            "1.5.5",
+            "0000000000000001",
+            &[],
+            UnitSide::Host,
+        )]);
+        host_slice.index.header.target =
+            stow_types::identity::TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap();
+        // Same compile_key across two slices stays distinct; a duplicate inside
+        // the same slice collapses.
+        let shared_key = target_slice.index.rows[0].compile_key.clone();
+        host_slice.index.rows[0].compile_key = shared_key;
+
+        let distinct = super::dedup_candidates(vec![
+            (&target_slice, &target_slice.index.rows[0]),
+            (&target_slice, &target_slice.index.rows[0]),
+            (&host_slice, &host_slice.index.rows[0]),
+        ]);
+        assert_eq!(distinct.len(), 2);
+        assert_eq!(
+            distinct[0].0.index.header.target.as_str(),
+            "aarch64-unknown-linux-gnu"
+        );
+        assert_eq!(
+            distinct[1].0.index.header.target.as_str(),
+            "x86_64-unknown-linux-gnu"
+        );
     }
 }

@@ -520,8 +520,14 @@ finds the tag —
 a slice whose publish died between its `index` and `folded` tags is
 extended with an empty folded set, so the pass refolds every record onto
 its rows;
-then loops the pass's `slices.json` for `stow-admin index publish`,
-which pushes the `index` plus `folded` pair and signs both. Because the header's
+then runs `stow-admin index publish --dir <out-dir>`, which pushes and
+signs all `index.*` tags first (host slices before cross-target slices,
+skipping cross slices whose runner host failed so cross dependents are
+never released without their dependencies' build scripts) and only then
+pushes and signs each succeeded slice's `folded.*` tag excluding any
+newly-folded multi-slice `records-*` tag that also named a failed slice,
+so the next export's `folded_union` never skips an incomplete
+multi-slice record. Because the header's
 `generated_at` makes every
 export byte-unique, the run does not compare blob digests: the export
 reports a `content_sha256` over everything but the timestamp, the

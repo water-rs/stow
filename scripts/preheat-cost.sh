@@ -601,25 +601,21 @@ publish_round() {
         >"$LOG_DIR/index-export-$tag.log" 2>&1 \
         || die "index export failed — see $LOG_DIR/index-export-$tag.log"
     cp "$WORK_DIR/index-export/new-records.json" "$dir/new-records.json"
-    local pairs
-    pairs="$(jq -r '.[] | "\(.index_file) \(.folded_file)"' "$WORK_DIR/index-export/slices.json")" \
-        || die "reading $WORK_DIR/index-export/slices.json failed"
-    while read -r index_file folded_file; do
-        [ -n "$index_file" ] || continue
-        env STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
-            STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
-            "$BIN/stow-admin" index publish \
-            --file "$WORK_DIR/index-export/$index_file" \
-            --folded "$WORK_DIR/index-export/$folded_file" \
-            >>"$LOG_DIR/index-publish.log" 2>&1 \
-            || die "index publish failed for $index_file — see $LOG_DIR/index-publish.log"
-    done <<<"$pairs"
+    env STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
+        STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
+        "$BIN/stow-admin" index publish \
+        --dir "$WORK_DIR/index-export" \
+        >>"$LOG_DIR/index-publish.log" 2>&1 \
+        || die "index publish failed — see $LOG_DIR/index-publish.log"
     snapshot "$dir/before-report.json"
     # One report per publish run carries the run's slices (stow#940).
+    local index_files
+    index_files="$(jq -r '.[] | select(.index_published) | .index_file' "$WORK_DIR/index-export/published.json")" \
+        || die "reading $WORK_DIR/index-export/published.json failed"
     local report_args=()
-    while read -r index_file _; do
+    while read -r index_file; do
         [ -n "$index_file" ] && report_args+=(--file "$WORK_DIR/index-export/$index_file")
-    done <<<"$pairs"
+    done <<<"$index_files"
     admin_as index-publish.yml index report "${report_args[@]}" \
         >>"$LOG_DIR/index-report.log" 2>&1 \
         || die "index report failed — see $LOG_DIR/index-report.log"
