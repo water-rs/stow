@@ -558,7 +558,8 @@ async fn download_verified_slice(
     let (bytes, manifest_digest) = match session.pull_manifest(reference).await {
         Ok(pulled) => pulled,
         Err(error)
-            if error.is_package_missing() || (!has_cached_pointer && error.is_not_found()) =>
+            if error.is_package_missing()
+                || (!has_cached_pointer && error.is_manifest_unknown()) =>
         {
             return Ok(None);
         }

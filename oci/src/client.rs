@@ -168,6 +168,32 @@ impl RegistryError {
         })
     }
 
+    /// Whether this refusal is an OCI `404` whose JSON error envelope names
+    /// `MANIFEST_UNKNOWN` — the response a `GET` on `/manifests/<tag>` of an
+    /// existing repository returns when that tag has not been published, as
+    /// distinct from a bare or non-OCI `404` body.
+    #[must_use]
+    pub fn is_manifest_unknown(&self) -> bool {
+        let RegistryErrorKind::Refused { status, body } = &self.kind else {
+            return false;
+        };
+        if *status != StatusCode::NOT_FOUND {
+            return false;
+        }
+        let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(body.as_bytes()) else {
+            return false;
+        };
+        envelope
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|errors| {
+                errors.iter().any(|entry| {
+                    entry.get("code").and_then(serde_json::Value::as_str)
+                        == Some("MANIFEST_UNKNOWN")
+                })
+            })
+    }
+
     /// Whether this refusal is the registry reporting the object's whole
     /// package absent — GHCR answers an anonymous pull of a package that
     /// does not exist (or is not public — it refuses to say which) with a
