@@ -32,6 +32,7 @@
       const li = document.createElement("li");
       const name = document.createElement("span");
       name.textContent = row.name;
+      name.title = row.name;
       const leader = document.createElement("span");
       leader.className = "leader";
       const hits = document.createElement("span");

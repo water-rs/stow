@@ -185,7 +185,9 @@ mod tests {
     use askama::Template;
     use stow_types::api::CI_TARGET_TRIPLES;
 
-    use super::{AUDIT_URL, IndexPage, TURNSTILE_SITE_KEY};
+    use super::{
+        AUDIT_URL, IndexPage, REPOSITORY_URL, SITE_CSS, STATS_JS, StatsPage, TURNSTILE_SITE_KEY,
+    };
 
     fn render() -> String {
         IndexPage::new(TURNSTILE_SITE_KEY)
@@ -272,5 +274,21 @@ mod tests {
         assert!(html.contains("https://stow-index.waterui.dev"));
         assert!(html.contains("/v1/lookup/"));
         assert!(!html.contains("/api/v1/index/"));
+    }
+
+    #[test]
+    fn stats_page_constrains_figures_and_digest_leaderboards() {
+        let html = StatsPage {
+            repository_url: REPOSITORY_URL,
+            version: env!("CARGO_PKG_VERSION"),
+            css: SITE_CSS,
+            js: STATS_JS,
+        }
+        .render()
+        .expect("stats page renders");
+        assert!(html.contains("container-type: inline-size;"));
+        assert!(html.contains("grid-template-columns: minmax(0, 1fr);"));
+        assert!(html.contains("text-overflow: ellipsis;"));
+        assert!(html.contains("name.title = row.name;"));
     }
 }
