@@ -517,6 +517,26 @@ impl StowConfig {
         drop(by_version);
         Ok(staging)
     }
+
+    /// Release cached [`crate::artifact_cache::StagingDir`] handles in `tier`
+    /// for every rustc version other than `keep_version` that holds no active
+    /// version lease and has no in-flight store reference, so Windows can
+    /// rename idle `<tier>/<stale_version>` directories into `.purge/`.
+    pub async fn release_idle_artifact_cache_staging(&self, tier: CacheTier, keep_version: &str) {
+        let mut by_version = self.artifact_cache_staging[tier.index()].lock().await;
+        let evicted: Vec<Arc<crate::artifact_cache::StagingDir>> = by_version
+            .extract_if(.., |version, staging| {
+                version != keep_version
+                    && !self.version_leases.is_held(tier, version)
+                    && Arc::strong_count(staging) == 1
+            })
+            .map(|(_, staging)| staging)
+            .collect();
+        drop(by_version);
+        if !evicted.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || drop(evicted)).await;
+        }
+    }
 }
 
 /// How downloaded bundles are verified. The mock variant exists only in a

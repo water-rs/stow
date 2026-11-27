@@ -92,6 +92,11 @@ pub struct SharedVersionLeases {
 }
 
 impl SharedVersionLeases {
+    #[must_use]
+    pub fn is_held(&self, tier: CacheTier, rustc_version: &str) -> bool {
+        self.get(tier, rustc_version).is_some()
+    }
+
     fn get(&self, tier: CacheTier, rustc_version: &str) -> Option<std::sync::Arc<FileLock>> {
         let mut guard = self
             .locks
@@ -360,6 +365,11 @@ pub async fn prepare_local_cache(
             None => None,
         };
         let active_version_matches = tier_active.as_deref() == Some(rustc_version.as_str());
+        if !active_version_matches {
+            config
+                .release_idle_artifact_cache_staging(tier, &rustc_version)
+                .await;
+        }
         let existing_lease = config.version_leases.get(tier, &rustc_version);
         let tier_root_for_prepare = tier_root.clone();
         let purge_root_for_prepare = purge_root.clone();
@@ -5300,10 +5310,18 @@ pub mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
 
+        let lease_100 = prepare_local_cache(&config, "1.100.0")
+            .await
+            .expect("prepare 1.100.0");
         let s100 = config
             .artifact_cache_staging_dir(CacheTier::CratesIo, "1.100.0")
             .await
             .expect("stage 1.100.0");
+        let old_100_path = s100.path().to_path_buf();
+
+        let lease_99 = prepare_local_cache(&config, "1.99.1")
+            .await
+            .expect("prepare 1.99.1 alongside active 1.100.0");
         let s99 = config
             .artifact_cache_staging_dir(CacheTier::CratesIo, "1.99.1")
             .await
@@ -5312,19 +5330,27 @@ pub mod tests {
         assert!(s99.is_live_on_disk());
         assert_ne!(s100.path(), s99.path());
 
-        // Simulate an idle version purge moving `crates-io/1.100.0` aside to `.purge/`.
-        let purged_dest = config.artifact_cache_purge_root().join("crates-io-1.100.0");
-        std::fs::create_dir_all(config.artifact_cache_purge_root()).expect("create purge root");
-        std::fs::rename(
-            config.tier_version_dir(CacheTier::CratesIo, "1.100.0"),
-            &purged_dest,
-        )
-        .expect("move 1.100.0 aside");
+        // End the 1.100.0 session: only `config.artifact_cache_staging` still
+        // holds `StagingDir` for 1.100.0. Switching to 1.101.0 must release
+        // that idle staging handle first so purging `crates-io/1.100.0` works
+        // on Windows as well as Unix.
+        drop(s100);
+        drop(lease_100);
+        let _lease_101 = prepare_local_cache(&config, "1.101.0")
+            .await
+            .expect("prepare 1.101.0 and purge idle 1.100.0");
         assert!(
-            !s100.is_live_on_disk(),
-            "purged version dir invalidates the old staging dir"
+            !old_100_path.exists(),
+            "idle 1.100.0 staging dir must be released and purged"
+        );
+        assert!(
+            s99.is_live_on_disk(),
+            "active 1.99.1 lease must keep 1.99.1 staging dir alive"
         );
 
+        let _lease_100_again = prepare_local_cache(&config, "1.100.0")
+            .await
+            .expect("re-prepare 1.100.0");
         let reacquired = config
             .artifact_cache_staging_dir(CacheTier::CratesIo, "1.100.0")
             .await
@@ -5334,6 +5360,7 @@ pub mod tests {
             .prefix("probe-")
             .tempdir_in(reacquired.path())
             .expect("create temp entry inside reacquired staging dir");
+        drop((lease_99, s99));
     }
 
     /// A live process's staging dir survives the sweep: its `<name>.lock`
