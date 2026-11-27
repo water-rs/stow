@@ -312,6 +312,19 @@ pub enum GetArtifactError {
         /// The targets trusted CI can build, comma-separated.
         supported: String,
     },
+    /// The caller named a non-stable rustc version (nightly, beta, dev, …).
+    /// Refused here before any admission minting or scheduler enqueue:
+    /// `dtolnay/rust-toolchain` rejects prerelease version strings and
+    /// `<rustc>-<task_id>` run titles split on the first `-`, so a
+    /// hyphenated version can never complete cleanly.
+    #[error(
+        "`{rustc_version}` is not a stable rustc release; only stable `<major>.<minor>.<patch>` toolchains are built",
+        status = BAD_REQUEST
+    )]
+    UnsupportedRustcVersion {
+        /// The rustc version the caller named.
+        rustc_version: String,
+    },
     /// A request named a crate (or an exact version) crates.io does not
     /// publish; the message names it because the request page shows the
     /// body's `error` verbatim.
@@ -489,6 +502,15 @@ mod tests {
             stow_types::api::REQUEST_BODY_LIMIT_BYTES,
             skyzen::RequestBodyLimit::DEFAULT
         );
+    }
+
+    #[test]
+    fn unsupported_rustc_version_maps_to_400() {
+        let error = GetArtifactError::UnsupportedRustcVersion {
+            rustc_version: "1.101.0-nightly".to_owned(),
+        };
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert!(error.to_string().contains("1.101.0-nightly"));
     }
 
     /// An upstream fetch failure stays a server error — its detail is

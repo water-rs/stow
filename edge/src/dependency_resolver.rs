@@ -240,6 +240,11 @@ pub fn expand_scheduler_requests(
     let target_typed = TargetTriple::parse(target).map_err(|error| error.to_string())?;
     let rustc_version_typed =
         WireRustcVersion::parse(rustc_version).map_err(|error| error.to_string())?;
+    if !rustc_version_typed.is_stable() {
+        return Err(ResolverError::BadRequest(format!(
+            "`{rustc_version}` is not a stable rustc release; only stable `<major>.<minor>.<patch>` toolchains are built"
+        )));
+    }
     let exact_graph = exact_graph_from_request(roots, expanded_entries)?;
     // A consumer target outside `CI_TARGET_TRIPLES` has no runner
     // family, so its host units have no host triple to mint on —
@@ -1968,5 +1973,16 @@ mod sqlite_tests {
              shared pass {shared:?}; per-entry resolve {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn expand_scheduler_requests_rejects_non_stable_rustc_versions() {
+        for rustc in ["1.101.0-nightly", "1.100.0-beta.2", "1.101.0-dev"] {
+            let result = expand_scheduler_requests("x86_64-unknown-linux-gnu", rustc, &[], &[]);
+            assert!(
+                matches!(result, Err(crate::errors::ResolverError::BadRequest(_))),
+                "expected BadRequest for {rustc}"
+            );
+        }
     }
 }

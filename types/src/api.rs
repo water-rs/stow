@@ -5841,6 +5841,29 @@ impl SubmissionTree {
         Ok((piece, bytes))
     }
 
+    /// Reject a tree naming any non-stable rustc version (`1.X.Y-nightly`,
+    /// `-beta`, `-dev`, …). The public cache builds only stable Rust releases:
+    /// `dtolnay/rust-toolchain` refuses prerelease strings, and
+    /// `<rustc>-<task_id>` run titles split on the first `-`, so a hyphenated
+    /// rustc version can never match its own completion webhook.
+    ///
+    /// # Errors
+    /// `Error` naming the offending rustc version and task id.
+    pub fn ensure_stable_rustc_versions(&self) -> crate::error::Result<()> {
+        if let Some(node) = self
+            .nodes
+            .iter()
+            .find(|node| !node.rustc_version.is_stable())
+        {
+            return Err(stow_error!(
+                "rustc version `{}` on task {} is not a stable release",
+                node.rustc_version,
+                node.task_id
+            ));
+        }
+        Ok(())
+    }
+
     /// Reject a tree whose dependency closure holds two members of one
     /// `(crate, compatibility range, target, side)`: two feature sets of
     /// one version (stow#1470) — the build's wrapper manifest declares a

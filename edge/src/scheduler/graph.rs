@@ -762,15 +762,16 @@ pub(super) struct ValidatedSubmission<'a> {
 }
 
 impl<'a> ValidatedSubmission<'a> {
-    /// A tree arriving at a submit route: its shape and identity, a
-    /// closure that agrees (stow#1470), no target-side node keyed at a
-    /// triple other than its owner's (stow#1593), and context edges one
-    /// build of each closure mints (stow#1566) — a tree breaking any
-    /// could only fail on a runner.
+    /// A tree arriving at a submit route: its shape and identity, stable
+    /// rustc versions, a closure that agrees (stow#1470), no target-side
+    /// node keyed at a triple other than its owner's (stow#1593), and
+    /// context edges one build of each closure mints (stow#1566) — a tree
+    /// breaking any could only fail on a runner.
     pub(super) fn new(tree: &'a SubmissionTree) -> Result<Self, QueueError> {
         // The shape check first: the agreement walk needs deps in range.
         let validated = Self::logged(tree)?;
-        tree.ensure_closure_agreement()
+        tree.ensure_stable_rustc_versions()
+            .and_then(|()| tree.ensure_closure_agreement())
             .and_then(|()| tree.ensure_target_side_keys())
             .and_then(|()| tree.ensure_context_coherence())
             .map_err(|error| QueueError::Invariant(error.to_string()))?;
@@ -2550,13 +2551,26 @@ impl Graph {
     }
 
     /// Why `ix`'s dispatch payload could only fail, as its refusal names
-    /// it: a disagreeing closure ([`Self::closure_disagreement`]) or a
-    /// target-side node keyed at another triple (stow#1593), whose
-    /// subgraph re-derives another task id on the runner.
+    /// it: a non-stable rustc version, a disagreeing closure
+    /// ([`Self::closure_disagreement`]), a target-side node keyed at
+    /// another triple (stow#1593), or incoherent context edges
+    /// (stow#1566).
     fn closure_refusal(&self, ix: u32) -> Option<String> {
-        self.closure_disagreement(ix)
+        self.non_stable_rustc(ix)
+            .or_else(|| self.closure_disagreement(ix))
             .or_else(|| self.foreign_target_side(ix))
             .or_else(|| self.context_incoherence(ix))
+    }
+
+    /// A pre-existing logged node whose rustc is not a stable release:
+    /// `dtolnay/rust-toolchain` rejects prerelease names and
+    /// `<rustc>-<task_id>` titles split on the first `-`, so dispatching
+    /// it can only fail and lose its completion webhook. The submit path
+    /// now refuses them; this settles any already merged.
+    fn non_stable_rustc(&self, ix: u32) -> Option<String> {
+        let rustc = &self.rustcs[usize::from(self.node(ix).rustc)];
+        (!stow_types::identity::is_stable_rustc_version(rustc))
+            .then(|| format!("rustc version `{rustc}` is not a stable release"))
     }
 
     /// The context edges in `ix`'s closure no build of that closure mints,
@@ -2676,9 +2690,9 @@ impl Graph {
         }
     }
 
-    /// [`Self::claim_nodes`], adding the ready entries the pass examined
     /// Return in-flight nodes whose claim outlived the lease to pending.
-    fn recover_stale_leases(&mut self, settings: &queue::SchedulerSettings, now: i64) {
+    /// Returns how many expired leases were reclaimed.
+    pub fn recover_stale_leases(&mut self, settings: &queue::SchedulerSettings, now: i64) -> usize {
         let stale_ms = i64::from(settings.stale_dispatch_minutes) * 60_000;
         let stale: Vec<u32> = self
             .inflight
@@ -2686,6 +2700,7 @@ impl Graph {
             .copied()
             .filter(|&ix| self.lease_since_of(ix) + stale_ms <= now)
             .collect();
+        let recovered = stale.len();
         for ix in stale {
             self.set_status(ix, Status::Pending);
             self.state_mut(ix).touch(now);
@@ -2697,6 +2712,7 @@ impl Graph {
             });
             self.refresh_ready(ix);
         }
+        recovered
     }
 
     /// to `scans` — the pass's cost, which tests bound.
@@ -2967,11 +2983,8 @@ impl Graph {
         self.reconcile_attempted_at = now;
         self.external_runs.clear();
         for run in runs {
-            let task_id = run
-                .title
-                .split_once('-')
-                .map_or_default(|(_, task_id)| task_id);
-            if let Some(ix) = self.node_ix(task_id)
+            if let Some((_, task_id)) = stow_types::records::parse_run_title(&run.title)
+                && let Some(ix) = self.node_ix(task_id)
                 && self.node(ix).status.in_flight()
             {
                 let bound = self.run_id_of(ix);
@@ -3886,14 +3899,27 @@ impl Graph {
         true
     }
 
+    /// The earliest expiry among currently in-flight leases, clamped to
+    /// `now` so an already-expired lease wakes immediately.
+    fn earliest_inflight_expiry(&self, now: i64, stale: i64) -> Option<i64> {
+        self.inflight
+            .iter()
+            .map(|&ix| (self.lease_since_of(ix) + stale).max(now))
+            .min()
+    }
+
     /// The wake the graph plans: the earliest instant an alarm can make
     /// progress, or a delete when nothing can. Pending work counts only
     /// while a slot is free for it and it clears the floor, its
     /// dependencies and its age gate; in-flight work counts by its lease
-    /// expiry. `Now` means work is claimable already.
+    /// expiry — including while frozen, so expired leases are still
+    /// reclaimed and residency releases once nothing is in flight.
     pub fn wake_plan(&self, now: i64, settings: &queue::SchedulerSettings) -> queue::AlarmPlan {
+        let stale = i64::from(settings.stale_dispatch_minutes) * 60_000;
         if self.freeze.is_some() {
-            return queue::AlarmPlan::Delete;
+            return self
+                .earliest_inflight_expiry(now, stale)
+                .map_or(queue::AlarmPlan::Delete, queue::AlarmPlan::At);
         }
         if self.ci_not_before > now {
             return if self.has_ready() || !self.inflight.is_empty() {
@@ -3909,7 +3935,6 @@ impl Graph {
             return queue::AlarmPlan::At(now);
         }
         let min_age = i64::from(settings.dispatch_min_age_minutes) * 60_000;
-        let stale = i64::from(settings.stale_dispatch_minutes) * 60_000;
         let (free, macos_free) = self.free_slots(settings);
         // The rate bound (stow#1568) is no slot: while its window is
         // full, ready work waits for the instant the window frees a
@@ -3943,14 +3968,10 @@ impl Graph {
                 }
             }
         }
-        // A lease that already expired — a freeze outlived it, and the
-        // freeze armed nothing — wakes now: only a claim pass reclaims
-        // it, and a cap full of expired claims plans no other wake.
-        for &ix in &self.inflight {
-            let expiry = (self.lease_since_of(ix) + stale).max(now);
-            if wake.is_none_or(|w| expiry < w) {
-                wake = Some(expiry);
-            }
+        if let Some(expiry) = self.earliest_inflight_expiry(now, stale)
+            && wake.is_none_or(|w| expiry < w)
+        {
+            wake = Some(expiry);
         }
         wake.map_or(queue::AlarmPlan::Delete, queue::AlarmPlan::At)
     }
@@ -4042,15 +4063,21 @@ impl Graph {
     }
 
     /// Whether the object should stay resident (stow#1574): while work
-    /// is in flight, completions and the alarm keep calling it; while
-    /// ready work can be claimed, the alarm or the next completion
-    /// claims it. Either way the next event comes soon, and a
+    /// has an unexpired in-flight lease, completions and the alarm keep
+    /// calling it; while ready work can be claimed, the alarm or the next
+    /// completion claims it. Either way the next event comes soon, and a
     /// hibernation between them would make it reload the snapshot.
     /// Ready work that nothing will claim — dispatch frozen or paused —
-    /// waits for an operator, so it holds nothing, and an idle
-    /// scheduler hibernates as before. Counter and set reads only.
-    pub fn needs_residency(&self, settings: &queue::SchedulerSettings) -> bool {
-        !self.inflight.is_empty()
+    /// waits for an operator, and expired in-flight leases wait on
+    /// stale recovery rather than completions, so neither holds
+    /// residency and an idle or frozen-drained scheduler hibernates.
+    pub fn needs_residency(&self, settings: &queue::SchedulerSettings, now: i64) -> bool {
+        let stale = i64::from(settings.stale_dispatch_minutes) * 60_000;
+        let live_inflight = self
+            .inflight
+            .iter()
+            .any(|&ix| self.lease_since_of(ix) + stale > now);
+        live_inflight
             || (self.has_ready()
                 && self.freeze.is_none()
                 && !matches!(settings.dispatch, queue::Dispatch::Paused))
@@ -7133,6 +7160,63 @@ mod tests {
     }
 
     #[test]
+    fn merge_refuses_non_stable_rustc_and_claim_refuses_preexisting_logged_node() {
+        let mut tree = solo();
+        tree.nodes[0].rustc_version =
+            WireRustcVersion::parse("1.101.0-nightly").expect("wire rustc");
+        tree.nodes[0].task_id = minted_id(&tree.nodes[0]);
+        let nightly_id = tree.nodes[0].task_id.clone();
+
+        // Live submissions refuse non-stable rustc versions.
+        assert!(matches!(
+            super::ValidatedSubmission::new(&tree),
+            Err(QueueError::Invariant(_))
+        ));
+        // Already-logged rows still replay through `logged` so existing
+        // event logs wake cleanly, and `claim_nodes` refuses them into
+        // `Failed` without ever dispatching them.
+        let validated = super::ValidatedSubmission::logged(&tree).expect("logged replays");
+        let mut graph = Graph::default();
+        let empty = HashMap::new();
+        graph
+            .merge_validated(&validated, 0, &mut super::TestTable(&empty))
+            .expect("replay merge");
+        assert_eq!(graph.status().pending, 1);
+
+        let pass = graph
+            .claim_nodes(&claim_settings(45, 16), 0, u32::MAX)
+            .expect("claim pass");
+        assert!(pass.claims.is_empty(), "nightly node must never dispatch");
+        assert_eq!(pass.refusals.len(), 1);
+        let ix = graph.node_ix(&nightly_id).expect("node");
+        assert_eq!(graph.node(ix).status, Status::Failed);
+        assert!(
+            graph
+                .error_of(ix)
+                .is_some_and(|error| error.contains("1.101.0-nightly") && error.contains("stable")),
+            "refusal error names the non-stable rustc"
+        );
+    }
+
+    #[test]
+    fn reconcile_runs_ignores_non_stable_title_prefix() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        graph.mark_claimed(ix, 1, 0);
+        graph.reconcile_runs(
+            &[listing(
+                77,
+                &format!("nightly-{}", id("solo")),
+                CiRunStatus::InProgress,
+            )],
+            5_000,
+        );
+        assert_eq!(graph.run_id_of(ix), 0, "non-stable prefix must not bind");
+        assert_eq!(graph.external_total(), 1);
+    }
+
+    #[test]
     fn merge_refuses_an_id_its_columns_do_not_derive() {
         let mut tree = solo();
         tree.nodes[0].task_id = "not-the-canonical-id".to_owned();
@@ -7675,11 +7759,12 @@ mod tests {
         );
     }
 
-    /// A freeze that outlives a claim's lease arms nothing; once it
-    /// clears with the cap full of that expired claim, the plan wakes
-    /// now so the claim pass reclaims it.
+    /// While frozen, in-flight claims still arm the alarm for their lease
+    /// expiry so stale recovery reaps dead runs, deletes the alarm, and
+    /// releases residency instead of keeping the DO pinned forever. Once
+    /// the freeze clears, the returned-to-pending task wakes and claims.
     #[test]
-    fn a_lease_expired_under_a_freeze_wakes_once_it_clears() {
+    fn a_lease_expired_under_a_freeze_reaps_while_frozen_and_claims_once_it_clears() {
         use stow_types::api::{ChannelOutcome, DispatchFreezeRecord, DispatchFreezeTrigger};
         let settings = claim_settings(1, 1);
         let stale = i64::from(settings.stale_dispatch_minutes) * 60_000;
@@ -7703,8 +7788,31 @@ mod tests {
             },
             0,
         );
+        // Before expiry: frozen wake plan tracks the lease deadline and
+        // holds residency while completions can still arrive.
+        let before = stale - 60_000;
+        assert_eq!(
+            graph.wake_plan(before, &settings),
+            queue::AlarmPlan::At(stale)
+        );
+        assert!(graph.needs_residency(&settings, before));
+
+        // At/past expiry while still frozen: the alarm wakes now to reap
+        // the expired lease, and residency is already dropped so a cold
+        // wake cannot pin the DO even before the alarm runs.
         let now = stale + 30 * 60_000;
+        assert_eq!(graph.wake_plan(now, &settings), queue::AlarmPlan::At(now));
+        assert!(!graph.needs_residency(&settings, now));
+
+        // The frozen alarm runs `recover_stale_leases` without claiming:
+        // `inflight` empties, the alarm deletes, and idle frozen cost is 0.
+        assert_eq!(graph.recover_stale_leases(&settings, now), 1);
+        assert_eq!(graph.inflight(), (0, 0));
+        assert_eq!(status_of(&graph, "solo"), Some(Status::Pending));
         assert_eq!(graph.wake_plan(now, &settings), queue::AlarmPlan::Delete);
+        assert!(!graph.needs_residency(&settings, now));
+
+        // Clearing the freeze wakes immediately and dispatches the task.
         graph.apply(
             &SchedulerEvent::Freeze {
                 at: "2026-11-15T04:30:00Z".to_owned(),
@@ -7786,22 +7894,22 @@ mod tests {
         let count = || holds.0.load(std::sync::atomic::Ordering::SeqCst);
         let cell = GraphCell::default();
         let loaded = cell.install(Graph::default());
-        let settle = || {
-            let needed = loaded.with(|graph| graph.needs_residency(&settings));
+        let settle = |now: i64| {
+            let needed = loaded.with(|graph| graph.needs_residency(&settings, now));
             loaded.cell().settle_residency(needed, &residency);
         };
 
-        settle();
+        settle(0);
         assert_eq!(count(), 0, "an empty graph holds nothing");
 
         loaded.with(|graph| graph.merge(&solo(), 0).expect("merge"));
-        settle();
+        settle(0);
         assert_eq!(count(), 1, "claimable work holds");
 
         let claimed = loaded.with(|graph| graph.claim(&settings, 0, u32::MAX).expect("claim"));
         assert_eq!(claimed.len(), 1);
-        settle();
-        settle();
+        settle(1_000);
+        settle(1_000);
         assert_eq!(count(), 1, "in-flight work keeps the one hold");
 
         loaded.with(|graph| {
@@ -7809,13 +7917,14 @@ mod tests {
             graph.run_finished(&id("solo"), completion(4242, true, false, None), 2_000);
             assert_eq!(status_of(graph, "solo"), Some(Status::Completed));
         });
-        settle();
+        settle(2_000);
         assert_eq!(count(), 0, "a drained graph releases");
     }
 
     /// Ready work nothing will claim — dispatch paused or frozen —
     /// waits for an operator and holds nothing; work already in flight
-    /// holds through a freeze, because its completions still arrive.
+    /// holds through a freeze only while its lease is live, because once
+    /// the lease expires stale recovery reaps it and releases residency.
     #[test]
     fn residency_ignores_work_an_operator_holds_back() {
         use stow_types::api::{ChannelOutcome, DispatchFreezeRecord, DispatchFreezeTrigger};
@@ -7825,9 +7934,10 @@ mod tests {
             dispatch: queue::Dispatch::Paused,
             ..queue::SchedulerSettings::default()
         };
-        assert!(!graph.needs_residency(&paused));
+        assert!(!graph.needs_residency(&paused, 0));
         let settings = claim_settings(45, 16);
-        assert!(graph.needs_residency(&settings));
+        let stale = i64::from(settings.stale_dispatch_minutes) * 60_000;
+        assert!(graph.needs_residency(&settings, 0));
 
         assert_eq!(graph.claim(&settings, 0, u32::MAX).expect("claim").len(), 1);
         let trigger = DispatchFreezeTrigger::Manual {
@@ -7847,8 +7957,22 @@ mod tests {
             },
             0,
         );
-        assert!(graph.needs_residency(&settings), "in flight under a freeze");
-        assert!(graph.needs_residency(&paused), "in flight while paused");
+        assert!(
+            graph.needs_residency(&settings, 0),
+            "live in-flight lease holds under a freeze"
+        );
+        assert!(
+            graph.needs_residency(&paused, 0),
+            "live in-flight lease holds while paused"
+        );
+        assert!(
+            !graph.needs_residency(&settings, stale),
+            "expired in-flight lease releases under a freeze"
+        );
+        assert!(
+            !graph.needs_residency(&paused, stale),
+            "expired in-flight lease releases while paused"
+        );
     }
 
     /// stow#1039: the operator's `set` replaces the binding caps in the

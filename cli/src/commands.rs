@@ -502,7 +502,9 @@ async fn apply_setup(
             stow_types::stow_error!("prepare the {identity_name} sandbox identity: {error}")
         })?;
 
-    if prepared.stow_config.cache.reaches_network() {
+    if prepared.stow_config.cache.reaches_network()
+        && stow_types::identity::is_stable_rustc_version(&prepared.plan.rustc_version)
+    {
         index::ensure_slice(
             &prepared.stow_config,
             &prepared.plan.host_target,

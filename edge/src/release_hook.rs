@@ -187,7 +187,7 @@ fn decode_release(
         );
         return Ok(None);
     }
-    let rustc_version = event
+    let rustc_version: stow_types::identity::WireRustcVersion = event
         .version
         .strip_prefix('v')
         .unwrap_or(&event.version)
@@ -198,6 +198,13 @@ fn decode_release(
                 event.version
             ))
         })?;
+    if !rustc_version.is_stable() {
+        tracing::debug!(
+            version = %rustc_version,
+            "ignoring non-stable rust release delivery"
+        );
+        return Ok(None);
+    }
     Ok(Some(stow_types::api::PreheatReleaseRequest {
         rustc_version,
     }))
@@ -332,6 +339,21 @@ mod tests {
             br#"{"provider":"gitlab","project":"rust-lang/rust","version":"1.90.0"}"#.as_slice(),
         ] {
             assert!(decode_release(body).expect("decodes").is_none());
+        }
+    }
+
+    /// A prerelease rust tag answers 200 without waking the scheduler —
+    /// preheat builds only stable releases.
+    #[test]
+    fn prerelease_rust_tag_is_ignored() {
+        for version in ["1.101.0-nightly", "1.100.0-beta.2", "v1.100.0-rc.1"] {
+            let body = format!(
+                r#"{{"provider":"github","project":"rust-lang/rust","version":"{version}"}}"#
+            );
+            assert!(
+                decode_release(body.as_bytes()).expect("decodes").is_none(),
+                "{version} must not trigger preheat"
+            );
         }
     }
 

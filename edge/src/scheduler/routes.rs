@@ -742,6 +742,12 @@ pub(super) async fn slice_reports(
     graph.with(|graph| {
         let mut seen = std::collections::BTreeSet::new();
         slices.iter().try_for_each(|slice| {
+            if !slice.rustc_version.is_stable() {
+                return Err(QueueError::Invariant(format!(
+                    "slice report rustc version `{}` is not a stable release",
+                    slice.rustc_version
+                )));
+            }
             if !seen.insert((slice.target.as_str(), slice.rustc_version.as_str())) {
                 return Err(QueueError::Invariant(format!(
                     "slice report names {}/{} twice",
@@ -2150,6 +2156,14 @@ mod inline_dispatch_tests {
         let live = woken
             .with(|graph| graph.slice_generation(stow_types::api::CI_TARGET_TRIPLES[8], "1.84.0"));
         assert_eq!(live, Some(5));
+
+        let mut nightly = slice(None, 1);
+        nightly.rustc_version =
+            stow_types::identity::WireRustcVersion::parse("1.101.0-nightly").expect("rustc");
+        let error = slice_reports(cell, &db, vec![nightly], None, HOST_NOW_MS)
+            .await
+            .expect_err("non-stable slice report must be refused");
+        assert!(matches!(error, QueueError::Invariant(_)), "{error}");
     }
 
     /// A run's three full slice reports of 4,000, 3,000 and 2,500 rows -

@@ -174,8 +174,7 @@ impl Origin for Cargo {
             target_dir,
             "",
             &[],
-        );
-        !observations.is_empty()
+        )
     }
 }
 

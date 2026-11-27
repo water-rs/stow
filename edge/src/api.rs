@@ -495,6 +495,34 @@ pub async fn set_memory_line(
     Ok(Json(stored))
 }
 
+/// Refuse any non-stable rustc version before it can mint admissions,
+/// wake the scheduler, or trigger a registry fetch.
+fn ensure_stable_rustc(rustc_version: &WireRustcVersion) -> Result<(), GetArtifactError> {
+    if !rustc_version.is_stable() {
+        return Err(GetArtifactError::UnsupportedRustcVersion {
+            rustc_version: rustc_version.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Refuse any submission tree carrying a non-stable rustc version before
+/// it reaches proof-of-work checks or the scheduler Durable Object.
+fn ensure_trees_stable_rustc(
+    trees: &[stow_types::api::SubmissionTree],
+) -> Result<(), GetArtifactError> {
+    if let Some(node) = trees
+        .iter()
+        .flat_map(|tree| &tree.nodes)
+        .find(|node| !node.rustc_version.is_stable())
+    {
+        return Err(GetArtifactError::UnsupportedRustcVersion {
+            rustc_version: node.rustc_version.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// POST /`api/v1/admin/index/published`
 ///
 /// The index-publish path's report that this run's slices went live,
@@ -508,6 +536,9 @@ pub async fn record_published_index(
     State(scheduler): State<CfDurableNamespace>,
     Json(report): Json<stow_types::api::PublishedRunReport>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
+    for slice in &report.slices {
+        ensure_stable_rustc(&slice.rustc_version)?;
+    }
     let slices = report.slices.len();
     let rows: usize = report
         .slices
@@ -832,6 +863,7 @@ pub async fn submit_scheduler_tasks(
     Json(trees): Json<Vec<stow_types::api::SubmissionTree>>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::SchedulerSubmitResponse>, GetArtifactError> {
+    ensure_trees_stable_rustc(&trees)?;
     // The edge resolves nothing (stow#429): every lane that posts here
     // already submits resolver-canonical trees, so they land verbatim —
     // `Json` deserialization itself is the only check (`FeaturesJson`
@@ -1026,6 +1058,9 @@ pub async fn scheduler_request_outcome(
     Json(report): Json<stow_types::api::RequestOutcomeReport>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::CrateRequestStatus>, GetArtifactError> {
+    if let stow_types::api::RequestOutcome::Resolved { trees, .. } = &report.outcome {
+        ensure_trees_stable_rustc(trees)?;
+    }
     let request_id = params
         .get("request_id")
         .map_err(|_| GetArtifactError::BadRequest)?;
@@ -1220,6 +1255,7 @@ pub async fn get_bundle(
         .map_err(|_| GetArtifactError::BadRequest)?
         .parse::<WireRustcVersion>()
         .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    ensure_stable_rustc(&rustc_version)?;
     let digest = params
         .get("digest")
         .map_err(|_| GetArtifactError::BadRequest)?;
@@ -1300,6 +1336,15 @@ pub async fn mint_miss_admissions(
     State(admission): State<PowAdmission>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<Vec<EnqueueAdmission>>, GetArtifactError> {
+    if !request.rustc_version.is_stable() {
+        tracing::info!(
+            rustc_version = %request.rustc_version,
+            "rejected admission request: non-stable rustc version"
+        );
+        return Err(GetArtifactError::UnsupportedRustcVersion {
+            rustc_version: request.rustc_version.to_string(),
+        });
+    }
     if request.entries.len() > settings.max_expanded_tasks {
         tracing::warn!(
             entries = request.entries.len(),
@@ -1321,8 +1366,10 @@ pub async fn mint_miss_admissions(
         &request.expanded_entries,
     )
     .map_err(|error| {
-        tracing::error!(%error, "admission miss derivation failed");
-        GetArtifactError::InternalWithMessage(error.to_string())
+        if !matches!(error, crate::errors::ResolverError::BadRequest(_)) {
+            tracing::error!(%error, "admission miss derivation failed");
+        }
+        GetArtifactError::from(error)
     })?;
     let enqueue_requests = plan.enqueue_requests;
     if enqueue_requests.is_empty() {
@@ -1419,6 +1466,14 @@ pub async fn enqueue_admitted_task(
             target: node.target.to_string(),
             supported: CI_TARGET_TRIPLES.join(", "),
         });
+    }
+    if let Err(error) = ensure_trees_stable_rustc(std::slice::from_ref(&ticket.tree)) {
+        tracing::info!(
+            task_id = %ticket.task_id,
+            %error,
+            "rejected enqueue ticket: non-stable rustc version"
+        );
+        return Err(error);
     }
     // The proof of work is pure CPU, so it verifies before the one
     // forward — the Durable Object's own pending-depth cap refuses a
