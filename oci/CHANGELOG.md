@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.16](https://github.com/water-rs/stow/compare/oci/v0.21.14...oci/v0.21.16) - 2026-11-28
+
+### Fixed
+
+- *(cli,oci)* require OCI MANIFEST_UNKNOWN envelope on cold missing index tag (stow#1736)
+
 ## [0.21.13](https://github.com/water-rs/stow/compare/oci/v0.21.12...oci/v0.21.13) - 2026-11-24
 
 ### Fixed
