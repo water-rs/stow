@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.16](https://github.com/water-rs/stow/compare/v0.21.15...v0.21.16) - 2026-11-28
+
+### Fixed
+
+- *(cli,oci)* require OCI MANIFEST_UNKNOWN envelope on cold missing index tag (stow#1736)
+- *(release,cli,ci)* restore workspace version lockstep and handle new-rustc index rollout (stow#1736)
+
 ## [0.21.15](https://github.com/water-rs/stow/compare/v0.21.14...v0.21.15) - 2026-11-27
 
 ### Fixed
