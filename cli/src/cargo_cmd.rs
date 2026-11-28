@@ -746,7 +746,7 @@ async fn predict_with_stow_resolver(
             stow_types::stow_error!("{}", render_prediction_failure(config, &error).trim_end())
         })?;
     let Some(stow_lockfile_toml) =
-        synthesize_lockfile_from_slices(&project.facts, slice, host_slice).await?
+        synthesize_lockfile_from_slices(&project.facts, slice.clone(), host_slice.clone()).await?
     else {
         return Ok(None);
     };
@@ -759,15 +759,10 @@ async fn predict_with_stow_resolver(
         return Ok(None);
     }
     let _ = invocation;
-    Ok(analyze_pinned_mirror(
-        config,
-        AnalysisScope {
-            project: &mirror_project,
-            env: &project.env,
-            slices,
-        },
+    Ok(
+        analyze_pinned_mirror_from_slices(config, &mirror_project, &project.env, slice, host_slice)
+            .await,
     )
-    .await)
 }
 
 #[derive(Debug, Clone)]
@@ -1534,11 +1529,13 @@ fn predict_from_inputs(
         .flatten()
         .flat_map(|slice| slice.index.local_programs.iter().cloned())
         .collect::<Vec<_>>();
-    let rows = slice.map_or_default(|slice| slice.index.rows);
+    let rows: &[stow_types::index::ArtifactIndexRow] = slice
+        .as_ref()
+        .map_or(&[], |slice| slice.index.rows.as_slice());
     let mut map = tracing::debug_span!("stow.precargo.serve_map_build").in_scope(|| {
         build_serve_map(
             project,
-            &rows,
+            rows,
             host_slice.as_ref(),
             &expanded_in,
             local_units,
@@ -1565,7 +1562,7 @@ fn predict_from_inputs(
         .collect::<stow_types::error::Result<Vec<_>>>()?;
     let non_additive = expanded.non_additive_features();
     let analysis = resolve::analyze_dependency_graph_with_non_additive(
-        &rows,
+        rows,
         &entries,
         &expanded_in,
         &project.target,
@@ -1670,17 +1667,23 @@ fn build_serve_map(
             })
             .collect()
     };
-    let index_pairs = |rows: &[stow_types::index::ArtifactIndexRow]| -> BTreeSet<(String, String)> {
-        rows.iter()
-            .filter(|row| resolve::row_servable_on_host(row, host_glibc))
-            .map(|row| {
-                (
-                    crate::canonical_crate_name(row.crate_name.as_str()),
-                    row.version.to_string(),
-                )
-            })
-            .collect()
+    let consumer_units = unit_pairs(false);
+    let host_units = unit_pairs(true);
+    // The units this build compiles as far as the map can prove: the
+    // expanded graph's own sets when one is cached, and the lockfile's
+    // registry packages on both sides when it is not (stow#617).
+    let lockfile_units = canonical_lockfile_packages(lockfile_packages);
+    let (consumer_known, host_known) = if expanded_entries.is_empty() {
+        (&lockfile_units, &lockfile_units)
+    } else {
+        (&consumer_units, &host_units)
     };
+    let consumer_known_names: std::collections::HashSet<&str> = consumer_known
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let host_known_names: std::collections::HashSet<&str> =
+        host_known.iter().map(|(name, _)| name.as_str()).collect();
     // The set a facade consults is keyed on whether ITS invocation spells
     // `--target`, and cargo spells it for consumer units only when the
     // user asked. On a `--target` build the split is the unit graph's two
@@ -1693,28 +1696,25 @@ fn build_serve_map(
     // `--target` build — and none when no host slice was fetched.
     let host_target = stow_types::api::runner_family(&project.target)
         .map(|family| family.host_triple().to_owned());
-    let host_rows: &[stow_types::index::ArtifactIndexRow] = match (host_target.as_deref(), host) {
-        (Some(host_target), _) if host_target == project.target => consumer_rows,
-        (_, Some(host_slice)) => &host_slice.index.rows,
-        _ => &[],
-    };
-    let consumer_index_pairs = index_pairs(consumer_rows);
-    let host_index_pairs = index_pairs(host_rows);
-    let consumer_index_names: BTreeSet<&String> =
-        consumer_index_pairs.iter().map(|(name, _)| name).collect();
-    let host_index_names: BTreeSet<&String> =
-        host_index_pairs.iter().map(|(name, _)| name).collect();
-    let consumer_units = unit_pairs(false);
-    let host_units = unit_pairs(true);
-    // The units this build compiles as far as the map can prove: the
-    // expanded graph's own sets when one is cached, and the lockfile's
-    // registry packages on both sides when it is not (stow#617).
-    let lockfile_units = canonical_lockfile_packages(lockfile_packages);
-    let (consumer_known, host_known) = if expanded_entries.is_empty() {
-        (&lockfile_units, &lockfile_units)
+    let host_shares_consumer = host_target.as_deref() == Some(project.target.as_str());
+    let (consumer_index_pairs, consumer_index_names_owned) =
+        scan_known_index_rows(consumer_rows, &consumer_known_names, host_glibc);
+    let (host_index_pairs, host_index_names_owned) = if host_shares_consumer {
+        if host_known_names == consumer_known_names {
+            (
+                consumer_index_pairs.clone(),
+                consumer_index_names_owned.clone(),
+            )
+        } else {
+            scan_known_index_rows(consumer_rows, &host_known_names, host_glibc)
+        }
+    } else if let Some(host_slice) = host {
+        scan_known_index_rows(&host_slice.index.rows, &host_known_names, host_glibc)
     } else {
-        (&consumer_units, &host_units)
+        (BTreeSet::new(), BTreeSet::new())
     };
+    let consumer_index_names: BTreeSet<&String> = consumer_index_names_owned.iter().collect();
+    let host_index_names: BTreeSet<&String> = host_index_names_owned.iter().collect();
     let consumer_servable: BTreeSet<(String, String)> = consumer_known
         .intersection(&consumer_index_pairs)
         .cloned()
@@ -1765,6 +1765,31 @@ fn build_serve_map(
         host: host.into_iter().collect(),
         pending: false,
     }
+}
+
+fn scan_known_index_rows(
+    rows: &[stow_types::index::ArtifactIndexRow],
+    known_names: &std::collections::HashSet<&str>,
+    host_glibc: Option<stow_types::glibc::GlibcVersion>,
+) -> (BTreeSet<(String, String)>, BTreeSet<String>) {
+    let mut pairs = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    if known_names.is_empty() {
+        return (pairs, names);
+    }
+    for row in rows {
+        if !resolve::row_servable_on_host(row, host_glibc) {
+            continue;
+        }
+        let canonical = crate::canonical_crate_name(row.crate_name.as_str());
+        if !known_names.contains(canonical.as_str()) {
+            continue;
+        }
+        let version = row.version.to_string();
+        names.insert(canonical.clone());
+        pairs.insert((canonical, version));
+    }
+    (pairs, names)
 }
 
 /// The lockfile's registry packages as the serve map's canonical
@@ -2030,7 +2055,7 @@ pub async fn admit_observed_misses(
     let mut published_shapes: BTreeMap<String, (UnitShape, bool)> = BTreeMap::new();
     for slice_target in [consumer_target, build_host] {
         if let Some(slice) = index::cached_slice(config, slice_target, rustc_version).await? {
-            for row in slice.index.rows {
+            for row in &slice.index.rows {
                 published_shapes
                     .entry(row.c_metadata.as_str().to_owned())
                     .and_modify(|(shape, consistent)| {
@@ -2494,7 +2519,7 @@ fn prediction_fetch_lists(
     (artifacts, cache_policy_entries)
 }
 
-const PINNED_RESOLVER_STAMP_VERSION: u32 = 1;
+const PINNED_RESOLVER_STAMP_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PinnedResolverStamp {
@@ -2570,7 +2595,17 @@ async fn try_stow_resolver(
         };
     }
 
-    let Some(stow_lockfile_toml) = synthesize_lockfile(config, &project.facts).await? else {
+    let (slice, host_slice, _) = cached_consumer_slices(config, &project.facts)
+        .instrument(tracing::debug_span!("stow.precargo.cached_slices"))
+        .await?;
+    let Some(slice) = slice else {
+        tracing::info!("no cached index slice; nothing for the resolver to pin to");
+        return Ok(None);
+    };
+
+    let Some(stow_lockfile_toml) =
+        synthesize_lockfile_from_slices(&project.facts, slice.clone(), host_slice.clone()).await?
+    else {
         write_pinned_resolver_stamp(&stamp_path, &input_digest, CachedResolverOutcome::Rejected)
             .await;
         return Ok(None);
@@ -2584,15 +2619,10 @@ async fn try_stow_resolver(
             .await;
         return Ok(None);
     };
-    let Some(mirror_analysis) = analyze_pinned_mirror(
-        config,
-        AnalysisScope {
-            project: &pinned.project,
-            env: &project.env,
-            slices,
-        },
-    )
-    .await
+    let _ = slices;
+    let Some(mirror_analysis) =
+        analyze_pinned_mirror_from_slices(config, &pinned.project, &project.env, slice, host_slice)
+            .await
     else {
         write_pinned_resolver_stamp(&stamp_path, &input_digest, CachedResolverOutcome::Rejected)
             .await;
@@ -2737,10 +2767,11 @@ fn compute_resolver_stamp_digest(
     feed(&mut hasher, project.rustc_version.as_bytes());
     feed(&mut hasher, consumer_digest.unwrap_or("").as_bytes());
     feed(&mut hasher, host_digest.unwrap_or("").as_bytes());
-    let arg_count = u64::try_from(cargo_args.len()).unwrap_or(u64::MAX);
+    let normalized_args = crate::lockfile_graph_cache::normalized_args(action, cargo_args);
+    let arg_count = u64::try_from(normalized_args.len()).unwrap_or(u64::MAX);
     hasher.update(&arg_count.to_le_bytes());
-    for arg in cargo_args {
-        feed(&mut hasher, arg.to_string_lossy().as_bytes());
+    for arg in &normalized_args {
+        feed(&mut hasher, arg);
     }
     let manifest_count = u64::try_from(manifests.len()).unwrap_or(u64::MAX);
     hasher.update(&manifest_count.to_le_bytes());
@@ -2810,33 +2841,6 @@ fn seed_from_mirror_analysis(
     )
 }
 
-/// Ask the local resolver for a cache-optimized lockfile covering
-/// `project`'s direct dependencies, resolved against the cached verified
-/// index slice. Returns `None` — after logging the reason — when the
-/// project has no direct dependencies or no consistent cache-pinned
-/// assignment exists. The resolver's internal candidate budget bounds the
-/// work; there is no network round trip to deadline — only the
-/// filesystem's slice is consulted, so a cold cache skips the attempt
-/// outright instead of paying the registry pull and signature
-/// verification in front of a resolve that has nothing to resolve
-/// against (stow#347). The in-build enrichment's live fetch is what
-/// brings a fresher index to a running build.
-async fn synthesize_lockfile(
-    config: &StowConfig,
-    project: &ProjectFacts,
-) -> stow_types::error::Result<Option<String>> {
-    // The resolver needs a cached slice to pin against — read it first,
-    // so a cold cache skips the manifest walk entirely (stow#608).
-    let (slice, host_slice, _) = cached_consumer_slices(config, project)
-        .instrument(tracing::debug_span!("stow.precargo.cached_slices"))
-        .await?;
-    let Some(slice) = slice else {
-        tracing::info!("no cached index slice; nothing for the resolver to pin to");
-        return Ok(None);
-    };
-    synthesize_lockfile_from_slices(project, slice, host_slice).await
-}
-
 async fn synthesize_lockfile_from_slices(
     project: &ProjectFacts,
     slice: index::IndexSlice,
@@ -2851,18 +2855,18 @@ async fn synthesize_lockfile_from_slices(
     if direct.is_empty() {
         return Ok(None);
     }
-    let outcome = {
+    let outcome = tokio::task::spawn_blocking(move || {
         // Host-side rows pin host-only subtrees the same way: on a
         // `--target` build a direct dep can exist only in the host
         // slice (stow#788).
-        let mut rows = slice.index.rows;
-        if let Some(host_slice) = host_slice {
-            rows.extend(host_slice.index.rows);
-        }
-        tokio::task::spawn_blocking(move || lockfile_resolver::resolve_lockfile(&rows, &direct))
-            .await
-            .wrap_err("join lockfile resolver")??
-    };
+        lockfile_resolver::resolve_lockfile_slices(
+            &slice.index.rows,
+            host_slice.as_ref().map(|host| host.index.rows.as_slice()),
+            &direct,
+        )
+    })
+    .await
+    .wrap_err("join lockfile resolver")??;
     let Some(stow_lockfile_toml) = outcome.lockfile_toml else {
         tracing::info!(
             uncovered_direct = ?outcome.uncovered_direct,
@@ -2947,22 +2951,48 @@ async fn prepare_pinned_mirror(
     Ok(Some(pinned))
 }
 
-/// Analyze the pinned mirror's graph. Returns `None` on failure: the
-/// mirror lockfile is the runtime closure only — dev/build dep pins are
-/// intentionally absent, the lockfile walk in mirror mode hydrates ALL dep
-/// kinds and fails when those pins are missing, and continuing would feed
-/// that broken lockfile to a real build invocation downstream.
-async fn analyze_pinned_mirror(
+/// Analyze the pinned mirror's graph against the already-decoded index slices
+/// that `synthesize_lockfile_from_slices` resolved against — avoiding a second
+/// slice decode and keeping any registry revalidation off the pre-Cargo path
+/// (stow#1740). Returns `None` on failure: the mirror lockfile is the runtime
+/// closure only — dev/build dep pins are intentionally absent, the lockfile
+/// walk in mirror mode hydrates ALL dep kinds and fails when those pins are
+/// missing, and continuing would feed that broken lockfile to a real build
+/// invocation downstream.
+async fn analyze_pinned_mirror_from_slices(
     config: &StowConfig,
-    scope: AnalysisScope<'_>,
+    mirror_project: &ProjectFacts,
+    env: &SessionEnv,
+    slice: index::IndexSlice,
+    host_slice: Option<index::IndexSlice>,
 ) -> Option<WorkspacePrediction> {
-    let mirror_project = scope.project;
-    match analyze_workspace_prediction(
-        scope,
-        mirror_project.current_dir(),
-        &mirror_project.manifest_path,
+    let expanded = match expanded_graph(
         config,
+        mirror_project,
+        env,
+        &mirror_project.manifest_path,
         None,
+    )
+    .await
+    {
+        Ok(expanded) => expanded,
+        Err(error) => {
+            tracing::info!(
+                %error,
+                "post-pin mirror graph analysis failed; falling back to vanilla cargo passthrough"
+            );
+            return None;
+        }
+    };
+    match analyze_workspace_prediction_from(
+        mirror_project,
+        config,
+        AnalysisInputs {
+            slice: Some(slice),
+            host_slice,
+            expanded: Some(expanded),
+            slice_pending: false,
+        },
     )
     .await
     {
@@ -6120,7 +6150,7 @@ mod tests {
     fn slice_for(rows: Vec<stow_types::index::ArtifactIndexRow>) -> crate::index::IndexSlice {
         crate::index::IndexSlice {
             manifest_digest: Some("sha256:deadbeef".to_owned()),
-            index: stow_types::index::ArtifactIndex {
+            index: std::sync::Arc::new(stow_types::index::ArtifactIndex {
                 header: stow_types::index::ArtifactIndexHeader {
                     format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
                     target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin")
@@ -6134,7 +6164,7 @@ mod tests {
                 rows,
                 build_scripts: Vec::new(),
                 local_programs: Vec::new(),
-            },
+            }),
         }
     }
 
@@ -6739,6 +6769,27 @@ mod tests {
             &manifests_v2,
         );
         assert_ne!(digest_v1, digest_manifest_changed);
+
+        // Changing `--target-dir` (split or `=` form) selects where artifacts
+        // land, never what lockfile or seed resolves (stow#1740).
+        let digest_target_dir_split = super::compute_resolver_stamp_digest(
+            &facts,
+            "build",
+            &[OsString::from("--target-dir"), OsString::from("/tmp/t1")],
+            Some("sha256:1111"),
+            None,
+            &manifests_v1,
+        );
+        let digest_target_dir_eq = super::compute_resolver_stamp_digest(
+            &facts,
+            "build",
+            &[OsString::from("--target-dir=/tmp/t2")],
+            Some("sha256:1111"),
+            None,
+            &manifests_v1,
+        );
+        assert_eq!(digest_v1, digest_target_dir_split);
+        assert_eq!(digest_v1, digest_target_dir_eq);
     }
 
     #[tokio::test]

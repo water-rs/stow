@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -117,7 +118,12 @@ const PROBE_FLAGS: &[&str] = &[
     "-dumpmachine",
     "-print-search-dirs",
 ];
-const FLAGS_WITH_VALUE: &[&str] = &[
+/// Value-taking flags whose entire effect is consumed by the preprocessor
+/// (`cc -E`) and therefore reflected in the preprocessed output. Keeping them
+/// out of `compile_hash_args` prevents ephemeral `-I <OUT_DIR>/...` search
+/// paths from busting the object cache across target directories and worktrees
+/// (stow#1739).
+const PREPROCESS_ONLY_FLAGS_WITH_VALUE: &[&str] = &[
     "-I",
     "-isystem",
     "-include",
@@ -127,17 +133,27 @@ const FLAGS_WITH_VALUE: &[&str] = &[
     "-iprefix",
     "-iwithprefix",
     "-iwithprefixbefore",
+    "-D",
+    "-U",
+    "-F",
+    "-iframework",
+];
+/// Value-taking flags that affect compilation beyond preprocessing and must
+/// stay in `compile_hash_args`.
+const COMPILE_FLAGS_WITH_VALUE: &[&str] = &[
     "-x",
     "-std",
     "-target",
     "-arch",
-    "-D",
-    "-U",
     "-Xpreprocessor",
     "-Xclang",
     "-Xlinker",
     "-Xassembler",
 ];
+
+/// Canonical placeholder substituted for ephemeral Cargo `OUT_DIR` prefixes in
+/// C/C++ cache keys (stow#1739).
+const STOW_OUT_DIR_PLACEHOLDER: &str = "<STOW_OUT_DIR>";
 
 /// Which header set the requested depfile must record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,7 +334,14 @@ pub async fn plan_compile(
     }
     let preprocessed = preprocess_source(compiler, &parsed).await?;
     let working_dir = std::env::current_dir().wrap_err("read the compiler working directory")?;
-    let cache_key = cache_key(&compiler_fingerprint, &parsed, &working_dir, &preprocessed);
+    let out_dir_prefixes = out_dir_prefixes_from(std::env::var_os("OUT_DIR").as_deref());
+    let cache_key = cache_key(
+        &compiler_fingerprint,
+        &parsed,
+        &working_dir,
+        &preprocessed,
+        &out_dir_prefixes,
+    );
     Ok(CcPlan::Keyed {
         cache_key,
         output_path: parsed.output_path,
@@ -970,28 +993,200 @@ async fn preprocess_source(
     Ok(output.stdout)
 }
 
+/// Collect raw and canonicalized forms of Cargo's `OUT_DIR` so cache keys stay
+/// stable across target directories and worktrees even when paths pass through
+/// symlinks (such as `/var` vs `/private/var` on macOS) or escaped Windows
+/// preprocessor line markers (stow#1739).
+fn out_dir_prefixes_from(out_dir: Option<&OsStr>) -> Vec<String> {
+    let Some(raw_os) = out_dir else {
+        return Vec::new();
+    };
+    let mut prefixes = Vec::new();
+    let mut push_variant = |path: &Path| {
+        let raw = path.to_string_lossy();
+        let trimmed = raw
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&raw)
+            .trim_end_matches(['/', '\\']);
+        if trimmed.is_empty() {
+            return;
+        }
+        prefixes.push(trimmed.to_owned());
+        if trimmed.contains('\\') {
+            prefixes.push(trimmed.replace('\\', "/"));
+            prefixes.push(trimmed.replace('\\', r"\\"));
+        }
+    };
+    let raw_path = Path::new(raw_os);
+    push_variant(raw_path);
+    if let Ok(canonical) = std::fs::canonicalize(raw_path) {
+        push_variant(&canonical);
+    }
+    prefixes.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    prefixes.dedup();
+    prefixes
+}
+
+/// Replace a leading `OUT_DIR` prefix at a path boundary with
+/// [`STOW_OUT_DIR_PLACEHOLDER`]. Paths outside `OUT_DIR` are returned verbatim.
+fn normalize_out_dir_path<'a>(value: &'a str, prefixes: &[String]) -> Cow<'a, str> {
+    for prefix in prefixes {
+        if value == prefix {
+            return Cow::Borrowed(STOW_OUT_DIR_PLACEHOLDER);
+        }
+        if let Some(rest) = value.strip_prefix(prefix.as_str())
+            && (rest.starts_with('/') || rest.starts_with('\\'))
+        {
+            let mut normalized = String::with_capacity(STOW_OUT_DIR_PLACEHOLDER.len() + rest.len());
+            normalized.push_str(STOW_OUT_DIR_PLACEHOLDER);
+            normalized.push_str(rest);
+            return Cow::Owned(normalized);
+        }
+    }
+    Cow::Borrowed(value)
+}
+
+/// Replace `OUT_DIR` prefixes inside a compiler flag value (such as
+/// `-fdebug-prefix-map=<OUT_DIR>=/dst`) when bounded by a path or flag
+/// delimiter.
+fn normalize_out_dir_arg<'a>(value: &'a str, prefixes: &[String]) -> Cow<'a, str> {
+    if prefixes.is_empty() {
+        return Cow::Borrowed(value);
+    }
+    for prefix in prefixes {
+        if !value.contains(prefix.as_str()) {
+            continue;
+        }
+        let mut out = String::with_capacity(value.len());
+        let mut rest = value;
+        let mut replaced = false;
+        while let Some(pos) = rest.find(prefix.as_str()) {
+            let after = &rest[pos + prefix.len()..];
+            let valid_end = after.is_empty()
+                || after.starts_with('/')
+                || after.starts_with('\\')
+                || after.starts_with('=')
+                || after.starts_with(':');
+            if valid_end {
+                out.push_str(&rest[..pos]);
+                out.push_str(STOW_OUT_DIR_PLACEHOLDER);
+                rest = after;
+                replaced = true;
+            } else {
+                out.push_str(&rest[..pos + prefix.len()]);
+                rest = after;
+            }
+        }
+        if replaced {
+            out.push_str(rest);
+            return Cow::Owned(out);
+        }
+    }
+    Cow::Borrowed(value)
+}
+
+/// Return the byte range `(start, end)` of the quoted path inside a C/C++
+/// preprocessor line marker (`# <digits> "<path>"...` or
+/// `#line <digits> "<path>"...`), or `None` for any non-marker line.
+fn line_marker_path_span(line: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < line.len() && matches!(line[i], b' ' | b'\t') {
+        i += 1;
+    }
+    if line.get(i) != Some(&b'#') {
+        return None;
+    }
+    i += 1;
+    while i < line.len() && matches!(line[i], b' ' | b'\t') {
+        i += 1;
+    }
+    if line[i..].starts_with(b"line") && line.get(i + 4).is_some_and(|b| matches!(b, b' ' | b'\t'))
+    {
+        i += 4;
+        while i < line.len() && matches!(line[i], b' ' | b'\t') {
+            i += 1;
+        }
+    }
+    let digits_start = i;
+    while i < line.len() && line[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == digits_start {
+        return None;
+    }
+    let space_start = i;
+    while i < line.len() && matches!(line[i], b' ' | b'\t') {
+        i += 1;
+    }
+    if i == space_start || line.get(i) != Some(&b'"') {
+        return None;
+    }
+    let path_start = i + 1;
+    let mut j = path_start;
+    while j < line.len() {
+        match line[j] {
+            b'\\' if j + 1 < line.len() => j += 2,
+            b'"' => return Some((path_start, j)),
+            b'\r' | b'\n' => return None,
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// Hash preprocessed source while normalizing `OUT_DIR` prefixes inside
+/// `# <line> "<path>"` / `#line` markers only. Actual C/C++ code — including
+/// string literals that embed a build path — is hashed verbatim.
+fn hash_preprocessed_normalized(hasher: &mut Sha256, preprocessed: &[u8], prefixes: &[String]) {
+    if prefixes.is_empty() {
+        hasher.update(preprocessed);
+        return;
+    }
+    for line in preprocessed.split_inclusive(|&byte| byte == b'\n') {
+        if let Some((start, end)) = line_marker_path_span(line)
+            && let Ok(path_str) = std::str::from_utf8(&line[start..end])
+            && let Cow::Owned(normalized) = normalize_out_dir_path(path_str, prefixes)
+        {
+            hasher.update(&line[..start]);
+            hasher.update(normalized.as_bytes());
+            hasher.update(&line[end..]);
+            continue;
+        }
+        hasher.update(line);
+    }
+}
+
 /// The key covers everything that shapes the object. `preprocessed` keeps
 /// its line markers (`# <line> "<file>"`): they carry the source and header
 /// paths and the line numbers `__builtin_LINE()`, `__builtin_FILE()` and
 /// the `.file` / debug line tables are compiled from, none of which survive
-/// `-P`. The working directory enters only when the object records it.
+/// `-P`. Ephemeral Cargo `OUT_DIR` prefixes inside `compile_hash_args`,
+/// `working_dir`, and preprocessor line markers normalize to
+/// [`STOW_OUT_DIR_PLACEHOLDER`] so identical C compiles share objects across
+/// target directories and worktrees (stow#1739). The working directory enters
+/// only when the object records it.
 fn cache_key(
     compiler_fingerprint: &[u8],
     parsed: &ParsedCcInvocation,
     working_dir: &Path,
     preprocessed: &[u8],
+    out_dir_prefixes: &[String],
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"stow-cc-v2");
+    hasher.update(b"stow-cc-v3");
     hasher.update(compiler_fingerprint);
     for arg in &parsed.compile_hash_args {
-        hash_os_string(&mut hasher, arg);
+        let encoded = arg.to_string_lossy();
+        let normalized = normalize_out_dir_arg(&encoded, out_dir_prefixes);
+        hash_str(&mut hasher, &normalized);
     }
     if parsed.records_working_dir {
         hasher.update(b"cwd");
-        hash_os_string(&mut hasher, working_dir.as_os_str());
+        let encoded = working_dir.to_string_lossy();
+        let normalized = normalize_out_dir_path(&encoded, out_dir_prefixes);
+        hash_str(&mut hasher, &normalized);
     }
-    hasher.update(preprocessed);
+    hash_preprocessed_normalized(&mut hasher, preprocessed, out_dir_prefixes);
     hex::encode(hasher.finalize())
 }
 
@@ -1005,10 +1200,15 @@ fn debug_info_enabled(args: &[OsString]) -> bool {
         .is_some_and(|arg| arg != "-g0")
 }
 
-fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
-    let encoded = value.to_string_lossy();
-    hasher.update((encoded.len() as u64).to_le_bytes());
-    hasher.update(encoded.as_bytes());
+fn hash_str(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn is_preprocess_only_attached_flag(arg: &str) -> bool {
+    PREPROCESS_ONLY_FLAGS_WITH_VALUE
+        .iter()
+        .any(|prefix| arg.len() > prefix.len() && arg.starts_with(prefix))
 }
 
 impl ParsedCcInvocation {
@@ -1053,7 +1253,14 @@ impl ParsedCcInvocation {
                     };
                     output_path = Some(PathBuf::from(path));
                 }
-                flag if FLAGS_WITH_VALUE.contains(&flag) => {
+                flag if PREPROCESS_ONLY_FLAGS_WITH_VALUE.contains(&flag) => {
+                    let Some(value) = iter.next() else {
+                        return Err(stow_types::stow_error!("missing value after {arg_str}"));
+                    };
+                    preprocess_args.push(arg.clone());
+                    preprocess_args.push(value.clone());
+                }
+                flag if COMPILE_FLAGS_WITH_VALUE.contains(&flag) => {
                     let Some(value) = iter.next() else {
                         return Err(stow_types::stow_error!("missing value after {arg_str}"));
                     };
@@ -1065,20 +1272,8 @@ impl ParsedCcInvocation {
                 value if value.starts_with("-o") && value.len() > 2 => {
                     output_path = Some(PathBuf::from(&value[2..]));
                 }
-                value
-                    if value.starts_with("-I")
-                        || value.starts_with("-D")
-                        || value.starts_with("-U")
-                        || value.starts_with("-std=")
-                        || value.starts_with("-isystem")
-                        || value.starts_with("-include")
-                        || value.starts_with("-imacros")
-                        || value.starts_with("-iquote")
-                        || value.starts_with("-target")
-                        || value.starts_with("-arch") =>
-                {
+                value if is_preprocess_only_attached_flag(value) => {
                     preprocess_args.push(arg.clone());
-                    compile_hash_args.push(arg.clone());
                 }
                 value if value.starts_with('-') => {
                     preprocess_args.push(arg.clone());
@@ -1684,7 +1879,7 @@ mod tests {
             let parsed = ParsedCcInvocation::parse(&args(&all))
                 .expect("parse")
                 .expect("cacheable");
-            super::cache_key(b"cc 1", &parsed, std::path::Path::new(dir), b"int x;")
+            super::cache_key(b"cc 1", &parsed, std::path::Path::new(dir), b"int x;", &[])
         };
         assert_ne!(key(&["-g"], "/one"), key(&["-g"], "/two"));
         assert_ne!(
@@ -1694,6 +1889,172 @@ mod tests {
         assert_eq!(key(&["-O2"], "/one"), key(&["-O2"], "/two"));
         assert_eq!(key(&["-g", "-g0"], "/one"), key(&["-g", "-g0"], "/two"));
         assert_ne!(key(&["-g0", "-g"], "/one"), key(&["-g0", "-g"], "/two"));
+    }
+
+    /// Preprocessor-only search/include/define flags stay in `preprocess_args`
+    /// and leave `compile_hash_args`, so ephemeral `-I <OUT_DIR>/...` flags do
+    /// not split the object cache across target directories (stow#1739).
+    #[test]
+    fn preprocess_only_flags_leave_compile_hash_args() {
+        let parsed = ParsedCcInvocation::parse(&args(&[
+            "-O2",
+            "-g",
+            "-I",
+            "/tmp/t1/out/include",
+            "-I/tmp/t1/out/gen",
+            "-isystem",
+            "/tmp/t1/out/sys",
+            "-DVERSION=1",
+            "-D",
+            "FOO=bar",
+            "-UOLD",
+            "-include",
+            "/tmp/t1/out/config.h",
+            "-std=c11",
+            "-c",
+            "src/foo.c",
+            "-o",
+            "out/foo.o",
+        ]))
+        .expect("parse")
+        .expect("cacheable");
+
+        assert_eq!(parsed.compile_hash_args, args(&["-O2", "-g", "-std=c11"]));
+        assert!(parsed.preprocess_args.iter().any(|arg| arg == "-I"));
+        assert!(
+            parsed
+                .preprocess_args
+                .iter()
+                .any(|arg| arg == "/tmp/t1/out/include")
+        );
+        assert!(
+            parsed
+                .preprocess_args
+                .iter()
+                .any(|arg| arg == "-DVERSION=1")
+        );
+    }
+
+    /// Ephemeral `OUT_DIR` prefixes in `working_dir`, preprocessor line markers,
+    /// and remaining compile flags normalize to the same key across distinct
+    /// target directories, while non-`OUT_DIR` paths and string literals inside
+    /// C code stay unnormalized (stow#1739).
+    #[test]
+    fn out_dir_paths_normalize_across_target_dirs() {
+        let out_a = "/tmp/target-a/debug/build/jemalloc-1111/out";
+        let out_b = "/tmp/target-b/debug/build/jemalloc-2222/out";
+
+        let key_for = |out_dir: &str, body: &str| {
+            let parsed = ParsedCcInvocation::parse(&args(&[
+                "-g",
+                "-O2",
+                "-I",
+                &format!("{out_dir}/include"),
+                &format!("-fdebug-prefix-map={out_dir}=/src"),
+                "-c",
+                "src/foo.c",
+                "-o",
+                &format!("{out_dir}/foo.o"),
+            ]))
+            .expect("parse")
+            .expect("cacheable");
+            let prefixes = super::out_dir_prefixes_from(Some(std::ffi::OsStr::new(out_dir)));
+            let cwd = PathBuf::from(format!("{out_dir}/build"));
+            let preprocessed = format!(
+                "# 1 \"{out_dir}/build//\"\n\
+                 # 1 \"{out_dir}/include/defs.h\" 1\n\
+                 #line 12 \"{out_dir}/gen/foo.c\"\n\
+                 {body}\n"
+            );
+            super::cache_key(b"cc 1", &parsed, &cwd, preprocessed.as_bytes(), &prefixes)
+        };
+
+        // Identical C code with different OUT_DIRs in -I, cwd, -fdebug-prefix-map,
+        // and line markers must produce the exact same cache key.
+        assert_eq!(
+            key_for(out_a, "int answer(void) { return 42; }"),
+            key_for(out_b, "int answer(void) { return 42; }")
+        );
+
+        // A C string literal embedding OUT_DIR is real object data and must NOT
+        // normalize to the same key.
+        assert_ne!(
+            key_for(
+                out_a,
+                &format!("const char *dir(void) {{ return \"{out_a}/share\"; }}")
+            ),
+            key_for(
+                out_b,
+                &format!("const char *dir(void) {{ return \"{out_b}/share\"; }}")
+            )
+        );
+    }
+
+    /// End-to-end check with the host C compiler: compiling the same source with
+    /// `-g`, a generated header in `OUT_DIR`, and `cwd` under `OUT_DIR` produces
+    /// the same cache key across two distinct `OUT_DIR`s (stow#1739).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_cc_shares_cache_key_across_distinct_out_dirs() {
+        let cc = super::ResolvedCompiler::explicit(OsString::from("cc"));
+        if let Err(error) = async_process::Command::new(&cc.program)
+            .arg("--version")
+            .output()
+            .await
+        {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return;
+            }
+            panic!("spawn cc --version: {error}");
+        }
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+
+        let mut keys = Vec::new();
+        for root in [dir_a.path(), dir_b.path()] {
+            let inc = root.join("include");
+            let work = root.join("build");
+            std::fs::create_dir_all(&inc).expect("create inc");
+            std::fs::create_dir_all(&work).expect("create work");
+            std::fs::write(inc.join("defs.h"), "#define ANSWER 42\n").expect("write header");
+            let src = work.join("foo.c");
+            std::fs::write(
+                &src,
+                "#include \"defs.h\"\nint answer(void) { return ANSWER; }\n",
+            )
+            .expect("write source");
+            let obj = root.join("foo.o");
+            let compile_args = vec![
+                OsString::from("-g"),
+                OsString::from("-O2"),
+                OsString::from("-I"),
+                inc.into_os_string(),
+                OsString::from("-c"),
+                src.into_os_string(),
+                OsString::from("-o"),
+                obj.into_os_string(),
+            ];
+            let parsed = ParsedCcInvocation::parse(&compile_args)
+                .expect("parse")
+                .expect("cacheable");
+            let fingerprint = super::compiler_fingerprint(&cc).await.expect("fingerprint");
+            let preprocessed = super::preprocess_source(&cc, &parsed)
+                .await
+                .expect("preprocess");
+            let prefixes = super::out_dir_prefixes_from(Some(root.as_os_str()));
+            keys.push(super::cache_key(
+                &fingerprint,
+                &parsed,
+                &work,
+                &preprocessed,
+                &prefixes,
+            ));
+        }
+
+        assert_eq!(
+            keys[0], keys[1],
+            "identical C compiles in distinct OUT_DIRs must share one cache key"
+        );
     }
 
     #[cfg(unix)]

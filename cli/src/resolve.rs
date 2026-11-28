@@ -14,7 +14,7 @@
 //! may reference, and a node is covered only when its candidate's whole
 //! dependency chain resolves inside the slice.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use semver::Version;
 use stow_types::api::{DependencyGraphEntry, ResolvedDependencyGraphEntry, runner_family};
@@ -618,26 +618,33 @@ fn cached_artifacts(
     // cannot load is still covered — rebuilding it would mint the same
     // floor, so it must not become an enqueue miss. Prefetch, though, is
     // real download: rerun the same reachability over only the rows this
-    // host can `dlopen`, so an unservable candidate or chain member never
-    // joins the fetch set.
-    let servable_rows = rows
-        .iter()
-        .filter(|row| row_servable_on_host(row, host_glibc))
-        .cloned()
-        .collect::<Vec<_>>();
-    let servable_reachable = resolve_reachable_cached_rows_with_non_additive(
-        &key_pairs,
-        dependency_identity_by_key,
-        &servable_rows,
-        local_programs,
-        non_additive,
-    )?;
-    let selected_prefetch_rows =
-        select_prefetch_candidates(feature_json_by_key, root_keys, &servable_reachable)?;
-    // Prefetch the full closure of every selected candidate: the CLI's
-    // injection walk loads chain dependencies locally and pays a
-    // per-artifact network round trip for each one not prefetched.
-    let prefetch_artifacts = servable_reachable.closure_artifacts(&selected_prefetch_rows);
+    // host can `dlopen` when any row is excluded by `host_glibc`, so an
+    // unservable candidate or chain member never joins the fetch set.
+    let all_rows_servable =
+        host_glibc.is_none() || rows.iter().all(|row| row_servable_on_host(row, host_glibc));
+    let prefetch_artifacts = if all_rows_servable {
+        let selected_prefetch_rows =
+            select_prefetch_candidates(feature_json_by_key, root_keys, &reachable)?;
+        reachable.closure_artifacts(&selected_prefetch_rows)
+    } else {
+        let servable_rows: Vec<&ArtifactIndexRow> = rows
+            .iter()
+            .filter(|row| row_servable_on_host(row, host_glibc))
+            .collect();
+        let servable_reachable = resolve_reachable_cached_row_refs(
+            &key_pairs,
+            dependency_identity_by_key,
+            &servable_rows,
+            local_programs,
+            non_additive,
+        )?;
+        let selected_prefetch_rows =
+            select_prefetch_candidates(feature_json_by_key, root_keys, &servable_reachable)?;
+        // Prefetch the full closure of every selected candidate: the CLI's
+        // injection walk loads chain dependencies locally and pays a
+        // per-artifact network round trip for each one not prefetched.
+        servable_reachable.closure_artifacts(&selected_prefetch_rows)
+    };
     Ok(CachedArtifacts {
         semantic_keys,
         inexact_keys,
@@ -668,206 +675,230 @@ fn resolve_reachable_cached_rows_with_non_additive<'a>(
     local_programs: &[stow_types::records::LocalProcMacro],
     non_additive: &BTreeMap<PackageKey, BTreeSet<String>>,
 ) -> stow_types::error::Result<ReachableRows<'a>> {
-    let IndexedRows {
-        mut candidates,
-        mut chain_rows,
-    } = partition_cached_rows(key_pairs, dependency_identity_by_key, rows)?;
+    let row_refs: Vec<&'a ArtifactIndexRow> = rows.iter().collect();
+    resolve_reachable_cached_row_refs(
+        key_pairs,
+        dependency_identity_by_key,
+        &row_refs,
+        local_programs,
+        non_additive,
+    )
+}
 
-    for program in local_programs {
-        if stable_c_metadata_for_compile_key(&program.compile_key)? != program.c_metadata.as_str() {
-            return Err(stow_types::stow_error!(
-                "local proc macro {} has inconsistent compile identity",
-                program.node.crate_name
-            ));
+/// On-demand memoized reachability state for one `c_metadata` node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReachState {
+    Visiting,
+    Reachable,
+    Unreachable,
+}
+
+fn dep_identities_for_row(row: &ArtifactIndexRow) -> Vec<DepChainIdentity> {
+    canonicalize_dependency_identities(
+        row.dependency_c_metadata_json
+            .entries()
+            .iter()
+            .map(|entry| DepChainIdentity {
+                crate_name: entry.crate_name.as_str().to_owned(),
+                c_metadata: entry.c_metadata.as_str().to_owned(),
+            })
+            .collect(),
+    )
+}
+
+struct ReachabilityIndex<'a> {
+    candidates: Vec<ReachableCandidateRow<'a>>,
+    candidate_index: HashMap<(String, &'a str), usize>,
+    candidate_by_c_metadata: HashMap<&'a str, Vec<usize>>,
+    rows_by_c_metadata: HashMap<&'a str, Vec<&'a ArtifactIndexRow>>,
+    local_programs: Vec<ChainRow<'a>>,
+    local_programs_by_c_metadata: HashMap<String, Vec<usize>>,
+    canonical_cache: HashMap<*const ArtifactIndexRow, bool>,
+    c_metadata_state: HashMap<String, ReachState>,
+    reachable_candidates: BTreeSet<usize>,
+    reachable_chain_keys: HashSet<(String, &'a str)>,
+    kept_chain: Vec<ChainRow<'a>>,
+    reachable_local_programs: BTreeSet<usize>,
+}
+
+impl<'a> ReachabilityIndex<'a> {
+    fn is_canonical(&mut self, row: &'a ArtifactIndexRow) -> stow_types::error::Result<bool> {
+        let ptr = std::ptr::from_ref(row);
+        if let Some(&cached) = self.canonical_cache.get(&ptr) {
+            return Ok(cached);
         }
-        chain_rows.push(ChainRow {
-            row: None,
-            c_metadata: program.c_metadata.as_str().to_owned(),
-            dependency_identities: program
+        let canonical = cached_row_has_canonical_metadata(row)?;
+        self.canonical_cache.insert(ptr, canonical);
+        Ok(canonical)
+    }
+
+    /// Whether every dependency edge of a candidate/chain/local-program row is
+    /// reachable in the slice.
+    fn deps_reachable(&mut self, dep_c_metadatas: &[String]) -> stow_types::error::Result<bool> {
+        for dep_c_metadata in dep_c_metadatas {
+            if !self.c_metadata_reachable(dep_c_metadata)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn c_metadata_reachable(&mut self, c_metadata: &str) -> stow_types::error::Result<bool> {
+        if let Some(&state) = self.c_metadata_state.get(c_metadata) {
+            return Ok(state == ReachState::Reachable);
+        }
+        self.c_metadata_state
+            .insert(c_metadata.to_owned(), ReachState::Visiting);
+
+        let mut any_reachable = false;
+
+        // Check candidate rows carrying this `c_metadata`.
+        let candidate_indices = self
+            .candidate_by_c_metadata
+            .get(c_metadata)
+            .cloned()
+            .unwrap_or_default();
+        for index in candidate_indices {
+            if self.candidate_reachable(index)? {
+                any_reachable = true;
+            }
+        }
+
+        // Check local proc-macro chain entries carrying this `c_metadata`.
+        let local_indices = self
+            .local_programs_by_c_metadata
+            .get(c_metadata)
+            .cloned()
+            .unwrap_or_default();
+        for index in local_indices {
+            let deps: Vec<String> = self.local_programs[index]
+                .dependency_identities
+                .iter()
+                .map(|dep| dep.c_metadata.clone())
+                .collect();
+            if self.deps_reachable(&deps)? {
+                self.reachable_local_programs.insert(index);
+                any_reachable = true;
+            }
+        }
+
+        // Check non-candidate artifact rows carrying this `c_metadata`.
+        let matching_rows = self
+            .rows_by_c_metadata
+            .get(c_metadata)
+            .cloned()
+            .unwrap_or_default();
+        for row in matching_rows {
+            if !self.is_canonical(row)? {
+                continue;
+            }
+            let identity_key = (
+                canonical_crate_name(row.crate_name.as_str()),
+                row.c_metadata.as_str(),
+            );
+            if self.candidate_index.contains_key(&identity_key) {
+                continue;
+            }
+            let deps: Vec<String> = row
                 .dependency_c_metadata_json
                 .entries()
                 .iter()
-                .map(|dep| DepChainIdentity {
-                    crate_name: dep.crate_name.as_str().to_owned(),
-                    c_metadata: dep.c_metadata.as_str().to_owned(),
-                })
-                .collect(),
-        });
-    }
-    let (reachable_candidates, _) = reachable_indices(&candidates, &chain_rows);
-    // stow#881: a node whose exact chain is not published may still be
-    // served — by the smallest published set containing its requested
-    // one, when that set's whole chain is published. Rows for the
-    // serving set join the candidates under the *node's* semantic key;
-    // reachability decides as it does for any candidate, so a node moves
-    // only once the whole chain its build needs is there.
-    let covered = reachable_candidates
-        .iter()
-        .map(|&index| candidates[index].semantic_key.clone())
-        .collect::<BTreeSet<_>>();
-    add_superset_candidates(&mut candidates, key_pairs, &covered, rows, non_additive)?;
-
-    let (reachable_candidates, reachable_chain) = reachable_indices(&candidates, &chain_rows);
-
-    let mut kept_candidates = Vec::new();
-    for (index, candidate) in candidates.into_iter().enumerate() {
-        if reachable_candidates.contains(&index) {
-            kept_candidates.push(candidate);
-        }
-    }
-    let mut kept_chain = Vec::new();
-    for (index, chain_row) in chain_rows.into_iter().enumerate() {
-        if reachable_chain.contains(&index) {
-            kept_chain.push(chain_row);
-        }
-    }
-
-    let candidate_by_c_metadata = by_c_metadata(&kept_candidates, |candidate| {
-        candidate.row.c_metadata.as_str()
-    });
-    let chain_by_c_metadata = by_c_metadata(&kept_chain, |chain_row| chain_row.c_metadata.as_str());
-    Ok(ReachableRows {
-        candidates: kept_candidates,
-        candidate_by_c_metadata,
-        chain_rows: kept_chain,
-        chain_by_c_metadata,
-    })
-}
-
-/// `c_metadata` → the indices of every row carrying it. A slice can hold
-/// two rows under one `c_metadata` (a linked and an unlinked unit shape),
-/// and a dependency edge — which records `c_metadata` alone — is
-/// satisfied by any of them (stow#578, mirroring the consume-side walk in
-/// stow#581).
-fn by_c_metadata<Row>(rows: &[Row], row_of: impl Fn(&Row) -> &str) -> BTreeMap<String, Vec<usize>> {
-    let mut map = BTreeMap::<String, Vec<usize>>::new();
-    for (index, entry) in rows.iter().enumerate() {
-        map.entry(row_of(entry).to_owned()).or_default().push(index);
-    }
-    map
-}
-
-/// Reachability fixpoint over the union of candidates and chain rows: a
-/// node is reachable when every dependency identity it references is a
-/// reachable node. Nodes are addressed as (`is_chain`, index); the result
-/// is the reachable index set per side.
-///
-/// Dependency identities record the `--extern` alias — the lib target
-/// name, which `[lib] name` may rename away from the package name rows
-/// are keyed on (stow#578) — so the recorded name is not an edge key at
-/// all. `c_metadata` is: it identifies the dep artifact uniquely, and an
-/// edge is satisfied when any row carrying it is reachable.
-fn reachable_indices<'a>(
-    candidates: &[ReachableCandidateRow<'a>],
-    chain_rows: &[ChainRow<'a>],
-) -> (BTreeSet<usize>, BTreeSet<usize>) {
-    let candidate_by_c_metadata =
-        by_c_metadata(candidates, |candidate| candidate.row.c_metadata.as_str());
-    let chain_by_c_metadata = by_c_metadata(chain_rows, |chain_row| chain_row.c_metadata.as_str());
-    let edge_reachable = |identity: &DepChainIdentity,
-                          reachable_candidates: &BTreeSet<usize>,
-                          reachable_chain: &BTreeSet<usize>| {
-        candidate_by_c_metadata
-            .get(identity.c_metadata.as_str())
-            .is_some_and(|indices| {
-                indices
-                    .iter()
-                    .any(|index| reachable_candidates.contains(index))
-            })
-            || chain_by_c_metadata
-                .get(identity.c_metadata.as_str())
-                .is_some_and(|indices| indices.iter().any(|index| reachable_chain.contains(index)))
-    };
-
-    let mut reachable_candidates = BTreeSet::<usize>::new();
-    let mut reachable_chain = BTreeSet::<usize>::new();
-    let mut progressed = true;
-    while progressed {
-        progressed = false;
-        let reach_check = |identity: &DepChainIdentity,
-                           reachable_candidates: &BTreeSet<usize>,
-                           reachable_chain: &BTreeSet<usize>| {
-            edge_reachable(identity, reachable_candidates, reachable_chain)
-        };
-        for (index, candidate) in candidates.iter().enumerate() {
-            if reachable_candidates.contains(&index) {
-                continue;
-            }
-            if candidate
-                .dependency_identities
-                .iter()
-                .all(|identity| reach_check(identity, &reachable_candidates, &reachable_chain))
-            {
-                reachable_candidates.insert(index);
-                progressed = true;
+                .map(|entry| entry.c_metadata.as_str().to_owned())
+                .collect();
+            if self.deps_reachable(&deps)? {
+                any_reachable = true;
+                if self.reachable_chain_keys.insert(identity_key) {
+                    self.kept_chain.push(ChainRow {
+                        row: Some(row),
+                        c_metadata: row.c_metadata.as_str().to_owned(),
+                        dependency_identities: dep_identities_for_row(row),
+                    });
+                }
             }
         }
-        for (index, chain_row) in chain_rows.iter().enumerate() {
-            if reachable_chain.contains(&index) {
-                continue;
-            }
-            if chain_row
-                .dependency_identities
-                .iter()
-                .all(|identity| reach_check(identity, &reachable_candidates, &reachable_chain))
-            {
-                reachable_chain.insert(index);
-                progressed = true;
-            }
-        }
-    }
-    (reachable_candidates, reachable_chain)
-}
 
-/// Partition index rows by request match: rows whose (package, features)
-/// pair is in `key_pairs` *and* whose recorded dependency digest equals
-/// the node's own become candidates (stow#790 — a tuple published under
-/// a different dependency context covers nothing); every other canonical
-/// row is a chain row another candidate's closure may reference. Rows
-/// failing the canonical-metadata check are dropped.
-fn partition_cached_rows<'a>(
-    key_pairs: &BTreeSet<(PackageKey, String)>,
-    dependency_identity_by_key: &BTreeMap<PackageKey, DependencyIdentity>,
-    rows: &'a [ArtifactIndexRow],
-) -> stow_types::error::Result<IndexedRows<'a>> {
-    let mut candidates = Vec::<ReachableCandidateRow<'a>>::new();
-    let mut candidate_index = BTreeMap::<(String, String), usize>::new();
-    let mut chain_rows = Vec::<ChainRow<'a>>::new();
-    let mut chain_index = BTreeMap::<(String, String), usize>::new();
-
-    for row in rows {
-        if !cached_row_has_canonical_metadata(row)? {
-            continue;
-        }
-        let dependency_identities = canonicalize_dependency_identities(
-            row.dependency_c_metadata_json
-                .entries()
-                .iter()
-                .map(|entry| DepChainIdentity {
-                    crate_name: entry.crate_name.as_str().to_owned(),
-                    c_metadata: entry.c_metadata.as_str().to_owned(),
-                })
-                .collect(),
+        self.c_metadata_state.insert(
+            c_metadata.to_owned(),
+            if any_reachable {
+                ReachState::Reachable
+            } else {
+                ReachState::Unreachable
+            },
         );
-        let identity_key = (
-            canonical_crate_name(row.crate_name.as_str()),
-            row.c_metadata.as_str().to_owned(),
-        );
+        Ok(any_reachable)
+    }
 
-        let package_key = PackageKey {
-            crate_name: row.crate_name.clone(),
-            version: row.version.as_semver().clone(),
-        };
-        let semantic_key = (package_key, row.features_json.raw());
-        let context_matches = if key_pairs.contains(&semantic_key) {
-            let digest = row.dependency_identity()?;
-            dependency_identity_by_key
-                .get(&semantic_key.0)
-                .is_some_and(|expected| *expected == digest)
+    fn candidate_reachable(&mut self, index: usize) -> stow_types::error::Result<bool> {
+        if self.reachable_candidates.contains(&index) {
+            return Ok(true);
+        }
+        let deps: Vec<String> = self.candidates[index]
+            .dependency_identities
+            .iter()
+            .map(|dep| dep.c_metadata.clone())
+            .collect();
+        if self.deps_reachable(&deps)? {
+            self.reachable_candidates.insert(index);
+            Ok(true)
         } else {
-            false
-        };
-        if context_matches {
+            Ok(false)
+        }
+    }
+    fn build(
+        key_pairs: &BTreeSet<(PackageKey, String)>,
+        dependency_identity_by_key: &BTreeMap<PackageKey, DependencyIdentity>,
+        rows: &[&'a ArtifactIndexRow],
+        local_programs: &[stow_types::records::LocalProcMacro],
+    ) -> stow_types::error::Result<Self> {
+        // Fast lookup of requested (crate_name, version) pairs so non-project rows
+        // never allocate `PackageKey` or `DepChainIdentity` during partitioning.
+        let requested_packages: HashSet<(&str, &Version)> = key_pairs
+            .iter()
+            .map(|(pkg, _)| (pkg.crate_name.as_str(), &pkg.version))
+            .collect();
+
+        let mut candidates = Vec::<ReachableCandidateRow<'a>>::new();
+        let mut candidate_index = HashMap::<(String, &'a str), usize>::new();
+        let mut candidate_by_c_metadata = HashMap::<&'a str, Vec<usize>>::new();
+        let mut rows_by_c_metadata =
+            HashMap::<&'a str, Vec<&'a ArtifactIndexRow>>::with_capacity(rows.len());
+        let mut canonical_cache = HashMap::<*const ArtifactIndexRow, bool>::new();
+
+        for &row in rows {
+            rows_by_c_metadata
+                .entry(row.c_metadata.as_str())
+                .or_default()
+                .push(row);
+
+            if !requested_packages.contains(&(row.crate_name.as_str(), row.version.as_semver())) {
+                continue;
+            }
+            let canonical = cached_row_has_canonical_metadata(row)?;
+            canonical_cache.insert(std::ptr::from_ref(row), canonical);
+            if !canonical {
+                continue;
+            }
+            let package_key = PackageKey {
+                crate_name: row.crate_name.clone(),
+                version: row.version.as_semver().clone(),
+            };
+            let semantic_key = (package_key, row.features_json.raw());
+            let context_matches = if key_pairs.contains(&semantic_key) {
+                let digest = row.dependency_identity()?;
+                dependency_identity_by_key
+                    .get(&semantic_key.0)
+                    .is_some_and(|expected| *expected == digest)
+            } else {
+                false
+            };
+            if !context_matches {
+                continue;
+            }
+            let dependency_identities = dep_identities_for_row(row);
+            let identity_key = (
+                canonical_crate_name(row.crate_name.as_str()),
+                row.c_metadata.as_str(),
+            );
             if let Some(existing_index) = candidate_index.get(&identity_key).copied() {
                 if !deduplicate_cached_candidate(
                     &candidates[existing_index],
@@ -883,33 +914,203 @@ fn partition_cached_rows<'a>(
                 }
                 continue;
             }
-            candidate_index.insert(identity_key, candidates.len());
+            let idx = candidates.len();
+            candidate_index.insert(identity_key, idx);
+            candidate_by_c_metadata
+                .entry(row.c_metadata.as_str())
+                .or_default()
+                .push(idx);
             candidates.push(ReachableCandidateRow {
                 semantic_key,
                 row,
                 dependency_identities,
                 superset: false,
             });
-            continue;
         }
 
-        // Not a semantic match for this request, but still a canonical
-        // artifact another candidate's closure may reference.
-        if chain_index.contains_key(&identity_key) || candidate_index.contains_key(&identity_key) {
-            continue;
-        }
-        chain_index.insert(identity_key, chain_rows.len());
-        chain_rows.push(ChainRow {
-            row: Some(row),
-            c_metadata: row.c_metadata.as_str().to_owned(),
-            dependency_identities,
-        });
+        let local_program_tables = build_local_program_tables(local_programs)?;
+
+        Ok(Self {
+            candidates,
+            candidate_index,
+            candidate_by_c_metadata,
+            rows_by_c_metadata,
+            local_programs: local_program_tables.rows,
+            local_programs_by_c_metadata: local_program_tables.by_c_metadata,
+            canonical_cache,
+            c_metadata_state: HashMap::new(),
+            reachable_candidates: BTreeSet::new(),
+            reachable_chain_keys: HashSet::new(),
+            kept_chain: Vec::new(),
+            reachable_local_programs: BTreeSet::new(),
+        })
     }
 
-    Ok(IndexedRows {
-        candidates,
-        chain_rows,
+    fn run_initial_reachability(
+        &mut self,
+        key_pairs: &BTreeSet<(PackageKey, String)>,
+        local_programs: &[stow_types::records::LocalProcMacro],
+    ) -> stow_types::error::Result<()> {
+        for idx in 0..self.candidates.len() {
+            self.candidate_reachable(idx)?;
+        }
+        // Local proc macros matching `key_pairs` are probed via `chain_by_c_metadata`
+        // in `cached_artifacts` even when no candidate references them directly.
+        for (idx, program) in local_programs.iter().enumerate() {
+            let key = PackageKey {
+                crate_name: program.node.crate_name.clone(),
+                version: program.node.version.as_semver().clone(),
+            };
+            let semantic = (key, program.node.features_json.raw());
+            if key_pairs.contains(&semantic) {
+                let deps: Vec<String> = self.local_programs[idx]
+                    .dependency_identities
+                    .iter()
+                    .map(|dep| dep.c_metadata.clone())
+                    .collect();
+                if self.deps_reachable(&deps)? {
+                    self.reachable_local_programs.insert(idx);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn into_reachable_rows(self) -> ReachableRows<'a> {
+        let mut kept_candidates = Vec::with_capacity(self.reachable_candidates.len());
+        for (index, candidate) in self.candidates.into_iter().enumerate() {
+            if self.reachable_candidates.contains(&index) {
+                kept_candidates.push(candidate);
+            }
+        }
+        let mut kept_chain = self.kept_chain;
+        for (index, chain_row) in self.local_programs.into_iter().enumerate() {
+            if self.reachable_local_programs.contains(&index) {
+                kept_chain.push(chain_row);
+            }
+        }
+
+        let candidate_by_c_metadata = by_c_metadata(&kept_candidates, |candidate| {
+            candidate.row.c_metadata.as_str()
+        });
+        let chain_by_c_metadata =
+            by_c_metadata(&kept_chain, |chain_row| chain_row.c_metadata.as_str());
+        ReachableRows {
+            candidates: kept_candidates,
+            candidate_by_c_metadata,
+            chain_rows: kept_chain,
+            chain_by_c_metadata,
+        }
+    }
+}
+
+struct LocalProgramTables<'a> {
+    rows: Vec<ChainRow<'a>>,
+    by_c_metadata: HashMap<String, Vec<usize>>,
+}
+
+fn build_local_program_tables<'a>(
+    local_programs: &[stow_types::records::LocalProcMacro],
+) -> stow_types::error::Result<LocalProgramTables<'a>> {
+    let mut rows = Vec::with_capacity(local_programs.len());
+    let mut by_c_metadata = HashMap::<String, Vec<usize>>::new();
+    for program in local_programs {
+        if stable_c_metadata_for_compile_key(&program.compile_key)? != program.c_metadata.as_str() {
+            return Err(stow_types::stow_error!(
+                "local proc macro {} has inconsistent compile identity",
+                program.node.crate_name
+            ));
+        }
+        let idx = rows.len();
+        by_c_metadata
+            .entry(program.c_metadata.as_str().to_owned())
+            .or_default()
+            .push(idx);
+        rows.push(ChainRow {
+            row: None,
+            c_metadata: program.c_metadata.as_str().to_owned(),
+            dependency_identities: program
+                .dependency_c_metadata_json
+                .entries()
+                .iter()
+                .map(|dep| DepChainIdentity {
+                    crate_name: dep.crate_name.as_str().to_owned(),
+                    c_metadata: dep.c_metadata.as_str().to_owned(),
+                })
+                .collect(),
+        });
+    }
+    Ok(LocalProgramTables {
+        rows,
+        by_c_metadata,
     })
+}
+
+fn resolve_reachable_cached_row_refs<'a>(
+    key_pairs: &BTreeSet<(PackageKey, String)>,
+    dependency_identity_by_key: &BTreeMap<PackageKey, DependencyIdentity>,
+    rows: &[&'a ArtifactIndexRow],
+    local_programs: &[stow_types::records::LocalProcMacro],
+    non_additive: &BTreeMap<PackageKey, BTreeSet<String>>,
+) -> stow_types::error::Result<ReachableRows<'a>> {
+    let mut solver =
+        ReachabilityIndex::build(key_pairs, dependency_identity_by_key, rows, local_programs)?;
+    solver.run_initial_reachability(key_pairs, local_programs)?;
+
+    // stow#881: a node whose exact chain is not published may still be
+    // served — by the smallest published set containing its requested
+    // one, when that set's whole chain is published. Skip the superset pass
+    // outright when every requested node is already covered by exact rows.
+    let covered = solver
+        .reachable_candidates
+        .iter()
+        .map(|&index| solver.candidates[index].semantic_key.clone())
+        .collect::<BTreeSet<_>>();
+    if covered.len() < key_pairs.len() {
+        let before = solver.candidates.len();
+        add_superset_candidates(
+            &mut solver.candidates,
+            key_pairs,
+            &covered,
+            rows,
+            &solver.rows_by_c_metadata,
+            &mut solver.canonical_cache,
+            non_additive,
+        )?;
+        if solver.candidates.len() > before {
+            for idx in before..solver.candidates.len() {
+                let c_metadata = solver.candidates[idx].row.c_metadata.as_str();
+                solver
+                    .candidate_by_c_metadata
+                    .entry(c_metadata)
+                    .or_default()
+                    .push(idx);
+            }
+            // Newly added superset candidates can make previously-unreachable
+            // c_metadata entries reachable, so clear any negative memos.
+            solver
+                .c_metadata_state
+                .retain(|_, state| *state == ReachState::Reachable);
+            for idx in before..solver.candidates.len() {
+                solver.candidate_reachable(idx)?;
+            }
+        }
+    }
+
+    Ok(solver.into_reachable_rows())
+}
+
+/// `c_metadata` → the indices of every row carrying it. A slice can hold
+/// two rows under one `c_metadata` (a linked and an unlinked unit shape),
+/// and a dependency edge — which records `c_metadata` alone — is
+/// satisfied by any of them (stow#578, mirroring the consume-side walk in
+/// stow#581).
+fn by_c_metadata<Row>(rows: &[Row], row_of: impl Fn(&Row) -> &str) -> BTreeMap<String, Vec<usize>> {
+    let mut map = BTreeMap::<String, Vec<usize>>::new();
+    for (index, entry) in rows.iter().enumerate() {
+        map.entry(row_of(entry).to_owned()).or_default().push(index);
+    }
+    map
 }
 
 fn cached_row_has_canonical_metadata(row: &ArtifactIndexRow) -> stow_types::error::Result<bool> {
@@ -957,7 +1158,7 @@ fn deduplicate_cached_candidate(
 /// *node's* semantic key. The row's `dependency_identity` is `T`'s build
 /// context, so the digest equality the exact pass requires cannot hold;
 /// publication of the whole chain the serving build needs is what
-/// [`reachable_indices`] proves instead. A node whose own set is
+/// reachability proves instead. A node whose own set is
 /// published — reachable or not — is never moved: its `S` is already the
 /// smallest containing set, and an unreachable exact chain keeps the
 /// node on the miss path it has.
@@ -975,33 +1176,46 @@ fn add_superset_candidates<'a>(
     candidates: &mut Vec<ReachableCandidateRow<'a>>,
     key_pairs: &BTreeSet<(PackageKey, String)>,
     covered: &BTreeSet<SemanticKey>,
-    rows: &'a [ArtifactIndexRow],
+    rows: &[&'a ArtifactIndexRow],
+    rows_by_c_metadata: &HashMap<&'a str, Vec<&'a ArtifactIndexRow>>,
+    canonical_cache: &mut HashMap<*const ArtifactIndexRow, bool>,
     non_additive: &BTreeMap<PackageKey, BTreeSet<String>>,
 ) -> stow_types::error::Result<()> {
-    // The chooser's pool: every canonical target-side row is built by
-    // definition, grouped by package with its decoded feature set.
-    let mut pool = Vec::<PoolRow<'a>>::new();
-    let mut published = BTreeMap::<PackageKey, Vec<usize>>::new();
-    let mut by_c_metadata = BTreeMap::<&str, Vec<usize>>::new();
-    for row in rows {
-        if row.unit_shape.side != UnitSide::Target || !cached_row_has_canonical_metadata(row)? {
+    let uncovered_packages: HashSet<(&str, &Version)> = key_pairs
+        .iter()
+        .filter(|pair| !covered.contains(*pair))
+        .map(|(pkg, _)| (pkg.crate_name.as_str(), &pkg.version))
+        .collect();
+    if uncovered_packages.is_empty() {
+        return Ok(());
+    }
+
+    // Collect only canonical target-side rows belonging to uncovered packages
+    // instead of decoding every row in the slice.
+    let mut published = HashMap::<(&'a str, &'a Version), Vec<&'a ArtifactIndexRow>>::new();
+    for &row in rows {
+        if row.unit_shape.side != UnitSide::Target
+            || !uncovered_packages.contains(&(row.crate_name.as_str(), row.version.as_semver()))
+        {
             continue;
         }
-        let Ok(features) = serde_json::from_str::<Vec<String>>(row.features_json.raw().as_str())
-        else {
+        let ptr = std::ptr::from_ref(row);
+        let canonical = if let Some(v) = canonical_cache.get(&ptr).copied() {
+            v
+        } else {
+            let v = cached_row_has_canonical_metadata(row)?;
+            canonical_cache.insert(ptr, v);
+            v
+        };
+        if !canonical {
             continue;
-        };
-        let key = PackageKey {
-            crate_name: row.crate_name.clone(),
-            version: row.version.as_semver().clone(),
-        };
-        published.entry(key.clone()).or_default().push(pool.len());
-        by_c_metadata
-            .entry(row.c_metadata.as_str())
+        }
+        published
+            .entry((row.crate_name.as_str(), row.version.as_semver()))
             .or_default()
-            .push(pool.len());
-        pool.push(PoolRow { key, row, features });
+            .push(row);
     }
+
     // What the build asks of each package and each compatibility range,
     // and what the chains accepted so far hold (stow#1470, stow#1487).
     let requested_features = requested_features(key_pairs);
@@ -1012,7 +1226,8 @@ fn add_superset_candidates<'a>(
         if covered.contains(key_pair) {
             continue;
         }
-        let Some(pkg_rows) = published.get(&key_pair.0) else {
+        let Some(pkg_rows) = published.get(&(key_pair.0.crate_name.as_str(), &key_pair.0.version))
+        else {
             continue;
         };
         let Ok(requested) = serde_json::from_str::<Vec<String>>(key_pair.1.as_str()) else {
@@ -1022,9 +1237,7 @@ fn add_superset_candidates<'a>(
         let forbidden = non_additive.get(&key_pair.0).unwrap_or(&empty);
         let Some(serving) = stow_types::feature_sets::smallest_containing_set_respecting(
             &requested,
-            pkg_rows
-                .iter()
-                .map(|&index| pool[index].features.as_slice()),
+            pkg_rows.iter().map(|row| row.features_json.features()),
             forbidden,
         ) else {
             continue;
@@ -1035,16 +1248,15 @@ fn add_superset_candidates<'a>(
             // existing exact artifact.
             continue;
         }
-        for &index in pkg_rows {
-            let PoolRow { row, features, .. } = &pool[index];
-            if features.as_slice() != serving {
+        for &row in pkg_rows {
+            if row.features_json.features() != serving {
                 continue;
             }
             // The row's whole recorded chain must agree with the build,
             // in feature sets and in versions per compatibility range:
             // the node's own package moves, so only the chain's other
             // packages answer to the request's feature sets.
-            let chain = chain_members(&pool, &by_c_metadata, index);
+            let chain = chain_members(rows_by_c_metadata, canonical_cache, row)?;
             let moving = |key: &PackageClosureKey<'_>| {
                 matches!(key, ClosureKey::Package { crate_name, version, .. }
                     if **crate_name == key_pair.0.crate_name && **version == key_pair.0.version)
@@ -1063,16 +1275,7 @@ fn add_superset_candidates<'a>(
             if !agrees {
                 continue;
             }
-            let dependency_identities = canonicalize_dependency_identities(
-                row.dependency_c_metadata_json
-                    .entries()
-                    .iter()
-                    .map(|entry| DepChainIdentity {
-                        crate_name: entry.crate_name.as_str().to_owned(),
-                        c_metadata: entry.c_metadata.as_str().to_owned(),
-                    })
-                    .collect(),
-            );
+            let dependency_identities = dep_identities_for_row(row);
             if added.insert((row.c_metadata.as_str().to_owned(), key_pair.clone())) {
                 pinned.hold(chain.iter().map(|(key, held)| (key, held)));
                 candidates.push(ReachableCandidateRow {
@@ -1085,14 +1288,6 @@ fn add_superset_candidates<'a>(
         }
     }
     Ok(())
-}
-
-/// One canonical target-side row of the superset pool, with its decoded
-/// feature set.
-struct PoolRow<'a> {
-    key: PackageKey,
-    row: &'a ArtifactIndexRow,
-    features: Vec<String>,
 }
 
 /// A closure key of the superset pass: every pool row and request is
@@ -1122,56 +1317,66 @@ fn requested_agreement<'a>(
 ) -> ClosureAgreement<PackageClosureKey<'a>, PackageClosureHeld<'a>> {
     let mut agreement = ClosureAgreement::default();
     for (key, features) in requested {
-        for (closure_key, held) in package_members(key, features) {
+        for (closure_key, held) in package_members(&key.crate_name, &key.version, features) {
             agreement.replace(closure_key, held);
         }
     }
     agreement
 }
 
-/// The closure members of `key` with `features`: its version under its
-/// crate's compatibility range and its feature set under the package.
+/// The closure members of `(crate_name, version)` with `features`: its version
+/// under its crate's compatibility range and its feature set under the package.
 fn package_members<'a>(
-    key: &'a PackageKey,
+    crate_name: &'a CrateName,
+    version: &'a Version,
     features: &'a [String],
 ) -> [(PackageClosureKey<'a>, PackageClosureHeld<'a>); 2] {
-    closure_members(
-        &&key.crate_name,
-        &key.version,
-        &&key.version,
-        (),
-        false,
-        features,
-    )
+    closure_members(&crate_name, version, &version, (), false, features)
 }
 
-/// The closure members of every pool row in the recorded chain of
-/// `pool[start]`, itself included. An edge names `c_metadata` alone, so
-/// every row carrying it is a member.
+/// The closure members of every canonical target-side row in the recorded chain
+/// of `start`, itself included. An edge names `c_metadata` alone, so every
+/// canonical target-side row carrying it is a member.
 fn chain_members<'a>(
-    pool: &'a [PoolRow<'_>],
-    by_c_metadata: &BTreeMap<&str, Vec<usize>>,
-    start: usize,
-) -> Vec<(PackageClosureKey<'a>, PackageClosureHeld<'a>)> {
-    let mut seen = BTreeSet::new();
+    rows_by_c_metadata: &HashMap<&'a str, Vec<&'a ArtifactIndexRow>>,
+    canonical_cache: &mut HashMap<*const ArtifactIndexRow, bool>,
+    start: &'a ArtifactIndexRow,
+) -> stow_types::error::Result<Vec<(PackageClosureKey<'a>, PackageClosureHeld<'a>)>> {
+    let mut seen = HashSet::<*const ArtifactIndexRow>::new();
     let mut stack = vec![start];
     let mut sets = Vec::new();
-    while let Some(index) = stack.pop() {
-        if !seen.insert(index) {
+    while let Some(row) = stack.pop() {
+        let ptr = std::ptr::from_ref(row);
+        if !seen.insert(ptr) {
             continue;
         }
-        let PoolRow { key, row, features } = &pool[index];
-        sets.extend(package_members(key, features));
+        sets.extend(package_members(
+            &row.crate_name,
+            row.version.as_semver(),
+            row.features_json.features(),
+        ));
         for entry in row.dependency_c_metadata_json.entries() {
-            stack.extend(
-                by_c_metadata
-                    .get(entry.c_metadata.as_str())
-                    .into_iter()
-                    .flatten(),
-            );
+            if let Some(dep_rows) = rows_by_c_metadata.get(entry.c_metadata.as_str()) {
+                for &dep_row in dep_rows {
+                    if dep_row.unit_shape.side != UnitSide::Target {
+                        continue;
+                    }
+                    let dep_ptr = std::ptr::from_ref(dep_row);
+                    let canonical = if let Some(v) = canonical_cache.get(&dep_ptr).copied() {
+                        v
+                    } else {
+                        let v = cached_row_has_canonical_metadata(dep_row)?;
+                        canonical_cache.insert(dep_ptr, v);
+                        v
+                    };
+                    if canonical {
+                        stack.push(dep_row);
+                    }
+                }
+            }
         }
     }
-    sets
+    Ok(sets)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1199,14 +1404,6 @@ struct ChainRow<'a> {
     row: Option<&'a ArtifactIndexRow>,
     c_metadata: String,
     dependency_identities: Vec<DepChainIdentity>,
-}
-
-/// Index rows partitioned by request match — semantic candidates and
-/// chain-only rows, each a node's (row, recorded dep edges).
-#[derive(Debug)]
-struct IndexedRows<'a> {
-    candidates: Vec<ReachableCandidateRow<'a>>,
-    chain_rows: Vec<ChainRow<'a>>,
 }
 
 /// Reachability result: semantic candidates plus the chain-only rows their

@@ -524,7 +524,7 @@ impl<R: std::io::Read> std::io::Read for BoundedIndexReader<'_, R> {
 /// [`ArtifactIndex`] failed, so an older or newer schema reports its
 /// version instead of whichever field differed.
 #[cfg(not(target_arch = "wasm32"))]
-fn probe_foreign_format_version(bytes: &[u8], max_json_len: u64) -> Option<u32> {
+fn probe_foreign_format_version(json: &[u8]) -> Option<u32> {
     #[derive(serde::Deserialize)]
     struct VersionProbe {
         header: HeaderVersion,
@@ -534,15 +534,7 @@ fn probe_foreign_format_version(bytes: &[u8], max_json_len: u64) -> Option<u32> 
         format_version: u32,
     }
 
-    let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(bytes)).ok()?;
-    let mut io_error = None;
-    let reader = std::io::BufReader::new(BoundedIndexReader {
-        inner: decoder,
-        remaining: max_json_len,
-        limit: max_json_len,
-        io_error: &mut io_error,
-    });
-    let probe: VersionProbe = serde_json::from_reader(reader).ok()?;
+    let probe: VersionProbe = serde_json::from_slice(json).ok()?;
     (probe.header.format_version != ARTIFACT_INDEX_FORMAT_VERSION)
         .then_some(probe.header.format_version)
 }
@@ -572,22 +564,25 @@ impl ArtifactIndex {
     }
 
     fn decode_bounded(bytes: &[u8], max_json_len: u64) -> Result<Self, IndexDecodeError> {
+        use std::io::Read as _;
+
         let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(bytes))
             .map_err(IndexDecodeError::Decompress)?;
         let mut io_error = None;
-        let reader = std::io::BufReader::new(BoundedIndexReader {
+        let mut reader = BoundedIndexReader {
             inner: decoder,
             remaining: max_json_len,
             limit: max_json_len,
             io_error: &mut io_error,
-        });
-        let index: Self = match serde_json::from_reader(reader) {
+        };
+        let mut json = Vec::new();
+        if let Err(err) = reader.read_to_end(&mut json) {
+            return Err(IndexDecodeError::Decompress(io_error.unwrap_or(err)));
+        }
+        let index: Self = match serde_json::from_slice(&json) {
             Ok(index) => index,
             Err(deserialize_error) => {
-                if let Some(err) = io_error {
-                    return Err(IndexDecodeError::Decompress(err));
-                }
-                if let Some(found) = probe_foreign_format_version(bytes, max_json_len) {
+                if let Some(found) = probe_foreign_format_version(&json) {
                     return Err(IndexDecodeError::Format {
                         found,
                         expected: ARTIFACT_INDEX_FORMAT_VERSION,
