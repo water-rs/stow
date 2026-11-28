@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.17](https://github.com/water-rs/stow/compare/types/v0.21.16...types/v0.21.17) - 2026-11-28
+
+### Fixed
+
+- *(cli)* normalize OUT_DIR in C cache keys and remove try_stow_resolver pre-Cargo stalls
+
 ## [0.21.14](https://github.com/water-rs/stow/compare/types/v0.21.13...types/v0.21.14) - 2026-11-27
 
 ### Added
