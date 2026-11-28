@@ -89,7 +89,7 @@ lto = "thin"
 
 [patch.crates-io]
 # Keep heel 0.9.7's Linux host requirements while taking the credential reset fix.
-heel = { git = "https://github.com/lexoliu/heel-sandbox", branch = "fix/linux-spawn-resetids-0.9.7" }
+heel = { git = "https://github.com/May-Agent/heel", branch = "fix/linux-spawn-resetids-0.9.7" }
 # zenwave's QUIC keep-alive (zen-rs/zenwave#93): without it an HTTP/3 request
 # whose server takes longer than 30 s to answer dies at quinn's idle timeout,
 # which is how stow-admin's long resolve and submit calls failed. Its h2 pool
