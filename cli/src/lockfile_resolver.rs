@@ -8,7 +8,8 @@
 //! `(target, rustc_version)` slice is already resident, so every closure
 //! walk resolves against the in-memory index the slice decodes to.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use stow_types::identity::CrateName;
 use stow_types::index::ArtifactIndexRow;
@@ -88,51 +89,43 @@ struct ResolverIndex<'a> {
     /// Rows whose dep closure could cover the whole direct-dep set —
     /// the only rows the seed scan may consider.
     seeds: Vec<&'a ArtifactIndexRow>,
-    by_pair: BTreeMap<(String, String), &'a ArtifactIndexRow>,
+    by_pair: HashMap<(Cow<'a, str>, &'a str), &'a ArtifactIndexRow>,
     /// `c_metadata` is unique per (target, `rustc_version`), so this is a
     /// 1:1 index — the fallback when a `dependency_c_metadata_json`
     /// entry's name disagrees with the cached row's name (Cargo lets a
     /// project rename a dep via `package = "..."`; rustc captures the
     /// local alias, the cache stores the published name).
-    by_c_metadata: BTreeMap<String, &'a ArtifactIndexRow>,
-    by_crate: BTreeMap<String, Vec<&'a ArtifactIndexRow>>,
+    by_c_metadata: HashMap<&'a str, &'a ArtifactIndexRow>,
+    by_crate: HashMap<&'a str, Vec<&'a ArtifactIndexRow>>,
 }
 
 impl<'a> ResolverIndex<'a> {
-    fn new(all: &'a [ArtifactIndexRow], min_seed_deps: usize) -> Self {
+    fn new(
+        primary: &'a [ArtifactIndexRow],
+        host: Option<&'a [ArtifactIndexRow]>,
+        min_seed_deps: usize,
+    ) -> Self {
+        let total = primary.len() + host.map_or(0, <[ArtifactIndexRow]>::len);
         let mut index = Self {
             seeds: Vec::new(),
-            by_pair: BTreeMap::new(),
-            by_c_metadata: BTreeMap::new(),
-            by_crate: BTreeMap::new(),
+            by_pair: HashMap::with_capacity(total),
+            by_c_metadata: HashMap::with_capacity(total),
+            by_crate: HashMap::new(),
         };
-        for row in all {
+        for row in primary.iter().chain(host.into_iter().flatten()) {
             if row.dependency_c_metadata_json.entries().len() >= min_seed_deps {
                 index.seeds.push(row);
             }
-        }
-        for row in all {
-            index.by_pair.insert(
-                (
-                    row.crate_name.as_str().to_owned(),
-                    row.c_metadata.as_str().to_owned(),
-                ),
-                row,
-            );
-            let alt = row.crate_name.as_str().replace('-', "_");
-            if alt != row.crate_name.as_str() {
+            let name = row.crate_name.as_str();
+            let c_metadata = row.c_metadata.as_str();
+            index.by_pair.insert((Cow::Borrowed(name), c_metadata), row);
+            if name.contains('-') {
                 index
                     .by_pair
-                    .insert((alt, row.c_metadata.as_str().to_owned()), row);
+                    .insert((Cow::Owned(name.replace('-', "_")), c_metadata), row);
             }
-            index
-                .by_c_metadata
-                .insert(row.c_metadata.as_str().to_owned(), row);
-            index
-                .by_crate
-                .entry(row.crate_name.as_str().to_owned())
-                .or_default()
-                .push(row);
+            index.by_c_metadata.insert(c_metadata, row);
+            index.by_crate.entry(name).or_default().push(row);
         }
         index
     }
@@ -142,20 +135,20 @@ impl<'a> ResolverIndex<'a> {
     /// where the rustc alias diverges from the cargo-published name
     /// entirely — by `c_metadata` alone (1:1 in this target/rustc index).
     fn lookup_dep_row(&self, name: &str, c_metadata: &str) -> Option<&'a ArtifactIndexRow> {
-        if let Some(row) = self.by_pair.get(&(name.to_owned(), c_metadata.to_owned())) {
+        if let Some(row) = self.by_pair.get(&(Cow::Borrowed(name), c_metadata)) {
             return Some(*row);
         }
-        let alt = name.replace('_', "-");
-        if alt != name
-            && let Some(row) = self.by_pair.get(&(alt, c_metadata.to_owned()))
-        {
-            return Some(*row);
+        if name.contains('_') {
+            let alt = name.replace('_', "-");
+            if let Some(row) = self.by_pair.get(&(Cow::Borrowed(alt.as_str()), c_metadata)) {
+                return Some(*row);
+            }
         }
-        let alt = name.replace('-', "_");
-        if alt != name
-            && let Some(row) = self.by_pair.get(&(alt, c_metadata.to_owned()))
-        {
-            return Some(*row);
+        if name.contains('-') {
+            let alt = name.replace('-', "_");
+            if let Some(row) = self.by_pair.get(&(Cow::Borrowed(alt.as_str()), c_metadata)) {
+                return Some(*row);
+            }
         }
         self.by_c_metadata.get(c_metadata).copied()
     }
@@ -166,8 +159,8 @@ impl<'a> ResolverIndex<'a> {
     /// from "explore every dead-end version" into "search only over
     /// coherent candidates", which is what makes large user dep graphs
     /// solvable.
-    fn candidate_closure_is_cached(&self, candidate: &ArtifactIndexRow) -> bool {
-        let mut visited: BTreeSet<String> = BTreeSet::new();
+    fn candidate_closure_is_cached(&self, candidate: &'a ArtifactIndexRow) -> bool {
+        let mut visited: HashSet<&'a str> = HashSet::new();
         self.closure_is_cached_recursive(candidate, &mut visited)
     }
 
@@ -180,21 +173,23 @@ impl<'a> ResolverIndex<'a> {
         &self,
         candidate: &'a ArtifactIndexRow,
     ) -> Option<(String, String)> {
-        let mut visited: BTreeSet<String> = BTreeSet::new();
+        let mut visited: HashSet<&'a str> = HashSet::new();
         self.first_uncached_recursive(candidate, &mut visited)
     }
 
     fn first_uncached_recursive(
         &self,
         candidate: &'a ArtifactIndexRow,
-        visited: &mut BTreeSet<String>,
+        visited: &mut HashSet<&'a str>,
     ) -> Option<(String, String)> {
-        if !visited.insert(candidate.c_metadata.as_str().to_owned()) {
+        if !visited.insert(candidate.c_metadata.as_str()) {
             return None;
         }
-        for (name, c_metadata) in dep_pairs(candidate) {
-            let Some(dep_row) = self.lookup_dep_row(&name, &c_metadata) else {
-                return Some((name, c_metadata));
+        for entry in candidate.dependency_c_metadata_json.entries() {
+            let name = entry.crate_name.as_str();
+            let c_metadata = entry.c_metadata.as_str();
+            let Some(dep_row) = self.lookup_dep_row(name, c_metadata) else {
+                return Some((name.to_owned(), c_metadata.to_owned()));
             };
             if let Some(miss) = self.first_uncached_recursive(dep_row, visited) {
                 return Some(miss);
@@ -205,14 +200,16 @@ impl<'a> ResolverIndex<'a> {
 
     fn closure_is_cached_recursive(
         &self,
-        candidate: &ArtifactIndexRow,
-        visited: &mut BTreeSet<String>,
+        candidate: &'a ArtifactIndexRow,
+        visited: &mut HashSet<&'a str>,
     ) -> bool {
-        if !visited.insert(candidate.c_metadata.as_str().to_owned()) {
+        if !visited.insert(candidate.c_metadata.as_str()) {
             return true;
         }
-        for (name, c_metadata) in dep_pairs(candidate) {
-            let Some(dep_row) = self.lookup_dep_row(&name, &c_metadata) else {
+        for entry in candidate.dependency_c_metadata_json.entries() {
+            let Some(dep_row) =
+                self.lookup_dep_row(entry.crate_name.as_str(), entry.c_metadata.as_str())
+            else {
                 return false;
             };
             if !self.closure_is_cached_recursive(dep_row, visited) {
@@ -321,8 +318,19 @@ fn features_set(row: &ArtifactIndexRow) -> BTreeSet<String> {
 ///
 /// Returns an error only when the synthesized lockfile fails to
 /// serialize; every resolvable-vs-not outcome is data in the response.
+#[cfg(test)]
 pub fn resolve_lockfile(
     rows: &[ArtifactIndexRow],
+    direct: &[DirectDependency],
+) -> stow_types::error::Result<LockfileResolution> {
+    resolve_lockfile_slices(rows, None, direct)
+}
+
+/// [`resolve_lockfile`] over a primary slice plus an optional host slice,
+/// without cloning or concatenating the two row tables.
+pub fn resolve_lockfile_slices(
+    rows: &[ArtifactIndexRow],
+    host_rows: Option<&[ArtifactIndexRow]>,
     direct: &[DirectDependency],
 ) -> stow_types::error::Result<LockfileResolution> {
     // Hard cap on the search budget. The in-memory index makes each step
@@ -359,7 +367,7 @@ pub fn resolve_lockfile(
         }
     };
 
-    let index = ResolverIndex::new(rows, typed_direct.len());
+    let index = ResolverIndex::new(rows, host_rows, typed_direct.len());
     let mut state = SearchState {
         considered: 0,
         budget: MAX_RESOLVER_BUDGET,
@@ -537,6 +545,41 @@ fn apply_seed_artifact(
     }
 }
 
+/// Precomputed name variants for a direct dependency so seed-row checks never
+/// reallocate dashed/underscored keys per row.
+struct DirectLookup<'a> {
+    name: &'a str,
+    underscored: String,
+    dashed: String,
+    req: &'a semver::VersionReq,
+    features: &'a BTreeSet<String>,
+}
+
+impl DirectLookup<'_> {
+    fn matches_entry_name(&self, entry_name: &str) -> bool {
+        entry_name == self.name || entry_name == self.underscored || entry_name == self.dashed
+    }
+}
+
+fn build_direct_lookups(typed_direct: &[TypedDirectDep]) -> Vec<DirectLookup<'_>> {
+    let mut direct_lookups: Vec<DirectLookup<'_>> = typed_direct
+        .iter()
+        .map(|(name, req, features)| {
+            let raw = name.as_str();
+            DirectLookup {
+                name: raw,
+                underscored: raw.replace('-', "_"),
+                dashed: raw.replace('_', "-"),
+                req,
+                features,
+            }
+        })
+        .collect();
+    // Deterministic order matching the previous BTreeMap<&str, ...> scan.
+    direct_lookups.sort_by_key(|entry| entry.name);
+    direct_lookups
+}
+
 /// Search the index for a "seed" row whose own
 /// `dependency_c_metadata_json` already covers every user direct dep with
 /// semver+features-compatible pins. When the user's project IS one of the
@@ -549,54 +592,76 @@ fn find_seed_artifact<'a>(
     considered: &mut u32,
     diagnostics: &mut Vec<String>,
 ) -> Option<&'a ArtifactIndexRow> {
-    let direct_index: BTreeMap<&str, (&semver::VersionReq, &BTreeSet<String>)> = typed_direct
+    const MAX_SEED_DIAGNOSTICS: usize = 20;
+
+    let direct_lookups = build_direct_lookups(typed_direct);
+    // Anchor on the direct dep with the fewest cached rows so non-matching
+    // seed rows reject in one zero-allocation pass.
+    let anchor = direct_lookups
         .iter()
-        .map(|(name, req, features)| (name.as_str(), (req, features)))
-        .collect();
+        .min_by_key(|entry| index.by_crate.get(entry.name).map_or(0, Vec::len));
+
     let mut best: Option<(&ArtifactIndexRow, usize)> = None;
     let mut diagnostic_size_pass = 0_usize;
     let mut diagnostic_partial_match: Vec<(String, String, usize, String)> = Vec::new();
+    let mut row_dep_index: HashMap<Cow<'_, str>, &str> = HashMap::new();
     for &row in &index.seeds {
         *considered = considered.saturating_add(1);
-        let deps = dep_pairs(row);
-        // `index.seeds` is already bounded by the dep-identity count —
-        // the same `deps.len() >= typed_direct.len()` predicate — so
-        // every iterated row is a size-pass.
+        let entries = row.dependency_c_metadata_json.entries();
         diagnostic_size_pass += 1;
-        let covered_count = match seed_row_direct_coverage(index, &direct_index, &deps) {
-            Ok(covered_count) => covered_count,
-            Err((covered_count, fail_reason)) => {
-                // Record every size-pass failure so a 0-coverage seed (the
-                // common case for "wrong artifact name happens to have many
-                // deps") still surfaces *why* it didn't seed — not just that
-                // 14 candidates passed the size filter and silently failed.
+        if let Some(anchor) = anchor
+            && !entries
+                .iter()
+                .any(|entry| anchor.matches_entry_name(entry.crate_name.as_str()))
+        {
+            if best.is_none() && diagnostic_partial_match.len() < MAX_SEED_DIAGNOSTICS {
+                diagnostic_partial_match.push((
+                    row.crate_name.as_str().to_owned(),
+                    row.version.to_string(),
+                    0,
+                    format!("name `{}` not in row_dep_index", anchor.name),
+                ));
+            }
+            continue;
+        }
+        let covered_count =
+            match seed_row_direct_coverage(index, &direct_lookups, entries, &mut row_dep_index) {
+                Ok(covered_count) => covered_count,
+                Err((covered_count, fail_reason)) => {
+                    if best.is_none()
+                        && (covered_count > 0
+                            || diagnostic_partial_match.len() < MAX_SEED_DIAGNOSTICS)
+                    {
+                        diagnostic_partial_match.push((
+                            row.crate_name.as_str().to_owned(),
+                            row.version.to_string(),
+                            covered_count,
+                            fail_reason,
+                        ));
+                    }
+                    continue;
+                }
+            };
+        // Confirm the seed's own full transitive closure is cached — a row
+        // with a missing transitive can't actually be walked.
+        if !index.candidate_closure_is_cached(row) {
+            if best.is_none() {
+                let reason = match index.first_uncached_in_closure(row) {
+                    Some((name, c_metadata)) => format!("transitive uncached: {name}/{c_metadata}"),
+                    None => "transitive closure walk failed".to_owned(),
+                };
                 diagnostic_partial_match.push((
                     row.crate_name.as_str().to_owned(),
                     row.version.to_string(),
                     covered_count,
-                    fail_reason,
+                    reason,
                 ));
-                continue;
             }
-        };
-        // Confirm the seed's own full transitive closure is cached — a row
-        // with a missing transitive can't actually be walked.
-        if !index.candidate_closure_is_cached(row) {
-            let reason = match index.first_uncached_in_closure(row) {
-                Some((name, c_metadata)) => format!("transitive uncached: {name}/{c_metadata}"),
-                None => "transitive closure walk failed".to_owned(),
-            };
-            diagnostic_partial_match.push((
-                row.crate_name.as_str().to_owned(),
-                row.version.to_string(),
-                covered_count,
-                reason,
-            ));
             continue;
         }
         // Prefer larger seeds (more transitives covered) so we lock in the
         // most amount of cache work per pin. Tie-break by version DESC.
-        let dep_count = deps.len();
+        let dep_count = entries.len();
         let take_this = match best {
             None => true,
             Some((current, current_deps)) => match dep_count.cmp(&current_deps) {
@@ -616,7 +681,9 @@ fn find_seed_artifact<'a>(
             diagnostic_size_pass,
             typed_direct.len()
         ));
-        for (name, version, cov, reason) in diagnostic_partial_match.iter().take(20) {
+        for (name, version, cov, reason) in
+            diagnostic_partial_match.iter().take(MAX_SEED_DIAGNOSTICS)
+        {
             diagnostics.push(format!(
                 "{name} {version}: covered={cov}/{total} fail={reason}",
                 total = typed_direct.len()
@@ -628,50 +695,55 @@ fn find_seed_artifact<'a>(
 
 /// Whether `row`'s dep index covers every user direct dep with a cached
 /// pin satisfying the req and feature subset. `Ok` carries the covered
-/// count (always `direct_index.len()`); `Err` carries the covered-so-far
+/// count (always `direct_lookups.len()`); `Err` carries the covered-so-far
 /// count plus the first failure reason, for the seed diagnostics.
-fn seed_row_direct_coverage(
-    index: &ResolverIndex<'_>,
-    direct_index: &BTreeMap<&str, (&semver::VersionReq, &BTreeSet<String>)>,
-    deps: &[(String, String)],
+fn seed_row_direct_coverage<'a>(
+    index: &ResolverIndex<'a>,
+    direct_lookups: &[DirectLookup<'_>],
+    entries: &'a [stow_types::identity::DependencyCMetadataIdentity],
+    row_dep_index: &mut HashMap<Cow<'a, str>, &'a str>,
 ) -> Result<usize, (usize, String)> {
-    let mut row_dep_index: BTreeMap<String, &str> = BTreeMap::new();
-    for (dep_name, dep_c_metadata) in deps {
-        row_dep_index.insert(dep_name.clone(), dep_c_metadata.as_str());
+    row_dep_index.clear();
+    for entry in entries {
+        let dep_name = entry.crate_name.as_str();
+        let dep_c_metadata = entry.c_metadata.as_str();
+        row_dep_index.insert(Cow::Borrowed(dep_name), dep_c_metadata);
         // Also accept normalized form (rustc underscored vs. cargo
         // dashed) so user direct deps named with dashes match a row
         // whose extern was captured with underscores.
-        row_dep_index.insert(dep_name.replace('_', "-"), dep_c_metadata.as_str());
+        if dep_name.contains('_') {
+            row_dep_index.insert(Cow::Owned(dep_name.replace('_', "-")), dep_c_metadata);
+        }
     }
     let mut covered_count = 0_usize;
-    for (user_name, (user_req, user_features)) in direct_index {
-        let lookup_keys = [
-            (*user_name).to_owned(),
-            user_name.replace('-', "_"),
-            user_name.replace('_', "-"),
-        ];
-        let mut hit = None;
-        for key in &lookup_keys {
-            if let Some(c_metadata) = row_dep_index.get(key) {
-                hit = Some(c_metadata);
-                break;
-            }
-        }
+    for direct in direct_lookups {
+        let user_name = direct.name;
+        let hit = row_dep_index
+            .get(&Cow::Borrowed(direct.name))
+            .or_else(|| row_dep_index.get(&Cow::Borrowed(direct.underscored.as_str())))
+            .or_else(|| row_dep_index.get(&Cow::Borrowed(direct.dashed.as_str())))
+            .copied();
         let Some(c_metadata) = hit else {
             return Err((
                 covered_count,
                 format!("name `{user_name}` not in row_dep_index"),
             ));
         };
-        let Some(pinned_row) = lookup_keys
-            .iter()
-            .find_map(|key| {
+        let Some(pinned_row) = index
+            .by_pair
+            .get(&(Cow::Borrowed(direct.name), c_metadata))
+            .or_else(|| {
                 index
                     .by_pair
-                    .get(&((*key).clone(), (*c_metadata).to_owned()))
+                    .get(&(Cow::Borrowed(direct.underscored.as_str()), c_metadata))
+            })
+            .or_else(|| {
+                index
+                    .by_pair
+                    .get(&(Cow::Borrowed(direct.dashed.as_str()), c_metadata))
             })
             .copied()
-            .or_else(|| index.by_c_metadata.get(*c_metadata).copied())
+            .or_else(|| index.by_c_metadata.get(c_metadata).copied())
         else {
             return Err((
                 covered_count,
@@ -679,10 +751,13 @@ fn seed_row_direct_coverage(
             ));
         };
         let pinned_version = pinned_row.version.as_semver();
-        if !user_req.matches(pinned_version) {
+        if !direct.req.matches(pinned_version) {
             return Err((
                 covered_count,
-                format!("req `{user_req}` does not match pinned {user_name} {pinned_version}"),
+                format!(
+                    "req `{}` does not match pinned {user_name} {pinned_version}",
+                    direct.req
+                ),
             ));
         }
         let pinned_features = features_set(pinned_row);
@@ -693,12 +768,12 @@ fn seed_row_direct_coverage(
         // of whether the user said default-features=true. Treat user's
         // "default" request as satisfied when the candidate has no
         // "default" feature recorded — it's a no-op.
-        let mut effective_user_features: BTreeSet<String> = (*user_features).clone();
+        let mut effective_user_features: BTreeSet<String> = direct.features.clone();
         if effective_user_features.contains("default") && !pinned_features.contains("default") {
             effective_user_features.remove("default");
         }
         if !effective_user_features.is_subset(&pinned_features) {
-            let user_set: Vec<&String> = user_features.iter().collect();
+            let user_set: Vec<&String> = direct.features.iter().collect();
             let pinned_set: Vec<&String> = pinned_features.iter().collect();
             return Err((
                 covered_count,

@@ -62,7 +62,7 @@ const VALUE_FLAGS: &[&[u8]] = &[
 /// after `--` then selects libtest cases, and for `test`/`bench` a
 /// bare positional is the test-name filter — neither changes the
 /// graph, so neither may split the key.
-fn normalized_args(action: &str, cargo_args: &[OsString]) -> Vec<Vec<u8>> {
+pub fn normalized_args(action: &str, cargo_args: &[OsString]) -> Vec<Vec<u8>> {
     let translated = crate::workspace_deps::unit_graph_args(action, cargo_args);
     let args = translated
         .iter()

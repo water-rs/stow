@@ -677,7 +677,7 @@ pub mod tests {
         };
         let slices = [stow_cli::build_consume::IndexSlice {
             manifest_digest: Some(format!("sha256:{}", "1".repeat(64))),
-            index: stow_types::index::ArtifactIndex {
+            index: std::sync::Arc::new(stow_types::index::ArtifactIndex {
                 header: stow_types::index::ArtifactIndexHeader {
                     format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
                     target: task.target.clone(),
@@ -689,7 +689,7 @@ pub mod tests {
                 rows: Vec::new(),
                 build_scripts: vec![row],
                 local_programs: Vec::new(),
-            },
+            }),
         }];
         // The claim covers the spelling whose phase was served the script:
         // the node owes it under the native spelling alone here.

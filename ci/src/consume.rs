@@ -449,7 +449,7 @@ pub mod test_support {
     pub fn index_slice(rows: Vec<ArtifactIndexRow>) -> IndexSlice {
         IndexSlice {
             manifest_digest: Some("sha256:".to_owned() + &"cd".repeat(32)),
-            index: ArtifactIndex {
+            index: std::sync::Arc::new(ArtifactIndex {
                 header: ArtifactIndexHeader {
                     format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
                     target: TargetTriple::parse(SLICE_TARGET).unwrap(),
@@ -461,7 +461,7 @@ pub mod test_support {
                 rows,
                 build_scripts: Vec::new(),
                 local_programs: Vec::new(),
-            },
+            }),
         }
     }
 
@@ -697,7 +697,9 @@ mod tests {
         script.artifact_kind = ArtifactKind::BuildScript;
         script.crate_types = vec![RustCrateType::Bin];
         let mut slice = index_slice(Vec::new());
-        slice.index.build_scripts.push(script);
+        std::sync::Arc::make_mut(&mut slice.index)
+            .build_scripts
+            .push(script);
         let packages = [dep_scan::ConsumablePackage {
             crate_name: "demo".to_owned(),
             version: semver::Version::new(1, 0, 0),
@@ -868,7 +870,9 @@ mod tests {
             &[],
             UnitSide::Target,
         )]);
-        target_slice.index.header.target =
+        std::sync::Arc::make_mut(&mut target_slice.index)
+            .header
+            .target =
             stow_types::identity::TargetTriple::parse("aarch64-unknown-linux-gnu").unwrap();
         let mut host_slice = index_slice(vec![index_row(
             "crc32fast",
@@ -877,12 +881,14 @@ mod tests {
             &[],
             UnitSide::Host,
         )]);
-        host_slice.index.header.target =
+        std::sync::Arc::make_mut(&mut host_slice.index)
+            .header
+            .target =
             stow_types::identity::TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap();
         // Same compile_key across two slices stays distinct; a duplicate inside
         // the same slice collapses.
         let shared_key = target_slice.index.rows[0].compile_key.clone();
-        host_slice.index.rows[0].compile_key = shared_key;
+        std::sync::Arc::make_mut(&mut host_slice.index).rows[0].compile_key = shared_key;
 
         let distinct = super::dedup_candidates(vec![
             (&target_slice, &target_slice.index.rows[0]),

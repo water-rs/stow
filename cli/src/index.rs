@@ -107,8 +107,10 @@ pub struct IndexSlice {
     /// which has no manifest to name.
     pub manifest_digest: Option<String>,
     /// The decoded index — header identity already checked against the
-    /// requested `(target, rustc_version)`.
-    pub index: ArtifactIndex,
+    /// requested `(target, rustc_version)`, reference-counted so sharing a
+    /// verified slice across `HeldSlices`, `SliceFetches` and analysis stages
+    /// never clones the row table.
+    pub index: Arc<ArtifactIndex>,
 }
 
 /// One cached slice's status, surfaced by `stow index status`.
@@ -495,7 +497,7 @@ async fn fetch_slice(
     commit_slice(&dir, &manifest_digest, blob, index.rows.len() as u64).await?;
     Ok(IndexSlice {
         manifest_digest: Some(manifest_digest),
-        index,
+        index: Arc::new(index),
     })
 }
 
@@ -507,7 +509,7 @@ async fn fetch_slice(
 fn empty_slice(target: &str, rustc_version: &str) -> stow_types::error::Result<IndexSlice> {
     Ok(IndexSlice {
         manifest_digest: None,
-        index: ArtifactIndex {
+        index: Arc::new(ArtifactIndex {
             header: stow_types::index::ArtifactIndexHeader {
                 format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
                 target: TargetTriple::parse(target)
@@ -522,7 +524,7 @@ fn empty_slice(target: &str, rustc_version: &str) -> stow_types::error::Result<I
             rows: Vec::new(),
             build_scripts: Vec::new(),
             local_programs: Vec::new(),
-        },
+        }),
     })
 }
 
@@ -670,7 +672,7 @@ async fn decode_cached(
     match smol::unblock(move || ArtifactIndex::decode(&blob)).await {
         Ok(index) => Ok(Some(IndexSlice {
             manifest_digest: Some(manifest_digest),
-            index,
+            index: Arc::new(index),
         })),
         Err(stow_types::index::IndexDecodeError::Format { .. }) => Ok(None),
         Err(error) => Err(error).wrap_err("decode cached index slice"),
@@ -1128,7 +1130,7 @@ mod tests {
             .expect("load cached")
             .expect("readable format");
         assert_eq!(loaded.manifest_digest.as_deref(), Some(digest.as_str()));
-        assert_eq!(loaded.index, index);
+        assert_eq!(*loaded.index, index);
     }
 
     /// A cached blob of another index format decodes to no slice — the
